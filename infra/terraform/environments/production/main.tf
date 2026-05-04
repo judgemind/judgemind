@@ -20,6 +20,13 @@ data "aws_secretsmanager_secret" "capsolver_api_key" {
   name = "judgemind/capsolver/api-key"
 }
 
+# Anthropic API access is disabled (cost control, #4031); we point the
+# production ingestion worker at Gemini. The secret is shared across envs
+# (single AWS account, same AI Studio project), matching the dev wiring.
+data "aws_secretsmanager_secret" "google_api_key" {
+  name = "judgemind/google/api-key"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "production"
@@ -68,6 +75,8 @@ module "compute" {
   scraper_task_role_arn              = module.iam_scraper.role_arn
   redis_url                          = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
   document_archive_bucket            = module.document_archive.bucket_id
+  llm_provider                       = "google"
+  google_api_key_secret_arn          = data.aws_secretsmanager_secret.google_api_key.arn
   proxy_secret_arn                   = data.aws_secretsmanager_secret.residential_proxy.arn
   courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
   capsolver_api_key_secret_arn       = data.aws_secretsmanager_secret.capsolver_api_key.arn
