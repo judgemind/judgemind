@@ -122,6 +122,26 @@ jobs:
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: bash infra/terraform/modules/dispatcher-v3-scheduled-skills/tests/postconditions/check.sh
 
+      # Postcondition fixture test for dispatcher-v3-task-defs (#3941, F2).
+      # Same defense-in-depth pattern as the v2 dispatcher-daemon /
+      # api-service / compute checks above — exercises the module's
+      # content-level postconditions on the rendered container_definitions
+      # JSON. Three regression classes are covered:
+      #   * #3764 / #2840 — silent-drop bug where a required secret entry
+      #     is missing despite the ARN variable being non-empty.
+      #   * #3754 — image-staleness drift caused by a mutable :latest tag
+      #     instead of a digest-pinned @sha256:<digest> reference.
+      #   * #3940 — Fargate's stopTimeout > 120s rejection. The pre-#3940
+      #     code rendered the wall-clock cap (21600 / 3600 / 7200) into
+      #     containerDefinitions[].stopTimeout, which Fargate rejects at
+      #     RegisterTaskDefinition; the fix splits stopTimeout (hardcoded
+      #     to 120) from the launcher-side wall-clock cap. The fixture's
+      #     `aws_ecs_task_definition.broken_stop_timeout` resource sets
+      #     stopTimeout = 21600 to verify the regression guard fires.
+      - name: dispatcher-v3-task-defs postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/dispatcher-v3-task-defs/tests/postconditions/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.
