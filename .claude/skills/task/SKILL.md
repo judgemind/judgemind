@@ -597,6 +597,8 @@ scripts/dispatcher/progress.sh "$AGENT_ID" awaiting_ci "PR #<PR-N>" || true
 
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
 
+**Do NOT use the `Monitor` tool for CI watch.** Monitor's bash-while-loop pattern fires a wake-up event on every state-string change, and `gh pr view --json mergeable` flickers between `UNKNOWN` and `MERGEABLE` while CI is still running. Each flicker is an unproductive turn for you and the calling dispatcher — observed root cause behind C2 (#3909), C3 (#3922), C4 (#3927), F2 (#3926) prematurely yielding before they could merge their own PRs. If `scripts/wait-for-ci.sh` gets auto-backgrounded by the harness, **just retry it directly** — do NOT switch to Monitor. Synchronous polling with the canonical helper is the only sanctioned CI-watch path.
+
 Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 
 ```
