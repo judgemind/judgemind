@@ -63,6 +63,44 @@ _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
 }
 
 
+def resolve_provider(provider: str | None = None) -> str:
+    """Resolve the active LLM provider name.
+
+    Resolution order:
+
+    1. Explicit ``provider`` argument.
+    2. ``LLM_PROVIDER`` environment variable.
+    3. Default ``"google"``.
+
+    This is the single source of truth for "which provider will ``call_llm``
+    actually use?" — callers that need to record or log the provider should
+    use this helper rather than reimplementing the precedence locally.
+    """
+    return provider or os.environ.get("LLM_PROVIDER", "google")
+
+
+def resolve_model(provider: str | None = None, model: str | None = None) -> str:
+    """Resolve the active LLM model ID for the given provider.
+
+    Resolution order matches ``call_llm``:
+
+    1. Explicit ``model`` argument.
+    2. ``LLM_MODEL`` environment variable.
+    3. Per-provider default from ``_PROVIDER_DEFAULT_MODELS``.
+    4. ``DEFAULT_HAIKU_MODEL`` (defensive fallback for unknown providers).
+
+    Callers (e.g. the ingestion summarizer) that need to persist or log the
+    model used should call this helper instead of duplicating the precedence
+    logic.  ``call_llm`` itself uses the same resolution.
+    """
+    resolved_provider = resolve_provider(provider)
+    return (
+        model
+        or os.environ.get("LLM_MODEL")
+        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, DEFAULT_HAIKU_MODEL)
+    )
+
+
 @dataclass
 class LLMResponse:
     """Unified response from any LLM provider."""
@@ -291,12 +329,8 @@ def call_llm(
         An ``LLMResponse`` with the text and token counts, or ``None``
         on any unrecoverable failure.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
-    resolved_model = (
-        model
-        or os.environ.get("LLM_MODEL")
-        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, DEFAULT_HAIKU_MODEL)
-    )
+    resolved_provider = resolve_provider(provider)
+    resolved_model = resolve_model(resolved_provider, model)
 
     if resolved_provider == "anthropic":
         return _call_anthropic(
@@ -358,12 +392,8 @@ def call_llm_with_images(
     Returns:
         An ``LLMResponse`` or ``None`` on failure.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
-    resolved_model = (
-        model
-        or os.environ.get("LLM_MODEL")
-        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, DEFAULT_HAIKU_MODEL)
-    )
+    resolved_provider = resolve_provider(provider)
+    resolved_model = resolve_model(resolved_provider, model)
 
     if resolved_provider == "anthropic":
         return _call_anthropic_with_images(
@@ -609,7 +639,7 @@ def create_client(
         A provider-specific client object, or ``None`` if no provider's
         credentials are available.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
+    resolved_provider = resolve_provider(provider)
 
     # Try the primary provider first.
     client = _try_create(resolved_provider)

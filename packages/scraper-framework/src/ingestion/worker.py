@@ -699,8 +699,9 @@ class IngestionWorker:
         self._empty_polls: int = 0
         self._last_event_time: float = time.monotonic()
 
-        # Ruling formatting — uses a dedicated Anthropic client (always Haiku),
-        # separate from the field extraction LLM client which may use Google.
+        # Ruling formatting — uses a dedicated client (provider resolved
+        # from LLM_PROVIDER env var), separate from the field extraction
+        # LLM client so the two paths can be tuned independently.
         self._formatting_enabled = os.environ.get("ENABLE_RULING_FORMATTING", "").lower() in (
             "1",
             "true",
@@ -708,15 +709,16 @@ class IngestionWorker:
         )
         self._formatting_client: object | None = None
         if self._formatting_enabled:
-            self._formatting_client = create_llm_client(provider="anthropic")
+            self._formatting_client = create_llm_client()
             if self._formatting_client is None:
                 logger.warning(
-                    "Ruling formatting enabled but ANTHROPIC_API_KEY not set — "
+                    "Ruling formatting enabled but no LLM provider API key is set — "
                     "formatting will use <pre> fallback"
                 )
 
-        # Ruling summarization — uses a dedicated Anthropic client (always Haiku),
-        # separate from the field extraction LLM client which may use Google.
+        # Ruling summarization — uses a dedicated client (provider resolved
+        # from LLM_PROVIDER env var), separate from the field extraction
+        # LLM client so the two paths can be tuned independently.
         self._summarization_enabled = os.environ.get("ENABLE_RULING_SUMMARIZATION", "").lower() in (
             "1",
             "true",
@@ -724,16 +726,17 @@ class IngestionWorker:
         )
         self._summarization_client: object | None = None
         if self._summarization_enabled:
-            self._summarization_client = create_llm_client(provider="anthropic")
+            self._summarization_client = create_llm_client()
             if self._summarization_client is None:
                 logger.warning(
-                    "Ruling summarization enabled but ANTHROPIC_API_KEY not set — "
+                    "Ruling summarization enabled but no LLM provider API key is set — "
                     "summarization disabled"
                 )
 
         # Ingestion validation gate — LLM-based quality checks between
-        # enrichment and DB write. Uses a dedicated Anthropic client (always
-        # Haiku), separate from extraction and formatting.
+        # enrichment and DB write. Uses a dedicated client (provider
+        # resolved from LLM_PROVIDER env var), separate from extraction
+        # and formatting.
         self._validation_enabled = os.environ.get("ENABLE_INGESTION_VALIDATION", "").lower() in (
             "1",
             "true",
@@ -741,10 +744,10 @@ class IngestionWorker:
         )
         self._validation_client: object | None = None
         if self._validation_enabled:
-            self._validation_client = create_llm_client(provider="anthropic")
+            self._validation_client = create_llm_client()
             if self._validation_client is None:
                 logger.warning(
-                    "Ingestion validation enabled but ANTHROPIC_API_KEY not set — "
+                    "Ingestion validation enabled but no LLM provider API key is set — "
                     "validation disabled"
                 )
                 self._validation_enabled = False
@@ -2301,7 +2304,8 @@ class IngestionWorker:
                 department=department,
                 county=county,
                 client=self._validation_client,
-                provider="anthropic",
+                # Provider intentionally omitted: validate_document falls
+                # through to LLM_PROVIDER env var (#4032).
                 timeout=self._llm_timeout,
             )
 

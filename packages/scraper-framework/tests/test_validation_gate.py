@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from validation.gate import (
     ValidationResult,
     _parse_validation_response,
@@ -372,3 +374,82 @@ class TestInsertValidationResult:
         assert params[1] == "ruling-789"
         assert params[2] == "flag"
         assert params[3] == "Case title mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Regression test for #4032: provider falls through to LLM_PROVIDER env var.
+# ---------------------------------------------------------------------------
+
+
+class TestProviderFallthrough:
+    """Regression tests for #4032 — validation gate must not pin provider."""
+
+    @patch("validation.gate.call_llm")
+    def test_does_not_pin_provider_when_caller_omits(self, mock_call_llm: MagicMock) -> None:
+        """When the caller omits provider, validate_document does not inject
+        a hardcoded ``"anthropic"``. The ``provider`` kwarg passed to
+        ``call_llm`` is ``None`` so it falls through to ``LLM_PROVIDER``."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_call_llm.return_value = LLMResponse(
+            text='{"result": "pass", "reason": null}',
+            input_tokens=100,
+            output_tokens=20,
+        )
+
+        validate_document(
+            ruling_text="The motion for summary judgment is GRANTED. " * 5,
+            case_number="23STCV12345",
+            case_title=None,
+            judge_name=None,
+            motion_type=None,
+            outcome=None,
+            hearing_date=None,
+            department=None,
+            county="Los Angeles",
+        )
+
+        call_kwargs = mock_call_llm.call_args.kwargs
+        assert call_kwargs.get("provider") is None, (
+            f"validate_document must not pin provider (#4032), got {call_kwargs.get('provider')!r}"
+        )
+
+    def test_routes_through_google_when_env_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: with ``LLM_PROVIDER=google`` set, validate_document
+        dispatches through ``_call_google`` (not ``_call_anthropic``)."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setenv("LLM_PROVIDER", "google")
+        monkeypatch.delenv("LLM_MODEL", raising=False)
+
+        google_response = LLMResponse(
+            text='{"result": "pass", "reason": null}',
+            input_tokens=100,
+            output_tokens=20,
+        )
+
+        with (
+            patch("ingestion.llm_providers._call_google") as mock_google,
+            patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
+        ):
+            mock_google.return_value = google_response
+
+            result = validate_document(
+                ruling_text="The motion for summary judgment is GRANTED. " * 5,
+                case_number="23STCV12345",
+                case_title=None,
+                judge_name=None,
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+                department=None,
+                county="Los Angeles",
+            )
+
+        mock_google.assert_called_once()
+        mock_anthropic.assert_not_called()
+        # Model resolves to google's default
+        google_call_args = mock_google.call_args
+        assert google_call_args[0][2] == "gemini-2.5-flash-lite"
+        # And the recorded model in ValidationResult matches
+        assert result.model == "gemini-2.5-flash-lite"
