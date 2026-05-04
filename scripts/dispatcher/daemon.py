@@ -8770,10 +8770,17 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before update"
         try:
             with self._conn.cursor() as cur:
+                # Issue #3574: defensively stamp ``ended_at`` so the
+                # zombie invariant (status terminal ⇒ ended_at NOT NULL)
+                # holds even if a caller invokes restore on a row that
+                # never had ended_at written. ``COALESCE(ended_at,
+                # now())`` preserves any earlier stamp from the original
+                # success path.
                 cur.execute(
                     "UPDATE dispatcher.agents "
                     "SET status = 'succeeded', "
                     "    phase = 'done', "
+                    "    ended_at = COALESCE(ended_at, now()), "
                     "    failure_summary = NULL "
                     "WHERE agent_id = %s",
                     (agent_id,),
@@ -24272,10 +24279,18 @@ class DispatcherDaemon:
             )
             try:
                 with self._conn.cursor() as cur:
+                    # Issue #3574: stamp ``ended_at`` synchronously with the
+                    # terminal status write. Without this, the launch-failed
+                    # row becomes a zombie (status='failed' AND ended_at IS
+                    # NULL), invisible to monitoring queries that order by
+                    # ``ended_at DESC``. ``COALESCE(ended_at, now())`` is
+                    # idempotent + race-safe with the housekeeping bulk
+                    # backfill in :meth:`_backfill_terminal_ended_at`.
                     cur.execute(
                         "UPDATE dispatcher.agents "
                         "   SET status = 'failed', "
-                        "       phase = 'scheduled_skill_launch_failed' "
+                        "       phase = 'scheduled_skill_launch_failed', "
+                        "       ended_at = COALESCE(ended_at, now()) "
                         " WHERE agent_id = %s",
                         (agent_id,),
                     )
