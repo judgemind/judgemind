@@ -172,7 +172,12 @@ import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
 from framework.extraction_config import get_county_extraction_config  # noqa: E402
-from framework.llm_enrichment import LlmEnrichmentExhaustedError, enrich_ruling_with_retry  # noqa: E402
+from framework.llm_enrichment import (  # noqa: E402
+    LlmEnrichmentExhaustedError,
+    LlmEnrichmentResult,
+    enrich_ruling_strict_retry,
+    enrich_ruling_with_retry,
+)
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
@@ -1434,6 +1439,12 @@ def _full_reparse_document(
     return results
 
 
+# Minimum stripped length of ruling_text before the strict-retry second
+# pass will run.  Mirrors ``ingestion.worker._STRICT_RETRY_MIN_TEXT_LEN``
+# (#3991) — keep both values in sync.
+_STRICT_RETRY_MIN_TEXT_LEN = 100
+
+
 def _apply_llm_enrichment(
     extracted: dict,
     *,
@@ -1499,9 +1510,13 @@ def _apply_llm_enrichment(
         if not extracted.get("outcome"):
             extraction_methods.setdefault("outcome", "llm_enrichment_skipped_no_text")
         if not extracted.get("motion_type"):
-            extraction_methods.setdefault("motion_type", "llm_enrichment_skipped_no_text")
+            extraction_methods.setdefault(
+                "motion_type", "llm_enrichment_skipped_no_text"
+            )
         if not extracted.get("case_title"):
-            extraction_methods.setdefault("case_title", "llm_enrichment_skipped_no_text")
+            extraction_methods.setdefault(
+                "case_title", "llm_enrichment_skipped_no_text"
+            )
         if not extracted.get("parties"):
             extraction_methods.setdefault("parties", "llm_enrichment_skipped_no_text")
         return
@@ -1540,9 +1555,62 @@ def _apply_llm_enrichment(
             extraction_methods.setdefault("parties", "llm_enrichment_errored")
         raise
 
+    # Strict-retry second pass (#3991): when the first pass leaves outcome
+    # and / or motion_type null on substantive ruling text, fire one more
+    # decisive LLM call asking specifically for the missing fields.  Mirrors
+    # ``ingestion.worker._llm_enrich_fields``.  ``strict_retry_fields``
+    # tracks which fields were filled by the strict retry so the diagnostic
+    # marker can be set correctly downstream.
+    strict_retry_fields: set[str] = set()
     if result is None:
-        # LLM responded but extracted nothing (all-None fields).  Not a
-        # transient failure — record diagnostic markers and return.
+        first_missing_outcome = True
+        first_missing_motion_type = True
+    else:
+        first_missing_outcome = result.outcome is None and not has_outcome
+        first_missing_motion_type = result.motion_type is None and not has_motion_type
+
+    text_long_enough = len(ruling_text.strip()) >= _STRICT_RETRY_MIN_TEXT_LEN
+    should_strict_retry = (
+        first_missing_outcome or first_missing_motion_type
+    ) and text_long_enough
+
+    if should_strict_retry:
+        strict_result = enrich_ruling_strict_retry(
+            ruling_text,
+            missing_outcome=first_missing_outcome,
+            missing_motion_type=first_missing_motion_type,
+            provider=llm_provider or "google",
+            model=llm_model,
+            client=llm_client,
+        )
+        if strict_result is not None:
+            if result is None:
+                result = LlmEnrichmentResult()
+            if first_missing_outcome and strict_result.outcome is not None:
+                result = result.model_copy(update={"outcome": strict_result.outcome})
+                strict_retry_fields.add("outcome")
+            if first_missing_motion_type and strict_result.motion_type is not None:
+                result = result.model_copy(
+                    update={"motion_type": strict_result.motion_type}
+                )
+                strict_retry_fields.add("motion_type")
+            logger.info(
+                "LLM enrichment strict retry completed",
+                document_id=document_id,
+                fields_populated=sorted(strict_retry_fields),
+                missing_outcome=first_missing_outcome,
+                missing_motion_type=first_missing_motion_type,
+            )
+        else:
+            logger.warning(
+                "LLM enrichment strict retry returned None — continuing with first-pass result",
+                document_id=document_id,
+            )
+
+    if result is None:
+        # LLM responded but extracted nothing (all-None fields), and the
+        # strict-retry pass either was skipped (text too short) or also
+        # returned nothing.  Record diagnostic markers and return.
         logger.info(
             "LLM enrichment returned empty result — no fields populated",
             document_id=document_id,
@@ -1559,14 +1627,22 @@ def _apply_llm_enrichment(
 
     if not has_outcome and result.outcome is not None:
         extracted["outcome"] = result.outcome
-        extraction_methods["outcome"] = "llm_enrichment"
+        extraction_methods["outcome"] = (
+            "llm_enrichment_strict_retry"
+            if "outcome" in strict_retry_fields
+            else "llm_enrichment"
+        )
     elif not has_outcome:
         # Enrichment ran successfully but did not return this field.
         extraction_methods.setdefault("outcome", "llm_enrichment_no_extraction")
 
     if not has_motion_type and result.motion_type is not None:
         extracted["motion_type"] = result.motion_type
-        extraction_methods["motion_type"] = "llm_enrichment"
+        extraction_methods["motion_type"] = (
+            "llm_enrichment_strict_retry"
+            if "motion_type" in strict_retry_fields
+            else "llm_enrichment"
+        )
     elif not has_motion_type:
         extraction_methods.setdefault("motion_type", "llm_enrichment_no_extraction")
 

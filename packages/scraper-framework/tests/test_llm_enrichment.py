@@ -25,6 +25,7 @@ from framework.llm_enrichment import (
     OutcomeType,
     _parse_response,
     enrich_ruling,
+    enrich_ruling_strict_retry,
 )
 
 # ---------------------------------------------------------------------------
@@ -542,3 +543,214 @@ class TestPromptContent:
         """Prompt should note that sustained demurrer = granted, overruled = denied."""
         assert "sustained" in ENRICHMENT_SYSTEM_PROMPT.lower()
         assert "overruled" in ENRICHMENT_SYSTEM_PROMPT.lower()
+
+    def test_prompt_includes_relaxed_null_policy(self) -> None:
+        """Prompt should explicitly limit null returns to fragmentary text (#3991)."""
+        # The phrase doesn't have to be verbatim, but the intent must show up:
+        # null is reserved for empty / fragmentary text, not "uncertain".
+        text = ENRICHMENT_SYSTEM_PROMPT.lower()
+        assert "null" in text
+        # At least one of these decisive-classification cues must appear.
+        assert (
+            "best-fitting" in text
+            or "best fitting" in text
+            or "do not return null" in text
+            or "rather than returning null" in text
+            or "rather than null" in text
+        ), (
+            "Prompt must instruct the LLM to prefer a taxonomy value over null "
+            "when the text describes a ruling."
+        )
+
+
+# ---------------------------------------------------------------------------
+# enrich_ruling_strict_retry — stronger second-pass enrichment for #3991
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichRulingStrictRetry:
+    """Tests for the enrich_ruling_strict_retry() function added by #3991.
+
+    The strict-retry pass is invoked by the worker AFTER the first
+    ``enrich_ruling_with_retry`` call when ``outcome`` and/or ``motion_type``
+    came back null on substantive ruling text.  The function makes ONE
+    additional LLM call with a more decisive prompt asking specifically for
+    those fields.
+    """
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_returns_outcome_when_first_pass_empty(self, mock_call_llm: MagicMock) -> None:
+        """Strict retry returns a result with outcome when first pass missed it."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"outcome": "continued"}))
+
+        result = enrich_ruling_strict_retry(
+            "Plaintiff to give notice. Will CONTINUE the hearing as set forth herein.",
+            missing_outcome=True,
+            missing_motion_type=False,
+        )
+
+        assert result is not None
+        assert result.outcome == "continued"
+        mock_call_llm.assert_called_once()
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_returns_motion_type_only(self, mock_call_llm: MagicMock) -> None:
+        """Strict retry can request just motion_type and parse it out."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"motion_type": "demurrer"}))
+
+        result = enrich_ruling_strict_retry(
+            "The demurrer to the second amended complaint is sustained without leave to amend.",
+            missing_outcome=False,
+            missing_motion_type=True,
+        )
+
+        assert result is not None
+        assert result.motion_type == "demurrer"
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_returns_both_outcome_and_motion_type(self, mock_call_llm: MagicMock) -> None:
+        """Strict retry can return both fields when both are missing."""
+        mock_call_llm.return_value = _make_llm_response(
+            json.dumps({"outcome": "granted", "motion_type": "msj"})
+        )
+
+        result = enrich_ruling_strict_retry(
+            "Defendant's motion for summary judgment is GRANTED.",
+            missing_outcome=True,
+            missing_motion_type=True,
+        )
+
+        assert result is not None
+        assert result.outcome == "granted"
+        assert result.motion_type == "msj"
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_returns_none_on_llm_api_failure(self, mock_call_llm: MagicMock) -> None:
+        """LLM API failure (None response) returns None."""
+        mock_call_llm.return_value = None
+
+        result = enrich_ruling_strict_retry(
+            "Some ruling text that's substantive.",
+            missing_outcome=True,
+            missing_motion_type=True,
+        )
+
+        assert result is None
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_handles_json_parse_failure(self, mock_call_llm: MagicMock) -> None:
+        """Malformed JSON returns LlmEnrichmentResult with all-None fields (no raise)."""
+        mock_call_llm.return_value = _make_llm_response("not json at all")
+
+        result = enrich_ruling_strict_retry(
+            "Some ruling text that's substantive.",
+            missing_outcome=True,
+            missing_motion_type=False,
+        )
+
+        # Function MUST NOT raise on JSON parse failure — it returns an empty
+        # LlmEnrichmentResult so the caller can record diagnostic markers
+        # without crashing the worker.
+        assert result is not None
+        assert result.outcome is None
+        assert result.motion_type is None
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_taxonomy_validated_on_uppercase_input(self, mock_call_llm: MagicMock) -> None:
+        """Pydantic validators normalize taxonomy values from the LLM."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"outcome": "GRANTED"}))
+
+        result = enrich_ruling_strict_retry(
+            "The motion is GRANTED.",
+            missing_outcome=True,
+            missing_motion_type=False,
+        )
+
+        assert result is not None
+        # Lowercased to canonical taxonomy value.
+        assert result.outcome == "granted"
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_taxonomy_unknown_outcome_mapped_to_other(self, mock_call_llm: MagicMock) -> None:
+        """Unknown taxonomy values are mapped to 'other' by the validator."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"outcome": "withdrawn"}))
+
+        result = enrich_ruling_strict_retry(
+            "Motion withdrawn by moving party.",
+            missing_outcome=True,
+            missing_motion_type=False,
+        )
+
+        assert result is not None
+        # "withdrawn" is not in OutcomeType — falls through to "other".
+        assert result.outcome == "other"
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_provider_and_model_passed_through(self, mock_call_llm: MagicMock) -> None:
+        """Provider and model kwargs reach call_llm so the same LLM is used."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"outcome": "granted"}))
+        mock_client = MagicMock()
+
+        enrich_ruling_strict_retry(
+            "The motion is GRANTED.",
+            missing_outcome=True,
+            missing_motion_type=False,
+            provider="anthropic",
+            model="claude-haiku-4-5-20251001",
+            client=mock_client,
+        )
+
+        call_kwargs = mock_call_llm.call_args
+        assert call_kwargs.kwargs["provider"] == "anthropic"
+        assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs.kwargs["client"] is mock_client
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_empty_ruling_text_does_not_call_llm(self, mock_call_llm: MagicMock) -> None:
+        """Empty / whitespace text returns an empty result without an LLM call."""
+        result = enrich_ruling_strict_retry(
+            "",
+            missing_outcome=True,
+            missing_motion_type=True,
+        )
+
+        assert result is not None
+        assert result.outcome is None
+        assert result.motion_type is None
+        mock_call_llm.assert_not_called()
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_no_missing_fields_short_circuits(self, mock_call_llm: MagicMock) -> None:
+        """If neither field is flagged missing, no LLM call is made."""
+        result = enrich_ruling_strict_retry(
+            "Some substantive ruling text.",
+            missing_outcome=False,
+            missing_motion_type=False,
+        )
+
+        # No work to do — function returns an empty result and skips the LLM.
+        assert result is not None
+        assert result.outcome is None
+        assert result.motion_type is None
+        mock_call_llm.assert_not_called()
+
+    @patch("framework.llm_enrichment.call_llm")
+    def test_prompt_lists_missing_fields(self, mock_call_llm: MagicMock) -> None:
+        """The strict-retry prompt names which fields the prior pass missed."""
+        mock_call_llm.return_value = _make_llm_response(json.dumps({"outcome": "granted"}))
+
+        enrich_ruling_strict_retry(
+            "The motion is GRANTED.",
+            missing_outcome=True,
+            missing_motion_type=False,
+        )
+
+        # Inspect the system prompt that was passed.
+        args, kwargs = mock_call_llm.call_args
+        # call_llm signature: call_llm(system_prompt, user_message, ...)
+        system_prompt = args[0] if args else kwargs.get("system_prompt", "")
+        # Prompt must mention the field that was missing.
+        assert "outcome" in system_prompt.lower()
+        # And must include the outcome taxonomy so the LLM can pick.
+        assert "continued" in system_prompt.lower()
+        assert "granted" in system_prompt.lower()

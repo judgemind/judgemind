@@ -7720,6 +7720,252 @@ class TestApplyLlmEnrichment:
         assert "motion_type" not in methods
 
 
+class TestApplyLlmEnrichmentStrictRetry:
+    """Strict-retry second pass for null outcome / motion_type rulings (#3991)."""
+
+    def _make_enrichment_result(
+        self,
+        *,
+        case_title: str | None = None,
+        motion_type: str | None = None,
+        outcome: str | None = None,
+        plaintiffs: list[str] | None = None,
+        defendants: list[str] | None = None,
+    ) -> Any:
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        return LlmEnrichmentResult(
+            case_title=case_title,
+            motion_type=motion_type,
+            outcome=outcome,
+            parties=EnrichmentParties(
+                plaintiffs=plaintiffs or [],
+                defendants=defendants or [],
+            ),
+        )
+
+    def _make_extracted(
+        self,
+        *,
+        ruling_text: str | None = (
+            "Plaintiff to give notice. The Court finds the motion supported "
+            "and well-taken. The matter is continued to a future date for "
+            "further consideration as set forth herein."
+        ),
+        outcome: str | None = None,
+        motion_type: str | None = None,
+        case_title: str | None = None,
+        parties: list | None = None,
+    ) -> dict:
+        return {
+            "ruling_text": ruling_text,
+            "case_number": "30-2024-01234567",
+            "case_title": case_title,
+            "case_type": None,
+            "judge_name": "Judge Smith",
+            "outcome": outcome,
+            "motion_type": motion_type,
+            "department": "C1",
+            "parties": parties if parties is not None else [],
+            "hearing_date": date(2026, 3, 5),
+            "extraction_methods": {"_all": "multimodal"},
+            "llm_skipped": False,
+            "llm_outcome": "multimodal_success",
+            "ruling_index": 0,
+            "split_document_id": "test-doc-id",
+            "is_split": False,
+        }
+
+    def test_strict_retry_called_when_first_pass_returns_none(self) -> None:
+        """When first pass returns None, strict retry runs and fills outcome (#3991)."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        strict = self._make_enrichment_result(outcome="continued")
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=None),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+                return_value=strict,
+            ) as mock_strict,
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-1",
+            )
+
+        mock_strict.assert_called_once()
+        # Outcome was populated by the strict retry — verify the value AND
+        # the new diagnostic marker.
+        assert extracted["outcome"] == "continued"
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment_strict_retry"
+
+    def test_strict_retry_called_when_outcome_missing_only(self) -> None:
+        """First pass returns case_title, strict retry fills outcome (#3991)."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        first = self._make_enrichment_result(
+            case_title="Smith v. Jones",
+            plaintiffs=["Smith"],
+            defendants=["Jones"],
+        )
+        strict = self._make_enrichment_result(outcome="granted", motion_type="demurrer")
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=first),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+                return_value=strict,
+            ) as mock_strict,
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-2",
+            )
+
+        mock_strict.assert_called_once()
+        call_kwargs = mock_strict.call_args.kwargs
+        assert call_kwargs["missing_outcome"] is True
+        assert call_kwargs["missing_motion_type"] is True
+        # Both outcome and motion_type were filled by the strict retry.
+        assert extracted["outcome"] == "granted"
+        assert extracted["motion_type"] == "demurrer"
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment_strict_retry"
+        assert methods["motion_type"] == "llm_enrichment_strict_retry"
+        # case_title was filled by the first pass — regular tag.
+        assert extracted["case_title"] == "Smith v. Jones"
+        assert methods["case_title"] == "llm_enrichment"
+
+    def test_strict_retry_skipped_when_text_too_short(self) -> None:
+        """Strict retry doesn't run on < 100-char text (#3991)."""
+        extracted = self._make_extracted(ruling_text="Short.")
+        mock_client = MagicMock()
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=None),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+            ) as mock_strict,
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-3",
+            )
+
+        mock_strict.assert_not_called()
+        # Empty marker is recorded since first pass returned None and strict
+        # retry was skipped.
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment_empty"
+
+    def test_strict_retry_skipped_when_first_pass_filled_both(self) -> None:
+        """Strict retry doesn't run when first pass returned outcome AND motion_type."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        first = self._make_enrichment_result(
+            case_title="Smith v. Jones",
+            motion_type="msj",
+            outcome="granted",
+            plaintiffs=["Smith"],
+            defendants=["Jones"],
+        )
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=first),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+            ) as mock_strict,
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-4",
+            )
+
+        mock_strict.assert_not_called()
+        # Both fields came from the first pass — regular tag.
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment"
+        assert methods["motion_type"] == "llm_enrichment"
+
+    def test_strict_retry_returns_none_falls_back_to_empty_marker(self) -> None:
+        """If strict retry LLM call fails (None), markers fall back to empty (#3991)."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=None),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+                return_value=None,
+            ),
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-5",
+            )
+
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment_empty"
+        assert methods["motion_type"] == "llm_enrichment_empty"
+
+    def test_strict_retry_partial_only_outcome_no_extraction_marker_for_motion_type(
+        self,
+    ) -> None:
+        """Strict retry returns outcome but not motion_type — motion_type still null."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        strict = self._make_enrichment_result(outcome="continued", motion_type=None)
+
+        with (
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=None),
+            patch.object(
+                reingest,
+                "enrich_ruling_strict_retry",
+                return_value=strict,
+            ),
+        ):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-strict-6",
+            )
+
+        # outcome filled by strict retry.
+        assert extracted["outcome"] == "continued"
+        # motion_type still None in extracted.
+        assert extracted.get("motion_type") is None
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment_strict_retry"
+        # motion_type field went through the merge but neither pass produced
+        # a value — since the merged result HAS data (outcome non-null), the
+        # script's no-extraction marker fires for motion_type.
+        assert methods["motion_type"] == "llm_enrichment_no_extraction"
+
+
 class TestReparseMultimodalCallsEnrichment:
     """Integration: ``_reparse_document_multimodal`` wires enrichment in (#2406)."""
 
