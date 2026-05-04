@@ -49,11 +49,7 @@ variable "master_user_name" {
 }
 
 variable "principal_arns" {
-  description = "IAM role/user ARNs allowed to call es:* on this OpenSearch domain (#3704). An empty list would deny all IAM access, so at least one ARN is required."
+  description = "IAM role/user ARNs that should be allowed to call es:* on this OpenSearch domain. CURRENTLY UNUSED in the access policy (see #3771): the policy is `Principal = AWS = '*'` because basic-auth requests via FGAC's internal user database carry no IAM principal at the AWS layer, so any narrower policy denies them as 'User: anonymous'. The variable is kept on the module interface so callers (dev/prod env blocks) don't need to change when a future SigV4 migration re-tightens the policy."
   type        = list(string)
-
-  validation {
-    condition     = length(var.principal_arns) > 0
-    error_message = "principal_arns must contain at least one ARN; an empty list would deny all IAM access to OpenSearch."
-  }
+  default     = []
 }

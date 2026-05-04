@@ -697,6 +697,143 @@ class TestEnsureIndexStartup:
         mock_os.indices.create.assert_called_once()
 
 
+class TestAnonymousUserDiagnostic:
+    """Regression tests for #3771 — when OpenSearch returns 403 with the
+    "User: anonymous" message, the worker must log a structured, actionable
+    diagnostic naming the most likely root causes (basic-auth credentials
+    not propagated, or the OpenSearch domain access policy was tightened to
+    drop ``Principal: AWS=*`` while basic auth is still in use).
+
+    The 403-anonymous case is OpenSearch-FGAC's behavior when the AWS-level
+    access policy is narrower than ``Principal: AWS=*`` AND the request
+    uses basic auth (which has no IAM principal at the AWS layer).  Once
+    the access policy denies the request as "anonymous", FGAC's internal
+    user database never gets to validate the basic-auth header.  See the
+    issue #3771 root-cause analysis for the full chain of evidence.
+    """
+
+    @staticmethod
+    def _anonymous_403() -> AuthorizationException:
+        """Build the exact AuthorizationException shape OpenSearch returns
+        for the access-policy-denies-anonymous case.
+
+        Real-world example from /ecs/judgemind-ingestion-worker-dev:
+            AuthorizationException(403, '{"Message":"User: anonymous is not
+            authorized to perform: es:ESHttpPut because no resource-based
+            policy allows the es:ESHttpPut action"}')
+        """
+        body = (
+            '{"Message":"User: anonymous is not authorized to perform: '
+            "es:ESHttpPut because no resource-based policy allows the "
+            'es:ESHttpPut action"}'
+        )
+        return AuthorizationException(403, body)
+
+    def test_anonymous_user_403_emits_actionable_diagnostic(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The startup 403 swallow must log a clear, actionable warning when
+        the 403 body contains "User: anonymous", because that case is
+        unambiguously caused by either credential-injection failure or a
+        narrowed OpenSearch access policy — not a transient outage.
+        """
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.side_effect = self._anonymous_403()
+
+        with caplog.at_level("ERROR", logger="framework.search.indexer"):
+            consumer = IndexingConsumer(
+                opensearch_client=mock_os,
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                ensure_index=True,
+            )
+
+        assert consumer is not None  # worker must NOT crash (#3917)
+
+        # The diagnostic must mention "anonymous" so log scrapers can match it.
+        anonymous_records = [r for r in caplog.records if "anonymous" in r.getMessage().lower()]
+        assert anonymous_records, (
+            "Expected at least one log record mentioning 'anonymous' for the "
+            f"403-anonymous case; got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+        # The diagnostic must be at ERROR level (not just WARNING) because
+        # this is an actionable misconfiguration, not a transient blip.
+        error_records = [r for r in anonymous_records if r.levelname == "ERROR"]
+        assert error_records, (
+            "Expected an ERROR-level diagnostic for 403-anonymous; got levels: "
+            f"{[r.levelname for r in anonymous_records]}"
+        )
+
+        # The diagnostic must name the two most likely root causes so on-call
+        # operators don't have to guess. Match on substrings that an operator
+        # would search for.
+        diag = error_records[0].getMessage().lower()
+        assert "opensearch_username" in diag or "opensearch_password" in diag, (
+            f"Expected diagnostic to name the credential env vars; got: {diag}"
+        )
+        assert "access policy" in diag or "principal" in diag, (
+            f"Expected diagnostic to name the access-policy root cause; got: {diag}"
+        )
+        assert "#3771" in diag, (
+            f"Expected diagnostic to cite issue #3771 for forward link; got: {diag}"
+        )
+
+    def test_anonymous_user_403_does_not_crash_worker(self) -> None:
+        """The new diagnostic must preserve the #3917 contract: a 403 at
+        startup does NOT raise, and the worker still constructs successfully.
+        """
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.side_effect = self._anonymous_403()
+
+        # Must NOT raise.
+        consumer = IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=True,
+        )
+        assert consumer is not None
+
+    def test_non_anonymous_403_still_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A 403 whose body does NOT mention "anonymous" must still be
+        swallowed (#3917) but logged at WARNING level — not the louder
+        ERROR-level diagnostic, because it could be a transient policy
+        propagation race or an unrelated authorization issue.
+        """
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.side_effect = AuthorizationException(
+            403,
+            '{"Message":"some other authorization failure"}',
+        )
+
+        with caplog.at_level("WARNING", logger="framework.search.indexer"):
+            consumer = IndexingConsumer(
+                opensearch_client=mock_os,
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                ensure_index=True,
+            )
+
+        assert consumer is not None
+        # No ERROR-level "anonymous" diagnostic for this case.
+        error_anonymous = [
+            r
+            for r in caplog.records
+            if r.levelname == "ERROR" and "anonymous" in r.getMessage().lower()
+        ]
+        assert not error_anonymous, (
+            "Non-anonymous 403 must NOT emit the ERROR-level 'anonymous' "
+            f"diagnostic; got: {[r.getMessage() for r in error_anonymous]}"
+        )
+        # And the existing WARNING-level swallow still fires.
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warning_records, "Expected the existing WARNING swallow log"
+
+
 class TestFetchTextError:
     """Tests for S3 fetch error handling in _fetch_text."""
 
