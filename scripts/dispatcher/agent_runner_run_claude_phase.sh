@@ -61,6 +61,48 @@ if ! declare -F die >/dev/null 2>&1; then
     }
 fi
 
+# ── _ms_now() — portable epoch-milliseconds helper (#4099) ──────────────────
+#
+# GNU ``date -u +%s%3N`` returns epoch-seconds + 3-digit nanoseconds (i.e.
+# milliseconds). BSD ``date`` (macOS) does NOT support the ``%N`` format
+# specifier — it silently emits a literal ``N`` appended to the seconds
+# (e.g. ``17780132253N``). The ``2>/dev/null || printf 'unknown'`` fallback
+# the helper used to wrap around ``date -u +%s%3N`` does NOT trip on this
+# case, because BSD date exits 0 with the malformed token. The literal ``N``
+# then poisons the downstream ``$((end - start))`` arithmetic with
+# ``value too great for base (error token is "17780132253N")``, which under
+# ``set -e`` aborts ``scripts/tests/test_agent_runner_entrypoint.sh`` on
+# macOS bash 3.2 — blocking any /task agent on a Mac from running the
+# entrypoint test suite locally.
+#
+# Fix: route through python3, which is already a hard dependency of the
+# entrypoint (used for the phase-transition shims) and which produces a
+# clean integer milliseconds value on every supported platform. The
+# fallback to ``printf 'unknown'`` is preserved for the unlikely case
+# where ``python3`` is absent so the existing ``unknown``-handling branch
+# in ``run_claude_phase`` (and the T3778 test) still has a code path to
+# exercise.
+#
+# Bash 3.2 compatible — no associative arrays, no ``${EPOCHREALTIME}`` (bash 5+).
+#
+# Output contract: prints either a positive integer (epoch milliseconds) or
+# the literal string ``unknown``. Validate python3's stdout is a non-empty
+# digit string before accepting it — a stubbed python3 (e.g. tests that
+# replace python3 with ``#!/usr/bin/env bash\nexit 0\n``) returns rc=0
+# with empty stdout, which would otherwise leak the empty string into the
+# downstream ``$((end - start))`` arithmetic. Validating here keeps the
+# ``unknown`` branch in ``run_claude_phase`` as the only path that
+# produces non-numeric output.
+_ms_now() {
+    local _ms_now_out
+    _ms_now_out=$(python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null) \
+        || _ms_now_out=""
+    case "$_ms_now_out" in
+        ''|*[!0-9]*) printf 'unknown' ;;
+        *)           printf '%s' "$_ms_now_out" ;;
+    esac
+}
+
 # ── Per-phase claude -p timeout constants ───────────────────────────────────
 #
 # Each phase has its own wall-clock cap so ralph (the long-tail phase)
@@ -245,7 +287,9 @@ run_claude_phase() {
     # name appears in the constants block above as a comment anchor
     # for the test_per_phase_timeout.py static lints.
     _phase_timeout=$(claude_phase_timeout_seconds_by_phase "$_phase")
-    _phase_start_ms=$(date -u +%s%3N 2>/dev/null || printf 'unknown')
+    # #4099: route through ``_ms_now`` (python3-backed) so macOS BSD date
+    # doesn't silently emit ``17780132253N`` — see helper docstring above.
+    _phase_start_ms=$(_ms_now)
     set +e
     (
         cd "$REPO_ROOT" || exit 127
@@ -269,7 +313,8 @@ run_claude_phase() {
     )
     _rc=$?
     set -e
-    _phase_end_ms=$(date -u +%s%3N 2>/dev/null || printf 'unknown')
+    # #4099: see ``_ms_now`` helper above — replaces ``date -u +%s%3N``.
+    _phase_end_ms=$(_ms_now)
     if [[ "$_phase_start_ms" == 'unknown' || "$_phase_end_ms" == 'unknown' ]]; then
         _phase_duration_ms='unknown'
     else

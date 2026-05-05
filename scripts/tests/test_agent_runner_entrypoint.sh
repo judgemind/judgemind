@@ -3661,9 +3661,14 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t41_funcs"
 done
 
-# #3775: the following 5 functions were extracted from the entrypoint to
+# #3775: the following functions were extracted from the entrypoint to
 # the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
-for fn in claude_phase_timeout_seconds_by_phase \
+# #4099: ``_ms_now`` is a HELPER-resident function used by
+# ``run_claude_phase`` for portable epoch-ms timing. Must be extracted
+# into the fixture or the sourced ``run_claude_phase`` body fails with
+# ``_ms_now: command not found`` on every invocation.
+for fn in _ms_now \
+          claude_phase_timeout_seconds_by_phase \
           run_claude_phase \
           write_phase_input \
           phase_to_skill \
@@ -4183,9 +4188,14 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t44_funcs"
 done
 
-# #3775: the following 5 functions were extracted from the entrypoint to
+# #3775: the following functions were extracted from the entrypoint to
 # the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
-for fn in phase_to_skill \
+# #4099: ``_ms_now`` is a HELPER-resident function used by
+# ``run_claude_phase`` for portable epoch-ms timing. Must be extracted
+# into the fixture or the sourced ``run_claude_phase`` body fails with
+# ``_ms_now: command not found`` on every invocation.
+for fn in _ms_now \
+          phase_to_skill \
           read_phase_output \
           write_phase_input \
           claude_phase_timeout_seconds_by_phase \
@@ -5706,9 +5716,14 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t58_funcs"
 done
 
-# #3775: the following 5 functions were extracted from the entrypoint to
+# #3775: the following functions were extracted from the entrypoint to
 # the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
-for fn in phase_to_skill \
+# #4099: ``_ms_now`` is a HELPER-resident function used by
+# ``run_claude_phase`` for portable epoch-ms timing. Must be extracted
+# into the fixture or the sourced ``run_claude_phase`` body fails with
+# ``_ms_now: command not found`` on every invocation.
+for fn in _ms_now \
+          phase_to_skill \
           read_phase_output \
           write_phase_input \
           claude_phase_timeout_seconds_by_phase \
