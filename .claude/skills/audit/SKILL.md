@@ -245,6 +245,21 @@ Flag a finding if any of the following are true:
 - **Do NOT report trend regressions with fewer than 3 ran-samples in each half.** Tiny samples produce noisy means; the `audit_ci_health.py` script enforces a minimum of 3 samples per half before emitting a trend finding.
 - **Do NOT rely on percentage alone for small-duration jobs.** A 3-second check going to 4 seconds is +33% but not an actionable regression. The script requires BOTH a ≥20% delta AND a ≥15-second absolute delta.
 
+#### Drill-down: which step inside the slow job (issue #4070)
+
+When a job is flagged as `> 10 min` (single-job threshold), `scripts/audit_ci_health.py` automatically fetches that job's log via `gh run view --log --job=<id>`, parses `##[group]<name>` / `##[endgroup]` paired timestamps, and attaches a `drill_down` section to the finding. This is the audit's job — do **not** repeat the manual log-eyeball drill that produced #4067 by hand.
+
+The drill-down emits, per flagged job:
+
+- `slowest_steps` — the top 3 `##[group]` blocks by wall-clock, each with `name`, `seconds`, and (when an inline `~Ns` estimate exists in `.github/workflows/ci.yml` near the matrix block) `estimate_seconds` and `drift_factor`.
+- `if_split_wall_clock_seconds` — wall-clock if the slowest step were extracted into its own matrix shard: `max(slowest_step, sum_of_remaining_steps)`.
+- `split_savings_seconds` — the savings if that re-shard happened.
+- `suggested_fixes` — `trim <step>` when `drift_factor ≥ 1.5`, `split <step> into separate shard` when the slowest step accounts for ≥ 50% of the total group time AND savings ≥ 30s.
+
+The drill-down section is omitted (rather than emitted as empty) when the job's log has no `##[group]` markers — that's expected for setup-only jobs and short jobs.
+
+To opt out (e.g. ad-hoc runs that don't need the extra `gh` API calls), pass `--no-drill-down`.
+
 #### Filing issues
 
 For each threshold violation or trend regression, file a `priority/p1` `type/dx` issue with:
@@ -254,7 +269,22 @@ For each threshold violation or trend regression, file a `priority/p1` `type/dx`
 - The specific run IDs and timestamps so the issue is traceable. Paste the output of `scripts/audit_ci_health.py --json` into the issue body.
 - Suggested investigation steps: check for new heavy test files, fixture bloat, missing parallelism, runner size, or unnecessary sequential steps.
 
-**Deduplication:** Before filing, check for existing open issues related to CI performance (e.g., #1243 tracks CI runner size / test splitting). If an existing issue covers the same job or concern, note it as "skipped — duplicate of #N" rather than filing a new one. Only file a new issue if the finding is distinct from existing tracked work.
+**For single-job findings, the issue body must include the drill-down sections** (the `audit_ci_health.render_finding_issue_body(finding)` helper produces them). Specifically:
+
+- **Slowest steps inside the flagged job** — a 3-row table (Step, Measured (s), Estimate (s), Drift). Modeled on #4067's body.
+- **Estimate drift** — for each step where `drift_factor ≥ 1.5`, name the step and quote measured-vs-estimate.
+- **Re-shard math** — if the slowest step were split into its own shard, what the new wall-clock and savings would be.
+- **Suggested fixes** — the `trim` / `split` recommendations from the drill-down's `suggested_fixes`.
+
+**Deduplication:** Before filing, dedup against the **open** issues list only — pass `state: "open"` to `mcp__github__list_issues` (the script and skill never match against closed issues, since a previously-fixed-and-closed issue must NOT silence a regression on the same job; see issue #4070). The dedup key is `(job_name, slowest_step_name)`, not job name alone — two distinct slow steps inside the same job get distinct issues.
+
+If an open issue matches the (job, slowest-step) key, note the new finding as "skipped — duplicate of #N" rather than filing a new one. **Closed issues do NOT silence regressions** — if a previously-closed issue's job (and step) regresses, file a **new** issue with `Recurrence of #N` in the body. Reopened issues sit in a weird state across `gh issue list --state` filters and dispatcher queue logic, so a fresh issue with a back-link is always preferred.
+
+The `audit_ci_health.classify_finding_against_issues(finding, issues)` helper returns one of:
+
+- `DedupMatch(kind="duplicate", issue_number=N)` — open match; skip filing.
+- `DedupMatch(kind="recurrence", issue_number=N)` — closed match; file fresh with `Recurrence of #N`.
+- `DedupMatch(kind="new")` — no match; file fresh.
 
 ### 1.9 — Scripts directory hygiene
 

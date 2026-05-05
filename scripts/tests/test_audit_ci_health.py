@@ -17,15 +17,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from audit_ci_health import (  # noqa: E402 — sys.path manipulation above
+    DRIFT_FACTOR_THRESHOLD,
     MIN_SAMPLES_PER_GROUP,
     SINGLE_JOB_SECONDS_THRESHOLD,
+    SPLIT_SAVINGS_MIN_SECONDS,
+    SPLIT_SLOWEST_DOMINANCE_THRESHOLD,
     TOTAL_WALL_CLOCK_THRESHOLD,
     TREND_ABSOLUTE_SECONDS_THRESHOLD,
     TREND_PERCENT_THRESHOLD,
+    DedupMatch,
+    Finding,
+    JobRun,
+    attach_drill_down,
     build_runs_from_json,
+    classify_finding_against_issues,
+    compute_drill_down,
     compute_threshold_findings,
     compute_trend_findings,
+    extract_step_estimates,
     main,
+    parse_group_durations,
+    render_finding_issue_body,
 )
 
 
@@ -36,6 +48,7 @@ def _make_job(
     duration_s: float,
     conclusion: str = "success",
     test_step_duration_s: float | None = None,
+    database_id: int | None = None,
 ) -> dict[str, object]:
     """Build a job-record dict matching gh run view --json jobs output."""
     t0 = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=start_offset_s)
@@ -51,13 +64,16 @@ def _make_job(
                 "completedAt": test_end.isoformat().replace("+00:00", "Z"),
             }
         )
-    return {
+    job: dict[str, object] = {
         "name": name,
         "conclusion": conclusion,
         "startedAt": t0.isoformat().replace("+00:00", "Z"),
         "completedAt": t1.isoformat().replace("+00:00", "Z"),
         "steps": steps,
     }
+    if database_id is not None:
+        job["databaseId"] = database_id
+    return job
 
 
 def _make_skipped_job(name: str) -> dict[str, object]:
@@ -324,3 +340,539 @@ class TestConstants:
 
     def test_trend_absolute_threshold_is_nonzero(self) -> None:
         assert TREND_ABSOLUTE_SECONDS_THRESHOLD > 0
+
+    def test_drill_down_constants_present(self) -> None:
+        assert DRIFT_FACTOR_THRESHOLD >= 1.0
+        assert SPLIT_SAVINGS_MIN_SECONDS > 0
+        assert 0 < SPLIT_SLOWEST_DOMINANCE_THRESHOLD < 1
+
+
+# ---------------------------------------------------------------------------
+# §4070 drill-down tests
+# ---------------------------------------------------------------------------
+
+
+def _log_line(job: str, step: str, ts: str, content: str) -> str:
+    """Build one line of `gh run view --log` output."""
+    return f"{job}\t{step}\t{ts} {content}"
+
+
+def _shell_log_fixture() -> str:
+    """A small log resembling `gh run view --log` for the shell shard.
+
+    Three `::group::test_X` runs:
+      * test_agent_runner_entrypoint.sh — 663s
+      * test_check_dispatcher_image_versions.sh — 66s
+      * test_other_quick.sh — 5s
+    """
+    job = "scripts-tests (shell)"
+    step = "Run all scripts/tests shell tests"
+    lines = [
+        _log_line(
+            job,
+            step,
+            "2026-05-05T19:00:11.000Z",
+            "##[group]scripts/tests/test_agent_runner_entrypoint.sh",
+        ),
+        _log_line(job, step, "2026-05-05T19:05:00.000Z", "PASS: t_first"),
+        _log_line(job, step, "2026-05-05T19:11:14.000Z", "##[endgroup]"),
+        _log_line(
+            job,
+            step,
+            "2026-05-05T19:11:14.500Z",
+            "##[group]scripts/tests/test_check_dispatcher_image_versions.sh",
+        ),
+        _log_line(job, step, "2026-05-05T19:12:20.500Z", "##[endgroup]"),
+        _log_line(
+            job,
+            step,
+            "2026-05-05T19:12:21.000Z",
+            "##[group]scripts/tests/test_other_quick.sh",
+        ),
+        _log_line(job, step, "2026-05-05T19:12:26.000Z", "##[endgroup]"),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+class TestParseGroupDurations:
+    def test_parses_paired_group_endgroup(self) -> None:
+        log = _shell_log_fixture()
+        groups = parse_group_durations(log)
+        names = [g["name"] for g in groups]
+        # All three test groups should appear, in encounter order.
+        assert names == [
+            "scripts/tests/test_agent_runner_entrypoint.sh",
+            "scripts/tests/test_check_dispatcher_image_versions.sh",
+            "scripts/tests/test_other_quick.sh",
+        ]
+        # Durations match the timestamps in the fixture (within ±0.5s).
+        secs = {g["name"]: g["seconds"] for g in groups}
+        assert secs["scripts/tests/test_agent_runner_entrypoint.sh"] == pytest.approx(
+            663, abs=1
+        )
+        assert secs[
+            "scripts/tests/test_check_dispatcher_image_versions.sh"
+        ] == pytest.approx(66, abs=1)
+        assert secs["scripts/tests/test_other_quick.sh"] == pytest.approx(5, abs=1)
+
+    def test_log_with_no_group_markers_returns_empty(self) -> None:
+        log = (
+            "job-x\tstep-y\t2026-05-05T19:00:00Z setup\n"
+            "job-x\tstep-y\t2026-05-05T19:00:01Z all good\n"
+        )
+        assert parse_group_durations(log) == []
+
+    def test_handles_truncated_log_open_group_at_eof(self) -> None:
+        # `##[group]` without a closing `##[endgroup]` should not crash;
+        # the open group is silently dropped (better undercount than crash).
+        log = (
+            _log_line("j", "s", "2026-05-05T00:00:00Z", "##[group]hanging-group") + "\n"
+        )
+        assert parse_group_durations(log) == []
+
+    def test_consecutive_groups_close_implicitly(self) -> None:
+        # Two `##[group]` lines in a row (missing first endgroup): the
+        # first group should be implicitly closed at the second start.
+        log = "\n".join(
+            [
+                _log_line("j", "s", "2026-05-05T00:00:00Z", "##[group]first"),
+                _log_line("j", "s", "2026-05-05T00:00:10Z", "##[group]second"),
+                _log_line("j", "s", "2026-05-05T00:00:15Z", "##[endgroup]"),
+            ]
+        )
+        groups = parse_group_durations(log)
+        assert [g["name"] for g in groups] == ["first", "second"]
+        assert groups[0]["seconds"] == pytest.approx(10, abs=1)
+        assert groups[1]["seconds"] == pytest.approx(5, abs=1)
+
+    def test_ignores_lines_without_log_prefix(self) -> None:
+        # Headers, banners, etc. without the `<job>\t<step>\t<ts> ...` shape
+        # should be ignored, not crash.
+        log = "Run started at 19:00:00\n" + _shell_log_fixture()
+        groups = parse_group_durations(log)
+        assert len(groups) == 3
+
+
+CIYML_FIXTURE = """
+  scripts-tests:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Shard python: pytest suites + inline shell guards.
+          # pytest-xdist parallelises the suite. Estimated wall-clock ~200s.
+          - shard: python
+          # Shard shell: scripts/run-scripts-tests.sh only.
+          # Dominated by test_agent_runner_entrypoint.sh (~275s) and
+          # test_check_dispatcher_image_versions.sh (~58s).
+          # Estimated wall-clock ~395s. See issue #3307.
+          - shard: shell
+"""
+
+
+class TestExtractStepEstimates:
+    def test_extracts_test_filename_estimates(self) -> None:
+        estimates = extract_step_estimates(CIYML_FIXTURE, "shard: shell")
+        # Test-filename keys take priority over the job-level estimate.
+        assert estimates["test_agent_runner_entrypoint.sh"] == 275.0
+        assert estimates["test_check_dispatcher_image_versions.sh"] == 58.0
+
+    def test_returns_empty_when_no_inline_estimate(self) -> None:
+        ci = """
+        - shard: never-mentioned-with-estimate
+"""
+        # No comment block above → empty dict, no crash.
+        assert extract_step_estimates(ci, "never-mentioned-with-estimate") == {}
+
+    def test_handles_minutes_unit(self) -> None:
+        ci = """
+        # Estimated wall-clock ~5 min total.
+        - shard: minute-form
+"""
+        e = extract_step_estimates(ci, "shard: minute-form")
+        # Job-level estimate keyed under the searched name.
+        assert e["shard: minute-form"] == 300.0
+
+    def test_handles_gh_display_name_form(self) -> None:
+        # `gh run view --json jobs` returns "<job-id> (<matrix-value>)";
+        # extract_step_estimates must derive `shard: <value>` to find the
+        # YAML matrix line above the comment block.
+        e = extract_step_estimates(CIYML_FIXTURE, "scripts-tests (shell)")
+        assert e["test_agent_runner_entrypoint.sh"] == 275.0
+
+
+class TestComputeDrillDown:
+    def test_returns_top3_slowest_with_estimates(self) -> None:
+        log = _shell_log_fixture()
+        estimates = {
+            "test_agent_runner_entrypoint.sh": 275.0,
+            "test_check_dispatcher_image_versions.sh": 58.0,
+        }
+        job = JobRun(
+            run_id="r1",
+            name="scripts-tests (shell)",
+            conclusion="success",
+            started_at=None,
+            completed_at=None,
+        )
+        drill = compute_drill_down(job, log_text=log, step_estimates=estimates)
+        assert drill is not None
+        names = [s["name"] for s in drill["slowest_steps"]]
+        assert names[0] == "scripts/tests/test_agent_runner_entrypoint.sh"
+        # Drift factor for the long-pole step is ~2.4× (663/275).
+        long_pole = drill["slowest_steps"][0]
+        assert long_pole["drift_factor"] == pytest.approx(2.41, abs=0.05)
+        assert long_pole["estimate_seconds"] == 275.0
+        # Re-shard math: total ~734s, isolating long pole gives wall-clock 663s
+        # (the long-pole's own seconds, since the remaining ~71s < long pole).
+        assert drill["if_split_wall_clock_seconds"] == pytest.approx(663, abs=1)
+        assert drill["split_savings_seconds"] == pytest.approx(71, abs=1)
+        # Suggested fixes include trim + split.
+        assert any(
+            "trim" in s and "test_agent_runner_entrypoint" in s
+            for s in drill["suggested_fixes"]
+        )
+        assert any("split" in s for s in drill["suggested_fixes"])
+
+    def test_returns_none_when_log_has_no_group_markers(self) -> None:
+        # §4070 backstop AC: silently omit drill-down on marker-less logs.
+        log = "job-x\tstep-y\t2026-05-05T19:00:00Z normal output line\n"
+        job = JobRun(
+            run_id="r1",
+            name="quick-job",
+            conclusion="success",
+            started_at=None,
+            completed_at=None,
+        )
+        assert compute_drill_down(job, log_text=log) is None
+
+    def test_returns_none_when_log_text_is_none(self) -> None:
+        job = JobRun(
+            run_id="r1",
+            name="job",
+            conclusion="success",
+            started_at=None,
+            completed_at=None,
+        )
+        assert compute_drill_down(job, log_text=None) is None
+
+    def test_no_split_suggestion_when_savings_below_threshold(self) -> None:
+        # Three roughly-balanced groups → splitting the slowest doesn't help.
+        log = "\n".join(
+            [
+                _log_line("j", "s", "2026-05-05T00:00:00Z", "##[group]a"),
+                _log_line("j", "s", "2026-05-05T00:01:40Z", "##[endgroup]"),
+                _log_line("j", "s", "2026-05-05T00:01:41Z", "##[group]b"),
+                _log_line("j", "s", "2026-05-05T00:03:21Z", "##[endgroup]"),
+                _log_line("j", "s", "2026-05-05T00:03:22Z", "##[group]c"),
+                _log_line("j", "s", "2026-05-05T00:05:02Z", "##[endgroup]"),
+            ]
+        )
+        job = JobRun(
+            run_id="r1",
+            name="balanced",
+            conclusion="success",
+            started_at=None,
+            completed_at=None,
+        )
+        drill = compute_drill_down(job, log_text=log)
+        assert drill is not None
+        # No split suggestion — savings would be too small.
+        assert not any("split" in s for s in drill.get("suggested_fixes") or [])
+
+
+class TestAttachDrillDown:
+    def test_attaches_drill_down_to_single_job_finding(self, tmp_path: Path) -> None:
+        ciyml = tmp_path / "ci.yml"
+        ciyml.write_text(CIYML_FIXTURE)
+        # Build a run with a > 10 min job.
+        raw = [
+            _make_run(
+                "rX",
+                "2026-05-05T19:00:00Z",
+                [
+                    _make_job(
+                        "shard: shell",
+                        start_offset_s=0,
+                        duration_s=SINGLE_JOB_SECONDS_THRESHOLD + 100,
+                        database_id=99,
+                    )
+                ],
+            )
+        ]
+        runs = build_runs_from_json(raw)
+        findings = compute_threshold_findings(runs)
+        assert findings, "expected a single-job finding above 10 min"
+        log_text = _shell_log_fixture()
+        attach_drill_down(
+            findings,
+            runs,
+            log_fetcher=lambda _r, _j: log_text,
+            ciyml_path=ciyml,
+        )
+        single_jobs = [f for f in findings if f.kind == "single-job"]
+        assert single_jobs[0].details.get("drill_down") is not None
+        drill = single_jobs[0].details["drill_down"]
+        assert (
+            drill["slowest_steps"][0]["name"]
+            == "scripts/tests/test_agent_runner_entrypoint.sh"
+        )
+
+    def test_silently_omits_when_no_log(self, tmp_path: Path) -> None:
+        ciyml = tmp_path / "ci.yml"
+        ciyml.write_text(CIYML_FIXTURE)
+        raw = [
+            _make_run(
+                "rY",
+                "2026-05-05T19:00:00Z",
+                [
+                    _make_job(
+                        "no-marker-job",
+                        start_offset_s=0,
+                        duration_s=SINGLE_JOB_SECONDS_THRESHOLD + 1,
+                        database_id=10,
+                    )
+                ],
+            )
+        ]
+        runs = build_runs_from_json(raw)
+        findings = compute_threshold_findings(runs)
+        attach_drill_down(
+            findings,
+            runs,
+            log_fetcher=lambda _r, _j: None,
+            ciyml_path=ciyml,
+        )
+        # No drill_down on the finding — graceful degradation.
+        assert "drill_down" not in findings[0].details
+
+
+class TestRenderFindingIssueBody:
+    def test_body_contains_drill_down_sections(self, tmp_path: Path) -> None:
+        ciyml = tmp_path / "ci.yml"
+        ciyml.write_text(CIYML_FIXTURE)
+        raw = [
+            _make_run(
+                "rX",
+                "2026-05-05T19:00:00Z",
+                [
+                    _make_job(
+                        "shard: shell",
+                        start_offset_s=0,
+                        duration_s=SINGLE_JOB_SECONDS_THRESHOLD + 100,
+                        database_id=99,
+                    )
+                ],
+            )
+        ]
+        runs = build_runs_from_json(raw)
+        findings = compute_threshold_findings(runs)
+        attach_drill_down(
+            findings,
+            runs,
+            log_fetcher=lambda _r, _j: _shell_log_fixture(),
+            ciyml_path=ciyml,
+        )
+        body = render_finding_issue_body(findings[0])
+        assert "Slowest steps inside the flagged job" in body
+        assert "Estimate drift" in body
+        assert "Suggested fixes" in body
+        assert "test_agent_runner_entrypoint.sh" in body
+        # 2.4× drift factor surfaces in the drift section.
+        assert "2.4×" in body or "2.41×" in body
+
+    def test_body_omits_drill_sections_when_no_drill_down(self) -> None:
+        f = Finding(
+            kind="single-job",
+            job_name="quick-job",
+            message="Job 'quick-job' took 700s",
+            details={"run_id": "r1", "seconds": 700},
+        )
+        body = render_finding_issue_body(f)
+        assert "Slowest steps" not in body
+        assert "Estimate drift" not in body
+
+    def test_body_includes_recurrence_line_for_closed_match(self) -> None:
+        f = Finding(
+            kind="single-job",
+            job_name="quick-job",
+            message="Job 'quick-job' took 700s",
+            details={"run_id": "r1", "seconds": 700},
+        )
+        body = render_finding_issue_body(
+            f, dedup=DedupMatch(kind="recurrence", issue_number=4067)
+        )
+        assert "Recurrence of #4067" in body
+
+
+class TestDedupClassification:
+    def _step_finding(self, job: str, step: str | None) -> Finding:
+        details: dict[str, object] = {"run_id": "r1", "seconds": 700}
+        if step:
+            details["drill_down"] = {
+                "slowest_steps": [{"name": step, "seconds": 663.0}],
+            }
+        return Finding(
+            kind="single-job",
+            job_name=job,
+            message=f"Job '{job}' took 700s",
+            details=details,
+        )
+
+    def test_open_match_returns_duplicate(self) -> None:
+        finding = self._step_finding("scripts-tests (shell)", "test_X.sh")
+        issues = [
+            {
+                "number": 999,
+                "state": "open",
+                "title": "perf(ci): scripts-tests (shell) too slow",
+                "body": "Inside that shard, test_X.sh is the long pole.",
+            }
+        ]
+        m = classify_finding_against_issues(finding, issues)
+        assert m.kind == "duplicate"
+        assert m.issue_number == 999
+
+    def test_closed_match_returns_recurrence(self) -> None:
+        # §4070 AC: closed issues do NOT silence regressions; they trigger
+        # a recurrence path with a `Recurrence of #N` body line.
+        finding = self._step_finding("scripts-tests (shell)", "test_X.sh")
+        issues = [
+            {
+                "number": 3313,
+                "state": "closed",
+                "title": "scripts-tests (shell) flagged > 10 min",
+                "body": "Was fixed by sharding. test_X.sh is still in the shard.",
+            }
+        ]
+        m = classify_finding_against_issues(finding, issues)
+        assert m.kind == "recurrence"
+        assert m.issue_number == 3313
+
+    def test_no_match_returns_new(self) -> None:
+        finding = self._step_finding("unique-job", "unique_test.sh")
+        m = classify_finding_against_issues(finding, [])
+        assert m.kind == "new"
+
+    def test_dedup_key_includes_step_name(self) -> None:
+        # Two findings against the same job but different slowest steps
+        # should both be treated as new — dedup key is (job, step).
+        f_a = self._step_finding("scripts-tests (shell)", "test_a.sh")
+        f_b = self._step_finding("scripts-tests (shell)", "test_b.sh")
+        issues = [
+            {
+                "number": 100,
+                "state": "open",
+                "title": "scripts-tests (shell) — test_a.sh is the long pole",
+                "body": "test_a.sh is slow.",
+            }
+        ]
+        # f_a matches the existing test_a.sh issue; f_b does not.
+        assert classify_finding_against_issues(f_a, issues).kind == "duplicate"
+        assert classify_finding_against_issues(f_b, issues).kind == "new"
+
+    def test_falls_back_to_job_name_when_no_drill_down(self) -> None:
+        # No drill_down on the finding → match on job name alone.
+        f = self._step_finding("misc-job", None)
+        issues = [
+            {
+                "number": 50,
+                "state": "open",
+                "title": "misc-job is slow",
+                "body": "see attached.",
+            }
+        ]
+        assert classify_finding_against_issues(f, issues).kind == "duplicate"
+
+    def test_open_overrides_closed_when_both_match(self) -> None:
+        f = self._step_finding("job-x", "step-y")
+        issues = [
+            {
+                "number": 1,
+                "state": "closed",
+                "title": "job-x slow (step-y)",
+                "body": "old",
+            },
+            {
+                "number": 2,
+                "state": "open",
+                "title": "job-x slow (step-y)",
+                "body": "current",
+            },
+        ]
+        m = classify_finding_against_issues(f, issues)
+        assert m.kind == "duplicate"
+        assert m.issue_number == 2
+
+
+class TestMainCliDrillDown:
+    def test_json_output_contains_drill_down(self, tmp_path: Path, capsys) -> None:
+        # Build a runs file with a > 10 min job, plus a fixture log + ci.yml.
+        runs_data: list[dict[str, object]] = [
+            _make_run(
+                "rX",
+                "2026-05-05T19:00:00Z",
+                [
+                    _make_job(
+                        "shard: shell",
+                        start_offset_s=0,
+                        duration_s=SINGLE_JOB_SECONDS_THRESHOLD + 100,
+                        database_id=99,
+                    )
+                ],
+            )
+        ]
+        runs_file = tmp_path / "runs.json"
+        runs_file.write_text(json.dumps(runs_data))
+        ciyml = tmp_path / "ci.yml"
+        ciyml.write_text(CIYML_FIXTURE)
+        log_file = tmp_path / "joblog.txt"
+        log_file.write_text(_shell_log_fixture())
+
+        rc = main(
+            [
+                "--from-file",
+                str(runs_file),
+                "--ciyml",
+                str(ciyml),
+                "--drill-down-log-file",
+                str(log_file),
+                "--json",
+            ]
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        payload = json.loads(out)
+        single_jobs = [f for f in payload["findings"] if f["kind"] == "single-job"]
+        assert single_jobs, "expected at least one single-job finding"
+        drill = single_jobs[0]["details"].get("drill_down")
+        assert drill is not None
+        assert "slowest_steps" in drill
+        assert "if_split_wall_clock_seconds" in drill
+        assert "split_savings_seconds" in drill
+
+    def test_no_drill_down_flag_skips_drill_down(self, tmp_path: Path, capsys) -> None:
+        runs_data: list[dict[str, object]] = [
+            _make_run(
+                "rY",
+                "2026-05-05T19:00:00Z",
+                [
+                    _make_job(
+                        "slow-job",
+                        start_offset_s=0,
+                        duration_s=SINGLE_JOB_SECONDS_THRESHOLD + 1,
+                        database_id=10,
+                    )
+                ],
+            )
+        ]
+        runs_file = tmp_path / "runs.json"
+        runs_file.write_text(json.dumps(runs_data))
+        rc = main(["--from-file", str(runs_file), "--no-drill-down", "--json"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        payload = json.loads(out)
+        assert payload["findings"]
+        # No drill_down attached when the flag is set.
+        assert "drill_down" not in payload["findings"][0]["details"]
