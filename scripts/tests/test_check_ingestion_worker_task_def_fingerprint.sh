@@ -32,6 +32,18 @@
 #   6. Tooling-broken — describe-services returns no PRIMARY deployment.
 #      Exit 2.
 #
+#   7. Match — running task-def has AWS-injected `cpu: 0` that SSM
+#      omits (#4057). Exit 0. Without canonicalization this would have
+#      been a false-positive DRIFT on every scraper deploy.
+#
+#   8. Match — running task-def returns `environment[]` and `secrets[]`
+#      in a different array order than SSM (#4057). Exit 0. Both sides
+#      are sorted by `name` before hashing.
+#
+#   9. Drift — `cpu: 256` (a real CPU pinning, not the zero default) on
+#      the running side without a matching SSM entry IS treated as
+#      drift. Exit 1. Guards against the canonicalizer over-stripping.
+#
 # Usage:
 #   scripts/tests/test_check_ingestion_worker_task_def_fingerprint.sh
 #
@@ -384,6 +396,199 @@ test_tooling_broken_no_primary() {
     fi
 }
 
+# ── Test 7: AWS-injected cpu:0 default is stripped (#4057) ────────────────
+#
+# Regression test for the post-#4044 false-positive class: every
+# scraper deploy was redlining the post-deploy fingerprint check
+# because describe-task-definition returns `"cpu": 0` for any
+# container whose terraform render omits the `cpu` field, but the
+# SSM-stored render (also coming through terraform / AWS) sometimes
+# omits the field entirely. The running side gets the zero injection;
+# the SSM side does not. Without normalization those hash differently
+# and the gate fails on semantically-equivalent state.
+
+test_match_aws_injected_cpu_zero() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    # SSM — terraform's render WITHOUT a cpu field.
+    write_ssm_match_baseline "$tmpdir/ssm-param-value.txt"
+
+    # Running task-def — same content but with the AWS-injected
+    # `"cpu": 0` default that describe-task-definition includes.
+    cat > "$tmpdir/describe-task-def.json" << 'JSON'
+[
+  {
+    "name": "ingestion-worker",
+    "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:DEPLOYSCRAPER",
+    "cpu": 0,
+    "essential": true,
+    "command": ["ingestion"],
+    "environment": [
+      {"name": "ENVIRONMENT", "value": "dev"},
+      {"name": "LLM_PROVIDER", "value": "google"}
+    ],
+    "secrets": [
+      {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"}
+    ]
+  }
+]
+JSON
+    echo "arn:aws:ecs:us-west-2:111:task-definition/judgemind-ingestion-worker-dev:607" > "$tmpdir/describe-services.json"
+
+    if run_script "$tmpdir" >"$tmpdir/stdout" 2>"$tmpdir/stderr"; then
+        if grep -q "OK:" "$tmpdir/stdout"; then
+            pass "match: AWS-injected cpu:0 default is stripped (#4057)"
+        else
+            fail "match: cpu:0 strip — exit 0 but no OK: line on stdout" "$(cat "$tmpdir/stdout")"
+        fi
+    else
+        fail "match: cpu:0 strip should be treated as match" "$(cat "$tmpdir/stderr")"
+    fi
+}
+
+# ── Test 8: env+secrets array order divergence is normalized (#4057) ──────
+#
+# Regression test for the post-#4044 false-positive class part 2:
+# terraform `concat()` produces an insertion-order array; AWS
+# describe-task-definition sometimes returns the same data in a
+# different order (the running side observed in revision 607 had env
+# vars in registration order, while the SSM render had them
+# alphabetized). The canonicalizer sorts both `environment[]` and
+# `secrets[]` arrays by `name` before hashing.
+
+test_match_env_secrets_array_order() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    # SSM — terraform render with envs sorted alphabetically (the
+    # post-apply form AWS stores).
+    cat > "$tmpdir/ssm-param-value.txt" << 'JSON'
+[
+  {
+    "name": "ingestion-worker",
+    "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:TFAPPLY",
+    "essential": true,
+    "command": ["ingestion"],
+    "environment": [
+      {"name": "ENVIRONMENT", "value": "dev"},
+      {"name": "JUDGEMIND_ARCHIVE_BUCKET", "value": "judgemind-archive-dev"},
+      {"name": "LLM_PROVIDER", "value": "google"},
+      {"name": "OPENSEARCH_URL", "value": "https://os.dev.example.com"},
+      {"name": "REDIS_URL", "value": "redis://cache.dev.example.com:6379"}
+    ],
+    "secrets": [
+      {"name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:anthropic-AAA"},
+      {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"}
+    ]
+  }
+]
+JSON
+
+    # Running — same content, but env vars in concat() insertion order
+    # and secrets in a shuffled order.
+    cat > "$tmpdir/describe-task-def.json" << 'JSON'
+[
+  {
+    "name": "ingestion-worker",
+    "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:DEPLOYSCRAPER",
+    "essential": true,
+    "command": ["ingestion"],
+    "environment": [
+      {"name": "JUDGEMIND_ARCHIVE_BUCKET", "value": "judgemind-archive-dev"},
+      {"name": "OPENSEARCH_URL", "value": "https://os.dev.example.com"},
+      {"name": "LLM_PROVIDER", "value": "google"},
+      {"name": "ENVIRONMENT", "value": "dev"},
+      {"name": "REDIS_URL", "value": "redis://cache.dev.example.com:6379"}
+    ],
+    "secrets": [
+      {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"},
+      {"name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:anthropic-AAA"}
+    ]
+  }
+]
+JSON
+    echo "arn:aws:ecs:us-west-2:111:task-definition/judgemind-ingestion-worker-dev:607" > "$tmpdir/describe-services.json"
+
+    if run_script "$tmpdir" >"$tmpdir/stdout" 2>"$tmpdir/stderr"; then
+        if grep -q "OK:" "$tmpdir/stdout"; then
+            pass "match: env+secrets array order divergence is normalized (#4057)"
+        else
+            fail "match: array order — exit 0 but no OK: line on stdout" "$(cat "$tmpdir/stdout")"
+        fi
+    else
+        fail "match: env+secrets array order should be normalized" "$(cat "$tmpdir/stderr")"
+    fi
+}
+
+# ── Test 9: real cpu pinning is NOT stripped (drift still detected) ───────
+#
+# Guard against the canonicalizer over-stripping. We only strip the
+# AWS-injected `cpu: 0` default (semantically equivalent to "field
+# absent"); a non-zero cpu value is real CPU pinning that should
+# differ between SSM and running if terraform changed it.
+
+test_drift_real_cpu_pinning() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    # SSM — terraform now sets cpu: 256.
+    cat > "$tmpdir/ssm-param-value.txt" << 'JSON'
+[
+  {
+    "name": "ingestion-worker",
+    "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:TFAPPLY",
+    "cpu": 256,
+    "essential": true,
+    "command": ["ingestion"],
+    "environment": [
+      {"name": "ENVIRONMENT", "value": "dev"},
+      {"name": "LLM_PROVIDER", "value": "google"}
+    ],
+    "secrets": [
+      {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"}
+    ]
+  }
+]
+JSON
+
+    # Running — still has the AWS default cpu: 0 (terraform pinning
+    # hasn't shipped to the service yet).
+    cat > "$tmpdir/describe-task-def.json" << 'JSON'
+[
+  {
+    "name": "ingestion-worker",
+    "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:STALE",
+    "cpu": 0,
+    "essential": true,
+    "command": ["ingestion"],
+    "environment": [
+      {"name": "ENVIRONMENT", "value": "dev"},
+      {"name": "LLM_PROVIDER", "value": "google"}
+    ],
+    "secrets": [
+      {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"}
+    ]
+  }
+]
+JSON
+    echo "arn:aws:ecs:us-west-2:111:task-definition/judgemind-ingestion-worker-dev:608" > "$tmpdir/describe-services.json"
+
+    set +e
+    run_script "$tmpdir" >"$tmpdir/stdout" 2>"$tmpdir/stderr"
+    local rc=$?
+    set -e
+    if [[ "$rc" -ne 1 ]]; then
+        fail "drift: real cpu pinning diff should exit 1, got $rc" "$(cat "$tmpdir/stderr")"
+        return
+    fi
+    if ! grep -q "DRIFT:" "$tmpdir/stderr"; then
+        fail "drift: real cpu pinning — missing DRIFT: marker" "$(cat "$tmpdir/stderr")"
+        return
+    fi
+    pass "drift: real cpu pinning (cpu:256) is still detected as drift"
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_match_image_tag_only_diff
@@ -392,6 +597,9 @@ test_drift_env_var
 test_drift_secrets_list
 test_tooling_broken_invalid_ssm
 test_tooling_broken_no_primary
+test_match_aws_injected_cpu_zero
+test_match_env_secrets_array_order
+test_drift_real_cpu_pinning
 
 echo ""
 echo "Tests: $TESTS, Failures: $FAILURES"

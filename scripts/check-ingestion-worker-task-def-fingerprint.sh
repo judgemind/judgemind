@@ -127,23 +127,36 @@ RUNNING_DEFS=$(aws ecs describe-task-definition \
 # ── Step 3: canonicalize and fingerprint ──────────────────────────────────
 #
 # Both sides go through the same normalization:
-#   - drop `.image` from each container (varies on every CI build)
 #   - filter to ONLY the named container (the SSM JSON may contain
 #     sidecars; the running task-def may pick them up too, but for the
 #     drift signal we care about the primary container's env vars and
 #     secrets)
+#   - drop `.image` from each container (varies on every CI build)
+#   - drop AWS-injected defaults that are semantically equivalent to
+#     "field absent": `cpu: 0` (ECS injects this on registration when
+#     terraform omits the cpu field) and explicit `null` values.
+#   - sort `environment[]` and `secrets[]` arrays by `name` so
+#     terraform's insertion-order render matches the AWS-stored order
+#     (AWS sorts both by name on registration; SSM stores the
+#     post-apply form, but the running task-def can still come back in
+#     insertion order through the describe-task-definition path)
 #   - sort keys recursively for deterministic JSON
 #
-# We use jq's `--sort-keys` (top-level) and a recursive walk for nested
-# objects. The `walk` builtin is the canonical way to do this in jq.
+# Drift root cause (#4057): without these two normalizations, every
+# scraper deploy redlines the post-deploy fingerprint check on
+# semantically-equivalent state — `cpu: 0` injected by ECS plus
+# environment vars that come back in a different order from the running
+# task-def than they appear in terraform's render.
 canonicalize() {
     jq --arg name "$CONTAINER_NAME" '
-        # walk recursively sorts keys at every depth; combined with
-        # del(.image) on the named container we get a stable hashable
-        # representation that ignores per-deploy image-tag changes.
+        # Recursive deep key-sort + null-stripping. Combined with the
+        # named-container projection below, this produces a stable
+        # hashable representation that ignores per-deploy image tags
+        # and AWS-injected defaults.
         def normalize:
             if type == "object" then
                 with_entries(.value |= normalize)
+                | with_entries(select(.value != null))
                 | to_entries
                 | sort_by(.key)
                 | from_entries
@@ -152,8 +165,31 @@ canonicalize() {
             else
                 .
             end;
+
+        # Strip AWS-injected defaults from a container definition.
+        # `cpu: 0` is the ECS API default — registering a task-def
+        # without `cpu` causes describe-task-definition to come back
+        # with `"cpu": 0`. Treat it as absent so terraform-rendered and
+        # AWS-running forms hash identically. (A real CPU pinning, e.g.
+        # `"cpu": 256`, is preserved; only the zero default is stripped.)
+        def strip_aws_defaults:
+            if has("cpu") and .cpu == 0 then del(.cpu) else . end;
+
+        # Sort an array of `{name, ...}` objects by `name`. Terraform
+        # `concat()` calls produce an insertion-order array; AWS
+        # describe-task-definition can return the same data in
+        # registration order. Sort both sides so the running and SSM
+        # forms compare equal regardless of how each path ordered them.
+        def sort_named_array:
+            if . == null then null else sort_by(.name) end;
+
         map(select(.name == $name))
-        | map(del(.image))
+        | map(
+              del(.image)
+            | strip_aws_defaults
+            | (.environment |= sort_named_array)
+            | (.secrets |= sort_named_array)
+          )
         | normalize
     '
 }
