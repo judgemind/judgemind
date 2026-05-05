@@ -205,3 +205,79 @@ describe('DISPATCHER_QUEUE_FULL_QUERY — dialog completions still rich (issue #
     }
   });
 });
+
+/**
+ * Regression test for issue #4100.
+ *
+ * After #4062 + #4063 + #4064 landed, the polled `DISPATCHER_STATE_QUERY`
+ * was still 35 units over the #4003 1000-cap (cost: 1035) — every cockpit
+ * poll continued to fail with HTTP 400 `Query exceeded complexity`. The
+ * next-largest contributor by inspection was `activeAgents`, a 12-field
+ * scalar list multiplied by 10× for being a list-of-objects.
+ *
+ * The fix in this PR trims `activeAgents` to the eight fields
+ * `ActiveAgentRow` actually reads. Detail-only fields that the row never
+ * renders (`status` is implicit "running" by definition, `endedAt` /
+ * `exitCode` are terminal-only, `prNumber` has no row affordance) are
+ * dropped from the polled path and continue to ride on
+ * `DISPATCHER_QUEUE_FULL_QUERY`.
+ *
+ * If a future change re-adds any of the dropped fields inside the
+ * polled query's `activeAgents` selection, this test fails and forces
+ * an explicit decision about the cost regression.
+ */
+describe('DISPATCHER_STATE_QUERY — activeAgents polled shape (issue #4100)', () => {
+  const printed = print(DISPATCHER_STATE_QUERY);
+
+  it('selects exactly one `activeAgents { ... }` block', () => {
+    const bodies = selectionBodiesFor(printed, 'activeAgents');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('keeps the eight row-essential fields in the polled `activeAgents` selection', () => {
+    // The eight fields `ActiveAgentRow` reads directly to render:
+    //   - `id`           — React key + native title for full UUID
+    //   - `worktreePath` — Logs link href and path-tail fallback
+    //   - `phase`        — phase chip text + tooltip via
+    //                      `dispatcher-phase-flow`
+    //   - `issueNumber`, `issueTitle`, `priority` — the unified
+    //     `(issue, priority, title)` prefix shared with QueueRow and
+    //     RecentCompletionRow (#2899 / #3583)
+    //   - `startedAt`    — elapsed-time cell (`formatUptime`)
+    //   - `retriesUsed`  — final-attempt Opus marker
+    //                      (`isFinalRalphAttempt`)
+    const bodies = selectionBodiesFor(printed, 'activeAgents');
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0];
+    for (const field of [
+      'id',
+      'issueNumber',
+      'issueTitle',
+      'priority',
+      'worktreePath',
+      'phase',
+      'startedAt',
+      'retriesUsed',
+    ]) {
+      expect(body).toMatch(new RegExp(`\\b${field}\\b`));
+    }
+  });
+
+  it('omits detail-only fields from the polled `activeAgents` selection', () => {
+    // - `status`    — by SQL definition every `activeAgents` row has
+    //                 status='running'; the polled view doesn't need
+    //                 to read it.
+    // - `endedAt` / `exitCode` — terminal-only signals; always null on
+    //                 a still-running row, so carrying them costs 20
+    //                 units of complexity for zero render information.
+    // - `prNumber`  — rare on running rows (only present after summary
+    //                 has opened a PR) and `ActiveAgentRow` has no UI
+    //                 affordance for the link. Restored on dialog open.
+    const bodies = selectionBodiesFor(printed, 'activeAgents');
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0];
+    for (const field of ['status', 'endedAt', 'exitCode', 'prNumber']) {
+      expect(body).not.toMatch(new RegExp(`\\b${field}\\b`));
+    }
+  });
+});
