@@ -147,6 +147,15 @@ ENRICHMENT_SYSTEM_PROMPT = (
     "You are a legal document parser for California court tentative rulings.\n\n"
     "Given the text of a single court ruling, extract the following structured "
     "fields into JSON:\n\n"
+    "## Null policy (#3991)\n\n"
+    "Return null for a field ONLY when the ruling text is empty, fragmentary, "
+    "or does not describe a ruling at all. If the text describes a ruling — "
+    "even briefly — pick the best-fitting taxonomy value rather than returning "
+    "null. When the outcome is unclear, prefer `submitted` (taken under "
+    "submission) for hearings with deferred decisions, `continued` for "
+    "postponements, and `other` only as a last resort. The same rule applies "
+    "to motion_type — pick the closest motion in the taxonomy rather than "
+    "leaving the field null when the text describes a motion at all.\n\n"
     '1. **case_title** - The case caption (e.g., "Smith v. Jones"). '
     'Extract the full "Plaintiff v. Defendant" format as it appears. '
     "If no clear case title is present, return null.\n\n"
@@ -170,7 +179,9 @@ ENRICHMENT_SYSTEM_PROMPT = (
     "   - petition\n"
     "   - other (only if none of the above fit)\n"
     "   If the ruling mentions multiple motions, use the PRIMARY motion "
-    "being ruled on. If no motion type can be determined, return null.\n\n"
+    "being ruled on. Per the null policy above, prefer the closest "
+    "taxonomy value over null whenever the text describes a motion at all "
+    "(use `other` only when the closest match is genuinely unclear).\n\n"
     "3. **outcome** - The ruling's outcome, using EXACTLY one of:\n"
     '   - granted (fully granted, including "granted with conditions")\n'
     '   - denied (fully denied, including "denied without prejudice")\n'
@@ -499,6 +510,203 @@ def enrich_ruling_with_retry(
         f"LLM enrichment failed after {max_attempts} attempts"
         + (f": {last_exc}" if last_exc is not None else " (API returned None)")
     )
+
+
+# ---------------------------------------------------------------------------
+# Strict-retry second pass (#3991)
+# ---------------------------------------------------------------------------
+
+# Outcome taxonomy summary used inside the strict-retry prompt.  Mirrors the
+# detail in ENRICHMENT_SYSTEM_PROMPT so the LLM has the same vocabulary on
+# both passes — kept inline here so the strict-retry prompt is self-contained.
+_STRICT_OUTCOME_TAXONOMY = (
+    '   - granted (fully granted, including "granted with conditions")\n'
+    '   - denied (fully denied, including "denied without prejudice")\n'
+    "   - granted_in_part (partially granted and partially denied)\n"
+    "   - denied_in_part (partially denied)\n"
+    "   - moot (no longer relevant)\n"
+    "   - continued (hearing postponed)\n"
+    "   - off_calendar (taken off calendar, vacated, OCAL)\n"
+    "   - submitted (taken under submission for later decision)\n"
+    "   - other (only if none of the above fit)\n"
+    '   Note: "sustained" on a demurrer = granted. "overruled" on a '
+    "demurrer = denied.\n"
+)
+
+_STRICT_MOTION_TYPE_TAXONOMY = (
+    "   - msj (motion for summary judgment)\n"
+    "   - mtd (motion to dismiss)\n"
+    "   - demurrer\n"
+    "   - mil (motion in limine)\n"
+    "   - motion_to_compel\n"
+    "   - motion_to_strike\n"
+    "   - motion_for_attorney_fees\n"
+    "   - motion_to_quash\n"
+    "   - motion_for_summary_adjudication\n"
+    "   - motion_to_compel_arbitration\n"
+    "   - motion_for_new_trial\n"
+    "   - motion_to_tax_costs\n"
+    "   - motion_for_reconsideration\n"
+    "   - motion_to_be_relieved_as_counsel\n"
+    "   - motion_pro_hac_vice\n"
+    "   - petition\n"
+    "   - other (only if none of the above fit)\n"
+)
+
+
+def _build_strict_retry_prompt(
+    *, missing_outcome: bool, missing_motion_type: bool
+) -> tuple[str, str]:
+    """Build the system prompt and JSON skeleton for the strict-retry pass.
+
+    Returns a (system_prompt, json_skeleton) tuple where the skeleton names
+    only the requested fields so the LLM's response is small and focused.
+    """
+    missing_list: list[str] = []
+    if missing_outcome:
+        missing_list.append("outcome")
+    if missing_motion_type:
+        missing_list.append("motion_type")
+    missing_str = ", ".join(missing_list) if missing_list else "(none)"
+
+    sections: list[str] = [
+        "You are a legal document parser for California court tentative "
+        "rulings, performing a SECOND PASS on a ruling whose first-pass "
+        "enrichment left specific fields null.\n\n",
+        "## Why you're being asked again (#3991)\n\n"
+        "On your previous attempt, you left these fields null: "
+        f"{missing_str}.\n\n"
+        "Re-read the ruling text and provide your best classification using "
+        "the taxonomies below.  Returning null is only acceptable if the "
+        "text is empty or does not describe any ruling.  If the text "
+        "describes a ruling — even briefly — pick the closest taxonomy "
+        "value.  Use `other` only when no closer match exists.\n\n",
+        "## Fields to return\n\n",
+    ]
+
+    if missing_outcome:
+        sections.append("- **outcome** - The ruling's outcome, using EXACTLY one of:\n")
+        sections.append(_STRICT_OUTCOME_TAXONOMY)
+        sections.append(
+            "   When the outcome is unclear, prefer `submitted` for "
+            "hearings with deferred decisions, `continued` for "
+            "postponements, and `other` as a last resort.\n\n"
+        )
+
+    if missing_motion_type:
+        sections.append("- **motion_type** - The motion being ruled on, using EXACTLY one of:\n")
+        sections.append(_STRICT_MOTION_TYPE_TAXONOMY)
+        sections.append(
+            "   If the ruling mentions multiple motions, use the PRIMARY "
+            "motion being ruled on.  Use `other` only when none of the "
+            "specific values fit.\n\n"
+        )
+
+    skeleton_keys: list[str] = []
+    if missing_outcome:
+        skeleton_keys.append('  "outcome": "..."')
+    if missing_motion_type:
+        skeleton_keys.append('  "motion_type": "..."')
+    skeleton = "{\n" + ",\n".join(skeleton_keys) + "\n}" if skeleton_keys else "{}"
+
+    sections.append(
+        "## Output format\n\nRespond with ONLY a JSON object containing "
+        "ONLY the field(s) listed above, no other text:\n\n"
+    )
+    sections.append(skeleton)
+
+    return ("".join(sections), skeleton)
+
+
+def enrich_ruling_strict_retry(
+    ruling_text: str,
+    *,
+    missing_outcome: bool,
+    missing_motion_type: bool,
+    provider: str = "google",
+    model: str | None = None,
+    client: object | None = None,
+) -> LlmEnrichmentResult | None:
+    """Stronger second-pass enrichment that re-asks for specific missing fields.
+
+    Invoked by the worker after the primary ``enrich_ruling_with_retry`` call
+    when ``outcome`` and / or ``motion_type`` came back null on substantive
+    ruling text (#3991).  The prompt explicitly names the fields the prior
+    pass missed and instructs the LLM to pick the closest taxonomy value
+    rather than returning null.
+
+    Parameters
+    ----------
+    ruling_text : str
+        Plain text of the ruling, already transcribed.
+    missing_outcome : bool
+        Whether the prior pass left ``outcome`` null.
+    missing_motion_type : bool
+        Whether the prior pass left ``motion_type`` null.
+    provider : str
+        LLM provider — ``"google"`` or ``"anthropic"``.  Same as the prior
+        pass so the same model sees the same text.
+    model : str | None
+        Model ID override.  ``None`` uses the provider default.
+    client : object | None
+        Pre-created provider client for connection reuse.
+
+    Returns
+    -------
+    LlmEnrichmentResult | None
+        A result with whichever fields the LLM populated.  May still have
+        ``None`` for one or both target fields if the LLM remained
+        non-committal.  Returns ``None`` only on LLM API call failure
+        (``call_llm`` returned ``None``).  Does NOT raise on JSON parse
+        failure — returns an empty ``LlmEnrichmentResult`` so the caller
+        can record diagnostic markers without crashing.
+
+    Notes
+    -----
+    Single LLM call by design — the budget for retries already lives in
+    ``enrich_ruling_with_retry``.  This pass is one additional decisive
+    attempt, not a retry loop.  When ``missing_outcome=False`` AND
+    ``missing_motion_type=False``, the function short-circuits with an
+    empty result (no LLM call).  Empty / whitespace ruling text also
+    short-circuits (matches ``enrich_ruling`` behavior).
+    """
+    if not missing_outcome and not missing_motion_type:
+        # Nothing to ask about — short-circuit so callers can pass through
+        # without inspecting flags.
+        return LlmEnrichmentResult()
+
+    if not ruling_text or not ruling_text.strip():
+        logger.warning("llm_enrichment.strict_retry_empty_ruling_text")
+        return LlmEnrichmentResult()
+
+    system_prompt, _ = _build_strict_retry_prompt(
+        missing_outcome=missing_outcome,
+        missing_motion_type=missing_motion_type,
+    )
+
+    response = call_llm(
+        system_prompt,
+        ruling_text,
+        provider=provider,
+        model=model,
+        client=client,
+        max_tokens=512,
+    )
+
+    if response is None:
+        logger.warning("llm_enrichment.strict_retry_llm_call_failed")
+        return None
+
+    _log_token_usage(response)
+
+    parsed = _parse_response(response.text)
+    if parsed is None:
+        # JSON parse failed — return an empty result so the caller can record
+        # a diagnostic marker without raising.
+        logger.warning("llm_enrichment.strict_retry_json_parse_failed")
+        return LlmEnrichmentResult()
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------

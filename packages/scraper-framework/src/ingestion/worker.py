@@ -126,6 +126,19 @@ _ENRICHMENT_NO_EXTRACTION_TAG = "llm_enrichment_no_extraction"
 _ENRICHMENT_ERRORED_TAG = "llm_enrichment_errored"
 _ENRICHMENT_SKIPPED_NO_TEXT_TAG = "llm_enrichment_skipped_no_text"
 
+# Diagnostic marker for fields populated by the strict-retry second pass
+# (#3991).  When the first ``enrich_ruling_with_retry`` call leaves outcome
+# and / or motion_type null on substantive ruling text, the worker invokes
+# ``enrich_ruling_strict_retry`` for one decisive second pass.  Fields that
+# come back from the strict retry carry this tag in extraction_methods so
+# post-deploy queries can measure how often the retry was the deciding pass.
+_ENRICHMENT_STRICT_RETRY_TAG = "llm_enrichment_strict_retry"
+
+# Minimum stripped length of ruling_text before the strict retry will run.
+# Below this gate the text is too short / fragmentary to make a confident
+# classification, and adding another LLM call is wasted budget (#3991).
+_STRICT_RETRY_MIN_TEXT_LEN = 100
+
 # ---------------------------------------------------------------------------
 # Markdown ↔ HTML/plain text for multimodal PDF extraction
 # ---------------------------------------------------------------------------
@@ -766,6 +779,15 @@ class IngestionWorker:
                 "enrichment fields may be missing"
             )
 
+        # Side-channel state for the strict-retry second pass (#3991).  When
+        # ``_llm_enrich_fields`` invokes ``enrich_ruling_strict_retry`` and
+        # populates fields, it records the field names here.  The single
+        # consumer in ``process_event`` reads this set immediately after the
+        # call and passes it to ``_apply_enrichment_result`` so those fields
+        # get the ``llm_enrichment_strict_retry`` diagnostic marker.  Reset
+        # to an empty set at the top of every ``_llm_enrich_fields`` call.
+        self._strict_retry_fields_for_last_call: set[str] = set()
+
         # Reusable httpx client for GitHub issue filing (validation gate).
         # Created lazily on first use; None means "not yet created".
         self._github_client: object | None = None
@@ -996,6 +1018,15 @@ class IngestionWorker:
         ``motion_type``, ``outcome``, ``case_title``, and ``parties`` from the
         ruling text in a single LLM call.
 
+        When the first pass leaves ``outcome`` and / or ``motion_type`` null on
+        substantive ruling text, this method invokes
+        ``enrich_ruling_strict_retry`` for one decisive second pass and merges
+        the strict-retry result into the first-pass result (#3991).  The set
+        of field names actually populated by the strict retry is recorded on
+        ``self._strict_retry_fields_for_last_call`` as a side channel so the
+        consumer in ``process_event`` can pass it to
+        ``_apply_enrichment_result`` for diagnostic-marker tagging.
+
         The import is deferred (lazy) to avoid a circular import between
         ``framework`` and ``ingestion`` packages.
 
@@ -1011,9 +1042,11 @@ class IngestionWorker:
         tuple[LlmEnrichmentResult | None, str]
             ``(result, status_tag)`` where ``status_tag`` is one of:
 
-            * ``"ok"`` — enrichment ran and returned a non-None result.
-            * ``"empty"`` — enrichment ran but the LLM returned all-None
-              fields (``enrich_ruling_with_retry`` returned ``None``).
+            * ``"ok"`` — enrichment ran and returned a non-None result (this
+              includes the case where the strict retry was the only pass to
+              produce data).
+            * ``"empty"`` — enrichment ran but neither the first pass nor any
+              strict retry returned data.
             * ``"errored"`` — ``LlmEnrichmentExhaustedError`` was raised;
               ``result`` is ``None``.  The caller decides whether to re-raise
               (single-event path) or absorb (split-loop path).
@@ -1022,6 +1055,10 @@ class IngestionWorker:
             * ``"skipped_disabled"`` — enrichment is disabled or the client
               is unavailable; enrichment was never attempted.
         """
+        # Reset side-channel state on every call so a prior call's strict-retry
+        # signal doesn't leak into this one.
+        self._strict_retry_fields_for_last_call = set()
+
         if not self._llm_enrichment_enabled:
             return None, "skipped_disabled"
 
@@ -1031,7 +1068,12 @@ class IngestionWorker:
         if not ruling_text or not ruling_text.strip():
             return None, "skipped_no_text"
 
-        from framework.llm_enrichment import LlmEnrichmentExhaustedError, enrich_ruling_with_retry
+        from framework.llm_enrichment import (
+            LlmEnrichmentExhaustedError,
+            LlmEnrichmentResult,
+            enrich_ruling_strict_retry,
+            enrich_ruling_with_retry,
+        )
 
         t0 = time.monotonic()
         try:
@@ -1053,9 +1095,74 @@ class IngestionWorker:
             return None, "errored"
         latency_ms = round((time.monotonic() - t0) * 1000)
 
+        # Strict-retry decision (#3991): when the first pass left outcome
+        # and / or motion_type null on substantive text, fire one more
+        # decisive LLM call asking specifically for the missing fields.
         if result is None:
-            # LLM responded but extracted nothing (all-None fields, e.g. text
-            # too short).  Not a transient failure — return None without retry.
+            missing_outcome = True
+            missing_motion_type = True
+        else:
+            missing_outcome = result.outcome is None
+            missing_motion_type = result.motion_type is None
+
+        text_long_enough = len(ruling_text.strip()) >= _STRICT_RETRY_MIN_TEXT_LEN
+        should_strict_retry = (missing_outcome or missing_motion_type) and text_long_enough
+
+        if should_strict_retry:
+            t_strict = time.monotonic()
+            strict_result = enrich_ruling_strict_retry(
+                ruling_text,
+                missing_outcome=missing_outcome,
+                missing_motion_type=missing_motion_type,
+                provider=self._llm_provider or "google",
+                model=self._llm_model,
+                client=self._enrichment_client,
+            )
+            strict_latency_ms = round((time.monotonic() - t_strict) * 1000)
+
+            if strict_result is not None:
+                # Merge any non-None strict-retry fields into the result.  If
+                # the first pass returned None, materialize an empty result so
+                # we have somewhere to attach merged fields.
+                if result is None:
+                    result = LlmEnrichmentResult()
+
+                merged_fields: set[str] = set()
+                if missing_outcome and strict_result.outcome is not None:
+                    result = result.model_copy(update={"outcome": strict_result.outcome})
+                    merged_fields.add("outcome")
+                if missing_motion_type and strict_result.motion_type is not None:
+                    result = result.model_copy(update={"motion_type": strict_result.motion_type})
+                    merged_fields.add("motion_type")
+
+                self._strict_retry_fields_for_last_call = merged_fields
+
+                logger.info(
+                    "LLM enrichment strict retry completed",
+                    extra={
+                        "document_id": document_id,
+                        "strict_retry_latency_ms": strict_latency_ms,
+                        "fields_populated": sorted(merged_fields),
+                        "missing_outcome": missing_outcome,
+                        "missing_motion_type": missing_motion_type,
+                    },
+                )
+            else:
+                # Strict-retry LLM call failed (call_llm returned None) — log
+                # and continue with the original first-pass result.  Do not
+                # raise; first-pass result (possibly None) is still valid.
+                logger.warning(
+                    "LLM enrichment strict retry returned None — continuing with first-pass result",
+                    extra={
+                        "document_id": document_id,
+                        "strict_retry_latency_ms": strict_latency_ms,
+                    },
+                )
+
+        if result is None:
+            # Neither the first pass nor (if invoked) the strict retry
+            # produced data.  Not a transient failure — return None without
+            # bubbling up an exception.
             logger.info(
                 "LLM enrichment completed with empty result",
                 extra={
@@ -1063,6 +1170,19 @@ class IngestionWorker:
                     "enrichment_latency_ms": latency_ms,
                 },
             )
+            return None, "empty"
+
+        # Confirm post-strict-retry result has at least one populated field.
+        # If both passes left it entirely empty (highly unusual), surface
+        # "empty" so callers tag with the correct diagnostic marker.
+        has_data = (
+            result.case_title is not None
+            or result.motion_type is not None
+            or result.outcome is not None
+            or result.parties.plaintiffs
+            or result.parties.defendants
+        )
+        if not has_data:
             return None, "empty"
 
         logger.info(
@@ -1076,6 +1196,7 @@ class IngestionWorker:
                 "outcome": result.outcome,
                 "plaintiff_count": len(result.parties.plaintiffs),
                 "defendant_count": len(result.parties.defendants),
+                "strict_retry_fields": sorted(self._strict_retry_fields_for_last_call),
             },
         )
 
@@ -1090,6 +1211,7 @@ class IngestionWorker:
         motion_type: str | None,
         case_title: str | None,
         parties_data: list[dict[str, str]],
+        strict_retry_fields: set[str] | None = None,
     ) -> tuple[
         str | None,
         str | None,
@@ -1132,6 +1254,14 @@ class IngestionWorker:
             * ``"skipped_disabled"`` → no diagnostic marker (enrichment intentionally off)
         outcome, motion_type, case_title, parties_data :
             Current values to merge into.
+        strict_retry_fields :
+            Optional set of field names (``"outcome"``, ``"motion_type"``)
+            that were populated by the strict-retry second pass (#3991).
+            Fields named here are tagged with ``_ENRICHMENT_STRICT_RETRY_TAG``
+            instead of the regular ``_ENRICHMENT_METHOD_TAG`` when assigning
+            to the methods dict.  Defaults to ``None`` / empty set, in which
+            case behavior matches pre-#3991 (every populated field uses
+            the regular ``llm_enrichment`` tag).
 
         Returns
         -------
@@ -1152,6 +1282,11 @@ class IngestionWorker:
         """
         methods: dict[str, str] = {}
         method_tag = _ENRICHMENT_METHOD_TAG
+        retry_fields = strict_retry_fields or set()
+
+        def _tag_for(field_name: str) -> str:
+            """Return the populated-field tag for ``field_name`` (#3991)."""
+            return _ENRICHMENT_STRICT_RETRY_TAG if field_name in retry_fields else method_tag
 
         # Map status_tag to the diagnostic marker for fields that remain None.
         # "skipped_disabled" means enrichment was intentionally off — no marker.
@@ -1190,19 +1325,22 @@ class IngestionWorker:
 
         if outcome is None and enrichment_result.outcome is not None:
             outcome = enrichment_result.outcome
-            methods["outcome"] = method_tag
+            methods["outcome"] = _tag_for("outcome")
         elif outcome is None and _failure_marker is not None:
             # Enrichment ran (ok) but did not return this field.
             methods["outcome"] = _failure_marker
 
         if motion_type is None and enrichment_result.motion_type is not None:
             motion_type = enrichment_result.motion_type
-            methods["motion_type"] = method_tag
+            methods["motion_type"] = _tag_for("motion_type")
         elif motion_type is None and _failure_marker is not None:
             methods["motion_type"] = _failure_marker
 
         if not case_title and enrichment_result.case_title is not None:
             case_title = enrichment_result.case_title
+            # case_title never comes from the strict retry — that pass only
+            # asks for outcome / motion_type — so the regular tag always
+            # applies here regardless of strict_retry_fields contents.
             methods["case_title"] = method_tag
         elif not case_title and _failure_marker is not None:
             methods["case_title"] = _failure_marker
@@ -1217,6 +1355,8 @@ class IngestionWorker:
                 parties_data.append({"name": name, "role": "plaintiff"})
             for name in enrichment_result.parties.defendants:
                 parties_data.append({"name": name, "role": "defendant"})
+            # parties never comes from the strict retry either — same reason
+            # as case_title above.  Regular tag.
             methods["parties"] = method_tag
         elif not parties_data and _failure_marker is not None:
             methods["parties"] = _failure_marker
@@ -1752,6 +1892,10 @@ class IngestionWorker:
             extraction_methods.setdefault("motion_type", "skipped_bad_split_fragment")
         if enrichment_fields_missing:
             enrichment_result, enrich_status = self._llm_enrich_fields(ruling_text, document_id)
+            # Capture the strict-retry side-channel state immediately after
+            # the call so it isn't reset by any future _llm_enrich_fields
+            # invocation in this same process_event flow (#3991).
+            strict_retry_fields = set(self._strict_retry_fields_for_last_call)
             (
                 outcome,
                 motion_type,
@@ -1765,6 +1909,7 @@ class IngestionWorker:
                 motion_type=motion_type,
                 case_title=case_title,
                 parties_data=parties_data,
+                strict_retry_fields=strict_retry_fields,
             )
             extraction_methods.update(enrichment_methods)
             if enrich_status == "errored":

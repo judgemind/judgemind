@@ -7296,3 +7296,385 @@ def test_multimodal_case_number_miss_telemetry_db_error_swallowed() -> None:
     assert any(
         "ROLLBACK TO SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql
     ), "Inner except must execute ROLLBACK TO SAVEPOINT when INSERT raises (#3729)."
+
+
+# ---------------------------------------------------------------------------
+# Strict-retry second pass for null-outcome / null-motion_type rulings (#3991)
+# ---------------------------------------------------------------------------
+#
+# When the first ``enrich_ruling_with_retry`` call leaves outcome and / or
+# motion_type null on substantive ruling text, the worker invokes
+# ``enrich_ruling_strict_retry`` for one decisive second pass.  Fields that
+# come back from the strict retry are tagged with the new
+# ``llm_enrichment_strict_retry`` diagnostic marker so post-deploy queries
+# can measure how often the retry was the deciding pass.
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_calls_strict_retry_when_first_pass_empty(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """When the first pass returns empty, the strict retry runs and fills outcome (#3991)."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    # First pass returns all-None — wrapper surfaces this as None.
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    # Patch the strict-retry function imported inside _llm_enrich_fields.
+    strict_retry_result = LlmEnrichmentResult(outcome="continued")
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+        return_value=strict_retry_result,
+    ) as mock_strict:
+        # Substantive text — long enough to clear the strict-retry length gate.
+        result, status = worker._llm_enrich_fields(
+            "Plaintiff to give notice. Before the Court is a Demurrer by defendant. "
+            "The Court will CONTINUE the hearing as set forth herein. "
+            "The matter is continued to a future date.",
+            "doc-strict-1",
+        )
+
+    assert result is not None
+    assert result.outcome == "continued"
+    assert status == "ok"
+    mock_strict.assert_called_once()
+    # The strict retry should have been called with missing_outcome=True.
+    call_kwargs = mock_strict.call_args.kwargs
+    assert call_kwargs.get("missing_outcome") is True
+    # And the worker should have recorded which fields the strict retry filled.
+    assert worker._strict_retry_fields_for_last_call == {"outcome"}
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_calls_strict_retry_when_outcome_missing_only(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """First pass returns case_title but not outcome — strict retry fills outcome (#3991)."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    # First pass got case_title and parties but not outcome / motion_type.
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type=None,
+        outcome=None,
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    strict_retry_result = LlmEnrichmentResult(outcome="granted", motion_type="demurrer")
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+        return_value=strict_retry_result,
+    ) as mock_strict:
+        result, status = worker._llm_enrich_fields(
+            "The demurrer to the second amended complaint is sustained without leave to amend. "
+            "The Court finds the complaint fails to state a claim upon which relief can be granted "
+            "as alleged.",
+            "doc-strict-2",
+        )
+
+    assert result is not None
+    # Original fields preserved.
+    assert result.case_title == "Smith v. Jones"
+    # Strict-retry fields merged in.
+    assert result.outcome == "granted"
+    assert result.motion_type == "demurrer"
+    assert status == "ok"
+    mock_strict.assert_called_once()
+    call_kwargs = mock_strict.call_args.kwargs
+    assert call_kwargs.get("missing_outcome") is True
+    assert call_kwargs.get("missing_motion_type") is True
+    assert worker._strict_retry_fields_for_last_call == {"outcome", "motion_type"}
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_skips_strict_retry_when_text_too_short(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """Strict retry is skipped when ruling_text.strip() is < 100 chars (#3991)."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+    ) as mock_strict:
+        # Short text — under 100 chars.
+        result, status = worker._llm_enrich_fields("Short.", "doc-strict-3")
+
+    assert result is None
+    assert status == "empty"
+    mock_strict.assert_not_called()
+    assert worker._strict_retry_fields_for_last_call == set()
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_skips_strict_retry_when_first_pass_succeeded_fully(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """Strict retry is skipped when first pass populated outcome AND motion_type (#3991)."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+    ) as mock_strict:
+        result, status = worker._llm_enrich_fields(
+            "Defendant's motion for summary judgment is GRANTED. "
+            "Plaintiff fails to raise a triable issue of material fact regarding the "
+            "negligence claim alleged in the first cause of action.",
+            "doc-strict-4",
+        )
+
+    assert result is not None
+    assert result.outcome == "granted"
+    assert result.motion_type == "msj"
+    assert status == "ok"
+    mock_strict.assert_not_called()
+    assert worker._strict_retry_fields_for_last_call == set()
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_strict_retry_returns_none_does_not_crash(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """If the strict-retry LLM call fails (returns None), worker continues gracefully (#3991)."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+        return_value=None,
+    ):
+        result, status = worker._llm_enrich_fields(
+            "Substantive ruling text that exceeds the 100-char gate so the strict retry runs. "
+            "The motion is something but the LLM is being non-committal again.",
+            "doc-strict-5",
+        )
+
+    # First pass was empty, strict retry returned None — overall result is still None / empty.
+    assert result is None
+    assert status == "empty"
+    assert worker._strict_retry_fields_for_last_call == set()
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_strict_retry_partial_outcome_only(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """Strict retry returns only outcome — motion_type stays null (#3991)."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    strict_retry_result = LlmEnrichmentResult(outcome="continued", motion_type=None)
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+        return_value=strict_retry_result,
+    ):
+        result, status = worker._llm_enrich_fields(
+            "Substantive ruling text that exceeds the 100-char gate so the strict retry runs. "
+            "The hearing is continued to next month.",
+            "doc-strict-6",
+        )
+
+    assert result is not None
+    assert result.outcome == "continued"
+    assert result.motion_type is None
+    assert status == "ok"
+    # Only outcome was filled by the strict retry.
+    assert worker._strict_retry_fields_for_last_call == {"outcome"}
+
+
+def test_apply_enrichment_result_tags_strict_retry_fields_with_strict_retry_marker() -> None:
+    """When fields came from strict retry, methods dict uses llm_enrichment_strict_retry (#3991)."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    from ingestion.worker import IngestionWorker
+
+    # The enrichment result has outcome + motion_type populated, but those came
+    # from the strict retry pass — so they should carry the new diagnostic tag.
+    enrichment = LlmEnrichmentResult(
+        case_title="Smith v. Jones",  # came from first pass
+        motion_type="demurrer",  # came from strict retry
+        outcome="granted",  # came from strict retry
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),  # first pass
+    )
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        enrichment,
+        status_tag="ok",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+        strict_retry_fields={"outcome", "motion_type"},
+    )
+
+    # outcome and motion_type came from strict retry — new diagnostic tag.
+    assert methods["outcome"] == "llm_enrichment_strict_retry"
+    assert methods["motion_type"] == "llm_enrichment_strict_retry"
+    # case_title and parties came from the first-pass enrichment — original tag.
+    assert methods["case_title"] == "llm_enrichment"
+    assert methods["parties"] == "llm_enrichment"
+
+
+def test_apply_enrichment_result_strict_retry_fields_default_none_unchanged_behavior() -> None:
+    """When strict_retry_fields is None / omitted, behavior matches pre-#3991 (no new tags)."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    from ingestion.worker import IngestionWorker
+
+    enrichment = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        enrichment,
+        status_tag="ok",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+        # strict_retry_fields not passed — defaults to None.
+    )
+
+    # Default behavior: every field gets the original llm_enrichment tag.
+    assert methods["outcome"] == "llm_enrichment"
+    assert methods["motion_type"] == "llm_enrichment"
+    assert methods["case_title"] == "llm_enrichment"
+    assert methods["parties"] == "llm_enrichment"
+
+
+def test_apply_enrichment_result_strict_retry_fields_empty_set_unchanged_behavior() -> None:
+    """An empty strict_retry_fields set behaves the same as None — no new tags."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    from ingestion.worker import IngestionWorker
+
+    enrichment = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        enrichment,
+        status_tag="ok",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+        strict_retry_fields=set(),
+    )
+
+    assert methods["outcome"] == "llm_enrichment"
+    assert methods["motion_type"] == "llm_enrichment"
+
+
+def test_apply_enrichment_result_strict_retry_only_outcome_field_tagged() -> None:
+    """Only fields named in strict_retry_fields get the new tag — others stay llm_enrichment."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    from ingestion.worker import IngestionWorker
+
+    enrichment = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type="msj",  # came from first pass
+        outcome="continued",  # came from strict retry
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        enrichment,
+        status_tag="ok",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+        strict_retry_fields={"outcome"},
+    )
+
+    assert methods["outcome"] == "llm_enrichment_strict_retry"
+    assert methods["motion_type"] == "llm_enrichment"
+    assert methods["case_title"] == "llm_enrichment"
+    assert methods["parties"] == "llm_enrichment"
+
+
+def test_strict_retry_tag_constant_is_exported_from_worker() -> None:
+    """The new diagnostic marker constant exists and matches the documented value (#3991)."""
+    from ingestion.worker import _ENRICHMENT_STRICT_RETRY_TAG
+
+    assert _ENRICHMENT_STRICT_RETRY_TAG == "llm_enrichment_strict_retry"
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_returns_empty_when_first_pass_has_data_but_strict_retry_yields_none(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """Defensive guard: even if first pass returns a 'has data' marker but no real fields and
+    strict-retry yields None, function returns ('empty') rather than asserting on partial data.
+
+    This covers the post-merge has_data check at worker.py — the path where the first pass
+    returned an empty result object (rare in practice, but the assertion guards correctness).
+    """
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    # Workaround for the upstream contract: enrich_ruling_with_retry returns
+    # None when result has no data — which means we'd need to construct a
+    # ruling_text that's substantive (>= 100 chars) and where both passes
+    # come back with no fields.  Easiest path: mock both layers.
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()  # all-None first pass
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    # Strict retry returns LlmEnrichmentResult with all-None — possible if the
+    # second pass LLM also remained non-committal AND neither field gets merged
+    # (because both strict_result.outcome and strict_result.motion_type are None).
+    strict_result = LlmEnrichmentResult()
+    with patch(
+        "framework.llm_enrichment.enrich_ruling_strict_retry",
+        return_value=strict_result,
+    ):
+        result, status = worker._llm_enrich_fields(
+            "Substantive ruling text exceeding the 100-char gate so the strict retry runs. "
+            "Both LLM passes are non-committal and return no fields whatsoever.",
+            "doc-strict-no-data",
+        )
+
+    # Both passes left every field None — function reports empty.
+    assert result is None
+    assert status == "empty"
+    assert worker._strict_retry_fields_for_last_call == set()
