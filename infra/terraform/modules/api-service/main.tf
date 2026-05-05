@@ -578,3 +578,71 @@ resource "aws_cloudwatch_metric_alarm" "api_unhealthy_hosts" {
   alarm_actions = [var.alert_sns_topic_arn]
   ok_actions    = [var.alert_sns_topic_arn]
 }
+
+# ─── Polled dispatcherState query cost — pre-cap alarm (#4110) ─────────────────
+#
+# The cockpit's polled `dispatcherState` query has crossed the 1000-unit
+# complexity cap four times in 30 days (#4062, #4063, #4064, #4100), each
+# time discovered only after operators noticed the cockpit going blank or
+# HTTP 400s in CloudWatch. The `costBreakdownPlugin` from #4100 logs a
+# `graphql.cost.breakdown` line with the total cost whenever a request
+# crosses the 800-unit early-warning band. This alarm watches that signal
+# and fires while the cockpit still works (cost > 900, 100-unit buffer
+# below the 1000 cap), so the next slim trim PR can be filed proactively
+# instead of as an emergency.
+#
+# Metric design:
+# - Pattern matches the structured Pino log shape: top-level `msg` field
+#   is "graphql.cost.breakdown" (set by the second positional arg to
+#   `app.log.info(entry, 'graphql.cost.breakdown')` in packages/api/src/app.ts).
+# - Value extracted from `$.cost` (top-level numeric in the entry object).
+# - Statistic `Maximum` over a 60-second period: each 1-min bin reports
+#   the highest observed cost. Sum would conflate distinct queries;
+#   Average would dilute a real regression with cheap parallel queries.
+# - 5-min evaluation window (5 × 60s) with `datapoints_to_alarm = 3` —
+#   3-of-5 minutes seeing max cost > 900 is a sustained trend, not a
+#   single noisy poll. The dispatcher polls every 2s so each 1-min bin
+#   has ~30 samples to draw the Maximum from.
+# - `treat_missing_data = "notBreaching"` so cost-quiet windows (cockpit
+#   not loaded by anyone) do not flap the alarm.
+#
+# Dev-only by design: production traffic on this query is operator-only
+# and the cap surfaces immediately as a blank cockpit, which is its own
+# alarm (#4110 Out of Scope).
+
+resource "aws_cloudwatch_log_metric_filter" "polled_query_cost" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "judgemind-api-polled-query-cost-${var.environment}"
+  pattern        = "{ $.msg = \"graphql.cost.breakdown\" }"
+  log_group_name = aws_cloudwatch_log_group.api.name
+
+  metric_transformation {
+    name          = "PolledQueryCost"
+    namespace     = "Judgemind/API"
+    value         = "$.cost"
+    default_value = null
+    unit          = "None"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "polled_query_cost" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "dispatcher-polled-cost-${var.environment}"
+  alarm_description = "Polled dispatcherState query cost crossed ${var.polled_query_cost_threshold} (cap 1000) in ${var.polled_query_cost_datapoints_to_alarm} of the last ${var.polled_query_cost_evaluation_periods} minutes (${var.environment}). The cockpit still works at this level — file a slim trim PR before the next field add pushes us over. See #4110."
+
+  namespace   = "Judgemind/API"
+  metric_name = "PolledQueryCost"
+  statistic   = "Maximum"
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.polled_query_cost_threshold
+  period              = 60
+  evaluation_periods  = var.polled_query_cost_evaluation_periods
+  datapoints_to_alarm = var.polled_query_cost_datapoints_to_alarm
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}

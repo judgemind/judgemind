@@ -490,6 +490,40 @@ aws cloudwatch get-metric-data --region us-west-2 \
 
 If a future investigation genuinely requires per-task-ARN metrics (to disambiguate two concurrent oneshots within the same family), toggle the setting to `enhanced` on a targeted basis — expect a billing uptick proportional to concurrent task count.
 
+### CloudWatch Alarms (dev)
+
+Alarms wired through Terraform — `enable_alerts = true` on each module gates whether the alarm resources are created. `alert_sns_topic_arn` is `module.compute.alerts_topic_arn` (the same SNS topic surfaces in Telegram and the `/admin/dispatcher` cockpit).
+
+| Alarm name prefix | Module | Source | Fires when |
+|---|---|---|---|
+| `judgemind-api-5xx-` | `api-service` | `AWS/ApplicationELB` `HTTPCode_Target_5XX_Count` | API 5xx error count > threshold in 5 min |
+| `judgemind-api-4xx-spike-` | `api-service` | `AWS/ApplicationELB` `HTTPCode_Target_4XX_Count` | API 4xx error count > threshold in 5 min |
+| `judgemind-api-latency-p99-` | `api-service` | `AWS/ApplicationELB` `TargetResponseTime` (p99) | API p99 latency > threshold for 2 consecutive 5-min periods |
+| `judgemind-api-unhealthy-hosts-` | `api-service` | `AWS/ApplicationELB` `UnHealthyHostCount` | ALB target group has unhealthy hosts |
+| `dispatcher-polled-cost-` | `api-service` | log metric filter on `/ecs/judgemind-api-${env}` matching `{ $.msg = "graphql.cost.breakdown" }`, namespace `Judgemind/API`, metric `PolledQueryCost` | Cockpit's polled `dispatcherState` query cost > 900 (cap 1000) in 3 of last 5 minutes — pre-cap early warning, see #4110 |
+| `judgemind-dispatcher-heartbeat-stale-` | `dispatcher-daemon` | `Judgemind/Dispatcher` `HeartbeatStale` | Daemon heartbeat hasn't advanced in `heartbeat_stale_seconds` |
+| `judgemind-dispatcher-stuck-timeout-repeated-` | `dispatcher-daemon` | log metric filter on `stuck_timeout_repeated` events | Same agent hits `stuck_timeout` twice within the configured window |
+| `judgemind-dispatcher-diagnoser-fallback-spike-` | `dispatcher-daemon` | log metric filter on `diagnoser_fallback` events | Diagnoser fell back to mechanical escalation `>= diagnoser_fallback_threshold` times in the configured window |
+| `judgemind-dispatcher-list-advanceable-failed-` | `dispatcher-daemon` | log metric filter on `_list_advanceable_agents` exceptions | Supervisor tick raised an unhandled exception |
+| `judgemind-dispatcher-recover-scan-failed-` | `dispatcher-daemon` | log metric filter on `_recover_scan` exceptions | Supervisor tick raised an unhandled exception |
+| `judgemind-dispatcher-resume-scan-failed-` | `dispatcher-daemon` | log metric filter on `_resume_scan` exceptions | Supervisor tick raised an unhandled exception |
+| `judgemind-dispatcher-observe-external-terminal-failed-` | `dispatcher-daemon` | log metric filter on `_observe_external_terminal` exceptions | Supervisor tick raised an unhandled exception |
+| `judgemind-dispatcher-reap-agent-tasks-select-failed-` | `dispatcher-daemon` | log metric filter on `_reap_agent_tasks` exceptions | Supervisor tick raised an unhandled exception |
+
+Confirm an alarm exists / inspect its config:
+
+```
+aws cloudwatch describe-alarms --region us-west-2 \
+  --alarm-name-prefix dispatcher-polled-cost
+```
+
+Confirm a metric filter exists / inspect its pattern:
+
+```
+aws logs describe-metric-filters --region us-west-2 \
+  --log-group-name /ecs/judgemind-api-dev
+```
+
 ### Dev DB Connection Budget
 
 The dev RDS instance (`judgemind-dev`) runs on **`db.t4g.small`** (2 GB RAM).  PostgreSQL 16's `max_connections` is derived from the instance-class memory via the formula `LEAST({DBInstanceClassMemory/9531392}, 5000)` — on `db.t4g.small` this resolves to roughly **~170 connections**.  Reserved slots:
