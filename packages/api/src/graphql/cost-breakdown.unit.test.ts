@@ -8,32 +8,27 @@
  *
  * These tests pin three things:
  *   1. The walker computes a value that matches the cost-rule
- *      algorithm (vendored in
- *      `node_modules/graphql-validation-complexity/lib/ComplexityVisitor.js`):
- *      scalars cost `scalarCost` (1), object types cost `objectCost`
- *      (0), and each list multiplies the running factor by `listFactor`
- *      (10). The post-#4100 polled query computes to ≤ 1000, the pre-
- *      #4100 polled query (with the four trimmed fields restored) to
- *      > 1000 — that is the regression-of-regression guard.
+ *      algorithm (mirrored in `cost-rule-estimator.ts`): scalars cost
+ *      `scalarCost` (1), object types cost `objectCost` (0), and each
+ *      list multiplies the running factor by `listFactor` (10). The
+ *      post-#4100 polled query computes to ≤ 1000, the pre-#4100
+ *      polled query (with the four trimmed fields restored) to > 1000
+ *      — that is the regression-of-regression guard.
  *   2. `__typename` injection (Apollo Client default on every selection
- *      set) is counted, matching what graphql-validation-complexity
- *      sees over the wire after Apollo Client expands the document.
+ *      set) is counted, matching what the cost rule sees over the wire
+ *      after Apollo Client expands the document.
  *   3. The `costBreakdownPlugin` only emits a log line when the total
  *      meets the threshold — keeps log volume bounded.
  *
- * Why we don't compare against `validate(schema, doc, [rule])`: the
- * `graphql-validation-complexity@0.4.2` library walks the document
- * with its OWN local TypeInfo (`visit(node, visitWithTypeInfo(typeInfo,
- * visitor))`) but reads field defs from `this.context.getFieldDef()`,
- * which is bound to the OUTER validation walk's TypeInfo. On graphql
- * 16 this mismatch makes the inner walk see null field defs for most
- * positions and underreport cost (~10× low) when invoked through the
- * standalone `validate()` API. In production the rule still correctly
- * rejects the polled query at 1035 — the integration with Apollo
- * Server's validation pipeline differs from a bare `validate()` call.
- * Comparing here would couple the test to that broken bare-call
- * behaviour, so we pin the walker against fixed expected values
- * instead.
+ * The agreement between this walker and the production cost rule
+ * (`createComplexityRule({ estimators: [judgemindEstimator] })`) is
+ * pinned by AC3 in `cost-rule-estimator.unit.test.ts` — that test runs
+ * `getComplexity(...)` against the same document and asserts equality
+ * with what `computeBreakdown(...)` here returns. The pre-#4112 cost
+ * library had a structural TypeInfo bug that made standalone
+ * `validate()` underreport cost ~10× — we no longer have to dance
+ * around it because the new library (`graphql-query-complexity`)
+ * computes correctly.
  */
 
 import { describe, expect, it, vi } from 'vitest';

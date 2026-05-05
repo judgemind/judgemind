@@ -3,7 +3,8 @@ import { ApolloServer, HeaderMap } from '@apollo/server';
 import type { Pool } from 'pg';
 import type { Client } from '@opensearch-project/opensearch';
 import depthLimit from 'graphql-depth-limit';
-import { createComplexityLimitRule } from 'graphql-validation-complexity';
+import { createComplexityRule } from 'graphql-query-complexity';
+import { judgemindEstimator } from './graphql/cost-rule-estimator';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
@@ -52,8 +53,15 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     introspection: process.env.NODE_ENV !== 'production',
     validationRules: [
       depthLimit(10),
-      createComplexityLimitRule(1000, {
-        onCost: (cost: number) => app.log.info({ cost }, 'graphql.cost'),
+      // #4003 cost cap: 1000 units. The custom `judgemindEstimator`
+      // mirrors the now-retired prior cost-rule library's algorithm
+      // (scalarCost=1, objectCost=0, listFactor=10) so the cap, the
+      // production cost-vs-cap relationship, and the per-field breakdown
+      // logger (`cost-breakdown.ts`) all stay in sync. Migration: #4112.
+      createComplexityRule({
+        maximumComplexity: 1000,
+        estimators: [judgemindEstimator],
+        onComplete: (cost: number) => app.log.info({ cost }, 'graphql.cost'),
       }),
     ],
     plugins: [

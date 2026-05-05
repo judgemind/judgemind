@@ -3,18 +3,19 @@
  * (`DispatcherState`) and any other operation flirting with the #4003
  * 1000-cost cap.
  *
- * Issue #4100. The `graphql-validation-complexity` library only exposes
- * the total cost via `onCost` — when an operation overshoots the cap and
- * the API returns HTTP 400, operators have to recompute the per-field
- * breakdown by hand to identify the next slim. This plugin runs the same
- * cost algorithm as `ComplexityVisitor` (vendored in
- * `node_modules/graphql-validation-complexity/lib/ComplexityVisitor.js`)
- * but emits a top-level-field breakdown alongside the total whenever the
- * total exceeds `COST_LOG_THRESHOLD`. Logging only on near-cap operations
- * keeps the volume bounded — the dispatcher polls every 2s and we don't
- * want a per-request breakdown for every cheap query.
+ * Issue #4100. The cost rule (`graphql-query-complexity` after #4112)
+ * only exposes the total cost via its complete callback — when an
+ * operation overshoots the cap and the API returns HTTP 400, operators
+ * have to recompute the per-field breakdown by hand to identify the
+ * next slim. This plugin runs the same cost algorithm as the rule
+ * itself (mirrored in `cost-rule-estimator.ts`) but emits a
+ * top-level-field breakdown alongside the total whenever the total
+ * exceeds `COST_LOG_THRESHOLD`.
+ * Logging only on near-cap operations keeps the volume bounded — the
+ * dispatcher polls every 2s and we don't want a per-request breakdown
+ * for every cheap query.
  *
- * Algorithm (mirrors `ComplexityVisitor`):
+ * Algorithm (mirrors `cost-rule-estimator.ts`):
  *   - Walk each Field node in the operation's selection set.
  *   - On enter, multiply the running `costFactor` by the field's type
  *     factor: `listFactor` (default 10) for each list-of-X wrapper,
@@ -46,10 +47,12 @@ import {
 } from 'graphql';
 
 /**
- * Default cost-rule options must match the `createComplexityLimitRule`
- * call in `app.ts` (which uses the library's defaults). Kept here as
- * named constants so a future option change in `app.ts` can be mirrored
- * by editing one place.
+ * Default cost-rule options must match the constants exported by
+ * `cost-rule-estimator.ts` (which are used by the production
+ * `createComplexityRule` call in `app.ts`). Kept here as named constants
+ * so a future option change in `app.ts` can be mirrored by editing one
+ * place — the `cost-rule-estimator.unit.test.ts` AC3 assertion enforces
+ * agreement between the two implementations.
  */
 const SCALAR_COST = 1;
 const OBJECT_COST = 0;
@@ -270,10 +273,10 @@ function pickOperation(
  * CloudWatch Insights.
  *
  * Threshold is checked against our own walker's total — if a future
- * graphql-validation-complexity option drift causes the two totals to
- * disagree, the breakdown still fires when our computation crosses
- * 800. The two totals should agree on the polled query (verified by
- * the regression test in `cost-breakdown.test.ts`).
+ * estimator option drift causes the two totals to disagree, the
+ * breakdown still fires when our computation crosses 800. The two
+ * totals should agree on the polled query (verified by AC3 in
+ * `cost-rule-estimator.unit.test.ts`).
  */
 export function costBreakdownPlugin(
   log: (entry: {
