@@ -8,8 +8,16 @@
  * Uses the `graphql` npm package for proper schema parsing and query validation.
  * Does not require running the API server.
  *
+ * **Why this lives under packages/web/scripts/ rather than the top-level scripts/ dir.**
+ * Node's ESM resolver anchors `import 'graphql'` to the importer's URL and walks up
+ * looking for `node_modules/graphql`. With the validator at
+ * `packages/web/scripts/validate-graphql-queries.mjs`, the resolver finds
+ * `packages/web/node_modules/graphql` after `npm install` in `packages/web/` — no
+ * NODE_PATH or repo-root install required. (NODE_PATH is a CommonJS-only knob;
+ * ESM ignores it. See #4093.)
+ *
  * Usage:
- *   node scripts/validate-graphql-queries.mjs [repo-root]
+ *   node packages/web/scripts/validate-graphql-queries.mjs [repo-root]
  *
  * Exit codes:
  *   0 — All queries are valid.
