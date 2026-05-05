@@ -9,6 +9,19 @@
  * Apollo `keyFields` for these types live in `apollo-client.ts`
  * (`DispatcherRun`, `DispatcherFailure`, `PhaseTransition`,
  * `DispatcherCommandResult`, and `keyFields: false` for `DispatcherState`).
+ *
+ * Polled-query complexity contract (issue #4062 — followup to the #4003
+ * GraphQL DoS hardening that capped per-query cost at 1000):
+ * `DISPATCHER_STATE_QUERY` is fired every 2s by the cockpit, so it must
+ * stay well below the 1000-cost cap. The biggest amplifier in this query
+ * shape is list-of-objects-containing-a-list — the polled `blockedBy`
+ * selections inside `queueReady` and `queueBlocked` therefore request
+ * ONLY `number`. Blocker titles are populated only when the operator
+ * opens the expand-on-click full-list dialog, which uses the separate
+ * `DISPATCHER_QUEUE_FULL_QUERY` below (fires once per dialog open, not
+ * polled). The render layer's `formatBlockerTooltip` already falls back
+ * to `#N` alone when `BlockerRef.title` is null/undefined, so the polled
+ * tooltip degrades gracefully — full titles still appear in the dialog.
  */
 import { gql } from '@apollo/client';
 
@@ -58,7 +71,6 @@ export const DISPATCHER_STATE_QUERY = gql`
         createdAt
         blockedBy {
           number
-          title
         }
         cooldownSecondsRemaining
       }
@@ -70,7 +82,6 @@ export const DISPATCHER_STATE_QUERY = gql`
         createdAt
         blockedBy {
           number
-          title
         }
       }
       recentCompletions {
@@ -254,10 +265,21 @@ export interface DispatcherFailure {
  *
  * Apollo `keyFields: ['number']` is registered in `apollo-client.ts` so
  * Apollo normalises distinct BlockerRef entries correctly.
+ *
+ * Title selection (issue #4062): only `DISPATCHER_QUEUE_FULL_QUERY`
+ * (the expand-on-click dialog) selects `title`. The polled
+ * `DISPATCHER_STATE_QUERY` selects only `number` to keep query cost
+ * under the 1000-cap from #4003. Render code that consumes
+ * `BlockerRef.title` MUST tolerate `undefined` as well as `null` — see
+ * `formatBlockerTooltip` in `QueuePanel.tsx` for the canonical fallback
+ * (renders `#N` alone when the title is missing).
  */
 export interface BlockerRef {
   number: number;
-  title: string | null;
+  /** May be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (which selects only `number`). Always either
+   * a string or `null` on rows fetched via `DISPATCHER_QUEUE_FULL_QUERY`. */
+  title?: string | null;
 }
 
 export interface QueueItem {
