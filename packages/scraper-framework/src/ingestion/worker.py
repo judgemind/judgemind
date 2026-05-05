@@ -67,6 +67,7 @@ from .db import (
     upsert_court,
 )
 from .department_normalize import normalize_department
+from .doc_timing import DocTiming, emit_via_stdlib_logger
 from .extract import (
     clean_case_title,
     dedupe_repeated_title,
@@ -1646,6 +1647,59 @@ class IngestionWorker:
           3. Fall back to regex extraction.
 
         Exposed for testing. Raises on unrecoverable errors.
+
+        Per-doc phase timing (#4116) is emitted as a single
+        ``reingest_doc_timing`` log line on every exit path (success,
+        early-return, raise) so the next perf bug in this pipeline is
+        self-diagnosing.  Bookkeeping lives in :meth:`_process_event_timed`
+        — see ``ingestion.doc_timing`` for the helper's contract.
+        """
+        # Pipeline branch — non-ruling scrapers (#3688).
+        # The ca-governor-appointments scraper emits judge-bio press releases
+        # that share the CapturedDocument shape but are NOT rulings. Without
+        # this branch the LLM extractor produces UNKNOWN-* case_numbers,
+        # empty case_titles, and a 'Governor / Statewide' court row that
+        # pollutes derived.rulings (178 rows as of 2026-04-28). Raw HTML is
+        # preserved in S3 + staging.captures so #2144 can recover appointee
+        # data via courts.ca.governor_appointments.parse_appointees().
+        scraper_id: str = event_data.get("scraper_id", "")
+        if scraper_id == "ca-governor-appointments":
+            logger.info(
+                "Routing governor-appointment document to bio path (skipping ruling extraction)",
+                extra={
+                    "document_id": event_data["document_id"],
+                    "scraper_id": scraper_id,
+                    "telemetry_event": "governor_appointment_routed_to_bio_path",
+                },
+            )
+            return
+
+        timing = DocTiming(
+            emit_via_stdlib_logger(logger),
+            document_id=event_data["document_id"],
+            county=event_data["county"],
+            state=event_data["state"],
+            scraper_id=scraper_id,
+        )
+        try:
+            self._process_event_timed(event_data, timing)
+        finally:
+            timing.emit()
+
+    def _process_event_timed(
+        self,
+        event_data: dict[str, Any],
+        timing: DocTiming,
+    ) -> None:
+        """Inner body of :meth:`process_event` wrapped by ``DocTiming``.
+
+        Split out so :meth:`process_event` can emit one
+        ``reingest_doc_timing`` log line on every exit path (success,
+        early-return, raise) without re-indenting the entire function
+        body.  ``timing`` accumulates per-phase elapsed time as
+        ``timing.phase(name)`` blocks fire inside this body — every
+        ``return`` from this method counts as an exit and triggers the
+        outer wrapper's ``timing.emit()`` exactly once.
         """
         document_id: str = event_data["document_id"]
         state: str = event_data["state"]
@@ -1677,74 +1731,64 @@ class IngestionWorker:
 
         strategy = decide_extraction_strategy(state, county, scraper_id=scraper_id)
 
-        # Pipeline branch — non-ruling scrapers (#3688).
-        # The ca-governor-appointments scraper emits judge-bio press releases
-        # that share the CapturedDocument shape but are NOT rulings. Without
-        # this branch the LLM extractor produces UNKNOWN-* case_numbers,
-        # empty case_titles, and a 'Governor / Statewide' court row that
-        # pollutes derived.rulings (178 rows as of 2026-04-28). Raw HTML is
-        # preserved in S3 + staging.captures so #2144 can recover appointee
-        # data via courts.ca.governor_appointments.parse_appointees().
-        if scraper_id == "ca-governor-appointments":
-            logger.info(
-                "Routing governor-appointment document to bio path (skipping ruling extraction)",
-                extra={
-                    "document_id": document_id,
-                    "scraper_id": scraper_id,
-                    "telemetry_event": "governor_appointment_routed_to_bio_path",
-                },
-            )
-            return
-
-        # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
-        # This handles documents where the scraper stored raw PDF bytes instead of
-        # extracted text (e.g. Riverside, Orange county PDFs).
-        #
-        # Preserve the raw PDF bytes before text extraction so the multimodal
-        # extraction path (per-page image LLM calls) can use them (#1590).
+        # ------------------------------------------------------------------
+        # PHASE: parse_document_ms (#4116)
+        # ------------------------------------------------------------------
+        # Cover the raw-PDF text extraction (pdfplumber via
+        # extract_text_from_pdf) plus the S3 multimodal-PDF download.  Both
+        # are bounded by IO + C-extension parsing latency, distinct from the
+        # downstream LLM call and DB write.
+        # ------------------------------------------------------------------
         raw_pdf_bytes: bytes | None = None
-        if ruling_text and content_format == "pdf" and is_pdf_binary(ruling_text):
-            raw_pdf_bytes = (
-                ruling_text.encode("latin-1") if isinstance(ruling_text, str) else ruling_text
-            )
-            extracted_pdf_text = extract_text_from_pdf(ruling_text)
-            if extracted_pdf_text:
-                logger.info(
-                    "Extracted text from raw PDF binary",
-                    extra={
-                        "document_id": document_id,
-                        "original_length": len(ruling_text),
-                        "extracted_length": len(extracted_pdf_text),
-                    },
+        with timing.phase("parse_document_ms"):
+            # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
+            # This handles documents where the scraper stored raw PDF bytes instead of
+            # extracted text (e.g. Riverside, Orange county PDFs).
+            #
+            # Preserve the raw PDF bytes before text extraction so the multimodal
+            # extraction path (per-page image LLM calls) can use them (#1590).
+            if ruling_text and content_format == "pdf" and is_pdf_binary(ruling_text):
+                raw_pdf_bytes = (
+                    ruling_text.encode("latin-1") if isinstance(ruling_text, str) else ruling_text
                 )
-                ruling_text = extracted_pdf_text
-            else:
-                logger.warning(
-                    "PDF text extraction returned no text — LLM may fail",
-                    extra={"document_id": document_id},
-                )
-                # When extraction returned empty (not None), normalize to
-                # empty string so the downstream "no ruling text" warning
-                # fires correctly (#1335).  When extraction returned None
-                # (complete failure), keep the original raw binary so
-                # existing behavior is preserved.
-                if extracted_pdf_text is not None:
-                    ruling_text = ""
+                extracted_pdf_text = extract_text_from_pdf(ruling_text)
+                if extracted_pdf_text:
+                    logger.info(
+                        "Extracted text from raw PDF binary",
+                        extra={
+                            "document_id": document_id,
+                            "original_length": len(ruling_text),
+                            "extracted_length": len(extracted_pdf_text),
+                        },
+                    )
+                    ruling_text = extracted_pdf_text
+                else:
+                    logger.warning(
+                        "PDF text extraction returned no text — LLM may fail",
+                        extra={"document_id": document_id},
+                    )
+                    # When extraction returned empty (not None), normalize to
+                    # empty string so the downstream "no ruling text" warning
+                    # fires correctly (#1335).  When extraction returned None
+                    # (complete failure), keep the original raw binary so
+                    # existing behavior is preserved.
+                    if extracted_pdf_text is not None:
+                        ruling_text = ""
 
-        # ------------------------------------------------------------------
-        # S3 PDF download for multimodal extraction (#2312)
-        # ------------------------------------------------------------------
-        # When a scraper pre-extracts PDF text in parse_document() (e.g.
-        # Santa Clara), ruling_text is pdfplumber text, not raw binary.
-        # is_pdf_binary() returns False, so raw_pdf_bytes stays None.
-        # For MULTIMODAL counties, download the original PDF from S3 so
-        # the multimodal path can send page images to the LLM.
-        if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
-            # ``strategy.use_multimodal`` is True for ExtractionMethod.MULTIMODAL
-            # AND for unconfigured counties (the helper preserves the worker's
-            # pre-refactor default-multimodal behavior, #4081).
-            if strategy.use_multimodal:
-                raw_pdf_bytes = self._fetch_raw_pdf_from_s3(s3_key, s3_bucket, document_id)
+            # ------------------------------------------------------------------
+            # S3 PDF download for multimodal extraction (#2312)
+            # ------------------------------------------------------------------
+            # When a scraper pre-extracts PDF text in parse_document() (e.g.
+            # Santa Clara), ruling_text is pdfplumber text, not raw binary.
+            # is_pdf_binary() returns False, so raw_pdf_bytes stays None.
+            # For MULTIMODAL counties, download the original PDF from S3 so
+            # the multimodal path can send page images to the LLM.
+            if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
+                # ``strategy.use_multimodal`` is True for ExtractionMethod.MULTIMODAL
+                # AND for unconfigured counties (the helper preserves the worker's
+                # pre-refactor default-multimodal behavior, #4081).
+                if strategy.use_multimodal:
+                    raw_pdf_bytes = self._fetch_raw_pdf_from_s3(s3_key, s3_bucket, document_id)
 
         # ------------------------------------------------------------------
         # Document splitting — detect multi-case calendar pages (#1475)
@@ -2026,49 +2070,56 @@ class IngestionWorker:
                 raise LlmEnrichmentExhaustedError("LLM enrichment exhausted all retries")
 
         # ------------------------------------------------------------------
+        # PHASE: regex_fallback_ms (#4116)
+        # ------------------------------------------------------------------
         # Remaining regex fallbacks — hearing_date, judge_name, case_number,
         # and case_type are still extracted via regex when missing.  The
         # enrichment fields (outcome, motion_type, case_title, parties)
         # are handled exclusively by LLM enrichment above (#2178).
+        #
+        # ``clean_ruling_text`` is included in this bucket — it runs the
+        # same regex-heavy text normalization as the other fallbacks and
+        # was implicated in the #4104 quadratic-cost regression.
         # ------------------------------------------------------------------
-        if hearing_dt is None and ruling_text:
-            hearing_dt = extract_hearing_date(ruling_text)
-            if hearing_dt is not None:
-                extraction_methods.setdefault("hearing_date", "regex")
-                logger.info(
-                    "Extracted hearing_date from ruling text (regex fallback)",
-                    extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
-                )
+        with timing.phase("regex_fallback_ms"):
+            if hearing_dt is None and ruling_text:
+                hearing_dt = extract_hearing_date(ruling_text)
+                if hearing_dt is not None:
+                    extraction_methods.setdefault("hearing_date", "regex")
+                    logger.info(
+                        "Extracted hearing_date from ruling text (regex fallback)",
+                        extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
+                    )
 
-        if is_llm_extracted and ruling_text:
-            if judge_name is None:
-                judge_name = extract_judge_name(ruling_text)
-                if judge_name is not None:
-                    extraction_methods["judge_name"] = "regex_post_llm"
+            if is_llm_extracted and ruling_text:
+                if judge_name is None:
+                    judge_name = extract_judge_name(ruling_text)
+                    if judge_name is not None:
+                        extraction_methods["judge_name"] = "regex_post_llm"
 
-        # case_type from case number — does not require ruling_text.
-        if case_type is None and case_number:
-            case_type = extract_case_type_from_number(case_number)
-            if case_type:
-                extraction_methods.setdefault("case_type", "regex")
+            # case_type from case number — does not require ruling_text.
+            if case_type is None and case_number:
+                case_type = extract_case_type_from_number(case_number)
+                if case_type:
+                    extraction_methods.setdefault("case_type", "regex")
 
-        # Clean ruling text for display — the cleaned version is stored
-        # in Postgres.
-        cleaned_ruling_text = clean_ruling_text(ruling_text)
+            # Clean ruling text for display — the cleaned version is stored
+            # in Postgres.
+            cleaned_ruling_text = clean_ruling_text(ruling_text)
 
-        court_name = f"{court}, County of {county}"
+            court_name = f"{court}, County of {county}"
 
-        # Fallback case number extraction (regex)
-        if not case_number and ruling_text:
-            extracted = extract_case_number(ruling_text)
-            if extracted:
-                method = "regex_post_llm" if is_llm_extracted else "regex"
-                extraction_methods.setdefault("case_number", method)
-                logger.info(
-                    "Extracted case_number from ruling text (regex fallback)",
-                    extra={"document_id": document_id, "case_number": extracted},
-                )
-                case_number = extracted
+            # Fallback case number extraction (regex)
+            if not case_number and ruling_text:
+                extracted = extract_case_number(ruling_text)
+                if extracted:
+                    method = "regex_post_llm" if is_llm_extracted else "regex"
+                    extraction_methods.setdefault("case_number", method)
+                    logger.info(
+                        "Extracted case_number from ruling text (regex fallback)",
+                        extra={"document_id": document_id, "case_number": extracted},
+                    )
+                    case_number = extracted
 
         # ------------------------------------------------------------------
         # Deterministic case_title cleanup (#2212, #2370)
@@ -2421,19 +2472,22 @@ class IngestionWorker:
             )
 
         # ------------------------------------------------------------------
+        # PHASE: validation_ms (deterministic, #4116)
+        # ------------------------------------------------------------------
         # Deterministic validation rules — cheap, rule-based checks that
         # run on every document (#2329).  These catch obvious structural
         # failures (raw HTML, wrong dates, concatenated titles) without
         # requiring an LLM call.  Runs before the LLM validation gate.
         # ------------------------------------------------------------------
         captured_at_date: date | None = capture_ts.date() if capture_ts else None
-        det_result = run_deterministic_rules(
-            ruling_text=cleaned_ruling_text,
-            case_number=case_number or f"UNKNOWN-{document_id}",
-            case_title=case_title,
-            hearing_date=hearing_dt,
-            captured_at=captured_at_date,
-        )
+        with timing.phase("validation_ms"):
+            det_result = run_deterministic_rules(
+                ruling_text=cleaned_ruling_text,
+                case_number=case_number or f"UNKNOWN-{document_id}",
+                case_title=case_title,
+                hearing_date=hearing_dt,
+                captured_at=captured_at_date,
+            )
 
         if det_result.overall != "pass":
             logger.info(
@@ -2544,21 +2598,25 @@ class IngestionWorker:
         validation_result: ValidationResult | None = None
         if self._validation_enabled:
             hearing_date_str = str(hearing_dt) if hearing_dt else None
-            validation_result = validate_document(
-                ruling_text=cleaned_ruling_text,
-                case_number=case_number,
-                case_title=case_title,
-                judge_name=judge_name,
-                motion_type=motion_type,
-                outcome=outcome,
-                hearing_date=hearing_date_str,
-                department=department,
-                county=county,
-                client=self._validation_client,
-                # Provider intentionally omitted: validate_document falls
-                # through to LLM_PROVIDER env var (#4032).
-                timeout=self._llm_timeout,
-            )
+            # PHASE: validation_ms (LLM gate, #4116) — additive with the
+            # deterministic block above; same bucket so callers see total
+            # validation cost in one number.
+            with timing.phase("validation_ms"):
+                validation_result = validate_document(
+                    ruling_text=cleaned_ruling_text,
+                    case_number=case_number,
+                    case_title=case_title,
+                    judge_name=judge_name,
+                    motion_type=motion_type,
+                    outcome=outcome,
+                    hearing_date=hearing_date_str,
+                    department=department,
+                    county=county,
+                    client=self._validation_client,
+                    # Provider intentionally omitted: validate_document falls
+                    # through to LLM_PROVIDER env var (#4032).
+                    timeout=self._llm_timeout,
+                )
 
             logger.info(
                 "Validation gate result",
@@ -2725,6 +2783,12 @@ class IngestionWorker:
                 f"{content_hash}:ruling:{split_index}".encode()
             ).hexdigest()
 
+        # PHASE: db_write_ms (#4116) — boundary-marked rather than wrapped
+        # in a ``with timing.phase(...)`` to avoid re-indenting the ~170-
+        # line transaction body.  ``add_ms`` is called in the ``finally`` /
+        # ``except`` arms so a raised exception still records the time
+        # spent in the failed transaction.
+        _db_write_t0 = time.perf_counter()
         conn = self._get_connection()
         try:
             # 1. Ensure court exists
@@ -2899,7 +2963,9 @@ class IngestionWorker:
             conn.commit()
         except Exception:
             conn.rollback()
+            timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
             raise
+        timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
         # Index in OpenSearch.  For split rulings, always index (each split
         # gets its own OS entry keyed by the synthetic split document_id).

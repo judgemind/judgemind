@@ -206,6 +206,7 @@ from ingestion.db import (  # noqa: E402
     upsert_case,
     upsert_case_judge,
 )
+from ingestion.doc_timing import DocTiming, emit_via_structlog_logger  # noqa: E402
 from ingestion.extract import (  # noqa: E402
     dedupe_repeated_title,
     extract_case_number,
@@ -887,6 +888,13 @@ def _reparse_document(
     """
     _load_scraper_registry()
 
+    # Per-doc phase timing (#4116) — accumulated into the result dict so
+    # the main DB-write loop can pick them up via ``DocTiming.add_ms``
+    # without re-implementing parse/regex timing across the 3 reparse
+    # entry points.  ``regex_fallback_ms`` is filled in when
+    # ``_apply_regex_fallbacks`` runs (single chokepoint at line ~1196).
+    _parse_t0 = time.perf_counter()
+
     doc_format = doc_meta.get("format", "html")
     text = _extract_text_from_content(
         raw_content, doc_format, pdf_timeout=pdf_timeout
@@ -1018,6 +1026,10 @@ def _reparse_document(
                 extracted["ruling_text"] = section
         except Exception:
             pass  # Fall through to full-text extraction
+
+    # End of parse_document_ms phase (#4116) — captured before the LLM
+    # extraction call which has its own ``llm_latency_ms`` timer.
+    extracted["parse_document_ms"] = (time.perf_counter() - _parse_t0) * 1000.0
 
     # ------------------------------------------------------------------
     # LLM extraction — secondary method for missing fields
@@ -1190,7 +1202,9 @@ def _reparse_document(
     # Regex fallback — fill any fields still missing after scraper + LLM
     # ------------------------------------------------------------------
     extracted["extraction_methods"] = extraction_methods
+    _regex_t0 = time.perf_counter()
     _apply_regex_fallbacks(extracted, regex_text, scraper_id=scraper_id)
+    extracted["regex_fallback_ms"] = (time.perf_counter() - _regex_t0) * 1000.0
 
     if extraction_methods:
         logger.info(
@@ -1294,13 +1308,18 @@ def _full_reparse_document(
         result["is_split"] = False
         return [result]
 
-    # Extract text from the raw content (PDF or HTML)
+    # Extract text from the raw content (PDF or HTML).  ``parse_document_ms``
+    # in the split-doc path covers only the text extraction here — the
+    # downstream split function may invoke its own LLM call which is timed
+    # separately by the LLM extractor.
+    _split_parse_t0 = time.perf_counter()
     doc_format = doc_meta.get("format", "html")
     text = _extract_text_from_content(
         raw_content,
         doc_format,
         pdf_timeout=pdf_timeout,
     ).replace("\x00", "")
+    _split_parse_ms = (time.perf_counter() - _split_parse_t0) * 1000.0
 
     # Prefer LLM-based splitting when available — it produces higher-quality
     # ruling_text (e.g. full legal analyses instead of disposition summaries,
@@ -1507,10 +1526,19 @@ def _full_reparse_document(
         # Regex fallback — fill any fields still missing after split (#1749)
         # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
+        _regex_t0 = time.perf_counter()
         if extracted["ruling_text"]:
             _apply_regex_fallbacks(
                 extracted, extracted["ruling_text"], scraper_id=scraper_id
             )
+        extracted["regex_fallback_ms"] = (time.perf_counter() - _regex_t0) * 1000.0
+
+        # Attribute the doc-level parse_document_ms to the first ruling so
+        # the per-doc timing log captures the work-once cost; subsequent
+        # rulings within the same split see 0 for parse_document_ms but
+        # carry their own regex_fallback_ms.  The main DB-write loop
+        # accumulates across all extracted entries from the same doc.
+        extracted["parse_document_ms"] = _split_parse_ms if not results else 0.0
 
         results.append(extracted)
 
@@ -2023,6 +2051,7 @@ def _reparse_document_multimodal(
         # and case_title from page images.  Other fields (judge_name,
         # outcome, motion_type) may still be missing and can be filled
         # by regex extraction from the ruling text.
+        _regex_t0 = time.perf_counter()
         if extracted["ruling_text"]:
             _apply_regex_fallbacks(
                 extracted, extracted["ruling_text"], scraper_id=scraper_id
@@ -2038,6 +2067,11 @@ def _reparse_document_multimodal(
                 if val:
                     extracted["case_type"] = val
                     extracted["extraction_methods"].setdefault("case_type", "regex")
+        extracted["regex_fallback_ms"] = (time.perf_counter() - _regex_t0) * 1000.0
+        # Multimodal does not invoke pdfplumber; ``parse_document_ms`` is
+        # 0 for this path.  The multimodal LLM call itself is timed
+        # separately by ``LlmExtractor`` (#4116).
+        extracted["parse_document_ms"] = 0.0
 
         # LLM enrichment — fills outcome, motion_type, case_title, parties.
         # The multimodal transcription pipeline deliberately does NOT extract
@@ -2549,6 +2583,25 @@ def reingest_batch(
         doc_id_str = doc_meta["document_id"]
         court_id_str = doc_meta["court_id"]
 
+        # Per-doc phase timing (#4116).  Parse + regex_fallback ms are
+        # already accumulated on each entry of ``extracted_list`` by the
+        # parse functions; this loop adds them up and times its own
+        # validation_ms + db_write_ms boundaries.  ``timing.emit()`` runs
+        # exactly once per source document on every exit path (success,
+        # exception, deterministic-FAIL skip-this-ruling).
+        timing = DocTiming(
+            emit_via_structlog_logger(logger),
+            document_id=doc_id_str,
+            county=doc_meta.get("county"),
+            state=doc_meta.get("state"),
+            scraper_id=doc_meta.get("scraper_id"),
+        )
+        for _e in extracted_list:
+            if "parse_document_ms" in _e:
+                timing.add_ms("parse_document_ms", _e.pop("parse_document_ms"))
+            if "regex_fallback_ms" in _e:
+                timing.add_ms("regex_fallback_ms", _e.pop("regex_fallback_ms"))
+
         try:
             with conn.transaction():
                 # Check if this document was split into multiple rulings
@@ -2622,6 +2675,7 @@ def reingest_batch(
                         for num in sibling_case_numbers
                         if num and num != own_case_number
                     ]
+                    _val_t0 = time.perf_counter()
                     det_result = run_deterministic_rules(
                         ruling_text=extracted.get("ruling_text"),
                         case_number=own_case_number,
@@ -2629,6 +2683,10 @@ def reingest_batch(
                         hearing_date=det_hearing,
                         captured_at=captured_at_date,
                         other_case_numbers=other_nums or None,
+                    )
+                    timing.add_ms(
+                        "validation_ms",
+                        (time.perf_counter() - _val_t0) * 1000.0,
                     )
                     if det_result.overall != "pass":
                         logger.info(
@@ -2683,6 +2741,7 @@ def reingest_batch(
                         # Skip this ruling's DB write but continue with
                         # sibling rulings from the same document.
                         continue
+                    _db_t0 = time.perf_counter()
                     effective_case_number = (
                         extracted["case_number"]
                         or doc_meta["case_number"]
@@ -2811,6 +2870,9 @@ def reingest_batch(
                     batch_upsert_parties(
                         conn, new_case_id, extracted.get("parties", [])
                     )
+                    timing.add_ms(
+                        "db_write_ms", (time.perf_counter() - _db_t0) * 1000.0
+                    )
 
             conn.commit()
             updated += 1
@@ -2831,6 +2893,11 @@ def reingest_batch(
                 document_id=doc_id_str,
                 exc_info=True,
             )
+        finally:
+            # Emit the per-doc ``reingest_doc_timing`` log line on every
+            # exit path (commit success, exception, deterministic FAIL).
+            # Idempotent — DocTiming.emit guards against double-emission.
+            timing.emit()
 
     return {
         "processed": processed,
