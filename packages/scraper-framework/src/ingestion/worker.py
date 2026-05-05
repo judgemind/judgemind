@@ -677,6 +677,7 @@ class IngestionWorker:
         llm_provider: str | None = None,
         llm_model: str | None = None,
         llm_timeout: float | None = 60.0,
+        bust_llm_cache: bool = False,
     ) -> None:
         self._redis = redis_client
         self._pg_dsn = pg_dsn
@@ -684,6 +685,18 @@ class IngestionWorker:
         self._conn: psycopg.Connection | None = None
         self._s3_client = s3_client
         self._archive_bucket = archive_bucket
+        # When True, every LlmExtractor this worker constructs (multimodal +
+        # framework) is created with ``bust_cache=True``, so cache reads are
+        # skipped on every extraction call.  Cache *writes* still happen, so
+        # subsequent runs without the flag benefit from the fresh extraction.
+        # This is required by the ``reingest_from_s3.py --prefix
+        # --bust-llm-cache`` re-extract path (#4049): split-child documents
+        # cannot be re-extracted via DB-row mode (the ``is_split_child_id``
+        # guard correctly skips them to prevent the #2416 exponential
+        # explosion), so the only path to replay a fresh extraction onto an
+        # already-split parent PDF is the prefix-mode worker re-running over
+        # the parent S3 key with cache reads disabled.
+        self._bust_llm_cache: bool = bust_llm_cache
         self._indexer = IndexingConsumer(
             opensearch_client=opensearch_client,
             s3_client=s3_client,
@@ -835,8 +848,16 @@ class IngestionWorker:
         """
         if self._framework_extractor is None:
             try:
-                self._framework_extractor = LlmExtractor()
-                logger.info("Initialized framework LlmExtractor for LLM extraction path")
+                # ``bust_cache=self._bust_llm_cache`` propagates the worker's
+                # cache-bust intent into every extraction call this instance
+                # makes (#4049).
+                self._framework_extractor = LlmExtractor(
+                    bust_cache=self._bust_llm_cache,
+                )
+                logger.info(
+                    "Initialized framework LlmExtractor for LLM extraction path",
+                    extra={"bust_cache": self._bust_llm_cache},
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to initialize LlmExtractor — LLM extraction path unavailable: %s",
@@ -882,11 +903,18 @@ class IngestionWorker:
             # No county-specific token limit — use the legacy single-slot
             # cache, created with the LlmExtractor default of 4,096 tokens.
             try:
+                # ``bust_cache=self._bust_llm_cache`` propagates the worker's
+                # cache-bust intent into every multimodal extraction call
+                # (#4049).
                 self._multimodal_extractor = LlmExtractor(
                     provider="google",
                     model="gemini-2.5-flash-lite",
+                    bust_cache=self._bust_llm_cache,
                 )
-                logger.info("Initialized multimodal LlmExtractor (Google Flash Lite)")
+                logger.info(
+                    "Initialized multimodal LlmExtractor (Google Flash Lite)",
+                    extra={"bust_cache": self._bust_llm_cache},
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
@@ -898,15 +926,22 @@ class IngestionWorker:
         cache_key = max_output_tokens
         if cache_key not in self._multimodal_extractors:
             try:
+                # ``bust_cache=self._bust_llm_cache`` propagates the worker's
+                # cache-bust intent into every multimodal extraction call
+                # (#4049).
                 extractor = LlmExtractor(
                     provider="google",
                     model="gemini-2.5-flash-lite",
                     max_output_tokens=max_output_tokens,
+                    bust_cache=self._bust_llm_cache,
                 )
                 self._multimodal_extractors[cache_key] = extractor
                 logger.info(
                     "Initialized multimodal LlmExtractor (Google Flash Lite)",
-                    extra={"max_output_tokens": max_output_tokens},
+                    extra={
+                        "max_output_tokens": max_output_tokens,
+                        "bust_cache": self._bust_llm_cache,
+                    },
                 )
             except Exception as exc:
                 logger.warning(

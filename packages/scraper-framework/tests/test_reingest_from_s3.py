@@ -11724,3 +11724,249 @@ class TestMultimodalReingestPerChildExhaustion:
 
         # All 3 children must land — no re-raise.
         assert len(results) == 3
+
+
+# ---------------------------------------------------------------------------
+# #4049 — bust_llm_cache propagation through prefix mode.
+#
+# DB-row reingest (--multimodal --bust-llm-cache) correctly skips split-child
+# rows via the is_split_child_id guard at scripts/reingest_from_s3.py:2245-2253
+# to prevent the #2416 exponential explosion.  Once a parent PDF has been
+# split, the *only* path to re-extract those children with a fresh LLM call
+# is to re-process the parent S3 key in prefix mode with bust_llm_cache=True.
+# These tests verify the plumbing: --bust-llm-cache reaches the worker,
+# which in turn constructs LlmExtractor with bust_cache=True.
+# ---------------------------------------------------------------------------
+
+
+class TestProcessPrefixDocumentBustCachePropagation:
+    """``_process_prefix_document(bust_llm_cache=True)`` must construct
+    ``IngestionWorker`` with ``bust_llm_cache=True``."""
+
+    def _build_key(self, content: bytes) -> str:
+        """Build a content-addressed S3 key whose embedded hash matches
+        ``content``.  Avoids triggering the hash-mismatch warning path so
+        the test focuses on the bust_llm_cache plumbing only."""
+        return f"federal/federal/courtlistener/raw/{hashlib.sha256(content).hexdigest()}.html"
+
+    def test_propagates_true_to_worker_constructor(self) -> None:
+        content = b"<html>ok</html>"
+        key = self._build_key(content)
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = content
+        mock_s3.get_object.return_value = {"Body": body}
+
+        mock_worker = MagicMock()
+        mock_worker_cls = MagicMock(return_value=mock_worker)
+
+        # Clear cached worker to force re-creation.
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", mock_worker_cls),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+        ):
+            result = reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+                bust_llm_cache=True,
+            )
+
+        assert result["status"] == "ok"
+        mock_worker_cls.assert_called_once()
+        assert mock_worker_cls.call_args.kwargs.get("bust_llm_cache") is True
+
+    def test_default_is_false(self) -> None:
+        """Calling ``_process_prefix_document`` without the new kwarg keeps
+        the live worker cache semantics — backward-compatible default."""
+        content = b"<html>also ok</html>"
+        key = self._build_key(content)
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = content
+        mock_s3.get_object.return_value = {"Body": body}
+
+        mock_worker = MagicMock()
+        mock_worker_cls = MagicMock(return_value=mock_worker)
+
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", mock_worker_cls),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+        ):
+            reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+
+        mock_worker_cls.assert_called_once()
+        assert mock_worker_cls.call_args.kwargs.get("bust_llm_cache") is False
+
+
+class TestRunReingestFromPrefixBustCachePropagation:
+    """``run_reingest_from_prefix(bust_llm_cache=True)`` must propagate the
+    flag into every ``_process_prefix_document`` invocation submitted to
+    the process pool."""
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_propagates_true_to_each_submit(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {"status": "ok", "hash_mismatch": False}
+        future2 = MagicMock()
+        future2.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.side_effect = [future1, future2]
+
+        with patch("reingest_from_s3.as_completed", return_value=[future1, future2]):
+            reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+                bust_llm_cache=True,
+            )
+
+        assert pool.submit.call_count == 2
+        # Every submit must include bust_llm_cache=True as the trailing
+        # positional arg passed to _process_prefix_document.
+        for call in pool.submit.call_args_list:
+            assert call.args[0] is reingest._process_prefix_document
+            # Positional args: (fn, key, bucket, database_url, redis_url, os_url, bust_llm_cache)
+            assert call.args[6] is True
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_default_is_false(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Backward-compatibility: omitting ``bust_llm_cache`` from
+        ``run_reingest_from_prefix`` keeps the worker's default cache
+        semantics (cache reads enabled)."""
+        keys = ["federal/federal/courtlistener/raw/ccc333.html"]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future = MagicMock()
+        future.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.return_value = future
+
+        with patch("reingest_from_s3.as_completed", return_value=[future]):
+            reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=1,
+            )
+
+        assert pool.submit.call_count == 1
+        call = pool.submit.call_args_list[0]
+        assert call.args[6] is False
+
+
+class TestSplitChildGuardUntouched:
+    """Regression guard: the ``is_split_child_id`` skip at
+    ``scripts/reingest_from_s3.py:2245-2253`` must remain in place so the
+    DB-row ``--multimodal`` mode does NOT regress on the #2416 exponential
+    explosion.  This test reads the source code directly and asserts the
+    guard text is unchanged in shape.
+    """
+
+    def test_guard_present_in_source(self) -> None:
+        source_path = os.path.join(_SCRIPTS_DIR, "reingest_from_s3.py")
+        with open(source_path, encoding="utf-8") as fh:
+            source = fh.read()
+        # The guard's distinguishing line must remain present.
+        assert "Skipping split-child document in re-split mode" in source, (
+            "is_split_child_id guard removed — #2416 regression risk."
+        )
+        assert "is_split_child_id(doc_id_str, content_hash)" in source, (
+            "is_split_child_id guard signature changed — verify #4049 plumbing "
+            "did not regress the DB-row multimodal mode."
+        )

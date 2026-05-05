@@ -491,9 +491,12 @@ class TestMultimodalExtractorInit:
 
             result = worker._get_multimodal_extractor()
             assert result is mock_instance
+            # ``bust_cache`` is propagated from ``self._bust_llm_cache``,
+            # which defaults to False in this fixture.  See #4049.
             mock_cls.assert_called_once_with(
                 provider="google",
                 model="gemini-2.5-flash-lite",
+                bust_cache=False,
             )
 
     def test_lazy_init_caches(self) -> None:
@@ -534,10 +537,13 @@ class TestMultimodalExtractorInit:
 
             result = worker._get_multimodal_extractor(max_output_tokens=32768)
             assert result is mock_instance
+            # ``bust_cache`` is propagated from ``self._bust_llm_cache``,
+            # which defaults to False in this fixture.  See #4049.
             mock_cls.assert_called_once_with(
                 provider="google",
                 model="gemini-2.5-flash-lite",
                 max_output_tokens=32768,
+                bust_cache=False,
             )
 
     def test_different_max_output_tokens_gets_separate_instances(self) -> None:
