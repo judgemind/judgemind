@@ -30,6 +30,7 @@ GitHub / DB writes.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from datetime import UTC, datetime, timedelta
@@ -231,9 +232,12 @@ class TestResurrectionHappyPath:
         # _count_orphan_pr_resurrections fetchone — 0 prior attempts.
         conn.cursor_instance.fetch_queue.append((0,))
 
-        # Stub _fetch_pr_status to return the canonical green payload.
-        # PR #3391 is the live test case from the issue body.
-        d._fetch_pr_status = lambda pr: _pr_status_green()  # type: ignore[method-assign]
+        # Stub _fetch_pr_status_batch to return the canonical green
+        # payload for every requested PR (#3407 batched-fetch). PR
+        # #3391 is the live test case from the issue body.
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_green() for pr in prs
+        }
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -287,7 +291,9 @@ class TestResurrectionNegativePaths:
         conn.cursor_instance.fetchall_queue.append([("agent-closed", 999, 100)])
         conn.cursor_instance.fetch_queue.append((0,))
         # Closed/declined PRs come back as mergeable != 'MERGEABLE'.
-        d._fetch_pr_status = lambda pr: _pr_status_closed()  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_closed() for pr in prs
+        }
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -319,7 +325,9 @@ class TestResurrectionNegativePaths:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue.append([("agent-dirty", 888, 200)])
         conn.cursor_instance.fetch_queue.append((0,))
-        d._fetch_pr_status = lambda pr: _pr_status_dirty()  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_dirty() for pr in prs
+        }
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -352,7 +360,9 @@ class TestResurrectionNegativePaths:
             "headRefOid": "head-sha",
             "mergeCommit": None,
         }
-        d._fetch_pr_status = lambda pr: unknown_payload  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: unknown_payload for pr in prs
+        }
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -367,7 +377,9 @@ class TestResurrectionNegativePaths:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue.append([("agent-pending", 777, 300)])
         conn.cursor_instance.fetch_queue.append((0,))
-        d._fetch_pr_status = lambda pr: _pr_status_pending()  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_pending() for pr in prs
+        }
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -380,8 +392,9 @@ class TestResurrectionNegativePaths:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue.append([("agent-pr-view-fail", 666, 400)])
         conn.cursor_instance.fetch_queue.append((0,))
-        # _fetch_pr_status returns None on transient gh failure.
-        d._fetch_pr_status = lambda pr: None  # type: ignore[method-assign]
+        # _fetch_pr_status_batch returns ``{pr: None}`` on transient
+        # gh / GraphQL failure (#3407).
+        d._fetch_pr_status_batch = lambda prs: {pr: None for pr in prs}  # type: ignore[method-assign]
 
         n = d._resurrect_orphan_pr_agents()
 
@@ -407,20 +420,26 @@ class TestResurrectionNegativePaths:
             (daemon.ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS,)
         )
 
-        # Sentinel: _fetch_pr_status must NOT be called when budget
-        # check short-circuits. (Saves a gh API call.)
-        called: list[int] = []
+        # Sentinel: _fetch_pr_status_batch must NOT receive the
+        # budget-exhausted PR (saves it from the GraphQL alias list).
+        called: list[list[int]] = []
 
-        def boom(pr: int) -> dict[str, Any]:
-            called.append(pr)
-            return _pr_status_green()
+        def boom(prs: list[int]) -> dict[int, dict[str, Any] | None]:
+            called.append(list(prs))
+            return {pr: _pr_status_green() for pr in prs}
 
-        d._fetch_pr_status = boom  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = boom  # type: ignore[method-assign]
 
         n = d._resurrect_orphan_pr_agents()
 
         assert n == 0
-        assert called == [], "_fetch_pr_status should not be called past budget"
+        # _fetch_pr_status_batch is either skipped entirely (no
+        # eligible candidates) OR receives a list NOT containing
+        # the budget-exhausted PR. Either is acceptable.
+        for invocation in called:
+            assert 555 not in invocation, (
+                "budget-exhausted PR must NOT be in batched fetch"
+            )
         skipped = handler.events("orphan_pr_resurrection_skipped")
         assert skipped, "expected orphan_pr_resurrection_skipped"
         assert skipped[0].reason == "budget_exhausted"
@@ -429,10 +448,10 @@ class TestResurrectionNegativePaths:
 
     def test_count_failed_skips_candidate_no_resurrection(self, tmp_path: Path) -> None:
         """When _count_orphan_pr_resurrections returns None (DB error),
-        the candidate must be skipped without calling _fetch_pr_status
-        (no wasted gh API call) and without any resurrection DB write.
-        A distinct orphan_pr_resurrection_skipped event with
-        reason='count_failed' must be logged (#3427).
+        the candidate must be skipped without batch-fetching its PR
+        status (no wasted GraphQL call) and without any resurrection
+        DB write. A distinct orphan_pr_resurrection_skipped event with
+        reason='count_failed' must be logged (#3427, #3407).
         """
         d, conn, handler = _make_daemon(tmp_path)
 
@@ -442,21 +461,23 @@ class TestResurrectionNegativePaths:
         # Force _count_orphan_pr_resurrections to return None.
         d._count_orphan_pr_resurrections = lambda agent_id: None  # type: ignore[method-assign]
 
-        # Sentinel: _fetch_pr_status must NOT be called.
-        pr_status_calls: list[int] = []
+        # Sentinel: _fetch_pr_status_batch must NOT include the
+        # count-failed PR.
+        pr_status_calls: list[list[int]] = []
 
-        def fetch_pr_sentinel(pr: int) -> dict[str, Any]:
-            pr_status_calls.append(pr)
-            return _pr_status_green()
+        def fetch_pr_sentinel(prs: list[int]) -> dict[int, dict[str, Any] | None]:
+            pr_status_calls.append(list(prs))
+            return {pr: _pr_status_green() for pr in prs}
 
-        d._fetch_pr_status = fetch_pr_sentinel  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = fetch_pr_sentinel  # type: ignore[method-assign]
 
         n = d._resurrect_orphan_pr_agents()
 
         assert n == 0, "no resurrection expected"
-        assert pr_status_calls == [], (
-            "_fetch_pr_status must NOT be called on count_failed"
-        )
+        for invocation in pr_status_calls:
+            assert 444 not in invocation, (
+                "_fetch_pr_status_batch must NOT include count_failed PR"
+            )
         # No resurrection event.
         assert handler.events("agent_resurrected_for_orphan_pr") == []
         # Distinct skip event with count_failed reason.
@@ -476,14 +497,20 @@ class TestResurrectionNegativePaths:
         # SELECT returns no rows.
         conn.cursor_instance.fetchall_queue.append([])
 
-        # Sentinel: _fetch_pr_status must NOT be called.
-        called: list[int] = []
-        d._fetch_pr_status = lambda pr: called.append(pr) or None  # type: ignore[method-assign]
+        # Sentinel: _fetch_pr_status_batch must NOT be called when
+        # there are no candidates.
+        called: list[list[int]] = []
+
+        def fetch_sentinel(prs: list[int]) -> dict[int, dict[str, Any] | None]:
+            called.append(list(prs))
+            return {}
+
+        d._fetch_pr_status_batch = fetch_sentinel  # type: ignore[method-assign]
 
         n = d._resurrect_orphan_pr_agents()
 
         assert n == 0
-        assert called == []
+        assert called == [], "_fetch_pr_status_batch must NOT be called"
         assert handler.events("agent_resurrected_for_orphan_pr") == []
         assert handler.events("orphan_pr_resurrection_skipped") == []
 
@@ -769,3 +796,515 @@ class TestDbErrorPaths:
 
         assert rows == []
         assert handler.events("orphan_pr_list_failed")
+
+
+# --------------------------------------------------------------------------
+# Issue #3407 — batched gh pr view + candidate cap
+# --------------------------------------------------------------------------
+
+
+class TestBatchedFetchInvariants:
+    """The orphan-PR resurrection sweep must issue ONE batched fetch
+    per supervisor tick instead of N per-PR ``gh pr view`` calls. The
+    pre-fix sweep took ~27s/tick at the 24h-lookback default with
+    20-30 candidates; one batched GraphQL roundtrip is the surgical
+    fix described in the issue body's "fix shape #1".
+    """
+
+    def test_constant_max_orphan_pr_batch_size(self) -> None:
+        # Candidate cap must exist and be a sensible bound — small
+        # enough to keep the GraphQL query under GitHub's 500-node
+        # limit (one alias per PR), large enough to absorb the
+        # observed 20-30-row 24h-lookback steady state.
+        assert daemon.MAX_ORPHAN_PR_BATCH_SIZE >= 20
+        assert daemon.MAX_ORPHAN_PR_BATCH_SIZE <= 100
+
+    def test_batched_fetch_called_exactly_once_per_sweep(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        # 5 eligible candidates — the batched contract is "one
+        # invocation regardless of N".
+        rows = [(f"agent-{i}", 1000 + i, 2000 + i) for i in range(5)]
+        conn.cursor_instance.fetchall_queue.append(rows)
+        # 5 budget-count fetchones, all 0.
+        for _ in range(5):
+            conn.cursor_instance.fetch_queue.append((0,))
+
+        invocations: list[list[int]] = []
+
+        def batched_fetch(prs: list[int]) -> dict[int, dict[str, Any] | None]:
+            invocations.append(list(prs))
+            # All green — every candidate resurrects.
+            return {pr: _pr_status_green() for pr in prs}
+
+        d._fetch_pr_status_batch = batched_fetch  # type: ignore[method-assign]
+
+        n = d._resurrect_orphan_pr_agents()
+
+        assert n == 5, "all five candidates should resurrect"
+        assert len(invocations) == 1, (
+            "batched fetch must be called once per sweep, not N times"
+        )
+        assert sorted(invocations[0]) == [1000, 1001, 1002, 1003, 1004]
+
+    def test_per_call_fetch_pr_status_not_invoked_in_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        """Sentinel — :meth:`_fetch_pr_status` (the per-call helper)
+        must not be reachable from the resurrection sweep after the
+        #3407 batched-fetch refactor. Calling the per-call helper
+        would spawn one ``gh pr view`` subprocess per candidate, which
+        is exactly the failure mode the issue describes."""
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        rows = [(f"agent-{i}", 5000 + i, 6000 + i) for i in range(3)]
+        conn.cursor_instance.fetchall_queue.append(rows)
+        for _ in range(3):
+            conn.cursor_instance.fetch_queue.append((0,))
+
+        per_call_invocations: list[int] = []
+
+        def boom_per_call(pr_number: int) -> dict[str, Any] | None:
+            per_call_invocations.append(pr_number)
+            return _pr_status_green()
+
+        d._fetch_pr_status = boom_per_call  # type: ignore[method-assign]
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_green() for pr in prs
+        }
+
+        d._resurrect_orphan_pr_agents()
+
+        assert per_call_invocations == [], (
+            "_fetch_pr_status MUST NOT be called from the sweep — "
+            "use _fetch_pr_status_batch instead"
+        )
+
+    def test_30_candidate_sweep_completes_under_5s(self, tmp_path: Path) -> None:
+        """Acceptance criterion #3 from issue #3407: simulate 30
+        candidate orphan-PR rows; sweep completes within 5s with
+        mocked gh calls.
+
+        The pre-fix sweep was ~27s for ~25 rows (one ``gh pr view``
+        per row at ~1s wall-clock). After the refactor a single
+        mocked batched fetch returns instantly, so the realistic
+        expectation is sub-100ms — but the AC's 5s threshold is the
+        operator-visible bound the supervisor tick must stay under.
+        """
+        import time as _time  # local import to keep test isolation
+
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        n_candidates = 30
+        rows = [(f"agent-{i}", 7000 + i, 8000 + i) for i in range(n_candidates)]
+        conn.cursor_instance.fetchall_queue.append(rows)
+        for _ in range(n_candidates):
+            conn.cursor_instance.fetch_queue.append((0,))
+
+        # All-green batched response. The real call would issue one
+        # GraphQL HTTP request — about 200-400ms in production. The
+        # test mocks it as instant.
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_green() for pr in prs
+        }
+
+        start = _time.monotonic()
+        n = d._resurrect_orphan_pr_agents()
+        elapsed = _time.monotonic() - start
+
+        assert n == n_candidates, "all 30 candidates should resurrect"
+        # 5s threshold from the issue's AC. The actual measured time
+        # should be well under 1s; the threshold provides headroom for
+        # CI-runner noise without being so loose it permits a regression.
+        assert elapsed < 5.0, f"30-candidate sweep took {elapsed:.2f}s — exceeds 5s AC"
+
+
+class TestBatchCapEnforcement:
+    """When the candidate set is larger than
+    :data:`MAX_ORPHAN_PR_BATCH_SIZE`, the sweep must drop the excess
+    rows (with an audit log line per drop) rather than letting the
+    GraphQL alias list grow unboundedly. The SELECT order
+    (``ended_at DESC``) keeps the most-recent failures in scope."""
+
+    def test_excess_candidates_emit_batch_cap_exceeded_skip(
+        self, tmp_path: Path
+    ) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+
+        # 5 over the cap — these should be skipped with the new reason.
+        n_candidates = daemon.MAX_ORPHAN_PR_BATCH_SIZE + 5
+        rows = [(f"agent-{i}", 9000 + i, 10000 + i) for i in range(n_candidates)]
+        conn.cursor_instance.fetchall_queue.append(rows)
+        for _ in range(n_candidates):
+            conn.cursor_instance.fetch_queue.append((0,))
+
+        d._fetch_pr_status_batch = lambda prs: {  # type: ignore[method-assign]
+            pr: _pr_status_green() for pr in prs
+        }
+
+        n = d._resurrect_orphan_pr_agents()
+
+        # Only the first MAX_ORPHAN_PR_BATCH_SIZE rows resurrected.
+        assert n == daemon.MAX_ORPHAN_PR_BATCH_SIZE
+        # The 5 excess rows each get a skip-event with the new reason.
+        skipped = handler.events("orphan_pr_resurrection_skipped")
+        cap_skips = [
+            s for s in skipped if getattr(s, "reason", None) == "batch_cap_exceeded"
+        ]
+        assert len(cap_skips) == 5, (
+            f"expected 5 batch_cap_exceeded skips, got {len(cap_skips)}"
+        )
+        # The CloudWatch event carries max_batch_size for operator
+        # readability so they can check the cap from the log alone.
+        assert cap_skips[0].max_batch_size == daemon.MAX_ORPHAN_PR_BATCH_SIZE
+
+    def test_batched_fetch_receives_at_most_max_batch_size_prs(
+        self, tmp_path: Path
+    ) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        n_candidates = daemon.MAX_ORPHAN_PR_BATCH_SIZE + 10
+        rows = [(f"agent-{i}", 11000 + i, 12000 + i) for i in range(n_candidates)]
+        conn.cursor_instance.fetchall_queue.append(rows)
+        for _ in range(n_candidates):
+            conn.cursor_instance.fetch_queue.append((0,))
+
+        invocations: list[list[int]] = []
+
+        def batched_fetch(prs: list[int]) -> dict[int, dict[str, Any] | None]:
+            invocations.append(list(prs))
+            return {pr: _pr_status_green() for pr in prs}
+
+        d._fetch_pr_status_batch = batched_fetch  # type: ignore[method-assign]
+
+        d._resurrect_orphan_pr_agents()
+
+        assert len(invocations) == 1
+        # The batched fetch sees only the first cap-many PRs.
+        assert len(invocations[0]) == daemon.MAX_ORPHAN_PR_BATCH_SIZE
+
+
+# --------------------------------------------------------------------------
+# _fetch_pr_status_batch — single subprocess, GraphQL shape, normalization
+# --------------------------------------------------------------------------
+
+
+class TestFetchPrStatusBatch:
+    def test_empty_input_returns_empty_dict_no_subprocess(self, tmp_path: Path) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        # Sentinel: no subprocess wrapper invoked when input is empty.
+        d._subprocess_with_retry = lambda *_a, **_k: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("subprocess must NOT be called for empty input")
+        )
+
+        result = d._fetch_pr_status_batch([])
+
+        assert result == {}
+
+    def test_single_subprocess_for_many_prs(self, tmp_path: Path) -> None:
+        """The whole point of #3407 — one subprocess call regardless
+        of PR count."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        invocations: list[list[str]] = []
+
+        # Build a synthetic GraphQL response for 25 PRs.
+        pr_numbers = list(range(100, 125))
+
+        def fake_run(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            invocations.append(cmd)
+            assert event_name == "pr_view_batch", "uses dedicated event name"
+            # Build a fake gh api graphql response.
+            repo_data = {}
+            for n in pr_numbers:
+                repo_data[f"pr{n}"] = {
+                    "number": n,
+                    "state": "OPEN",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "mergedAt": None,
+                    "headRefOid": f"sha-{n}",
+                    "mergeCommit": None,
+                    "commits": {
+                        "nodes": [
+                            {
+                                "commit": {
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "nodes": [
+                                                {
+                                                    "__typename": "CheckRun",
+                                                    "name": "ci-passed",
+                                                    "status": "COMPLETED",
+                                                    "conclusion": "SUCCESS",
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                }
+            payload = {"data": {"repository": repo_data}}
+
+            class _Result:
+                stdout = json.dumps(payload)
+
+            return {"ok": True, "result": _Result(), "attempts": 1}
+
+        d._subprocess_with_retry = fake_run  # type: ignore[method-assign]
+
+        result = d._fetch_pr_status_batch(pr_numbers)
+
+        # ONE subprocess invocation regardless of N.
+        assert len(invocations) == 1
+        # The cmd is a `gh api graphql` invocation with a query
+        # containing one alias per PR.
+        cmd = invocations[0]
+        assert cmd[:3] == ["gh", "api", "graphql"]
+        assert cmd[3] == "-f"
+        query = cmd[4].removeprefix("query=")
+        for n in pr_numbers:
+            assert f"pr{n}: pullRequest(number: {n})" in query
+
+        # Per-PR shape mirrors `_fetch_pr_status` so the existing
+        # classifier (transition_from_awaiting_ci) consumes it
+        # without changes.
+        assert set(result.keys()) == set(pr_numbers)
+        for n in pr_numbers:
+            payload = result[n]
+            assert payload is not None
+            assert payload["state"] == "OPEN"
+            assert payload["mergeable"] == "MERGEABLE"
+            assert payload["mergeStateStatus"] == "CLEAN"
+            # CheckRun translated to gh-pr-view shape.
+            assert payload["statusCheckRollup"] == [
+                {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+
+    def test_subprocess_failure_returns_all_none(self, tmp_path: Path) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        # _subprocess_with_retry returns ok=False on exhausted retries.
+        d._subprocess_with_retry = lambda *_a, **_k: {  # type: ignore[method-assign]
+            "ok": False,
+            "reason": "timeout",
+            "stderr_tail": "",
+            "exit_code": None,
+            "attempts": 3,
+        }
+
+        result = d._fetch_pr_status_batch([100, 200, 300])
+
+        assert result == {100: None, 200: None, 300: None}
+
+    def test_unparseable_json_returns_all_none(self, tmp_path: Path) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        class _Result:
+            stdout = "{not json"
+
+        d._subprocess_with_retry = lambda *_a, **_k: {  # type: ignore[method-assign]
+            "ok": True,
+            "result": _Result(),
+            "attempts": 1,
+        }
+
+        result = d._fetch_pr_status_batch([100, 200])
+
+        assert result == {100: None, 200: None}
+        assert handler.events("pr_view_batch_invalid_json")
+
+    def test_missing_repository_data_returns_all_none(self, tmp_path: Path) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        class _Result:
+            # Valid JSON but no data.repository — treated as transient
+            # like in _fetch_blocker_titles.
+            stdout = json.dumps({"data": {}})
+
+        d._subprocess_with_retry = lambda *_a, **_k: {  # type: ignore[method-assign]
+            "ok": True,
+            "result": _Result(),
+            "attempts": 1,
+        }
+
+        result = d._fetch_pr_status_batch([100, 200])
+
+        assert result == {100: None, 200: None}
+        assert handler.events("pr_view_batch_missing_data")
+
+    def test_alias_null_for_one_pr_returns_none_for_only_that_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """A specific PR may have been deleted; the alias resolves to
+        null while the rest of the batch returns valid data. The
+        deleted PR's slot must be ``None``; the others must carry
+        their normalized payloads."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        class _Result:
+            stdout = json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "pr100": None,  # deleted
+                            "pr200": {
+                                "number": 200,
+                                "state": "OPEN",
+                                "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN",
+                                "mergedAt": None,
+                                "headRefOid": "sha-200",
+                                "mergeCommit": None,
+                                "commits": {
+                                    "nodes": [
+                                        {
+                                            "commit": {
+                                                "statusCheckRollup": {
+                                                    "contexts": {
+                                                        "nodes": [
+                                                            {
+                                                                "__typename": "CheckRun",
+                                                                "name": "ci-passed",
+                                                                "status": "COMPLETED",
+                                                                "conclusion": "SUCCESS",
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                },
+                            },
+                        }
+                    }
+                }
+            )
+
+        d._subprocess_with_retry = lambda *_a, **_k: {  # type: ignore[method-assign]
+            "ok": True,
+            "result": _Result(),
+            "attempts": 1,
+        }
+
+        result = d._fetch_pr_status_batch([100, 200])
+
+        assert result[100] is None
+        assert result[200] is not None
+        assert result[200]["state"] == "OPEN"
+
+
+class TestNormalizeGraphqlPrPayload:
+    """Direct tests for the GraphQL-to-gh-pr-view shape normalizer.
+    Both CheckRun and StatusContext discriminator paths must round-
+    trip through the same gh-pr-view-shaped output the existing
+    classifier consumes."""
+
+    def test_check_run_node_normalized(self) -> None:
+        node = {
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": None,
+            "headRefOid": "head-sha",
+            "mergeCommit": None,
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "statusCheckRollup": {
+                                "contexts": {
+                                    "nodes": [
+                                        {
+                                            "__typename": "CheckRun",
+                                            "name": "ci-passed",
+                                            "status": "COMPLETED",
+                                            "conclusion": "SUCCESS",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+        }
+        out = daemon._normalize_graphql_pr_payload(node)
+        assert out["state"] == "OPEN"
+        assert out["mergeable"] == "MERGEABLE"
+        assert out["mergeStateStatus"] == "CLEAN"
+        assert out["mergeCommit"] is None
+        assert out["statusCheckRollup"] == [
+            {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ]
+
+    def test_status_context_node_normalized(self) -> None:
+        node = {
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": None,
+            "headRefOid": "head-sha",
+            "mergeCommit": None,
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "statusCheckRollup": {
+                                "contexts": {
+                                    "nodes": [
+                                        {
+                                            "__typename": "StatusContext",
+                                            "context": "vercel/preview",
+                                            "state": "SUCCESS",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+        }
+        out = daemon._normalize_graphql_pr_payload(node)
+        assert out["statusCheckRollup"] == [
+            {"context": "vercel/preview", "state": "SUCCESS"}
+        ]
+
+    def test_merge_commit_oid_normalized(self) -> None:
+        node = {
+            "state": "MERGED",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": "2026-04-26T03:00:00Z",
+            "headRefOid": "head-sha",
+            "mergeCommit": {"oid": "merge-sha"},
+            "commits": {"nodes": []},
+        }
+        out = daemon._normalize_graphql_pr_payload(node)
+        assert out["mergeCommit"] == {"oid": "merge-sha"}
+        assert out["state"] == "MERGED"
+        assert out["mergedAt"] == "2026-04-26T03:00:00Z"
+        # Empty commits.nodes → empty rollup, NOT a crash.
+        assert out["statusCheckRollup"] == []
+
+    def test_missing_fields_default_to_none_or_empty(self) -> None:
+        # Defensive — GraphQL may omit fields under transient errors.
+        out = daemon._normalize_graphql_pr_payload({})
+        assert out["state"] is None
+        assert out["mergeable"] is None
+        assert out["mergeStateStatus"] is None
+        assert out["mergedAt"] is None
+        assert out["headRefOid"] is None
+        assert out["mergeCommit"] is None
+        assert out["statusCheckRollup"] == []
