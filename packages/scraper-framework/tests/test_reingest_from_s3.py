@@ -462,6 +462,105 @@ class TestReparseDocumentNulBytes:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — DB format='txt' regression (#4122)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentDbFormatTxt:
+    """Regression coverage for #4122.
+
+    The DB ``derived.documents.format`` enum stores ``'txt'`` while the
+    Python ``ContentFormat`` enum spells the textual format ``'text'``.
+    Pre-fix, the bare ``ContentFormat(doc_meta["format"])`` constructor
+    at lines 927/1391/1921 of ``scripts/reingest_from_s3.py`` raised
+    ``ValueError: 'txt' is not a valid ContentFormat`` for every Federal
+    CourtListener ``.txt`` document — silently swallowed by the
+    surrounding ``except Exception:`` block.  The fix routes all three
+    sites through ``ContentFormat.from_db_value`` which maps
+    ``'txt'`` → ``ContentFormat.TEXT``.
+
+    These tests assert that ``_reparse_document`` runs ``parse_document``
+    end-to-end on a ``format='txt'`` ``doc_meta`` (no silent fallback),
+    which is the integration-level guarantee the line 927 site needs.
+    The other two call sites (1391, 1921) are mechanically identical and
+    covered by the unit-level test at ``tests/test_models.py``.
+    """
+
+    def _doc_meta(self) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "Federal",
+            "county": "Federal",
+            "court_name": "CourtListener",
+            "source_url": "https://www.courtlistener.com/opinion/9e269fb7/",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            # 'txt' is the DB enum value (matches the document_format
+            # SQL enum); pre-fix this string raised ValueError when fed
+            # straight into the ContentFormat constructor.
+            "format": "txt",
+            "case_number": "1:25-cv-00001",
+            "case_title": "State v. Evans",
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "federal-courtlistener-opinions",
+            "s3_key": "federal/federal/courtlistener/raw/abc123.txt",
+            "s3_bucket": "test-bucket",
+        }
+
+    def test_format_txt_runs_scraper_parse_document_without_value_error(
+        self,
+    ) -> None:
+        """``format='txt'`` must reach ``parse_document`` — not the
+        ``except Exception`` fallback path.
+
+        Pre-fix, ``CapturedDocument(... content_format=ContentFormat('txt'))``
+        raised ``ValueError`` and the scraper's ``parse_document`` was
+        never invoked.  We assert the mock's ``parse_document`` is
+        called exactly once, and that the parsed fields propagate into
+        the returned ``extracted`` dict — proving the wiring at line 927
+        of ``scripts/reingest_from_s3.py`` works for the txt format.
+        """
+        raw = b"OPINION OF THE COURT\n\nThe judgment of conviction is AFFIRMED.\n"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = (
+            "OPINION OF THE COURT\n\nThe judgment of conviction is AFFIRMED.\n"
+        )
+        mock_parsed.case_number = "1:25-cv-00001"
+        # Simulate the #3970 mapper — case_name_full populated, so the
+        # scraper-emitted title is the full caption rather than the
+        # surname-only short form that AC#2 of #3978 measures.
+        mock_parsed.case_title = "State v. Evans"
+        mock_parsed.judge_name = None
+        mock_parsed.outcome = None
+        mock_parsed.motion_type = None
+        mock_parsed.department = None
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["federal-courtlistener-opinions"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(
+                raw,
+                "federal-courtlistener-opinions",
+                self._doc_meta(),
+            )
+            # parse_document MUST have run — pre-fix this was zero.
+            assert mock_scraper_cls.return_value.parse_document.call_count == 1
+            # The parsed full-caption title must propagate into the result.
+            # Pre-fix the regex fallback path produced None (or the
+            # surname-only DB value), never the parser's full caption.
+            assert result["case_title"] == "State v. Evans"
+            # And the extraction-method label must reflect that the
+            # scraper actually ran.
+            assert result["extraction_methods"].get("case_title") == "scraper"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("federal-courtlistener-opinions", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — stored_ruling_text format awareness (#2360)
 # ---------------------------------------------------------------------------
 
