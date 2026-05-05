@@ -685,6 +685,44 @@ If `mergeable` is `MERGEABLE`, `ci-passed` is `SUCCESS`, and nothing is `FAILURE
 gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 ```
 
+**Fallback — `gh pr merge` rejects with `base branch policy prohibits the merge` (#4058).**
+
+`gh pr merge` runs a stricter pre-flight than the underlying REST API: it consults `mergeStateStatus` (and a few related fields) directly and refuses to call `PUT /repos/.../pulls/N/merge` whenever GitHub returns `BLOCKED` — even when the actual branch-protection requirements are satisfied. The most common trigger is a phantom rollup entry: a check that *registered* on the SHA but never *reported* a final conclusion (the rollup shows `{"name": null, "conclusion": null, "status": null}` or `{"conclusion": ""}`). The phantom is enough to push `mergeStateStatus` to `BLOCKED` and trip `gh pr merge`, but it is **not** a real branch-protection failure — the REST `PUT /merge` endpoint accepts the same SHA without complaint. `gh pr merge --auto` is also not a workaround on this repo: GitHub returns "Auto merge is not allowed for this repository."
+
+**Use the API-merge fallback only when the canonical merge gate above is green** — i.e. all three of:
+
+1. `mergeable == MERGEABLE`, AND
+2. The required `ci-passed` check has `conclusion: SUCCESS` on its latest run, AND
+3. No *latest* check has `conclusion: FAILURE`.
+
+If those three are green and `gh pr merge --squash --delete-branch` rejects with stderr containing `base branch policy prohibits the merge`, fall through to the REST API. Both calls below are write operations — they stay on `gh` (no MCP equivalents):
+
+```
+gh api /repos/judgemind/judgemind/pulls/<PR-N>/merge -X PUT -f merge_method=squash
+gh api /repos/judgemind/judgemind/git/refs/heads/<branch-name> -X DELETE
+```
+
+The first call performs the squash-merge; on success its JSON response includes `{"merged": true, "message": "Pull Request successfully merged", "sha": "..."}`. The second call deletes the head branch — `gh pr merge --delete-branch` does this automatically, the API path does not, so it is a separate explicit call. `<branch-name>` is the PR's `headRefName` from `mcp__github__get_pull_request` (the worktree branch — typically `worktree-agent-<id>` or the original ralph branch name).
+
+If the canonical merge gate above is **not** green, do NOT use this fallback — diagnose the failing check first. The fallback is for the phantom-rollup case where the API is willing but `gh pr merge` is not, not for bypassing real CI failures or branch-protection requirements.
+
+A worked example from #4053 (the PR that surfaced #4058):
+
+```
+$ gh pr merge 4053 --squash --delete-branch
+X Pull request judgemind/judgemind#4053 is not mergeable: the base branch policy prohibits the merge.
+
+$ gh pr view 4053 --json mergeable,mergeStateStatus --jq '{mergeable, mergeStateStatus}'
+{"mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE"}
+
+$ gh api /repos/judgemind/judgemind/pulls/4053/merge -X PUT -f merge_method=squash
+{"merged":true,"message":"Pull Request successfully merged","sha":"00396b68..."}
+
+$ gh api /repos/judgemind/judgemind/git/refs/heads/worktree-agent-... -X DELETE
+```
+
+The dispatcher daemon takes a *different* path for this same failure mode — it pushes an empty commit to force a fresh rollup evaluation and re-enters `awaiting_ci` (#2641, see `docs/specs/dispatcher-v2-spec.md` §"Merge-phase stale-rollup auto-unstick"). That path exists because the daemon must drive the phase machine forward without operator intervention; the `/task` interactive path can take the simpler API-merge shortcut because the agent has already verified the canonical gate is green.
+
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
 **Release the label interlock (label-only flow, #2927).** Remove the `status/in-progress` label so the daemon can see the issue as terminal and (on future reopens) pick it up again. Run this *before* A.8 deploy-watch so the signal releases promptly even if deploy verification drags:
