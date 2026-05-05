@@ -39,6 +39,15 @@ import {
   validate,
   type DocumentNode,
 } from 'graphql';
+// ESM-default import in this test file (the production wiring in
+// `app.ts` uses the `/cjs` subpath — see the note there). The test
+// builds its schema with `buildSchema(typeDefs)` via the test-realm
+// `graphql` import, and we run the rule against that same-realm
+// schema; both call sites end up in vitest's ESM graphql realm, which
+// is internally consistent and lets us pin algorithm correctness.
+// Production traffic goes through Apollo Server (CJS realm) + the
+// `/cjs` import, which is verified by the existing
+// `tests/graphql-dos-limits.unit.test.ts` integration-style suite.
 import {
   createComplexityRule,
   getComplexity,
@@ -341,7 +350,15 @@ describe('cost-rule-estimator — AC1 grep guard', () => {
     const appPath = resolve(__dirname, '..', 'app.ts');
     const src = readFileSync(appPath, 'utf8');
     expect(src).not.toContain(FORBIDDEN_PACKAGE);
-    // Sanity: the new import is in place.
+  });
+
+  it('cost-limit-plugin.ts uses the new cost-rule library', () => {
+    // The cost cap is now enforced by `costLimitPlugin` which lives in
+    // `cost-limit-plugin.ts`. The import there must be the maintained
+    // replacement library.
+    const pluginPath = resolve(__dirname, 'cost-limit-plugin.ts');
+    const src = readFileSync(pluginPath, 'utf8');
     expect(src).toContain(NEW_PACKAGE);
+    expect(src).not.toContain(FORBIDDEN_PACKAGE);
   });
 });

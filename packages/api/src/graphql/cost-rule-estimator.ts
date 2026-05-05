@@ -34,17 +34,25 @@
  *
  * Defaults match the old library's defaults (the call site in `app.ts`
  * never overrode them).
+ *
+ * Realm-safety note: graphql-js maintains separate class identities
+ * across its CJS and ESM builds (the `instanceOf` helper at
+ * `graphql/jsutils/instanceOf.mjs` even throws when both realms have
+ * loaded). Vitest's ESM loader can resolve `graphql` and
+ * `graphql/index.mjs` as distinct module instances, which makes
+ * `field.type instanceof GraphQLObjectType` return `false` even when
+ * the type IS structurally an object type — leaking 0-cost back into
+ * the walker. We sidestep this by reading `Symbol.toStringTag` on the
+ * type, which is stable across realms (graphql-js sets it on every
+ * type class).
  */
 
-import {
-  GraphQLInterfaceType,
-  GraphQLList,
-  GraphQLNonNull,
-  GraphQLObjectType,
-  GraphQLUnionType,
-  type GraphQLOutputType,
-} from 'graphql';
-import type { ComplexityEstimator } from 'graphql-query-complexity';
+import type { GraphQLOutputType } from 'graphql';
+// Type-only import — we never import a value from
+// `graphql-query-complexity` here, so the realm question is moot for
+// this file. The signature comes from the same `/cjs` subpath the
+// production wiring uses, for consistency.
+import type { ComplexityEstimator } from 'graphql-query-complexity/cjs';
 
 /**
  * Cost of one scalar / enum / `__typename` leaf, before list factor is
@@ -68,6 +76,22 @@ export const OBJECT_COST = 0;
 export const LIST_FACTOR = 10;
 
 /**
+ * Read `Symbol.toStringTag` on a type, falling back to the
+ * constructor name. graphql-js sets `[Symbol.toStringTag]` on every
+ * type class (e.g. `'GraphQLNonNull'`, `'GraphQLList'`,
+ * `'GraphQLObjectType'`), so this is a realm-stable discriminator —
+ * unlike `instanceof`, which is bound to a specific realm's class
+ * identity.
+ */
+function typeTag(t: unknown): string | undefined {
+  if (t == null || typeof t !== 'object') return undefined;
+  const sym = (t as { [Symbol.toStringTag]?: string })[Symbol.toStringTag];
+  if (typeof sym === 'string') return sym;
+  const ctor = (t as { constructor?: { name?: string } }).constructor;
+  return ctor?.name;
+}
+
+/**
  * Unwrap `NonNull`/`List` wrappers and return the named (innermost)
  * type plus the cumulative list-factor multiplier picked up along the
  * way. `NonNull` does not affect the factor; each `List` multiplies it
@@ -77,11 +101,15 @@ function unwrapType(
   type: GraphQLOutputType,
   factor: number = 1,
 ): { named: GraphQLOutputType; factor: number } {
-  if (type instanceof GraphQLNonNull) {
-    return unwrapType(type.ofType, factor);
+  const tag = typeTag(type);
+  if (tag === 'GraphQLNonNull') {
+    return unwrapType((type as unknown as { ofType: GraphQLOutputType }).ofType, factor);
   }
-  if (type instanceof GraphQLList) {
-    return unwrapType(type.ofType, factor * LIST_FACTOR);
+  if (tag === 'GraphQLList') {
+    return unwrapType(
+      (type as unknown as { ofType: GraphQLOutputType }).ofType,
+      factor * LIST_FACTOR,
+    );
   }
   return { named: type, factor };
 }
@@ -94,10 +122,11 @@ function unwrapType(
  * this PR).
  */
 function leafFieldCost(named: GraphQLOutputType): number {
+  const tag = typeTag(named);
   if (
-    named instanceof GraphQLObjectType ||
-    named instanceof GraphQLInterfaceType ||
-    named instanceof GraphQLUnionType
+    tag === 'GraphQLObjectType' ||
+    tag === 'GraphQLInterfaceType' ||
+    tag === 'GraphQLUnionType'
   ) {
     return OBJECT_COST;
   }
@@ -105,9 +134,10 @@ function leafFieldCost(named: GraphQLOutputType): number {
 }
 
 /**
- * The estimator wired into `createComplexityRule({ estimators: [...] })`.
- * Returns a number for every Field — never returns `void` — because we
- * want this to be the only estimator (no fallthrough to simpleEstimator).
+ * The estimator wired into `createComplexityRule({ estimators: [...] })`
+ * (and the equivalent `costLimitPlugin` plugin path). Returns a number
+ * for every Field — never returns `void` — because we want this to be
+ * the only estimator (no fallthrough to simpleEstimator).
  *
  * `__typename` (Apollo Client's auto-injected meta-field) flows through
  * here too: graphql-query-complexity walks `TypeNameMetaFieldDef` as a
@@ -121,10 +151,11 @@ export const judgemindEstimator: ComplexityEstimator = ({
   childComplexity,
 }) => {
   const { named, factor } = unwrapType(field.type);
+  const namedTag = typeTag(named);
   const composite =
-    named instanceof GraphQLObjectType ||
-    named instanceof GraphQLInterfaceType ||
-    named instanceof GraphQLUnionType;
+    namedTag === 'GraphQLObjectType' ||
+    namedTag === 'GraphQLInterfaceType' ||
+    namedTag === 'GraphQLUnionType';
   if (composite) {
     return factor * (OBJECT_COST + childComplexity);
   }
