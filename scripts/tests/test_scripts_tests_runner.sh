@@ -86,6 +86,19 @@ run_runner() {
     TESTS_DIR="$TMPDIR_TEST" SKIP_TESTS="$skip_tests" "$RUNNER"
 }
 
+# Like run_runner, but also threads SHARD_FILTER + SLOW_TESTS for the
+# #4067 shard-partition tests below.
+run_runner_with_shard() {
+    local shard_filter="${1:-}"
+    local slow_tests="${2:-}"
+    # shellcheck disable=SC2097,SC2098
+    TESTS_DIR="$TMPDIR_TEST" \
+        SKIP_TESTS="" \
+        SHARD_FILTER="$shard_filter" \
+        SLOW_TESTS="$slow_tests" \
+        "$RUNNER"
+}
+
 assert_eq() {
     local desc="$1"
     local expected="$2"
@@ -207,6 +220,72 @@ set -e
 assert_eq "runner exits 1 when a test fails" 1 "$rc"
 assert_file_exists "passing test still ran" "$TMPDIR_TEST/RAN_alpha"
 assert_file_exists "failing test ran (and failed)" "$TMPDIR_TEST/RAN_bad"
+
+# ─── Test 6.5a (#4067): SHARD_FILTER=slow runs only SLOW_TESTS entries ─
+reset_tmpdir
+make_passing_test "test_alpha.sh" alpha
+make_passing_test "test_beta.sh" beta
+make_passing_test "test_slow.sh" slow
+slow_path="$TMPDIR_TEST/test_slow.sh"
+set +e
+out="$(run_runner_with_shard slow "$slow_path" 2>&1)"
+rc=$?
+set -e
+assert_eq "SHARD_FILTER=slow exits 0" 0 "$rc"
+assert_file_exists "SHARD_FILTER=slow ran the slow test" "$TMPDIR_TEST/RAN_slow"
+assert_file_absent "SHARD_FILTER=slow did NOT run alpha (fast)" "$TMPDIR_TEST/RAN_alpha"
+assert_file_absent "SHARD_FILTER=slow did NOT run beta (fast)" "$TMPDIR_TEST/RAN_beta"
+
+# ─── Test 6.5b (#4067): SHARD_FILTER=not-slow skips SLOW_TESTS entries ─
+reset_tmpdir
+make_passing_test "test_alpha.sh" alpha
+make_passing_test "test_beta.sh" beta
+make_passing_test "test_slow.sh" slow
+slow_path="$TMPDIR_TEST/test_slow.sh"
+set +e
+out="$(run_runner_with_shard not-slow "$slow_path" 2>&1)"
+rc=$?
+set -e
+assert_eq "SHARD_FILTER=not-slow exits 0" 0 "$rc"
+assert_file_exists "SHARD_FILTER=not-slow ran alpha (fast)" "$TMPDIR_TEST/RAN_alpha"
+assert_file_exists "SHARD_FILTER=not-slow ran beta (fast)" "$TMPDIR_TEST/RAN_beta"
+assert_file_absent "SHARD_FILTER=not-slow did NOT run the slow test" "$TMPDIR_TEST/RAN_slow"
+
+# ─── Test 6.5c (#4067): SHARD_FILTER unset (legacy) runs everything ──────
+reset_tmpdir
+make_passing_test "test_alpha.sh" alpha
+make_passing_test "test_slow.sh" slow
+slow_path="$TMPDIR_TEST/test_slow.sh"
+set +e
+# Empty shard filter — equivalent to legacy callers that don't set the var.
+out="$(run_runner_with_shard "" "$slow_path" 2>&1)"
+rc=$?
+set -e
+assert_eq "SHARD_FILTER='' exits 0 (legacy compat)" 0 "$rc"
+assert_file_exists "SHARD_FILTER='' ran alpha" "$TMPDIR_TEST/RAN_alpha"
+assert_file_exists "SHARD_FILTER='' also ran the slow test" "$TMPDIR_TEST/RAN_slow"
+
+# ─── Test 6.5d (#4067): SHARD_FILTER=invalid exits 1 with error ──────────
+reset_tmpdir
+make_passing_test "test_alpha.sh" alpha
+set +e
+out="$(run_runner_with_shard bogus "" 2>&1)"
+rc=$?
+set -e
+assert_eq "SHARD_FILTER=bogus exits 1" 1 "$rc"
+case "$out" in
+    *"Invalid SHARD_FILTER"*)
+        TESTS=$((TESTS + 1))
+        echo "PASS: SHARD_FILTER=bogus emits 'Invalid SHARD_FILTER' error" ;;
+    *)
+        TESTS=$((TESTS + 1))
+        FAILURES=$((FAILURES + 1))
+        echo "FAIL: SHARD_FILTER=bogus missing 'Invalid SHARD_FILTER' error"
+        echo "---OUTPUT---"
+        echo "$out"
+        echo "---END---" ;;
+esac
+assert_file_absent "SHARD_FILTER=bogus did NOT execute any test" "$TMPDIR_TEST/RAN_alpha"
 
 # ─── Test 7: Regression guard — real scripts/tests/_guard_self_match_helpers.sh
 #            is not executed by the live runner (the production scenario).

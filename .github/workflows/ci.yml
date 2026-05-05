@@ -590,6 +590,11 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
+    # #4067: per-shard wall-clock cap — the matrix supplies a value for
+    # the shell-slow shard so a future drift in test_agent_runner_entrypoint.sh
+    # fails the shard rather than silently bloating CI again. The python +
+    # shell-fast shards default to GitHub's 360-min job ceiling.
+    timeout-minutes: ${{ matrix.timeout-minutes || 360 }}
     strategy:
       fail-fast: false
       matrix:
@@ -598,11 +603,28 @@ jobs:
           # pytest-xdist (-n auto) parallelises the 73-file dispatcher suite
           # (~292s sequential → ~150-200s). Estimated wall-clock ~200s.
           - shard: python
-          # Shard shell: scripts/run-scripts-tests.sh only.
-          # Dominated by test_agent_runner_entrypoint.sh (~275s) and
-          # test_check_dispatcher_image_versions.sh (~58s).
-          # Estimated wall-clock ~395s. See issue #3307.
-          - shard: shell
+          # Shard shell-fast (#4067): every scripts/tests/*.sh and every
+          # scripts/dispatcher/tests/*.sh EXCEPT the long-pole entrypoint
+          # test split into shell-slow. Pre-#4067 this was the `shell`
+          # shard; it observed ~21 min wall-clock dominated entirely by
+          # test_agent_runner_entrypoint.sh.
+          # Estimated wall-clock ~3-4 min on a clean run.
+          # See issues #3307 (original sharding) + #4067 (this split).
+          - shard: shell-fast
+            timeout-minutes: 10
+            shard-filter: not-slow
+          # Shard shell-slow (#4067): isolates test_agent_runner_entrypoint.sh
+          # (and any peer added to SLOW_TESTS in scripts/run-scripts-tests.sh)
+          # so the ~30 fast tests in shell-fast no longer queue behind it.
+          # The hard timeout-minutes:14 is the regression gate from issue
+          # #4067's cross-cutting AC — it fails the shard if the long pole
+          # ever drifts past 1.5× its post-trim budget.
+          # Estimated wall-clock ~7-11 min (~11 min today, ≤7 min target
+          # after Prong-A trim work lands).
+          # See issue #4067.
+          - shard: shell-slow
+            timeout-minutes: 14
+            shard-filter: slow
     env:
       PYTHONPATH: scripts
     steps:
@@ -778,16 +800,25 @@ jobs:
       #                              itself, and ci.yml). See #2536 for
       #                              the duration regression this skip
       #                              addresses (+34s, +112%).
-      - name: Run all scripts/tests shell tests
-        if: matrix.shard == 'shell'
+      # #4067: SHARD_FILTER plumbs the matrix-level `shard-filter` (one of
+      # "not-slow" or "slow") into the runner so the shell-fast and
+      # shell-slow shards each see only their portion of scripts/tests/.
+      # SLOW_TESTS in scripts/run-scripts-tests.sh defines which paths are
+      # considered slow; today it's just test_agent_runner_entrypoint.sh.
+      - name: Run scripts/tests shell tests (shard-filtered)
+        if: startsWith(matrix.shard, 'shell-')
         shell: bash
         env:
           # Whitespace-separated list of test paths to defer to their own
           # dedicated CI jobs. See the comment above this step for why.
           SKIP_TESTS: "scripts/tests/test_pre_push.sh"
+          SHARD_FILTER: ${{ matrix.shard-filter }}
         run: scripts/run-scripts-tests.sh
+      # The dispatcher tests directory has only fast tests today, so it
+      # runs solely on the shell-fast shard (no SHARD_FILTER threading
+      # needed — the directory contains no SLOW_TESTS entries anyway).
       - name: Run all scripts/dispatcher/tests shell tests
-        if: matrix.shard == 'shell'
+        if: matrix.shard == 'shell-fast'
         shell: bash
         # TESTS_DIR is already plumbed by scripts/run-scripts-tests.sh and
         # unit-tested by scripts/tests/test_scripts_tests_runner.sh.

@@ -2513,7 +2513,9 @@ t23_seed="$TEST_TMP/t23-seed.txt"
 printf 'aaaaaaa1 first ralph iteration commit\n' > "$t23_seed"
 
 set +e
-t23_out=$(run_watcher_test "$t23_workspace" "$t23_commits" "$t23_seed" 3 1 "")
+# #4067 — sleep trimmed from 3 → 2 (one tick is enough to observe the
+# seed; +1s margin keeps it non-flaky on slow runners).
+t23_out=$(run_watcher_test "$t23_workspace" "$t23_commits" "$t23_seed" 2 1 "")
 t23_rc=$?
 set -e
 
@@ -2598,7 +2600,8 @@ printf 'ddddddd2 iteration two subject\n' >> "$t24_seed"
 printf 'ddddddd3 iteration three subject\n' >> "$t24_seed"
 
 set +e
-t24_out=$(run_watcher_test "$t24_workspace" "$t24_commits" "$t24_seed" 3 1 "")
+# #4067 — sleep trimmed from 3 → 2 (see T23 rationale).
+t24_out=$(run_watcher_test "$t24_workspace" "$t24_commits" "$t24_seed" 2 1 "")
 t24_rc=$?
 set -e
 
@@ -2691,7 +2694,8 @@ printf 'eeeeeee1 iteration with DB down\n' > "$t26_seed"
 # watcher should log ralph_head_watcher_db_failure and continue; the
 # agent-runner top-level must not crash.
 set +e
-t26_out=$(run_watcher_test "$t26_workspace" "$t26_commits" "$t26_seed" 3 1 "PSQL_FAIL_ON_INSERT=1")
+# #4067 — sleep trimmed from 3 → 2 (see T23 rationale).
+t26_out=$(run_watcher_test "$t26_workspace" "$t26_commits" "$t26_seed" 2 1 "PSQL_FAIL_ON_INSERT=1")
 t26_rc=$?
 set -e
 
@@ -2729,7 +2733,8 @@ printf 'fffffff1 should be skipped as duplicate\n' > "$t27_seed"
 # watcher treats this iteration as already-persisted and logs
 # ralph_head_watcher_skip_existing instead of attempting the INSERT.
 set +e
-t27_out=$(run_watcher_test "$t27_workspace" "$t27_commits" "$t27_seed" 3 1 "RALPH_PATCH_EXISTS=1")
+# #4067 — sleep trimmed from 3 → 2 (see T23 rationale).
+t27_out=$(run_watcher_test "$t27_workspace" "$t27_commits" "$t27_seed" 2 1 "RALPH_PATCH_EXISTS=1")
 t27_rc=$?
 set -e
 
