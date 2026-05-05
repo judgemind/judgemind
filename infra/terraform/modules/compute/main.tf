@@ -683,6 +683,31 @@ resource "aws_ecs_service" "ingestion_worker" {
 
   # Ignore changes to task_definition so that image tag updates via CI/CD
   # don't trigger a Terraform diff on every plan.
+  #
+  # Silent-drift failure mode (#4044): because terraform never rolls this
+  # service forward, an infra-only change that updates the task-def or the
+  # rendered container_definitions SSM parameter (e.g. a secret-ARN flip,
+  # an env-var rename) does NOT reach the running container on its own.
+  # Historically the next deploy-scraper.yml run rolled it forward, but
+  # when a scraper-touching push and an infra-touching push land on the
+  # same merge commit, the race deploy-scraper-vs-terraform-apply (see
+  # #4044) lets deploy-scraper win, read the *stale* SSM parameter, and
+  # pin the service to a pre-apply task-def revision. terraform-apply
+  # finishes after, registers the correct revision, but cannot roll the
+  # service because of this ignore_changes — i.e. terraform-apply won't
+  # roll the service forward on its own. Result: silent stale env vars
+  # on the running container, with silent-drift between the desired SSM
+  # state and the running task-def, until the next deploy happens to
+  # win the race.
+  #
+  # Mitigations in tree:
+  #   - .github/workflows/terraform.yml dev-apply force-deploys this
+  #     service whenever the apply diff modified its task-def or its
+  #     container_definitions SSM parameter (#4044, Option B).
+  #   - .github/workflows/deploy-scraper.yml post-deploy-health-check
+  #     runs scripts/check-ingestion-worker-task-def-fingerprint.sh,
+  #     which compares the running task-def's container_definitions to
+  #     the terraform-rendered SSM parameter and fails on drift (#4044).
   lifecycle {
     ignore_changes = [task_definition]
   }

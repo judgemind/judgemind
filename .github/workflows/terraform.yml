@@ -6,11 +6,19 @@ on:
     paths:
       - "infra/terraform/**"
       - ".github/workflows/terraform.yml"
+      # scripts/wait-for-rollout.sh is invoked by the dev-apply job's
+      # post-apply force-deploy step (#4044). The shared script's paths-
+      # filter contract (#2592) requires every consumer to list it so a
+      # PR that touches only the script triggers each consumer's deploy
+      # path on its own merge — otherwise regressions surface on the
+      # next unrelated apply.
+      - "scripts/wait-for-rollout.sh"
   pull_request:
     branches: [main]
     paths:
       - "infra/terraform/**"
       - ".github/workflows/terraform.yml"
+      - "scripts/wait-for-rollout.sh"
 
 jobs:
   terraform:
@@ -258,4 +266,85 @@ jobs:
             echo '```'
             tail -n 200 "$apply_log" || true
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Force-deploy the ingestion-worker service when this apply touched
+      # its task-def or its rendered container_definitions SSM parameter
+      # (#4044, Option B). `aws_ecs_service.ingestion_worker.lifecycle.
+      # ignore_changes = [task_definition]` means terraform never rolls
+      # the service forward on its own — without this step, an infra-only
+      # change leaves the running container on the *old* revision until
+      # the next deploy-scraper.yml run wins the race against another
+      # apply. Self-contained: makes terraform-apply the single place
+      # that's responsible for getting an infra-induced task-def change
+      # onto the running service.
+      #
+      # The detection grep looks for `Creating|Modifying|Destroying...`
+      # lines (the apply-time mutation verbs) targeting either the
+      # task-def or the SSM parameter resource address. Plain
+      # "Refreshing state..." lines run on every apply for every
+      # resource and are explicitly excluded so we only force-deploy
+      # when something actually changed.
+      #
+      # No-op fast path: if neither resource changed, the step exits 0
+      # without making any AWS API calls.
+      - name: Detect ingestion-worker task-def change
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && steps.apply.outputs.apply_log != '' }}
+        id: detect-ingestion-worker-change
+        run: |
+          apply_log="${{ steps.apply.outputs.apply_log }}"
+          if grep -E '^module\.compute\.(aws_ecs_task_definition\.ingestion_worker|aws_ssm_parameter\.ingestion_worker_container_definitions)\[0\]: (Creating|Modifying|Destroying)\.\.\.' "$apply_log" >/dev/null; then
+            echo "ingestion_worker_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Ingestion-worker task-def or container_definitions SSM parameter changed by this apply." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ingestion_worker_changed=false" >> "$GITHUB_OUTPUT"
+            echo "Ingestion-worker resources unchanged by this apply — skipping force-deploy." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Force-deploy ingestion-worker (close lifecycle.ignore_changes gap)
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && steps.detect-ingestion-worker-change.outputs.ingestion_worker_changed == 'true' }}
+        env:
+          ECS_CLUSTER: judgemind-dev
+          ECS_SERVICE: judgemind-ingestion-worker-dev
+          INGESTION_TASK_FAMILY: judgemind-ingestion-worker-dev
+        run: |
+          set -euo pipefail
+
+          # Resolve the latest ACTIVE revision of the family — that is
+          # whatever terraform-apply just registered. Pinning the service
+          # to the family ARN (without :revision) would let ECS pick up
+          # any later revision deploy-scraper.yml registers, which is
+          # exactly the race we're trying to close.
+          NEW_TASK_DEF_ARN=$(aws ecs describe-task-definition \
+            --task-definition "$INGESTION_TASK_FAMILY" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          export NEW_TASK_DEF_ARN
+
+          echo "Forcing ingestion-worker rollout to $NEW_TASK_DEF_ARN"
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
+            --force-new-deployment \
+            --query 'service.serviceName' \
+            --output text
+
+          # Wait for the rollout to finish so a CI failure on this step
+          # surfaces as a deploy failure (not as silent drift). Reuses
+          # scripts/wait-for-rollout.sh (env-driven: ECS_CLUSTER,
+          # ECS_SERVICE, NEW_TASK_DEF_ARN — same contract as the
+          # ecs-deploy composite action).
+          bash "${GITHUB_WORKSPACE}/scripts/wait-for-rollout.sh"
+
+          {
+            echo "## Forced ingestion-worker rollout (#4044)"
+            echo
+            echo "Task-def: \`$NEW_TASK_DEF_ARN\`"
+            echo
+            echo "This step closed the lifecycle.ignore_changes race by"
+            echo "rolling the service forward after terraform-apply"
+            echo "registered the new revision. See"
+            echo ".github/workflows/terraform.yml + #4044."
           } >> "$GITHUB_STEP_SUMMARY"
