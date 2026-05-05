@@ -185,6 +185,7 @@ import structlog  # noqa: E402
 
 from framework.extraction_config import (  # noqa: E402
     ExtractionMethod,
+    decide_extraction_strategy,
     get_county_extraction_config,
 )
 from framework.llm_enrichment import (  # noqa: E402
@@ -1024,22 +1025,23 @@ def _reparse_document(
     llm_skipped = False
     llm_outcome = "not_attempted"
 
-    # Short-circuit LLM extraction when the county/scraper is registered
-    # with ``ExtractionMethod.NONE`` (#4056).  The live worker path honors
-    # this in ``ingestion.worker._extract_fields`` (worker.py L1719-1732),
-    # but the reingest path historically only consulted the county config
-    # for ``max_output_tokens`` (#2355) and ran the LLM regardless of the
-    # configured method.  That mismatch caused ``ExtractionMethod.NONE``
-    # counties (e.g. Federal CourtListener clusters, #3967) to be re-run
-    # through the CA-tuned LLM prompt during reingest, producing
-    # truncation, JSON-parse errors, and field contamination that
-    # blocked #3978's federal cleanup pass.
-    _ext_config = get_county_extraction_config(
+    # Resolve the extraction strategy once and reuse below (#4081 — Option B).
+    # Single source of truth shared with ``packages/scraper-framework/src/
+    # ingestion/worker.py`` — both paths read ``strategy.skip_llm`` and
+    # ``strategy.max_output_tokens`` instead of re-deriving the gate logic
+    # from ``CountyExtractionConfig`` inline.  This closes the recurring
+    # divergence pattern (#2490, #2501, #2502, #2521, #4056).
+    strategy = decide_extraction_strategy(
         doc_meta.get("state", ""),
         doc_meta.get("county", ""),
         scraper_id=scraper_id,
     )
-    if _ext_config is not None and _ext_config.method == ExtractionMethod.NONE:
+
+    # Short-circuit LLM extraction when the county/scraper is registered
+    # with ``ExtractionMethod.NONE`` (#4056).  The live worker path honors
+    # this in ``ingestion.worker.process_event``, and now both paths read
+    # ``strategy.skip_llm`` from the same helper.
+    if strategy.skip_llm:
         logger.info(
             "Skipping LLM extraction — county uses ExtractionMethod.NONE",
             document_id=doc_meta["document_id"],
@@ -1081,17 +1083,12 @@ def _reparse_document(
             # causes output truncation).  Narrowing already happened
             # above for SD HTML pages regardless of LLM availability.
             llm_text = extracted.get("ruling_text") or text
-            # Look up county-specific max_output_tokens (#2355).
-            # Large-document counties (e.g. Santa Clara, 130K+ chars)
-            # need more than the default 4096 output tokens to avoid
-            # truncated JSON responses.
-            _cc = get_county_extraction_config(
-                doc_meta.get("state", ""),
-                doc_meta.get("county", ""),
-            )
-            _llm_max_tokens = (
-                _cc.max_output_tokens if _cc and _cc.max_output_tokens else 4096
-            )
+            # County-specific max_output_tokens (#2355) — large-document
+            # counties (e.g. Santa Clara, 130K+ chars) need more than the
+            # default 4096 output tokens to avoid truncated JSON responses.
+            # ``strategy.max_output_tokens`` already resolves to 4096 when
+            # no county override is configured (#4081).
+            _llm_max_tokens = strategy.max_output_tokens
 
             t0 = time.monotonic()
             llm_result = extract_fields_llm(

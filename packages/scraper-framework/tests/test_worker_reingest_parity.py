@@ -12,40 +12,41 @@ live worker correctly handled.  The pattern has now repeated five times:
 - #2521 — text-split branch had the same fixed-point pattern
 - #4056 — ``ExtractionMethod.NONE`` not honored
 
-The test is the **Option A** snapshot/regex-pair contract test described in
-issue #4071.  For each (state, county, scraper_id) case it verifies:
+After Option B (#4081) landed, both paths consume the shared
+``decide_extraction_strategy`` helper from
+``framework.extraction_config``.  The test now verifies:
 
 1. **Reingest live behavior** — ``_reparse_document`` is invoked with a
    mocked ``extract_fields_llm``; the number of times it was called matches
    the expectation derived from ``get_county_extraction_config``.  This
    catches regressions where someone deletes the NONE-skip guard from
    ``reingest_from_s3.py`` and the reingest path starts running the LLM on
-   ``ExtractionMethod.NONE`` counties.
+   ``ExtractionMethod.NONE`` counties.  This live-call check is the
+   primary regression guard — it directly observes the divergence symptom.
 
-2. **Worker source-text sentinels** — ``ingestion/worker.py`` is read as
-   text and asserted to contain a regex that matches the equivalent guard
-   (an ``is_extraction_none = True`` assignment gated on
-   ``ExtractionMethod.NONE``, plus a multimodal selector reading
-   ``ExtractionMethod.MULTIMODAL``).  This catches the symmetric
-   regression where someone deletes the guard from ``worker.py``.
+2. **Strategy-helper consumer sentinels** — both ``ingestion/worker.py``
+   and ``scripts/reingest_from_s3.py`` are read as text and asserted to
+   import ``decide_extraction_strategy`` and read ``strategy.skip_llm``.
+   The Option B refactor (#4081) made ``decide_extraction_strategy`` the
+   single source of truth for the gate logic; deleting either side's
+   call would re-open the divergence pattern.  The sentinels are kept
+   intentionally narrow — they catch deletion of the helper consumer,
+   not every possible behavior regression (the live-call check above is
+   the contract for those).
 
 The deliberate-revert verification mentioned in #4071's acceptance criterion
 is captured by the Verifies-fail-on-revert behavior of (1) — ``patch.object``
 on ``reingest.extract_fields_llm`` directly observes whether the live path
 called the LLM, so removing the NONE short-circuit from
 ``reingest_from_s3.py`` flips the call count from ``0`` to ``1`` and the
-NONE cases fail.  The (2) regex pairs likewise fail when the worker.py
-sentinel is deleted.
+NONE cases fail.  The (2) consumer sentinels likewise fail when either
+side stops calling the helper.
 
-When ``ExtractionMethod`` gains a new value or worker/reingest gains a new
-config consumer (e.g. a future ``max_chars_per_chunk`` selector), this file
-must be extended with a new ``_GUARD_PATTERNS`` entry on **both** sides.
-That is the maintenance load the issue explicitly accepted in exchange for
-the divergence-detection coverage; it is intentionally a manual edit so a
-change to one side without the other surfaces in the diff review.
-
-See #4071 for the full investigation and Option B (refactor into shared
-``decide_extraction_strategy`` helper) follow-up.
+When ``ExtractionMethod`` gains a new value or ``ExtractionStrategy``
+gains a new field, ``decide_extraction_strategy`` is the only place that
+needs to learn about it — both consumers automatically pick up the new
+field.  See #4081 for the structural fix and #4071 for the original
+divergence catalog.
 """
 
 from __future__ import annotations
@@ -109,43 +110,38 @@ _REINGEST_SRC = _REPO_ROOT / "scripts/reingest_from_s3.py"
 
 _GUARD_PATTERNS: tuple[tuple[str, str, str], ...] = (
     (
-        "extraction_method_none_skip",
-        # Worker: gates on ``method == ExtractionMethod.NONE`` and then sets
-        # ``is_extraction_none = True`` on the next non-blank line.  Match
-        # the conditional + the assignment within a tight window so a stray
-        # ``ExtractionMethod.NONE`` reference (e.g. in a doc-comment) cannot
-        # satisfy the pattern alone.
-        (
-            r"\.method\s*==\s*ExtractionMethod\.NONE\s*:"
-            r"[^\n]*\n(?:[^\n]*\n){0,3}\s*is_extraction_none\s*=\s*True"
-        ),
-        # Reingest: short-circuits when ``_ext_config.method ==
-        # ExtractionMethod.NONE``.  Single-line match.
-        r"_ext_config\.method\s*==\s*ExtractionMethod\.NONE",
+        "decide_extraction_strategy_imported",
+        # Worker: imports the helper from ``framework.extraction_config``.
+        # The Option B refactor (#4081) made this the single source of
+        # truth for the NONE / MULTIMODAL / max_output_tokens gates.
+        r"from\s+framework\.extraction_config\s+import\s+decide_extraction_strategy",
+        # Reingest: imports the helper alongside ExtractionMethod and
+        # get_county_extraction_config (the latter is still consumed by
+        # ``_full_reparse_document``, which #4081 declared out of scope).
+        r"decide_extraction_strategy",
     ),
     (
-        "extraction_method_multimodal_selector",
-        # Worker: branches on ``ExtractionMethod.MULTIMODAL`` for the
-        # raw-PDF per-page extraction path.
-        r"ExtractionMethod\.MULTIMODAL",
-        # Reingest: must import ``ExtractionMethod`` from
-        # ``framework.extraction_config`` so the NONE short-circuit (and
-        # any future MULTIMODAL-aware reingest branch) compiles.  The
-        # MULTIMODAL value is not a separate reingest path today —
-        # reingest uses the text LLM for MULTIMODAL counties because the
-        # multimodal extractor is a worker-only feature — but the paired
-        # sentinel makes a future divergence detectable.
-        r"from\s+framework\.extraction_config\s+import[^)]*ExtractionMethod",
+        "strategy_skip_llm_consumed",
+        # Worker: reads ``strategy.skip_llm`` to short-circuit the
+        # per-event NONE gate (replaces the historic
+        # ``is_extraction_none = True`` assignment) and to skip framework
+        # extraction inside ``_llm_split_document``.
+        r"strategy\.skip_llm",
+        # Reingest: reads ``strategy.skip_llm`` in ``_reparse_document``
+        # to short-circuit the LLM call.  This is the live regression
+        # site catalogued in #4056.
+        r"strategy\.skip_llm",
     ),
     (
-        "extraction_config_consulted_for_max_output_tokens",
-        # Worker: text-LLM path looks up ``<name>.max_output_tokens`` and
-        # falls back to the 4096 default (#2355).  The pattern must appear
-        # within ~120 chars so an unrelated reference plus a stray ``4096``
-        # later in the file does not produce a false match.
-        r"\.max_output_tokens[^\n]{0,120}4096",
-        # Reingest: same lookup with the same default.
-        r"\.max_output_tokens[^\n]{0,120}4096",
+        "strategy_max_output_tokens_consumed",
+        # Worker: reads ``strategy.max_output_tokens`` for the per-field
+        # LLM call (#2355) and for the multimodal extractor's per-page
+        # token cap (#2369).  No more 4096 fallback constant — the
+        # helper resolves the default.
+        r"strategy\.max_output_tokens",
+        # Reingest: reads ``strategy.max_output_tokens`` in
+        # ``_reparse_document`` for the same reason.
+        r"strategy\.max_output_tokens",
     ),
 )
 
