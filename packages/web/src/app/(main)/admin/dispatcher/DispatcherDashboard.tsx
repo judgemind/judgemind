@@ -7,10 +7,12 @@ import { useAuth } from '@/providers/AuthProvider';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import { PAGE_TITLE } from '@/lib/typography';
 import {
+  DISPATCHER_CONFIG_QUERY,
   DISPATCHER_CONTROL_MUTATION,
   DISPATCHER_SET_CONFIG_MUTATION,
   DISPATCHER_STATE_QUERY,
   type DispatcherCommand,
+  type DispatcherConfigData,
   type DispatcherControlData,
   type DispatcherQueueKind,
   type DispatcherSetConfigData,
@@ -128,6 +130,19 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     },
   );
 
+  /**
+   * Dispatcher config (issue #4063). Decoupled from the polled
+   * `dispatcherState` query — config rows change rarely (manual
+   * operator edits) so we fetch them once on mount and refetch
+   * explicitly after a `dispatcherSetConfig` mutation. Skipping the
+   * 2s poll saved ~40 cost units against the #4003 1000-cap.
+   */
+  const { data: configData, refetch: refetchConfig } =
+    useQuery<DispatcherConfigData>(DISPATCHER_CONFIG_QUERY, {
+      skip: !authReady,
+      fetchPolicy: 'cache-and-network',
+    });
+
   useEffect(() => {
     if (error) {
       const timer = setTimeout(() => {
@@ -229,7 +244,9 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         await dispatcherSetConfig({
           variables: { key, value },
         });
-        await refetch();
+        // #4063: refetch the config-only query (not the polled state
+        // query — `dispatcherState` no longer selects `config`).
+        await refetchConfig();
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Config update failed';
         setConfigError(message);
@@ -238,7 +255,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         setBusyConfigKey(null);
       }
     },
-    [dispatcherSetConfig, refetch],
+    [dispatcherSetConfig, refetchConfig],
   );
 
   const handleConfirm = useCallback(() => {
@@ -287,7 +304,9 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   const handleConfigEdit = useCallback(
     async (key: string, value: string): Promise<void> => {
       if (key === 'concurrency_cap') {
-        const entries = renderedData?.dispatcherState?.config ?? [];
+        // #4063: config now comes from the separate `DISPATCHER_CONFIG_QUERY`,
+        // not the polled state.
+        const entries = configData?.dispatcherState?.config ?? [];
         const current = entries.find((e) => e.key === 'concurrency_cap');
         const currentValue = current ? parsePositiveInt(current.value) : null;
         const nextValue = parsePositiveInt(value);
@@ -306,7 +325,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
       }
       await commitConfigEdit(key, value);
     },
-    [commitConfigEdit, renderedData],
+    [commitConfigEdit, configData],
   );
 
   // Loading states — show the skeleton while either auth or the first
@@ -446,7 +465,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
           </div>
 
           <ConfigPanel
-            entries={state?.config ?? []}
+            entries={configData?.dispatcherState?.config ?? []}
             spawnFrozenUntil={state?.spawnFrozenUntil ?? null}
             onCommitEdit={handleConfigEdit}
             errorMessage={configError}

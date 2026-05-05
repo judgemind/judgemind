@@ -22,6 +22,15 @@
  * polled). The render layer's `formatBlockerTooltip` already falls back
  * to `#N` alone when `BlockerRef.title` is null/undefined, so the polled
  * tooltip degrades gracefully — full titles still appear in the dialog.
+ *
+ * Polled-query slim — `config` (issue #4063): the dispatcher config rows
+ * change rarely (manual operator edits via `dispatcherSetConfig`) and
+ * don't need to ride the 2s real-time refresh. They were contributing
+ * ~40 cost units to a query that was already over the 1000 cap (#4062).
+ * Config now lives in the separate `DISPATCHER_CONFIG_QUERY` below,
+ * which fires once on dashboard mount and is refetched explicitly by
+ * the `dispatcherSetConfig` mutation's `refetchQueries` so the displayed
+ * value stays in sync without a manual page reload.
  */
 import { gql } from '@apollo/client';
 
@@ -102,15 +111,32 @@ export const DISPATCHER_STATE_QUERY = gql`
         retroedAt
       }
       recentCompletionsCount
+      spawnFrozenUntil
+      circuitBreakerOpen
+      capFlippedBy
+    }
+  }
+`;
+
+/**
+ * Dispatcher config rows (issue #4063). Fires once on dashboard mount
+ * (NOT in the 2s `dispatcherState` poll path), and is re-fetched by
+ * `DISPATCHER_SET_CONFIG_MUTATION` via `refetchQueries` so the displayed
+ * value updates without a page reload after an operator edit.
+ *
+ * Resolves the same `dispatcher.config` snapshot the polled query used
+ * to read — no API/schema change. Splitting the selection out of the
+ * 2s poll saved ~40 cost units against the #4003 1000-cap.
+ */
+export const DISPATCHER_CONFIG_QUERY = gql`
+  query DispatcherConfig {
+    dispatcherState {
       config {
         key
         value
         updatedAt
         updatedBy
       }
-      spawnFrozenUntil
-      circuitBreakerOpen
-      capFlippedBy
     }
   }
 `;
@@ -390,7 +416,6 @@ export interface DispatcherState {
    * admin-cockpit panel header can render `{shown} / {total}`, matching
    * the Ready/Blocked panels. Returns 0 when the table is empty. */
   recentCompletionsCount: number;
-  config: DispatcherConfigEntry[];
   spawnFrozenUntil: string | null;
   /** True when the circuit breaker is open (#2860). */
   circuitBreakerOpen: boolean;
@@ -404,6 +429,17 @@ export interface DispatcherSetConfigData {
 
 export interface DispatcherStateData {
   dispatcherState: DispatcherState;
+}
+
+/**
+ * Result type for `DISPATCHER_CONFIG_QUERY` (issue #4063). The query
+ * selects only `dispatcherState.config`, so the result shape is a
+ * minimal `dispatcherState` object carrying just that field.
+ */
+export interface DispatcherConfigData {
+  dispatcherState: {
+    config: DispatcherConfigEntry[];
+  };
 }
 
 /** Control commands accepted by `dispatcherControl` (#2884 simplified).
