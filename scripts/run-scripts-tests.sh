@@ -32,8 +32,8 @@
 #                   to defer (e.g. "scripts/tests/test_pre_push.sh").
 #   SHARD_FILTER  — one of "", "slow", "not-slow" (see #4 above).
 #   SLOW_TESTS    — whitespace-separated list of repo-relative paths
-#                   considered "slow". Default:
-#                   "scripts/tests/test_agent_runner_entrypoint.sh".
+#                   considered "slow". See the inline assignment below
+#                   for the current list and observed wall-clocks.
 #   TESTS_DIR     — tests directory (default: "scripts/tests"). Testing
 #                   hook: the unit test sets this to a temp directory.
 #
@@ -47,6 +47,14 @@ shopt -s nullglob
 : "${SKIP_TESTS:=}"
 : "${TESTS_DIR:=scripts/tests}"
 : "${SHARD_FILTER:=}"
+# SLOW_TESTS — paths that should run on the shell-slow shard, not shell-fast.
+# Tracked observed wall-clock from CI run 25401898705 (#4067):
+#   * test_agent_runner_entrypoint.sh    — ~11 min  (long pole)
+# Add a path here when one climbs past ~5 min on a triggering CI run.
+# test_dev_db_query.sh (~5m25s) is the next-largest single test; it stays in
+# shell-fast for now so shell-slow doesn't sequentially run two long poles
+# (which would push max parallel wall-clock past the issue's ≤10 min target
+# in the wrong direction).
 : "${SLOW_TESTS:=scripts/tests/test_agent_runner_entrypoint.sh}"
 
 case "$SHARD_FILTER" in

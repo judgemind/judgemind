@@ -604,23 +604,27 @@ jobs:
           # (~292s sequential → ~150-200s). Estimated wall-clock ~200s.
           - shard: python
           # Shard shell-fast (#4067): every scripts/tests/*.sh and every
-          # scripts/dispatcher/tests/*.sh EXCEPT the long-pole entrypoint
-          # test split into shell-slow. Pre-#4067 this was the `shell`
-          # shard; it observed ~21 min wall-clock dominated entirely by
-          # test_agent_runner_entrypoint.sh.
-          # Estimated wall-clock ~3-4 min on a clean run.
+          # scripts/dispatcher/tests/*.sh EXCEPT the paths in SLOW_TESTS
+          # (defined in scripts/run-scripts-tests.sh — currently just
+          # test_agent_runner_entrypoint.sh). Pre-#4067 this was the
+          # `shell` shard; it observed ~21 min wall-clock dominated by
+          # serial execution behind the long pole.
+          # Estimated wall-clock ~10 min today (next-largest test is
+          # test_dev_db_query.sh at ~5m25s; the rest are <1 min each).
+          # timeout-minutes:14 = ~1.4× current — adds room for setup
+          # variance + the dispatcher-tests step that runs after.
           # See issues #3307 (original sharding) + #4067 (this split).
           - shard: shell-fast
-            timeout-minutes: 10
+            timeout-minutes: 14
             shard-filter: not-slow
-          # Shard shell-slow (#4067): isolates test_agent_runner_entrypoint.sh
-          # (and any peer added to SLOW_TESTS in scripts/run-scripts-tests.sh)
-          # so the ~30 fast tests in shell-fast no longer queue behind it.
-          # The hard timeout-minutes:14 is the regression gate from issue
-          # #4067's cross-cutting AC — it fails the shard if the long pole
-          # ever drifts past 1.5× its post-trim budget.
-          # Estimated wall-clock ~7-11 min (~11 min today, ≤7 min target
-          # after Prong-A trim work lands).
+          # Shard shell-slow (#4067): runs only paths in SLOW_TESTS so
+          # the other tests in shell-fast no longer queue behind them.
+          # Today's slow set: test_agent_runner_entrypoint.sh (~11 min).
+          # The hard timeout-minutes:14 is the regression gate from
+          # issue #4067's cross-cutting AC — it fails the shard if the
+          # long pole drifts past ~1.3× its current observed budget.
+          # Estimated wall-clock ~11 min today; structural trim is a
+          # #4067 follow-up.
           # See issue #4067.
           - shard: shell-slow
             timeout-minutes: 14
