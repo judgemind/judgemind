@@ -3032,11 +3032,25 @@ def _process_prefix_document(
     database_url: str,
     redis_url: str,
     os_url: str,
+    bust_llm_cache: bool = False,
 ) -> dict[str, Any]:
     """Process a single S3 object through the ingestion pipeline.
 
     Creates its own DB connection, Redis client, and IngestionWorker.
     Designed for ProcessPoolExecutor — each call is fully independent.
+
+    Parameters
+    ----------
+    bust_llm_cache:
+        When True, the per-process ``IngestionWorker`` is constructed with
+        ``bust_llm_cache=True`` so every ``LlmExtractor`` it creates skips
+        cache reads.  This is the only path through which already-split
+        documents (parents whose split-child rows live in
+        ``derived.documents``) can be re-extracted with a fresh LLM call —
+        DB-row mode (``--multimodal --bust-llm-cache``) correctly skips
+        split-child rows to avoid the #2416 exponential explosion, leaving
+        prefix-mode the sole avenue once a parent has been split.  See
+        #4049.
 
     Returns a dict with:
       - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
@@ -3122,12 +3136,17 @@ def _process_prefix_document(
         else:
             os_client = MagicMock()
         s3_for_worker = _make_s3()
+        # ``bust_llm_cache=...`` propagates the operator's --bust-llm-cache
+        # flag through this worker into every ``LlmExtractor`` it creates
+        # (multimodal + framework).  This is the only way to re-extract
+        # already-split parent PDFs with a fresh LLM call — see #4049.
         worker = IngestionWorker(
             redis_client=rc,
             pg_dsn=database_url,
             opensearch_client=os_client,
             s3_client=s3_for_worker,
             archive_bucket=bucket,
+            bust_llm_cache=bust_llm_cache,
         )
         _process_prefix_document._worker = worker  # type: ignore[attr-defined]
 
@@ -3146,6 +3165,7 @@ def run_reingest_from_prefix(
     concurrency: int = 10,
     limit: int | None = None,
     dry_run: bool = False,
+    bust_llm_cache: bool = False,
 ) -> dict[str, Any]:
     """Scan S3 by key prefix and ingest documents not in the DB.
 
@@ -3167,6 +3187,15 @@ def run_reingest_from_prefix(
         Maximum number of documents to process.
     dry_run:
         If True, list keys and seed courts but skip document processing.
+    bust_llm_cache:
+        If True, the per-process ``IngestionWorker`` is constructed with
+        ``bust_llm_cache=True`` so every ``LlmExtractor`` it builds skips
+        cache reads.  Required to re-extract documents whose parent PDF has
+        already been split into per-ruling child rows: DB-row mode (the
+        ``--multimodal`` path) correctly skips split-child rows via the
+        ``is_split_child_id`` guard to avoid the #2416 exponential
+        explosion, so the prefix path is the only avenue once a parent has
+        been split.  See #4049.
 
     Returns
     -------
@@ -3254,6 +3283,7 @@ def run_reingest_from_prefix(
                 database_url,
                 redis_url,
                 os_url,
+                bust_llm_cache,
             ): key
             for key in keys
         }
@@ -3816,7 +3846,11 @@ def main() -> None:
             "(e.g. dead-lettered events). Lists S3 objects under the prefix, "
             "seeds court records, and processes each document through the "
             "ingestion pipeline via IngestionWorker.process_event(). "
-            "Example: --prefix federal/"
+            "Example: --prefix federal/. "
+            "Combine with --bust-llm-cache to re-extract already-split "
+            "documents (the only path once parent PDFs have produced "
+            "split-child rows; DB-row mode skips them to avoid #2416). "
+            "See #4049."
         ),
     )
     parser.add_argument(
@@ -3880,6 +3914,7 @@ def main() -> None:
             concurrency=args.concurrency,
             limit=args.limit,
             dry_run=args.dry_run,
+            bust_llm_cache=args.bust_llm_cache,
         )
         logger.info(
             "Prefix reingest complete",
