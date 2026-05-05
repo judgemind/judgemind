@@ -1644,6 +1644,20 @@ ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS = 3
 #: append-only audit + bookkeeping marker.
 PHASE_RESURRECTED_FOR_ORPHAN_PR = "resurrected_for_orphan_pr"
 
+#: Maximum number of orphan-PR candidates the resurrection sweep
+#: examines per supervisor tick (#3407). The pre-fix sweep iterated
+#: every ``status='failed' AND pr_number IS NOT NULL`` row from the
+#: 24h lookback window — typically 20-30 rows in production — and
+#: issued one ``gh pr view`` subprocess per row, taking ~27s per tick
+#: (threshold 10s). Capping the candidate set bounds worst-case
+#: latency: the SELECT order is ``ended_at DESC`` so the most-recent
+#: failures (most likely to still be transient and resurrectable)
+#: stay in scope. Older rows beyond the cap are operator-attention
+#: territory anyway. Combined with the batched GraphQL fetch in
+#: :meth:`_fetch_pr_status_batch` this drops the sweep from N
+#: subprocess calls to one.
+MAX_ORPHAN_PR_BATCH_SIZE = 30
+
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
@@ -1735,6 +1749,95 @@ def _stderr_tail(stderr: str | bytes | None) -> str:
     if len(stderr) <= STRUCTURED_LOG_STDERR_MAX:
         return stderr
     return stderr[-STRUCTURED_LOG_STDERR_MAX:]
+
+
+def _normalize_graphql_pr_payload(node: dict[str, Any]) -> dict[str, Any]:
+    """Translate a ``pullRequest(number:N)`` GraphQL node into the dict
+    shape :meth:`_fetch_pr_status` returns from ``gh pr view --json``.
+
+    The orphan-PR resurrection sweep's classifier
+    (``phase_transitions._ci_rollup_state`` via
+    :func:`phase_transitions.transition_from_awaiting_ci`) consumes the
+    ``gh pr view`` shape — a flat list of dicts under the
+    ``statusCheckRollup`` key, each with ``status`` / ``conclusion`` for
+    CheckRun-typed checks and ``state`` for legacy StatusContext-typed
+    checks. The GraphQL ``commits(last:1).statusCheckRollup.contexts.nodes``
+    response wraps those same checks in a deeper shape with
+    ``__typename`` discrimination. This helper flattens the GraphQL
+    nodes into the gh-pr-view shape so downstream code (and existing
+    tests) keeps working without two parallel classifiers.
+
+    Issue #3407.
+
+    Returns a dict with these keys (all best-effort — missing fields
+    map to ``None`` so the classifier's defensive checks still apply):
+
+    * ``state`` — ``"OPEN"`` / ``"MERGED"`` / ``"CLOSED"``
+    * ``mergeable`` — ``"MERGEABLE"`` / ``"CONFLICTING"`` / ``"UNKNOWN"``
+    * ``mergeStateStatus`` — ``"CLEAN"`` / ``"UNSTABLE"`` / ``"DIRTY"`` / ``"UNKNOWN"`` / ...
+    * ``mergedAt`` — ISO timestamp string or ``None``
+    * ``headRefOid`` — head SHA string or ``None``
+    * ``mergeCommit`` — ``{"oid": "..."}`` or ``None``
+    * ``statusCheckRollup`` — list of ``{"status", "conclusion", "name"}``
+      (CheckRun) or ``{"state", "context"}`` (StatusContext) dicts.
+    """
+    out: dict[str, Any] = {
+        "state": node.get("state"),
+        "mergeable": node.get("mergeable"),
+        "mergeStateStatus": node.get("mergeStateStatus"),
+        "mergedAt": node.get("mergedAt"),
+        "headRefOid": node.get("headRefOid"),
+    }
+
+    # mergeCommit is nested in GraphQL — flatten to {"oid": ...} or None.
+    merge_commit = node.get("mergeCommit")
+    if isinstance(merge_commit, dict) and merge_commit.get("oid"):
+        out["mergeCommit"] = {"oid": merge_commit["oid"]}
+    else:
+        out["mergeCommit"] = None
+
+    # Flatten commits(last:1).statusCheckRollup.contexts.nodes — convert
+    # each context into the gh-pr-view shape the classifier expects.
+    rollup: list[dict[str, Any]] = []
+    commits_field = node.get("commits") or {}
+    commits_nodes = (
+        commits_field.get("nodes") if isinstance(commits_field, dict) else None
+    )
+    if isinstance(commits_nodes, list) and commits_nodes:
+        commit = (
+            commits_nodes[0].get("commit")
+            if isinstance(commits_nodes[0], dict)
+            else None
+        )
+        if isinstance(commit, dict):
+            rollup_obj = commit.get("statusCheckRollup")
+            if isinstance(rollup_obj, dict):
+                contexts = rollup_obj.get("contexts") or {}
+                ctx_nodes = (
+                    contexts.get("nodes") if isinstance(contexts, dict) else None
+                )
+                if isinstance(ctx_nodes, list):
+                    for ctx in ctx_nodes:
+                        if not isinstance(ctx, dict):
+                            continue
+                        typename = ctx.get("__typename")
+                        if typename == "CheckRun":
+                            rollup.append(
+                                {
+                                    "status": ctx.get("status"),
+                                    "conclusion": ctx.get("conclusion"),
+                                    "name": ctx.get("name"),
+                                }
+                            )
+                        elif typename == "StatusContext":
+                            rollup.append(
+                                {
+                                    "state": ctx.get("state"),
+                                    "context": ctx.get("context"),
+                                }
+                            )
+    out["statusCheckRollup"] = rollup
+    return out
 
 
 def _extract_botocore_error_code(exc: Exception) -> str:
@@ -14025,6 +14128,15 @@ class DispatcherDaemon:
         supervisor-tick log summary). Per-row failures (PR fetch
         timeout, DB write error) are logged and swallowed so one bad
         row cannot stall the sweep or the tick.
+
+        **Performance (#3407):** the candidate set is capped at
+        :data:`MAX_ORPHAN_PR_BATCH_SIZE` *after* the budget filter, and
+        the remaining PRs are fetched in a single batched GraphQL call
+        via :meth:`_fetch_pr_status_batch`. This drops the sweep from
+        N sequential ``gh pr view`` subprocesses to one — measured at
+        ~27s/tick (threshold 10s) before the fix. Any candidates beyond
+        the cap emit ``orphan_pr_resurrection_skipped`` with reason
+        ``batch_cap_exceeded`` so CloudWatch retains the audit trail.
         """
         assert self._conn is not None, "connect() must run before resurrection sweep"
 
@@ -14032,20 +14144,19 @@ class DispatcherDaemon:
         if not candidates:
             return 0
 
-        resurrected = 0
+        # Phase 1: filter by budget. Skipping budget-exhausted /
+        # count-failed rows BEFORE the PR-status fetch keeps the
+        # GraphQL query short and avoids burning rate on PRs we
+        # already know we can't resurrect.
+        eligible: list[dict[str, Any]] = []
         for row in candidates:
             agent_id = row["agent_id"]
             pr_number = row["pr_number"]
             issue_number = row["issue_number"]
 
-            # Budget check — count past resurrections for this agent_id
-            # via the phase_transitions audit log. This avoids needing
-            # a new schema column for the counter (#3399 is pure code).
             past_attempts = self._count_orphan_pr_resurrections(agent_id)
             if past_attempts is None:
                 # DB read failed — skip rather than grant a free pass.
-                # Checked BEFORE _fetch_pr_status to avoid a wasted gh
-                # API call when we already know we can't proceed safely.
                 self._log.info(
                     "daemon.orphan_pr_resurrection_skipped",
                     extra={
@@ -14074,12 +14185,60 @@ class DispatcherDaemon:
                 )
                 continue
 
-            # PR-state guard. Re-uses the same classifier as the
-            # awaiting_ci handler so the gate is consistent — if the
-            # PR isn't currently green-and-mergeable, don't resurrect.
-            pr_status = self._fetch_pr_status(pr_number)
+            eligible.append(
+                {
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "past_attempts": past_attempts,
+                }
+            )
+
+        if not eligible:
+            return 0
+
+        # Phase 2: cap the set so a 100-row backlog can't burn the tick.
+        # The SELECT in :meth:`_list_orphan_pr_failed_agents` already
+        # ordered by ``ended_at DESC`` so most-recent failures (most
+        # likely to still be transient and resurrectable) stay in scope.
+        # Anything beyond the cap is operator-attention territory —
+        # autonomous resurrection isn't going to help.
+        if len(eligible) > MAX_ORPHAN_PR_BATCH_SIZE:
+            for skipped in eligible[MAX_ORPHAN_PR_BATCH_SIZE:]:
+                self._log.info(
+                    "daemon.orphan_pr_resurrection_skipped",
+                    extra={
+                        "event": "orphan_pr_resurrection_skipped",
+                        "run_id": self._run_id,
+                        "agent_id": skipped["agent_id"],
+                        "pr_number": skipped["pr_number"],
+                        "issue_number": skipped["issue_number"],
+                        "reason": "batch_cap_exceeded",
+                        "max_batch_size": MAX_ORPHAN_PR_BATCH_SIZE,
+                    },
+                )
+            eligible = eligible[:MAX_ORPHAN_PR_BATCH_SIZE]
+
+        # Phase 3: ONE batched GraphQL call for all remaining PR numbers.
+        # _fetch_pr_status_batch returns ``{pr_number: payload | None}``
+        # — None means the alias resolved to null OR the whole batch
+        # failed (transient gh / GraphQL flake).
+        pr_numbers = [row["pr_number"] for row in eligible]
+        pr_status_by_number = self._fetch_pr_status_batch(pr_numbers)
+
+        # Phase 4: per-row classification + DB write. No subprocess
+        # calls happen in this loop — the heavy work is already done.
+        resurrected = 0
+        for row in eligible:
+            agent_id = row["agent_id"]
+            pr_number = row["pr_number"]
+            issue_number = row["issue_number"]
+            past_attempts = row["past_attempts"]
+
+            pr_status = pr_status_by_number.get(pr_number)
             if pr_status is None:
-                # Transient gh failure — log and skip; next tick re-tries.
+                # Transient gh failure or alias-null — log and skip; next
+                # tick re-tries with a fresh batch.
                 self._log.info(
                     "daemon.orphan_pr_resurrection_skipped",
                     extra={
@@ -14909,6 +15068,136 @@ class DispatcherDaemon:
                 },
             )
             return None
+
+    def _fetch_pr_status_batch(
+        self, pr_numbers: list[int]
+    ) -> dict[int, dict[str, Any] | None]:
+        """Fetch combined check rollup + merge state for many PRs in one
+        GraphQL call (#3407).
+
+        The orphan-PR resurrection sweep used to call :meth:`_fetch_pr_status`
+        once per candidate, which translated to N sequential ``gh pr view``
+        subprocesses per supervisor tick. Production load (20-30 candidates
+        in the 24h lookback) drove that sweep to ~27s per tick (threshold
+        10s) and burned ~50min/hour of supervisor time on what is supposed
+        to be a ~1s housekeeping step. This batched helper issues a single
+        ``gh api graphql`` call with one aliased ``pullRequest(number:N)``
+        node per PR, mirroring the pattern in :meth:`_fetch_blocker_titles`.
+
+        Each PR resolves to either:
+
+        * a parsed dict shaped like the per-call :meth:`_fetch_pr_status`
+          payload (``statusCheckRollup``, ``mergeable``, ``mergeStateStatus``,
+          ``state``, ``mergedAt``, ``headRefOid``, ``mergeCommit``), OR
+        * ``None`` if the alias resolved to ``null`` (PR doesn't exist in
+          the repo, scope mismatch) or the whole batch failed.
+
+        On a transient failure (timeout, gh missing, empty stdout, missing
+        ``data.repository``) every key in the returned dict is ``None`` —
+        the caller treats that as "skip these candidates this tick" the
+        same way the per-call helper handles a flake.
+
+        Empty input returns ``{}`` without issuing a subprocess. Inputs
+        beyond GitHub's 500-node GraphQL limit are bounded by the caller
+        (see :data:`MAX_ORPHAN_PR_BATCH_SIZE`).
+        """
+        if not pr_numbers:
+            return {}
+
+        # Sort for deterministic alias ordering so unit tests can assert
+        # on the generated query without depending on input order.
+        capped = sorted(set(pr_numbers))
+
+        # Parse owner/name from "owner/repo" config value (mirrors the
+        # split in _fetch_blocker_titles).
+        repo_parts = self._cfg.github_repo.split("/", 1)
+        owner = repo_parts[0]
+        name = repo_parts[1] if len(repo_parts) > 1 else ""
+
+        # Build a single GraphQL query with one aliased pullRequest field
+        # per PR number. The ``statusCheckRollup`` shape mirrors the
+        # ``gh pr view --json statusCheckRollup`` output so the same
+        # phase_transitions._ci_rollup_state classifier accepts both.
+        # ``commits(last:1).statusCheckRollup.contexts.nodes`` returns the
+        # individual check runs / status contexts; we flatten them client
+        # side into the gh-pr-view-shaped ``statusCheckRollup`` list.
+        alias_fields = " ".join(
+            f"pr{n}: pullRequest(number: {n}) {{ "
+            f"number state mergeable mergeStateStatus mergedAt "
+            f"headRefOid "
+            f"mergeCommit {{ oid }} "
+            f"commits(last: 1) {{ nodes {{ commit {{ "
+            f"statusCheckRollup {{ contexts(first: 100) {{ nodes {{ "
+            f"__typename "
+            f"... on CheckRun {{ name status conclusion }} "
+            f"... on StatusContext {{ context state }} "
+            f"}} }} }} }} }} }} "
+            f"}}"
+            for n in capped
+        )
+        query = (
+            f'query {{ repository(owner:"{owner}", name:"{name}") '
+            f"{{ {alias_fields} }} }}"
+        )
+
+        cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+
+        # Hot-path: the supervisor tick blocks on this, so route through
+        # _subprocess_with_retry for the same 1s+2s backoff envelope the
+        # per-call _fetch_pr_status uses. The retry helper treats every
+        # non-zero exit as transient — acceptable here because the
+        # orphan-PR PRs are all author=daemon and a partial-error response
+        # (one of N PRs missing) is genuinely worth retrying. Compare to
+        # _fetch_blocker_titles which bypasses the retry helper because
+        # mixed-issue/PR batches deterministically partial-error.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="pr_view_batch",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"pr_count": len(capped)},
+        )
+        if not outcome["ok"]:
+            return {n: None for n in capped}
+
+        result = outcome["result"]
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            self._log.warning(
+                "daemon.pr_view_batch_invalid_json",
+                extra={
+                    "event": "pr_view_batch_invalid_json",
+                    "run_id": self._run_id,
+                    "pr_count": len(capped),
+                },
+            )
+            return {n: None for n in capped}
+
+        repo_data = (
+            payload.get("data", {}).get("repository")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(repo_data, dict):
+            self._log.warning(
+                "daemon.pr_view_batch_missing_data",
+                extra={
+                    "event": "pr_view_batch_missing_data",
+                    "run_id": self._run_id,
+                    "pr_count": len(capped),
+                },
+            )
+            return {n: None for n in capped}
+
+        out: dict[int, dict[str, Any] | None] = {}
+        for n in capped:
+            node = repo_data.get(f"pr{n}")
+            if not isinstance(node, dict):
+                # PR doesn't exist (e.g. number was deleted) or scope mismatch.
+                out[n] = None
+                continue
+            out[n] = _normalize_graphql_pr_payload(node)
+        return out
 
     @staticmethod
     def _pr_observed_as_merged(pr_status: dict[str, Any] | None) -> bool:
