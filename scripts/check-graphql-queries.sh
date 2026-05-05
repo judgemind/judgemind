@@ -53,11 +53,13 @@ fi
 # The validator imports `graphql` via ESM. Node's ESM resolver anchors the
 # lookup at the importer's URL (`packages/web/scripts/validate-graphql-queries.mjs`)
 # and walks UP the directory tree looking for `node_modules/graphql`. NODE_PATH
-# is a CommonJS-only knob and is ignored by ESM (#4093). The two paths that
-# satisfy this resolver:
-#   1. Local dev: `npm install` in packages/web/ → packages/web/node_modules/graphql
-#   2. CI: `npm install --no-save graphql@^16.8` at repo root → <repo>/node_modules/graphql
-# Either is fine; we only need to verify at least one exists so the failure
+# is a CommonJS-only knob and is ignored by ESM (#4093). The canonical path that
+# satisfies this resolver is `npm install` in packages/web/, which populates
+# packages/web/node_modules/graphql. A repo-root `<repo>/node_modules/graphql`
+# also resolves (the walk reaches it from packages/web/scripts/) and is kept as
+# a fallback for the scripts-tests Python shard, which installs graphql at the
+# repo root via `npm install --no-save graphql@^16.8` (.github/workflows/ci.yml
+# `scripts-tests` job). We only need to verify at least one exists so the failure
 # mode is a friendly error rather than Node's raw stack trace.
 if [ ! -d "$REPO_ROOT/packages/web/node_modules/graphql" ] && \
    [ ! -d "$REPO_ROOT/node_modules/graphql" ]; then
@@ -65,8 +67,7 @@ if [ ! -d "$REPO_ROOT/packages/web/node_modules/graphql" ] && \
     echo "  Looked for it at:"
     echo "    $REPO_ROOT/packages/web/node_modules/graphql"
     echo "    $REPO_ROOT/node_modules/graphql"
-    echo "  Fix (local): cd packages/web && npm install"
-    echo "  Fix (CI):    npm install --no-save graphql@^16.8  # at repo root"
+    echo "  Fix: cd packages/web && npm install"
     exit 1
 fi
 

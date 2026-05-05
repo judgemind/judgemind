@@ -1395,6 +1395,15 @@ jobs:
   # ---------------------------------------------------------------
   # GraphQL query validation: frontend queries must match API schema
   # ---------------------------------------------------------------
+  # Install graphql via packages/web/ so this CI step exercises the same
+  # ESM-resolution path local users hit via `npm run check` from
+  # packages/web/. The previous repo-root `npm install --no-save graphql@^16.8`
+  # workaround dates from when the validator lived at repo-root scripts/ and
+  # relied on NODE_PATH (Node 20 only). #4093 / #4098 relocated the validator
+  # to packages/web/scripts/ where ESM resolution finds graphql at
+  # packages/web/node_modules/graphql naturally — no NODE_PATH, no Node 24
+  # branch. Keeping the repo-root install would silently mask a future
+  # regression that re-breaks the local-dev path (#4089).
   graphql-query-check:
     runs-on: ubuntu-latest
     steps:
@@ -1402,8 +1411,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - name: Install graphql package
-        run: npm install --no-save graphql@^16.8
+      - name: Install web dependencies (provides packages/web/node_modules/graphql)
+        run: npm --prefix packages/web ci
       - name: Validate frontend GraphQL queries against API schema
         run: scripts/check-graphql-queries.sh
 
