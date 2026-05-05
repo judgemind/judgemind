@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 
+import httpx
 import structlog
 
 from .capture_dedup import content_hash_seen_at, record_capture_dedup_skipped
@@ -24,6 +25,10 @@ from .retry import retry_sync
 from .storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
+
+# Default timeout for the per-run shared httpx.Client used to fetch external
+# CSS for inlining (#3641).  Matches the per-request timeout in css_inliner.
+_INLINE_CSS_CLIENT_TIMEOUT = 10.0
 
 
 class ScraperPreconditionFailure(RuntimeError):  # noqa: N818
@@ -74,6 +79,11 @@ class BaseScraper(abc.ABC):
         self._event_bus = event_bus
         self._db_conn = db_conn
         self._log = structlog.get_logger(__name__).bind(scraper_id=config.scraper_id)
+        # Lazy per-run shared httpx.Client for inline_css (#3641).  Constructed
+        # on first HTML document, closed in run()'s finally block.  Sharing one
+        # client across an entire scraper run avoids ~200 redundant TLS
+        # handshakes per LA tentatives run (194 docs × 2 parses each).
+        self._inline_css_client: httpx.Client | None = None
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -114,31 +124,46 @@ class BaseScraper(abc.ABC):
         error_message: str | None = None
 
         try:
-            docs = retry_sync(
-                self.fetch_documents,
-                max_attempts=self.config.max_retries,
-                exceptions=(Exception,),
-            )
+            try:
+                docs = retry_sync(
+                    self.fetch_documents,
+                    max_attempts=self.config.max_retries,
+                    exceptions=(Exception,),
+                )
 
-            for doc in docs:
+                for doc in docs:
+                    try:
+                        captured = self._process_document(doc)
+                        if captured:
+                            records_captured += 1
+                    except Exception as exc:
+                        self._log.error(
+                            "Failed to process document",
+                            source_url=doc.source_url,
+                            error=str(exc),
+                        )
+
+                success = True
+                self._log.info("Run complete", records=records_captured)
+
+            except Exception as exc:
+                success = False
+                error_message = str(exc)
+                self._log.error("Run failed", error=error_message)
+        finally:
+            # Close the shared inline-CSS client if it was created during
+            # this run.  Idempotent — safe to call even if no HTML docs
+            # triggered construction.  See #3641.
+            if self._inline_css_client is not None:
                 try:
-                    captured = self._process_document(doc)
-                    if captured:
-                        records_captured += 1
+                    self._inline_css_client.close()
                 except Exception as exc:
-                    self._log.error(
-                        "Failed to process document",
-                        source_url=doc.source_url,
+                    self._log.warning(
+                        "Failed to close shared inline_css httpx.Client",
                         error=str(exc),
                     )
-
-            success = True
-            self._log.info("Run complete", records=records_captured)
-
-        except Exception as exc:
-            success = False
-            error_message = str(exc)
-            self._log.error("Run failed", error=error_message)
+                finally:
+                    self._inline_css_client = None
 
         elapsed = time.monotonic() - start
         health = ScraperHealthEvent(
@@ -210,11 +235,21 @@ class BaseScraper(abc.ABC):
         land in the DB (#2367).
         """
         # Inline CSS for HTML documents (makes archived HTML self-contained).
-        # TODO(perf): If a scraper produces many HTML docs per run, consider
-        # sharing an httpx.Client across calls to avoid per-document overhead.
+        # We share one httpx.Client across the entire scraper run to avoid the
+        # per-document TLS handshake + DNS lookup overhead — #3641.
         if doc.content_format == ContentFormat.HTML:
+            if self._inline_css_client is None:
+                self._inline_css_client = httpx.Client(
+                    follow_redirects=True,
+                    timeout=_INLINE_CSS_CLIENT_TIMEOUT,
+                    headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
+                )
             try:
-                doc.raw_content = inline_css(doc.raw_content, base_url=doc.source_url)
+                doc.raw_content = inline_css(
+                    doc.raw_content,
+                    base_url=doc.source_url,
+                    http_client=self._inline_css_client,
+                )
             except Exception as exc:
                 self._log.warning(
                     "CSS inlining failed, continuing with original content",

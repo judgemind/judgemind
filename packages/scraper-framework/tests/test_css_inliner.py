@@ -416,3 +416,197 @@ def test_base_scraper_continues_if_css_inlining_fails() -> None:
         assert len(captured) == 1
         # Content hash should be based on original content
         assert captured[0].content_hash == sha256_hex(html)
+
+
+def test_base_scraper_shares_httpx_client_across_inline_css_calls() -> None:
+    """Regression for #3641 — BaseScraper should open at most one httpx.Client
+    per run, regardless of how many HTML documents go through inline_css.
+
+    Before #3641, ``_process_document`` called ``inline_css`` without an
+    ``http_client`` kwarg, so each call opened a fresh ``httpx.Client`` —
+    a TLS handshake + DNS lookup per document.  The LA tentatives scraper
+    captures ~194 docs × 2 parses each, so the prior behavior produced
+    ~388 client constructions per run; the fix shares one client.
+
+    The assertion is on the ``httpx.Client`` *constructor* count: any
+    construction site (BaseScraper itself, or fall-through inside
+    ``inline_css``) is counted, so the test catches regressions even if
+    the wiring later moves between layers.
+    """
+    from datetime import UTC, datetime
+
+    from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+
+    html_with_css = (
+        b"<html><head>"
+        b'<link rel="stylesheet" href="https://court.example.com/css/styles.css">'
+        b"</head><body><p>Ruling</p></body></html>"
+    )
+
+    def make_doc(idx: int) -> CapturedDocument:
+        return CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="Test",
+            court="Superior Court",
+            source_url=f"https://court.example.com/rulings/page-{idx}.html",
+            capture_timestamp=datetime.now(UTC),
+            content_format=ContentFormat.HTML,
+            raw_content=html_with_css,
+            content_hash="",
+        )
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["https://court.example.com"],
+    )
+
+    docs = [make_doc(i) for i in range(5)]
+
+    class TestScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return docs
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            return d
+
+    # Wrap ``httpx.Client.__init__`` to count constructions.  This catches
+    # *any* construction path — whether BaseScraper builds the client and
+    # passes it down, or inline_css constructs internally — without
+    # depending on which module imports httpx.  We use a real client so
+    # context-manager semantics in inline_css still work, and patch
+    # ``httpx.Client.get`` to short-circuit so no real network I/O happens.
+    construction_count = 0
+    original_init = httpx.Client.__init__
+
+    def counting_init(self: httpx.Client, *args: object, **kwargs: object) -> None:
+        nonlocal construction_count
+        construction_count += 1
+        original_init(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch.object(httpx.Client, "__init__", counting_init),
+        patch.object(httpx.Client, "get", side_effect=httpx.ConnectError("blocked")),
+    ):
+        scraper = TestScraper(config=config)
+        health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 5
+    assert construction_count <= 1, (
+        f"Expected at most one httpx.Client construction per scraper run "
+        f"across {len(docs)} HTML documents, got {construction_count}. "
+        f"This is the #3641 regression — BaseScraper should reuse one client."
+    )
+
+
+def test_base_scraper_closes_shared_inline_css_client_after_run() -> None:
+    """The shared httpx.Client must be closed in run()'s finally block (#3641).
+
+    Leaking sockets at run end across hundreds of scraper runs would
+    eventually exhaust file descriptors on the worker.
+    """
+    from datetime import UTC, datetime
+
+    from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["https://court.example.com"],
+    )
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        source_url="https://court.example.com/page.html",
+        capture_timestamp=datetime.now(UTC),
+        content_format=ContentFormat.HTML,
+        raw_content=(
+            b"<html><head>"
+            b'<link rel="stylesheet" href="https://court.example.com/css/styles.css">'
+            b"</head><body><p>x</p></body></html>"
+        ),
+        content_hash="",
+    )
+
+    captured_clients: list[httpx.Client] = []
+    real_init = httpx.Client.__init__
+
+    def capture_init(self: httpx.Client, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)  # type: ignore[arg-type]
+        captured_clients.append(self)
+
+    class TestScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return [doc]
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            return d
+
+    with (
+        patch.object(httpx.Client, "__init__", capture_init),
+        patch.object(httpx.Client, "get", side_effect=httpx.ConnectError("blocked")),
+    ):
+        scraper = TestScraper(config=config)
+        scraper.run()
+
+    assert len(captured_clients) == 1
+    # The client BaseScraper created should be closed and the field cleared.
+    assert captured_clients[0].is_closed
+    assert scraper._inline_css_client is None
+
+
+def test_base_scraper_logs_warning_when_inline_css_client_close_raises() -> None:
+    """If the shared client's close() raises, the run should still finish (#3641)."""
+    from datetime import UTC, datetime
+
+    from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["https://court.example.com"],
+    )
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        source_url="https://court.example.com/page.html",
+        capture_timestamp=datetime.now(UTC),
+        content_format=ContentFormat.HTML,
+        raw_content=(
+            b"<html><head>"
+            b'<link rel="stylesheet" href="https://court.example.com/css/styles.css">'
+            b"</head><body><p>x</p></body></html>"
+        ),
+        content_hash="",
+    )
+
+    class TestScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return [doc]
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            return d
+
+    with (
+        patch.object(httpx.Client, "close", side_effect=RuntimeError("close failed")),
+        patch.object(httpx.Client, "get", side_effect=httpx.ConnectError("blocked")),
+    ):
+        scraper = TestScraper(config=config)
+        # Should not raise even though close() raises.
+        health = scraper.run()
+
+    # Run still produced a health event, and the client field was cleared.
+    assert health.success is True
+    assert scraper._inline_css_client is None
