@@ -7,6 +7,7 @@ import { createComplexityLimitRule } from 'graphql-validation-complexity';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
+import { costBreakdownPlugin } from './graphql/cost-breakdown';
 import { pool as defaultPool } from './data-access/db';
 import { extractUser } from './auth';
 import { opensearchClient as defaultOsClient } from './search/client';
@@ -54,6 +55,19 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
       createComplexityLimitRule(1000, {
         onCost: (cost: number) => app.log.info({ cost }, 'graphql.cost'),
       }),
+    ],
+    plugins: [
+      // Issue #4100 — emit a per-top-level-field cost breakdown when an
+      // operation's total cost is within the early-warning band of the
+      // 1000-cap (≥ 800). The cost rule above only exposes the total via
+      // `onCost`; this plugin walks the same algorithm and names which
+      // fields dominate, so future cap-overflow incidents can be triaged
+      // from a single CloudWatch line. Threshold-gated to keep log
+      // volume bounded — the dispatcher polls every 2s and we don't
+      // want a breakdown for every cheap query.
+      costBreakdownPlugin((entry) =>
+        app.log.info(entry, 'graphql.cost.breakdown'),
+      ),
     ],
   });
   await apollo.start();

@@ -51,6 +51,32 @@
  * render plain green ✓ instead of the amber-✓ incomplete variant; the
  * cost footnote and start/duration tooltip are absent. The full
  * milestone breakdown still renders inside the expand-on-click dialog.
+ *
+ * Polled-query slim — `activeAgents` (issue #4100): the polled
+ * `activeAgents` block originally selected 12 fields. After #4062 +
+ * #4063 + #4064 landed, the polled query was still 35 units over the
+ * #4003 1000-cap (cost: 1035); CloudWatch on `/ecs/judgemind-api-dev`
+ * showed every cockpit poll returning HTTP 400 with `Query exceeded
+ * complexity`. Per-field breakdown (computed offline from the cost-
+ * rule algorithm; the `costBreakdownPlugin` in
+ * `packages/api/src/graphql/cost-breakdown.ts` will print this in
+ * CloudWatch on each near-cap operation going forward) showed the
+ * biggest remaining contributor was `activeAgents`'s 12-field scalar
+ * list. Trimmed to the eight fields `ActiveAgentRow` actually reads
+ * to render the row — `id` (key + native title for full UUID),
+ * `worktreePath` (Logs link href + path-tail fallback), `phase`
+ * (chip + tooltip via `dispatcher-phase-flow`), the unified
+ * `(issue, priority, title)` prefix (`issueNumber` / `issueTitle` /
+ * `priority`), `startedAt` (elapsed-time cell), and `retriesUsed`
+ * (final-attempt Opus marker via `dispatcher-ralph-model`). The four
+ * detail-only fields (`status`, `endedAt`, `exitCode`, `prNumber`)
+ * are not consumed by `ActiveAgentRow` — `status` is implicit
+ * ("running" by definition for active agents), `endedAt` and
+ * `exitCode` are terminal-only signals (always null on a row that
+ * appears in `activeAgents`), and `prNumber` is rare on running
+ * agents and the row has no UI affordance for it anyway. Trim saves
+ * 4 × 10 = 40 units; combined with the other slims the polled cost
+ * is ≤ 995 — back under the 1000-cap with headroom.
  */
 import { gql } from '@apollo/client';
 
@@ -73,11 +99,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         priority
         worktreePath
         phase
-        status
         startedAt
-        endedAt
-        exitCode
-        prNumber
         retriesUsed
       }
       recentFailures(sinceHours: 24) {
@@ -265,11 +287,30 @@ export interface DispatcherAgent {
   priority: string | null;
   worktreePath: string;
   phase: string;
-  status: string;
+  /** Always `"running"` on rows fetched via `DISPATCHER_STATE_QUERY`
+   * (issue #4100): the polled query no longer selects `status` because
+   * `activeAgents` is — by SQL definition — only the running agents.
+   * Always populated on rows fetched via `DISPATCHER_QUEUE_FULL_QUERY`
+   * (active agents are not included in that bucket today, but the
+   * field stays for type compatibility with terminal rows). */
+  status?: string;
   startedAt: string;
-  endedAt: string | null;
-  exitCode: number | null;
-  prNumber: number | null;
+  /** Always null on rows fetched via `DISPATCHER_STATE_QUERY` (issue
+   * #4100): an active row by definition has not ended yet; the field
+   * carries no information for the polled view, so it was dropped from
+   * the polled selection. Populated when fetched via the dialog query. */
+  endedAt?: string | null;
+  /** Always null on rows fetched via `DISPATCHER_STATE_QUERY` (issue
+   * #4100): paired with `endedAt` above — no exit code exists yet on
+   * a still-running agent. */
+  exitCode?: number | null;
+  /** May be `undefined` on rows fetched via `DISPATCHER_STATE_QUERY`
+   * (issue #4100): trimmed from the polled selection. PR is rare on
+   * running agents (typically only present after summary phase has
+   * opened the PR) and `ActiveAgentRow` has no UI affordance for it,
+   * so the polled row carries no PR link. The dialog still surfaces
+   * it via `DISPATCHER_QUEUE_FULL_QUERY`. */
+  prNumber?: number | null;
   retriesUsed: number;
 }
 
