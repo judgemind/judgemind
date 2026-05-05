@@ -249,10 +249,8 @@ def test_reparse_document_records_parse_and_regex_timing() -> None:
     import sys
 
     # Reuse the same path-bootstrap as test_reingest_from_s3.py.
-    _SCRIPTS_DIR = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "..", "scripts"
-    )
-    sys.path.insert(0, _SCRIPTS_DIR)
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts")
+    sys.path.insert(0, scripts_dir)
     reingest = importlib.import_module("reingest_from_s3")
 
     raw_html = b"<html><body><p>Some ruling text.</p></body></html>"
