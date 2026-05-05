@@ -25,8 +25,25 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 const mockControlMutate = vi.fn().mockResolvedValue({ data: {} });
 const mockSetConfigMutate = vi.fn().mockResolvedValue({ data: {} });
 const mockRefetch = vi.fn().mockResolvedValue({ data: {} });
+// #4063: per-query refetch trackers. The polled `DispatcherState` query
+// and the once-on-mount `DispatcherConfig` query each get their own
+// refetch fn so tests can assert which one a given side-effect targets.
+const mockStateRefetch = vi.fn().mockResolvedValue({ data: {} });
+const mockConfigRefetch = vi.fn().mockResolvedValue({ data: {} });
+// #4063: track useQuery options per operation name so tests can
+// assert `DispatcherState` is polled and `DispatcherConfig` is not.
+const useQueryCalls: Record<
+  string,
+  Array<{ pollInterval?: number; skip?: boolean }>
+> = {};
 
 let mockQueryData: { dispatcherState?: Record<string, unknown> } | undefined;
+// #4063: mock for the new config-only query. Defaults to mirroring the
+// `BASE_STATE.config` fixture so tests that don't care about the split
+// keep working.
+let mockConfigData:
+  | { dispatcherState?: { config?: Record<string, unknown>[] } }
+  | undefined;
 // #3159: separate mock data for the `dispatcherQueueFull` query fired
 // only when the operator opens an expand-count dialog. Keyed by the
 // `kind` variable so the mock can serve READY / BLOCKED / COMPLETED
@@ -50,9 +67,16 @@ vi.mock('@apollo/client', async () => {
       options?: {
         variables?: { kind?: string };
         skip?: boolean;
+        pollInterval?: number;
       },
     ) => {
       const opName = doc?.definitions?.[0]?.name?.value ?? '';
+      // #4063: record every useQuery invocation so tests can assert the
+      // poll-interval contract per operation.
+      (useQueryCalls[opName] ??= []).push({
+        pollInterval: options?.pollInterval,
+        skip: options?.skip,
+      });
       if (opName === 'DispatcherQueueFull') {
         // #3159: serve per-kind mock data. When `skip` is true (dialog
         // closed) Apollo would return `data: undefined`; mirror that
@@ -84,11 +108,28 @@ vi.mock('@apollo/client', async () => {
           refetch: mockRefetch,
         };
       }
+      if (opName === 'DispatcherConfig') {
+        // #4063: standalone config query — fires once on mount, not in
+        // the 2s poll. Default to mirroring `mockQueryData.dispatcherState.config`
+        // so tests written against the old combined query don't drift.
+        const fallback = mockQueryData?.dispatcherState?.config as
+          | Record<string, unknown>[]
+          | undefined;
+        const data =
+          mockConfigData ??
+          (fallback ? { dispatcherState: { config: fallback } } : undefined);
+        return {
+          data,
+          loading: false,
+          error: undefined,
+          refetch: mockConfigRefetch,
+        };
+      }
       return {
         data: mockQueryData,
         loading: false,
         error: undefined,
-        refetch: mockRefetch,
+        refetch: mockStateRefetch,
       };
     },
     useMutation: (doc: { definitions?: Array<{ name?: { value?: string } }> }) => {
@@ -169,6 +210,10 @@ describe('DispatcherDashboard — #2884 simplified command surface', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
@@ -234,6 +279,10 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
@@ -307,11 +356,121 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
   });
 });
 
+// #4063 — `config` was moved out of the polled `dispatcherState` query into
+// a separate `DispatcherConfig` query that fires once on mount and is
+// refetched explicitly after a `dispatcherSetConfig` mutation. Two
+// regressions to guard:
+//   1. The polled `DispatcherState` query MUST NOT select `config` (saves
+//      ~40 cost units against the #4003 1000-cap).
+//   2. The new `DispatcherConfig` query is fired without `pollInterval`
+//      and is refetched (not the polled state query) after a config edit.
+describe('DispatcherDashboard — #4063 config decoupled from poll', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+  });
+
+  it('DispatcherState query is polled (pollInterval set) but does NOT carry config in its document', async () => {
+    renderDashboard();
+    // The state query must have been invoked with a non-zero pollInterval —
+    // that's the contract that drives the 2s real-time refresh.
+    const stateCalls = useQueryCalls['DispatcherState'] ?? [];
+    expect(stateCalls.length).toBeGreaterThan(0);
+    expect(stateCalls.every((c) => (c.pollInterval ?? 0) > 0)).toBe(true);
+
+    // The query document MUST NOT select `config` — this is the cost-cap
+    // regression guard. We re-import the query and walk its AST.
+    const queries = await import('@/lib/dispatcher-queries');
+    const stateDoc = queries.DISPATCHER_STATE_QUERY;
+    const stateText = JSON.stringify(stateDoc);
+    expect(stateText).not.toMatch(/"name":\{[^}]*"value":"config"/);
+  });
+
+  it('DispatcherConfig query fires WITHOUT pollInterval (fires once on mount)', () => {
+    renderDashboard();
+    const configCalls = useQueryCalls['DispatcherConfig'] ?? [];
+    // The query must have been invoked at least once.
+    expect(configCalls.length).toBeGreaterThan(0);
+    // None of those invocations may carry a pollInterval — `config`
+    // changes rarely (manual operator edits) and doesn't ride the 2s
+    // real-time refresh.
+    for (const call of configCalls) {
+      expect(call.pollInterval ?? 0).toBe(0);
+    }
+  });
+
+  it('committing a config edit refetches DispatcherConfig (not the polled state query)', async () => {
+    renderDashboard();
+    // Sanity: no refetches yet.
+    expect(mockConfigRefetch).not.toHaveBeenCalled();
+    expect(mockStateRefetch).not.toHaveBeenCalled();
+
+    const capButton = screen.getByTestId('config-value-concurrency_cap');
+    fireEvent.click(capButton);
+    const input = screen.getByTestId('config-input-concurrency_cap') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '4' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(mockSetConfigMutate).toHaveBeenCalled();
+    });
+    // Refetch is awaited inside `commitConfigEdit` — wait for it.
+    await waitFor(() => {
+      expect(mockConfigRefetch).toHaveBeenCalled();
+    });
+    // The polled-state refetch must NOT have been triggered by the
+    // config edit — the polled query no longer carries `config`.
+    expect(mockStateRefetch).not.toHaveBeenCalled();
+  });
+
+  it('ConfigPanel reads entries from the DispatcherConfig query (not from polled state)', () => {
+    // Override the config query result with a value the polled state
+    // does NOT carry. If the panel is wired correctly, the displayed cap
+    // tracks the dedicated config query.
+    mockConfigData = {
+      dispatcherState: {
+        config: [
+          {
+            key: 'concurrency_cap',
+            value: '7',
+            updatedAt: '2026-04-18T09:00:00Z',
+            updatedBy: 'init',
+          },
+          {
+            key: 'backoff_seconds',
+            value: '[60,300,900]',
+            updatedAt: '2026-04-18T09:00:00Z',
+            updatedBy: 'init',
+          },
+        ],
+      },
+    };
+    // Polled state still has the OLD value (3) — used to be where the
+    // panel read from. After #4063 it must NOT be the source of truth.
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    renderDashboard();
+    const capButton = screen.getByTestId('config-value-concurrency_cap');
+    // Display reads as "[7]" — pulled from the new query, not the old state.
+    expect(capButton.textContent).toMatch(/\[7\]/);
+    expect(capButton.textContent).not.toMatch(/\[3\]/);
+  });
+});
+
 describe('DispatcherDashboard — #2823 state-flow two-column layout', () => {
   beforeEach(() => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
@@ -385,6 +544,10 @@ describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
   });
 
   it('renders the banner when circuitBreakerOpen is true', () => {
@@ -443,6 +606,10 @@ describe('DispatcherDashboard — #3584 synchronous poll state update (no view-t
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
   });
 
   it('does NOT call startViewTransition on a poll-driven update (#3584)', async () => {
@@ -528,6 +695,10 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
     mockQueueFullData.READY = undefined;
     mockQueueFullData.BLOCKED = undefined;
@@ -636,6 +807,10 @@ describe('DispatcherDashboard — #3222 dialog title (total only)', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueueFullData.READY = undefined;
     mockQueueFullData.BLOCKED = undefined;
     mockQueueFullData.COMPLETED = undefined;
@@ -759,6 +934,10 @@ describe('DispatcherDashboard — #2812 Phase 2 polish', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
@@ -795,6 +974,10 @@ describe('DispatcherDashboard — #3206 dialog-open view-transition gate', () =>
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueueFullData.READY = undefined;
     mockQueueFullData.BLOCKED = undefined;
     mockQueueFullData.COMPLETED = undefined;
@@ -963,6 +1146,10 @@ describe('DispatcherDashboard — DiagnoserEffectivenessPanel (#2800)', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
@@ -990,6 +1177,10 @@ describe('DispatcherDashboard — #3220 / #3584 no view-transition on any poll (
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockStateRefetch.mockClear();
+    mockConfigRefetch.mockClear();
+    mockConfigData = undefined;
+    for (const k of Object.keys(useQueryCalls)) delete useQueryCalls[k];
     mockQueueFullData.READY = undefined;
     mockQueueFullData.BLOCKED = undefined;
     mockQueueFullData.COMPLETED = undefined;
