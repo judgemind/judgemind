@@ -1449,6 +1449,32 @@ jobs:
         run: python3 scripts/check-ci-job-skipped.py --base "origin/${{ github.event.pull_request.base.ref }}"
 
   # ---------------------------------------------------------------
+  # Workflow paths-filter coverage guard: assert every shell script
+  # invoked from a runner-side `run:` block in a deploy workflow (or
+  # composite action it references) is listed in that workflow's
+  # `paths:` filter, so changes to the shared script trigger the
+  # workflow on the PR that introduces them. Closes the recurring
+  # bug-class behind #2592, #2608, #4073, #4084 — a regression in a
+  # shared script otherwise only surfaces on the next *unrelated* PR's
+  # deploy. Runs unconditionally on every PR since the check is fast
+  # and scoping-by-paths-filter is exactly what we'd be auditing.
+  # ---------------------------------------------------------------
+  workflow-paths-filter-coverage-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: pip install pytest
+      - name: Verify workflow paths-filters cover invoked shell scripts
+        run: python3 scripts/check-workflow-paths-filter-coverage.py
+      - name: Run unit tests for the coverage check
+        run: pytest tests/test_check_workflow_paths_filter_coverage.py -v
+
+  # ---------------------------------------------------------------
   # Preflight hook test suite: runs when .claude/hooks/ changes (#2408)
   # ---------------------------------------------------------------
   preflight-hook-test:
@@ -1623,7 +1649,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

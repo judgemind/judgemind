@@ -13,12 +13,18 @@ on:
       # path on its own merge — otherwise regressions surface on the
       # next unrelated apply.
       - "scripts/wait-for-rollout.sh"
+      # scripts/check-no-nonascii-tf-descriptions.sh is invoked by the
+      # `Check no non-ASCII in tf descriptions` step. Same paths-filter
+      # contract — a regression in the hygiene check would otherwise
+      # only surface on the next unrelated terraform PR (see #4084).
+      - "scripts/check-no-nonascii-tf-descriptions.sh"
   pull_request:
     branches: [main]
     paths:
       - "infra/terraform/**"
       - ".github/workflows/terraform.yml"
       - "scripts/wait-for-rollout.sh"
+      - "scripts/check-no-nonascii-tf-descriptions.sh"
 
 jobs:
   terraform:
