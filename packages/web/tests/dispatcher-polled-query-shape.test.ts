@@ -13,9 +13,10 @@ import {
  * complexity cap of 1000, which the dashboard query was exceeding
  * (cost: 1355). The biggest single contributor to that cost was the
  * nested `blockedBy { number title }` selection inside the two queue
- * lists — `graphql-validation-complexity` multiplies cost for each list
- * nesting level, and list-of-objects-containing-a-list is the most
- * expensive shape.
+ * lists — the cost rule (`graphql-query-complexity` after #4112,
+ * `graphql-validation-complexity` before) multiplies cost for each
+ * list nesting level, and list-of-objects-containing-a-list is the
+ * most expensive shape.
  *
  * The fix in this PR drops `blockedBy.title` from the polled query and
  * keeps only `blockedBy.number`. Blocker titles remain on the
@@ -97,8 +98,9 @@ describe('DISPATCHER_QUEUE_FULL_QUERY — dialog query still selects title', () 
  *
  * The polled `DISPATCHER_STATE_QUERY.recentCompletions` block originally
  * selected 14 fields. Combined with the 10× list-of-objects multiplier
- * applied by `graphql-validation-complexity`, this contributed the
- * third-largest chunk of the 1355-unit query cost (cap is 1000).
+ * applied by the cost rule (`graphql-query-complexity` after #4112),
+ * this contributed the third-largest chunk of the 1355-unit query cost
+ * (cap is 1000).
  *
  * The fix in this PR trims the polled selection to the row-essential
  * fields only — the eight needed by `RecentCompletionRow` to render

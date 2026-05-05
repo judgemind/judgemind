@@ -3,11 +3,11 @@ import { ApolloServer, HeaderMap } from '@apollo/server';
 import type { Pool } from 'pg';
 import type { Client } from '@opensearch-project/opensearch';
 import depthLimit from 'graphql-depth-limit';
-import { createComplexityLimitRule } from 'graphql-validation-complexity';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
 import { costBreakdownPlugin } from './graphql/cost-breakdown';
+import { costLimitPlugin } from './graphql/cost-limit-plugin';
 import { pool as defaultPool } from './data-access/db';
 import { extractUser } from './auth';
 import { opensearchClient as defaultOsClient } from './search/client';
@@ -50,21 +50,26 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     resolvers,
     // Introspection disabled in production to reduce attack surface.
     introspection: process.env.NODE_ENV !== 'production',
-    validationRules: [
-      depthLimit(10),
-      createComplexityLimitRule(1000, {
+    validationRules: [depthLimit(10)],
+    plugins: [
+      // #4003 cost cap: 1000 units. Implemented as an Apollo Server
+      // plugin (not a validation rule) so per-request `request.variables`
+      // are available — `graphql-query-complexity`'s rule path requires
+      // variables at construction time, which doesn't match per-request
+      // reality. See `cost-limit-plugin.ts` for the full rationale.
+      // Migration: #4112.
+      costLimitPlugin({
+        maximumCost: 1000,
         onCost: (cost: number) => app.log.info({ cost }, 'graphql.cost'),
       }),
-    ],
-    plugins: [
       // Issue #4100 — emit a per-top-level-field cost breakdown when an
       // operation's total cost is within the early-warning band of the
-      // 1000-cap (≥ 800). The cost rule above only exposes the total via
-      // `onCost`; this plugin walks the same algorithm and names which
-      // fields dominate, so future cap-overflow incidents can be triaged
-      // from a single CloudWatch line. Threshold-gated to keep log
-      // volume bounded — the dispatcher polls every 2s and we don't
-      // want a breakdown for every cheap query.
+      // 1000-cap (>= 800). The cost-limit plugin above only exposes the
+      // total via `onCost`; this plugin walks the same algorithm and
+      // names which fields dominate, so future cap-overflow incidents
+      // can be triaged from a single CloudWatch line. Threshold-gated
+      // to keep log volume bounded — the dispatcher polls every 2s and
+      // we don't want a per-request breakdown for every cheap query.
       costBreakdownPlugin((entry) =>
         app.log.info(entry, 'graphql.cost.breakdown'),
       ),

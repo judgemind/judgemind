@@ -30,7 +30,7 @@
     "google-auth-library": "^9.15.1",
     "graphql": "^16.8",
     "graphql-depth-limit": "^1.1.0",
-    "graphql-validation-complexity": "^0.4.2",
+    "graphql-query-complexity": "^1.1.0",
     "jsonwebtoken": "^9.0",
     "node-pg-migrate": "^8.0.4",
     "pg": "^8.11",
