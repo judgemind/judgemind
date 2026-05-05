@@ -283,6 +283,143 @@ class TestSupervisorTickEmitsSlowEvents:
 
 
 # --------------------------------------------------------------------------
+# #4087 — supervisor_tick carries per-sub-step elapsed_seconds dict.
+#
+# The end-of-tick ``supervisor_tick`` INFO event must include a
+# ``step_durations`` field (dict of step-name → elapsed_seconds, rounded
+# to 3 decimals) covering every sub-step that ran during the tick. This
+# lets CloudWatch Logs Insights queries like
+# ``stats avg(step_durations.orphan_pr_resurrect) by bin(5m)``
+# answer "is the orphan-PR sweep getting slower?" without waiting for the
+# 10s slow-step WARN to fire.
+#
+# Regression test for #4087 — the gap was that the slow-WARN path was the
+# ONLY happy-path source of per-step timing, so a sweep going from 5s →
+# 9.9s was indistinguishable from a sweep going 0.5s → 0.5s.
+# --------------------------------------------------------------------------
+
+
+class TestSupervisorTickStepDurations:
+    """Verify per-sub-step elapsed_seconds appears on every tick (#4087)."""
+
+    # Step names declared in supervisor_tick — keep in sync with the
+    # ``_record_supervisor_step`` calls inside ``daemon.supervisor_tick``.
+    _EXPECTED_STEPS = {
+        "heartbeat_and_failures",
+        "stuck_check",
+        "gh_rate_check",
+        "phase_async_reap",
+        "orphan_pr_resurrect",
+        "advance_running_agents",
+        "retry_markers",
+        "diagnoser_circuit_breaker",
+        "diagnoser_reap",
+        "diagnoser_run",
+        "scheduled_skills",
+        "heartbeat_metric_emit",
+    }
+
+    def test_tick_event_carries_step_durations_dict(self, tmp_path: Path) -> None:
+        """The end-of-tick INFO event has a ``step_durations`` dict
+        covering every sub-step that ran (not just slow ones)."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d.supervisor_tick()
+
+        events = handler.events("supervisor_tick")
+        assert len(events) == 1
+        rec = events[0]
+        step_durations = getattr(rec, "step_durations", None)
+        assert isinstance(step_durations, dict), (
+            f"expected step_durations dict on supervisor_tick event; "
+            f"got {step_durations!r}"
+        )
+        # Every step that fired must appear. Sub-step list mirrors the
+        # body of supervisor_tick — if a step is added/removed the
+        # daemon code AND this set must change together.
+        assert set(step_durations.keys()) == self._EXPECTED_STEPS
+
+    def test_step_durations_values_are_rounded_to_3_decimals(
+        self, tmp_path: Path
+    ) -> None:
+        """Per AC: values are rounded to 3 decimals so CloudWatch Logs
+        Insights ``stats avg(step_durations.orphan_pr_resurrect)`` returns
+        readable numbers, not 17-digit floats."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d.supervisor_tick()
+        rec = handler.events("supervisor_tick")[0]
+        step_durations: dict[str, float] = getattr(rec, "step_durations")
+        for step_name, elapsed in step_durations.items():
+            assert isinstance(elapsed, (int, float)), (
+                f"step_durations[{step_name!r}] is {type(elapsed).__name__}, "
+                f"expected number"
+            )
+            assert elapsed >= 0.0, f"step_durations[{step_name!r}]={elapsed} < 0"
+            # Round-trip check — value must be exactly equal to its
+            # 3-decimal rounding (i.e. no extra precision leaked).
+            assert elapsed == round(elapsed, 3), (
+                f"step_durations[{step_name!r}]={elapsed!r} not rounded to 3 decimals"
+            )
+
+    def test_slow_step_value_in_step_durations_matches_warn_event(
+        self, tmp_path: Path
+    ) -> None:
+        """A slow sub-step still emits the existing ``slow_<step>`` WARN
+        AND its duration shows up in the tick-level ``step_durations``
+        dict — the two paths are complementary, not exclusive."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+
+        def _slow_advance() -> int:
+            time.sleep(daemon.SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS + 0.1)
+            return 0
+
+        d._advance_running_agents = _slow_advance  # type: ignore[method-assign]
+        d.supervisor_tick()
+
+        # The slow-WARN still fires.
+        slow_events = handler.events("supervisor_tick_slow_advance_running_agents")
+        assert len(slow_events) == 1
+
+        # The tick-level event carries the same step name with a
+        # duration ≥ the slow threshold.
+        tick_events = handler.events("supervisor_tick")
+        assert len(tick_events) == 1
+        step_durations: dict[str, float] = getattr(tick_events[0], "step_durations")
+        advance_elapsed = step_durations["advance_running_agents"]
+        assert advance_elapsed >= daemon.SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS
+
+    def test_step_durations_is_present_on_fast_tick(self, tmp_path: Path) -> None:
+        """The whole point of #4087 — durations show up on EVERY tick,
+        not just slow ones. This is the regression that would have caught
+        the gap that motivated the issue."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d.supervisor_tick()
+        rec = handler.events("supervisor_tick")[0]
+        step_durations = getattr(rec, "step_durations", None)
+        assert step_durations is not None
+        # On a fast tick every value is well below the slow threshold.
+        for step_name, elapsed in step_durations.items():
+            assert elapsed < daemon.SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS, (
+                f"fast tick should not produce slow {step_name}; got {elapsed}s"
+            )
+
+    def test_step_durations_is_in_summary_dict(self, tmp_path: Path) -> None:
+        """The summary dict returned from ``supervisor_tick`` must also
+        carry ``step_durations`` so callers (tests, future telemetry
+        consumers) can read it without re-parsing log records."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        summary = d.supervisor_tick()
+        assert "step_durations" in summary
+        step_durations = summary["step_durations"]
+        assert isinstance(step_durations, dict)
+        assert set(step_durations.keys()) == self._EXPECTED_STEPS
+
+
+# --------------------------------------------------------------------------
 # AC #3 — watchdog_heartbeat fires every WATCHDOG_HEARTBEAT_LOG_EVERY_N_POLLS
 # polls regardless of scheduler / supervisor activity.
 # --------------------------------------------------------------------------
