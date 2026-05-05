@@ -1111,6 +1111,46 @@ class TestJoinPageRows:
         """
         assert _parse_header_date("13/05/2026") is None
 
+    def test_parse_header_date_labeled_slash_beats_bare_filed_stamp(self) -> None:
+        """Labeled slash date wins over a bare slash date earlier in the header (#3601).
+
+        Headers like "Filed 1/15/2024 — Hearing Date 3/16/2026" must return the
+        labeled hearing date, not the unlabeled filed-date stamp.
+        """
+        header = "Filed 1/15/2024 — Hearing Date 3/16/2026"
+        assert _parse_header_date(header) == "2026-03-16"
+
+    def test_parse_header_date_labeled_month_name_beats_bare_filed_stamp(self) -> None:
+        """Labeled month-name date wins over a bare month-name earlier in the header (#3601).
+
+        Headers like "Filed January 15, 2024 — Hearing Date March 16, 2026" must
+        return the labeled hearing date, not the unlabeled filed-date stamp.
+        """
+        header = "Filed January 15, 2024 — Hearing Date March 16, 2026"
+        assert _parse_header_date(header) == "2026-03-16"
+
+    def test_parse_header_date_labeled_slash_no_colon(self) -> None:
+        """Labeled slash format works without an explicit colon (#3601).
+
+        Real-world OC headers sometimes render the label as "Hearing Date"
+        followed by whitespace and the date, with no colon between them.
+        """
+        assert _parse_header_date("Hearing Date 3/16/2026") == "2026-03-16"
+
+    def test_parse_header_date_calendar_date_label(self) -> None:
+        """The "Calendar Date" label is also recognized (#3601)."""
+        assert _parse_header_date("Calendar Date: 3/16/2026") == "2026-03-16"
+
+    def test_parse_header_date_labeled_iso_still_wins_over_bare_slash(self) -> None:
+        """A labeled ISO date beats any earlier bare slash date in the header (#3601).
+
+        The ISO branch was already labeled (#3559), but in a dual-format header
+        like "Filed 1/15/2024 — Hearing Date: 2026-03-16" the labeled ISO must
+        still win — confirming the priority ordering is correct.
+        """
+        header = "Filed 1/15/2024 — Hearing Date: 2026-03-16"
+        assert _parse_header_date(header) == "2026-03-16"
+
     def test_metadata_fallback_judge_via_permissive_scan(self) -> None:
         """Permissive second pass picks up judge name from a non-header row (#3722).
 

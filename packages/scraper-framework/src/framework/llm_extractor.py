@@ -4192,19 +4192,54 @@ def _append_ruling_from_case(
 def _parse_header_date(info: str) -> str | None:
     """Extract a hearing date from a page-header string, returning ISO YYYY-MM-DD.
 
-    Tries three patterns in priority order so that the existing ISO path
-    wins over ambiguous slash or month-name matches (#3559):
+    Tries patterns in priority order so labeled dates always beat bare dates,
+    preventing dual-date headers like ``Filed 1/15/2024 — Hearing Date 3/16/2026``
+    from selecting the filed date instead of the hearing date (#3601). The
+    bare-format fallbacks remain so OC multimodal headers like ``March 16, 2026``
+    on a line by themselves continue to parse (#3559):
 
-    1. ``Hearing Date: YYYY-MM-DD`` — explicit ISO label (existing behaviour).
-    2. Month-name: ``March 16, 2026`` — common in OC multimodal PDFs.
-    3. Slash: ``3/16/2026`` or ``03/16/2026`` — alternate courts.
+    1. Labeled ISO: ``Hearing Date: 2026-03-16`` — highest priority.
+    2. Labeled slash: ``Hearing Date: 3/16/2026`` — beats any bare slash earlier in the header.
+    3. Labeled month-name: ``Hearing Date: March 16, 2026`` — beats any bare month-name earlier.
+    4. Bare month-name: ``March 16, 2026`` — fallback for OC multimodal PDFs (#3559).
+    5. Bare slash: ``3/16/2026`` or ``03/16/2026`` — fallback for alternate courts.
+
+    The label alternation covers the known set: "Hearing Date", "Calendar Date",
+    "Date". Filed/effective/recording stamps are not in this set, so a header that
+    contains both a stamp and a labeled hearing date will pick the hearing date.
     """
-    # 1. Existing ISO path — must remain the highest-priority match.
-    m = re.search(r"Hearing Date:\s*(\d{4}-\d{2}-\d{2})", info)
+    # Common label prefix used by branches 1-3 below. Allow optional ":" plus
+    # whitespace so headers that omit the colon (e.g. "Hearing Date 3/16/2026")
+    # still match. Matches case-insensitively.
+    label_prefix = r"(?:Hearing Date|Calendar Date|Date)[:\s]+"
+
+    # 1. Labeled ISO path — must remain the highest-priority match.
+    m = re.search(label_prefix + r"(\d{4}-\d{2}-\d{2})", info, re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # 2. Month-name format, e.g. "March 16, 2026".
+    # 2. Labeled slash format, e.g. "Hearing Date: 3/16/2026".
+    m = re.search(label_prefix + r"(\d{1,2}/\d{1,2}/\d{4})", info, re.IGNORECASE)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 3. Labeled month-name format, e.g. "Hearing Date: March 16, 2026".
+    m = re.search(
+        label_prefix + r"((?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},\s*\d{4})",
+        info,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%B %d, %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 4. Bare month-name format, e.g. "March 16, 2026" — fallback for OC PDFs.
     m = re.search(
         r"\b((?:January|February|March|April|May|June|July|August|September|"
         r"October|November|December)\s+\d{1,2},\s*\d{4})\b",
@@ -4216,7 +4251,7 @@ def _parse_header_date(info: str) -> str | None:
         except ValueError:
             pass
 
-    # 3. Slash format, e.g. "3/16/2026" or "03/16/2026".
+    # 5. Bare slash format, e.g. "3/16/2026" or "03/16/2026".
     m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", info)
     if m:
         try:
