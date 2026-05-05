@@ -372,6 +372,81 @@ class TestExtractJudgeName:
         result = extract_judge_name(text)
         assert result == "Arthur Hester III"
 
+    # --- Performance regression tests (#4104) ---
+
+    def test_no_quadratic_blowup_on_long_no_match_input(self) -> None:
+        """Regression: extract_judge_name must complete in bounded time on
+        long opinion text that contains no matchable judge signature (#4104).
+
+        Pre-fix, the LA `([^\\n]+?)\\s+Judge of the Superior Court` pattern with
+        re.IGNORECASE cost O(n^2) per call.  On a 50KB synthetic federal
+        opinion (no LA signature, lots of capitalized prose), the call took
+        15+ seconds — driving reingest_from_s3.py CPU-bound at ~1 doc/min.
+
+        Post-fix, anchoring to start-of-line plus a bounded capture forces
+        O(n) behavior. 100ms is generous headroom over the actual sub-10ms
+        cost on modern hardware.
+        """
+        import time
+
+        # Federal-opinion-shaped text without any LA judge signature.
+        paragraph = (
+            "The Court has considered Plaintiff's Motion for Summary Judgment "
+            "filed pursuant to Federal Rule of Civil Procedure 56. As the "
+            "Ninth Circuit held in Smith v. Jones, 123 F.3d 456, 459 (9th Cir. "
+            "2018), summary judgment is appropriate when the moving party has "
+            "shown there is no genuine dispute as to any material fact. See "
+            "also Anderson v. Liberty Lobby, Inc., 477 U.S. 242, 248 (1986); "
+            "Celotex Corp. v. Catrett, 477 U.S. 317, 322 (1986). Defendant "
+            "Acme Industries, A California Corporation, opposes the Motion. "
+            "The Court finds that Plaintiff has met its burden under Federal "
+            "Rule of Evidence 401. United States District Court for the "
+            "Southern District of California considered the matter on January "
+            "5, 2026 at 1:30 PM. "
+        )
+        # Build ~100KB of synthetic opinion text.
+        text = (paragraph * ((100 * 1024) // len(paragraph) + 1))[: 100 * 1024]
+        assert len(text) >= 100 * 1024
+
+        start = time.perf_counter()
+        result = extract_judge_name(text)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        assert result is None, "Synthetic federal text contains no LA judge"
+        assert elapsed_ms < 100.0, (
+            f"extract_judge_name took {elapsed_ms:.1f}ms on 100KB of federal-"
+            f"opinion-shaped text — quadratic regression in pattern[0] suspected."
+        )
+
+    def test_no_quadratic_blowup_on_long_with_match_input(self) -> None:
+        """Same as above but WITH a real LA judge signature appended (#4104).
+
+        Pre-fix, even with the signature present, the unanchored lazy capture
+        explored quadratic backtracks before settling on the match. Post-fix,
+        the line anchor lets the engine seek directly to the match.
+        """
+        import time
+
+        paragraph = (
+            "The Court has considered Plaintiff's Motion for Summary Judgment "
+            "filed pursuant to Federal Rule of Civil Procedure 56. As the "
+            "Ninth Circuit held in Smith v. Jones, 123 F.3d 456, 459 (9th Cir. "
+            "2018), summary judgment is appropriate when the moving party has "
+            "shown there is no genuine dispute as to any material fact. "
+        )
+        text = (paragraph * ((100 * 1024) // len(paragraph) + 1))[: 100 * 1024]
+        text += "\nWilliam A. Crowfoot Judge of the Superior Court\n"
+
+        start = time.perf_counter()
+        result = extract_judge_name(text)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        assert result == "William A. Crowfoot"
+        assert elapsed_ms < 100.0, (
+            f"extract_judge_name took {elapsed_ms:.1f}ms on 100KB+match text — "
+            f"quadratic regression in pattern[0] suspected."
+        )
+
 
 # ---------------------------------------------------------------------------
 # _looks_like_person_name validation

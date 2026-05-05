@@ -840,10 +840,19 @@ def normalize_motion_type(motion_type: str) -> str | None:
 
 _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
     # LA: "William A. Crowfoot Judge of the Superior Court" (now case-insensitive
-    # to also match "JARED D. MOSES JUDGE OF THE SUPERIOR COURT")
+    # to also match "JARED D. MOSES JUDGE OF THE SUPERIOR COURT").
+    #
+    # Pattern is line-anchored (^ with MULTILINE) and bounded to 80 chars to
+    # prevent catastrophic-backtracking-like quadratic blowup on long opinion
+    # text.  The pre-fix unanchored, unbounded variant
+    # `([^\n]+?)\s+Judge of the Superior Court` cost O(n^2) per call on input
+    # without the literal substring (15+ seconds on a 50KB federal opinion;
+    # see #4104).  Anchoring to the start of a line and capping the capture at
+    # 80 characters bounds the work to O(n) and matches all real LA judge
+    # signatures, which always start on their own line.
     re.compile(
-        r"([^\n]+?)\s+Judge of the Superior Court",
-        re.IGNORECASE,
+        r"^([^\n]{1,80}?)\s+Judge of the Superior Court",
+        re.IGNORECASE | re.MULTILINE,
     ),
     # SB: "Department S22 - Judge Bobby P. Luna"
     re.compile(
