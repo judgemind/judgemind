@@ -1,0 +1,351 @@
+"""Parity test between ``ingestion.worker`` and ``scripts/reingest_from_s3.py``
+extraction-config consumers.
+
+This is a structural-divergence detector for the recurring class of bugs in
+which ``worker.py`` adds (or removes) an ``ExtractionMethod`` guard but the
+parallel reingest path is not updated, causing reingest to corrupt data the
+live worker correctly handled.  The pattern has now repeated five times:
+
+- #2490 — title-fixed-point bug (multimodal branch)
+- #2501 — judge_name / department missing from ``FETCH_DOCUMENTS_QUERY``
+- #2502 — multimodal ``case_title`` fallback caused fixed-point wrong titles
+- #2521 — text-split branch had the same fixed-point pattern
+- #4056 — ``ExtractionMethod.NONE`` not honored
+
+The test is the **Option A** snapshot/regex-pair contract test described in
+issue #4071.  For each (state, county, scraper_id) case it verifies:
+
+1. **Reingest live behavior** — ``_reparse_document`` is invoked with a
+   mocked ``extract_fields_llm``; the number of times it was called matches
+   the expectation derived from ``get_county_extraction_config``.  This
+   catches regressions where someone deletes the NONE-skip guard from
+   ``reingest_from_s3.py`` and the reingest path starts running the LLM on
+   ``ExtractionMethod.NONE`` counties.
+
+2. **Worker source-text sentinels** — ``ingestion/worker.py`` is read as
+   text and asserted to contain a regex that matches the equivalent guard
+   (an ``is_extraction_none = True`` assignment gated on
+   ``ExtractionMethod.NONE``, plus a multimodal selector reading
+   ``ExtractionMethod.MULTIMODAL``).  This catches the symmetric
+   regression where someone deletes the guard from ``worker.py``.
+
+The deliberate-revert verification mentioned in #4071's acceptance criterion
+is captured by the Verifies-fail-on-revert behavior of (1) — ``patch.object``
+on ``reingest.extract_fields_llm`` directly observes whether the live path
+called the LLM, so removing the NONE short-circuit from
+``reingest_from_s3.py`` flips the call count from ``0`` to ``1`` and the
+NONE cases fail.  The (2) regex pairs likewise fail when the worker.py
+sentinel is deleted.
+
+When ``ExtractionMethod`` gains a new value or worker/reingest gains a new
+config consumer (e.g. a future ``max_chars_per_chunk`` selector), this file
+must be extended with a new ``_GUARD_PATTERNS`` entry on **both** sides.
+That is the maintenance load the issue explicitly accepted in exchange for
+the divergence-detection coverage; it is intentionally a manual edit so a
+change to one side without the other surfaces in the diff review.
+
+See #4071 for the full investigation and Option B (refactor into shared
+``decide_extraction_strategy`` helper) follow-up.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from uuid import UUID
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Import reingest module from scripts/
+# ---------------------------------------------------------------------------
+_SCRIPTS_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "..",
+    "scripts",
+)
+sys.path.insert(0, _SCRIPTS_DIR)
+
+# Ensure the scraper-framework src is importable.
+_SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, os.path.abspath(_SRC_DIR))
+
+reingest = importlib.import_module("reingest_from_s3")
+
+from framework.extraction_config import (  # noqa: E402
+    ExtractionMethod,
+    get_county_extraction_config,
+)
+
+# ---------------------------------------------------------------------------
+# Source-file paths for the worker-side regex sentinel checks
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_WORKER_SRC = _REPO_ROOT / "packages/scraper-framework/src/ingestion/worker.py"
+_REINGEST_SRC = _REPO_ROOT / "scripts/reingest_from_s3.py"
+
+
+# ---------------------------------------------------------------------------
+# (worker_pattern, reingest_pattern) sentinel pairs
+# ---------------------------------------------------------------------------
+# Each pair is a structural guard that MUST exist on both sides.  When a new
+# extraction-config consumer is added (e.g. a new ``ExtractionMethod`` value or
+# a new ``CountyExtractionConfig`` field), append a new entry here.  Both
+# regexes must match or both must not-match — a partial match indicates a
+# divergence and fails the test.
+#
+# Patterns are matched in default (single-line) mode.  Use ``[^\n]*`` to
+# constrain matches to one logical statement so an incidental keyword
+# elsewhere in the file (e.g. in a comment) cannot satisfy the pattern.
+
+_GUARD_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "extraction_method_none_skip",
+        # Worker: gates on ``method == ExtractionMethod.NONE`` and then sets
+        # ``is_extraction_none = True`` on the next non-blank line.  Match
+        # the conditional + the assignment within a tight window so a stray
+        # ``ExtractionMethod.NONE`` reference (e.g. in a doc-comment) cannot
+        # satisfy the pattern alone.
+        (
+            r"\.method\s*==\s*ExtractionMethod\.NONE\s*:"
+            r"[^\n]*\n(?:[^\n]*\n){0,3}\s*is_extraction_none\s*=\s*True"
+        ),
+        # Reingest: short-circuits when ``_ext_config.method ==
+        # ExtractionMethod.NONE``.  Single-line match.
+        r"_ext_config\.method\s*==\s*ExtractionMethod\.NONE",
+    ),
+    (
+        "extraction_method_multimodal_selector",
+        # Worker: branches on ``ExtractionMethod.MULTIMODAL`` for the
+        # raw-PDF per-page extraction path.
+        r"ExtractionMethod\.MULTIMODAL",
+        # Reingest: must import ``ExtractionMethod`` from
+        # ``framework.extraction_config`` so the NONE short-circuit (and
+        # any future MULTIMODAL-aware reingest branch) compiles.  The
+        # MULTIMODAL value is not a separate reingest path today —
+        # reingest uses the text LLM for MULTIMODAL counties because the
+        # multimodal extractor is a worker-only feature — but the paired
+        # sentinel makes a future divergence detectable.
+        r"from\s+framework\.extraction_config\s+import[^)]*ExtractionMethod",
+    ),
+    (
+        "extraction_config_consulted_for_max_output_tokens",
+        # Worker: text-LLM path looks up ``<name>.max_output_tokens`` and
+        # falls back to the 4096 default (#2355).  The pattern must appear
+        # within ~120 chars so an unrelated reference plus a stray ``4096``
+        # later in the file does not produce a false match.
+        r"\.max_output_tokens[^\n]{0,120}4096",
+        # Reingest: same lookup with the same default.
+        r"\.max_output_tokens[^\n]{0,120}4096",
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# (state, county, scraper_id) parity cases — required by issue #4071
+# ---------------------------------------------------------------------------
+# Each case is paired with the expected ``ExtractionMethod`` so the test can
+# derive the expected ``extract_fields_llm`` call count for the reingest live
+# path.  Cases come from #4071's acceptance criterion — extending the list
+# is fine, removing one is not (each documents a real divergence-prone
+# scraper).
+
+_PARITY_CASES: tuple[tuple[str, str, str, ExtractionMethod | None], ...] = (
+    # LA HTML — no scraper-level config, county registry has no LA entry,
+    # so the framework default LLM path runs.  ``get_county_extraction_config``
+    # returns ``None`` here; the worker treats ``None`` as "default LLM".
+    ("CA", "Los Angeles", "ca-la-tentatives-civil", None),
+    # SD calendar — scraper-level override sets NONE.  Both paths must skip
+    # the LLM (#2331, #4056).
+    ("CA", "San Diego", "ca-sd-calendar", ExtractionMethod.NONE),
+    # Federal CourtListener — county-level NONE (#3967, #4056).  Live regression
+    # site: this is the case that motivated #4056's reingest fix.
+    ("Federal", "Federal", "courtlistener", ExtractionMethod.NONE),
+    # Orange County — MULTIMODAL.  Worker uses multimodal extractor;
+    # reingest's _reparse_document falls through to the text LLM path
+    # (the multimodal model is a worker-only feature), so the call count
+    # there is ≥1.  This case guards against the worker losing the
+    # MULTIMODAL selector.
+    ("CA", "Orange", "ca-oc-tentatives-civil", ExtractionMethod.MULTIMODAL),
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _doc_meta(state: str, county: str, scraper_id: str) -> dict:
+    """Build a minimal ``doc_meta`` dict accepted by ``_reparse_document``."""
+    return {
+        "document_id": str(UUID(int=1)),
+        "state": state,
+        "county": county,
+        "court_name": f"{county} Superior Court",
+        "source_url": "https://example.test/ruling",
+        "captured_at": datetime(2026, 5, 1, 0, 0, 0),
+        "content_hash": "deadbeef",
+        "format": "html",
+        # Empty fields force the missing-fields branch to run, so a non-NONE
+        # path actually invokes the LLM.  NONE-config cases short-circuit
+        # before the missing-fields check.
+        "case_number": None,
+        "case_title": None,
+        "case_type": None,
+        "hearing_date": None,
+        "court_id": str(UUID(int=2)),
+        "scraper_id": scraper_id,
+        "s3_key": "test-key",
+        "s3_bucket": "test-bucket",
+        "stored_ruling_text": None,
+    }
+
+
+def _expected_llm_calls(method: ExtractionMethod | None) -> int:
+    """Return the expected ``extract_fields_llm`` call count for reingest."""
+    if method == ExtractionMethod.NONE:
+        return 0
+    # LLM, MULTIMODAL, or default (None) all hit the text LLM path in
+    # reingest — the multimodal model is a worker-only feature, so reingest
+    # falls through to ``extract_fields_llm`` for MULTIMODAL counties too.
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Source-text sentinel checks — fail when either side's guard is removed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def worker_source() -> str:
+    """Return the worker.py source as a single string."""
+    return _WORKER_SRC.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def reingest_source() -> str:
+    """Return the reingest_from_s3.py source as a single string."""
+    return _REINGEST_SRC.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("name", "worker_pattern", "reingest_pattern"),
+    _GUARD_PATTERNS,
+    ids=[name for name, _, _ in _GUARD_PATTERNS],
+)
+def test_guard_pattern_present_in_both(
+    worker_source: str,
+    reingest_source: str,
+    name: str,
+    worker_pattern: str,
+    reingest_pattern: str,
+) -> None:
+    """For each named guard, both worker.py and reingest_from_s3.py must
+    contain the corresponding regex.  When one side's match disappears, the
+    test fails — preventing the recurring divergence pattern (#4071)."""
+    worker_match = re.search(worker_pattern, worker_source)
+    reingest_match = re.search(reingest_pattern, reingest_source)
+
+    # Both-or-neither contract.  Both-missing would still fail because the
+    # guard is supposed to exist; both-present is the desired state.
+    assert worker_match, (
+        f"Guard '{name}' missing from worker.py — pattern {worker_pattern!r}. "
+        f"If this guard was intentionally removed, also remove the "
+        f"reingest pattern from _GUARD_PATTERNS in this test."
+    )
+    assert reingest_match, (
+        f"Guard '{name}' missing from reingest_from_s3.py — pattern "
+        f"{reingest_pattern!r}. If this guard was intentionally removed, "
+        f"also remove the worker pattern from _GUARD_PATTERNS in this test."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live behavior parity — counts extract_fields_llm invocations per case
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "county", "scraper_id", "expected_method"),
+    _PARITY_CASES,
+    ids=[
+        f"{state}-{county}-{scraper_id}".replace(" ", "_")
+        for state, county, scraper_id, _ in _PARITY_CASES
+    ],
+)
+def test_reingest_extract_fields_llm_call_count(
+    state: str,
+    county: str,
+    scraper_id: str,
+    expected_method: ExtractionMethod | None,
+) -> None:
+    """The reingest path's ``extract_fields_llm`` call count must match what
+    ``get_county_extraction_config`` predicts for the (state, county,
+    scraper_id) tuple.  When the NONE short-circuit is removed, the
+    NONE-configured cases (San Diego calendar, Federal CourtListener)
+    produce ``call_count >= 1`` instead of ``0`` — the test fails.
+
+    This is the "deliberate revert" check from #4071's acceptance criterion:
+    revert the L1042-1051 short-circuit in ``reingest_from_s3._reparse_document``
+    and the ``CA-San_Diego-ca-sd-calendar`` and ``Federal-Federal-courtlistener``
+    cases will fail with the recorded call count of 1 instead of 0.
+    """
+    # Sanity: the case's expected method matches what the live registry says.
+    actual_config = get_county_extraction_config(state, county, scraper_id=scraper_id)
+    actual_method = actual_config.method if actual_config else None
+    assert actual_method == expected_method, (
+        f"Test fixture drift: ({state}, {county}, {scraper_id}) registry "
+        f"returned method={actual_method!r} but the test expected "
+        f"{expected_method!r}. Update _PARITY_CASES to match the registry."
+    )
+
+    # Build the inputs and a fake LLM client.  Use simple HTML so the
+    # scraper registry's auto-discovery does not try to parse a real PDF.
+    raw_content = b"<html><body>Test ruling text body.</body></html>"
+    doc_meta = _doc_meta(state, county, scraper_id)
+    llm_client = MagicMock()
+
+    # Mock both ``extract_fields_llm`` (so the live LLM never fires) and
+    # ``_load_scraper_registry`` (to avoid the production scraper registry
+    # walking the courts/ tree).  Returning ``None`` from the patched
+    # ``extract_fields_llm`` triggers the "LLM returned None" branch in
+    # reingest, which is fine — we only care about the call count.
+    with (
+        patch.object(reingest, "extract_fields_llm", return_value=None) as mock_llm,
+        patch.object(reingest, "_load_scraper_registry"),
+    ):
+        result = reingest._reparse_document(
+            raw_content=raw_content,
+            scraper_id=scraper_id,
+            doc_meta=doc_meta,
+            llm_client=llm_client,
+            llm_provider="anthropic",
+            llm_model="claude-3-5-haiku",
+            llm_timeout=60.0,
+        )
+
+    expected = _expected_llm_calls(expected_method)
+    assert mock_llm.call_count == expected, (
+        f"Reingest path called extract_fields_llm {mock_llm.call_count} "
+        f"time(s) for ({state}, {county}, {scraper_id}); expected {expected}. "
+        f"Configured method: {expected_method!r}. "
+        f"llm_outcome={result.get('llm_outcome')!r}, "
+        f"llm_skipped={result.get('llm_skipped')!r}."
+    )
+
+    # Cross-check: NONE-configured cases must record ``llm_outcome ==
+    # 'skipped_none'`` so observability stays consistent.  Without this,
+    # an alternative regression — e.g. someone setting llm_skipped=True
+    # without flipping the outcome — would slip past the call-count check.
+    if expected_method == ExtractionMethod.NONE:
+        assert result["llm_skipped"] is True
+        assert result["llm_outcome"] == "skipped_none"
