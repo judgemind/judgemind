@@ -17,7 +17,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CHECK_SCRIPT="$SCRIPT_DIR/check-graphql-queries.sh"
+VALIDATOR_SCRIPT="$REPO_ROOT/packages/web/scripts/validate-graphql-queries.mjs"
 FAILURES=0
 TESTS=0
 
@@ -28,14 +30,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Set up the directory structure the script expects
+# Set up the directory structure the script expects.
+#
+# IMPORTANT: ESM resolution for `import 'graphql'` walks UP from the validator's
+# file URL. To exercise that path realistically, we symlink the validator at
+# `$TMPDIR_TEST/packages/web/scripts/` AND symlink real `node_modules/`
+# directories from the host repo so the resolver finds the package. (#4093)
 setup_repo() {
     rm -rf "$TMPDIR_TEST"/*
     mkdir -p "$TMPDIR_TEST/packages/api/src/graphql"
     mkdir -p "$TMPDIR_TEST/packages/web/src/app"
-    mkdir -p "$TMPDIR_TEST/scripts"
-    # Symlink the validator script so it can be found
-    ln -sf "$SCRIPT_DIR/validate-graphql-queries.mjs" "$TMPDIR_TEST/scripts/validate-graphql-queries.mjs"
+    mkdir -p "$TMPDIR_TEST/packages/web/scripts"
+    # Symlink the validator script at the new location so check-graphql-queries.sh
+    # finds it under $REPO_ROOT/packages/web/scripts/.
+    ln -sf "$VALIDATOR_SCRIPT" "$TMPDIR_TEST/packages/web/scripts/validate-graphql-queries.mjs"
+    # Make the `graphql` npm package resolvable from the validator. Prefer the
+    # host repo's packages/web/node_modules/, fall back to the host repo's
+    # top-level node_modules/ (CI installs it there via npm install --no-save).
+    if [ -d "$REPO_ROOT/packages/web/node_modules" ]; then
+        ln -sf "$REPO_ROOT/packages/web/node_modules" "$TMPDIR_TEST/packages/web/node_modules"
+    elif [ -d "$REPO_ROOT/node_modules" ]; then
+        ln -sf "$REPO_ROOT/node_modules" "$TMPDIR_TEST/node_modules"
+    fi
 }
 
 # Write a schema.ts file with the given SDL content
@@ -489,6 +505,69 @@ write_query_file "app/DispatcherPage.tsx" '
   }
 '
 assert_fails "Module schema still surfaces invalid fields"
+
+# ─── Test 17: Regression for #4093 — packages/web/node_modules/graphql alone is sufficient ─
+# The previous validator lived at scripts/validate-graphql-queries.mjs and relied
+# on NODE_PATH to resolve the `graphql` package. ESM ignores NODE_PATH, so when
+# only packages/web/node_modules/graphql/ existed (the local-dev path),
+# `npm run check` failed with ERR_MODULE_NOT_FOUND. The fix (#4093) moved the
+# validator to packages/web/scripts/ so ESM's natural upward resolution finds
+# the package. Verify that even when packages/web/node_modules is the *only*
+# place graphql lives — i.e. no top-level node_modules — the check still passes.
+TESTS=$((TESTS + 1))
+TMPDIR_LOCAL=$(mktemp -d)
+local_cleanup() {
+    rm -rf "$TMPDIR_LOCAL"
+}
+mkdir -p "$TMPDIR_LOCAL/packages/api/src/graphql"
+mkdir -p "$TMPDIR_LOCAL/packages/web/src/app"
+mkdir -p "$TMPDIR_LOCAL/packages/web/scripts"
+# Validator at the new location.
+ln -sf "$VALIDATOR_SCRIPT" "$TMPDIR_LOCAL/packages/web/scripts/validate-graphql-queries.mjs"
+# Schema and a valid query.
+cat > "$TMPDIR_LOCAL/packages/api/src/graphql/schema.ts" <<'SCHEMA_EOF'
+export const typeDefs = `#graphql
+  type Query {
+    health: String!
+  }
+`;
+SCHEMA_EOF
+cat > "$TMPDIR_LOCAL/packages/web/src/app/Page.tsx" <<'QUERY_EOF'
+import { gql } from '@apollo/client';
+const Q = gql`
+  query Health {
+    health
+  }
+`;
+QUERY_EOF
+# Crucially, only symlink packages/web/node_modules — NOT a top-level
+# node_modules. This locks in the local-dev layout where the prior bug fired.
+if [ -d "$REPO_ROOT/packages/web/node_modules/graphql" ]; then
+    ln -sf "$REPO_ROOT/packages/web/node_modules" "$TMPDIR_LOCAL/packages/web/node_modules"
+elif [ -d "$REPO_ROOT/node_modules/graphql" ]; then
+    # CI runs `npm install --no-save graphql@^16.8` at repo root and does NOT
+    # populate packages/web/node_modules. In that environment we still want to
+    # exercise the same code path: place a node_modules fixture at the
+    # packages/web/ level by symlinking the host's root node_modules.
+    ln -sf "$REPO_ROOT/node_modules" "$TMPDIR_LOCAL/packages/web/node_modules"
+else
+    echo "FAIL: Test 17 setup — neither packages/web/node_modules/graphql nor"
+    echo "      node_modules/graphql exists at REPO_ROOT=$REPO_ROOT. Run npm"
+    echo "      install in packages/web/ before invoking this test."
+    FAILURES=$((FAILURES + 1))
+    local_cleanup
+    # fall through to summary
+fi
+if [ -L "$TMPDIR_LOCAL/packages/web/node_modules" ]; then
+    if "$CHECK_SCRIPT" "$TMPDIR_LOCAL" > /dev/null 2>&1; then
+        echo "PASS: #4093 — validator resolves graphql via packages/web/node_modules only"
+    else
+        echo "FAIL: #4093 — validator could not resolve graphql with only"
+        echo "      packages/web/node_modules populated (this is the regression)."
+        FAILURES=$((FAILURES + 1))
+    fi
+fi
+local_cleanup
 
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""

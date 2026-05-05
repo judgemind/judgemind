@@ -192,6 +192,8 @@ For `packages/web/`, also run `npm run build`. The same diff coverage and floor 
 
 `packages/web/` also has `npm run check` — covers hardcoded-colors, apollo-keyfields, and graphql-queries, the CI hygiene guards that fail fast. Run it before pushing large frontend changes.
 
+The graphql-queries guard is implemented as `scripts/check-graphql-queries.sh` (bash wrapper) → `packages/web/scripts/validate-graphql-queries.mjs` (Node ESM validator). The validator lives under `packages/web/scripts/` rather than the top-level `scripts/` dir on purpose: `import 'graphql'` is resolved by Node's ESM loader by walking up from the importer's URL, so locating the validator inside `packages/web/` lets the loader find `packages/web/node_modules/graphql` after a vanilla `npm install` in `packages/web/` — no NODE_PATH tricks or repo-root install required. CI's `graphql-query-check` job continues to install the package via `npm install --no-save graphql@^16.8` at repo root, which the resolver also finds by walking further up. See #4093.
+
 ### Terraform (from `infra/terraform/`)
 
 ```
