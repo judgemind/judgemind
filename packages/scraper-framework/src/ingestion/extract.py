@@ -1351,10 +1351,60 @@ _IMPLAUSIBLE_PREFIXES = (
 )
 
 # Phrases that should never appear in a valid case title.
+#
+# Original vocabulary (#1958, #1974, #2022): ruling-outcome verbs and
+# courtroom-section keywords (GRANTED / DENIED / TENTATIVE RULING / MOTION /
+# DEMURRER / ORDER / Department XXX / Timekeeper / paralegal).
+#
+# #3615 widening: motion-description / procedural-language phrases that the
+# LLM concatenates with the case caption (e.g. "Sixth Cause of Action",
+# "Judge Smith's Report", "MIL 2", "Allegations in the Complaint",
+# "Declaration of", "Objections to", "Report and Recommendations",
+# "Cross-Complaint", "Plaintiff's burden", "Ex Parte Application",
+# "individually and on behalf of", and structural caption noise like
+# "And Cross-Defendants"). Each is constrained narrowly enough to avoid
+# false positives on legitimate party names — see test_extract.py
+# TestProceduralVocabularyFragments for negative regression coverage.
 _IMPLAUSIBLE_FRAGMENTS_RE = re.compile(
+    r"(?:"
+    # --- Original vocabulary ---
     r"\b(?:GRANTED|DENIED|CONTINUED|TENTATIVE RULING|TENTATIVE RULINGS"
     r"|OVERRULED|SUSTAINED|MOOT|OFF CALENDAR|HEARING|MOTION|DEMURRER"
-    r"|ORDER|Department\s+[A-Z0-9]+|Timekeeper|paralegal)\b",
+    r"|ORDER|Department\s+[A-Z0-9]+|Timekeeper|paralegal)\b"
+    # --- #3615 widening ---
+    # "Cause of Action" (with or without ordinal prefix)
+    r"|\b(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth)?\s*Cause\s+of\s+Action\b"
+    # Judge + capitalized name (NOT "Judge & Sons" — & is non-word).
+    # [\w'\-]* matches single-letter names through compound/apostrophe
+    # names ("Judge d'Arcy", "Judge Smith-Jones").
+    r"|\bJudge\s+[A-Z][\w'\-]*"
+    # MIL N (motion in limine: MIL 1, MIL 2:, etc.)
+    r"|\bMIL\s+\d"
+    # Allegations followed by preposition/verb (NOT "Allegations Inc.")
+    r"|\bAllegations\s+(?:in|of|are|that)\b"
+    # Declaration of
+    r"|\bDeclaration\s+of\b"
+    # Objections + preposition/verb
+    r"|\bObjections\s+(?:to|are|of)\b"
+    # Report and Recommendation(s)
+    r"|\bReport\s+and\s+Recommendations?\b"
+    # Cross-Complaint (hyphenated; NOT bare "Cross")
+    r"|\bCross-Complaint\b"
+    # Plaintiff's/Defendant's burden/Objections/Ability/Burden
+    r"|\b(?:Plaintiff|Defendant)s?'?s?\s+(?:burden|Objections|Ability|Burden)\b"
+    # Ex Parte + verb/noun (NOT bare "Ex Parte")
+    r"|\bEx\s+Parte\s+(?:Application|Motion|Order|for|to)\b"
+    # Class-action descriptor — the contamination shape always has a
+    # comma delimiter before "individually" (the LLM has just emitted a
+    # name and is now appending the role descriptor as a continuation).
+    # Requiring the comma avoids false positives on contrived legitimate
+    # entity names that embed the phrase without a comma boundary.
+    r"|,\s+individually\s+and\s+on\s+behalf\s+of\b"
+    # Leading "And Cross-Defendants/Complainants" structural caption noise
+    r"|^And\s+Cross-(?:Defendants?|Complainants?)\b"
+    # Mid-string "v. And Cross-Defendants/Complainants"
+    r"|\bv\.\s+And\s+Cross-(?:Defendants?|Complainants?)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1542,17 +1592,60 @@ _EMBEDDED_CASE_NUMBER_RE = re.compile(
 )
 
 # Motion / procedural keywords that should terminate a case title.
+#
+# Original vocabulary (#2212): MOTION TO/FOR/IN/RE, PETITION TO/FOR/OF/RE,
+# DEMURRER, ORDER TO/RE/ON, REQUEST FOR, NOTICE OF, INTERROGATOR forms.
+#
+# #3615 widening: same procedural-text vocabulary as
+# _IMPLAUSIBLE_FRAGMENTS_RE so clean_case_title() can find a boundary in
+# contaminated titles instead of returning them essentially unchanged.
 _TITLE_TERMINATOR_RE = re.compile(
-    r"\b(?:"
-    r"REQUEST\s+FOR|HEARING\s+ON|MOTION\s+(?:TO|FOR|IN|RE)"
-    r"|PETITION\s+(?:TO|FOR|OF|RE)"
-    r"|DEMURRER|ORDER\s+(?:TO|RE|ON)"
-    r"|FORM\s+INTERROGATOR"
-    r"|SPECIAL\s+INTERROGATOR"
-    r"|REQUEST\s+FOR\s+(?:PRODUCTION|ADMISSION)"
-    r"|NOTICE\s+OF"
-    r"|by\s+and\s+through\s+(?:his|her|its|their)\s+Guardian"
-    r")\b",
+    r"(?:"
+    # --- Original vocabulary ---
+    r"\bREQUEST\s+FOR\b|\bHEARING\s+ON\b|\bMOTION\s+(?:TO|FOR|IN|RE)\b"
+    # Bare MOTION (#3615): catches contamination like "Smith v. Jones
+    # Motion for Sanctions" where the cleaner needs SOME terminator to
+    # cut on.  The IMPLAUSIBLE check already flags it; this lets the
+    # cleaner recover the party names instead of NULL-falling back.
+    r"|\bMOTION\b"
+    r"|\bPETITION\s+(?:TO|FOR|OF|RE)\b"
+    r"|\bDEMURRER\b|\bORDER\s+(?:TO|RE|ON)\b"
+    r"|\bFORM\s+INTERROGATOR"
+    r"|\bSPECIAL\s+INTERROGATOR"
+    r"|\bREQUEST\s+FOR\s+(?:PRODUCTION|ADMISSION)\b"
+    r"|\bNOTICE\s+OF\b"
+    r"|\bby\s+and\s+through\s+(?:his|her|its|their)\s+Guardian\b"
+    # --- #3615 widening ---
+    # "Cause of Action" (with or without ordinal prefix). Ordinal prefix
+    # comes first so the cut point lands BEFORE "Sixth", not after.
+    r"|\b(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth)\s+Cause\s+of\s+Action\b"
+    r"|\bCause\s+of\s+Action\b"
+    # Judge + capitalized name (single-letter or longer; supports
+    # compound/apostrophe names; & breaks the [A-Z] match).
+    r"|\bJudge\s+[A-Z][\w'\-]*"
+    # MIL N
+    r"|\bMIL\s+\d"
+    # Allegations + preposition/verb
+    r"|\bAllegations\s+(?:in|of|are|that)\b"
+    # Declaration of
+    r"|\bDeclaration\s+of\b"
+    # Objections + preposition/verb
+    r"|\bObjections\s+(?:to|are|of)\b"
+    # Report and Recommendation(s)
+    r"|\bReport\s+and\s+Recommendations?\b"
+    # Cross-Complaint
+    r"|\bCross-Complaint\b"
+    # Plaintiff's/Defendant's burden/Objections/Ability/Burden
+    r"|\b(?:Plaintiff|Defendant)s?'?s?\s+(?:burden|Objections|Ability|Burden)\b"
+    # Ex Parte + verb/noun
+    r"|\bEx\s+Parte\s+(?:Application|Motion|Order|for|to)\b"
+    # Class-action descriptor (comma-delimited; see _IMPLAUSIBLE_FRAGMENTS_RE)
+    r"|,\s+individually\s+and\s+on\s+behalf\s+of\b"
+    # Leading "And Cross-Defendants/Complainants" caption noise
+    r"|^And\s+Cross-(?:Defendants?|Complainants?)\b"
+    # Mid-string "v. And Cross-Defendants/Complainants"
+    r"|\bv\.\s+And\s+Cross-(?:Defendants?|Complainants?)\b"
+    r")",
     re.IGNORECASE,
 )
 

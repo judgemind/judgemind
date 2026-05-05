@@ -638,6 +638,72 @@ PENDING_RECLAIM_MIN_IDLE_MS = 30_000
 PENDING_RECLAIM_INTERVAL = 12
 
 
+def apply_case_title_cleanup(
+    case_title: str,
+    *,
+    document_id: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Apply deterministic cleanup to an implausible case_title (#3615).
+
+    Called from the LLM-extracted-case-title cleanup branch in
+    ``IngestionWorker._process_message`` when the raw title fails
+    ``is_plausible_case_title()``. The function:
+
+      1. Calls ``clean_case_title()`` to attempt deterministic recovery.
+      2. If the cleaned title passes ``is_plausible_case_title``, returns
+         ``(cleaned_title, "deterministic_cleaned")``.
+      3. If the cleaned title is None or still fails plausibility, returns
+         ``(None, None)`` and emits a ``case_title.unrecoverable`` warning
+         log so post-deploy telemetry queries can measure how often this
+         path fires (#3615).
+
+    Better-null-than-wrong: previously the implicit-else preserved the
+    contaminated title when cleanup failed. Downstream NULL handling
+    (#1930, #2637 backfill paths) routes a NULL ``case_title`` to the
+    LLM-backfill flow rather than persisting motion-description /
+    procedural-text contamination in the UI.
+
+    Args:
+        case_title: The raw, implausible case title to clean. Caller
+            guarantees this is non-empty and ``is_plausible_case_title``
+            returned False.
+        document_id: Document UUID for log correlation (optional).
+
+    Returns:
+        Tuple of (new_case_title, new_extraction_method):
+          * (cleaned_title, "deterministic_cleaned") on successful recovery
+          * (None, None) when cleanup cannot produce a plausible title
+    """
+    cleaned_title = clean_case_title(case_title)
+    if cleaned_title and is_plausible_case_title(cleaned_title):
+        if cleaned_title != case_title:
+            logger.info(
+                "Deterministic case_title cleanup applied",
+                extra={
+                    "document_id": document_id,
+                    "old_title": case_title[:80],
+                    "new_title": cleaned_title[:80],
+                },
+            )
+        return cleaned_title, "deterministic_cleaned"
+
+    # Hard reject (#3615): better-null-than-wrong.  When cleanup can't
+    # produce a plausible title, NULL is preferable to persisting
+    # motion-description / procedural-text contamination.  Downstream
+    # NULL-handling routes to LLM-backfill (#1930, #2637) instead of
+    # surfacing visible garbage in the UI.
+    logger.warning(
+        "case_title.unrecoverable",
+        extra={
+            "document_id": document_id,
+            "raw_title": case_title[:200],
+            "cleaned_title": (cleaned_title or "")[:200],
+            "telemetry_event": "case_title_unrecoverable",
+        },
+    )
+    return None, None
+
+
 class IngestionWorker:
     """Consumes document.captured events from Redis Streams.
 
@@ -1968,6 +2034,14 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         # Deterministic case_title cleanup (#2212, #2370)
         # ------------------------------------------------------------------
+        # Empty-string normalization (#3615 spotcheck 2026-04-28): treat
+        # case_title="" the same as case_title=None so the falsy check below
+        # (and downstream NULL-handling paths) consistently see a single
+        # "missing" sentinel instead of two states.
+        if case_title is not None and not case_title.strip():
+            case_title = None
+            extraction_methods.pop("case_title", None)
+
         # First: strip repeated segments and trailing case numbers that the
         # LLM sometimes appends (#2370).  These are cheap checks that
         # always run; they leave well-formed titles unchanged.
@@ -2058,19 +2132,12 @@ class IngestionWorker:
         # messy (motion descriptions, case citations, multiple parties).
         # Apply deterministic cleanup via clean_case_title().
         if case_title and not is_plausible_case_title(case_title):
-            cleaned_title = clean_case_title(case_title)
-            if cleaned_title and is_plausible_case_title(cleaned_title):
-                if cleaned_title != case_title:
-                    logger.info(
-                        "Deterministic case_title cleanup applied",
-                        extra={
-                            "document_id": document_id,
-                            "old_title": case_title[:80],
-                            "new_title": cleaned_title[:80],
-                        },
-                    )
-                case_title = cleaned_title
-                extraction_methods["case_title"] = "deterministic_cleaned"
+            new_title, new_method = apply_case_title_cleanup(case_title, document_id=document_id)
+            case_title = new_title
+            if new_method is None:
+                extraction_methods.pop("case_title", None)
+            else:
+                extraction_methods["case_title"] = new_method
 
         # Probate decedent-as-judge guard (#2370): for probate cases the
         # decedent/conservatee name is prominently printed in the caption
