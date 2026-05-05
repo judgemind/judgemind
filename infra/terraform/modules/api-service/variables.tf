@@ -168,3 +168,23 @@ variable "unhealthy_host_threshold" {
   type        = number
   default     = 0
 }
+
+# ─── Polled dispatcherState query cost alarm (#4110) ─────────────────────────
+
+variable "polled_query_cost_threshold" {
+  description = "Cost threshold (in graphql-validation-complexity units) above which the polled-query-cost alarm fires. The cap is 1000; the cost-breakdown logger emits at >= 800. 900 leaves a 100-unit buffer between the early-warning emit and the cap so the alarm fires while the cockpit still works."
+  type        = number
+  default     = 900
+}
+
+variable "polled_query_cost_evaluation_periods" {
+  description = "Number of consecutive 60-second periods evaluated for the polled-query-cost alarm. Default 5 (5-min window)."
+  type        = number
+  default     = 5
+}
+
+variable "polled_query_cost_datapoints_to_alarm" {
+  description = "Number of evaluation periods within polled_query_cost_evaluation_periods that must breach the threshold to alarm. 3-of-5 default avoids flapping on a single noisy poll while still firing on a sustained trend."
+  type        = number
+  default     = 3
+}
