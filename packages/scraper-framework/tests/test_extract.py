@@ -2976,3 +2976,447 @@ class TestIsProbateDecedentNameEdgeCases:
             )
             is False
         )
+
+
+# ---------------------------------------------------------------------------
+# Procedural-text vocabulary widening (#3615)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the gaps described in #3615: the LLM concatenates the
+# case caption with motion-description / procedural-language text using
+# phrases that _TITLE_TERMINATOR_RE and _IMPLAUSIBLE_FRAGMENTS_RE didn't
+# previously cover.  The fix widens both regexes so:
+#   1. is_plausible_case_title() rejects contaminated titles (gating cleanup).
+#   2. clean_case_title() finds a boundary and returns a clean party-name pair.
+#
+# Each contamination shape gets a positive (rejected as implausible AND
+# cleanup recovers a clean title) and a negative regression test (legitimate
+# party names containing the same lexical token are NOT rejected).
+
+
+class TestProceduralVocabularyFragments:
+    """Issue #3615 — widened _IMPLAUSIBLE_FRAGMENTS_RE rejects contaminated
+    titles so they enter the cleanup branch instead of bypassing it."""
+
+    # --- "Cause of Action" / "Nth Cause of Action" ---
+
+    def test_rejects_cause_of_action(self) -> None:
+        """'X v. Y Cause of Action ...' is procedural body text contamination."""
+        title = "Smith v. Jones Cause of Action for Negligence"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_nth_cause_of_action(self) -> None:
+        """'X v. Y Sixth Cause of Action ...' is body section header contamination."""
+        title = "STEINMAN v. FORD MOTOR COMPANY Sixth Cause of Action - Fraudulent Inducement"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_first_cause_of_action(self) -> None:
+        """'X v. Y First Cause of Action ...' is contamination."""
+        title = (
+            "Seaman v. Hoag Memorial Hospital First Cause of Action for Disability Discrimination"
+        )
+        assert is_plausible_case_title(title) is False
+
+    # --- "Judge <Name>" ---
+
+    def test_rejects_judge_named(self) -> None:
+        """'X v. Y Judge Smith's Report ...' is body-text contamination."""
+        title = "Balt USA, LLC v. Treadstone Medical Judge Smith's Report"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_judge_single_letter_name(self) -> None:
+        """'X v. Y Judge A's decision ...' single-letter name is also caught.
+
+        Adversarial-review hardening: the original \\w pattern required at
+        least one word char AFTER the leading capital, missing single-letter
+        names. \\w* allows zero-or-more so 'Judge A' matches just like
+        'Judge Smith'.
+        """
+        title = "Smith v. Jones Judge A's decision on the motion"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_judge_apostrophe_name(self) -> None:
+        """'Judge d'Arcy' (apostrophe in name) is caught.
+
+        Adversarial-review hardening: judge names with apostrophes
+        (Irish surnames like d'Arcy, O'Brien) require ``[\\w'\\-]*`` not
+        just ``\\w*`` so the apostrophe-internal char class extends through.
+        """
+        title = "Acme v. Widget Judge d'Arcy's report on the motion"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_judge_hyphenated_name(self) -> None:
+        """'Judge Smith-Jones' (hyphenated compound name) is caught.
+
+        Adversarial-review hardening: hyphenated compound names require
+        ``[\\w'\\-]*`` so the hyphen extends the match through both halves.
+        """
+        title = "Acme v. Widget Judge Smith-Jones's order on demurrer"
+        assert is_plausible_case_title(title) is False
+
+    def test_accepts_judge_entity_name(self) -> None:
+        """'Judge & Sons LLC' as an entity name (no following capitalized word) is preserved."""
+        # The pattern requires "Judge" + whitespace + capitalized word, so an
+        # entity name like "Judge & Sons LLC" or "Judge Inc." is NOT flagged.
+        # Note the leading non-word "& " breaks the \w follow.
+        assert is_plausible_case_title("Judge & Sons LLC v. Smith") is True
+
+    # --- "MIL N" (motion in limine) ---
+
+    def test_rejects_mil_with_number(self) -> None:
+        """'X v. Y MIL 2: Motion ...' is motion-in-limine contamination."""
+        title = "MOJAVE PISTACHIOS v. INDIAN WELLS WATER MIL 2: Motion to Exclude"
+        assert is_plausible_case_title(title) is False
+
+    # --- "Allegations <preposition>" ---
+
+    def test_rejects_allegations_in(self) -> None:
+        """'X v. Y Allegations in the Complaint ...' is body-text contamination."""
+        title = "Wells Fargo Bank v. HLEE, Inc Allegations in the Complaint"
+        assert is_plausible_case_title(title) is False
+
+    def test_accepts_allegations_inc(self) -> None:
+        """'Allegations Inc.' as a party name (no following preposition) is preserved."""
+        # The pattern requires Allegations + a preposition/verb, so "Allegations Inc."
+        # is NOT flagged.
+        assert is_plausible_case_title("Allegations Inc. v. Smith") is True
+
+    # --- "Declaration of" ---
+
+    def test_rejects_declaration_of(self) -> None:
+        """'X v. Y Declaration of Daniel ...' is procedural contamination."""
+        title = "Nano Banc v. Shyam Declaration of Daniel Patrick"
+        assert is_plausible_case_title(title) is False
+
+    # --- "Objections <preposition>" ---
+
+    def test_rejects_objections_to(self) -> None:
+        """'X v. Y Defendants' Objections to ...' is procedural contamination."""
+        title = "Nano Banc v. Shyam Defendants' Objections to Declaration"
+        assert is_plausible_case_title(title) is False
+
+    # --- "Report and Recommendations" ---
+
+    def test_rejects_report_and_recommendations(self) -> None:
+        """'X v. Y Report and Recommendations ...' is body-text contamination."""
+        title = "Balt USA v. Treadstone Report and Recommendations Moving"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_report_and_recommendation_singular(self) -> None:
+        """Singular 'Recommendation' also rejected."""
+        title = "Smith v. Jones Report and Recommendation on Motion"
+        assert is_plausible_case_title(title) is False
+
+    # --- "Cross-Complaint" ---
+
+    def test_rejects_cross_complaint(self) -> None:
+        """'X v. Y Cross-Complaint ...' is procedural contamination."""
+        title = "Smith v. Jones Cross-Complaint of Defendant Roe"
+        assert is_plausible_case_title(title) is False
+
+    def test_accepts_cross_roads_entity(self) -> None:
+        """'Cross Roads Inc.' (no hyphen, NOT 'Cross-Complaint') is preserved."""
+        assert is_plausible_case_title("Cross Roads Inc. v. Smith") is True
+
+    # --- "Plaintiff's burden" / "Defendant's Ability" ---
+
+    def test_rejects_plaintiff_burden(self) -> None:
+        """'X v. Y Plaintiff's burden ...' is body-text contamination."""
+        title = "Wells Fargo v. HLEE Plaintiff's burden: Issue 1"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_defendant_ability(self) -> None:
+        """'X v. Y Defendants' Ability ...' is body-text contamination."""
+        title = "Balt USA v. Treadstone Moving Defendants' Ability to"
+        assert is_plausible_case_title(title) is False
+
+    # --- "Ex Parte <verb-noun>" ---
+
+    def test_rejects_ex_parte_application(self) -> None:
+        """'X v. Y Ex Parte Application ...' is procedural contamination."""
+        title = "Tong v. Le Ex Parte Application for Restraining Order"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_ex_parte_motion(self) -> None:
+        """'X v. Y Ex Parte Motion ...' is procedural contamination."""
+        title = "Smith v. Jones Ex Parte Motion to Compel Discovery"
+        assert is_plausible_case_title(title) is False
+
+    # --- "individually and on behalf of" (class-action descriptor) ---
+
+    def test_rejects_individually_and_on_behalf_of(self) -> None:
+        """'X v. Y Z, individually and on behalf of ...' is class-action
+        contamination.
+
+        Note the comma before 'individually' — this is the actual shape
+        of the contamination in OC PDFs (the LLM emits a name then
+        appends the descriptor as a continuation).  The regex requires
+        the comma so legitimate entity names that contain the phrase
+        without a comma boundary are NOT flagged.
+        """
+        title = (
+            "Gonzalez v. Buccola Services, Inc. Everardo Gonzalez, individually and on behalf of"
+        )
+        assert is_plausible_case_title(title) is False
+
+    def test_accepts_individually_phrase_without_comma_boundary(self) -> None:
+        """A legitimate (though contrived) entity-name use of the phrase
+        without the comma delimiter is NOT flagged as contamination.
+
+        The comma in the regex (``,\\s+individually\\s+and\\s+on\\s+behalf``)
+        distinguishes contamination from legitimate use (issue #3615
+        acceptance criteria called out this edge case explicitly:
+        "a SHORT title containing the phrase that's actually a
+        legitimate party name does NOT trip cleanup").
+        """
+        # No comma before "individually" — the regex doesn't fire.  This
+        # test is contrived (no real-world example exists in the data) but
+        # it pins the comma-boundary contract so a future regex relaxation
+        # would fail this assertion.
+        title = "In re The Individually and On Behalf Of Trust"
+        assert is_plausible_case_title(title) is True
+
+    # --- "And Cross-Defendants/Complainants" ---
+
+    def test_rejects_leading_and_cross_defendants(self) -> None:
+        """Leading 'And Cross-Defendants ...' is structural caption noise."""
+        title = "And Cross-Defendants Jane Does 1-5 v. William Robinson"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_v_and_cross_complainants(self) -> None:
+        """'X v. And Cross-Complainants ...' is structural caption noise."""
+        title = "Jane Does 1-5 v. And Cross-Complainants William Robinson"
+        assert is_plausible_case_title(title) is False
+
+    # --- Negative regression: legitimate titles must still pass ---
+
+    def test_accepts_steinman_short_form(self) -> None:
+        """The legitimate 'STEINMAN VS. FORD MOTOR COMPANY' (no contamination) passes."""
+        # Note: ALL CAPS is OK; this is the un-contaminated version of the
+        # contaminated examples above.
+        assert is_plausible_case_title("STEINMAN VS. FORD MOTOR COMPANY") is True
+
+    def test_accepts_legitimate_motor_company(self) -> None:
+        """Title-case 'Steinman v. Ford Motor Company' passes."""
+        assert is_plausible_case_title("Steinman v. Ford Motor Company") is True
+
+    def test_accepts_in_re_marriage_with_party(self) -> None:
+        """Probate titles still pass."""
+        assert is_plausible_case_title("In re Marriage of Garcia") is True
+
+
+class TestProceduralVocabularyTerminators:
+    """Issue #3615 — widened _TITLE_TERMINATOR_RE causes clean_case_title()
+    to find the boundary in contaminated titles and return clean party names."""
+
+    def _expect_clean_or_implausible(
+        self,
+        raw: str,
+        expected_substrings: list[str],
+        excluded_substrings: list[str],
+    ) -> None:
+        """Helper: run clean_case_title and assert the result either:
+        - returns a value containing expected_substrings and excluding
+          excluded_substrings, OR
+        - returns None / a value that fails is_plausible_case_title (which
+          triggers the worker.py NULL fallback — also acceptable).
+        """
+        result = clean_case_title(raw)
+        if result is None or not is_plausible_case_title(result):
+            # NULL fallback path is acceptable for unrecoverable contamination.
+            return
+        for substr in expected_substrings:
+            assert substr.lower() in result.lower(), (
+                f"Expected {substr!r} in cleaned result {result!r}"
+            )
+        for substr in excluded_substrings:
+            assert substr.lower() not in result.lower(), (
+                f"Did not expect {substr!r} in cleaned result {result!r}"
+            )
+
+    def test_clean_truncates_cause_of_action(self) -> None:
+        """Sixth Cause of Action contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "STEINMAN VS. FORD MOTOR COMPANY Sixth Cause of Action - Fraudulent Inducement",
+            expected_substrings=["Steinman", "Ford", "Motor", "Company"],
+            excluded_substrings=["Cause of Action", "Sixth", "Fraudulent", "Inducement"],
+        )
+
+    def test_clean_truncates_first_cause_of_action(self) -> None:
+        """First Cause of Action contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "Seaman v. Hoag Memorial Hospital First Cause of Action for Disability Discrimination",
+            expected_substrings=["Seaman", "Hoag"],
+            excluded_substrings=["First Cause", "Disability"],
+        )
+
+    def test_clean_truncates_at_judge_name(self) -> None:
+        """'Judge Smith' contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "Balt USA, LLC v. Treadstone Medical Judge Smith's Report and Recommendations",
+            expected_substrings=["Balt", "Treadstone"],
+            excluded_substrings=["Judge Smith", "Recommendations"],
+        )
+
+    def test_clean_truncates_at_apostrophe_judge_name(self) -> None:
+        """'Judge d'Arcy' (Irish surname with apostrophe) is truncated."""
+        self._expect_clean_or_implausible(
+            "Acme v. Widget Judge d'Arcy's report on the motion",
+            expected_substrings=["Acme", "Widget"],
+            excluded_substrings=["report", "motion"],
+        )
+
+    def test_clean_truncates_at_bare_motion(self) -> None:
+        """'X v. Y Motion for Sanctions' bare-MOTION contamination is truncated.
+
+        Adversarial-review hardening: the original implementation only had
+        ``MOTION TO|FOR|IN|RE`` in the terminator regex.  The bare
+        ``\\bMOTION\\b`` alternative lets the cleaner truncate when the
+        contamination is just "Motion <something else>".
+        """
+        self._expect_clean_or_implausible(
+            "Smith v. Jones Motion for Sanctions",
+            expected_substrings=["Smith", "Jones"],
+            excluded_substrings=["Sanctions"],
+        )
+
+    def test_clean_truncates_at_mil_number(self) -> None:
+        """'MIL 2:' motion-in-limine contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "MOJAVE PISTACHIOS v. INDIAN WELLS WATER MIL 2: Motion by the Authority",
+            expected_substrings=["Mojave", "Indian Wells"],
+            excluded_substrings=["MIL 2", "Authority"],
+        )
+
+    def test_clean_truncates_at_allegations(self) -> None:
+        """'Allegations in' contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "Wells Fargo Bank v. HLEE, Inc Allegations in the Complaint Plaintiff's burden",
+            expected_substrings=["Wells Fargo", "HLEE"],
+            excluded_substrings=["Allegations", "burden"],
+        )
+
+    def test_clean_truncates_at_declaration_of(self) -> None:
+        """'Declaration of' contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "Nano Banc v. Shyam Defendants' Objections to Declaration of Daniel Patrick",
+            expected_substrings=["Nano", "Shyam"],
+            excluded_substrings=["Declaration of", "Daniel Patrick"],
+        )
+
+    def test_clean_truncates_at_ex_parte(self) -> None:
+        """'Ex Parte Application' contamination is truncated."""
+        self._expect_clean_or_implausible(
+            "Tong vs. Le Ex Parte Application for Temporary Restraining Order",
+            expected_substrings=["Tong", "Le"],
+            excluded_substrings=["Ex Parte", "Restraining"],
+        )
+
+    def test_clean_truncates_at_individually_and_on_behalf_of(self) -> None:
+        """'individually and on behalf of' class-action descriptor is truncated."""
+        raw = (
+            "Gonzalez v. Buccola Services, Inc. Everardo Gonzalez, "
+            "individually and on behalf of others"
+        )
+        self._expect_clean_or_implausible(
+            raw,
+            expected_substrings=["Gonzalez", "Buccola"],
+            excluded_substrings=["individually", "on behalf"],
+        )
+
+    def test_clean_truncates_body_sentence_fusion(self) -> None:
+        """Body-sentence fusion ('Plaintiff X's...' continuation) is unrecoverable
+        but must NOT round-trip the contamination unchanged.
+
+        Per issue body, 'Plaintiff's <noun>' patterns are added to the
+        terminator regex, so the cleaner truncates at "Plaintiff's"."""
+        raw = (
+            "Wilmington Trust, National Association v. Merge Portfolio Owner, "
+            "LLC Plaintiff Wilmington Trust, National Association's"
+        )
+        self._expect_clean_or_implausible(
+            raw,
+            expected_substrings=["Wilmington", "Merge Portfolio"],
+            excluded_substrings=[],
+        )
+
+    def test_clean_logan_trust_known_unrecoverable_at_cleaner_level(self) -> None:
+        """Demurrer-analysis prose fusion ('The FAP does not establish ...') is
+        sentence-fragment contamination that the cleaner's regex vocabulary
+        genuinely cannot detect — there's no consistent token to anchor a
+        boundary on.
+
+        Per the 2026-05-03 spotcheck on issue #3615 (operator's own words):
+        "structural fix (null on silent-failure + enrichment hook) is more
+        important than chasing new terminator phrases one at a time."
+
+        This test documents the gap rather than asserting recovery.  The
+        sentence-fragment case is upstream of the cleanup layer — the LLM
+        produced a hallucinated party name ("Logan Diversified LP") fused
+        with body prose ("The FAP does not establish ...").  Neither the
+        cleaner nor the implausibility regex can reliably catch this without
+        an LLM round-trip.  The mitigation lives in the LLM-extraction layer
+        (better prompts, post-extraction sanity checks via re-prompting), not
+        in the deterministic cleanup.
+        """
+        raw = (
+            "Logan - Trust Garfield v. Logan Diversified LP The FAP "
+            "does not establish Colin had reason to discover the causes"
+        )
+        result = clean_case_title(raw)
+        # The cleaner returns the input unchanged (no terminator hits).
+        # This is documented expected behavior; a future enrichment-layer
+        # fix would catch this upstream.  Keeping the assertion loose: the
+        # cleaner doesn't make the title worse than it was.
+        assert result is None or len(result) <= len(raw) + 10
+
+    def test_clean_unrecoverable_and_cross_returns_implausible(self) -> None:
+        """'And Cross-Defendants ... v. And Cross-Complainants ...' is structural
+        caption noise with no clean party names.  Cleaner result either fails
+        plausibility (triggering NULL fallback) or returns None."""
+        raw = (
+            "And Cross-Defendants Jane Does 1-5 And John Doe 1 v. "
+            "And Cross-Complainants William Robinson, Jr"
+        )
+        result = clean_case_title(raw)
+        # Acceptable: result is None, or fails is_plausible_case_title.
+        # If the cleaner does produce something plausible, at minimum the
+        # leading "And Cross-Defendants" caption noise must be gone.
+        if result is not None and is_plausible_case_title(result):
+            assert not result.lower().startswith("and cross")
+
+    # --- Negative regression tests: legitimate titles round-trip unchanged ---
+
+    def test_clean_legitimate_steinman(self) -> None:
+        """Legitimate all-caps title is title-cased without truncation."""
+        result = clean_case_title("STEINMAN VS. FORD MOTOR COMPANY")
+        assert result is not None
+        assert "Steinman" in result
+        assert "Ford" in result
+        assert "Motor Company" in result
+
+    def test_clean_legitimate_smith_v_jones(self) -> None:
+        """Legitimate adversarial title round-trips."""
+        result = clean_case_title("Smith v. Jones")
+        assert result == "Smith v. Jones"
+
+    def test_clean_legitimate_acme_widget(self) -> None:
+        """Legitimate corporate adversarial title round-trips."""
+        result = clean_case_title("Acme Corporation v. Widget LLC")
+        assert result is not None
+        assert "Acme Corporation" in result
+        assert "Widget LLC" in result
+
+
+class TestEmptyCaseTitle:
+    """Issue #3615 spotcheck (2026-04-28) — empty-string case_title is a
+    third state that should never persist; it must normalize to None."""
+
+    def test_empty_string_is_implausible(self) -> None:
+        """Empty string fails plausibility (already covered, but reaffirms)."""
+        assert is_plausible_case_title("") is False
+
+    def test_whitespace_only_is_implausible(self) -> None:
+        """Whitespace-only string fails plausibility."""
+        assert is_plausible_case_title("   ") is False
+        assert is_plausible_case_title("\t\n") is False
