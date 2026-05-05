@@ -54,6 +54,18 @@ the live worker path — known divergences have been resolved.
     case row.  The LLM always wins when it produces a case_number, so
     the fixed-point risk that affected ``case_title`` does not apply.
 
+-   ``_reparse_document`` and ``_full_reparse_document`` now honor
+    ``ExtractionMethod.NONE`` (#4056).  Previously, the script consulted
+    ``get_county_extraction_config`` only to read ``max_output_tokens``
+    (#2355) and ran the LLM regardless of the configured ``method``.
+    That mismatch caused NONE-configured counties (Federal CourtListener
+    clusters, #3967; San Diego calendar override, #2331) to be re-run
+    through the CA-tuned LLM prompt during reingest, producing
+    truncation, JSON-parse errors, and field contamination.  Both reparse
+    entry points now skip ``extract_fields_llm`` (and any registered
+    ``llm_split_fn``) when the lookup returns ``ExtractionMethod.NONE``,
+    matching the live worker guard at ``worker.py:1719-1732``.
+
 For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
 --county <name>`` over reingest — rebuild walks S3 directly and does not
 touch existing ``cases.*`` rows when the split set changes across runs.
@@ -171,7 +183,10 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
-from framework.extraction_config import get_county_extraction_config  # noqa: E402
+from framework.extraction_config import (  # noqa: E402
+    ExtractionMethod,
+    get_county_extraction_config,
+)
 from framework.llm_enrichment import (  # noqa: E402
     LlmEnrichmentExhaustedError,
     LlmEnrichmentResult,
@@ -850,7 +865,12 @@ def _reparse_document(
     Extraction priority per field:
       1. Scraper ``parse_document()`` (highest priority).
       2. LLM extraction via ``extract_fields_llm()`` (if *llm_client*
-         is provided and fields are missing, or *force_llm* is True).
+         is provided and fields are missing, or *force_llm* is True),
+         **unless** the (state, county, scraper_id) lookup in
+         ``framework.extraction_config`` returns ``ExtractionMethod.NONE``.
+         NONE-configured counties (e.g. Federal CourtListener clusters,
+         San Diego calendar) ship complete scraper-populated fields and
+         the CA-tuned LLM prompt corrupts them — see #4056.
       3. Regex fallback (lowest priority).
 
     For PDF documents, extracts text via pdfplumber in a subprocess with
@@ -858,8 +878,11 @@ def _reparse_document(
 
     Returns a dict of extracted fields plus an ``extraction_methods`` dict
     recording which method populated each field, and an ``llm_skipped``
-    boolean indicating whether LLM extraction was skipped because all
-    fields were already populated.
+    boolean indicating whether LLM extraction was skipped (because all
+    fields were already populated, or because the county is registered
+    with ``ExtractionMethod.NONE``).  ``llm_outcome`` distinguishes the
+    two: ``"skipped"`` for the all-fields-present path and
+    ``"skipped_none"`` for the NONE-config short-circuit.
     """
     _load_scraper_registry()
 
@@ -1000,7 +1023,33 @@ def _reparse_document(
     # ------------------------------------------------------------------
     llm_skipped = False
     llm_outcome = "not_attempted"
-    if llm_client is not None:
+
+    # Short-circuit LLM extraction when the county/scraper is registered
+    # with ``ExtractionMethod.NONE`` (#4056).  The live worker path honors
+    # this in ``ingestion.worker._extract_fields`` (worker.py L1719-1732),
+    # but the reingest path historically only consulted the county config
+    # for ``max_output_tokens`` (#2355) and ran the LLM regardless of the
+    # configured method.  That mismatch caused ``ExtractionMethod.NONE``
+    # counties (e.g. Federal CourtListener clusters, #3967) to be re-run
+    # through the CA-tuned LLM prompt during reingest, producing
+    # truncation, JSON-parse errors, and field contamination that
+    # blocked #3978's federal cleanup pass.
+    _ext_config = get_county_extraction_config(
+        doc_meta.get("state", ""),
+        doc_meta.get("county", ""),
+        scraper_id=scraper_id,
+    )
+    if _ext_config is not None and _ext_config.method == ExtractionMethod.NONE:
+        logger.info(
+            "Skipping LLM extraction — county uses ExtractionMethod.NONE",
+            document_id=doc_meta["document_id"],
+            state=doc_meta.get("state"),
+            county=doc_meta.get("county"),
+            scraper_id=scraper_id,
+        )
+        llm_skipped = True
+        llm_outcome = "skipped_none"
+    elif llm_client is not None:
         missing_fields = [
             f
             for f in (
@@ -1190,6 +1239,38 @@ def _full_reparse_document(
       - ``is_split``: bool — True if this came from splitting
     """
     _load_scraper_registry()
+
+    # Short-circuit the LLM-based split path when the county/scraper is
+    # registered with ``ExtractionMethod.NONE`` (#4056).  Even though the
+    # downstream ``_reparse_document`` path also guards LLM extraction, an
+    # ``llm_split_fn`` registered for a NONE-configured scraper would still
+    # invoke an LLM here.  No NONE-registered scraper has an llm_split_fn
+    # today, but the explicit guard makes the contract self-documenting and
+    # protects future scrapers from regressing the federal cleanup case.
+    _ext_config = get_county_extraction_config(
+        doc_meta.get("state", ""),
+        doc_meta.get("county", ""),
+        scraper_id=scraper_id,
+    )
+    if _ext_config is not None and _ext_config.method == ExtractionMethod.NONE:
+        result = _reparse_document(
+            raw_content,
+            scraper_id,
+            doc_meta,
+            pdf_timeout=pdf_timeout,
+            llm_client=llm_client,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_timeout=llm_timeout,
+            force_llm=force_llm,
+            token_tracker=token_tracker,
+            force_retranscribe=force_retranscribe,
+            bust_llm_cache=bust_llm_cache,
+        )
+        result["ruling_index"] = 0
+        result["split_document_id"] = doc_meta["document_id"]
+        result["is_split"] = False
+        return [result]
 
     split_fn = _SPLIT_REGISTRY.get(scraper_id)
     llm_split_fn = _LLM_SPLIT_REGISTRY.get(scraper_id)

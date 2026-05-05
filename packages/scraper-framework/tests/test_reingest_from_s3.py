@@ -3562,6 +3562,285 @@ class TestFullReparseDocumentScraperIdFallback:
 
 
 # ---------------------------------------------------------------------------
+# ExtractionMethod.NONE short-circuit (#4056)
+#
+# scripts/reingest_from_s3.py historically only consulted
+# get_county_extraction_config to read ``max_output_tokens`` (#2355) and ran
+# the LLM regardless of the configured ``method``.  That mismatch caused
+# ``ExtractionMethod.NONE`` counties (Federal CourtListener clusters, #3967)
+# to be re-run through the CA-tuned LLM prompt during reingest, producing
+# truncation, JSON-parse errors, and field contamination that blocked
+# #3978's federal cleanup pass.  These tests pin the new guard.
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentExtractionMethodNone:
+    """LLM short-circuit when the county/scraper config returns NONE (#4056)."""
+
+    def _federal_doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "Federal",
+            "county": "Federal",
+            "court_name": "Court of Appeals for the Ninth Circuit",
+            "source_url": "https://www.courtlistener.com/opinion/abc/",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "fedabc",
+            "format": "html",
+            "case_number": "24-1234",
+            "case_title": "United States v. Doe",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "courtlistener",
+            "s3_key": "federal/test.html",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_reparse_document_skips_llm_when_config_none(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Federal docs (ExtractionMethod.NONE) must not invoke extract_fields_llm.
+
+        The (FEDERAL, FEDERAL) county registers ``ExtractionMethod.NONE`` in
+        ``framework/extraction_config.py``.  Reingest must honor that and
+        skip the LLM call entirely — running the CA-tuned LLM prompt over
+        federal opinion text causes the truncation/JSON-parse failures
+        documented in #3967 / #4056.
+        """
+        raw = b"<html>federal opinion text - judges named in cluster metadata</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw,
+            "courtlistener",
+            self._federal_doc_meta(case_number=None, case_title=None),
+            llm_client=client,
+        )
+
+        mock_llm.assert_not_called()
+        assert result["llm_skipped"] is True
+        assert result["llm_outcome"] == "skipped_none"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_reparse_document_skips_llm_even_with_force_llm(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """``force_llm=True`` must not override an ExtractionMethod.NONE config.
+
+        The whole point of the NONE registration is that the LLM prompt
+        produces wrong/contaminated output for this county.  ``force_llm``
+        was originally meant for selective re-extraction on counties that
+        *do* support LLM — applying it to NONE-configured counties would
+        re-introduce the exact contamination class #3967 documented.
+        """
+        raw = b"<html>federal opinion text</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw,
+            "courtlistener",
+            self._federal_doc_meta(case_number=None),
+            llm_client=client,
+            force_llm=True,
+        )
+
+        mock_llm.assert_not_called()
+        assert result["llm_outcome"] == "skipped_none"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_reparse_document_runs_llm_for_non_none_county(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Non-NONE counties must continue to invoke extract_fields_llm.
+
+        Pins the negative case so the new guard cannot accidentally break
+        LA / Riverside / SF / etc.  ``unknown-scraper`` + ``CA / Los
+        Angeles`` is not registered in ``_COUNTY_CONFIGS`` so
+        ``get_county_extraction_config`` returns ``None`` and the LLM
+        path runs as before.
+        """
+        from ingestion.llm_extract import LLMExtractionResult
+
+        mock_llm.return_value = LLMExtractionResult(
+            judge_name=None,
+            hearing_date=None,
+            department=None,
+            case_count=0,
+            rulings=[],
+        )
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "unknown-scraper",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+        client = MagicMock()
+        reingest._reparse_document(
+            b"<html>ruling text</html>", "unknown-scraper", meta, llm_client=client
+        )
+
+        mock_llm.assert_called_once()
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_reparse_document_skips_llm_for_sd_calendar_scraper_override(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Scraper-level NONE overrides (e.g. ca-sd-calendar) are also honored.
+
+        The ``_SCRAPER_CONFIGS`` table in ``extraction_config.py`` maps the
+        ``ca-sd-calendar`` scraper_id to ``ExtractionMethod.NONE`` even
+        though its parent county (CA / San Diego) is configured for LLM.
+        Reingest must respect the scraper-level override.
+        """
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "San Diego",
+            "court_name": "Superior Court of California, San Diego",
+            "source_url": "",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "sd123",
+            "format": "html",
+            "case_number": "37-2024-00021082-CL-CL-CTL",
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-sd-calendar",
+            "s3_key": "ca/san_diego/superior_court/raw/abc.html",
+            "s3_bucket": "test-bucket",
+        }
+        # Make sure the scraper is not registered so parse_document doesn't run.
+        reingest._SCRAPER_REGISTRY.pop("ca-sd-calendar", None)
+
+        raw = b"<html>calendar HTML</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(raw, "ca-sd-calendar", meta, llm_client=client)
+
+        mock_llm.assert_not_called()
+        assert result["llm_outcome"] == "skipped_none"
+
+
+class TestFullReparseDocumentExtractionMethodNone:
+    """LLM short-circuit in _full_reparse_document for NONE-configured counties (#4056)."""
+
+    def _federal_doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "Federal",
+            "county": "Federal",
+            "court_name": "Court of Appeals for the Ninth Circuit",
+            "source_url": "https://www.courtlistener.com/opinion/abc/",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "fedabc",
+            "format": "html",
+            "case_number": "24-1234",
+            "case_title": "United States v. Doe",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "courtlistener",
+            "s3_key": "federal/test.html",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_full_reparse_document_skips_llm_for_federal(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """``--full-reparse`` on a Federal doc must not invoke extract_fields_llm.
+
+        ``_full_reparse_document`` delegates to ``_reparse_document`` for
+        scrapers without a split function.  The ExtractionMethod.NONE
+        guard at the top of ``_full_reparse_document`` (and the matching
+        guard in the inner ``_reparse_document``) ensure the LLM is
+        skipped regardless of which split path is taken.
+        """
+        raw = b"<html>federal opinion text</html>"
+        client = MagicMock()
+
+        # Make sure no split function is registered (matches reality for
+        # the courtlistener scraper).
+        reingest._SPLIT_REGISTRY.pop("courtlistener", None)
+        reingest._LLM_SPLIT_REGISTRY.pop("courtlistener", None)
+
+        results = reingest._full_reparse_document(
+            raw,
+            "courtlistener",
+            self._federal_doc_meta(case_number=None, case_title=None),
+            llm_client=client,
+        )
+
+        mock_llm.assert_not_called()
+        assert isinstance(results, list)
+        assert len(results) == 1
+        assert results[0]["llm_skipped"] is True
+        assert results[0]["llm_outcome"] == "skipped_none"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_full_reparse_document_skips_llm_split_for_none_config(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """The NONE guard short-circuits *before* the llm_split_fn runs.
+
+        Defense in depth: even if a future scraper registered under an
+        ExtractionMethod.NONE county had an llm_split_fn entry, the guard
+        at the top of ``_full_reparse_document`` would skip it.  We
+        simulate that by registering a mock llm_split_fn for the
+        ``courtlistener`` scraper and asserting the mock was not called.
+        """
+        mock_llm_split = MagicMock()
+        reingest._LLM_SPLIT_REGISTRY["courtlistener"] = mock_llm_split
+        try:
+            raw = b"<html>federal opinion text</html>"
+            client = MagicMock()
+            results = reingest._full_reparse_document(
+                raw,
+                "courtlistener",
+                self._federal_doc_meta(case_number=None),
+                llm_client=client,
+            )
+
+            mock_llm.assert_not_called()
+            mock_llm_split.assert_not_called()
+            assert len(results) == 1
+            assert results[0]["llm_outcome"] == "skipped_none"
+        finally:
+            reingest._LLM_SPLIT_REGISTRY.pop("courtlistener", None)
+
+
+# ---------------------------------------------------------------------------
 # LLM extraction in reingest_batch — llm_client passthrough
 # ---------------------------------------------------------------------------
 
