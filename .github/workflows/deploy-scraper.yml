@@ -17,6 +17,19 @@ on:
       # must trigger this deploy so regressions surface on the PR that
       # introduces them, not on the next unrelated deploy (see #2608/#2592).
       - "scripts/ecs-post-deploy-healthcheck.sh"
+      # scripts/check-ingestion-worker-task-def-fingerprint.sh is invoked
+      # by the post-deploy-health-check job's drift gate (#4044). Same
+      # paths-filter contract as wait-for-rollout.sh / ecs-post-deploy-healthcheck.sh
+      # — a regression in the canonicalize() filter (e.g. #4057) would
+      # otherwise only surface on the next *unrelated* scraper PR's deploy,
+      # blinding every scraper deploy's drift gate in the meantime
+      # (see #4073/#2608/#2592).
+      - "scripts/check-ingestion-worker-task-def-fingerprint.sh"
+      # scripts/ecs-render-task-def.sh is invoked transitively by the
+      # ecs-deploy composite action (.github/actions/ecs-deploy/action.yml).
+      # Same shared-script convention — a regression there silently breaks
+      # every scraper deploy's task-def render. See #4073.
+      - "scripts/ecs-render-task-def.sh"
   workflow_dispatch:
     inputs:
       image_tag:

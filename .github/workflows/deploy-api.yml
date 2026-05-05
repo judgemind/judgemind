@@ -13,6 +13,11 @@ on:
       # action. Changes to the shared script must trigger this deploy so the
       # fix is exercised against a real rollout on its own PR (see #2592).
       - "scripts/wait-for-rollout.sh"
+      # scripts/ecs-render-task-def.sh is invoked transitively by the
+      # ecs-deploy composite action (.github/actions/ecs-deploy/action.yml).
+      # Same shared-script convention — a regression there silently breaks
+      # every API deploy's task-def render. See #4073.
+      - "scripts/ecs-render-task-def.sh"
   workflow_dispatch:
     inputs:
       image_tag:
