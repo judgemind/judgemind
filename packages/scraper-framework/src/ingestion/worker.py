@@ -1664,6 +1664,19 @@ class IngestionWorker:
         source_url: str = event_data.get("source_url", "")
         scraper_id: str = event_data.get("scraper_id", "")
 
+        # Resolve the extraction strategy once for this event (#4081).
+        # Single source of truth shared with scripts/reingest_from_s3.py — both
+        # paths read ``strategy.skip_llm`` / ``use_multimodal`` /
+        # ``max_output_tokens`` / ``system_prompt`` / ``provider`` / ``model``
+        # / ``max_chars_per_chunk`` instead of re-deriving the gate logic from
+        # ``CountyExtractionConfig`` inline.  This closes the divergence
+        # pattern catalogued in #2490, #2501, #2502, #2521, #4056 — adding a
+        # new ``ExtractionMethod`` value or ``CountyExtractionConfig`` field
+        # now updates both paths in one place.
+        from framework.extraction_config import decide_extraction_strategy
+
+        strategy = decide_extraction_strategy(state, county, scraper_id=scraper_id)
+
         # Pipeline branch — non-ruling scrapers (#3688).
         # The ca-governor-appointments scraper emits judge-bio press releases
         # that share the CapturedDocument shape but are NOT rulings. Without
@@ -1727,16 +1740,10 @@ class IngestionWorker:
         # For MULTIMODAL counties, download the original PDF from S3 so
         # the multimodal path can send page images to the LLM.
         if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
-            from framework.extraction_config import (
-                ExtractionMethod,
-                get_county_extraction_config,
-            )
-
-            county_config = get_county_extraction_config(state, county, scraper_id=scraper_id)
-            needs_multimodal = (
-                county_config is not None and county_config.method == ExtractionMethod.MULTIMODAL
-            ) or county_config is None  # unconfigured counties default to multimodal
-            if needs_multimodal:
+            # ``strategy.use_multimodal`` is True for ExtractionMethod.MULTIMODAL
+            # AND for unconfigured counties (the helper preserves the worker's
+            # pre-refactor default-multimodal behavior, #4081).
+            if strategy.use_multimodal:
                 raw_pdf_bytes = self._fetch_raw_pdf_from_s3(s3_key, s3_bucket, document_id)
 
         # ------------------------------------------------------------------
@@ -1821,16 +1828,14 @@ class IngestionWorker:
         # already populated by the scraper — skip per-field LLM extraction.
         # This handles scrapers like SD calendar where structured HTML is
         # fully parsed and the LLM would produce wrong results (#2331).
+        # ``strategy.skip_llm`` is the single-source-of-truth flag (#4081),
+        # populated identically for the reingest path.
         is_extraction_none = False
-        if not is_llm_extracted:
-            from framework.extraction_config import ExtractionMethod, get_county_extraction_config
-
-            _ext_config = get_county_extraction_config(state, county, scraper_id=scraper_id)
-            if _ext_config is not None and _ext_config.method == ExtractionMethod.NONE:
-                is_extraction_none = True
-                for field in EXTRACTABLE_FIELDS:
-                    if event_data.get(field):
-                        extraction_methods[field] = "scraper"
+        if not is_llm_extracted and strategy.skip_llm:
+            is_extraction_none = True
+            for field in EXTRACTABLE_FIELDS:
+                if event_data.get(field):
+                    extraction_methods[field] = "scraper"
 
         # ------------------------------------------------------------------
         # LLM extraction — primary method for missing fields
@@ -1846,13 +1851,12 @@ class IngestionWorker:
                 "judge_name": event_data.get("judge_name"),
                 "department": event_data.get("department"),
             }
-            # Look up county-specific max_output_tokens (#2355).
+            # County-specific max_output_tokens (#2355).
             # Large-document counties (e.g. Santa Clara, 130K+ chars) need
             # more than the default 4096 output tokens to avoid truncated JSON.
-            from framework.extraction_config import get_county_extraction_config as _get_cc
-
-            _cc = _get_cc(state, county)
-            _llm_max_tokens = _cc.max_output_tokens if _cc and _cc.max_output_tokens else 4096
+            # ``strategy.max_output_tokens`` already resolves to 4096 when no
+            # county override is configured (#4081).
+            _llm_max_tokens = strategy.max_output_tokens
 
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
@@ -3048,22 +3052,24 @@ class IngestionWorker:
         extracted_rulings = None
         extraction_method = "llm"  # Track which path was used for logging.
 
-        # Check if the county/scraper has a configured extraction method (#2271, #2331).
-        # Counties with ExtractionMethod.LLM (e.g. Ventura) have custom
-        # text-based prompts that extract structured fields including outcome.
-        # The multimodal per-page extraction does NOT extract outcome or
-        # motion_type, so using it for LLM-configured counties causes field
-        # regressions.  Only use multimodal for counties explicitly configured
-        # as ExtractionMethod.MULTIMODAL (e.g. Orange County).
-        # Counties/scrapers with ExtractionMethod.NONE skip framework extraction
-        # entirely (e.g. SD calendar — structured HTML already fully parsed).
-        from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+        # Resolve the extraction strategy once (#4081).  Counties with
+        # ExtractionMethod.LLM (e.g. Ventura) have custom text-based prompts
+        # that extract structured fields including outcome.  The multimodal
+        # per-page extraction does NOT extract outcome or motion_type, so
+        # using it for LLM-configured counties causes field regressions
+        # (#2271, #2331).  Only use multimodal when ``strategy.use_multimodal``
+        # is True — that is, ExtractionMethod.MULTIMODAL counties (e.g.
+        # Orange) and unconfigured counties (default behavior).  Counties
+        # with ExtractionMethod.NONE (``strategy.skip_llm``) skip framework
+        # extraction entirely (e.g. SD calendar — structured HTML already
+        # fully parsed).
+        from framework.extraction_config import decide_extraction_strategy
 
         event_scraper_id: str = event_data.get("scraper_id", "")
-        county_config = get_county_extraction_config(state, county, scraper_id=event_scraper_id)
+        strategy = decide_extraction_strategy(state, county, scraper_id=event_scraper_id)
 
         # NONE means the scraper handles everything — no framework extraction.
-        if county_config is not None and county_config.method == ExtractionMethod.NONE:
+        if strategy.skip_llm:
             logger.debug(
                 "Skipping framework extraction — scraper/county uses ExtractionMethod.NONE",
                 extra={
@@ -3074,20 +3080,18 @@ class IngestionWorker:
             )
             return False
 
-        use_multimodal = (
-            county_config is not None and county_config.method == ExtractionMethod.MULTIMODAL
-        ) or county_config is None  # Default: allow multimodal for unconfigured counties
+        use_multimodal = strategy.use_multimodal
 
         # Multimodal path: per-page image extraction from raw PDF (#1590).
         # Only used when the county is configured for multimodal extraction
         # or has no specific config (default behavior).
         if raw_pdf_bytes is not None and use_multimodal:
-            # Pass the county's multimodal max_output_tokens (if configured)
-            # so dense multi-case pages don't truncate the LLM JSON response
-            # at the default 4,096 tokens (#2369).
-            mm_max_output_tokens: int | None = (
-                county_config.max_output_tokens if county_config is not None else None
-            )
+            # ``strategy.max_output_tokens`` already resolves to 4096 when no
+            # county override is configured (#4081), and to the override
+            # value (e.g. 32768 for Orange) when present — so dense
+            # multi-case pages don't truncate the LLM JSON response at the
+            # default 4,096 tokens (#2369).
+            mm_max_output_tokens: int = strategy.max_output_tokens
             multimodal_extractor = self._get_multimodal_extractor(
                 max_output_tokens=mm_max_output_tokens,
             )
@@ -3133,27 +3137,26 @@ class IngestionWorker:
         if extracted_rulings is None and ruling_text:
             extraction_method = "llm"  # Falling back to text-based.
 
-            # Check for county/scraper-specific extraction config (#1728, #2331).
-            from framework.extraction_config import get_county_extraction_config
+            # County/scraper-specific extraction config (#1728, #2331), now
+            # resolved through the shared strategy helper (#4081).
+            county_prompt: str | None = strategy.system_prompt
 
-            county_config = get_county_extraction_config(state, county, scraper_id=event_scraper_id)
-            county_prompt: str | None = None
-
-            if county_config and county_config.provider:
+            if strategy.provider:
                 # County has a custom provider — use a dedicated extractor.
+                # ``_get_county_extractor`` accepts ``max_output_tokens=None``
+                # to mean "use the LlmExtractor default", but the strategy
+                # already resolved 4096 for that case — pass it through.
                 extractor = self._get_county_extractor(
-                    county_config.provider,
-                    county_config.model,
-                    county_config.max_output_tokens,
-                    county_config.max_chars_per_chunk,
+                    strategy.provider,
+                    strategy.model,
+                    strategy.max_output_tokens,
+                    strategy.max_chars_per_chunk,
                 )
-                county_prompt = county_config.system_prompt
                 if county_prompt:
                     extraction_method = "llm_county"
             else:
                 extractor = self._get_framework_extractor()
-                if county_config and county_config.system_prompt:
-                    county_prompt = county_config.system_prompt
+                if county_prompt:
                     extraction_method = "llm_county"
 
             if extractor is None:
