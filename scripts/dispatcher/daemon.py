@@ -3047,7 +3047,7 @@ class DispatcherDaemon:
 
     # ── scheduler tick (every ``tick_scheduler_seconds``) ───────────────
 
-    def scheduler_tick(self) -> dict[str, int]:
+    def scheduler_tick(self) -> dict[str, Any]:
         """Run one scheduler tick — queue scan + retry drain + Phase 3A orchestration.
 
         Steps (in order; DB work is one transaction per step for isolation):
@@ -3108,6 +3108,11 @@ class DispatcherDaemon:
               infra-preemption retry markers drained before the queue
               scan this tick (#2949). Non-zero means an interrupted
               agent was reclaimed ahead of any fresh queue claim.
+            * ``step_durations``: ``dict[str, float]`` mapping each
+              sub-step name that ran this tick to its elapsed_seconds
+              (rounded to 3 decimals). Mirrors the log-event field of
+              the same name (#4109). Empty dict on a tick that crashed
+              before recording any step.
         """
         assert self._conn is not None, "connect() must run before ticks"
 
@@ -3131,11 +3136,20 @@ class DispatcherDaemon:
         t_step = self._last_scheduler_tick_at
         t_tick_entry = t_step
 
+        # #4109 — per-sub-step happy-path timing. Each
+        # ``_record_scheduler_step`` call writes ``step_name → elapsed``
+        # (rounded to 3 decimals) into this dict; the end-of-tick INFO
+        # event surfaces it as ``step_durations`` so CloudWatch Logs
+        # Insights queries can chart per-step durations on every tick,
+        # not just on the slow-WARN path. Mirrors PR #4102's
+        # supervisor-side fix for issue #4087.
+        step_durations: dict[str, float] = {}
+
         # 1. Consume any pending commands. Each command is dispatched to
         # its handler; consumed_at is set AFTER the handler returns so
         # a mid-handler crash leaves the command unconsumed for retry.
         commands_consumed = self._consume_commands()
-        t_step = self._record_scheduler_step("consume_commands", t_step)
+        t_step = self._record_scheduler_step("consume_commands", t_step, step_durations)
 
         concurrency_cap: int | None = None
 
@@ -3150,7 +3164,9 @@ class DispatcherDaemon:
                 # Stored as JSONB — a bare number comes back as int.
                 concurrency_cap = int(row[0]) if row[0] is not None else None
         self._conn.commit()
-        t_step = self._record_scheduler_step("concurrency_cap_read", t_step)
+        t_step = self._record_scheduler_step(
+            "concurrency_cap_read", t_step, step_durations
+        )
 
         # Killswitch observation (#2847, amended #2884). Update the
         # observation state and the ``_pause_requested`` event so the
@@ -3253,7 +3269,9 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
-        t_step = self._record_scheduler_step("circuit_breaker_auto_close", t_step)
+        t_step = self._record_scheduler_step(
+            "circuit_breaker_auto_close", t_step, step_durations
+        )
 
         # Issue #2949 — process infra-preemption retry markers BEFORE
         # scanning the ``agent/ready`` queue. When a daemon restart
@@ -3299,7 +3317,9 @@ class DispatcherDaemon:
                     "markers_processed": retry_markers_prioritized,
                 },
             )
-        t_step = self._record_scheduler_step("process_retry_markers", t_step)
+        t_step = self._record_scheduler_step(
+            "process_retry_markers", t_step, step_durations
+        )
 
         # #3091 Stage 2 reap pass. Observe any in-flight per-agent ECS
         # tasks (``dispatcher.agents.agent_task_arn IS NOT NULL``) and
@@ -3331,7 +3351,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_scheduler_step("reap_agent_tasks", t_step)
+        t_step = self._record_scheduler_step("reap_agent_tasks", t_step, step_durations)
 
         # 3. Scan the ``agent/ready`` queue and persist a snapshot.
         #
@@ -3344,7 +3364,7 @@ class DispatcherDaemon:
             self._last_queue_scan = now_for_queue_scan
         else:
             queue_depth = -1  # sentinel: "queue scan throttled this tick"
-        t_step = self._record_scheduler_step("scan_queue", t_step)
+        t_step = self._record_scheduler_step("scan_queue", t_step, step_durations)
 
         # 3b. Scan the ``status/blocked`` list on a slower cadence
         # (every ``BLOCKED_SCAN_EVERY_N_TICKS`` ticks — ~2min at the
@@ -3355,7 +3375,7 @@ class DispatcherDaemon:
         blocked_depth = -1  # sentinel: "scan not attempted this tick"
         if self._should_run_blocked_scan():
             blocked_depth = self._scan_blocked_and_snapshot()
-        t_step = self._record_scheduler_step("scan_blocked", t_step)
+        t_step = self._record_scheduler_step("scan_blocked", t_step, step_durations)
 
         # 4. Phase 3A orchestration gate (#2783) — threaded spawn (#2847).
         #
@@ -3431,7 +3451,9 @@ class DispatcherDaemon:
             and not self._is_paused()
         ):
             active_agent_count = self._active_agent_count()
-            t_step = self._record_scheduler_step("active_agent_count", t_step)
+            t_step = self._record_scheduler_step(
+                "active_agent_count", t_step, step_durations
+            )
             has_active_agent_this_tick = active_agent_count > 0
             gate_blocked_on_cap = active_agent_count >= concurrency_cap
             if active_agent_count < concurrency_cap:
@@ -3449,7 +3471,7 @@ class DispatcherDaemon:
                         },
                     )
                 t_step = self._record_scheduler_step(
-                    "maybe_spawn_orchestration", t_step
+                    "maybe_spawn_orchestration", t_step, step_durations
                 )
 
         self._scheduler_ticks += 1
@@ -3553,6 +3575,13 @@ class DispatcherDaemon:
                 # regressions are visible without waiting for a
                 # ``scheduler_tick_slow_*`` threshold trip.
                 "tick_elapsed_s": round(tick_elapsed_s, 3),
+                # #4109 — per-sub-step elapsed_seconds (rounded to 3
+                # decimals). Surfaces happy-path timing on every tick so
+                # CloudWatch Logs Insights queries like
+                # ``stats avg(step_durations.scan_queue) by bin(5m)``
+                # work without waiting for the slow-WARN to fire.
+                # Mirrors PR #4102's supervisor-side fix for #4087.
+                "step_durations": step_durations,
             },
         )
         return {
@@ -3583,6 +3612,10 @@ class DispatcherDaemon:
             "reap_still_running": reap_summary["still_running"],
             # #3344 — untracked-ARN counter.
             "reap_untracked": reap_summary.get("reaped_untracked", 0),
+            # #4109 — per-sub-step elapsed_seconds (mirror of the log
+            # event field). Tests + future telemetry consumers can read
+            # this without re-parsing log records. Mirrors PR #4102.
+            "step_durations": step_durations,
         }
 
     # ── command consumption (#2801) ────────────────────────────────────
@@ -27270,8 +27303,13 @@ class DispatcherDaemon:
             )
         return dump
 
-    def _record_scheduler_step(self, step: str, t_before: float) -> float:
-        """Warn on slow scheduler-tick sub-steps (#3205, #3801).
+    def _record_scheduler_step(
+        self,
+        step: str,
+        t_before: float,
+        durations: dict[str, float] | None = None,
+    ) -> float:
+        """Warn on slow scheduler-tick sub-steps (#3205, #3801, #4109).
 
         Called from :meth:`scheduler_tick` between each major sub-step
         (``_consume_commands``, concurrency_cap read, ``_process_retry_markers``,
@@ -27297,11 +27335,26 @@ class DispatcherDaemon:
         single ``scheduler_tick`` entry timestamp and fires once the
         whole tick exceeds the EXIT threshold.
 
+        **#4109 — happy-path elapsed_seconds.** When ``durations`` is
+        provided the rounded elapsed time is also written to
+        ``durations[step]`` so the end-of-tick ``scheduler_tick`` event
+        can carry a per-sub-step ``step_durations`` dict. Mirrors the
+        #4087 supervisor-side fix. The slow-WARN was the ONLY happy-path
+        timing source — a ``scan_queue`` going from 5s → 9.9s was
+        indistinguishable from one going 0.5s → 0.5s. CloudWatch Logs
+        Insights queries like ``stats avg(step_durations.scan_queue) by
+        bin(5m)`` now return real numbers on every tick. Default
+        ``None`` keeps the helper backwards-compatible for any caller
+        that does not care about happy-path timing.
+
         Returns ``time.monotonic()`` so the caller can chain by passing
         the return value as the next step's ``t_before``.
         """
         now = time.monotonic()
         elapsed = now - t_before
+        rounded = round(elapsed, 3)
+        if durations is not None:
+            durations[step] = rounded
         if elapsed >= SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS:
             self._log.warning(
                 f"daemon.scheduler_tick_slow_{step}",
@@ -27309,7 +27362,7 @@ class DispatcherDaemon:
                     "event": f"scheduler_tick_slow_{step}",
                     "run_id": self._run_id,
                     "step": step,
-                    "elapsed_seconds": round(elapsed, 3),
+                    "elapsed_seconds": rounded,
                     "threshold_seconds": SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS,
                 },
             )
