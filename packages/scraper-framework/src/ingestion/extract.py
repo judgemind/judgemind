@@ -1298,6 +1298,203 @@ _ORG_KEYWORD_RE = re.compile(
 )
 
 
+# Boilerplate first-name / surname tokens (#4123).
+#
+# When the regex patterns in ``_JUDGE_NAME_PATTERNS`` run against Federal
+# opinion text (CourtListener) — text the LLM extractor never saw because of
+# #4122's ContentFormat enum mismatch — they capture body-text phrases that
+# happen to follow the literal word "Judge" (e.g. "Judge Instructions For
+# The Jury", "...Judge Diana may rule on..."). The result is a "name" whose
+# words are common English verbs, articles, prepositions, or noun-phrase
+# fragments rather than proper nouns.
+#
+# This stop-list is checked against EITHER the first or the last token of the
+# captured name. A real judge's first or last name should never be one of
+# these boilerplate words. Tokens are upper-cased for matching.
+#
+# The list is conservative — it excludes any word that could plausibly be a
+# real surname or first name (e.g. "Will" is excluded because it's a real
+# first name; "Lord" is excluded because it appears as a surname in real
+# CA filings). Any word here must be one that NEVER appears as a real name
+# in the judge corpus.
+_BOILERPLATE_NAME_TOKENS: frozenset[str] = frozenset(
+    {
+        # Articles, prepositions, conjunctions
+        "THE",
+        "AND",
+        "OR",
+        "OF",
+        "FOR",
+        "BY",
+        "ON",
+        "AT",
+        "TO",
+        "IN",
+        "WITH",
+        "FROM",
+        "AS",
+        "AN",
+        # Common verbs that appear capitalized in title-cased headings
+        # ("May", "Say", "Will" excluded because they ARE real surnames /
+        # first names — instead we reject based on the truncation pattern
+        # below). This list covers verbs that are NEVER names.
+        "INSTRUCTIONS",
+        "INSTRUCTION",
+        "ORDER",
+        "ORDERED",
+        "MOTION",
+        "MOTIONS",
+        "RULING",
+        "RULINGS",
+        "TENTATIVE",
+        "JURY",
+        "TRIAL",
+        "TRIALS",
+        "HEARING",
+        "HEARINGS",
+        "OPINION",
+        "OPINIONS",
+        "BRIEF",
+        "BRIEFS",
+        "OBJECTION",
+        "OBJECTIONS",
+        "PLAINTIFF",
+        "DEFENDANT",
+        "PLAINTIFFS",
+        "DEFENDANTS",
+        "APPELLANT",
+        "APPELLEE",
+        "PETITIONER",
+        "RESPONDENT",
+        "MOVANT",
+        "JUDGMENT",
+        "DECISION",
+        "FINDINGS",
+        "CONCLUSIONS",
+        "PROPOSED",
+        "PRELIMINARY",
+        "FINAL",
+        # Procedural / boilerplate
+        "GRANTED",
+        "DENIED",
+        "CONTINUED",
+        "OVERRULED",
+        "SUSTAINED",
+        "REVIEW",
+        "REPLY",
+        "EXHIBIT",
+        "TABLE",
+        "INDEX",
+        "SUMMARY",
+        "DEPARTMENT",
+        "COURTROOM",
+        "COUNTY",
+        "DISTRICT",
+        "STATE",
+        "FEDERAL",
+        "UNITED",
+        "STATES",
+        "AMERICA",
+    }
+)
+
+
+# Surname particles that are never complete surnames on their own (#4123).
+#
+# Dutch ("Van", "Van Der"), German ("Von"), French ("De", "Du", "La", "Le"),
+# Spanish ("Del", "El"), Italian ("Di", "Da", "Della"), and Arabic ("Al")
+# surname particles always precede the actual surname. When a regex match
+# captures a name like "Lindsay Van" or "Alexander C. Van" with no further
+# token, the name is truncated — the real surname (Van Pelt, Van Deusen)
+# was cut off upstream by line breaks or document parsing.
+#
+# Reject any captured name whose LAST token is one of these particles.
+# Names like "Van Pelt", "De La Cruz", "Della Rocca" remain valid because
+# the particle is followed by another token in the captured surname.
+_TRUNCATED_SURNAME_PARTICLES: frozenset[str] = frozenset(
+    {
+        # Dutch / Afrikaans
+        "VAN",
+        "VANDER",
+        "VANDEN",
+        # German / Yiddish
+        "VON",
+        # French
+        "DE",
+        "DU",
+        "LA",
+        "LE",
+        "DES",
+        # Spanish / Portuguese
+        "DEL",
+        "EL",
+        "DOS",
+        "DAS",
+        # Italian
+        "DI",
+        "DA",
+        "DELLA",
+        "DELLO",
+        # Arabic
+        "AL",
+    }
+)
+
+
+# Common English modal verbs / short helper verbs that appear capitalized in
+# title-cased text but are never used as standalone surnames (#4123).
+#
+# These differ from `_BOILERPLATE_NAME_TOKENS` because they CAN appear in
+# legitimate-looking 2-word names like "Diana May" or "Scott Say". A 2-token
+# capture whose surname is one of these is almost certainly a false positive
+# where the regex stopped at a sentence boundary mid-phrase. Real judges
+# named "May" / "Will" / "Say" exist but are rare enough that the
+# false-positive rate dominates in Federal opinion text.
+#
+# Reject only when the captured name is exactly 2 tokens (first + last),
+# the last token is in this set, AND the captured name has no middle initial
+# or third token. This narrowly targets the truncation pattern observed in
+# #4123 (`Diana May`, `Scott Say`) without rejecting longer captures like
+# `Hon. Diana May Smith`.
+_AMBIGUOUS_VERB_SURNAMES: frozenset[str] = frozenset(
+    {
+        # Modal / helper verbs
+        "MAY",
+        "WILL",
+        "SHALL",
+        "MUST",
+        "CAN",
+        "SAY",
+        "DO",
+        "DOES",
+        "DID",
+        "HAS",
+        "HAVE",
+        "HAD",
+        "BE",
+        "AM",
+        "IS",
+        "ARE",
+        "WAS",
+        "WERE",
+        # Common short verbs that produce title-cased false positives
+        "GO",
+        "GOES",
+        "WENT",
+        "GET",
+        "GOT",
+        "TAKE",
+        "TOOK",
+        "MAKE",
+        "MADE",
+        "SEE",
+        "SAW",
+        "USE",
+        "USED",
+    }
+)
+
+
 def _looks_like_person_name(name: str) -> bool:
     """Return True if *name* plausibly represents a person (judge) rather than an organization.
 
@@ -1310,6 +1507,14 @@ def _looks_like_person_name(name: str) -> bool:
     - Rejects names containing "vs" or "v." (case title leaked into the field).
     - Rejects names that are too long (> 60 chars) — real judge names are short.
     - Rejects names that are too short (< 3 chars) — need at least first + last.
+    - Rejects names whose first or last token is a boilerplate English word
+      (article, preposition, common verb, procedural noun) — #4123.
+    - Rejects names whose last token is a Dutch / German / French / Spanish
+      surname particle ("Van", "Von", "De") with no following token — these
+      are truncated surnames cut off mid-name (#4123).
+    - Rejects 2-token names whose surname is an ambiguous English verb
+      ("May", "Say", "Will") — these are almost always Federal opinion
+      body-text false positives (#4123).
     """
     if not name:
         return False
@@ -1330,6 +1535,38 @@ def _looks_like_person_name(name: str) -> bool:
 
     # "A CALIFORNIA CORPORATION" or similar entity descriptors
     if re.search(r"\bA\s+CALIFORNIA\b", upper):
+        return False
+
+    # --- #4123 hardening ---
+    #
+    # Tokenize the upper-cased name on whitespace. Strip trailing punctuation
+    # from each token (e.g. "Smith." -> "SMITH", "C." -> "C") so that middle
+    # initials and period-terminated names compare cleanly.
+    tokens = [tok.rstrip(".,;:") for tok in upper.split()]
+    tokens = [tok for tok in tokens if tok]
+    if not tokens:
+        return False
+
+    first_token = tokens[0]
+    last_token = tokens[-1]
+
+    # Reject if the first or last token is a boilerplate English word.
+    # A judge's actual first or last name is never one of these.
+    if first_token in _BOILERPLATE_NAME_TOKENS:
+        return False
+    if last_token in _BOILERPLATE_NAME_TOKENS:
+        return False
+
+    # Reject if the last token is a surname particle with no following token.
+    # "Van Pelt" → particle is at index -2, name remains valid.
+    # "Lindsay Van" → particle is the last token, name is truncated.
+    if last_token in _TRUNCATED_SURNAME_PARTICLES:
+        return False
+
+    # Reject 2-token names whose surname is an ambiguous English verb.
+    # 3+ token names are allowed because the additional tokens make the
+    # match much less likely to be a body-text false positive.
+    if len(tokens) == 2 and last_token in _AMBIGUOUS_VERB_SURNAMES:
         return False
 
     return True
