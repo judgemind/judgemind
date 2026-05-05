@@ -67,9 +67,16 @@ if [[ ! -f "$HELPER" ]]; then
 fi
 pass "helper script $HELPER exists"
 
-# ── Sourceability: sourcing defines all 5 functions ──────────────────────────
+# ── Sourceability: sourcing defines all named functions ─────────────────────
 
-for fn in write_phase_input read_phase_output phase_to_skill run_claude_phase \
+# #4099: ``_ms_now`` is the helper's portable epoch-ms shim, used by
+# ``run_claude_phase`` for ``_phase_start_ms`` / ``_phase_end_ms``. The
+# previous in-line ``date -u +%s%3N`` pattern silently emitted a literal
+# ``N`` on macOS BSD date (e.g. ``17780132253N``), poisoning the
+# downstream ``$((end - start))`` arithmetic with
+# ``value too great for base``. Listing ``_ms_now`` here so a future
+# refactor that drops or renames the helper trips this static lint.
+for fn in _ms_now write_phase_input read_phase_output phase_to_skill run_claude_phase \
           claude_phase_timeout_seconds_by_phase; do
     if ! ( set +u; source "$HELPER"; type "$fn" >/dev/null 2>&1 ); then
         fail "helper defines $fn" \
@@ -80,6 +87,84 @@ for fn in write_phase_input read_phase_output phase_to_skill run_claude_phase \
     fi
     pass "helper defines $fn function"
 done
+
+# ── #4099 regression: _ms_now produces clean integer (no trailing N) ────────
+#
+# The bug being prevented: GNU date format ``+%s%3N`` is unsupported on
+# macOS BSD date, which silently emits a literal ``N`` appended to the
+# seconds value. The helper routes through python3 to avoid the BSD/GNU
+# split. Verify the function returns either a non-negative integer or
+# the literal 'unknown' fallback (no other strings are valid).
+ms_now_output=$(
+    set +u
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _ms_now
+)
+if [[ "$ms_now_output" =~ ^[0-9]+$ ]] || [[ "$ms_now_output" == 'unknown' ]]; then
+    pass "_ms_now returns integer ms or 'unknown' (#4099 — got '$ms_now_output')"
+else
+    fail "_ms_now returns integer ms or 'unknown' (#4099)" \
+        "expected ^[0-9]+$ or 'unknown', got '$ms_now_output'"
+fi
+
+# ── #4099 regression: arithmetic on _ms_now output succeeds under set -e ────
+#
+# The original failure mode: ``$((end_ms - start_ms))`` aborted under
+# ``set -e`` when start/end carried the literal ``N`` token. Verify the
+# arithmetic shape from ``run_claude_phase`` succeeds end-to-end with
+# the new ``_ms_now`` helper.
+arithmetic_ok=$(
+    set -e
+    set +u
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _start=$(_ms_now)
+    _end=$(_ms_now)
+    if [[ "$_start" == 'unknown' || "$_end" == 'unknown' ]]; then
+        printf 'fallback'
+    else
+        _delta=$((_end - _start))
+        if (( _delta >= 0 )); then
+            printf 'ok'
+        else
+            printf 'negative'
+        fi
+    fi
+)
+if [[ "$arithmetic_ok" == 'ok' ]] || [[ "$arithmetic_ok" == 'fallback' ]]; then
+    pass "_ms_now output supports \$((end - start)) arithmetic under set -e (#4099 — '$arithmetic_ok')"
+else
+    fail "_ms_now output supports \$((end - start)) arithmetic under set -e (#4099)" \
+        "expected 'ok' or 'fallback', got '$arithmetic_ok'"
+fi
+
+# ── #4099 regression: stubbed python3 (rc=0, empty stdout) → 'unknown' ──────
+#
+# Tests in this very repo stub python3 with ``#!/usr/bin/env bash\nexit 0\n``
+# to keep the PHASE_INPUT_SHIM lookup from blocking the dispatch path. A
+# naive ``python3 -c ... 2>/dev/null || printf 'unknown'`` would NOT trip
+# the fallback (rc=0 with empty stdout is treated as success), leaking the
+# empty string into the downstream ``$((end - start))`` arithmetic. The
+# helper validates the captured stdout is a non-empty digit string and
+# falls back to 'unknown' otherwise. Verify the fallback fires.
+broken_stub_tmp=$(mktemp -d)
+TEMP_DIRS+=("$broken_stub_tmp")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$broken_stub_tmp/python3"
+chmod +x "$broken_stub_tmp/python3"
+broken_stub_output=$(
+    set +u
+    export PATH="$broken_stub_tmp:$PATH"
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _ms_now
+)
+if [[ "$broken_stub_output" == 'unknown' ]]; then
+    pass "_ms_now falls back to 'unknown' when python3 returns rc=0 with empty stdout (#4099)"
+else
+    fail "_ms_now falls back to 'unknown' when python3 returns rc=0 with empty stdout (#4099)" \
+        "expected 'unknown', got '$broken_stub_output'"
+fi
 
 # ── phase_to_skill: phase name → skill suffix mapping ────────────────────────
 
