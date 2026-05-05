@@ -24624,7 +24624,7 @@ class DispatcherDaemon:
 
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
-    def supervisor_tick(self) -> dict[str, int]:
+    def supervisor_tick(self) -> dict[str, Any]:
         """Run one supervisor tick. Writes heartbeat; advances running agents.
 
         **#3403 instrumentation.** Each major sub-step is bracketed by
@@ -24685,6 +24685,14 @@ class DispatcherDaemon:
         t_step = time.monotonic()
         self._last_scheduler_tick_at = t_step
 
+        # #4087 — per-sub-step happy-path timing. Each
+        # ``_record_supervisor_step`` call writes ``step_name → elapsed``
+        # (rounded to 3 decimals) into this dict; the end-of-tick INFO
+        # event surfaces it as ``step_durations`` so CloudWatch Logs
+        # Insights queries can chart per-step durations on every tick,
+        # not just on the slow-WARN path.
+        step_durations: dict[str, float] = {}
+
         failures_last_hour = 0
 
         with self._conn.cursor() as cur:
@@ -24704,7 +24712,9 @@ class DispatcherDaemon:
             if row is not None:
                 failures_last_hour = int(row[0] or 0)
         self._conn.commit()
-        t_step = self._record_supervisor_step("heartbeat_and_failures", t_step)
+        t_step = self._record_supervisor_step(
+            "heartbeat_and_failures", t_step, step_durations
+        )
 
         # Phase 3C (#2791): stuck-timeout scan. Runs first so any newly
         # crashed agents land retry markers early in the tick, giving
@@ -24723,7 +24733,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("stuck_check", t_step)
+        t_step = self._record_supervisor_step("stuck_check", t_step, step_durations)
 
         # Phase 3C (#2791): rate-limit guard. Write the failure row +
         # set the skip flag before the 3B advance pass so this tick
@@ -24738,7 +24748,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("gh_rate_check", t_step)
+        t_step = self._record_supervisor_step("gh_rate_check", t_step, step_durations)
 
         rate_skip_active = self._gh_rate_skip_active()
 
@@ -24758,7 +24768,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("phase_async_reap", t_step)
+        t_step = self._record_supervisor_step(
+            "phase_async_reap", t_step, step_durations
+        )
 
         # Issue #3399: orphan-PR resurrection sweep. Runs BEFORE the
         # advance pass so any agent flipped from status='failed' back
@@ -24782,7 +24794,9 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
-        t_step = self._record_supervisor_step("orphan_pr_resurrect", t_step)
+        t_step = self._record_supervisor_step(
+            "orphan_pr_resurrect", t_step, step_durations
+        )
 
         # Phase 3B (#2787): advance agents that are past push_and_pr.
         # Wrapped in try/except — the heartbeat + metric emission below
@@ -24813,7 +24827,9 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
-        t_step = self._record_supervisor_step("advance_running_agents", t_step)
+        t_step = self._record_supervisor_step(
+            "advance_running_agents", t_step, step_durations
+        )
 
         # Phase 3C (#2791): drain due retry markers. Runs AFTER the
         # advance pass so a marker created earlier in this tick (via
@@ -24831,7 +24847,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("retry_markers", t_step)
+        t_step = self._record_supervisor_step("retry_markers", t_step, step_durations)
 
         # Phase 3D (#2795): circuit breaker + diagnoser pass. The
         # breaker check runs FIRST so a bad 24h window disables the
@@ -24854,7 +24870,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("diagnoser_circuit_breaker", t_step)
+        t_step = self._record_supervisor_step(
+            "diagnoser_circuit_breaker", t_step, step_durations
+        )
         # Issue #3376: reap completed/timed-out async diagnosers
         # FIRST so the slot count is current before the spawn pass
         # checks the cap. The reaper is the consumer side of the
@@ -24872,7 +24890,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("diagnoser_reap", t_step)
+        t_step = self._record_supervisor_step("diagnoser_reap", t_step, step_durations)
         diagnoses_ran = 0
         try:
             diagnoses_ran = self._run_diagnoser_pass()
@@ -24884,7 +24902,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("diagnoser_run", t_step)
+        t_step = self._record_supervisor_step("diagnoser_run", t_step, step_durations)
 
         # Issue #3374 — generalized scheduled-skills tick. Iterates
         # ``dispatcher.scheduled_skills`` and fires due skills (audit,
@@ -24909,7 +24927,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
-        t_step = self._record_supervisor_step("scheduled_skills", t_step)
+        t_step = self._record_supervisor_step(
+            "scheduled_skills", t_step, step_durations
+        )
 
         self._supervisor_ticks += 1
         self._last_heartbeat_at = datetime.now(UTC)
@@ -24920,7 +24940,9 @@ class DispatcherDaemon:
         # indicator for the alarm in
         # ``infra/terraform/modules/dispatcher-daemon/main.tf``.
         metric_emitted = self._emit_heartbeat_metric()
-        t_step = self._record_supervisor_step("heartbeat_metric_emit", t_step)
+        t_step = self._record_supervisor_step(
+            "heartbeat_metric_emit", t_step, step_durations
+        )
 
         self._log.info(
             "daemon.supervisor_tick",
@@ -24955,6 +24977,12 @@ class DispatcherDaemon:
                 "scheduled_skills_fires_failed": scheduled_skills_summary[
                     "fires_failed"
                 ],
+                # #4087 — per-sub-step elapsed_seconds (rounded to 3
+                # decimals). Surfaces happy-path timing on every tick so
+                # CloudWatch Logs Insights queries like
+                # ``stats avg(step_durations.orphan_pr_resurrect)`` work
+                # without waiting for the slow-WARN to fire.
+                "step_durations": step_durations,
             },
         )
         return {
@@ -24981,6 +25009,10 @@ class DispatcherDaemon:
                 "fires_skipped_collision"
             ],
             "scheduled_skills_fires_failed": scheduled_skills_summary["fires_failed"],
+            # #4087 — per-sub-step elapsed_seconds (mirror of the log
+            # event field). Tests + future telemetry consumers can read
+            # this without re-parsing log records.
+            "step_durations": step_durations,
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────
@@ -27283,8 +27315,13 @@ class DispatcherDaemon:
             )
         return now
 
-    def _record_supervisor_step(self, step: str, t_before: float) -> float:
-        """Warn on slow supervisor-tick sub-steps (#3403, #3801).
+    def _record_supervisor_step(
+        self,
+        step: str,
+        t_before: float,
+        durations: dict[str, float] | None = None,
+    ) -> float:
+        """Warn on slow supervisor-tick sub-steps (#3403, #3801, #4087).
 
         Mirror of :meth:`_record_scheduler_step` for :meth:`supervisor_tick`.
         Emits a ``daemon.supervisor_tick_slow_<step>`` WARNING the moment
@@ -27298,12 +27335,28 @@ class DispatcherDaemon:
         and is the load-bearing reason the 2026-04-29 reaper wedge
         stayed silent.
 
+        **#4087 — happy-path elapsed_seconds.** When ``durations`` is
+        provided the rounded elapsed time is also written to
+        ``durations[step]`` so the end-of-tick ``supervisor_tick`` event
+        can carry a per-sub-step ``step_durations`` dict. This closes the
+        observability gap where the slow-WARN was the ONLY happy-path
+        timing source — a sweep going from 5s → 9.9s was indistinguishable
+        from one going 0.5s → 0.5s. CloudWatch Logs Insights queries like
+        ``stats avg(step_durations.orphan_pr_resurrect) by bin(5m)`` now
+        return real numbers on every tick. Default ``None`` keeps the
+        helper backwards-compatible for any future caller that does not
+        care about happy-path timing (no current call site, but cheap to
+        preserve).
+
         Returns ``time.monotonic()`` so callers can chain
-        ``t_step = _record_supervisor_step("foo", t_step)`` between
-        sub-steps without re-reading the clock.
+        ``t_step = _record_supervisor_step("foo", t_step, durations)``
+        between sub-steps without re-reading the clock.
         """
         now = time.monotonic()
         elapsed = now - t_before
+        rounded = round(elapsed, 3)
+        if durations is not None:
+            durations[step] = rounded
         if elapsed >= SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS:
             self._log.warning(
                 f"daemon.supervisor_tick_slow_{step}",
@@ -27311,7 +27364,7 @@ class DispatcherDaemon:
                     "event": f"supervisor_tick_slow_{step}",
                     "run_id": self._run_id,
                     "step": step,
-                    "elapsed_seconds": round(elapsed, 3),
+                    "elapsed_seconds": rounded,
                     "threshold_seconds": SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS,
                 },
             )
