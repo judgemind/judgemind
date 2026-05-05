@@ -626,7 +626,7 @@ Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 scripts/wait-for-ci.sh <PR-N>
 ```
 
-This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 only when `ci-passed` is success, no check has failed, and `mergeStateStatus` is CLEAN or UNSTABLE. Exit 1 = failure, Exit 2 = timeout.
+This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 via either of two paths: (a) the canonical-merge-gate fast-path — `mergeable == MERGEABLE`, any `ci-passed` entry is `success`, no latest check has failed — fires immediately even if stale `in_progress` entries from a superseded CI run linger in the response (#4069); (b) the all-checks-complete fallback — `pending == 0`, `ci-passed` is `success`, no failures, `mergeStateStatus` is `CLEAN` or `UNSTABLE` — fires when CI legitimately drains to zero pending. Stdout names the path explicitly with `canonical merge gate green` or `all checks complete`. Exit 1 = failure, Exit 2 = timeout.
 
 For workflow-run-level watching (deploy workflows in §A.8), `gh run watch` stays as the fallback:
 

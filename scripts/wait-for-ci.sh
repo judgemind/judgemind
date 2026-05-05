@@ -55,9 +55,19 @@
 #   --help              Print this help and exit 0
 #
 # Exit codes:
-#   0 — Success: ci-passed check has conclusion=success, no other latest check
-#       has conclusion=failure/timed_out/action_required/cancelled, AND
-#       mergeStateStatus is CLEAN or UNSTABLE.
+#   0 — Success. Reached via one of two paths, in priority order:
+#       (a) **Canonical-merge-gate fast-path** (#4069): `mergeable == MERGEABLE`,
+#           any `ci-passed` entry in the filter=latest response has
+#           conclusion=success, and no latest check has conclusion=
+#           failure/timed_out/action_required/cancelled. Stdout names this
+#           path explicitly with the substring `canonical merge gate green`.
+#           This path exits immediately even if filter=latest still surfaces
+#           in_progress entries from a superseded CI run on the same SHA —
+#           the same gate documented in `docs/agent/code-standards.md`
+#           §"Interpreting mergeStateStatus (UNSTABLE-but-green)".
+#       (b) **All-checks-complete path:** filter=latest shows pending=0,
+#           ci-passed=success, no failures, and mergeStateStatus is CLEAN or
+#           UNSTABLE. Stdout names this path with `all checks complete`.
 #   1 — Early failure: one or more checks have a failed conclusion. Prints the
 #       failed check names and their details_url.
 #   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
@@ -171,15 +181,45 @@ while true; do
         exit 1
     fi
 
-    # Check for success: ci-passed is success and no failures.
-    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '.[] | select(.name == "ci-passed") | .conclusion // ""')
+    # Determine whether `ci-passed` succeeded on its latest run. Use `any(...)`
+    # rather than `select(...) | .conclusion` because filter=latest dedupes
+    # within a workflow run but NOT across workflow re-runs on the same SHA —
+    # a re-run plus a superseded run can leave two `ci-passed` entries in the
+    # response, which would make a single jq `select()` print two lines and
+    # silently break the equality check that follows (#4069 root cause). The
+    # `any` form returns a single boolean string.
+    CI_PASSED_SUCCESS=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | any(.conclusion == "success")')
+    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed") | .conclusion] | (.[0] // "")')
 
-    if [ "$CI_PASSED_CONCLUSION" = "success" ] && [ "$FAILED_COUNT" -eq 0 ]; then
+    # ── Canonical-merge-gate fast-path (#4069) ───────────────────────────────
+    # Mirrors `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
+    # (UNSTABLE-but-green)" and the `/task` skill's §A.7 merge gate. When
+    # `mergeable == MERGEABLE`, the required `ci-passed` check is success on
+    # its latest run, and no latest check is a hard failure, the PR is safe
+    # to merge regardless of any pending entries left over from a superseded
+    # CI run on the same SHA. Exit immediately so callers don't burn the full
+    # timeout watching phantom in_progress rows that will never complete.
+    if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
+        MERGEABLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeable -q .mergeable 2>/dev/null || echo "UNKNOWN")
+        if [ "$MERGEABLE" = "MERGEABLE" ]; then
+            echo ""
+            echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, ci-passed=success, failed=0; pending=${PENDING_COUNT} ignored as superseded)."
+            exit 0
+        fi
+    fi
+
+    # ── Existing all-checks-complete path ────────────────────────────────────
+    # When pending=0, every check has a terminal conclusion. Combined with
+    # ci-passed=success and a CLEAN/UNSTABLE mergeStateStatus, this is the
+    # original safe-to-merge signal. Kept as a fallback for the case where
+    # `mergeable` cannot be resolved (UNKNOWN, API error) so the script still
+    # exits when CI legitimately drained to zero pending.
+    if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$PENDING_COUNT" -eq 0 ]; then
         # Secondary guard: verify mergeStateStatus is CLEAN or UNSTABLE.
         MERGE_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus -q .mergeStateStatus)
         if [ "$MERGE_STATE" = "CLEAN" ] || [ "$MERGE_STATE" = "UNSTABLE" ]; then
             echo ""
-            echo "CI passed after ${ELAPSED}s. ci-passed=success, mergeStateStatus=${MERGE_STATE}."
+            echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE})."
             exit 0
         else
             echo "  ci-passed=success but mergeStateStatus=${MERGE_STATE}, still waiting..."
