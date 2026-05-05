@@ -31,6 +31,26 @@
  * which fires once on dashboard mount and is refetched explicitly by
  * the `dispatcherSetConfig` mutation's `refetchQueries` so the displayed
  * value stays in sync without a manual page reload.
+ *
+ * Polled-query slim — `recentCompletions` (issue #4064): the polled
+ * `recentCompletions` block originally selected 14 fields; under the
+ * 10× list-of-objects multiplier this contributed the third-largest
+ * chunk of the 1355-unit cost. Trimmed to the eight fields
+ * `RecentCompletionRow` actually reads to render the visible row layout
+ * — `agentId` (key), the unified `(issue, priority, [PR,] title)`
+ * prefix (`issueNumber` / `issueTitle` / `priority` / `prNumber`),
+ * the OutcomePill `status` driver, the relative-time cell's `endedAt`,
+ * and `failureSummary` (which re-skins the pill to gray ↺ for
+ * infra-preempted rows). Detail-only fields (`startedAt` for the
+ * Start/Duration tooltip, `totalTokens` / `totalCostUsd` for the cost
+ * footnote, and the four milestone columns `mergedAt` / `verifiedAt` /
+ * `verifySkipReason` / `retroedAt` that drive the green-vs-amber-✓
+ * "shipped but bookkeeping incomplete" pill nuance) ride exclusively
+ * on `DISPATCHER_QUEUE_FULL_QUERY` — fired on dialog open, not in the
+ * 2s poll path. The polled row degrades gracefully: succeeded rows
+ * render plain green ✓ instead of the amber-✓ incomplete variant; the
+ * cost footnote and start/duration tooltip are absent. The full
+ * milestone breakdown still renders inside the expand-on-click dialog.
  */
 import { gql } from '@apollo/client';
 
@@ -99,16 +119,9 @@ export const DISPATCHER_STATE_QUERY = gql`
         issueTitle
         priority
         status
-        startedAt
         endedAt
         prNumber
-        totalTokens
-        totalCostUsd
         failureSummary
-        mergedAt
-        verifiedAt
-        verifySkipReason
-        retroedAt
       }
       recentCompletionsCount
       spawnFrozenUntil
@@ -342,19 +355,36 @@ export interface RecentCompletion {
   status: string;
   /** Timestamp the agent claimed the issue (`dispatcher.agents.started_at`).
    * Non-nullable on the API side. Issue #3024 — paired with `endedAt` for
-   * the Start/Duration/End hover tooltip in the Recently completed panel. */
-  startedAt: string;
+   * the Start/Duration/End hover tooltip in the Recently completed panel.
+   *
+   * Issue #4064: may be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (which no longer selects `startedAt`).
+   * The render code in `RecentCompletionRow` already handles missing
+   * `startedAt` defensively — `Date.parse(undefined)` returns NaN,
+   * `Number.isFinite(NaN)` is false, the tooltip falls back to the
+   * single-line end-time string. Always populated on rows fetched via
+   * `DISPATCHER_QUEUE_FULL_QUERY`. */
+  startedAt?: string;
   endedAt: string;
   prNumber: number | null;
   /** Sum of input+output tokens across every phase the agent ran
    * (#2869). Null when no phase row has recorded usage — rendered as
-   * "no cost data" rather than a misleading 0. */
-  totalTokens: number | null;
+   * "no cost data" rather than a misleading 0.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (which no longer selects `totalTokens`);
+   * the cost footnote is absent on the polled row and reappears in the
+   * expand-on-click dialog. `formatCostFootnote` treats undefined and
+   * null identically. */
+  totalTokens?: number | null;
   /** Sum of `cost_usd` across every phase the agent ran (#2869). Null
    * when no phase row has recorded usage.
    *
-   * WARNING: list-price estimate, NOT Max plan-adjusted. */
-  totalCostUsd: number | null;
+   * WARNING: list-price estimate, NOT Max plan-adjusted.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (same rationale as `totalTokens`). */
+  totalCostUsd?: number | null;
   /** One-line "what happened" string for failure terminals (`failed`,
    * `crashed`, `plan_blocked`). Populated at terminal-time by the
    * daemon from `failures.category` + `phase` + stderr tail, then
@@ -363,29 +393,47 @@ export interface RecentCompletion {
    * Null for `succeeded` / `needs_review` rows and for historical rows
    * that pre-date migration 33. Rendered as a tooltip on the outcome
    * glyph in the `Recently completed` panel — no always-visible second
-   * line. Issue #2900. */
+   * line. Issue #2900.
+   *
+   * Issue #4064: kept on the polled `DISPATCHER_STATE_QUERY` selection
+   * because the `OutcomePill` infra-preempted re-skin (gray ↺) keys off
+   * a `failureSummary` exact-match against `INFRA_PREEMPTED_SUMMARIES`. */
   failureSummary: string | null;
   /** Timestamp the PR squash-merge was observed by the daemon. Paired
    * with the `status='succeeded'` flip at merge time — `mergedAt != null`
    * is the canonical "shipped" signal. Null on rows that never merged
    * (push failed, CI red after retries, etc.) and on pre-migration-35
-   * historical rows. Issue #2953. */
-  mergedAt: string | null;
+   * historical rows. Issue #2953.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (the polled row falls back to the
+   * status-only OutcomePill path; the milestone-completeness path runs
+   * only for rows fetched via `DISPATCHER_QUEUE_FULL_QUERY`). */
+  mergedAt?: string | null;
   /** Timestamp the verify phase completed with verdict=VERIFIED. Null
    * when verify was intentionally skipped (see `verifySkipReason`),
    * when verify crashed mid-phase, or for pre-migration-35 rows.
-   * Issue #2953. */
-  verifiedAt: string | null;
+   * Issue #2953.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (same rationale as `mergedAt`). */
+  verifiedAt?: string | null;
   /** Non-null when verify was intentionally skipped. Today the only
    * written value is `"self_deploy"` (dispatcher-self-PR touches
    * `scripts/dispatcher/`). A merged row with a non-null skip reason
    * counts as fully-shipped (green ✓) — skipping is not a regression.
-   * Issue #2953. */
-  verifySkipReason: string | null;
+   * Issue #2953.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (same rationale as `mergedAt`). */
+  verifySkipReason?: string | null;
   /** Timestamp the retro phase completed (reached PHASE_RETRO_DONE).
    * Null when retro crashed, when the worktree was already gone at
-   * retro time, or for pre-migration-35 rows. Issue #2953. */
-  retroedAt: string | null;
+   * retro time, or for pre-migration-35 rows. Issue #2953.
+   *
+   * Issue #4064: may also be `undefined` on rows fetched via the polled
+   * `DISPATCHER_STATE_QUERY` (same rationale as `mergedAt`). */
+  retroedAt?: string | null;
 }
 
 export interface DispatcherConfigEntry {

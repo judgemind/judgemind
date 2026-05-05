@@ -197,7 +197,16 @@ export function RecentCompletionRow({
   // prop so we fall back to `Date.now()`.
   const effectiveNowMs = nowMs ?? Date.now();
   const endedMs = Date.parse(completion.endedAt);
-  const startedMs = Date.parse(completion.startedAt);
+  // Issue #4064: `startedAt` is undefined on rows fetched via the
+  // polled `DISPATCHER_STATE_QUERY` (omitted from the slim selection).
+  // `Date.parse(undefined)` is NaN, so the explicit guard collapses
+  // the polled-row path to "no Start row in tooltip" via the
+  // `Number.isFinite(startedMs)` check below — equivalent to the prior
+  // unparseable-timestamp behaviour, no rendering regression.
+  const startedMs =
+    completion.startedAt !== undefined
+      ? Date.parse(completion.startedAt)
+      : Number.NaN;
   const relativeTime = Number.isFinite(endedMs)
     ? formatRelativeTime(endedMs, effectiveNowMs)
     : null;
@@ -305,6 +314,13 @@ export function RecentCompletionRow({
  * agent" from "no metering signal on this row" (e.g. a pre-migration-31
  * agent, or every phase crashed before emitting a JSON envelope).
  *
+ * Issue #4064: `costUsd` and `totalTokens` may be `undefined` on rows
+ * fetched via the polled `DISPATCHER_STATE_QUERY` (the polled
+ * selection no longer requests these fields). Both `null` and
+ * `undefined` are treated as "no signal" — the footnote disappears
+ * on the polled row and reappears in the expand-on-click dialog where
+ * the rich `DISPATCHER_QUEUE_FULL_QUERY` selection still populates them.
+ *
  * Design choices:
  * - Cost is formatted with 2 decimals when ≥ $1, 4 decimals otherwise —
  *   a cheap haiku verify phase lands at ~$0.0008 and would round to
@@ -315,16 +331,16 @@ export function RecentCompletionRow({
  *   documented on `totalCostUsd`.
  */
 function formatCostFootnote(
-  costUsd: number | null,
-  totalTokens: number | null,
+  costUsd: number | null | undefined,
+  totalTokens: number | null | undefined,
 ): string | null {
-  if (costUsd === null && totalTokens === null) return null;
+  if (costUsd == null && totalTokens == null) return null;
   const parts: string[] = [];
-  if (costUsd !== null) {
+  if (costUsd != null) {
     const decimals = Math.abs(costUsd) >= 1 ? 2 : 4;
     parts.push(`~$${costUsd.toFixed(decimals)}`);
   }
-  if (totalTokens !== null) {
+  if (totalTokens != null) {
     parts.push(formatTokenCount(totalTokens));
   }
   return `(${parts.join(', ')})`;
