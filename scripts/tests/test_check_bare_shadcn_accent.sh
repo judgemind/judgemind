@@ -231,7 +231,169 @@ export const Two = () => (
 assert_fails "Allowlist on one violation does not cover unrelated later violation"
 reset_tmpdir
 
-# ─── Test 21: Self-match on ci.yml step name ─────────────────────────────
+# ─── #4225 expansion: *-foreground family + invisible-chrome typos ──────
+#
+# The guard expansion in #4225 adds:
+#   - bare `(text|bg|border|ring)-X-foreground` for X in
+#     {primary, secondary, card, popover, destructive, accent}
+#   - `text-background` / `(bg|border|ring)-foreground` symmetric typos
+#   - `text-muted-foreground` allowlist (legitimate body color)
+# Tests 22-37 below cover the new cases. The marker name is preserved
+# from #2832 so existing waivers continue to work (already covered by
+# tests 16-20 above).
+# ─────────────────────────────────────────────────────────────────────────
+
+# ─── Test 22: Bare text-primary-foreground is flagged ────────────────────
+create_test_file "BadFgPrimary.tsx" \
+    'export const Bad = () => <span className="text-primary-foreground">hi</span>;' > /dev/null
+assert_fails "Bare text-primary-foreground (no paired bg-primary) is flagged"
+reset_tmpdir
+
+# ─── Test 23: bg-primary text-primary-foreground pair passes ─────────────
+# Same-element pairing is the canonical shadcn idiom (button.tsx,
+# badge.tsx); the foreground sits on its paired surface.
+create_test_file "GoodPairPrimary.tsx" \
+    'export const Ok = () => <button className="bg-primary text-primary-foreground hover:bg-primary/90">hi</button>;' > /dev/null
+assert_passes "bg-primary text-primary-foreground on same element passes (paired idiom)"
+reset_tmpdir
+
+# ─── Test 24: Bare text-secondary-foreground is flagged ──────────────────
+create_test_file "BadFgSecondary.tsx" \
+    'export const Bad = () => <span className="text-secondary-foreground">hi</span>;' > /dev/null
+assert_fails "Bare text-secondary-foreground is flagged"
+reset_tmpdir
+
+# ─── Test 25: Bare text-card-foreground is flagged ───────────────────────
+create_test_file "BadFgCard.tsx" \
+    'export const Bad = () => <div className="rounded-lg p-4 text-card-foreground">hi</div>;' > /dev/null
+assert_fails "Bare text-card-foreground without bg-card is flagged"
+reset_tmpdir
+
+# ─── Test 26: bg-card text-card-foreground pair passes ───────────────────
+# Mirrors `packages/web/src/components/ui/card.tsx`.
+create_test_file "GoodPairCard.tsx" \
+    "export const Ok = () => <div className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', className)} />;" > /dev/null
+assert_passes "bg-card text-card-foreground inside cn() passes (paired idiom)"
+reset_tmpdir
+
+# ─── Test 27: Bare text-popover-foreground is flagged ────────────────────
+create_test_file "BadFgPopover.tsx" \
+    'export const Bad = () => <span className="text-popover-foreground">hi</span>;' > /dev/null
+assert_fails "Bare text-popover-foreground is flagged"
+reset_tmpdir
+
+# ─── Test 28: Bare text-destructive-foreground is flagged ────────────────
+create_test_file "BadFgDestructive.tsx" \
+    'export const Bad = () => <span className="text-destructive-foreground">hi</span>;' > /dev/null
+assert_fails "Bare text-destructive-foreground is flagged"
+reset_tmpdir
+
+# ─── Test 29: Modifier-prefixed *-foreground passes ──────────────────────
+# Mirrors `packages/web/src/components/ui/checkbox.tsx` - the
+# `data-[state=checked]:` modifier marks a state-conditional that is
+# legitimate even without an unmodified surface partner.
+create_test_file "ModifierFg.tsx" \
+    'export const Ok = () => <button className="data-[state=checked]:bg-primary data-[state=checked]:text-primary-foreground">hi</button>;' > /dev/null
+assert_passes "data-[state=checked]:text-primary-foreground passes (modifier-prefixed)"
+reset_tmpdir
+
+# ─── Test 30: dark: chained modifier-prefixed *-foreground passes ────────
+create_test_file "DarkModifierFg.tsx" \
+    'export const Ok = () => <span className="dark:hover:text-secondary-foreground">hi</span>;' > /dev/null
+assert_passes "dark:hover:text-secondary-foreground passes (chained modifier)"
+reset_tmpdir
+
+# ─── Test 31: text-muted-foreground on <p> passes ────────────────────────
+create_test_file "MutedP.tsx" \
+    'export const Ok = () => <p className="text-muted-foreground">hi</p>;' > /dev/null
+assert_passes "text-muted-foreground on <p> passes (legitimate body color)"
+reset_tmpdir
+
+# ─── Test 32: text-muted-foreground on <span> passes ─────────────────────
+create_test_file "MutedSpan.tsx" \
+    'export const Ok = () => <span className="text-muted-foreground">hi</span>;' > /dev/null
+assert_passes "text-muted-foreground on <span> passes (legitimate body color)"
+reset_tmpdir
+
+# ─── Test 33: text-muted-foreground inside cn(...) passes ────────────────
+create_test_file "MutedCn.tsx" \
+    "export const Ok = ({className}: any) => <span className={cn('text-sm text-muted-foreground', className)}>hi</span>;" > /dev/null
+assert_passes "text-muted-foreground inside cn(...) passes"
+reset_tmpdir
+
+# ─── Test 34: Bare bg-foreground is flagged ──────────────────────────────
+# Symmetric typo - `bg-foreground` paints the foreground color as a
+# surface. On a default-cascade page this is near-black-on-near-black
+# (light mode) or white-on-white (dark mode). 0 current usages.
+create_test_file "BadBgFg.tsx" \
+    'export const Bad = () => <div className="bg-foreground p-4">hi</div>;' > /dev/null
+assert_fails "Bare bg-foreground is flagged (symmetric typo)"
+reset_tmpdir
+
+# ─── Test 35: Bare text-background is flagged ────────────────────────────
+# Symmetric typo - `text-background` paints text in the surface color.
+create_test_file "BadTextBg.tsx" \
+    'export const Bad = () => <span className="text-background">hi</span>;' > /dev/null
+assert_fails "Bare text-background is flagged (symmetric typo)"
+reset_tmpdir
+
+# ─── Test 36: Bare border-foreground is flagged ──────────────────────────
+create_test_file "BadBorderFg.tsx" \
+    'export const Bad = () => <div className="border border-foreground">hi</div>;' > /dev/null
+assert_fails "Bare border-foreground is flagged (symmetric typo)"
+reset_tmpdir
+
+# ─── Test 37: Bare ring-foreground is flagged ────────────────────────────
+create_test_file "BadRingFg.tsx" \
+    'export const Bad = () => <input className="ring-2 ring-foreground" />;' > /dev/null
+assert_fails "Bare ring-foreground is flagged (symmetric typo)"
+reset_tmpdir
+
+# ─── Test 38: text-foreground (legitimate body text) passes ──────────────
+# `text-foreground` is the default body-text token and the symmetric
+# partner of `bg-background` (default page surface). It is NOT in the
+# forbidden list - only `text-background` (swap) and
+# `bg-foreground` (swap) are flagged.
+create_test_file "TextFg.tsx" \
+    'export const Ok = () => <h1 className="text-xl font-bold text-foreground">hi</h1>;' > /dev/null
+assert_passes "Bare text-foreground passes (legitimate body text token)"
+reset_tmpdir
+
+# ─── Test 39: bg-background passes ───────────────────────────────────────
+# Symmetric to test 38 - `bg-background` is the default surface and is
+# not in the forbidden list.
+create_test_file "BgBackground.tsx" \
+    'export const Ok = () => <body className="bg-background text-foreground">hi</body>;' > /dev/null
+assert_passes "bg-background passes (default surface token)"
+reset_tmpdir
+
+# ─── Test 40: Allowlist marker waives a *-foreground violation ────────────
+# Mirrors the parent-paired pattern from
+# `packages/web/src/components/Autocomplete.tsx` where the surface lives
+# on a parent <ul> and the foreground lives on the <li> child. The
+# `shadcn-accent: intentional` marker (preserved from #2832) waives the
+# guard.
+create_test_file "AllowFg.tsx" \
+    'export const Ok = () => (
+  <ul className="bg-popover">
+    {/* shadcn-accent: intentional - parent-paired chrome */}
+    <li className="text-popover-foreground hover:bg-accent">hi</li>
+  </ul>
+);' > /dev/null
+assert_passes "shadcn-accent: intentional waives a *-foreground parent-pair violation"
+reset_tmpdir
+
+# ─── Test 41: bg-primary/80 opacity counts as a paired surface ───────────
+# Mirrors `packages/web/src/components/ui/badge.tsx` line 11:
+# 'border-transparent bg-primary text-primary-foreground hover:bg-primary/80'.
+# The `/80` opacity modifier doesn't change whether the surface is
+# painted, so the foreground pair should pass.
+create_test_file "BadgeOpacity.tsx" \
+    "export const Ok = () => <span className=\"border-transparent bg-primary text-primary-foreground hover:bg-primary/80\">hi</span>;" > /dev/null
+assert_passes "bg-primary text-primary-foreground hover:bg-primary/80 (opacity) passes"
+reset_tmpdir
+
+# ─── Test 42: Self-match on ci.yml step name ─────────────────────────────
 # Mirrors the #2541/#2542 self-match guard used by every string-forbidding
 # check. If a ci.yml step name quotes the forbidden pattern, the guard
 # matches itself on first CI run — describe what the check does, not what
@@ -240,6 +402,27 @@ reset_tmpdir
 source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
 assert_no_self_match_on_ci_step_name \
     "scripts/check-bare-shadcn-accent.sh" "yml"
+
+# ─── Test 43: Self-match on guard's own source files (#4225) ─────────────
+# The guard now exists across two files (the bash entrypoint and the
+# Python helper) that both contain the forbidden token names as literal
+# strings inside regex patterns and docstrings. Running the guard
+# against itself should pass - the source files live under scripts/, not
+# packages/web/src/, so they're outside the default scan scope; but as
+# a defensive assertion we copy them into the tmpdir as `.tsx` and
+# verify the guard handles its own source verbatim.
+TESTS=$((TESTS + 1))
+mkdir -p "$TMPDIR_TEST"
+# The guard scans .ts/.tsx; rename to .tsx so it's picked up.
+cp "$SCRIPT_DIR/check-bare-shadcn-accent.sh" "$TMPDIR_TEST/guard_source.tsx"
+cp "$SCRIPT_DIR/_check_bare_shadcn_strip_pairs.py" "$TMPDIR_TEST/guard_helper_source.tsx"
+if "$CHECK_SCRIPT" "$TMPDIR_TEST" > /dev/null 2>&1; then
+    echo "PASS: Guard does not flag its own source files (#4225 self-match)"
+else
+    echo "FAIL: Guard flags its own source files (#4225 self-match — see #2541/#2542)"
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
 
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""
