@@ -95,17 +95,29 @@ assert_contains() {
 }
 
 # ─── Test 1: Three-section fixture; preserves exit code 0 ────────────────
+# NOTE — timing-jitter constraint (#4188): the sort-by-elapsed-desc
+# assertion below (Test 2) requires a strict ordering Test 3 > Test 2 >
+# Test 1 by wall-clock elapsed time. On a busy CI runner, scheduling
+# jitter can add 10s-100s of milliseconds to a `sleep` call, so the gaps
+# between sleeps must be wide enough that no realistic jitter can
+# reorder them. The 0.05 / 0.20 / 0.50 schedule below leaves a 4× gap
+# between successive sleeps, which makes a flip statistically
+# infeasible. The previous 0.02 / 0.04 / 0.06 schedule had only a 1.5×
+# gap and flaked under load (see #4188 / PR #4187 CI run 25433409933).
+# If you are tempted to reduce these sleeps to "speed up the test" —
+# don't. The deterministic ordering matters more than the ~0.7s of
+# extra wall-clock time.
 fixture1=$(make_fixture "fixture_basic.sh" '#!/usr/bin/env bash
 set -euo pipefail
 
 # Test 1: alpha
-sleep 0.02
+sleep 0.05
 
 # Test 2: beta
-sleep 0.04
+sleep 0.20
 
 # Test 3: gamma
-sleep 0.06
+sleep 0.50
 exit 0
 ')
 tsv1="$TMPDIR_TEST/fixture1.tsv"
