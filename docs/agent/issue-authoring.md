@@ -70,6 +70,8 @@ Without the `derived.documents` join + `d.status = 'active'` filter, supersede c
 
 This applies to any AC that gates "the cleanup is done" on a row count — file/issue authors filing such ACs and agents implementing them should both verify the SELECT carries the `derived.documents` join + `d.status = 'active'` filter before treating the count as authoritative.
 
+When the verification reads the bidirectional spotcheck JSON in `s3://judgemind-document-archive-dev/spotcheck/<TS>.json`, use `scripts/spotcheck/inspect.py <s3-uri-or-local-path> [--unknown-only] [--null-judge-only] [--department-in C20 C23 …] [--format table|json]` to filter and summarise the result without writing custom one-liners (#4235).
+
 ## Verify the gap exists before filing
 
 Before filing a "does X" / "enable X" / "add X" issue, run a single command that verifies X is not already the case. This rule exists because an agent-runner cycle spent re-creating state that already exists is pure waste — the canonical example is #3146, where an issue was filed to "enable Container Insights on the ECS cluster" after the Terraform attribute `enable_container_insights = true` had already shipped in a prior PR. The agent spent a full cycle discovering, through probing, that there was nothing to do. A thirty-second check before filing would have surfaced that immediately. This is a sibling of the external-integration feasibility note in §Writing Acceptance Criteria (line 15): both rules say "verify the precondition before you ask an agent to build on top of it."
