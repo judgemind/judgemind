@@ -619,15 +619,21 @@ jobs:
             shard-filter: not-slow
           # Shard shell-slow (#4067): runs only paths in SLOW_TESTS so
           # the other tests in shell-fast no longer queue behind them.
-          # Today's slow set: test_agent_runner_entrypoint.sh (~11 min).
-          # The hard timeout-minutes:14 is the regression gate from
-          # issue #4067's cross-cutting AC — it fails the shard if the
-          # long pole drifts past ~1.3× its current observed budget.
-          # Estimated wall-clock ~11 min today; structural trim is a
-          # #4067 follow-up.
-          # See issue #4067.
+          # Today's slow set: test_agent_runner_entrypoint.sh.
+          # #4139 converted the bulk of test_agent_runner_entrypoint.sh
+          # from per-case `bash $ENTRYPOINT` invocations (~11 min wall
+          # clock baseline) to direct ``run_entrypoint_main`` calls
+          # against a once-sourced entrypoint, bringing the shard to
+          # ~2-3 min wall clock. The hard timeout-minutes:6 is the new
+          # regression gate from issue #4139 — it fails the shard if a
+          # future change reintroduces per-case re-parse cost or adds a
+          # comparable long pole. Don't bump back to 14 without a
+          # follow-up issue documenting why the structural trim is no
+          # longer holding.
+          # See issues #4067 (sharding + 14-min gate) and #4139
+          # (structural trim + 6-min gate).
           - shard: shell-slow
-            timeout-minutes: 14
+            timeout-minutes: 6
             shard-filter: slow
     env:
       PYTHONPATH: scripts
