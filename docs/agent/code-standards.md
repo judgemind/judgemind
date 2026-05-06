@@ -142,6 +142,29 @@ except Exception:  # noqa: BLE001
 
 Prefer narrowing the handler (`except FileNotFoundError:`) or logging the exception over the escape hatch — the goal is to keep blind swallows out of assertion paths.
 
+### HTTP-status assertion hygiene (enforced in CI for `packages/api/`)
+
+A TypeScript API test whose title names a specific HTTP status — `it('returns 400 for invalid UUID', ...)`, `it('rejects with HTTP 401', ...)`, `it('responds with statusCode 404', ...)` — must include a corresponding `statusCode` assertion in the test body (e.g. `expect(res.statusCode).toBe(400)`). Without this, the title is decorative and the test can pass even when the handler returns a different status, which is exactly how #4129 slipped through (a test titled "rejects … with HTTP 400" only checked the JSON-body shape; PR #4218 added the missing assertion).
+
+CI enforces this via `scripts/check-test-statuscode-assertions.sh`, which scans `packages/api/tests/**/*.test.ts` and `packages/api/src/**/*.test.ts` for `it()`/`test()`/`it.each()` titles that match `HTTP <NNN>` / `returns <NNN>` / `responds with <NNN>` / `status(Code)? <NNN>`, then verifies the same `it()` block contains a `statusCode` reference paired with the matching status number.
+
+**Escape hatch.** If a test legitimately doesn't go through an HTTP boundary (e.g. it asserts on a thrown error rather than on an inject-response object), append `// status-assertion-noqa` to the same line as the `it()` / `test()` opening call:
+
+```typescript
+it('returns 400 via direct call', async () => { // status-assertion-noqa
+  await expect(callDirectly()).rejects.toThrow(/bad input/);
+});
+```
+
+The check job is `test-statuscode-assertions-check` (gated on `detect-changes.outputs.api`). Run it locally:
+
+```
+scripts/check-test-statuscode-assertions.sh             # default scan
+scripts/check-test-statuscode-assertions.sh --selftest  # embedded fixture self-test
+```
+
+Ref: #4220 (the issue that added the guard), #4129 (the regression that motivated it), #4218 (the original fix that added the missing assertion).
+
 ### Test marker convention (`scripts/tests/test_agent_runner_entrypoint.sh`)
 
 Each test block in `scripts/tests/test_agent_runner_entrypoint.sh` carries a unique marker tied to the GitHub issue that introduced the test. This avoids the sequential-numbering collision that occurred when two parallel agents (PRs #3661 and #3666) both claimed marker T65, causing a merge conflict.
