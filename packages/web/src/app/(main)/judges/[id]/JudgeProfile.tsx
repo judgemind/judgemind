@@ -391,6 +391,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                     return (
                       <TableRow
                         key={row.motionType}
+                        // shadcn-accent: intentional — selected-row chrome (#2832)
                         className={`group cursor-pointer transition-colors ${isActive ? 'bg-accent' : 'hover:bg-accent/50'}`}
                         onClick={() => handleMotionTypeClick(row.motionType)}
                         role="button"
@@ -591,6 +592,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
             Recent Rulings
           </h2>
           {motionTypeFilter && (
+            // shadcn-accent: intentional — active-filter pill chrome (#2832)
             <span
               className="inline-flex items-center gap-1 rounded-full border border-border bg-accent px-2.5 py-0.5 text-xs font-medium text-foreground"
               data-testid="motion-type-filter-pill"

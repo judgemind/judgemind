@@ -173,6 +173,7 @@ export function TabletSidebar() {
                       className={cn(
                         'h-9 w-9',
                         item.activeFn(pathname) &&
+                          // shadcn-accent: intentional — active-nav selected-row chrome (#2832)
                           'bg-accent text-accent-foreground border-l-2 border-primary',
                       )}
                       asChild
@@ -214,6 +215,7 @@ function SidebarLink({
       size="sm"
       className={cn(
         'w-full justify-start gap-2',
+        // shadcn-accent: intentional — active-nav selected-row chrome (#2832)
         active && 'bg-accent text-accent-foreground font-medium border-l-2 border-primary',
       )}
       asChild

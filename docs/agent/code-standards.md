@@ -395,7 +395,7 @@ Both shards inherit the same `needs: detect-changes` / `scripts == 'true'` path 
 - Process substitution `< <(...)` — bash 3.2 supports it.
 - `[[ ... ]]` conditionals, `$(...)` command substitution, indexed arrays — all bash 2+.
 
-**Historical context.** Two earlier check scripts (`scripts/check-admin-dispatcher-brand-accent.sh`, `scripts/check-no-inline-ecs-healthcheck.sh`) and the `scripts/check-terminal-routing-comments.sh` guard each carry inline comments explaining why they avoid `mapfile` — the convention existed as tribal knowledge for months. PR #3081's first draft still used `mapfile -t` and silently exited 127 on the operator's laptop; the author found the precedent only by grepping peer check scripts. Issue #3082 codified the convention into `check-bash-compat.sh` + this docs section.
+**Historical context.** Two earlier check scripts (`scripts/check-bare-shadcn-accent.sh` — formerly the narrow `check-admin-dispatcher-brand-accent.sh` retired in #2832, `scripts/check-no-inline-ecs-healthcheck.sh`) and the `scripts/check-terminal-routing-comments.sh` guard each carry inline comments explaining why they avoid `mapfile` — the convention existed as tribal knowledge for months. PR #3081's first draft still used `mapfile -t` and silently exited 127 on the operator's laptop; the author found the precedent only by grepping peer check scripts. Issue #3082 codified the convention into `check-bash-compat.sh` + this docs section.
 
 ### Hygiene-check CI steps
 

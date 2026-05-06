@@ -93,7 +93,7 @@ ROUTING_PATTERN='ROUTING[[:space:]]*\(#[0-9]+\)'
 # ─── Locate call sites ──────────────────────────────────────────────────
 # We use while-read loops rather than ``mapfile`` so the script runs on
 # macOS's stock bash 3.2 — same constraint observed by
-# ``scripts/check-admin-dispatcher-brand-accent.sh`` and
+# ``scripts/check-bare-shadcn-accent.sh`` and
 # ``scripts/check-no-inline-ecs-healthcheck.sh``.
 call_lines=()
 while IFS= read -r line; do
