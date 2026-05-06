@@ -765,6 +765,17 @@ echo "" >&2
 if [[ "$DETACH" == "true" ]]; then
     echo "Detach mode: task launched successfully." >&2
 
+    # Persist the ARN so `scripts/ecs-wait-task.sh` (and any other helper)
+    # can pick it up without copy-pasting.  The sentinel path is fixed at
+    # <repo>/tmp/last-ecs-task.arn — if a previous detach left a stale ARN
+    # there, it is overwritten.  Failures are non-fatal: the ARN is also
+    # printed to stdout below for callers that want to capture it directly.
+    if mkdir -p "${REPO_ROOT}/tmp" 2>/dev/null; then
+        if printf '%s\n' "${TASK_ARN}" > "${REPO_ROOT}/tmp/last-ecs-task.arn" 2>/dev/null; then
+            echo "Saved ARN to tmp/last-ecs-task.arn (run scripts/ecs-wait-task.sh to wait)." >&2
+        fi
+    fi
+
     # Print the task ARN to stdout (everything else goes to stderr)
     # so callers can capture it easily.
     echo "${TASK_ARN}"
