@@ -168,6 +168,18 @@ When filing or implementing an issue whose migration drops `NOT NULL` on a colum
 - **Flip the GraphQL field to nullable in the same PR.** Change `FieldName: Type!` to `FieldName: Type` in the schema file. Leaving it non-null causes the GraphQL serializer to throw at runtime when NULL rows appear post-migration, crashing the entire query.
 - **The `graphql-nullability-drift-check` CI job enforces this** for columns listed in `KNOWN_MAPPINGS` inside `scripts/check-graphql-nullability-drift.py`. If your column is not yet covered, extend `KNOWN_MAPPINGS` in the same PR (see `docs/agent/code-standards.md` §Nullable schema migrations and #3441).
 
+## Symmetric guards: file the production-side and test-side guard together
+
+Any time you file an issue to add a CI hygiene guard `check-X.sh` that enforces a rule on production code under `packages/.../src/`, ask whether the rule has a symmetric analog on tests of that production code under `packages/.../tests/`. If production code must do X, tests of that production code almost always need a structural counterpart — typically a shared helper or fixture pattern that ensures the property X is preserved end-to-end. The two guards land naturally as a pair, and filing both at the same time prevents weeks of drift between them.
+
+The canonical example is the reingest-safety pair: #4141 added `scripts/check-parse-document-reingest-safety.sh`, which enforces docstring markers on Live-only `parse_document` implementations. The matching test-side guard #4190 — `scripts/check-tests-use-reingest-helper.sh`, which forbids inline reingest-shape `CapturedDocument(...)` in `tests/courts/` and requires the shared `make_reingest_cap_doc` helper — landed weeks later, only after three regression tests had to be migrated one-by-one (#4153, #4133, #4165). Each migration was a separate issue precisely because there was no test-side guard to catch the structural drift the moment a new test introduced it.
+
+When filing a hygiene-check issue:
+
+- **Identify the test-side analog explicitly.** State in the issue body whether one exists and what it would enforce — even if the answer is "none, because the rule is purely about production code and has no test-side shape."
+- **File both halves at the same time.** Either as one issue (when the work is small enough to land together) or as a pair of linked issues with `Parent: #<root>` and a cross-reference in each body. Do not assume the test-side guard will follow naturally — it usually doesn't.
+- **Reference the symmetric pair in both bodies.** Future readers should be able to see the loop closed without having to re-derive it from the audit history.
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:
