@@ -32,6 +32,7 @@
 #  12. Migration-only push skips TS lint  no 'checking TypeScript package' (#2877 AC1)
 #  13. Real TS change still fires lint    'checking TypeScript package' present (#2877 AC2)
 #  18. Non-ASCII tf description rejected  em-dash in description -> hook fails (#3923)
+#  19. Stale ci-passed.needs entry rejected  hook fails before actionlint (#4207)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -893,6 +894,80 @@ else
         report_fail "expected 'FAILED: check-no-nonascii-tf-descriptions for terraform' in output (#3923)" "$hook_out"
     else
         report_pass "hook rejects push with non-ASCII Terraform description field (#3923)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 19: ci.yml with a stale ci-passed.needs: entry rejected (#4207)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds .github/workflows/ci.yml with an entry in ci-passed.needs: that
+# does not correspond to any top-level job. The pre-push hook must run
+# scripts/check-ci-passed-coverage.py and fail with the targeted message
+# naming the stale entry — BEFORE actionlint, since actionlint also
+# catches this but with a less specific message that doesn't point at
+# the array. Mirrors scenario 18's "copy script into work tree" pattern.
+echo "[scenario 19] ci.yml with stale ci-passed.needs: entry — hook rejects push (#4207)"
+init_workspace
+
+CI_PASSED_PY="$REPO_ROOT/scripts/check-ci-passed-coverage.py"
+if [ ! -x "$CI_PASSED_PY" ]; then
+    report_skip "scripts/check-ci-passed-coverage.py unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-stale-needs
+    mkdir -p "$WORK/.github/workflows" "$WORK/scripts"
+    cp "$CI_PASSED_PY" "$WORK/scripts/check-ci-passed-coverage.py"
+    chmod +x "$WORK/scripts/check-ci-passed-coverage.py"
+    # Write a ci.yml whose ci-passed.needs: array references a job
+    # that does not exist in the workflow. The intended-job
+    # `bare-shadcn-accent-check` IS defined; the stale entry models
+    # the #2832 case where a job was renamed and the array was not
+    # updated.
+    cat > "$WORK/.github/workflows/ci.yml" <<'YML'
+name: CI
+on:
+  push:
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo detecting
+
+  scripts-tests:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+
+  bare-shadcn-accent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo accent
+
+  ci-passed:
+    needs: [scripts-tests, admin-dispatcher-brand-accent-check, bare-shadcn-accent-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed or were skipped
+        run: echo ok
+YML
+    git -C "$WORK" add .github/workflows/ci.yml scripts/check-ci-passed-coverage.py
+    git -C "$WORK" commit --quiet -m "ci: stale ci-passed.needs entry"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    # Run without actionlint so the failure must come from our targeted
+    # check, not from actionlint's generic [job-needs] lint.
+    run_hook_without actionlint \
+        "refs/heads/feature-stale-needs $feat_sha refs/heads/feature-stale-needs $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject stale ci-passed.needs entry (#4207), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "admin-dispatcher-brand-accent-check"; then
+        report_fail "expected hook output to name the stale entry 'admin-dispatcher-brand-accent-check' (#4207)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "do not correspond to any top-level job"; then
+        report_fail "expected hook output to include the stale-direction message (#4207)" "$hook_out"
+    else
+        report_pass "hook rejects push with stale ci-passed.needs entry and names it (#4207)"
     fi
 fi
 

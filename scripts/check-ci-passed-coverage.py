@@ -2,20 +2,36 @@
 # venv: none
 # permanent: true
 """
-check-ci-passed-coverage.py — Assert every top-level CI job appears in the
-`ci-passed.needs:` array so missing entries (like the #3919 gap) are caught
+check-ci-passed-coverage.py — Assert `ci-passed.needs:` and the top-level
+`jobs:` block in `.github/workflows/ci.yml` agree in both directions, so
+gaps like #3919 (missing entry) and #2832 (stale/renamed entry) are caught
 before merge.
 
-Motivation (#3919): The `ci-passed` aggregator job is the sole required
-status check for branch protection. If a job is defined in ci.yml but absent
-from `ci-passed.needs:`, CI can be green on a PR even when that job fails,
-giving a false green signal.
+Motivation: The `ci-passed` aggregator job is the sole required status
+check for branch protection. Two ways the array can fall out of sync with
+the real job set, both of which this script flags:
+
+  1. Missing entry (#3919): a job is defined in ci.yml but absent from
+     `ci-passed.needs:`. CI can be green on a PR even when that job fails,
+     giving a false green signal. The original failure mode this guard
+     was created for.
+
+  2. Stale entry (#2832): `ci-passed.needs:` references a job name that
+     no longer exists as a top-level `jobs:` entry — typically because a
+     job was renamed or deleted but the array was not updated. actionlint
+     also flags this at push time with `job "ci-passed" needs job "X"
+     which does not exist in this workflow [job-needs]`, but actionlint
+     runs after most other pre-push hooks, so a targeted check at the
+     same hygiene layer that already enforces direction (1) gives a
+     faster, more specific error.
 
 This script:
 1. Parses `.github/workflows/ci.yml` (simple line-oriented parser).
 2. Enumerates every top-level job name.
 3. Reads the `ci-passed.needs:` array.
-4. Asserts every job (excluding an explicit allow-list) is present.
+4. Asserts every non-allow-listed job is present (direction 1 — missing).
+5. Asserts every entry in `needs:` corresponds to a real top-level job
+   (direction 2 — stale / renamed / removed / nonexistent).
 
 Allow-list (jobs that legitimately do not need to be in ci-passed.needs:):
   - detect-changes       (orchestrator; always succeeds)
@@ -31,8 +47,10 @@ Usage:
     scripts/check-ci-passed-coverage.py --help
 
 Exit codes:
-    0 — Every top-level job is covered by ci-passed.needs:.
-    1 — One or more jobs are missing from ci-passed.needs:.
+    0 — `ci-passed.needs:` and the jobs block agree in both directions.
+    1 — One or more jobs are missing from ci-passed.needs:, OR
+        one or more entries in ci-passed.needs: do not correspond to a
+        real top-level job (stale / renamed / removed).
     2 — Script error (cannot parse ci.yml, etc.).
 """
 
@@ -153,7 +171,10 @@ def main() -> int:
         print(f"ERROR: failed to parse ci-passed.needs: {exc}", file=sys.stderr)
         return 2
 
+    job_set = set(all_jobs)
     needs_set = set(needs)
+
+    # Direction 1 (#3919): every real job must appear in ci-passed.needs:.
     missing: list[str] = []
     for job in all_jobs:
         if job in ALLOW_LIST:
@@ -161,24 +182,52 @@ def main() -> int:
         if job not in needs_set:
             missing.append(job)
 
-    if not missing:
+    # Direction 2 (#2832): every entry in ci-passed.needs: must correspond
+    # to a real top-level job. A stale entry indicates a job was renamed or
+    # removed but the array was not updated.
+    stale: list[str] = []
+    for entry in needs:
+        if entry not in job_set:
+            stale.append(entry)
+
+    if not missing and not stale:
         print(f"check-ci-passed-coverage: all {len(all_jobs)} jobs covered.")
         return 0
 
+    if missing:
+        print(
+            "check-ci-passed-coverage: the following jobs are NOT listed in "
+            "ci-passed.needs: and will not block merge if they fail:",
+            file=sys.stderr,
+        )
+        for name in missing:
+            print(f"  - {name}", file=sys.stderr)
+        print(
+            "\nFix: add the missing job name(s) to the ci-passed.needs: array in "
+            ".github/workflows/ci.yml.",
+            file=sys.stderr,
+        )
+
+    if stale:
+        if missing:
+            print("", file=sys.stderr)
+        print(
+            "check-ci-passed-coverage: the following entries in "
+            "ci-passed.needs: do not correspond to any top-level job in "
+            "ci.yml (stale / renamed / removed):",
+            file=sys.stderr,
+        )
+        for name in stale:
+            print(f"  - {name}", file=sys.stderr)
+        print(
+            "\nFix: remove the stale entry from the ci-passed.needs: array, "
+            "or update it to the current job name.",
+            file=sys.stderr,
+        )
+
     print(
-        "check-ci-passed-coverage: the following jobs are NOT listed in "
-        "ci-passed.needs: and will not block merge if they fail:",
-        file=sys.stderr,
-    )
-    for name in missing:
-        print(f"  - {name}", file=sys.stderr)
-    print(
-        "\nFix: add the missing job name(s) to the ci-passed.needs: array in "
-        ".github/workflows/ci.yml.",
-        file=sys.stderr,
-    )
-    print(
-        "\nSee https://github.com/judgemind/judgemind/issues/3919 for background.",
+        "\nSee https://github.com/judgemind/judgemind/issues/3919 (missing) "
+        "and #2832 (stale) for background.",
         file=sys.stderr,
     )
     return 1
