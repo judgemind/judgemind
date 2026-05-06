@@ -697,6 +697,9 @@ class TestCooldownSkip:
         d._issue_already_attempted = lambda n: n in attempted  # type: ignore[method-assign]
         d._issue_in_cooldown = lambda n: n in cooldown  # type: ignore[method-assign]
         d._issue_author_trusted = lambda _n: True  # type: ignore[method-assign]
+        # #4211 — stub the shipped-zombie hook so this test doesn't
+        # shell out to scripts/check-shipped-pr.sh on the test runner.
+        d._issue_already_shipped = lambda _n: None  # type: ignore[method-assign]
 
         # Issue 2 is in cooldown — picker should skip to 3.
         assert d._pick_candidate_issue([1, 2, 3]) == 1
