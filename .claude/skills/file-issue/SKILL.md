@@ -114,6 +114,10 @@ See `docs/agent/issue-authoring.md` for why — #1979 burned ~a day of agent tim
 
 Data cleanup tasks on `derived.*` tables should plan to use `rebuild_db.py --county <name>`, not a surgical delete/patch script. Surgical scripts ship with their own bugs and only patch existing rows. Only write a surgical script if (a) rebuild cost is prohibitive at the affected scale, or (b) the deletion is scoped to a subset rebuild can't express — and put a one-line justification in the body when going surgical.
 
+### 8a. Cleanup AC SQL — anchor on `derived.documents.status = 'active'`
+
+When the issue's acceptance criteria gate "the cleanup is done" on a row count from `derived.rulings`, `derived.cases`, `derived.judges`, `derived.attorneys`, `derived.parties`, or any other table whose source-of-truth is a `derived.documents` row, every `Verify:` SELECT MUST `JOIN derived.documents d ON d.id = <row>.document_id WHERE d.status = 'active'`. Supersede chains (post-#3722 multimodal-fix and similar reingest events) leave OLD-case-number / OLD-case-title rows behind as `status = 'superseded'`; a naive count picks them up as live regression and the AC reads as failing long after the fix has shipped. See `docs/agent/issue-authoring.md` §Cleanup AC queries — anchor on document status (and #4236 / #3629 for the incident) for the full pattern and a worked example.
+
 ---
 
 ## Creation command
