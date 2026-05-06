@@ -7525,8 +7525,21 @@ class TestMultimodalSplitChildGuard:
 class TestSplitRegistry:
     """Tests for the split function registry."""
 
-    def test_split_registry_not_populated_for_riverside(self) -> None:
-        """Riverside no longer has _split_rulings — splitting moved to ingestion worker (#1728)."""
+    def test_split_registry_populated_for_riverside(self) -> None:
+        """Riverside has a deterministic ``_split_rulings`` (#3649) — auto-
+        discovery must register it in ``_SPLIT_REGISTRY`` so the reingest
+        path uses the deterministic splitter instead of falling back to
+        the framework LLM extractor.
+
+        Updated from the inverse "not populated" assertion landed for
+        #1728 (which moved splitting to the framework-level ``LlmExtractor``).
+        #3649 reverses that decision for Riverside specifically because
+        the LLM violates rule 5b of the Riverside extraction prompt and
+        copies ``outcome``/``motion_type``/``case_title`` from one entry
+        onto another in multi-case PDFs.  The deterministic regex-based
+        splitter eliminates the cross-entry carry-forward window by
+        dispatching each entry as its own LLM enrichment call.
+        """
         # Clear registries to force re-discovery
         reingest._SCRAPER_REGISTRY.clear()
         reingest._SPLIT_REGISTRY.clear()
@@ -7535,7 +7548,15 @@ class TestSplitRegistry:
         reingest._load_scraper_registry()
 
         scraper_id = "ca-riverside-tentatives-civil"
-        assert scraper_id not in reingest._SPLIT_REGISTRY
+        assert scraper_id in reingest._SPLIT_REGISTRY, (
+            "Riverside scraper should be registered in _SPLIT_REGISTRY because "
+            "courts.ca.riverside_tentatives now exports a module-level "
+            "_split_rulings callable (#3649)"
+        )
+        # And the registered callable is the one we actually expect.
+        from courts.ca.riverside_tentatives import _split_rulings as expected_split
+
+        assert reingest._SPLIT_REGISTRY[scraper_id] is expected_split
 
 
 # ---------------------------------------------------------------------------
@@ -10556,21 +10577,32 @@ class TestLlmSplitRegistryAutoDiscovery:
     """Tests that _load_scraper_registry() correctly discovers and registers
     _llm_extract_rulings functions from scraper modules (#1969)."""
 
-    def test_riverside_not_in_split_registries(self) -> None:
-        """After #1728, Riverside LLM extraction moved to framework-level
-        LlmExtractor via extraction_config.py.  The scraper module no longer
-        exports _llm_extract_rulings or _split_rulings, so Riverside must NOT
-        appear in _LLM_SPLIT_REGISTRY or _SPLIT_REGISTRY."""
+    def test_riverside_in_regex_split_registry_only(self) -> None:
+        """Riverside has a deterministic regex-based ``_split_rulings`` (#3649)
+        but no LLM-based ``_llm_extract_rulings`` — so it appears in
+        ``_SPLIT_REGISTRY`` only, not ``_LLM_SPLIT_REGISTRY``.
+
+        Replaces the ``test_riverside_not_in_split_registries`` assertion
+        landed for #1728 (which moved splitting to the framework-level
+        ``LlmExtractor``).  #3649 adds the deterministic splitter to
+        eliminate the cross-entry carry-forward window the LLM was
+        creating in multi-case PDFs (see issue body for examples of the
+        ``outcome``/``motion_type``/``case_title`` leakage).
+        """
         reingest._SCRAPER_REGISTRY.clear()
         reingest._LLM_SPLIT_REGISTRY.clear()
         reingest._SPLIT_REGISTRY.clear()
         reingest._load_scraper_registry()
 
         assert "ca-riverside-tentatives-civil" not in reingest._LLM_SPLIT_REGISTRY, (
-            "Riverside should not be in _LLM_SPLIT_REGISTRY (LLM extraction moved to framework)"
+            "Riverside should not be in _LLM_SPLIT_REGISTRY — LLM extraction "
+            "remains in the framework via extraction_config.py; only the "
+            "deterministic splitter (regex) is exported by the scraper "
+            "module."
         )
-        assert "ca-riverside-tentatives-civil" not in reingest._SPLIT_REGISTRY, (
-            "Riverside should not be in _SPLIT_REGISTRY (splitting moved to framework)"
+        assert "ca-riverside-tentatives-civil" in reingest._SPLIT_REGISTRY, (
+            "Riverside should be in _SPLIT_REGISTRY — courts.ca.riverside_tentatives "
+            "now exports a module-level _split_rulings callable (#3649)"
         )
 
 
