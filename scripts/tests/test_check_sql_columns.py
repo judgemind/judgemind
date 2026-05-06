@@ -20,6 +20,10 @@ _is_sql_string = check_sql_columns._is_sql_string
 _resolve_aliases = check_sql_columns._resolve_aliases
 _extract_column_references = check_sql_columns._extract_column_references
 _validate_column_ref = check_sql_columns._validate_column_ref
+_extract_unqualified_column_references = (
+    check_sql_columns._extract_unqualified_column_references
+)
+_single_base_table = check_sql_columns._single_base_table
 build_table_columns = check_sql_columns.build_table_columns
 scan_file = check_sql_columns.scan_file
 TABLE_COLUMNS = check_sql_columns.TABLE_COLUMNS
@@ -551,3 +555,329 @@ class TestTableColumnsCompleteness:
         repo_root = Path(__file__).resolve().parent.parent.parent
         fresh = build_table_columns(repo_root)
         assert fresh == TABLE_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# Tests: Unqualified column reference detection (#4271)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleBaseTable:
+    """Tests for _single_base_table — identifies single-table SQL queries."""
+
+    def test_simple_select(self) -> None:
+        """SELECT from a single table returns that table."""
+        sql = "SELECT id, name FROM courts"
+        assert _single_base_table(sql) == "courts"
+
+    def test_simple_select_schema_prefixed(self) -> None:
+        sql = "SELECT id FROM derived.documents"
+        assert _single_base_table(sql) == "documents"
+
+    def test_simple_select_with_alias(self) -> None:
+        """Aliased single table still returns the underlying table."""
+        sql = "SELECT c.id FROM courts c WHERE c.id = 1"
+        assert _single_base_table(sql) == "courts"
+
+    def test_select_with_join_returns_none(self) -> None:
+        """Joins introduce ambiguity — bail out."""
+        sql = "SELECT r.id FROM rulings r JOIN cases c ON c.id = r.case_id"
+        assert _single_base_table(sql) is None
+
+    def test_select_with_inner_join_returns_none(self) -> None:
+        sql = "SELECT r.id FROM rulings r INNER JOIN cases c ON c.id = r.case_id"
+        assert _single_base_table(sql) is None
+
+    def test_select_with_left_join_returns_none(self) -> None:
+        sql = "SELECT r.id FROM rulings r LEFT JOIN cases c ON c.id = r.case_id"
+        assert _single_base_table(sql) is None
+
+    def test_update_table(self) -> None:
+        sql = "UPDATE rulings SET outcome = 'granted' WHERE id = 1"
+        assert _single_base_table(sql) == "rulings"
+
+    def test_update_table_aliased(self) -> None:
+        sql = "UPDATE rulings r SET r.outcome = 'granted' WHERE r.id = 1"
+        assert _single_base_table(sql) == "rulings"
+
+    def test_insert_into(self) -> None:
+        sql = "INSERT INTO courts (id, state) VALUES (1, 'CA')"
+        assert _single_base_table(sql) == "courts"
+
+    def test_delete_from(self) -> None:
+        sql = "DELETE FROM rulings WHERE id = 1"
+        assert _single_base_table(sql) == "rulings"
+
+    def test_select_from_subquery_returns_none(self) -> None:
+        """A subquery in FROM means there is no single base table."""
+        sql = "SELECT * FROM (SELECT id FROM rulings) t"
+        assert _single_base_table(sql) is None
+
+    def test_select_with_cte_returns_none(self) -> None:
+        """CTEs introduce ambiguity — bail out."""
+        sql = "WITH cte AS (SELECT id FROM rulings) SELECT id FROM cte"
+        assert _single_base_table(sql) is None
+
+    def test_select_from_two_tables_returns_none(self) -> None:
+        """Comma-joined tables — bail out (legacy join syntax)."""
+        sql = "SELECT * FROM rulings r, cases c WHERE c.id = r.case_id"
+        assert _single_base_table(sql) is None
+
+
+class TestExtractUnqualifiedColumnReferences:
+    """Tests for _extract_unqualified_column_references."""
+
+    def test_where_clause_unqualified(self) -> None:
+        """Bare column in WHERE clause is detected."""
+        sql = "SELECT * FROM derived.documents WHERE scraper_id = %s"
+        refs = _extract_unqualified_column_references(sql)
+        assert "scraper_id" in refs
+
+    def test_where_clause_two_columns(self) -> None:
+        """Multiple bare columns in WHERE clause are all detected."""
+        sql = (
+            "SELECT * FROM derived.documents "
+            "WHERE scraper_id = %s AND captured_at >= %s"
+        )
+        refs = _extract_unqualified_column_references(sql)
+        assert "scraper_id" in refs
+        assert "captured_at" in refs
+
+    def test_select_clause_columns(self) -> None:
+        """Bare columns in SELECT clause are detected."""
+        sql = "SELECT id, name, captured_at FROM derived.documents"
+        refs = _extract_unqualified_column_references(sql)
+        assert "id" in refs
+        assert "name" in refs
+        assert "captured_at" in refs
+
+    def test_select_star_skipped(self) -> None:
+        """SELECT * does not produce column references."""
+        sql = "SELECT * FROM derived.documents WHERE id = 1"
+        refs = _extract_unqualified_column_references(sql)
+        # `*` is not a column reference — only id matters here.
+        assert "*" not in refs
+        assert "id" in refs
+
+    def test_order_by_columns(self) -> None:
+        sql = "SELECT id FROM derived.documents ORDER BY captured_at DESC"
+        refs = _extract_unqualified_column_references(sql)
+        assert "captured_at" in refs
+
+    def test_update_set_columns(self) -> None:
+        sql = "UPDATE rulings SET outcome = 'granted', is_tentative = false WHERE id = 1"
+        refs = _extract_unqualified_column_references(sql)
+        assert "outcome" in refs
+        assert "is_tentative" in refs
+        assert "id" in refs
+
+    def test_insert_column_list(self) -> None:
+        sql = "INSERT INTO courts (id, state, county) VALUES (%s, %s, %s)"
+        refs = _extract_unqualified_column_references(sql)
+        assert "id" in refs
+        assert "state" in refs
+        assert "county" in refs
+
+    def test_skips_string_literals(self) -> None:
+        """Identifiers inside string literals must NOT be treated as columns."""
+        sql = "SELECT * FROM courts WHERE state = 'CA' AND county = 'fake_col'"
+        refs = _extract_unqualified_column_references(sql)
+        # 'fake_col' is inside a string literal, not a column reference.
+        assert "fake_col" not in refs
+        # state and county ARE legitimate references.
+        assert "state" in refs
+        assert "county" in refs
+
+    def test_skips_function_calls(self) -> None:
+        """Function names should not be treated as columns."""
+        sql = "SELECT COUNT(*) FROM derived.documents WHERE NOW() > captured_at"
+        refs = _extract_unqualified_column_references(sql)
+        assert "count" not in refs
+        assert "now" not in refs
+        assert "captured_at" in refs
+
+    def test_skips_keywords(self) -> None:
+        """SQL keywords should not be treated as columns."""
+        sql = "SELECT id FROM derived.documents WHERE id IS NOT NULL ORDER BY captured_at"
+        refs = _extract_unqualified_column_references(sql)
+        for kw in ("is", "not", "null", "order", "by", "where", "select", "from"):
+            assert kw not in refs
+        assert "id" in refs
+        assert "captured_at" in refs
+
+    def test_skips_qualified_columns(self) -> None:
+        """Qualified columns (alias.col) are NOT included in unqualified refs."""
+        sql = "SELECT d.id FROM derived.documents d WHERE d.scraper_id = %s"
+        refs = _extract_unqualified_column_references(sql)
+        # d.id and d.scraper_id are qualified — handled by the existing path.
+        assert "id" not in refs
+        assert "scraper_id" not in refs
+
+
+class TestScanFileUnqualified:
+    """Integration tests for unqualified-column detection in scan_file."""
+
+    def test_catches_capture_timestamp_bug(self, tmp_path: Path) -> None:
+        """The #4271 regression: capture_timestamp does not exist on documents.
+
+        This is the exact bug pattern that prompted the issue: an unqualified
+        column reference in a WHERE clause that the existing qualified-only
+        check missed.
+        """
+        f = tmp_path / "buggy.py"
+        f.write_text('''
+QUERY = """
+    SELECT COUNT(*) FROM derived.documents
+    WHERE scraper_id = %s AND capture_timestamp >= %s
+"""
+''')
+        # documents table has captured_at, NOT capture_timestamp.
+        table_cols = {
+            "documents": {"id", "scraper_id", "captured_at", "s3_key"},
+        }
+        errors = scan_file(f, table_columns=table_cols)
+        # We expect EXACTLY one error: capture_timestamp is unknown.
+        # scraper_id and captured_at would be valid — but only if the user
+        # actually wrote those.
+        assert len(errors) == 1, f"expected 1 error, got: {errors}"
+        assert "capture_timestamp" in errors[0]
+        assert "documents" in errors[0]
+
+    def test_no_false_positives_on_correct_unqualified_query(
+        self, tmp_path: Path
+    ) -> None:
+        """The fixed version of the same query must NOT flag anything."""
+        f = tmp_path / "fixed.py"
+        f.write_text('''
+QUERY = """
+    SELECT COUNT(*) FROM derived.documents
+    WHERE scraper_id = %s AND captured_at >= %s
+"""
+''')
+        table_cols = {
+            "documents": {"id", "scraper_id", "captured_at", "s3_key"},
+        }
+        errors = scan_file(f, table_columns=table_cols)
+        assert errors == [], f"unexpected errors: {errors}"
+
+    def test_skips_join_queries(self, tmp_path: Path) -> None:
+        """Queries with JOINs are not analyzed for unqualified refs.
+
+        Joins introduce ambiguity about which table an unqualified column
+        belongs to; the safe play is to skip those queries entirely.
+        """
+        f = tmp_path / "joined.py"
+        f.write_text('''
+QUERY = """
+    SELECT id, captured_at FROM derived.documents d
+    JOIN derived.rulings r ON r.document_id = d.id
+    WHERE bogus_column = %s
+"""
+''')
+        # bogus_column is not in any table — but we skip JOIN queries for
+        # unqualified analysis, so this should NOT raise an error from the
+        # unqualified path. (The qualified path also won't catch it because
+        # it's not a qualified ref.)
+        table_cols = {
+            "documents": {"id", "captured_at"},
+            "rulings": {"id", "document_id"},
+        }
+        errors = scan_file(f, table_columns=table_cols)
+        assert errors == []
+
+    def test_detects_in_update_set(self, tmp_path: Path) -> None:
+        f = tmp_path / "update_buggy.py"
+        f.write_text('''
+QUERY = """
+    UPDATE rulings SET bogus_col = 'x' WHERE id = %s
+"""
+''')
+        table_cols = {"rulings": {"id", "outcome", "is_tentative"}}
+        errors = scan_file(f, table_columns=table_cols)
+        assert len(errors) == 1
+        assert "bogus_col" in errors[0]
+
+    def test_detects_in_insert_column_list(self, tmp_path: Path) -> None:
+        f = tmp_path / "insert_buggy.py"
+        f.write_text('''
+QUERY = """
+    INSERT INTO courts (id, state, fake_county) VALUES (%s, %s, %s)
+"""
+''')
+        table_cols = {"courts": {"id", "state", "county"}}
+        errors = scan_file(f, table_columns=table_cols)
+        assert len(errors) == 1
+        assert "fake_county" in errors[0]
+
+    def test_string_literal_not_flagged(self, tmp_path: Path) -> None:
+        """Identifiers inside SQL string literals must not be flagged."""
+        f = tmp_path / "string_lit.py"
+        f.write_text('''
+QUERY = """
+    SELECT id FROM courts WHERE state = 'capture_timestamp'
+"""
+''')
+        table_cols = {"courts": {"id", "state"}}
+        errors = scan_file(f, table_columns=table_cols)
+        assert errors == []
+
+    def test_sql_check_ignore_suppresses_unqualified(
+        self, tmp_path: Path
+    ) -> None:
+        """sql-check:ignore suppresses both qualified and unqualified checks."""
+        f = tmp_path / "ignored.py"
+        f.write_text('''
+# sql-check:ignore
+BAD_QUERY = """
+    SELECT * FROM derived.documents WHERE bogus_col = %s
+"""
+''')
+        table_cols = {"documents": {"id", "captured_at"}}
+        errors = scan_file(f, table_columns=table_cols)
+        assert errors == []
+
+    def test_unknown_table_skipped(self, tmp_path: Path) -> None:
+        """Queries against unknown tables (CTEs, temp tables) are skipped."""
+        f = tmp_path / "unknown.py"
+        f.write_text('''
+QUERY = """
+    SELECT bogus FROM unknown_table WHERE other_bogus = %s
+"""
+''')
+        table_cols = {"documents": {"id"}}
+        errors = scan_file(f, table_columns=table_cols)
+        # Unknown table — skip without error.
+        assert errors == []
+
+    def test_ac_capture_timestamp_typo_against_real_schema(
+        self, tmp_path: Path
+    ) -> None:
+        """AC #4271: deliberate typo `captured_at` -> `capture_timestamp`
+        on `derived.documents` is detected against the real repo schema.
+
+        Verifies the issue's explicit acceptance criterion: introduce a
+        deliberate column-name typo, run the check, confirm it fails
+        with a clear error pointing at the bad reference.
+        """
+        f = tmp_path / "regression_ac.py"
+        # This is the exact bug the issue describes: WHERE clause uses
+        # `capture_timestamp` but the actual column is `captured_at`.
+        f.write_text('''
+def fetch_capture_count(conn, scraper_id, since):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM derived.documents "
+            "WHERE scraper_id = %s AND capture_timestamp >= %s",
+            (scraper_id, since),
+        )
+        return cur.fetchone()[0]
+''')
+        # Use the real TABLE_COLUMNS map built from the repo's schema files.
+        errors = scan_file(f, table_columns=TABLE_COLUMNS)
+        assert len(errors) >= 1
+        joined = "\n".join(errors)
+        assert "capture_timestamp" in joined
+        assert "documents" in joined
+        # The error message must call out the available columns to make
+        # the fix obvious.
+        assert "captured_at" in joined

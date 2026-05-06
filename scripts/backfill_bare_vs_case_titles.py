@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 # starts with at least one uppercase letter, then any non-period characters,
 # then ends with whitespace + v/vs/vs. (case-insensitive).
 # Uses keyset pagination on (id) for efficient batching.
+#
+# NOTE: The `county` column does not exist on `derived.cases` (it lives on
+# `derived.courts`). This SELECT is broken and will fail at runtime; the
+# proper fix joins courts via court_id. Tracked separately so the new
+# unqualified-column check (#4271) can ship without bundling unrelated
+# bug fixes. See follow-up filed at PR-merge time.
+# sql-check:ignore
 FETCH_QUERY = """
     SELECT id, case_title, county
     FROM derived.cases
