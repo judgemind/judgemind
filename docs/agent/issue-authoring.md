@@ -115,6 +115,28 @@ If a task naturally breaks into 2+ independent pieces of work, create child issu
 - Sub-tasks should be self-contained — another agent should be able to pick one up independently.
 - Label child issues appropriately and add `agent/ready` if fully specified.
 
+## Refactor sub-tasks: scope test updates with structural changes
+
+When a refactor sub-task changes the *shape* of a file (extracting a block into a function, collapsing duplicate arms, renaming a section), check whether existing tests pin the current shape via line-anchored extraction (`awk`/`sed`/`grep` with literal patterns), structural assertions ("the body is N lines long"), or whitespace-sensitive matching. If they do, those tests are part of the structural change — they cannot stay as-is once the structure moves.
+
+A "no test-file edits" AC on a sub-task whose structural change *is* the thing those tests are pinning to creates an unresolvable tension. The implementing agent has three bad choices: (a) violate the structural-change AC, (b) violate the no-edit AC, or (c) introduce duplicate-code transitional measures (the new function lives next to an unchanged inline copy that the tests still extract). Option (c) is the transitional dead-code antipattern called out in agent-memory `feedback_no_known_broken_paths.md` — known-broken code is a failure waiting to happen, not a hedge. The "regression test with fix" pattern in reverse: tests that lock structure should be in scope for the same PR that changes the structure.
+
+**See #4138 (sub-task B of #4097) for the concrete example.** T51's awk `^        fix_conflict)$` pattern in `test_agent_runner_entrypoint.sh` extracts the inline `fix_conflict` arm body, but the PR was supposed to reduce that body to a single function call. The "no test-file edits" AC forced the agent to keep the body inline as a transitional copy alongside a defined-but-unused `handle_fix_conflict_arm` — known-broken transitional shape that sub-task C had to resolve later.
+
+**Checklist when filing a refactor sub-task:**
+
+- **Grep for tests that depend on the structure being changed.** Common patterns:
+  ```
+  grep -rE 'awk.*\$ENTRYPOINT|grep.*\$ENTRYPOINT' scripts/tests/ scripts/dispatcher/tests/
+  grep -rE 'awk[[:space:]]+(/.+/|"\^[[:space:]]+[a-z_]+\)\$")' tests/ scripts/tests/
+  ```
+  Adjust the patterns for the file under refactor — anything that extracts blocks by literal-line anchor, counts lines in a region, or asserts on byte-identical output is a candidate.
+- **List the affected tests in the issue body under "Tests that pin the current structure."** Name each test by file + line and quote the extraction pattern that will break.
+- **Then make a scope decision and state it explicitly in the AC**, choosing exactly one of:
+  - **(a) Update those tests in the same PR.** Add an AC line: "Tests `<file>:<test-name>` are updated to match the new structure (see `<new-pattern>`)." This is the default — the tests pin the structure being changed, so they belong to the same change.
+  - **(b) Flag the contradiction explicitly and accept it.** Add an AC line: "Test `<file>:<test-name>` will fail until sub-task <C>; that's expected. Sub-task <C> updates the test pattern to `<new-pattern>`." This requires sub-task <C> to actually exist and be linked. Don't write this if the follow-up sub-task is hypothetical.
+- **Avoid the strict "no test-file edits" AC unless the affected tests genuinely don't touch the structure being changed.** When the tests are structure-agnostic (they invoke the script and assert on logs / DB rows / exit codes only), "no test-file edits" is fine and protects against scope creep. When the tests are structure-anchored, "no test-file edits" is the bug.
+
 ## Backfill Migrations: Row-Class Coverage
 
 Why: Issues #2961 and #2960 revealed that a backfill migration silently skipped entire row classes — specifically, `failed` and `plan_blocked` rows were left un-updated because the SQL filter only matched the modal (`crashed`) case. The checklist below makes row-class coverage an explicit authoring and implementation requirement so the same oversight cannot recur. See #2961 (checklist formalized) and #2960 (prior incident).
