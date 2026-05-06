@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# test_check_admin_dispatcher_brand_accent.sh — Tests for
-# scripts/check-admin-dispatcher-brand-accent.sh.
+# test_check_bare_shadcn_accent.sh — Tests for
+# scripts/check-bare-shadcn-accent.sh.
 #
 # Synthesises small .tsx fixtures in a temp dir, runs the guard against
-# the temp dir, and asserts the expected pass/fail outcome for each
+# the temp dir, and asserts the expected pass/fail outcome for every
 # canonical pattern described in the check script's header comment.
+#
+# Mirrors the scope of test_check_admin_dispatcher_brand_accent.sh so
+# the repo-wide replacement preserves all existing coverage, plus adds
+# cases for the `shadcn-accent: intentional` allowlist mechanism (#2832).
 #
 # Also calls `assert_no_self_match_on_ci_step_name` at the end so the
 # check does not accidentally flag the ci.yml step name that invokes
 # it (see #2541/#2542 and scripts/tests/_guard_self_match_helpers.sh).
 #
 # Usage:
-#   scripts/tests/test_check_admin_dispatcher_brand_accent.sh
+#   scripts/tests/test_check_bare_shadcn_accent.sh
 #
 # Exit codes:
 #   0 — All tests passed.
@@ -20,7 +24,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CHECK_SCRIPT="$SCRIPT_DIR/check-admin-dispatcher-brand-accent.sh"
+CHECK_SCRIPT="$SCRIPT_DIR/check-bare-shadcn-accent.sh"
 FAILURES=0
 TESTS=0
 
@@ -100,7 +104,7 @@ reset_tmpdir
 
 # ─── Test 6: hover:bg-accent hover:text-accent-foreground pattern passes ─
 # This is shadcn's canonical hover behaviour — ui/button.tsx, dropdown,
-# select, command, sidebar all use it.  It must not be flagged.
+# select, command, sidebar all use it. It must not be flagged.
 create_test_file "Hover.tsx" \
     'export const Hov = () => <button className="hover:bg-accent hover:text-accent-foreground">hi</button>;' > /dev/null
 assert_passes "Hover-state accent pair (hover:bg-accent hover:text-accent-foreground) is allowed"
@@ -159,15 +163,83 @@ export const Good = () => <span className="text-brand-accent">hi</span>;' > /dev
 assert_fails "Real usage line in a mixed file is caught"
 reset_tmpdir
 
-# ─── Test 15: No self-match on ci.yml step name ──────────────────────────
+# ─── Test 15: Files under __tests__/ are excluded ────────────────────────
+# The narrow predecessor excluded only test filename suffixes; the
+# repo-wide guard must also exclude __tests__/ subdirectories so that
+# regression tests can spell `text-accent` literally in expectations.
+create_test_file "__tests__/Foo.tsx" \
+    'export const Bad = () => <span className="text-accent">hi</span>;' > /dev/null
+assert_passes "Files under __tests__/ are excluded from the scan"
+reset_tmpdir
+
+# ─── Test 16: Allowlist marker on the same line passes ───────────────────
+create_test_file "Allow.tsx" \
+    'export const Sel = () => <span className="bg-accent" /* shadcn-accent: intentional */>hi</span>;' > /dev/null
+assert_passes "shadcn-accent: intentional on the same line waives the violation"
+reset_tmpdir
+
+# ─── Test 17: Allowlist marker on the immediately preceding line passes ──
+create_test_file "AllowPrev.tsx" \
+    'export const Sel = () => (
+  // shadcn-accent: intentional — selected-row chrome
+  <span className="bg-accent text-accent-foreground">hi</span>
+);' > /dev/null
+assert_passes "shadcn-accent: intentional on the preceding line waives the violation"
+reset_tmpdir
+
+# ─── Test 18: Allowlist marker 3 lines back (wrapped JSX) passes ─────────
+# The motion-type filter pill in JudgeProfile.tsx puts the allowlist
+# comment above the opening <span and the className wraps to the next
+# line. The lookback window must reach 3 lines back to catch this.
+create_test_file "AllowWrap.tsx" \
+    'export const Wrap = () => (
+  // shadcn-accent: intentional — wrapped JSX selected-row chrome
+  <span
+    data-testid="filter-pill"
+    className="bg-accent text-accent-foreground"
+  >hi</span>
+);' > /dev/null
+assert_passes "shadcn-accent: intentional within 3 preceding lines waives the violation (wrapped JSX)"
+reset_tmpdir
+
+# ─── Test 19: Allowlist marker 4+ lines back does NOT waive ──────────────
+# A bare reference too far up the file must not silently allowlist a
+# later violation — the marker has to be near the offending line.
+create_test_file "AllowFar.tsx" \
+    'export const Far = () => (
+  // shadcn-accent: intentional — but unrelated, far away
+  <div>
+    <p>filler 1</p>
+    <p>filler 2</p>
+    <span className="bg-accent">later</span>
+  </div>
+);' > /dev/null
+assert_fails "shadcn-accent: intentional more than 3 lines away does NOT waive a later violation"
+reset_tmpdir
+
+# ─── Test 20: Allowlist marker only waives its line, not later ones ──────
+# Test that a single allowlist marker doesn't cascade to flag-free
+# everything in the rest of the file.
+create_test_file "AllowOne.tsx" \
+    'export const One = () => (
+  // shadcn-accent: intentional
+  <span className="bg-accent">selected</span>
+);
+export const Two = () => (
+  <span className="bg-accent">unrelated bug</span>
+);' > /dev/null
+assert_fails "Allowlist on one violation does not cover unrelated later violation"
+reset_tmpdir
+
+# ─── Test 21: Self-match on ci.yml step name ─────────────────────────────
 # Mirrors the #2541/#2542 self-match guard used by every string-forbidding
-# check.  If a ci.yml step name quotes the forbidden pattern, the guard
+# check. If a ci.yml step name quotes the forbidden pattern, the guard
 # matches itself on first CI run — describe what the check does, not what
 # it forbids.
 # shellcheck source=./_guard_self_match_helpers.sh
 source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
 assert_no_self_match_on_ci_step_name \
-    "scripts/check-admin-dispatcher-brand-accent.sh" "yml"
+    "scripts/check-bare-shadcn-accent.sh" "yml"
 
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""

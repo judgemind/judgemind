@@ -101,10 +101,13 @@ A `bg-stone-200` in production code will fail CI.
 >   `data-[selected=true]:bg-accent`. Never as a bare class on an
 >   always-visible element.
 >
-> Regressions on `/admin/dispatcher` (#2816) prompted a CI guard
-> (`scripts/check-admin-dispatcher-brand-accent.sh`) that blocks bare
-> `*-accent` utilities on that surface. When in doubt, grep the
-> Wordmark component for the canonical pattern.
+> Regressions on `/admin/dispatcher` (#2816) prompted a CI guard that
+> was expanded repo-wide in #2832
+> (`scripts/check-bare-shadcn-accent.sh`); it blocks bare `*-accent`
+> utilities anywhere under `packages/web/src/`. Legitimate selected-row
+> surfaces (sidebar active nav, filter pills) waive the check with an
+> inline `shadcn-accent: intentional` comment. When in doubt, grep the
+> Wordmark component for the canonical brand-accent pattern.
 
 ```
 // packages/web/tailwind.config.ts

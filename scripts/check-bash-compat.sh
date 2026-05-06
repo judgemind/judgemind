@@ -20,7 +20,8 @@
 # this on its first draft — ``mapfile -t`` silently exited 127 on the
 # operator's laptop. The bug was caught only by grepping other check
 # scripts for the repo's unwritten convention; two existing guards
-# (``check-admin-dispatcher-brand-accent.sh``,
+# (``check-bare-shadcn-accent.sh`` — formerly the narrow
+# ``check-admin-dispatcher-brand-accent.sh`` retired in #2832 — and
 # ``check-no-inline-ecs-healthcheck.sh``) had inline comments noting
 # the constraint, but it was not codified anywhere enforceable. Issue
 # #3082 codifies it: this check + the ``docs/agent/code-standards.md``
@@ -112,7 +113,7 @@ SCAN_DIR="${1:-$REPO_ROOT}"
 # ─── Files that legitimately mention the forbidden tokens ────────────────
 # The check script itself and its test must spell the tokens literally.
 # scripts/check-terminal-routing-comments.sh,
-# scripts/check-admin-dispatcher-brand-accent.sh, and
+# scripts/check-bare-shadcn-accent.sh, and
 # scripts/check-no-inline-ecs-healthcheck.sh each have a comment
 # explaining that they avoid ``mapfile`` for bash 3.2 reasons — those
 # comments are excluded via the generic comment-line filter, not by
