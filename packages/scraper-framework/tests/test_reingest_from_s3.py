@@ -462,6 +462,242 @@ class TestReparseDocumentNulBytes:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — merge asymmetry regression (#4142)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentMergeAsymmetry:
+    """Regression coverage for #4142.
+
+    Pre-fix, the merge logic at lines ~944-965 of
+    ``scripts/reingest_from_s3.py::_reparse_document`` unconditionally
+    overwrote ``judge_name``, ``department``, and ``parties`` from
+    ``parsed.X`` even when the parser returned ``None`` / ``[]``.  This
+    is the silent-data-loss path that compounded #3986 for Live-only
+    scrapers — a no-op ``parse_document`` (returns ``doc`` unchanged)
+    silently wipes structured fields the DB still carries from the
+    original capture-time ingestion.
+
+    Post-fix, the merge mirrors the ``case_number`` / ``case_title``
+    pattern: ``parsed.X or doc_meta.get("X")`` for fields with a DB
+    seed (judge_name, department), and ``parsed.X or extracted["X"]``
+    for fields without a DB seed (parties → falls back to the initial
+    ``[]``).  ``outcome`` / ``motion_type`` legitimately stay on the
+    no-DB-seed-available branch with ``None`` as their fallback (their
+    seeds are not selected by FETCH_DOCUMENTS_QUERY).
+
+    See ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+    for the per-scraper audit and the audit's #3 entry on the
+    ``cc_tentatives_portal`` / ``oc_tentatives`` / ``sf_civil_tentatives``
+    Live-only triage.
+    """
+
+    def _doc_meta(
+        self,
+        *,
+        judge_name: str | None = None,
+        department: str | None = None,
+    ) -> dict:
+        """Build a doc_meta dict mirroring the production shape (lines ~2408-2432).
+
+        ``judge_name`` and ``department`` ride along on every doc_meta
+        (the rulings row's canonical_name and department, see
+        FETCH_DOCUMENTS_QUERY).  ``parties`` is intentionally absent —
+        no DB seed exists today.
+        """
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "San Francisco",
+            "court_name": "San Francisco Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "CGC-24-12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-sf-civil-tentatives",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+            "judge_name": judge_name,
+            "department": department,
+        }
+
+    def _live_only_no_op_parsed(self) -> MagicMock:
+        """Build a parsed mock that mirrors a Live-only no-op parse_document.
+
+        Live-only scrapers (e.g. ``ca/sf_civil_tentatives.py:1153``) return
+        ``doc`` unchanged from ``parse_document``.  The ``cap_doc`` built
+        inside ``_reparse_document`` carries only ``raw_content`` and
+        identifiers, so the parsed object's structured fields are all
+        falsy — exactly the input shape that this regression test
+        exercises.
+        """
+        parsed = MagicMock()
+        parsed.ruling_text = "<html>ruling body</html>"
+        parsed.case_number = None
+        parsed.case_title = None
+        parsed.judge_name = None
+        parsed.outcome = None
+        parsed.motion_type = None
+        parsed.department = None
+        parsed.parties = []
+        parsed.hearing_date = None
+        return parsed
+
+    def test_merge_asymmetry_live_only_no_op_preserves_db_seed_judge_name_and_department(
+        self,
+    ) -> None:
+        """A no-op parse_document MUST NOT clobber DB-seeded fields.
+
+        Pre-fix, ``extracted["judge_name"] = parsed.judge_name`` set the
+        result to ``None`` even when ``doc_meta["judge_name"]`` carried
+        the canonical_name from the rulings row.  Same for department.
+        Post-fix, the DB seed survives because ``parsed.X`` is ``None``
+        and the ``or doc_meta.get("X")`` fallback returns the seed.
+        """
+        raw = b"<html>ruling body</html>"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-live-only"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(
+                raw,
+                "test-live-only",
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            )
+            assert result["judge_name"] == "Hon. Jane Smith"
+            assert result["department"] == "C-32"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-live-only", None)
+
+    def test_merge_asymmetry_reingest_aware_overrides_db_seed_when_parsed_present(
+        self,
+    ) -> None:
+        """A reingest-aware parse_document's value MUST win over the DB seed.
+
+        The fallback only fires when ``parsed.X`` is falsy.  When the
+        parser produces a real value (the reingest-aware happy path),
+        that value supersedes any DB seed.  This guards against the
+        opposite over-correction — making the fallback unconditional.
+        """
+        raw = b"<html>ruling body</html>"
+        parsed = self._live_only_no_op_parsed()
+        parsed.judge_name = "Hon. John Parsed"
+        parsed.department = "D-1"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+        reingest._SCRAPER_REGISTRY["test-reingest-aware"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(
+                raw,
+                "test-reingest-aware",
+                self._doc_meta(judge_name="Hon. DB Seed", department="D-X"),
+            )
+            assert result["judge_name"] == "Hon. John Parsed"
+            assert result["department"] == "D-1"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-reingest-aware", None)
+
+    def test_merge_asymmetry_parties_fall_back_to_initial_empty_list_on_no_op(
+        self,
+    ) -> None:
+        """``parties`` MUST fall back to the initial ``[]`` on a no-op.
+
+        ``doc_meta`` does not carry a parties seed (no FETCH_DOCUMENTS_QUERY
+        column for it), so the symmetric-merge fallback is to the prior
+        ``extracted["parties"]`` value — which is initialized to ``[]``
+        at line ~911 of ``_reparse_document``.  Pre-fix, an empty
+        ``parsed.parties`` would still unconditionally overwrite, but
+        the result was already ``[]`` so this test specifically guards
+        the *post-fix* invariant: the result is the empty list (not
+        ``None``, not a crash) when the parser returns either ``None``
+        or ``[]``.
+        """
+        raw = b"<html>ruling body</html>"
+
+        # Case A: parse_document returns parties=[] (today's Live-only shape).
+        parsed_empty = self._live_only_no_op_parsed()
+        parsed_empty.parties = []
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed_empty
+        reingest._SCRAPER_REGISTRY["test-parties-empty"] = mock_scraper_cls
+        try:
+            result = reingest._reparse_document(raw, "test-parties-empty", self._doc_meta())
+            assert result["parties"] == []
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-parties-empty", None)
+
+        # Case B: parse_document returns parties=None (defensive — a future
+        # Live-only addition could leave the attribute None instead of [];
+        # the symmetric-merge fallback must cope with both.)
+        parsed_none = self._live_only_no_op_parsed()
+        parsed_none.parties = None
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed_none
+        reingest._SCRAPER_REGISTRY["test-parties-none"] = mock_scraper_cls
+        try:
+            result = reingest._reparse_document(raw, "test-parties-none", self._doc_meta())
+            assert result["parties"] == []
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-parties-none", None)
+
+    def test_merge_asymmetry_reingest_aware_overrides_parties_when_parsed_populated(
+        self,
+    ) -> None:
+        """A populated ``parsed.parties`` MUST win over the empty-list fallback."""
+        raw = b"<html>ruling body</html>"
+        parsed = self._live_only_no_op_parsed()
+        parsed.parties = [
+            {"name": "Alice Smith", "role": "plaintiff"},
+            {"name": "Bob Jones", "role": "defendant"},
+        ]
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+        reingest._SCRAPER_REGISTRY["test-parties-populated"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-parties-populated", self._doc_meta())
+            assert result["parties"] == [
+                {"name": "Alice Smith", "role": "plaintiff"},
+                {"name": "Bob Jones", "role": "defendant"},
+            ]
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-parties-populated", None)
+
+    def test_merge_asymmetry_doc_meta_missing_judge_name_and_department_keys_does_not_crash(
+        self,
+    ) -> None:
+        """``doc_meta.get("judge_name")`` returns ``None`` when the key is absent.
+
+        Older callers (or future call sites that build a minimal
+        doc_meta) might omit the ``judge_name`` / ``department`` keys
+        entirely.  ``.get()`` returns ``None`` in that case — same
+        result as the Live-only no-op above, with no KeyError.
+        """
+        raw = b"<html>ruling body</html>"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-missing-keys"] = mock_scraper_cls
+
+        # Build a doc_meta WITHOUT judge_name / department keys.
+        meta = self._doc_meta()
+        meta.pop("judge_name", None)
+        meta.pop("department", None)
+
+        try:
+            result = reingest._reparse_document(raw, "test-missing-keys", meta)
+            assert result["judge_name"] is None
+            assert result["department"] is None
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-missing-keys", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — DB format='txt' regression (#4122)
 # ---------------------------------------------------------------------------
 

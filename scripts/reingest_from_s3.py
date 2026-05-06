@@ -946,23 +946,40 @@ def _reparse_document(
             extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
-            extracted["judge_name"] = parsed.judge_name
-            # Normalize scraper-provided outcome to lowercase enum value
-            # (#2113).  Mirrors the normalization in worker.py so reingest
-            # produces the same canonical values as live ingestion.
+            # Symmetric merge with DB-seeded fallback (#4142).  A no-op
+            # ``parse_document`` on a Live-only scraper (e.g. SF civil
+            # tentatives, CC tentatives portal) returns the cap_doc
+            # unchanged with ``judge_name`` / ``department`` / ``parties``
+            # equal to ``None`` / ``[]``.  Without this fallback those
+            # values silently overwrite the DB-seeded values pulled from
+            # the rulings row at lines ~2408-2432, which is the same
+            # silent-data-loss path #3986 surfaced for CourtListener.
+            # See ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+            # for the full per-scraper audit.
+            extracted["judge_name"] = parsed.judge_name or doc_meta.get("judge_name")
+            # ``outcome`` and ``motion_type`` legitimately fall back to
+            # ``None`` here rather than a DB seed: ``doc_meta`` does not
+            # carry these fields (FETCH_DOCUMENTS_QUERY at lines ~380-403
+            # does not select them from the rulings row), so there is no
+            # seed to fall back to.  The LLM and regex tiers below
+            # repopulate them from text when missing.  Normalization
+            # (#2113 outcome, #1849 motion_type) mirrors the worker.py
+            # path so reingest produces the same canonical values as
+            # live ingestion.
             extracted["outcome"] = (
                 normalize_outcome(parsed.outcome) if parsed.outcome else None
             )
-            # Normalize scraper-provided motion_type to snake_case (#1849).
-            # Mirrors the normalization in worker.py so reingest produces
-            # the same canonical values as live ingestion.
             extracted["motion_type"] = (
                 normalize_motion_type(parsed.motion_type)
                 if parsed.motion_type
                 else None
             )
-            extracted["department"] = parsed.department
-            extracted["parties"] = parsed.parties
+            extracted["department"] = parsed.department or doc_meta.get("department")
+            # ``parties`` falls back to the prior ``extracted["parties"]``
+            # (initialized to ``[]`` at line 911) because ``doc_meta``
+            # does not carry a parties seed.  The LLM and enrichment
+            # tiers below repopulate this when text is available.
+            extracted["parties"] = parsed.parties or extracted["parties"]
             if parsed.hearing_date:
                 extracted["hearing_date"] = (
                     parsed.hearing_date.date()
