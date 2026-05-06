@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
 import structlog.testing
+from helpers.reingest import make_reingest_cap_doc
 
 from courts.federal.courtlistener import (
     _CL_COURT_ID_TO_JURISDICTION,
@@ -34,6 +35,13 @@ from courts.federal.courtlistener import (
     default_config,
 )
 from framework import CapturedDocument, ContentFormat, ScraperConfig
+
+# Identifier-shape defaults shared across the reingest-path regression tests.
+_CL_SCRAPER_ID = "federal-courtlistener-opinions"
+_CL_STATE = "Federal"
+_CL_COUNTY = "Federal"
+_CL_COURT = "CourtListener"
+_CL_SOURCE_URL_BASE = "https://www.courtlistener.com/api/rest/v4/opinions"
 
 # ---------------------------------------------------------------------------
 # Fixtures — sample API responses
@@ -1634,6 +1642,10 @@ class TestParseDocumentReingestPath:
     ) -> CapturedDocument:
         """Build a fresh CapturedDocument with only raw_content set —
         mirrors the shape ``scripts/reingest_from_s3.py:890-901`` constructs.
+
+        Delegates to ``helpers.reingest.make_reingest_cap_doc`` (the
+        shared scaffold from #4153) — only the envelope-shape JSON
+        construction is CourtListener-specific.
         """
         envelope: dict = {}
         if cluster is not None:
@@ -1644,16 +1656,15 @@ class TestParseDocumentReingestPath:
             envelope["docket"] = docket
         raw_content = json.dumps(envelope, default=str).encode("utf-8")
 
-        return CapturedDocument(
-            document_id="reingest-doc-1",
-            scraper_id="federal-courtlistener-opinions",
-            state="Federal",
-            county="Federal",
-            court="CourtListener",
-            source_url="https://www.courtlistener.com/api/rest/v4/opinions/2001/",
-            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
-            content_format=ContentFormat.TEXT,
+        return make_reingest_cap_doc(
             raw_content=raw_content,
+            scraper_id=_CL_SCRAPER_ID,
+            state=_CL_STATE,
+            county=_CL_COUNTY,
+            court=_CL_COURT,
+            source_url=f"{_CL_SOURCE_URL_BASE}/2001/",
+            content_format=ContentFormat.TEXT,
+            document_id="reingest-doc-1",
             content_hash="0" * 64,
         )
 
@@ -1715,16 +1726,14 @@ class TestParseDocumentReingestPath:
         leave the doc untouched so the reingest caller can fall back to
         its raw text decode.
         """
-        doc = CapturedDocument(
-            document_id="reingest-bad-json",
-            scraper_id="federal-courtlistener-opinions",
-            state="Federal",
-            county="Federal",
-            court="CourtListener",
-            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
-            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
-            content_format=ContentFormat.TEXT,
+        doc = make_reingest_cap_doc(
             raw_content=b"not json",
+            scraper_id=_CL_SCRAPER_ID,
+            state=_CL_STATE,
+            county=_CL_COUNTY,
+            court=_CL_COURT,
+            source_url=f"{_CL_SOURCE_URL_BASE}/9999/",
+            document_id="reingest-bad-json",
             content_hash="0" * 64,
         )
 
@@ -1744,16 +1753,14 @@ class TestParseDocumentReingestPath:
         """
         # Well-formed JSON but no cluster/opinion keys.
         raw = json.dumps({"unrelated": {"data": "shape"}}).encode("utf-8")
-        doc = CapturedDocument(
-            document_id="reingest-wrong-shape",
-            scraper_id="federal-courtlistener-opinions",
-            state="Federal",
-            county="Federal",
-            court="CourtListener",
-            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
-            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
-            content_format=ContentFormat.TEXT,
+        doc = make_reingest_cap_doc(
             raw_content=raw,
+            scraper_id=_CL_SCRAPER_ID,
+            state=_CL_STATE,
+            county=_CL_COUNTY,
+            court=_CL_COURT,
+            source_url=f"{_CL_SOURCE_URL_BASE}/9999/",
+            document_id="reingest-wrong-shape",
             content_hash="0" * 64,
         )
 
@@ -1841,16 +1848,14 @@ class TestParseDocumentReingestPath:
 
     def test_parse_document_handles_none_raw_content(self) -> None:
         """Defensive: parse_document on a doc with raw_content=b'' returns unchanged."""
-        doc = CapturedDocument(
-            document_id="reingest-empty",
-            scraper_id="federal-courtlistener-opinions",
-            state="Federal",
-            county="Federal",
-            court="CourtListener",
-            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
-            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
-            content_format=ContentFormat.TEXT,
+        doc = make_reingest_cap_doc(
             raw_content=b"",
+            scraper_id=_CL_SCRAPER_ID,
+            state=_CL_STATE,
+            county=_CL_COUNTY,
+            court=_CL_COURT,
+            source_url=f"{_CL_SOURCE_URL_BASE}/9999/",
+            document_id="reingest-empty",
             content_hash="0" * 64,
         )
 

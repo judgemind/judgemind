@@ -21,6 +21,7 @@ import httpx
 import pytest
 import respx
 import structlog.testing
+from helpers.reingest import make_reingest_cap_doc
 
 from courts.ca.cc_tentatives_portal import (
     BASE_URL,
@@ -35,7 +36,17 @@ from courts.ca.cc_tentatives_portal import (
     _parse_listing_table,
 )
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
-from framework import CapturedDocument, ContentFormat
+from framework import ContentFormat
+
+# Identifier-shape defaults shared across this module's reingest-path
+# regression tests.  Kept as module constants so each call to the shared
+# ``make_reingest_cap_doc`` helper pins the same scraper identity.
+_CC_SCRAPER_ID = "ca-cc-tentatives-portal"
+_CC_STATE = "CA"
+_CC_COUNTY = "Contra Costa"
+_CC_COURT = "Superior Court"
+_CC_SOURCE_URL = "https://contracosta.courts.ca.gov/tentative-ruling/l24-04564"
+_CC_CAPTURE_TS = datetime(2025, 1, 28, 12, 0, 0, tzinfo=UTC)
 
 pytestmark = pytest.mark.regression
 
@@ -539,29 +550,6 @@ def _build_envelope_bytes(
     return json.dumps(envelope).encode("utf-8")
 
 
-def _make_cap_doc(raw_content: bytes) -> CapturedDocument:
-    """Build a CapturedDocument the way reingest_from_s3._reparse_document does.
-
-    Mirrors the production shape: only ``raw_content`` and the
-    identifier fields are set; every parsed field is left at its
-    default (``None`` / ``[]`` / ``{}``).  The structured-field
-    population MUST come from ``parse_document`` reading
-    ``raw_content`` — exactly the contract this test suite enforces.
-    """
-    return CapturedDocument(
-        document_id="test-doc-id",
-        scraper_id="ca-cc-tentatives-portal",
-        state="CA",
-        county="Contra Costa",
-        court="Superior Court",
-        source_url="https://contracosta.courts.ca.gov/tentative-ruling/l24-04564",
-        capture_timestamp=datetime(2025, 1, 28, 12, 0, 0, tzinfo=UTC),
-        content_format=ContentFormat.TEXT,
-        raw_content=raw_content,
-        content_hash="deadbeef" * 8,
-    )
-
-
 def test_parse_document_reingest_populates_fields_from_envelope() -> None:
     """Acceptance criterion #3 (#4133) — parse_document populates structured fields
     from raw_content alone, with no live-capture state available.
@@ -577,7 +565,15 @@ def test_parse_document_reingest_populates_fields_from_envelope() -> None:
     pdf_bytes = _load_bytes("sample.pdf")
 
     raw = _build_envelope_bytes(detail_html=detail_html, pdf_bytes=pdf_bytes)
-    doc = _make_cap_doc(raw)
+    doc = make_reingest_cap_doc(
+        raw_content=raw,
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
     assert doc.case_number is None
     assert doc.judge_name is None
     assert doc.department is None
@@ -627,7 +623,15 @@ def test_parse_document_reingest_pre_4133_pdf_bytes_returns_unchanged() -> None:
     (the symmetric merge in #4142 keeps the DB seeds intact).
     """
     pdf_bytes = _load_bytes("sample.pdf")
-    doc = _make_cap_doc(pdf_bytes)
+    doc = make_reingest_cap_doc(
+        raw_content=pdf_bytes,
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
 
     scraper = _make_reingest_scraper()
     parsed = scraper.parse_document(doc)
@@ -646,7 +650,15 @@ def test_parse_document_reingest_pre_4133_pdf_bytes_returns_unchanged() -> None:
 def test_parse_document_reingest_invalid_envelope_shape_returns_unchanged() -> None:
     """A JSON-decodable but wrong-shaped envelope must not populate garbage fields."""
     raw = json.dumps({"unrelated": "payload"}).encode("utf-8")
-    doc = _make_cap_doc(raw)
+    doc = make_reingest_cap_doc(
+        raw_content=raw,
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
 
     scraper = _make_reingest_scraper()
     parsed = scraper.parse_document(doc)
@@ -660,7 +672,15 @@ def test_parse_document_reingest_invalid_envelope_shape_returns_unchanged() -> N
 
 def test_parse_document_reingest_empty_raw_content_returns_unchanged() -> None:
     """Empty raw_content (defensive case) must not crash."""
-    doc = _make_cap_doc(b"")
+    doc = make_reingest_cap_doc(
+        raw_content=b"",
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
     scraper = _make_reingest_scraper()
     parsed = scraper.parse_document(doc)
     assert parsed.case_number is None
@@ -683,7 +703,15 @@ def test_parse_document_reingest_envelope_with_unknown_pdf_filename_skips_dept()
         pdf_bytes=pdf_bytes,
         pdf_url="https://example.com/some-other-name.pdf",
     )
-    doc = _make_cap_doc(raw)
+    doc = make_reingest_cap_doc(
+        raw_content=raw,
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
 
     scraper = _make_reingest_scraper()
     parsed = scraper.parse_document(doc)
