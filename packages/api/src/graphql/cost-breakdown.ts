@@ -62,6 +62,16 @@ import {
   type SelectionSetNode,
   Kind,
 } from 'graphql';
+// Realm-stable type discriminators — see realm-stable-type-checks.ts
+// for the full background. CI guards against a future regression
+// reaching for `instanceof GraphQLObjectType` again
+// (`scripts/check-no-graphql-instanceof.sh`, issue #4198).
+import {
+  type CompositeTypeLike,
+  isComposite,
+  isObjectOrInterface,
+  typeTag,
+} from './realm-stable-type-checks';
 
 /**
  * Default cost-rule options must match the constants exported by
@@ -114,59 +124,13 @@ const SELF_SUFFIX = ':__self';
 const TRUNCATED_KEY = '__truncated';
 
 /**
- * Read `Symbol.toStringTag` on a graphql-js type, falling back to the
- * constructor name. graphql-js sets `[Symbol.toStringTag]` on every
- * type class (e.g. `'GraphQLNonNull'`, `'GraphQLList'`,
- * `'GraphQLObjectType'`), so this is a realm-stable discriminator —
- * unlike `instanceof`, which is bound to a specific realm's class
- * identity.
- *
- * Same approach as `cost-rule-estimator.ts` — vitest's ESM loader can
- * resolve `graphql` and `graphql/index.mjs` as distinct module
- * instances, which makes `field.type instanceof GraphQLObjectType`
- * return `false` for a structurally-correct object type and silently
- * collapse everything to scalar leaf cost. The `costLimitPlugin`
- * passes its Apollo-Server-built (CJS realm) schema into
- * `computeBreakdown`, which in test runs ESM — the realm gap is real
- * and verified.
- */
-function typeTag(t: unknown): string | undefined {
-  if (t == null || typeof t !== 'object') return undefined;
-  const sym = (t as { [Symbol.toStringTag]?: string })[Symbol.toStringTag];
-  if (typeof sym === 'string') return sym;
-  const ctor = (t as { constructor?: { name?: string } }).constructor;
-  return ctor?.name;
-}
-
-function isComposite(named: GraphQLOutputType): boolean {
-  const tag = typeTag(named);
-  return (
-    tag === 'GraphQLObjectType' ||
-    tag === 'GraphQLInterfaceType' ||
-    tag === 'GraphQLUnionType'
-  );
-}
-
-/**
- * Composite type as duck-typed by graphql-js's Object/Interface
- * surface (the only methods this module needs). Using a structural
- * type instead of the realm-bound `GraphQLObjectType | GraphQLInterfaceType`
- * union keeps the walker realm-stable — see the `typeTag` docstring.
- */
-interface CompositeTypeLike {
-  name: string;
-  getFields(): Record<string, { type: GraphQLOutputType }>;
-}
-
-/** True only for Object/Interface types — Union types have no `.getFields()`. */
-function isObjectOrInterface(t: unknown): t is CompositeTypeLike {
-  const tag = typeTag(t);
-  return tag === 'GraphQLObjectType' || tag === 'GraphQLInterfaceType';
-}
-
-/**
  * Unwrap NonNull/List wrappers and return the unwrapped (named) type
  * plus the cumulative list-factor multiplier picked up along the way.
+ *
+ * `typeTag` (and the `isComposite` / `isObjectOrInterface` helpers
+ * used elsewhere in this file) come from
+ * `realm-stable-type-checks.ts` — see that file's docstring for the
+ * realm-clash rationale.
  */
 function unwrapType(
   type: GraphQLOutputType,

@@ -53,6 +53,11 @@ import type { GraphQLOutputType } from 'graphql';
 // this file. The signature comes from the same `/cjs` subpath the
 // production wiring uses, for consistency.
 import type { ComplexityEstimator } from 'graphql-query-complexity/cjs';
+// Realm-stable type discriminators — see realm-stable-type-checks.ts
+// for the full background. CI guards against a future regression
+// reaching for `instanceof GraphQLObjectType` again
+// (`scripts/check-no-graphql-instanceof.sh`, issue #4198).
+import { typeTag } from './realm-stable-type-checks';
 
 /**
  * Cost of one scalar / enum / `__typename` leaf, before list factor is
@@ -74,22 +79,6 @@ export const OBJECT_COST = 0;
  * `listFactor: 10` default.
  */
 export const LIST_FACTOR = 10;
-
-/**
- * Read `Symbol.toStringTag` on a type, falling back to the
- * constructor name. graphql-js sets `[Symbol.toStringTag]` on every
- * type class (e.g. `'GraphQLNonNull'`, `'GraphQLList'`,
- * `'GraphQLObjectType'`), so this is a realm-stable discriminator —
- * unlike `instanceof`, which is bound to a specific realm's class
- * identity.
- */
-function typeTag(t: unknown): string | undefined {
-  if (t == null || typeof t !== 'object') return undefined;
-  const sym = (t as { [Symbol.toStringTag]?: string })[Symbol.toStringTag];
-  if (typeof sym === 'string') return sym;
-  const ctor = (t as { constructor?: { name?: string } }).constructor;
-  return ctor?.name;
-}
 
 /**
  * Unwrap `NonNull`/`List` wrappers and return the named (innermost)
