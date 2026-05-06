@@ -13,12 +13,14 @@ Other RulingIDs use the same response format.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import respx
+from helpers.reingest import make_reingest_cap_doc
 
 from courts.ca.sf_civil_tentatives import (
     CAPSOLVER_API_KEY_ENV_VAR,
@@ -39,9 +41,20 @@ from courts.ca.sf_civil_tentatives import (
     parse_hearing_date,
 )
 from courts.ca.sf_civil_tentatives import default_config as sf_civil_default_config
+from framework import ContentFormat
 
 # Fake session ID for tests — bypasses Playwright session acquisition.
 TEST_SESSION_ID = "AABBCCDD1122334455667788AABBCCDD11223344"
+
+# Identifier-shape defaults shared across this module's reingest-path
+# regression tests. Kept as module constants so each call to the shared
+# ``make_reingest_cap_doc`` helper pins the same scraper identity.
+_SF_SCRAPER_ID = "ca-sf-tentatives-civil"
+_SF_STATE = "CA"
+_SF_COUNTY = "San Francisco"
+_SF_COURT = "Superior Court"
+_SF_SOURCE_URL_BASE = "https://webapps.sftc.org/tr/tr.dll?RulingID=10"
+_SF_CAPTURE_TS = datetime(2026, 3, 23, tzinfo=UTC)
 
 pytestmark = pytest.mark.regression
 
@@ -1838,21 +1851,22 @@ class TestParseDocumentReingestSafety:
 
     @staticmethod
     def _make_reingest_cap_doc(raw_content: bytes) -> Any:
-        """Construct the shape of CapturedDocument the reingest path passes."""
-        from datetime import UTC, datetime
+        """Construct the shape of CapturedDocument the reingest path passes.
 
-        from framework import CapturedDocument, ContentFormat
-
-        return CapturedDocument(
-            document_id="00000000-0000-0000-0000-000000000001",
-            scraper_id="ca-sf-tentatives-civil",
-            state="CA",
-            county="San Francisco",
-            court="Superior Court",
-            source_url="https://webapps.sftc.org/tr/tr.dll?RulingID=10",
-            capture_timestamp=datetime(2026, 3, 23, tzinfo=UTC),
-            content_format=ContentFormat.HTML,
+        Thin wrapper around the shared ``make_reingest_cap_doc`` helper —
+        pins SF-civil-specific identifier defaults so the per-test call
+        sites stay terse.
+        """
+        return make_reingest_cap_doc(
             raw_content=raw_content,
+            scraper_id=_SF_SCRAPER_ID,
+            state=_SF_STATE,
+            county=_SF_COUNTY,
+            court=_SF_COURT,
+            source_url=_SF_SOURCE_URL_BASE,
+            capture_timestamp=_SF_CAPTURE_TS,
+            content_format=ContentFormat.HTML,
+            document_id="00000000-0000-0000-0000-000000000001",
             content_hash="0" * 64,
         )
 
@@ -2089,10 +2103,6 @@ class TestParseDocumentReingestSafety:
         (mimicking what reingest does) and assert parse_document recovers
         the same field values as the live capture.
         """
-        from datetime import UTC, datetime
-
-        from framework import CapturedDocument, ContentFormat
-
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
         _mock_rest_api(json_text)
 
@@ -2113,16 +2123,16 @@ class TestParseDocumentReingestSafety:
         # Mimic reingest's CapturedDocument construction — only raw_content
         # carries content into parse_document, every other field is the
         # DB-seeded shape.
-        reingest_doc = CapturedDocument(
-            document_id=live_doc.document_id,
+        reingest_doc = make_reingest_cap_doc(
+            raw_content=live_doc.raw_content,
             scraper_id=live_doc.scraper_id,
             state=live_doc.state,
             county=live_doc.county,
             court=live_doc.court,
             source_url=live_doc.source_url,
-            capture_timestamp=datetime(2026, 3, 23, tzinfo=UTC),
+            capture_timestamp=_SF_CAPTURE_TS,
             content_format=ContentFormat.HTML,
-            raw_content=live_doc.raw_content,
+            document_id=live_doc.document_id,
             content_hash="0" * 64,
         )
 
