@@ -37,6 +37,15 @@ ENTRYPOINT="$REPO_ROOT/scripts/dispatcher/agent-runner-entrypoint.sh"
 # and claude_phase_timeout_seconds_by_phase were extracted to a sourceable helper.
 # Tests that awk-extract those functions must read from HELPER, not ENTRYPOINT.
 HELPER="$(dirname "$ENTRYPOINT")/agent_runner_run_claude_phase.sh"
+# #4138: per-phase case-arm bodies (planning, ralph, summary, verify, claiming,
+# push_and_pr, fix_conflict, fix_ci, operational, awaiting_ci, merge,
+# awaiting_deploy, retro/setup, *) were extracted from ``phase_loop()`` into
+# named handler functions in this sourceable file. Tests that awk-extract those
+# arm bodies (T3651, T3675 for the ralph baseline-rebase block) must read from
+# HANDLERS, not ENTRYPOINT. The 30 ``bash $ENTRYPOINT`` invocation tests are
+# unchanged — they still drive the entrypoint top-to-bottom and observe the
+# same external-API behavior (psql.log / claude.log / git.log / gh.log).
+HANDLERS="$(dirname "$ENTRYPOINT")/agent_runner_handlers.sh"
 FAILURES=0
 TESTS=0
 
@@ -7386,13 +7395,19 @@ fi
 # advance_with_status branch.
 # ══════════════════════════════════════════════════════════════════════════
 
-# Extract the #3651 envelope-construction block from the entrypoint via
-# awk. Boundary: from ``_ralph_baseline_output=""`` (a marker line added
-# in #3651) to the matching outer ``fi``. Walks ``if [[`` openings and
-# ``fi`` closings to get the nesting right. This matches T3614's "extract
-# the actual production code path" approach, adapted for an inline block
-# (not a function — handle_ralph_baseline_rebase doesn't exist as a
-# function in the entrypoint, see issue body).
+# Extract the #3651 envelope-construction block via awk. Boundary: from
+# ``_ralph_baseline_output=""`` (a marker line added in #3651) to the
+# matching outer ``fi``. Walks ``if [[`` openings and ``fi`` closings to
+# get the nesting right. This matches T3614's "extract the actual
+# production code path" approach, adapted for an inline block.
+#
+# #4138: the ralph baseline-rebase block was moved from an inline
+# ``planning|ralph|summary|verify)`` arm in ``phase_loop()`` into the
+# ``handle_ralph`` function in ``agent_runner_handlers.sh``. Read the
+# block from HANDLERS instead of ENTRYPOINT — the production code path
+# is unchanged (the handler is sourced into the entrypoint at startup
+# and called from the new thin dispatcher arm), only the file location
+# changed.
 t3651_block="$TEST_TMP/t3651-envelope-block.sh"
 awk '
   /_ralph_baseline_output=""/ { in_block=1; depth=0 }
@@ -7405,7 +7420,7 @@ awk '
       if (depth == 0) exit
     }
   }
-' "$ENTRYPOINT" > "$t3651_block"
+' "$HANDLERS" > "$t3651_block"
 
 if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t3651_block"; then
     pass "#3651 T3651 setup — extracted envelope block contains the new log event marker"
@@ -9264,6 +9279,10 @@ fi
 # ``fi`` block and source it standalone with the inputs the entrypoint
 # would have computed (``_baseline_conflict_files_json``,
 # ``_baseline_rebase_stderr_tail``).
+#
+# #4138: the inline block now lives inside ``handle_ralph`` in
+# ``agent_runner_handlers.sh``. Extract from HANDLERS — see T3651 setup
+# above for the same retarget rationale.
 
 t3675_block="$TEST_TMP/t3675-envelope-block.sh"
 awk '
@@ -9277,7 +9296,7 @@ awk '
       if (depth == 0) exit
     }
   }
-' "$ENTRYPOINT" > "$t3675_block"
+' "$HANDLERS" > "$t3675_block"
 
 if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t3675_block"; then
     pass "#3675 T3675 setup — extracted ralph_baseline envelope block contains the log event marker"
