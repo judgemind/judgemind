@@ -2571,12 +2571,33 @@ def is_probate_decedent_name(
     return True
 
 
+# Default plausibility windows (in days) for civil tentative rulings.
+# Civil tentatives are typically captured ~24 hours before the hearing —
+# a value more than ±14 days from capture is almost certainly a continuance
+# date or a referenced minute-order date that the LLM picked up from body
+# text.  See #2370 for the original Ventura case that motivated this guard.
+_HEARING_DATE_DEFAULT_PAST_DAYS = 14
+_HEARING_DATE_DEFAULT_FUTURE_DAYS = 14
+
+# Wider plausibility window for probate calendars.  Probate departments
+# (e.g. CC dept 38, where Judge Hinton publishes a single multi-week master
+# calendar covering 4-16 hearings spanning 30+ days) routinely post the next
+# month or more of hearings in one PDF.  The civil ±14 day window rejects
+# correctly-extracted regex dates from these calendars, producing the NULL-
+# hearing class tracked by #4251.  The 60-day window covers the observed
+# spread (-24 to +17 days) with margin for natural variation in publication
+# cadence (some months/depts publish farther out).
+_HEARING_DATE_PROBATE_PAST_DAYS = 60
+_HEARING_DATE_PROBATE_FUTURE_DAYS = 60
+
+
 def is_plausible_hearing_date(
     hearing_date: date | None,
     capture_timestamp: datetime | None,
     *,
-    past_days: int = 14,
-    future_days: int = 14,
+    past_days: int | None = None,
+    future_days: int | None = None,
+    case_type: str | None = None,
 ) -> bool:
     """Return True if *hearing_date* is plausible given *capture_timestamp*
     (#2370).
@@ -2585,6 +2606,12 @@ def is_plausible_hearing_date(
     more than ``past_days`` before capture or ``future_days`` after capture
     is almost certainly a continuance or referenced minute-order date,
     not the actual hearing date.
+
+    Probate departments are an exception (#4251): they publish multi-week
+    master calendars covering 30+ days of hearings in a single PDF, so a
+    ±14 day window incorrectly rejects correctly-extracted regex dates.
+    When ``case_type == "probate"``, the helper widens the window to
+    ±60 days unless ``past_days`` / ``future_days`` are explicitly passed.
 
     Parameters
     ----------
@@ -2595,12 +2622,19 @@ def is_plausible_hearing_date(
         ruling).  When ``None``, plausibility cannot be checked and the
         function returns ``True`` (permissive — don't drop data we can't
         verify).
-    past_days : int
-        Maximum number of days *before* capture allowed.  Default 14.
-    future_days : int
-        Maximum number of days *after* capture allowed.  Default 14.
-        Tentative rulings are sometimes posted up to a week before the
-        hearing; allow a bit of slack.
+    past_days : int | None
+        Explicit maximum number of days *before* capture allowed.  When
+        ``None`` (default), the value is chosen based on ``case_type``:
+        ``60`` for ``"probate"``, ``14`` for everything else.  Pass an
+        explicit integer to override the case-type default.
+    future_days : int | None
+        Explicit maximum number of days *after* capture allowed.  Same
+        case-type defaulting as ``past_days``.
+    case_type : str | None
+        Optional case type for window selection.  ``"probate"`` selects
+        the wider ±60 day window (#4251).  All other values (including
+        ``None``) select the civil-tentative ±14 day default.  Ignored
+        when ``past_days`` / ``future_days`` are passed explicitly.
 
     Returns
     -------
@@ -2612,6 +2646,18 @@ def is_plausible_hearing_date(
     if capture_timestamp is None:
         # Can't verify — default to plausible.
         return True
+    if past_days is None:
+        past_days = (
+            _HEARING_DATE_PROBATE_PAST_DAYS
+            if case_type == "probate"
+            else _HEARING_DATE_DEFAULT_PAST_DAYS
+        )
+    if future_days is None:
+        future_days = (
+            _HEARING_DATE_PROBATE_FUTURE_DAYS
+            if case_type == "probate"
+            else _HEARING_DATE_DEFAULT_FUTURE_DAYS
+        )
     capture_date = capture_timestamp.date()
     delta = (hearing_date - capture_date).days
     return -past_days <= delta <= future_days

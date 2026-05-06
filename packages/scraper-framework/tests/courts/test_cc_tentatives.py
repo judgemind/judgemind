@@ -11,6 +11,15 @@ Additional fixture captured from live site 2026-04-14 (#2449):
     (probate, 16 entries, exercises the Csicsery/Cianci/Vincent fuzzy-match
     scenario from #2449 — three Levenshtein-close case_numbers P25-02101,
     P25-02117, P25-02118 in the same calendar).
+
+Additional fixture captured from S3 archive 2026-04-26 (#4251):
+  cc_dept38_probate_040226.pdf — Dept 38, Judge Barbara C. Hinton
+    (probate, 16 entries, master calendar for APRIL 2, 2026).  Reproduces
+    the dept-38 master-calendar publication cadence (capture 2026-04-26,
+    hearing 2026-04-02 → -24 days, outside the civil ±14 day plausibility
+    window).  The regex extraction works correctly on this format; the
+    case_type-aware window in ``is_plausible_hearing_date`` is what lets
+    the date survive the post-extraction guard.
 """
 
 from __future__ import annotations
@@ -184,6 +193,27 @@ def test_cc_hearing_date_probate_pdf() -> None:
     text = _extract_pdf_text(_load_bytes("cc_dept30_031626.pdf"))
     dt = _cc_hearing_date_from_pdf(text)
     assert dt == datetime(2026, 3, 16)
+
+
+def test_cc_hearing_date_dept38_probate_multi_pdf() -> None:
+    """Regression for #4251 — dept 38 multi-ruling probate calendar.
+
+    The page-1 header is ``COURT CALENDAR FOR APRIL 2, 2026`` followed by 16
+    individual ruling entries.  ``_cc_hearing_date_from_pdf`` MUST extract
+    the date from the cover-page header — the 16 entries below do not
+    repeat the date, so the regex must lock onto the first occurrence.
+
+    Pre-#4251 this test would still pass (regex extraction was never broken
+    for this format).  The actual #4251 bug was downstream: the
+    ``is_plausible_hearing_date`` ±14-day window rejected the correctly-
+    extracted date because the dept-38 master calendar publishes 30+ days
+    in advance.  See ``test_extract.py`` ``TestIsPlausibleHearingDate`` for
+    the case_type-aware window tests; this test guards the regex layer so a
+    future regex regression is caught at the layer where it would happen.
+    """
+    text = _extract_pdf_text(_load_bytes("cc_dept38_probate_040226.pdf"))
+    dt = _cc_hearing_date_from_pdf(text)
+    assert dt == datetime(2026, 4, 2)
 
 
 def test_cc_hearing_date_from_pdf_invalid_civil_date() -> None:

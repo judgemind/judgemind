@@ -1926,8 +1926,23 @@ class IngestionWorker:
                 # hearing date far outside the capture window is almost
                 # certainly wrong — skip it and let regex/capture-date
                 # fallbacks run.
+                #
+                # Probate calendars publish multi-week master schedules
+                # (#4251) — pass the best-known case_type so the helper
+                # widens the window to ±60 days when ``case_type ==
+                # "probate"``.  ``case_type`` may already be populated
+                # from ``event_data`` (line ~1851); if not, the LLM-
+                # matched ``ruling.case_type`` is the next best signal
+                # available before this guard fires.
                 if hearing_dt is None and llm_result.hearing_date is not None:
-                    if is_plausible_hearing_date(llm_result.hearing_date, capture_ts):
+                    plausibility_case_type = case_type or (
+                        ruling.case_type if ruling is not None else None
+                    )
+                    if is_plausible_hearing_date(
+                        llm_result.hearing_date,
+                        capture_ts,
+                        case_type=plausibility_case_type,
+                    ):
                         hearing_dt = llm_result.hearing_date
                         extraction_methods["hearing_date"] = "llm"
                     else:
@@ -1937,6 +1952,7 @@ class IngestionWorker:
                                 "document_id": document_id,
                                 "llm_hearing_date": str(llm_result.hearing_date),
                                 "capture_timestamp": str(capture_ts) if capture_ts else None,
+                                "case_type": plausibility_case_type,
                             },
                         )
                 if not judge_name and llm_result.judge_name:
