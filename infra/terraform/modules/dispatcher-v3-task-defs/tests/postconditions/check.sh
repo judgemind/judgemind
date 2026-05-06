@@ -48,29 +48,46 @@ set -e
 
 echo "$plan_output"
 
-# Any one of the missing-secret / digest-pin / stopTimeout
-# postconditions firing at plan time is sufficient proof the fixture
-# is well-formed. The fixture intentionally trips the missing-secret +
-# digest-pin checks via `aws_ecs_task_definition.broken` and the
-# stopTimeout check via `aws_ecs_task_definition.broken_stop_timeout`
-# (#3940).
-if echo "$plan_output" | grep -q "missing ANTHROPIC_API_KEY"; then
-  echo "PASS: missing-secret postcondition fired at plan time (preferred)."
-  exit 0
-fi
-if echo "$plan_output" | grep -q "is not digest-pinned"; then
-  echo "PASS: digest-pin postcondition fired at plan time (preferred)."
-  exit 0
-fi
-if echo "$plan_output" | grep -q 'stopTimeout != 120'; then
-  echo "PASS: stopTimeout-cap postcondition fired at plan time (preferred)."
+# #4037: assert ALL expected postcondition messages are present, not
+# first-match-wins. The previous shape ("any one PASS = exit 0") would
+# silently mask a regression that disabled, e.g., the stopTimeout
+# postcondition -- the missing-secret PASS would still be observed
+# first and the script would exit 0.
+#
+# The fixture intentionally trips the missing-secret + digest-pin
+# checks via `aws_ecs_task_definition.broken` and the stopTimeout
+# check via `aws_ecs_task_definition.broken_stop_timeout` (#3940).
+# All three error messages should appear concurrently in the same
+# `terraform plan` output.
+expected_passes=(
+  "missing ANTHROPIC_API_KEY"
+  "is not digest-pinned"
+  'stopTimeout != 120'
+)
+missing=()
+for needle in "${expected_passes[@]}"; do
+  if ! echo "$plan_output" | grep -q "$needle"; then
+    missing+=("$needle")
+  fi
+done
+
+if [ ${#missing[@]} -eq 0 ]; then
+  echo "PASS: all expected postconditions fired at plan time."
   exit 0
 fi
 
-if [ "$plan_exit" -eq 0 ]; then
+# Deferred-to-apply fallback: if plan succeeded AND no needles fired,
+# the postconditions are deferred to apply (expected when self.*
+# references are not knowable until apply). Only a *complete* miss is
+# acceptable here -- a partial miss (some needles present, others not)
+# means at least one postcondition was definitely evaluated at plan
+# time but a sibling did not fire, which is the regression class this
+# script must catch.
+if [ "$plan_exit" -eq 0 ] && [ ${#missing[@]} -eq ${#expected_passes[@]} ]; then
   echo "PASS: plan succeeded -- postconditions deferred to apply (expected when self.* references are not knowable until apply)."
   exit 0
 fi
 
-echo "FAIL: terraform plan exited $plan_exit but no expected postcondition error message was visible in the output." >&2
+echo "FAIL: expected postcondition messages not seen in plan output (plan_exit=$plan_exit):" >&2
+printf '  - %s\n' "${missing[@]}" >&2
 exit 1
