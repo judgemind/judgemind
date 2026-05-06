@@ -32,6 +32,7 @@ from courts.federal.courtlistener import (
     _extract_judge_names,
     _map_opinion_type,
     _parse_date,
+    _resolve_court_id,
     default_config,
 )
 from framework import CapturedDocument, ContentFormat, ScraperConfig
@@ -507,6 +508,33 @@ class TestCourtListenerClient:
 
 class TestDataMapping:
     """Tests for the data mapping helper functions."""
+
+    def test_resolve_court_id_prefers_docket(self) -> None:
+        """Regression for #4247: when docket.court is populated, it wins."""
+        cluster = {"court": "/api/rest/v4/courts/parent/"}
+        docket = {"court": "/api/rest/v4/courts/texapp1/"}
+        assert _resolve_court_id(cluster, docket) == "texapp1"
+
+    def test_resolve_court_id_falls_back_to_cluster_when_docket_court_empty(self) -> None:
+        """Backward-compat: cluster.court is consulted when docket.court is empty."""
+        cluster = {"court": "/api/rest/v4/courts/scotus/"}
+        docket = {"court": ""}
+        assert _resolve_court_id(cluster, docket) == "scotus"
+
+    def test_resolve_court_id_uses_cluster_when_docket_is_none(self) -> None:
+        """Backward-compat: cluster.court is used when no docket sub-resource is present."""
+        cluster = {"court": "/api/rest/v4/courts/ca9/"}
+        assert _resolve_court_id(cluster, None) == "ca9"
+
+    def test_resolve_court_id_returns_empty_when_both_missing(self) -> None:
+        """When neither side has a court reference, empty string is returned."""
+        assert _resolve_court_id({"court": ""}, {"court": ""}) == ""
+        assert _resolve_court_id({}, None) == ""
+
+    def test_resolve_court_id_handles_bare_short_id(self) -> None:
+        """Some endpoints return the bare short-id rather than a URL path."""
+        assert _resolve_court_id({"court": ""}, {"court": "texapp14"}) == "texapp14"
+        assert _resolve_court_id({"court": "scotus"}, None) == "scotus"
 
     def test_extract_docket_number(self) -> None:
         """Extract docket number from cluster."""
@@ -1286,15 +1314,25 @@ class TestJurisdictionMapping:
 
     @respx.mock
     def test_empty_court_id_falls_back_to_config_defaults(self) -> None:
-        """Empty court field on cluster falls back to config state/county."""
+        """Empty court field on cluster falls back to config state/county.
+
+        Only triggers when both cluster.court AND docket.court are empty.
+        """
         cluster = _make_cluster(court="")
         opinion = _make_opinion(plain_text="Opinion text")
+        cluster_id = cluster["id"]
 
         respx.get(f"{API_BASE_URL}/clusters/").mock(
             return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
         )
         respx.get(f"{API_BASE_URL}/opinions/").mock(
             return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+        # Docket sub-resource also has no court — resolver falls through.
+        respx.get(f"{API_BASE_URL}/dockets/{cluster_id * 10}/").mock(
+            return_value=httpx.Response(
+                200, json={"id": cluster_id * 10, "court": "", "docket_number": "22-1234"}
+            )
         )
 
         config = _make_scraper_config()  # state="Federal", county="Federal"
@@ -1306,6 +1344,125 @@ class TestJurisdictionMapping:
         doc = docs[0]
         assert doc.state == "Federal"
         assert doc.county == "Federal"
+
+    @respx.mock
+    def test_docket_court_resolves_when_cluster_court_empty(self) -> None:
+        """Regression for #4247: when cluster.court is empty (the actual API
+        shape we receive today), the resolver must fall back to docket.court
+        and produce the correct (state, county) — NOT the config defaults.
+
+        Without the fix, every CourtListener opinion lands in Federal/Federal
+        regardless of true jurisdiction (the misclassification described in
+        the issue: 1507 → 2091 docs in 24h, all wrongly tagged Federal).
+        """
+        # cluster.court is EMPTY — exactly what the live API returns today.
+        cluster = _make_cluster(court="")
+        opinion = _make_opinion(plain_text="Texas appellate opinion text")
+        cluster_id = cluster["id"]
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+        # docket.court IS populated (e.g. Texas appellate court 14).
+        respx.get(f"{API_BASE_URL}/dockets/{cluster_id * 10}/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": cluster_id * 10,
+                    "court": "/api/rest/v4/courts/texapp14/",
+                    "docket_number": "01-22-00123-CV",
+                },
+            )
+        )
+
+        config = _make_scraper_config()  # defaults: state="Federal", county="Federal"
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        # The doc must come out tagged Texas/Statewide via the docket fallback,
+        # NOT Federal/Federal via the config defaults.
+        assert doc.state == "Texas"
+        assert doc.county == "Statewide"
+        # Extra metadata must record the resolved court_id for downstream consumers.
+        assert doc.extra["courtlistener_court_id"] == "texapp14"
+
+    @respx.mock
+    def test_docket_court_takes_precedence_over_cluster_court(self) -> None:
+        """When BOTH cluster.court and docket.court are populated, docket.court wins.
+
+        The docket sub-resource is the canonical source of jurisdiction —
+        the cluster's court field is sometimes a stale reference to a
+        parent court rather than the specific deciding court.
+        """
+        # cluster.court points to a generic parent (Texas Supreme Court)
+        cluster = _make_cluster(court="/api/rest/v4/courts/tex/")
+        opinion = _make_opinion(plain_text="Opinion text")
+        cluster_id = cluster["id"]
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+        # docket.court points to a specific appellate court — should win.
+        respx.get(f"{API_BASE_URL}/dockets/{cluster_id * 10}/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": cluster_id * 10,
+                    "court": "/api/rest/v4/courts/texapp1/",
+                    "docket_number": "12345",
+                },
+            )
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        # Both Texas/Statewide today, but the recorded short-id must come
+        # from the docket so downstream callers can disambiguate.
+        assert doc.extra["courtlistener_court_id"] == "texapp1"
+        assert doc.state == "Texas"
+        assert doc.county == "Statewide"
+
+    @respx.mock
+    def test_cluster_court_used_when_no_docket(self) -> None:
+        """Backwards-compat: when there is no docket sub-resource, cluster.court still works.
+
+        Some clusters legitimately have no docket URL — the resolver must
+        not regress on those; cluster.court remains the fallback source.
+        """
+        cluster = _make_cluster(court="/api/rest/v4/courts/scotus/", docket="")
+        opinion = _make_opinion(plain_text="SCOTUS opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.state == "Federal"
+        assert doc.county == "Federal"
+        assert doc.extra["courtlistener_court_id"] == "scotus"
 
 
 # ---------------------------------------------------------------------------
@@ -1845,6 +2002,37 @@ class TestParseDocumentReingestPath:
         assert parsed.ruling_text.startswith("The motion is GRANTED.")
         # Sanity: respected the 10000-char cap matching _map_to_document.
         assert len(parsed.ruling_text) == 10000
+
+    def test_parse_document_resolves_court_via_docket_envelope_key(self) -> None:
+        """Regression for #4247: when raw_content contains a ``docket`` envelope
+        key with a populated ``court`` field, the reingest path resolves
+        jurisdiction from the docket — even when ``cluster.court`` is empty.
+
+        This covers the new envelope shape produced after the #4247 fix
+        (raw_content now includes the docket sub-resource so future
+        reingest/backfill runs do not need to re-fetch from the API).
+        """
+        cluster = _make_cluster(court="")  # Live API returns this empty.
+        opinion = {
+            "id": 2001,
+            "type": "010combined",
+            "plain_text": "Texas appellate opinion text",
+        }
+        docket = {
+            "id": 73251044,
+            "court": "/api/rest/v4/courts/texapp14/",
+            "docket_number": "01-22-00123-CV",
+        }
+        doc = self._make_envelope_doc(cluster=cluster, opinion=opinion, docket=docket)
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        # Reingest must resolve Texas/Statewide via docket.court — NOT the
+        # config defaults (Federal/Federal).
+        assert parsed.state == "Texas"
+        assert parsed.county == "Statewide"
+        assert parsed.extra["courtlistener_court_id"] == "texapp14"
 
     def test_parse_document_handles_none_raw_content(self) -> None:
         """Defensive: parse_document on a doc with raw_content=b'' returns unchanged."""
