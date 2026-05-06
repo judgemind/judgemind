@@ -1012,6 +1012,157 @@ class TestFullReparseDocumentMergeAsymmetry:
 
 
 # ---------------------------------------------------------------------------
+# _full_reparse_document — per-ruling judge_name preference (#4282)
+# ---------------------------------------------------------------------------
+
+
+class TestFullReparsePerRulingJudgeName:
+    """Regression coverage for #4282.
+
+    LA HTMLs whose per-case section uses the ``JUDGE/DEPT: <surname>/<dept>``
+    form-layout header carry the day-of-bench judge in
+    ``LASplitRuling.judge_name``.  ``_full_reparse_document`` must prefer
+    that per-ruling value over the doc-level ``doc_judge_name`` so the
+    DB write attributes the ruling to the in-document judge instead of
+    the directory's primary-assignment fallback.
+    """
+
+    def _doc_meta(self) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://www.lacourt.ca.gov/...",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "25STLC05162",
+            "case_title": "Highlakes v. Acme",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "ca/los_angeles/superior_court/raw/abc.html",
+            "s3_bucket": "test-bucket",
+            "judge_name": None,
+            "department": None,
+        }
+
+    def _make_la_split_rulings(
+        self,
+        *,
+        per_ruling_judge: str | None,
+    ) -> list:
+        from courts.ca.la_tentatives import LASplitRuling
+
+        return [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="25STLC05162",
+                ruling_text="Ruling text for Mkrtchyan.",
+                department="25",
+                judge_name=per_ruling_judge,
+            ),
+            LASplitRuling(
+                ruling_index=2,
+                case_number="25STLC05163",
+                ruling_text="Ruling text for the second case.",
+                department="25",
+                judge_name=per_ruling_judge,
+            ),
+        ]
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_per_ruling_judge_name_overrides_doc_level(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LASplitRuling.judge_name takes precedence over doc-level judge (#4282)."""
+        mock_extract.return_value = "<html>la text</html>"
+        # Live-only no-op parse_document so doc_judge_name comes from
+        # the DB seed below.
+        parsed = MagicMock()
+        parsed.case_number = None
+        parsed.case_title = None
+        parsed.judge_name = None
+        parsed.department = None
+        parsed.hearing_date = None
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+
+        reingest._SCRAPER_REGISTRY["test-la-per-ruling-judge"] = mock_scraper_cls
+        reingest._SPLIT_REGISTRY["test-la-per-ruling-judge"] = MagicMock(
+            return_value=self._make_la_split_rulings(per_ruling_judge="Mkrtchyan")
+        )
+
+        try:
+            doc_meta = self._doc_meta()
+            doc_meta["judge_name"] = "Latrice A. G. Byrdsong"  # DB seed (wrong)
+            doc_meta["scraper_id"] = "test-la-per-ruling-judge"
+            results = reingest._full_reparse_document(
+                b"<html>raw</html>",
+                "test-la-per-ruling-judge",
+                doc_meta,
+            )
+            assert len(results) == 2
+            for ruling in results:
+                # Per-ruling Mkrtchyan wins over the DB-seeded Byrdsong.
+                assert ruling["judge_name"] == "Mkrtchyan"
+                assert ruling["extraction_methods"]["judge_name"] == "split"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-la-per-ruling-judge", None)
+            reingest._SPLIT_REGISTRY.pop("test-la-per-ruling-judge", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_per_ruling_judge_name_none_falls_back_to_doc_level(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LASplitRuling.judge_name is None, doc-level judge survives.
+
+        Preserves the pre-fix behaviour for split rulings whose HTML
+        carries no JUDGE/DEPT or signature line — the doc-level
+        ``doc_judge_name`` (parsed.judge_name or DB seed) flows through
+        unchanged.
+        """
+        mock_extract.return_value = "<html>la text</html>"
+        parsed = MagicMock()
+        parsed.case_number = None
+        parsed.case_title = None
+        parsed.judge_name = "Hon. Doc Level Judge"
+        parsed.department = None
+        parsed.hearing_date = None
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+
+        reingest._SCRAPER_REGISTRY["test-la-no-per-ruling-judge"] = mock_scraper_cls
+        reingest._SPLIT_REGISTRY["test-la-no-per-ruling-judge"] = MagicMock(
+            return_value=self._make_la_split_rulings(per_ruling_judge=None)
+        )
+
+        try:
+            doc_meta = self._doc_meta()
+            doc_meta["scraper_id"] = "test-la-no-per-ruling-judge"
+            results = reingest._full_reparse_document(
+                b"<html>raw</html>",
+                "test-la-no-per-ruling-judge",
+                doc_meta,
+            )
+            assert len(results) == 2
+            for ruling in results:
+                # Falls through to the doc-level judge from parsed.
+                assert ruling["judge_name"] == "Hon. Doc Level Judge"
+                assert ruling["extraction_methods"]["judge_name"] == "scraper"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-la-no-per-ruling-judge", None)
+            reingest._SPLIT_REGISTRY.pop("test-la-no-per-ruling-judge", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document_multimodal merge-asymmetry tests (#4150)
 # ---------------------------------------------------------------------------
 

@@ -1649,6 +1649,14 @@ def _full_reparse_document(
         # header).  Fall back to the doc-level department otherwise.
         ruling_department = getattr(ruling, "department", None) or doc_department
 
+        # Prefer per-ruling judge_name when the split provides one
+        # (#4282: LASplitRuling.judge_name carries the in-document
+        # JUDGE/DEPT or signature-line judge).  Fall back to the
+        # doc-level judge name otherwise.  This mirrors the worker.py
+        # path in _try_la_html_split which now passes sr.judge_name
+        # through the split_event.
+        ruling_judge_name = getattr(ruling, "judge_name", None) or doc_judge_name
+
         extracted: dict = {
             "ruling_text": ruling_text_cleaned,
             # ``case_number`` keeps its ``doc_meta`` fallback because it is
@@ -1691,7 +1699,7 @@ def _full_reparse_document(
             "case_type": (
                 getattr(ruling, "case_type", None) or doc_meta.get("case_type")
             ),
-            "judge_name": doc_judge_name,
+            "judge_name": ruling_judge_name,
             "outcome": normalize_outcome(ruling.outcome),
             # Normalize split-provided motion_type to snake_case (#1849).
             "motion_type": (
@@ -1720,8 +1728,10 @@ def _full_reparse_document(
             extracted["extraction_methods"]["case_type"] = (
                 "split" if getattr(ruling, "case_type", None) else "db_seed"
             )
-        if doc_judge_name:
-            extracted["extraction_methods"]["judge_name"] = "scraper"
+        if ruling_judge_name:
+            extracted["extraction_methods"]["judge_name"] = (
+                "split" if getattr(ruling, "judge_name", None) else "scraper"
+            )
         if doc_hearing_date:
             extracted["extraction_methods"]["hearing_date"] = "scraper"
         if ruling_department:

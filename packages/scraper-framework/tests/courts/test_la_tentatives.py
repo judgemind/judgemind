@@ -2380,6 +2380,121 @@ class TestSplitRulings:
 
 
 # ---------------------------------------------------------------------------
+# _split_rulings — judge_name extraction from per-case HTML (#4282)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulingsJudgeName:
+    """Tests for _split_rulings() populating LASplitRuling.judge_name (#4282).
+
+    Without per-ruling judge_name extraction, LA dept-25 (and other depts
+    using the JUDGE/DEPT form-layout header) fall through to the
+    derived.court_directory_snapshots dept→judge directory fallback,
+    which produces the wrong judge when the directory's primary
+    assignment differs from the day-of-bench judge.
+    """
+
+    def test_la_split_ruling_has_judge_name_field(self) -> None:
+        """LASplitRuling exposes a judge_name attribute (AC1)."""
+        ruling = LASplitRuling(ruling_index=1, case_number="X", ruling_text="Y")
+        # Default value when not provided is None.
+        assert ruling.judge_name is None
+        # Explicit value is preserved.
+        ruling.judge_name = "Mkrtchyan"
+        assert ruling.judge_name == "Mkrtchyan"
+
+    def test_split_rulings_populates_judge_name_dept25_fixture(self) -> None:
+        """Dept-25 fixture (JUDGE/DEPT: Mkrtchyan/25) yields judge_name='Mkrtchyan' (AC2)."""
+        html = _load("la_ruling_dept25_judge_dept_format.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) >= 1
+        # The fixture's HTML carries the JUDGE/DEPT form-layout header but no
+        # signature line — _split_rulings must extract Mkrtchyan from the
+        # JUDGE/DEPT line, not fall through to None.
+        assert rulings[0].judge_name == "Mkrtchyan"
+
+    def test_split_rulings_populates_judge_name_signature_line(self) -> None:
+        """Signature-line fixture yields judge_name from '<X> Judge of the Superior Court'."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) == 2
+        # Both Alhambra Dept 3 cases share the same Crowfoot signature line.
+        for ruling in rulings:
+            assert ruling.judge_name is not None
+            assert "Crowfoot" in ruling.judge_name
+
+    def test_split_rulings_judge_name_inline_judge_dept_only(self) -> None:
+        """Synthetic JUDGE/DEPT-only HTML (no signature line) yields judge_name (AC6).
+
+        Mirrors the Highlakes failure mode in #4282: a per-case fragment
+        whose HTML carries only the JUDGE/DEPT header — without this fix,
+        _split_rulings produces LASplitRuling(judge_name=None) and the
+        downstream worker / reingest path falls through to the directory
+        primary-assignment judge.
+        """
+        # Use a long ruling_text so _split_rulings's 50-char minimum passes.
+        html = (
+            "<html><body><div id='speechSynthesis'>"
+            "<b>Case Number: </b> 25STLC05162"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Hearing Date: </b> March 26, 2026"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Dept: </b> 25"
+            "<p>HEARING DATE: Tues., April 7, 2026 "
+            "JUDGE/DEPT: Mkrtchyan/25 "
+            "CASE NAME: Highlakes Towing v. Acme Corp</p>"
+            "<p>The motion is GRANTED. The court finds that the moving party "
+            "has carried its burden under Code of Civil Procedure section 2031.310 "
+            "to compel further responses to requests for production.</p>"
+            "</div></body></html>"
+        )
+        rulings = _split_rulings(html)
+        assert len(rulings) == 1
+        assert rulings[0].judge_name == "Mkrtchyan"
+        # Department comes from the deterministic <b>-tag header.
+        assert rulings[0].department == "25"
+
+    def test_split_rulings_judge_name_compound_surname(self) -> None:
+        """JUDGE/DEPT regex accepts compound surnames with internal whitespace."""
+        html = (
+            "<html><body><div id='speechSynthesis'>"
+            "<b>Case Number: </b> 25STLC99999"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Hearing Date: </b> March 26, 2026"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Dept: </b> F46"
+            "<p>HEARING DATE: Tues., April 7, 2026 "
+            "JUDGE/DEPT: Van Der Berg/F46 "
+            "CASE NAME: Foo v. Bar</p>"
+            "<p>The motion is DENIED.  The court finds that the moving party "
+            "has not carried its burden under Code of Civil Procedure section "
+            "2031.310 to compel further responses to requests for production.</p>"
+            "</div></body></html>"
+        )
+        rulings = _split_rulings(html)
+        assert len(rulings) == 1
+        assert rulings[0].judge_name == "Van Der Berg"
+
+    def test_split_rulings_judge_name_none_when_no_judge_signal(self) -> None:
+        """Pages with no JUDGE/DEPT or signature line yield judge_name=None."""
+        html = (
+            "<html><body><div id='speechSynthesis'>"
+            "<b>Case Number: </b> 25STLC99999"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Hearing Date: </b> March 26, 2026"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Dept: </b> 1"
+            "<p>The motion is DENIED.  The court finds that the moving party "
+            "has not carried its burden under Code of Civil Procedure section "
+            "2031.310 to compel further responses to requests for production.</p>"
+            "</div></body></html>"
+        )
+        rulings = _split_rulings(html)
+        assert len(rulings) == 1
+        assert rulings[0].judge_name is None
+
+
+# ---------------------------------------------------------------------------
 # _replace_ruling_text_from_html — LLM text replacement (#2007)
 # ---------------------------------------------------------------------------
 
@@ -2481,6 +2596,63 @@ class TestReplaceRulingTextFromHtml:
         rulings = [LASplitRuling(ruling_index=1, case_number="X", ruling_text=original)]
         _replace_ruling_text_from_html(no_cases_html, rulings)
         assert rulings[0].ruling_text == original
+
+    def test_populates_judge_name_from_chunk_judge_dept(self) -> None:
+        """LLM-path replace populates judge_name from chunk JUDGE/DEPT (#4282)."""
+        html = (
+            "<html><body><div id='speechSynthesis'>"
+            "<b>Case Number: </b> 25STLC05162"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Hearing Date: </b> March 26, 2026"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Dept: </b> 25"
+            "<p>HEARING DATE: Tues., April 7, 2026 "
+            "JUDGE/DEPT: Mkrtchyan/25 "
+            "CASE NAME: Highlakes v. Acme</p>"
+            "<p>The motion is GRANTED. The court finds that the moving party "
+            "has carried its burden under Code of Civil Procedure section 2031.310 "
+            "to compel further responses to requests for production.</p>"
+            "</div></body></html>"
+        )
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="25STLC05162",
+                ruling_text="LLM truncated text" * 10,
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        assert rulings[0].judge_name == "Mkrtchyan"
+
+    def test_does_not_clobber_existing_llm_judge_name(self) -> None:
+        """LLM-extracted judge_name is preserved when the chunk also has a value (#4282)."""
+        html = (
+            "<html><body><div id='speechSynthesis'>"
+            "<b>Case Number: </b> 25STLC05162"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Hearing Date: </b> March 26, 2026"
+            "&nbsp;&nbsp;&nbsp;"
+            "<b>Dept: </b> 25"
+            "<p>HEARING DATE: Tues., April 7, 2026 "
+            "JUDGE/DEPT: Mkrtchyan/25 "
+            "CASE NAME: Highlakes v. Acme</p>"
+            "<p>The motion is GRANTED. The court finds that the moving party "
+            "has carried its burden under Code of Civil Procedure section 2031.310 "
+            "to compel further responses to requests for production.</p>"
+            "</div></body></html>"
+        )
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="25STLC05162",
+                ruling_text="LLM truncated text" * 10,
+                judge_name="LLM Provided Judge",
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        # LLM-provided judge_name takes precedence — the chunk match must
+        # not clobber a non-None value.
+        assert rulings[0].judge_name == "LLM Provided Judge"
 
 
 # ---------------------------------------------------------------------------
