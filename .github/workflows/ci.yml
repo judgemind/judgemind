@@ -725,6 +725,22 @@ jobs:
       - name: Verify dispatcher image installs every Python import used by the daemon
         if: matrix.shard == 'python'
         run: scripts/check-dispatcher-image-deps.sh
+      # Issue #4294 (retro from #4288): every operator-only script
+      # invoked at runtime via the scraper image's in-container scripts
+      # path must have a corresponding COPY directive in
+      # packages/scraper-framework/Dockerfile. Without this check, a new
+      # caller that references a script under that path but forgets to
+      # update the Dockerfile's COPY block fails silently — direct
+      # python invocation breaks at runtime, while the alternative
+      # scripts/ecs-run-task.sh path keeps working because it uploads
+      # scripts via S3 every run. #4288 was the fixing PR; this check
+      # is the recurrence preventer. NOTE: the literal in-container path
+      # prefix is intentionally not spelled here because the guard's
+      # own pattern would self-match on this comment (CLAUDE.md
+      # §Hygiene-check CI steps / #2542).
+      - name: Verify scraper image ships every script referenced from the in-container scripts path
+        if: matrix.shard == 'python'
+        run: scripts/check-scraper-image-shipped.sh
       # Issues #3062 (audit) + #3072 (this check): every
       # ``self._mark_agent_terminal`` call site in
       # ``scripts/dispatcher/daemon.py`` must carry a nearby
