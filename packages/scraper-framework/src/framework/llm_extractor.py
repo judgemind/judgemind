@@ -96,6 +96,17 @@ _MAX_RETRY_DEPTH = 1
 # Minimum chunk size (chars) to attempt a retry split.
 _MIN_RETRY_CHUNK_CHARS = 2000
 
+# Deterministic-chunk-failure instrumentation (#4233).
+# When the same document_id has accumulated this many ``_extract_chunk_google``
+# failures within a single reingest run, emit
+# ``llm_extract.deterministic_chunk_failure`` with the chunk's content
+# SHA-256 and a 200-char preview so future log queries can group by content
+# and identify documents that deterministically trip the LLM provider.
+_DETERMINISTIC_FAILURE_THRESHOLD = 3
+# Number of leading chars from the failing chunk to include in the structured
+# log event.  Bounded so the log line stays cheap to ingest.
+_DETERMINISTIC_FAILURE_PREVIEW_CHARS = 200
+
 # Patterns for natural split boundaries.
 _PAGE_BREAK_RE = re.compile(r"\f")
 _CASE_BOUNDARY_RE = re.compile(
@@ -2669,6 +2680,17 @@ class LlmExtractor:
             else None
         )
 
+        # Per-document Google API failure counter (#4233).  Maps
+        # ``document_id`` -> count of ``_extract_chunk_google`` calls that
+        # returned ``None`` within this extractor's lifetime (typically one
+        # reingest run).  Used to fire the
+        # ``llm_extract.deterministic_chunk_failure`` structured log event
+        # exactly once when the count crosses
+        # ``_DETERMINISTIC_FAILURE_THRESHOLD``.  Counter is best-effort: only
+        # populated when callers pass ``document_id`` to ``extract()``.
+        self._google_chunk_failure_counts: dict[str, int] = {}
+        self._deterministic_failure_fired: set[str] = set()
+
     @staticmethod
     def _get_cache_s3_client() -> object:
         """Return an S3 client for the LLM cache.
@@ -2691,6 +2713,7 @@ class LlmExtractor:
         metadata: dict[str, str] | None = None,
         system_prompt: str | None = None,
         bust_cache: bool = False,
+        document_id: str | None = None,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from raw calendar page text.
 
@@ -2713,6 +2736,14 @@ class LlmExtractor:
                 from the fresh result.  See ``self._bust_cache`` for a
                 persistent instance-level default.  Used by the
                 ``--bust-llm-cache`` reingest flag (#2424).
+            document_id: Optional source ``derived.documents`` UUID.  When
+                provided, ``_extract_chunk_google`` failures for this doc
+                are counted; once
+                ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
+                a single reingest run, ``llm_extract.deterministic_chunk_failure``
+                is emitted with the failing chunk's content SHA-256 and a
+                200-char preview so future log queries can group by content
+                (#4233).  Has no effect on cache key (kept out of metadata).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -2738,7 +2769,11 @@ class LlmExtractor:
 
         if len(chunks) == 1:
             results = self._extract_chunk_with_retry(
-                chunks[0], metadata=metadata, usage=usage, system_prompt=system_prompt
+                chunks[0],
+                metadata=metadata,
+                usage=usage,
+                system_prompt=system_prompt,
+                document_id=document_id,
             )
             self._log_usage(usage)
             if not results:
@@ -2760,6 +2795,7 @@ class LlmExtractor:
                     usage=usage,
                     chunk_index=i,
                     system_prompt=system_prompt,
+                    document_id=document_id,
                 )
                 all_results.extend(results)
 
@@ -2811,6 +2847,7 @@ class LlmExtractor:
         metadata: dict[str, str] | None = None,
         max_pages: int = 50,
         bust_cache: bool = False,
+        document_id: str | None = None,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from PDF page images (multimodal).
 
@@ -2836,6 +2873,13 @@ class LlmExtractor:
                 from the fresh result.  See ``self._bust_cache`` for a
                 persistent instance-level default.  Used by the
                 ``--bust-llm-cache`` reingest flag (#2424).
+            document_id: Optional source ``derived.documents`` UUID.  When
+                provided, ``_extract_single_page`` failures for this doc
+                are counted; once
+                ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
+                a single reingest run, ``llm_extract.deterministic_chunk_failure``
+                is emitted with the failing page's image SHA-256 so future
+                log queries can group by content (#4233).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -2868,7 +2912,12 @@ class LlmExtractor:
         any_page_failed = False
         for page_idx, (img_bytes, media_type) in enumerate(page_images):
             page_rows = self._extract_single_page(
-                img_bytes, media_type, metadata=metadata, usage=usage, page_index=page_idx
+                img_bytes,
+                media_type,
+                metadata=metadata,
+                usage=usage,
+                page_index=page_idx,
+                document_id=document_id,
             )
             if page_rows:
                 all_rows.extend(page_rows)
@@ -2920,6 +2969,7 @@ class LlmExtractor:
         usage: TokenUsage,
         chunk_index: int = 0,
         system_prompt: str | None = None,
+        document_id: str | None = None,
     ) -> ExtractionResult | None:
         """Call the LLM API for a single text chunk and parse the result.
 
@@ -2942,6 +2992,8 @@ class LlmExtractor:
                 usage=usage,
                 chunk_index=chunk_index,
                 metadata=metadata,
+                document_id=document_id,
+                chunk_text=text,
             )
 
         for attempt in range(1, self._max_retries + 1):
@@ -3052,6 +3104,8 @@ class LlmExtractor:
         usage: TokenUsage,
         chunk_index: int = 0,
         metadata: dict[str, str] | None = None,
+        document_id: str | None = None,
+        chunk_text: str | None = None,
     ) -> ExtractionResult | None:
         """Call the Google GenAI API for a single text chunk.
 
@@ -3073,6 +3127,12 @@ class LlmExtractor:
             logger.warning(
                 "llm_extractor.google_api_failure",
                 chunk_index=chunk_index,
+                document_id=document_id,
+            )
+            self._record_google_chunk_failure(
+                document_id=document_id,
+                chunk_index=chunk_index,
+                chunk_text=chunk_text,
             )
             return None
 
@@ -3081,6 +3141,71 @@ class LlmExtractor:
         usage.api_calls += 1
 
         return self._parse_response(response.text, metadata)
+
+    def _record_google_chunk_failure(
+        self,
+        *,
+        document_id: str | None,
+        chunk_index: int,
+        chunk_text: str | None,
+        chunk_bytes: bytes | None = None,
+    ) -> None:
+        """Increment the per-document Google chunk-failure counter (#4233).
+
+        When the same ``document_id`` accumulates
+        ``_DETERMINISTIC_FAILURE_THRESHOLD`` failed Google API calls
+        (text-chunk or per-page-image) within this extractor's lifetime,
+        emit ``llm_extract.deterministic_chunk_failure`` exactly once with
+        the current chunk's content SHA-256 and (for text chunks) a
+        200-char preview, so operators can group log entries by content
+        and identify the documents that deterministically trip the LLM
+        provider.
+
+        Either ``chunk_text`` (text-chunk path) or ``chunk_bytes`` (PDF
+        per-page multimodal path) may be provided; SHA-256 is taken over
+        whichever is present.  The text preview field stays empty for
+        the multimodal path since the binary is image data.
+
+        No-op when ``document_id`` is ``None`` (legacy callers), so this
+        instrumentation is opt-in per call site.
+        """
+        if not document_id:
+            return
+
+        new_count = self._google_chunk_failure_counts.get(document_id, 0) + 1
+        self._google_chunk_failure_counts[document_id] = new_count
+
+        if (
+            new_count >= _DETERMINISTIC_FAILURE_THRESHOLD
+            and document_id not in self._deterministic_failure_fired
+        ):
+            self._deterministic_failure_fired.add(document_id)
+            preview = ""
+            content_sha256 = ""
+            content_len = 0
+            content_kind = "unknown"
+            if chunk_text is not None:
+                preview = chunk_text[:_DETERMINISTIC_FAILURE_PREVIEW_CHARS]
+                content_sha256 = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+                content_len = len(chunk_text)
+                content_kind = "text"
+            elif chunk_bytes is not None:
+                content_sha256 = hashlib.sha256(chunk_bytes).hexdigest()
+                content_len = len(chunk_bytes)
+                content_kind = "image"
+            logger.warning(
+                "llm_extract.deterministic_chunk_failure",
+                document_id=document_id,
+                chunk_index=chunk_index,
+                failure_count=new_count,
+                threshold=_DETERMINISTIC_FAILURE_THRESHOLD,
+                provider=self._provider,
+                model=self._model,
+                chunk_content_sha256=content_sha256,
+                chunk_preview=preview,
+                chunk_len=content_len,
+                chunk_kind=content_kind,
+            )
 
     def _extract_chunk_with_retry(
         self,
@@ -3091,6 +3216,7 @@ class LlmExtractor:
         chunk_index: int = 0,
         system_prompt: str | None = None,
         _depth: int = 0,
+        document_id: str | None = None,
     ) -> list[ExtractionResult]:
         """Extract a chunk, retrying with smaller sub-chunks on parse failure.
 
@@ -3115,6 +3241,7 @@ class LlmExtractor:
             usage=usage,
             chunk_index=chunk_index,
             system_prompt=system_prompt,
+            document_id=document_id,
         )
         if result is not None:
             return [result]
@@ -3149,6 +3276,7 @@ class LlmExtractor:
                     chunk_index=chunk_index * 10 + i,
                     system_prompt=system_prompt,
                     _depth=_depth + 1,
+                    document_id=document_id,
                 )
             )
         return sub_results
@@ -3209,6 +3337,7 @@ class LlmExtractor:
         metadata: dict[str, str] | None = None,
         usage: TokenUsage,
         page_index: int = 0,
+        document_id: str | None = None,
     ) -> list[dict]:
         """Send a single page image to the LLM and return extracted table rows.
 
@@ -3246,6 +3375,19 @@ class LlmExtractor:
                             max_retries=self._max_retries,
                             retry_in=wait,
                             page_index=page_index,
+                            document_id=document_id,
+                        )
+                        # Count failed page-attempts toward the
+                        # deterministic-failure instrumentation (#4233).
+                        # Each retry attempt is its own data point —
+                        # ``call_llm_with_images`` was invoked with
+                        # ``max_retries=0`` so this loop is the only
+                        # retry layer for the multimodal path.
+                        self._record_google_chunk_failure(
+                            document_id=document_id,
+                            chunk_index=page_index,
+                            chunk_text=None,
+                            chunk_bytes=img_bytes,
                         )
                         time.sleep(wait)
                         delay *= 2
@@ -3253,6 +3395,13 @@ class LlmExtractor:
                     logger.error(
                         "llm_extractor.page_api_exhausted",
                         page_index=page_index,
+                        document_id=document_id,
+                    )
+                    self._record_google_chunk_failure(
+                        document_id=document_id,
+                        chunk_index=page_index,
+                        chunk_text=None,
+                        chunk_bytes=img_bytes,
                     )
                     return []
 

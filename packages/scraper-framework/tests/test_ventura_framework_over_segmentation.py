@@ -54,6 +54,7 @@ def _make_extractor_with_stub(
         usage: object,  # noqa: ARG001
         chunk_index: int = 0,  # noqa: ARG001
         system_prompt: str | None = None,  # noqa: ARG001
+        document_id: str | None = None,  # noqa: ARG001
     ) -> list[ExtractionResult]:
         return [stub_result]
 
