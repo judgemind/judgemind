@@ -96,16 +96,14 @@ _MAX_RETRY_DEPTH = 1
 # Minimum chunk size (chars) to attempt a retry split.
 _MIN_RETRY_CHUNK_CHARS = 2000
 
-# Deterministic-chunk-failure instrumentation (#4233).
-# When the same document_id has accumulated this many ``_extract_chunk_google``
-# failures within a single reingest run, emit
-# ``llm_extract.deterministic_chunk_failure`` with the chunk's content
-# SHA-256 and a 200-char preview so future log queries can group by content
-# and identify documents that deterministically trip the LLM provider.
-_DETERMINISTIC_FAILURE_THRESHOLD = 3
-# Number of leading chars from the failing chunk to include in the structured
-# log event.  Bounded so the log line stays cheap to ingest.
-_DETERMINISTIC_FAILURE_PREVIEW_CHARS = 200
+# Number of leading chars from a failing chunk's text (or bytes count
+# for image data) to include in structured log events.  Bounded so each
+# log line stays cheap to ingest.  See #4253 — this enrichment was
+# previously gated behind a 3-failure threshold
+# (``deterministic_chunk_failure``); the threshold was structurally too
+# strict for typical 2-chunk docs and has been removed.  Every Google
+# API failure now gets the rich payload directly.
+_CHUNK_FAILURE_PREVIEW_CHARS = 200
 
 # Patterns for natural split boundaries.
 _PAGE_BREAK_RE = re.compile(r"\f")
@@ -2680,17 +2678,6 @@ class LlmExtractor:
             else None
         )
 
-        # Per-document Google API failure counter (#4233).  Maps
-        # ``document_id`` -> count of ``_extract_chunk_google`` calls that
-        # returned ``None`` within this extractor's lifetime (typically one
-        # reingest run).  Used to fire the
-        # ``llm_extract.deterministic_chunk_failure`` structured log event
-        # exactly once when the count crosses
-        # ``_DETERMINISTIC_FAILURE_THRESHOLD``.  Counter is best-effort: only
-        # populated when callers pass ``document_id`` to ``extract()``.
-        self._google_chunk_failure_counts: dict[str, int] = {}
-        self._deterministic_failure_fired: set[str] = set()
-
     @staticmethod
     def _get_cache_s3_client() -> object:
         """Return an S3 client for the LLM cache.
@@ -2736,14 +2723,13 @@ class LlmExtractor:
                 from the fresh result.  See ``self._bust_cache`` for a
                 persistent instance-level default.  Used by the
                 ``--bust-llm-cache`` reingest flag (#2424).
-            document_id: Optional source ``derived.documents`` UUID.  When
-                provided, ``_extract_chunk_google`` failures for this doc
-                are counted; once
-                ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
-                a single reingest run, ``llm_extract.deterministic_chunk_failure``
-                is emitted with the failing chunk's content SHA-256 and a
-                200-char preview so future log queries can group by content
-                (#4233).  Has no effect on cache key (kept out of metadata).
+            document_id: Optional source ``derived.documents`` UUID.  Echoed
+                into the ``llm_extractor.google_api_failure`` structured log
+                event whenever ``_extract_chunk_google`` returns ``None``,
+                so future log queries can correlate failures back to the
+                source document and group by ``chunk_content_sha256``
+                (#4233 / #4253).  Has no effect on cache key (kept out of
+                metadata).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -2873,13 +2859,13 @@ class LlmExtractor:
                 from the fresh result.  See ``self._bust_cache`` for a
                 persistent instance-level default.  Used by the
                 ``--bust-llm-cache`` reingest flag (#2424).
-            document_id: Optional source ``derived.documents`` UUID.  When
-                provided, ``_extract_single_page`` failures for this doc
-                are counted; once
-                ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
-                a single reingest run, ``llm_extract.deterministic_chunk_failure``
-                is emitted with the failing page's image SHA-256 so future
-                log queries can group by content (#4233).
+            document_id: Optional source ``derived.documents`` UUID.  Echoed
+                into the ``llm_extractor.page_api_failure`` and
+                ``llm_extractor.page_api_exhausted`` structured log events
+                whenever ``_extract_single_page`` cannot get a usable
+                response, so future log queries can correlate failures
+                back to the source document and group by the page-image
+                ``chunk_content_sha256`` (#4233 / #4253).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -3124,15 +3110,28 @@ class LlmExtractor:
         )
 
         if response is None:
+            # Self-diagnosing API-failure payload (#4253).  ``call_llm``
+            # already represents 3 exhausted internal Google retries, so
+            # a single failure deserves the full diagnostic blob (SHA-256
+            # + preview) rather than waiting for an N-failure threshold —
+            # which the typical 2-chunk doc never reached.
+            chunk_preview = ""
+            chunk_content_sha256 = ""
+            chunk_len = 0
+            if chunk_text is not None:
+                chunk_preview = chunk_text[:_CHUNK_FAILURE_PREVIEW_CHARS]
+                chunk_content_sha256 = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+                chunk_len = len(chunk_text)
             logger.warning(
                 "llm_extractor.google_api_failure",
                 chunk_index=chunk_index,
                 document_id=document_id,
-            )
-            self._record_google_chunk_failure(
-                document_id=document_id,
-                chunk_index=chunk_index,
-                chunk_text=chunk_text,
+                provider=self._provider,
+                model=self._model,
+                chunk_content_sha256=chunk_content_sha256,
+                chunk_preview=chunk_preview,
+                chunk_len=chunk_len,
+                chunk_kind="text",
             )
             return None
 
@@ -3141,71 +3140,6 @@ class LlmExtractor:
         usage.api_calls += 1
 
         return self._parse_response(response.text, metadata)
-
-    def _record_google_chunk_failure(
-        self,
-        *,
-        document_id: str | None,
-        chunk_index: int,
-        chunk_text: str | None,
-        chunk_bytes: bytes | None = None,
-    ) -> None:
-        """Increment the per-document Google chunk-failure counter (#4233).
-
-        When the same ``document_id`` accumulates
-        ``_DETERMINISTIC_FAILURE_THRESHOLD`` failed Google API calls
-        (text-chunk or per-page-image) within this extractor's lifetime,
-        emit ``llm_extract.deterministic_chunk_failure`` exactly once with
-        the current chunk's content SHA-256 and (for text chunks) a
-        200-char preview, so operators can group log entries by content
-        and identify the documents that deterministically trip the LLM
-        provider.
-
-        Either ``chunk_text`` (text-chunk path) or ``chunk_bytes`` (PDF
-        per-page multimodal path) may be provided; SHA-256 is taken over
-        whichever is present.  The text preview field stays empty for
-        the multimodal path since the binary is image data.
-
-        No-op when ``document_id`` is ``None`` (legacy callers), so this
-        instrumentation is opt-in per call site.
-        """
-        if not document_id:
-            return
-
-        new_count = self._google_chunk_failure_counts.get(document_id, 0) + 1
-        self._google_chunk_failure_counts[document_id] = new_count
-
-        if (
-            new_count >= _DETERMINISTIC_FAILURE_THRESHOLD
-            and document_id not in self._deterministic_failure_fired
-        ):
-            self._deterministic_failure_fired.add(document_id)
-            preview = ""
-            content_sha256 = ""
-            content_len = 0
-            content_kind = "unknown"
-            if chunk_text is not None:
-                preview = chunk_text[:_DETERMINISTIC_FAILURE_PREVIEW_CHARS]
-                content_sha256 = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-                content_len = len(chunk_text)
-                content_kind = "text"
-            elif chunk_bytes is not None:
-                content_sha256 = hashlib.sha256(chunk_bytes).hexdigest()
-                content_len = len(chunk_bytes)
-                content_kind = "image"
-            logger.warning(
-                "llm_extract.deterministic_chunk_failure",
-                document_id=document_id,
-                chunk_index=chunk_index,
-                failure_count=new_count,
-                threshold=_DETERMINISTIC_FAILURE_THRESHOLD,
-                provider=self._provider,
-                model=self._model,
-                chunk_content_sha256=content_sha256,
-                chunk_preview=preview,
-                chunk_len=content_len,
-                chunk_kind=content_kind,
-            )
 
     def _extract_chunk_with_retry(
         self,
@@ -3367,6 +3301,17 @@ class LlmExtractor:
                 )
 
                 if response is None:
+                    # Self-diagnosing page-failure payload (#4253).
+                    # ``call_llm_with_images`` was invoked with
+                    # ``max_retries=0`` so this loop is the only retry
+                    # layer for the multimodal path; every failure here
+                    # already represents the exhausted internal retries
+                    # for one attempt.  Emit the rich payload (image
+                    # SHA-256 + byte length) on every failure so future
+                    # log queries can group by content without waiting
+                    # for a counter threshold.
+                    image_sha256 = hashlib.sha256(img_bytes).hexdigest()
+                    image_len = len(img_bytes)
                     if attempt < self._max_retries:
                         wait = min(delay, self._max_delay)
                         logger.warning(
@@ -3376,18 +3321,12 @@ class LlmExtractor:
                             retry_in=wait,
                             page_index=page_index,
                             document_id=document_id,
-                        )
-                        # Count failed page-attempts toward the
-                        # deterministic-failure instrumentation (#4233).
-                        # Each retry attempt is its own data point —
-                        # ``call_llm_with_images`` was invoked with
-                        # ``max_retries=0`` so this loop is the only
-                        # retry layer for the multimodal path.
-                        self._record_google_chunk_failure(
-                            document_id=document_id,
-                            chunk_index=page_index,
-                            chunk_text=None,
-                            chunk_bytes=img_bytes,
+                            provider=self._provider,
+                            model=self._model,
+                            chunk_content_sha256=image_sha256,
+                            chunk_preview="",
+                            chunk_len=image_len,
+                            chunk_kind="image",
                         )
                         time.sleep(wait)
                         delay *= 2
@@ -3396,12 +3335,12 @@ class LlmExtractor:
                         "llm_extractor.page_api_exhausted",
                         page_index=page_index,
                         document_id=document_id,
-                    )
-                    self._record_google_chunk_failure(
-                        document_id=document_id,
-                        chunk_index=page_index,
-                        chunk_text=None,
-                        chunk_bytes=img_bytes,
+                        provider=self._provider,
+                        model=self._model,
+                        chunk_content_sha256=image_sha256,
+                        chunk_preview="",
+                        chunk_len=image_len,
+                        chunk_kind="image",
                     )
                     return []
 

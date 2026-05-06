@@ -629,90 +629,13 @@ _MAX_CHUNKS = 10
 # Overlap characters between consecutive chunks for context continuity.
 _CHUNK_OVERLAP = 500
 
-# Deterministic-chunk-failure instrumentation (#4233).
-# When the same ``document_id`` accumulates this many ``call_llm`` failures
-# (i.e. ``llm_extract.chunk_api_failure`` events) within a single reingest
-# run, emit ``llm_extract.deterministic_chunk_failure`` once with the
-# failing chunk's content SHA-256 and a 200-char preview so future log
-# queries can group hits by content and identify the documents that
-# deterministically trip the LLM provider.
-_DETERMINISTIC_FAILURE_THRESHOLD = 3
-_DETERMINISTIC_FAILURE_PREVIEW_CHARS = 200
-
-# Process-local counters for the deterministic-chunk-failure instrumentation.
-# The reingest worker is a per-task ECS process — these dicts live for the
-# duration of the run.  Thread-safe under the ``_DETERMINISTIC_FAILURE_LOCK``
-# because multi-chunk documents fan out via ``ThreadPoolExecutor``.
-_DETERMINISTIC_FAILURE_LOCK = threading.Lock()
-_DETERMINISTIC_FAILURE_COUNTS: dict[str, int] = {}
-_DETERMINISTIC_FAILURE_FIRED: set[str] = set()
-
-
-def _record_deterministic_chunk_failure(
-    *,
-    document_id: str | None,
-    chunk_index: int,
-    chunk_text: str,
-    provider: str | None,
-    model: str | None,
-) -> None:
-    """Increment the per-document chunk-failure counter (#4233).
-
-    When the same ``document_id`` accumulates
-    ``_DETERMINISTIC_FAILURE_THRESHOLD`` failed ``call_llm`` invocations
-    within this process's lifetime, emit
-    ``llm_extract.deterministic_chunk_failure`` once with the current
-    chunk's content SHA-256 and a 200-char preview so operators can
-    group log entries by content and identify the documents that
-    deterministically trip the LLM provider.
-
-    No-op when ``document_id`` is ``None`` (legacy callers).  Thread-safe
-    via the module-level lock — concurrent chunk extractions for the
-    same document_id race-correctly.
-    """
-    if not document_id:
-        return
-
-    with _DETERMINISTIC_FAILURE_LOCK:
-        new_count = _DETERMINISTIC_FAILURE_COUNTS.get(document_id, 0) + 1
-        _DETERMINISTIC_FAILURE_COUNTS[document_id] = new_count
-        already_fired = document_id in _DETERMINISTIC_FAILURE_FIRED
-        if new_count >= _DETERMINISTIC_FAILURE_THRESHOLD and not already_fired:
-            _DETERMINISTIC_FAILURE_FIRED.add(document_id)
-            should_emit = True
-        else:
-            should_emit = False
-
-    if not should_emit:
-        return
-
-    preview = chunk_text[:_DETERMINISTIC_FAILURE_PREVIEW_CHARS]
-    content_sha256 = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-    logger.warning(
-        "llm_extract.deterministic_chunk_failure",
-        document_id=document_id,
-        chunk_index=chunk_index,
-        failure_count=new_count,
-        threshold=_DETERMINISTIC_FAILURE_THRESHOLD,
-        provider=provider,
-        model=model,
-        chunk_content_sha256=content_sha256,
-        chunk_preview=preview,
-        chunk_len=len(chunk_text),
-        chunk_kind="text",
-    )
-
-
-def reset_deterministic_chunk_failure_state() -> None:
-    """Reset the per-process deterministic-failure counters (#4233).
-
-    Used by tests and by long-lived processes that want to scope the
-    counter to a particular run.  No-op if no failures have been
-    recorded yet.
-    """
-    with _DETERMINISTIC_FAILURE_LOCK:
-        _DETERMINISTIC_FAILURE_COUNTS.clear()
-        _DETERMINISTIC_FAILURE_FIRED.clear()
+# Number of leading chars of the failing chunk to include in the
+# ``chunk_api_failure`` structured log event.  Bounded so the log line
+# stays cheap to ingest.  See #4253 — this enrichment was previously
+# gated behind a 3-failure threshold (``deterministic_chunk_failure``);
+# the threshold was structurally too strict for typical 2-chunk docs and
+# was removed.  Every chunk failure now gets the rich payload directly.
+_CHUNK_FAILURE_PREVIEW_CHARS = 200
 
 
 # Patterns that indicate natural split boundaries in text.
@@ -943,15 +866,12 @@ def extract_fields_llm(
             from the fresh result.  Used by the ``--bust-llm-cache``
             reingest flag (#2424) to force fresh LLM output after a
             prompt change, without invalidating the cache permanently.
-        document_id: Optional source ``derived.documents`` UUID.  When
-            provided, ``call_llm`` failures for this doc are counted in
-            a process-local map; once
-            ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
-            a single reingest run,
-            ``llm_extract.deterministic_chunk_failure`` is emitted with
-            the failing chunk's content SHA-256 and a 200-char preview
-            so future log queries can group by content (#4233).  Has no
-            effect on cache key.
+        document_id: Optional source ``derived.documents`` UUID.  Echoed
+            into the ``llm_extract.chunk_api_failure`` structured log
+            event when a chunk's LLM call returns ``None``, so future log
+            queries can correlate failures back to the source document
+            and group by ``chunk_content_sha256`` (#4233 / #4253).  Has
+            no effect on cache key.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -1027,17 +947,26 @@ def extract_fields_llm(
             max_tokens=max_tokens,
         )
         if llm_response is None:
+            # Self-diagnosing chunk-failure payload (#4253).  Each
+            # ``call_llm`` already represents 3 exhausted internal Google
+            # retries, so a single failure here is enough to deserve the
+            # full diagnostic blob (SHA-256 + preview) rather than waiting
+            # for an N-failure threshold.  The 97KB / 2-chunk #4233 docs
+            # never accumulated 3 failures in a single run, which made the
+            # prior threshold-based event silent on the very docs it was
+            # added to diagnose.
+            chunk_preview = chunk[:_CHUNK_FAILURE_PREVIEW_CHARS]
+            chunk_content_sha256 = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
             logger.warning(
                 "llm_extract.chunk_api_failure",
                 chunk_index=i,
                 document_id=document_id,
-            )
-            _record_deterministic_chunk_failure(
-                document_id=document_id,
-                chunk_index=i,
-                chunk_text=chunk,
                 provider=provider,
                 model=model,
+                chunk_content_sha256=chunk_content_sha256,
+                chunk_preview=chunk_preview,
+                chunk_len=len(chunk),
+                chunk_kind="text",
             )
             return None
         if token_tracker is not None:

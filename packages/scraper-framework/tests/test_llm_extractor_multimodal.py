@@ -5056,28 +5056,29 @@ class TestAppendRulingFromCaseMetadataFallback:
 
 
 # ---------------------------------------------------------------------------
-# Multimodal deterministic chunk-failure instrumentation (#4233)
+# Multimodal page-failure rich payload (#4253)
+#
+# The threshold-based ``deterministic_chunk_failure`` event was removed.
+# Every ``page_api_failure`` (retry branch) and ``page_api_exhausted``
+# (terminal branch) log emission now carries the page-image SHA-256,
+# byte length, and ``chunk_kind="image"`` so log queries can group by
+# content without waiting for a counter to cross.
 # ---------------------------------------------------------------------------
 
 
-class TestMultimodalDeterministicChunkFailure:
-    """Verify the multimodal per-page-image failure path also fires the
-    ``llm_extract.deterministic_chunk_failure`` event after 3+ failures
-    on the same document_id (#4233).
-    """
+class TestMultimodalChunkFailureEnrichedPayload:
+    """Multimodal per-page failure events carry the rich payload (#4253)."""
 
-    def test_pdf_page_failures_fire_deterministic_event(self, sample_pdf_bytes: bytes) -> None:
-        """Three consecutive per-page failures with a document_id fire the event."""
+    def test_page_api_failure_and_exhausted_carry_image_payload(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """Every retry-branch warning AND the terminal error get the image SHA-256."""
         from framework import llm_extractor as mod
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
         ext._base_delay = 0.0
-        # max_retries=3 -> the loop in _extract_single_page records up to 3
-        # failures (attempts 1, 2 record into the retry branch; attempt 3
-        # records into the exhaustion branch). That's enough to cross the
-        # threshold of 3 for a single PDF page.
-        ext._max_retries = 3
+        ext._max_retries = 3  # 2 retry-branch warnings + 1 terminal error
 
         page_image = b"\x89PNG_only_page"
         with (
@@ -5094,25 +5095,42 @@ class TestMultimodalDeterministicChunkFailure:
             rulings = ext.extract_from_pdf(sample_pdf_bytes, document_id="multimodal-doc")
 
         assert rulings == []
-        fail_events = [
-            c
-            for c in mock_logger.warning.call_args_list
-            if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-        ]
-        assert len(fail_events) == 1
-        payload = fail_events[0].kwargs
-        assert payload["document_id"] == "multimodal-doc"
-        assert payload["chunk_kind"] == "image"
-        # SHA-256 of the image bytes is recorded.
+
         import hashlib
 
-        assert payload["chunk_content_sha256"] == hashlib.sha256(page_image).hexdigest()
-        # Image path leaves the text preview empty by design.
+        expected_sha = hashlib.sha256(page_image).hexdigest()
+
+        # Retry-branch warnings: every page_api_failure carries the rich payload.
+        warn_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extractor.page_api_failure"
+        ]
+        assert len(warn_events) == ext._max_retries - 1  # attempts 1, 2
+        for ev in warn_events:
+            payload = ev.kwargs
+            assert payload["document_id"] == "multimodal-doc"
+            assert payload["chunk_kind"] == "image"
+            assert payload["chunk_content_sha256"] == expected_sha
+            assert payload["chunk_preview"] == ""
+            assert payload["chunk_len"] == len(page_image)
+
+        # Terminal exhaustion: page_api_exhausted also carries the rich payload.
+        err_events = [
+            c
+            for c in mock_logger.error.call_args_list
+            if c.args and c.args[0] == "llm_extractor.page_api_exhausted"
+        ]
+        assert len(err_events) == 1
+        payload = err_events[0].kwargs
+        assert payload["document_id"] == "multimodal-doc"
+        assert payload["chunk_kind"] == "image"
+        assert payload["chunk_content_sha256"] == expected_sha
         assert payload["chunk_preview"] == ""
         assert payload["chunk_len"] == len(page_image)
 
-    def test_pdf_no_event_without_document_id(self, sample_pdf_bytes: bytes) -> None:
-        """Multimodal failures without document_id do not fire the event."""
+    def test_pdf_event_fires_without_document_id(self, sample_pdf_bytes: bytes) -> None:
+        """Multimodal failures without document_id still emit rich payloads (document_id=None)."""
         from framework import llm_extractor as mod
 
         with patch.object(anthropic, "Anthropic"):
@@ -5120,10 +5138,11 @@ class TestMultimodalDeterministicChunkFailure:
         ext._base_delay = 0.0
         ext._max_retries = 3
 
+        page_image = b"\x89PNG_x"
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
-                return_value=[(b"\x89PNG_x", "image/png")],
+                return_value=[(page_image, "image/png")],
             ),
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
@@ -5133,9 +5152,26 @@ class TestMultimodalDeterministicChunkFailure:
         ):
             ext.extract_from_pdf(sample_pdf_bytes)  # no document_id
 
-        fail_events = [
+        # The legacy threshold-based event must never fire.
+        threshold_events = [
             c
             for c in mock_logger.warning.call_args_list
             if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
         ]
-        assert fail_events == []
+        assert threshold_events == []
+
+        # The rich payload still shows up on the per-attempt warnings, just with document_id=None.
+        warn_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extractor.page_api_failure"
+        ]
+        assert warn_events, "expected at least one page_api_failure warning"
+        import hashlib
+
+        expected_sha = hashlib.sha256(page_image).hexdigest()
+        for ev in warn_events:
+            payload = ev.kwargs
+            assert payload["document_id"] is None
+            assert payload["chunk_content_sha256"] == expected_sha
+            assert payload["chunk_kind"] == "image"
