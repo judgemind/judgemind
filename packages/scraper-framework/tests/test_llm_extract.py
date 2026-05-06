@@ -992,46 +992,25 @@ class TestExtractFieldsLlm:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic chunk-failure instrumentation (#4233)
+# Enriched chunk_api_failure payload (#4253)
+#
+# The threshold-based ``deterministic_chunk_failure`` event was removed
+# (#4253) — it required 3 ``call_llm`` failures on the same doc within a
+# single run before firing the rich payload, but the actual #4233 docs
+# only chunk to 2 pieces and never accumulated 3 failures, so the event
+# was silent on the very docs that motivated it.  Each ``call_llm``
+# already represents 3 exhausted internal Google retries, so a single
+# chunk failure is now sufficient to deserve the full diagnostic blob;
+# the rich payload is folded directly into the existing
+# ``chunk_api_failure`` event.
 # ---------------------------------------------------------------------------
 
 
-class TestDeterministicChunkFailure:
-    """Verify the `llm_extract.deterministic_chunk_failure` event (#4233).
+class TestChunkApiFailureEnrichedPayload:
+    """Every ``llm_extract.chunk_api_failure`` event carries the rich payload (#4253)."""
 
-    When the same `document_id` accumulates 3+ failed `call_llm` calls
-    within a single reingest run, `extract_fields_llm` emits a
-    structured warning log event with the failing chunk's content
-    SHA-256 and a 200-char preview so future log queries can group
-    hits by content.
-    """
-
-    def setup_method(self) -> None:
-        from ingestion.llm_extract import reset_deterministic_chunk_failure_state
-
-        reset_deterministic_chunk_failure_state()
-
-    def teardown_method(self) -> None:
-        from ingestion.llm_extract import reset_deterministic_chunk_failure_state
-
-        reset_deterministic_chunk_failure_state()
-
-    def test_no_event_below_threshold(self) -> None:
-        """Two consecutive failures stay below the 3-failure threshold."""
-        from ingestion import llm_extract as mod
-
-        with (
-            patch("ingestion.llm_extract.call_llm", return_value=None),
-            patch.object(mod, "logger") as mock_logger,
-        ):
-            extract_fields_llm(document_text="some text", content_format="pdf", document_id="doc-A")
-            extract_fields_llm(document_text="some text", content_format="pdf", document_id="doc-A")
-
-            events = [c.args[0] for c in mock_logger.warning.call_args_list if c.args]
-            assert "llm_extract.deterministic_chunk_failure" not in events
-
-    def test_event_fires_at_threshold(self) -> None:
-        """Third failure on the same doc fires the deterministic-chunk-failure event."""
+    def test_single_failure_emits_enriched_payload(self) -> None:
+        """One failure (no threshold!) fires the enriched chunk_api_failure event."""
         from ingestion import llm_extract as mod
 
         chunk_text = "Case No. 30-2024-0123456 boilerplate ruling text" * 3
@@ -1039,166 +1018,136 @@ class TestDeterministicChunkFailure:
             patch("ingestion.llm_extract.call_llm", return_value=None),
             patch.object(mod, "logger") as mock_logger,
         ):
-            for _ in range(3):
-                extract_fields_llm(
-                    document_text=chunk_text,
-                    content_format="pdf",
-                    document_id="doc-B",
-                    provider="google",
-                    model="gemini-2.5-flash-lite",
-                )
-
-            fail_events = [
-                c
-                for c in mock_logger.warning.call_args_list
-                if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-            ]
-            assert len(fail_events) == 1, (
-                f"Expected exactly one deterministic_chunk_failure event, got {len(fail_events)}"
+            extract_fields_llm(
+                document_text=chunk_text,
+                content_format="pdf",
+                document_id="doc-single",
+                provider="google",
+                model="gemini-2.5-flash-lite",
             )
 
-            payload = fail_events[0].kwargs
-            assert payload["document_id"] == "doc-B"
-            assert payload["failure_count"] == 3
-            assert payload["threshold"] == 3
-            assert payload["provider"] == "google"
-            assert payload["model"] == "gemini-2.5-flash-lite"
-            assert payload["chunk_kind"] == "text"
+        fail_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extract.chunk_api_failure"
+        ]
+        assert len(fail_events) == 1, (
+            f"Expected exactly one chunk_api_failure event, got {len(fail_events)}"
+        )
 
-            import hashlib
+        payload = fail_events[0].kwargs
+        assert payload["document_id"] == "doc-single"
+        assert payload["chunk_index"] == 0
+        assert payload["provider"] == "google"
+        assert payload["model"] == "gemini-2.5-flash-lite"
+        assert payload["chunk_kind"] == "text"
 
-            expected_sha = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-            assert payload["chunk_content_sha256"] == expected_sha
-            assert len(payload["chunk_content_sha256"]) == 64
-            assert len(payload["chunk_preview"]) <= 200
-            assert payload["chunk_preview"] == chunk_text[:200]
-            assert payload["chunk_len"] == len(chunk_text)
+        import hashlib
 
-    def test_event_fires_only_once_per_document(self) -> None:
-        """Failures beyond threshold for the same doc do not re-fire the event."""
-        from ingestion import llm_extract as mod
-
-        with (
-            patch("ingestion.llm_extract.call_llm", return_value=None),
-            patch.object(mod, "logger") as mock_logger,
-        ):
-            for _ in range(5):
-                extract_fields_llm(
-                    document_text="some text",
-                    content_format="pdf",
-                    document_id="doc-C",
-                )
-
-            fail_events = [
-                c
-                for c in mock_logger.warning.call_args_list
-                if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-            ]
-            assert len(fail_events) == 1
-
-    def test_no_event_without_document_id(self) -> None:
-        """Failures without a document_id are not counted — instrumentation is opt-in."""
-        from ingestion import llm_extract as mod
-
-        with (
-            patch("ingestion.llm_extract.call_llm", return_value=None),
-            patch.object(mod, "logger") as mock_logger,
-        ):
-            for _ in range(5):
-                extract_fields_llm(
-                    document_text="some text", content_format="pdf"
-                )  # no document_id
-
-            fail_events = [
-                c
-                for c in mock_logger.warning.call_args_list
-                if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-            ]
-            assert fail_events == []
-
-    def test_counts_are_per_document(self) -> None:
-        """Failure counts are scoped per document_id — distinct docs accumulate separately."""
-        from ingestion import llm_extract as mod
-
-        with (
-            patch("ingestion.llm_extract.call_llm", return_value=None),
-            patch.object(mod, "logger") as mock_logger,
-        ):
-            extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-D")
-            extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-E")
-            extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-D")
-            extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-E")
-            extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-E")
-
-            fail_events = [
-                c
-                for c in mock_logger.warning.call_args_list
-                if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-            ]
-            assert len(fail_events) == 1
-            assert fail_events[0].kwargs["document_id"] == "doc-E"
+        expected_sha = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+        assert payload["chunk_content_sha256"] == expected_sha
+        assert len(payload["chunk_content_sha256"]) == 64
+        assert payload["chunk_preview"] == chunk_text[:200]
+        assert len(payload["chunk_preview"]) <= 200
+        assert payload["chunk_len"] == len(chunk_text)
 
     def test_event_payload_schema_has_required_fields(self) -> None:
-        """Log payload exposes all fields the issue's grouping queries depend on (#4233 AC)."""
+        """Log payload exposes the fields log queries depend on (#4253 AC)."""
         from ingestion import llm_extract as mod
 
         with (
             patch("ingestion.llm_extract.call_llm", return_value=None),
             patch.object(mod, "logger") as mock_logger,
         ):
-            for _ in range(3):
+            extract_fields_llm(
+                document_text="some text",
+                content_format="pdf",
+                document_id="doc-schema",
+            )
+
+        fail_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extract.chunk_api_failure"
+        ]
+        assert len(fail_events) == 1
+        payload = fail_events[0].kwargs
+        required_keys = {
+            "document_id",
+            "chunk_index",
+            "provider",
+            "model",
+            "chunk_content_sha256",
+            "chunk_preview",
+            "chunk_len",
+            "chunk_kind",
+        }
+        missing = required_keys - payload.keys()
+        assert not missing, f"Missing required log payload fields: {missing}"
+
+    def test_no_threshold_event_emitted(self) -> None:
+        """The legacy ``deterministic_chunk_failure`` event must never fire (#4253)."""
+        from ingestion import llm_extract as mod
+
+        with (
+            patch("ingestion.llm_extract.call_llm", return_value=None),
+            patch.object(mod, "logger") as mock_logger,
+        ):
+            for _ in range(5):
                 extract_fields_llm(
-                    document_text="some text",
+                    document_text="repeated failure text",
                     content_format="pdf",
-                    document_id="doc-schema",
+                    document_id="doc-no-threshold",
                 )
 
-            fail_events = [
-                c
-                for c in mock_logger.warning.call_args_list
-                if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-            ]
-            assert len(fail_events) == 1
-            payload = fail_events[0].kwargs
-            required_keys = {
-                "document_id",
-                "chunk_index",
-                "failure_count",
-                "threshold",
-                "provider",
-                "model",
-                "chunk_content_sha256",
-                "chunk_preview",
-                "chunk_len",
-                "chunk_kind",
-            }
-            missing = required_keys - payload.keys()
-            assert not missing, f"Missing required log payload fields: {missing}"
+        events = [c.args[0] for c in mock_logger.warning.call_args_list if c.args]
+        assert "llm_extract.deterministic_chunk_failure" not in events
 
-    def test_reset_clears_state(self) -> None:
-        """reset_deterministic_chunk_failure_state() clears counters between runs."""
+    def test_event_fires_without_document_id(self) -> None:
+        """Failures without a document_id still emit the rich payload (document_id=None)."""
         from ingestion import llm_extract as mod
-        from ingestion.llm_extract import reset_deterministic_chunk_failure_state
 
-        with patch("ingestion.llm_extract.call_llm", return_value=None):
-            for _ in range(3):
-                extract_fields_llm(document_text="text", content_format="pdf", document_id="doc-R")
-            # First fire happened — second batch with same doc_id, post-reset,
-            # should fire again.
-            reset_deterministic_chunk_failure_state()
+        chunk_text = "anonymous chunk text"
+        with (
+            patch("ingestion.llm_extract.call_llm", return_value=None),
+            patch.object(mod, "logger") as mock_logger,
+        ):
+            extract_fields_llm(
+                document_text=chunk_text,
+                content_format="pdf",
+            )  # no document_id
 
-            with patch.object(mod, "logger") as mock_logger:
-                for _ in range(3):
-                    extract_fields_llm(
-                        document_text="text", content_format="pdf", document_id="doc-R"
-                    )
+        fail_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extract.chunk_api_failure"
+        ]
+        assert len(fail_events) == 1
+        payload = fail_events[0].kwargs
+        assert payload["document_id"] is None
+        # SHA-256 + preview are still present — they are content-derived,
+        # not document_id-derived, so they always populate.
+        import hashlib
 
-                fail_events = [
-                    c
-                    for c in mock_logger.warning.call_args_list
-                    if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
-                ]
-                assert len(fail_events) == 1
+        assert (
+            payload["chunk_content_sha256"]
+            == hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+        )
+        assert payload["chunk_preview"] == chunk_text[:200]
+        assert payload["chunk_kind"] == "text"
+
+    def test_legacy_helpers_removed(self) -> None:
+        """The threshold-based helper API was removed in #4253."""
+        from ingestion import llm_extract as mod
+
+        # Public reset helper is gone.
+        assert not hasattr(mod, "reset_deterministic_chunk_failure_state")
+        # Counter constants and module-level state are gone.
+        assert not hasattr(mod, "_DETERMINISTIC_FAILURE_THRESHOLD")
+        assert not hasattr(mod, "_DETERMINISTIC_FAILURE_COUNTS")
+        assert not hasattr(mod, "_DETERMINISTIC_FAILURE_FIRED")
+        assert not hasattr(mod, "_DETERMINISTIC_FAILURE_LOCK")
+        assert not hasattr(mod, "_record_deterministic_chunk_failure")
 
 
 # ---------------------------------------------------------------------------
