@@ -3685,7 +3685,12 @@ done
 # ``run_claude_phase`` for portable epoch-ms timing. Must be extracted
 # into the fixture or the sourced ``run_claude_phase`` body fails with
 # ``_ms_now: command not found`` on every invocation.
+# #4125: ``_resolve_timeout_cmd`` is the macOS-portability resolver for
+# ``timeout`` / ``gtimeout`` — also HELPER-resident, also called from
+# ``run_claude_phase``. Same extraction requirement: omit it and the
+# sourced fixture aborts with ``_resolve_timeout_cmd: command not found``.
 for fn in _ms_now \
+          _resolve_timeout_cmd \
           claude_phase_timeout_seconds_by_phase \
           run_claude_phase \
           write_phase_input \
@@ -4213,6 +4218,7 @@ done
 # into the fixture or the sourced ``run_claude_phase`` body fails with
 # ``_ms_now: command not found`` on every invocation.
 for fn in _ms_now \
+          _resolve_timeout_cmd \
           phase_to_skill \
           read_phase_output \
           write_phase_input \
@@ -5741,6 +5747,7 @@ done
 # into the fixture or the sourced ``run_claude_phase`` body fails with
 # ``_ms_now: command not found`` on every invocation.
 for fn in _ms_now \
+          _resolve_timeout_cmd \
           phase_to_skill \
           read_phase_output \
           write_phase_input \

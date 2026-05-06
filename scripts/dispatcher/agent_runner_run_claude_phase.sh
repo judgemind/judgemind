@@ -61,6 +61,40 @@ if ! declare -F die >/dev/null 2>&1; then
     }
 fi
 
+# ── _resolve_timeout_cmd() — portable timeout(1) lookup (#4125) ────────────
+#
+# GNU coreutils ships ``timeout(1)`` on Linux. macOS BSD does NOT ship a
+# ``timeout`` binary out of the box. Operators with ``brew install coreutils``
+# get ``gtimeout`` (the ``g``-prefixed coreutils alias). The helper's
+# ``run_claude_phase`` wraps ``claude -p`` in ``timeout "$_phase_timeout" ...``
+# so a hung claude surfaces as exit 124 — but on a fresh Mac without
+# coreutils, bash returns rc=127 ("command not found") instead of rc=124,
+# the rc==124 short-circuit branch never fires, and the
+# ``test_agent_runner_run_claude_phase.sh`` runtime-timeout regression
+# silently fails locally with empty stdout.
+#
+# Resolve once at call time (cheap — two ``command -v`` checks) and return
+# the binary name. Empty string means neither is on PATH; ``run_claude_phase``
+# treats that as "exec inner command directly with no timer", which loses
+# the rc=124 branch but is strictly better than aborting with rc=127. The
+# self-sufficient runtime-timeout regression test stubs ``timeout`` into
+# its private ``$_tbin`` directory the same way the entrypoint test does
+# (see ``scripts/tests/test_agent_runner_entrypoint.sh`` lines 599-605),
+# so the test path doesn't depend on the operator having coreutils
+# installed.
+#
+# Output: prints either ``timeout``, ``gtimeout``, or empty string on
+# stdout. Always exits 0.
+_resolve_timeout_cmd() {
+    if command -v timeout >/dev/null 2>&1; then
+        printf 'timeout'
+    elif command -v gtimeout >/dev/null 2>&1; then
+        printf 'gtimeout'
+    else
+        printf ''
+    fi
+}
+
 # ── _ms_now() — portable epoch-milliseconds helper (#4099) ──────────────────
 #
 # GNU ``date -u +%s%3N`` returns epoch-seconds + 3-digit nanoseconds (i.e.
@@ -287,6 +321,13 @@ run_claude_phase() {
     # name appears in the constants block above as a comment anchor
     # for the test_per_phase_timeout.py static lints.
     _phase_timeout=$(claude_phase_timeout_seconds_by_phase "$_phase")
+    # #4125: pick ``timeout`` (Linux) or ``gtimeout`` (macOS + coreutils);
+    # empty string when neither is on PATH (fresh Mac with no coreutils),
+    # in which case we exec claude directly without a timer. Runtime
+    # ``rc=124`` branch is unreachable in that fallback, but that's
+    # strictly better than rc=127 ("command not found") which the bare
+    # ``timeout`` invocation produced before this fix.
+    _timeout_cmd=$(_resolve_timeout_cmd)
     # #4099: route through ``_ms_now`` (python3-backed) so macOS BSD date
     # doesn't silently emit ``17780132253N`` — see helper docstring above.
     _phase_start_ms=$(_ms_now)
@@ -297,6 +338,7 @@ run_claude_phase() {
             "phase=$_phase" \
             "skill=$_skill" \
             "cwd=$(pwd)" \
+            "timeout_cmd=$_timeout_cmd" \
             "timeout_seconds=$_phase_timeout"
         # #3683: wrap ``claude -p`` in ``timeout`` so a hung or wedged
         # claude process surfaces as a distinct ``claude_phase_timeout``
@@ -304,7 +346,10 @@ run_claude_phase() {
         # up to 30 minutes until the heartbeat reaper fires.
         # #3766: per-phase timeout — look up at function-call time so a
         # post-init mutation of the table (test override) takes effect.
-        timeout "$_phase_timeout" \
+        # #4125: ``$_timeout_cmd`` resolves to ``timeout`` / ``gtimeout`` /
+        # empty (see _resolve_timeout_cmd above). When empty, the leading
+        # token expansion vanishes and bash execs ``claude -p ...`` directly.
+        $_timeout_cmd ${_timeout_cmd:+"$_phase_timeout"} \
             claude -p "/task-v2-$_skill $AGENT_ID" \
             --output-format json \
             --dangerously-skip-permissions \
@@ -337,7 +382,16 @@ run_claude_phase() {
         # terminal_reason="completed". Route through the same output-resolution
         # chain as the clean-exit branch (see lines ~2176-2267, canonical copy)
         # instead of emitting a misleading BLOCKED envelope.
-        if jq -e '.result and .is_error == false and (.terminal_reason == "completed")' \
+        # #4125: explicitly require ``_out_file`` to be non-empty (``-s``)
+        # before invoking jq. macOS jq-1.6 returns rc=0 with empty output
+        # when given an empty input file, so the bare ``jq -e ...`` filter
+        # silently fired the salvage branch on a SIGKILLed-empty file —
+        # which falls through ``read_phase_output`` (no dispatcher-output
+        # written) → ``jq -c '.result'`` (still empty) → empty stdout, no
+        # BLOCKED envelope. Linux jq-1.7+ exits rc=2 on empty input which
+        # masked the bug in CI. The ``-s`` guard makes the salvage path
+        # correct regardless of jq version.
+        if [[ -s "$_out_file" ]] && jq -e '.result and .is_error == false and (.terminal_reason == "completed")' \
                 "$_out_file" >/dev/null 2>&1; then
             _claude_duration_ms=$(jq -r '.duration_ms // "unknown"' "$_out_file" 2>/dev/null)
             log "claude_phase_timeout_salvaged" \

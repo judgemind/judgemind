@@ -76,7 +76,16 @@ pass "helper script $HELPER exists"
 # downstream ``$((end - start))`` arithmetic with
 # ``value too great for base``. Listing ``_ms_now`` here so a future
 # refactor that drops or renames the helper trips this static lint.
-for fn in _ms_now write_phase_input read_phase_output phase_to_skill run_claude_phase \
+#
+# #4125: ``_resolve_timeout_cmd`` is the helper's portable timeout(1)
+# resolver — picks ``timeout`` (Linux) or ``gtimeout`` (macOS+coreutils)
+# at run time, falls back to empty string when neither is on PATH so a
+# fresh Mac without coreutils still exec's ``claude -p`` directly
+# instead of aborting with rc=127 ("command not found"). Listing
+# ``_resolve_timeout_cmd`` here so a future refactor that drops the
+# resolver re-introduces the macOS portability gap and trips this lint.
+for fn in _ms_now _resolve_timeout_cmd write_phase_input read_phase_output \
+          phase_to_skill run_claude_phase \
           claude_phase_timeout_seconds_by_phase; do
     if ! ( set +u; source "$HELPER"; type "$fn" >/dev/null 2>&1 ); then
         fail "helper defines $fn" \
@@ -164,6 +173,95 @@ if [[ "$broken_stub_output" == 'unknown' ]]; then
 else
     fail "_ms_now falls back to 'unknown' when python3 returns rc=0 with empty stdout (#4099)" \
         "expected 'unknown', got '$broken_stub_output'"
+fi
+
+# ── #4125 regression: _resolve_timeout_cmd — macOS portability ─────────────
+#
+# The bug being prevented: bare ``timeout`` invocation in run_claude_phase
+# returns rc=127 ("command not found") on macOS BSD without coreutils,
+# which never trips the rc==124 short-circuit and silently breaks the
+# runtime-timeout regression below. The resolver picks ``timeout`` /
+# ``gtimeout`` at runtime via ``command -v`` lookups, falling back to an
+# empty string so the call site exec's the inner command directly when
+# neither is on PATH. Verify all three branches.
+
+# Case 1: PATH has only ``timeout`` (Linux-shape).
+timeout_only_tmp=$(mktemp -d)
+TEMP_DIRS+=("$timeout_only_tmp")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$timeout_only_tmp/timeout"
+chmod +x "$timeout_only_tmp/timeout"
+timeout_only_output=$(
+    set +u
+    # Empty PATH except our stub so ``command -v gtimeout`` can't find
+    # a coreutils install on the test host.
+    export PATH="$timeout_only_tmp"
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _resolve_timeout_cmd
+)
+if [[ "$timeout_only_output" == 'timeout' ]]; then
+    pass "_resolve_timeout_cmd picks 'timeout' when only timeout is on PATH (#4125 — Linux shape)"
+else
+    fail "_resolve_timeout_cmd picks 'timeout' when only timeout is on PATH (#4125 — Linux shape)" \
+        "expected 'timeout', got '$timeout_only_output'"
+fi
+
+# Case 2: PATH has only ``gtimeout`` (macOS + coreutils shape).
+gtimeout_only_tmp=$(mktemp -d)
+TEMP_DIRS+=("$gtimeout_only_tmp")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$gtimeout_only_tmp/gtimeout"
+chmod +x "$gtimeout_only_tmp/gtimeout"
+gtimeout_only_output=$(
+    set +u
+    export PATH="$gtimeout_only_tmp"
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _resolve_timeout_cmd
+)
+if [[ "$gtimeout_only_output" == 'gtimeout' ]]; then
+    pass "_resolve_timeout_cmd picks 'gtimeout' when only gtimeout is on PATH (#4125 — macOS+coreutils shape)"
+else
+    fail "_resolve_timeout_cmd picks 'gtimeout' when only gtimeout is on PATH (#4125 — macOS+coreutils shape)" \
+        "expected 'gtimeout', got '$gtimeout_only_output'"
+fi
+
+# Case 3: PATH has neither (fresh Mac without coreutils).
+neither_tmp=$(mktemp -d)
+TEMP_DIRS+=("$neither_tmp")
+neither_output=$(
+    set +u
+    export PATH="$neither_tmp"
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _resolve_timeout_cmd
+)
+if [[ -z "$neither_output" ]]; then
+    pass "_resolve_timeout_cmd returns empty string when neither is on PATH (#4125 — fresh Mac)"
+else
+    fail "_resolve_timeout_cmd returns empty string when neither is on PATH (#4125 — fresh Mac)" \
+        "expected empty string, got '$neither_output'"
+fi
+
+# Case 4: PATH has both — ``timeout`` wins (Linux precedence over Mac+coreutils;
+# avoids surprising operators who installed coreutils via brew on a Linux
+# distro that already ships its own coreutils).
+both_tmp=$(mktemp -d)
+TEMP_DIRS+=("$both_tmp")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$both_tmp/timeout"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$both_tmp/gtimeout"
+chmod +x "$both_tmp/timeout" "$both_tmp/gtimeout"
+both_output=$(
+    set +u
+    export PATH="$both_tmp"
+    # shellcheck disable=SC1090
+    source "$HELPER"
+    _resolve_timeout_cmd
+)
+if [[ "$both_output" == 'timeout' ]]; then
+    pass "_resolve_timeout_cmd prefers 'timeout' over 'gtimeout' when both are on PATH (#4125)"
+else
+    fail "_resolve_timeout_cmd prefers 'timeout' over 'gtimeout' when both are on PATH (#4125)" \
+        "expected 'timeout', got '$both_output'"
 fi
 
 # ── phase_to_skill: phase name → skill suffix mapping ────────────────────────
@@ -370,6 +468,44 @@ run_timeout_regression_test() {
     local err_file="$tmp/err.log"
 
     mkdir -p "$ws" "$repo/tmp/dispatcher-output" "$stub_bin"
+
+    # #4125: stub ``timeout`` so the test runs on macOS without coreutils.
+    # macOS BSD does not ship ``timeout(1)`` — without this stub the bare
+    # ``$_timeout_cmd "$_phase_timeout" claude ...`` invocation in
+    # ``run_claude_phase`` would either resolve to nothing (bypassing the
+    # rc==124 short-circuit because no timer ever fires) or — pre-#4125,
+    # before the resolver — exit rc=127 ("command not found"). The stub
+    # mirrors GNU ``timeout(1)`` semantics for the ``timer fired`` path:
+    # SIGTERM the inner command after ``$1`` seconds and return rc=124,
+    # so the helper's rc==124 branch builds the BLOCKED envelope as
+    # expected. Mirrors the precedent set by
+    # ``scripts/tests/test_agent_runner_entrypoint.sh`` (lines 599-605),
+    # which stubs a passthrough ``timeout`` for the same portability
+    # reason.
+    cat > "$stub_bin/timeout" <<'TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+# Mimics GNU timeout(1) for the runtime-timeout regression test:
+# fork the inner command, sleep for $seconds, and if it's still
+# running, SIGTERM it and return 124. Bash 3.2-compatible (no
+# ``wait -n``, no ``-fr 0`` peeking).
+seconds="$1"
+shift
+"$@" &
+inner_pid=$!
+( sleep "$seconds" ; kill -TERM "$inner_pid" 2>/dev/null ) &
+sleeper_pid=$!
+wait "$inner_pid" 2>/dev/null
+inner_rc=$?
+# If the sleeper killed the inner process, $inner_rc is 143 (SIGTERM)
+# on most shells; normalize to 124 to match GNU timeout(1).
+kill -0 "$sleeper_pid" 2>/dev/null && kill "$sleeper_pid" 2>/dev/null
+if (( inner_rc == 143 )); then
+    exit 124
+fi
+exit "$inner_rc"
+TIMEOUTEOF
+    chmod +x "$stub_bin/timeout"
 
     # Stub claude: sleep 5 so the 1s timeout fires.
     printf '#!/usr/bin/env bash\nsleep 5\n' > "$stub_bin/claude"
