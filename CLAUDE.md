@@ -161,7 +161,7 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 - **All commits on the worktree branch.** Every change goes through a PR.
 - **Scope completeness check before implementing.** Grep for all locations affected by the change.
 - **Ralph for testable code only** (Python, TypeScript). Non-testable tasks implement directly, then run pre-PR checks and self-review the diff.
-- **Check for duplicate PRs** — `scripts/check-duplicate-pr.sh <N>`.
+- **Check for duplicate PRs** — `scripts/check-duplicate-pr.sh <N>` (open PRs) and `scripts/check-shipped-pr.sh <N>` (already-shipped via merged PR with no `Closes` keyword — pivots /task to verify-and-close per `.claude/skills/task/SKILL.md` §4a.2; #4204).
 - **CI watch is non-negotiable.** `gh run watch <id> --interval 60 --exit-status --compact`. Fix and re-push until CI is green.
 - **Verify `mergeable: MERGEABLE` and `statusCheckRollup` all SUCCESS/SKIPPED before merging.**
 - **Verification evidence comment is MANDATORY on every task completion.** For deployed services: curl / DB query / log lines / screenshot. For docs/CI/tooling: state the skip reason.
