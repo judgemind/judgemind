@@ -426,6 +426,8 @@ When wiring a `scripts/check-no-*.sh`, `scripts/check-forbidden-*.sh`, or `scrip
 
 The peer guard tests under `scripts/tests/test_check_*.sh` include a self-match assertion (see `scripts/tests/_guard_self_match_helpers.sh`) that catches this at test time. When adding a new string-forbidding guard, add an `assert_no_self_match_on_ci_step_name` call to its test.
 
+**`scripts/check-no-heredoc-pipe-shadow.sh`** — flags the silent-miscompile pattern `... | python3 << TAG` whose body reads stdin via `json.load(sys.stdin)` / `sys.stdin.read()`. Bash gives the heredoc precedence as Python's stdin, so the piped data is silently discarded and JSON parsing raises `Expecting value: line 1 column 1` at runtime. See #4267 (the guard) and #4252 (the `scripts/ecs-wait-task.sh` PR that surfaced the footgun).
+
 ### Test profiling — find the long pole in a shell test
 
 When a `scripts/tests/test_*.sh` shell test gets slow and the cost is unclear ("which `# Test N:` section is dominant?"), run `scripts/profile-shell-test.sh` against it:
