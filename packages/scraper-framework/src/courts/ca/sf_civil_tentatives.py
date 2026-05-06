@@ -1151,17 +1151,32 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         return doc
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Parse structured fields from a CapturedDocument.
+        """No-op on the live-capture path — all fields are populated during
+        ``fetch_documents`` via ``_ruling_to_document`` from the AJAX
+        response's structured data.
 
-        For this scraper, most fields are already populated in
-        fetch_documents via _ruling_to_document. This method handles
-        any additional parsing that couldn't be done during fetch.
+        **Reingest hazard (audit #4046, follow-up #4134):** this method is
+        also called from ``scripts/reingest_from_s3.py::_reparse_document``
+        with a fresh ``CapturedDocument`` carrying only ``raw_content``
+        (per-ruling HTML bytes). ``raw_content`` does NOT contain the AJAX
+        response's structured fields — those existed only in the live
+        ``ParsedRuling``. Returning the doc unchanged means ``judge_name``,
+        ``department``, ``parties``, ``outcome``, ``motion_type``, and
+        ``ruling_text_html`` get cleared by the reingest merge logic,
+        and only ``ruling_text`` (via UTF-8 decode of the HTML body) plus
+        the DB-seeded ``case_number/case_title/hearing_date`` survive.
+        **Reingest of SF-civil-tentatives documents is NOT fully
+        supported** — the surviving fields are a subset of the original
+        capture. Unlike #3986 there is no truncation-cap symptom because
+        the body is HTML rather than a JSON envelope, but the structural
+        loss is the same shape. #4134 tracks the refactor along the
+        #3986 ``_populate_from_envelope`` shape.
 
         Args:
             doc: The document to parse.
 
         Returns:
-            The document with any additional fields populated.
+            The document unchanged.
         """
         # Fields are pre-populated during fetch — no additional parsing needed
         # since the AJAX API returns structured data.
