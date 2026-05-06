@@ -150,10 +150,16 @@ resource "aws_ecs_task_definition" "field_population_audit" {
 
   container_definitions = jsonencode([
     {
-      name      = "field-population-audit"
-      image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
-      command   = ["python3", "scripts/audit_scraper_field_population.py", "--json"]
-      essential = true
+      name  = "field-population-audit"
+      image = "${var.ecr_repository_url}:${var.scraper_image_tag}"
+      # Override the scraper image's ENTRYPOINT (["python", "-m"]).
+      # Without this override the rendered command becomes
+      # `python -m python3 scripts/...` -> "No module named python3".
+      # The same bug pattern affects the zero-record-check sibling
+      # module today; that one is tracked separately (see /ecs/judgemind-zero-record-check-dev logs).
+      entryPoint = ["python3"]
+      command    = ["scripts/audit_scraper_field_population.py", "--json"]
+      essential  = true
 
       environment = [
         { name = "AWS_REGION", value = data.aws_region.current.id },
