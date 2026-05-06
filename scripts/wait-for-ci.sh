@@ -52,6 +52,8 @@
 #   --timeout-secs N    Overall timeout in seconds (default: 1800)
 #   --poll-interval N   Polling interval in seconds (default: 30)
 #   --repo OWNER/REPO   GitHub repository (default: judgemind/judgemind)
+#   --no-auto-rerun     Disable the known-flake auto-rerun classifier (#4148).
+#                       When set, any failed check exits 1 immediately.
 #   --help              Print this help and exit 0
 #
 # Exit codes:
@@ -69,7 +71,12 @@
 #           ci-passed=success, no failures, and mergeStateStatus is CLEAN or
 #           UNSTABLE. Stdout names this path with `all checks complete`.
 #   1 — Early failure: one or more checks have a failed conclusion. Prints the
-#       failed check names and their details_url.
+#       failed check names and their details_url. Before exiting, the failed
+#       jobs' logs are passed to `scripts/classify-ci-flake.sh`. If any
+#       classifies as a known flake AND no rerun has fired on this run yet,
+#       `gh run rerun <run-id> --failed` is invoked once and polling continues
+#       (path stdout names the matched pattern with `flake detected: <label>`).
+#       A second flake on the same run exits 1 — see #4148.
 #   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +89,12 @@ TIMEOUT_SECS=1800
 POLL_INTERVAL=30
 REPO="judgemind/judgemind"
 PR_NUMBER=""
+AUTO_RERUN=1
+
+# Path to this script's directory — used to locate the sibling
+# `classify-ci-flake.sh` helper without depending on PATH.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLASSIFIER="$SCRIPT_DIR/classify-ci-flake.sh"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -115,6 +128,10 @@ while [ $# -gt 0 ]; do
         --repo)
             REPO="$2"
             shift 2
+            ;;
+        --no-auto-rerun)
+            AUTO_RERUN=0
+            shift
             ;;
         --*)
             echo "ERROR: Unknown option: $1" >&2
@@ -153,6 +170,48 @@ echo "PR #${PR_NUMBER} head SHA: ${SHA}"
 echo "Polling check-runs (timeout: ${TIMEOUT_SECS}s, interval: ${POLL_INTERVAL}s)..."
 echo ""
 
+# ── Auto-rerun sentinel (#4148) ──────────────────────────────────────────────
+#
+# When --auto-rerun is enabled (the default), the script will fire
+# `gh run rerun <run-id> --failed` exactly once per CI run on this SHA when a
+# failed job's log matches a known-flake pattern. The sentinel file remembers
+# which run-ids have already been rerun so a second flake on the same run
+# falls through to exit 1 — this prevents chasing a real outage forever.
+#
+# Tests override the sentinel path via WAIT_FOR_CI_RERUN_SENTINEL_FILE.
+RERUN_SENTINEL_FILE="${WAIT_FOR_CI_RERUN_SENTINEL_FILE:-${TMPDIR:-/tmp}/wait-for-ci-rerun.${SHA}}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Extract the workflow run-id from a check-run's details_url. GitHub formats
+# the URL as `https://<host>/<owner>/<repo>/actions/runs/<run-id>/job/<job-id>`
+# (or sometimes without the `/job/<job-id>` suffix). We tolerate either form.
+# Echoes the run-id, or empty string if no match.
+parse_run_id_from_url() {
+    local url="$1"
+    # Strip everything up to and including `/actions/runs/`, then keep digits
+    # before the next `/` boundary.
+    echo "$url" | sed -n 's|.*/actions/runs/\([0-9][0-9]*\).*|\1|p'
+}
+
+# Check whether `gh run rerun` has already been invoked for the given run-id
+# during this script's lifetime (across poll iterations). Returns 0 if the
+# sentinel records this run, 1 otherwise.
+rerun_already_fired() {
+    local run_id="$1"
+    if [ -f "$RERUN_SENTINEL_FILE" ] && grep -Fxq "$run_id" "$RERUN_SENTINEL_FILE"; then
+        return 0
+    fi
+    return 1
+}
+
+# Record that `gh run rerun` was fired for this run-id.
+record_rerun_fired() {
+    local run_id="$1"
+    mkdir -p "$(dirname "$RERUN_SENTINEL_FILE")"
+    echo "$run_id" >> "$RERUN_SENTINEL_FILE"
+}
+
 # ── Poll loop ─────────────────────────────────────────────────────────────────
 
 START_TS=$(date +%s)
@@ -178,6 +237,80 @@ while true; do
         echo ""
         echo "ERROR: ${FAILED_COUNT} check(s) failed:" >&2
         echo "$CHECK_RUNS_JSON" | jq -r '.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled")) | "  - \(.name): conclusion=\(.conclusion)  \(.details_url // "(no details url)")"' >&2
+
+        # ── Known-flake auto-rerun (#4148) ────────────────────────────────
+        # Before exiting 1, classify each failed job's log tail. If any
+        # classifies as a known flake AND no rerun has fired yet on the
+        # owning workflow run, fire `gh run rerun --failed` once and continue
+        # polling. A second flake on the same run falls through to exit 1.
+        if [ "$AUTO_RERUN" -eq 1 ] && [ -x "$CLASSIFIER" ]; then
+            FLAKE_DETECTED=0
+            FLAKE_LABEL=""
+            FLAKE_RUN_ID=""
+
+            # Extract one (failed-check, run-id) pair per failed check.
+            # We only need to check the first failed run-id we see —
+            # `gh run rerun --failed` already reruns every failed job on
+            # that run, and rerunning multiple distinct runs from one
+            # script invocation is out of scope (one rerun per SHA per
+            # script call). The first failed check in the rollup is
+            # representative.
+            FAILED_DETAILS=$(echo "$CHECK_RUNS_JSON" | jq -r '
+                .[]
+                | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled"))
+                | (.details_url // "")
+            ')
+
+            # Walk failed checks until we find one whose run-id parses AND
+            # whose log classifies as a known flake.
+            while IFS= read -r URL; do
+                [ -z "$URL" ] && continue
+                CANDIDATE_RUN_ID=$(parse_run_id_from_url "$URL")
+                if [ -z "$CANDIDATE_RUN_ID" ]; then
+                    continue
+                fi
+
+                # Fetch the failed-job log tail for this run. `gh run view
+                # --log-failed` concatenates every failed job's full log;
+                # we pass the whole thing to the classifier (the classifier
+                # is grep-based so size is fine for typical CI logs <10MB).
+                # Suppress stderr — `gh` may print a non-fatal warning about
+                # log truncation that we don't want polluting stdout.
+                JOB_LOG=$(gh run view "$CANDIDATE_RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || echo "")
+
+                CLASSIFICATION=$(printf '%s' "$JOB_LOG" | "$CLASSIFIER" 2>/dev/null || echo "real")
+                if [ "${CLASSIFICATION#flake/}" != "$CLASSIFICATION" ]; then
+                    FLAKE_DETECTED=1
+                    FLAKE_LABEL="${CLASSIFICATION#flake/}"
+                    FLAKE_RUN_ID="$CANDIDATE_RUN_ID"
+                    break
+                fi
+            done <<EOF
+$FAILED_DETAILS
+EOF
+
+            if [ "$FLAKE_DETECTED" -eq 1 ]; then
+                if rerun_already_fired "$FLAKE_RUN_ID"; then
+                    echo "" >&2
+                    echo "flake detected: ${FLAKE_LABEL} (run ${FLAKE_RUN_ID}) — but rerun already fired once for this run; not retrying." >&2
+                    exit 1
+                fi
+
+                echo ""
+                echo "flake detected: ${FLAKE_LABEL} (run ${FLAKE_RUN_ID}) — auto-rerunning failed jobs and continuing to poll."
+                if gh run rerun "$FLAKE_RUN_ID" --repo "$REPO" --failed >/dev/null 2>&1; then
+                    record_rerun_fired "$FLAKE_RUN_ID"
+                    # Sleep one poll interval so the new run has a moment to
+                    # register before the next check-runs fetch.
+                    sleep "$POLL_INTERVAL"
+                    continue
+                else
+                    echo "ERROR: gh run rerun failed for run ${FLAKE_RUN_ID}; exiting 1." >&2
+                    exit 1
+                fi
+            fi
+        fi
+
         exit 1
     fi
 

@@ -86,6 +86,8 @@ CALL_COUNTER_FILE="${CALL_COUNTER_FILE:?CALL_COUNTER_FILE required}"
 SHA_RESPONSE="${SHA_RESPONSE:-deadbeefdeadbeef}"
 MERGE_STATE_RESPONSE="${MERGE_STATE_RESPONSE:-CLEAN}"
 MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}"
+LOG_FAILED_FILE="${LOG_FAILED_FILE:-}"
+RERUN_LOG_FILE="${RERUN_LOG_FILE:-}"
 
 ARGS="$*"
 
@@ -104,6 +106,23 @@ case "$ARGS" in
         ;;
     *"mergeable"*)
         printf '%s\n' "$MERGEABLE_RESPONSE"
+        exit 0
+        ;;
+    *"run rerun"*)
+        # Record the rerun invocation so tests can assert it fired exactly N
+        # times. Each call appends a single line: `<run-id> <args>`.
+        if [ -n "$RERUN_LOG_FILE" ]; then
+            echo "$ARGS" >> "$RERUN_LOG_FILE"
+        fi
+        exit 0
+        ;;
+    *"run view"*"--log-failed"*)
+        # Emit the canned failed-job log. If LOG_FAILED_FILE is unset or
+        # missing, return empty output (which the classifier will label
+        # as `real` — i.e. the auto-rerun path is suppressed).
+        if [ -n "$LOG_FAILED_FILE" ] && [ -f "$LOG_FAILED_FILE" ]; then
+            cat "$LOG_FAILED_FILE"
+        fi
         exit 0
         ;;
     *"check-runs"*)
@@ -156,6 +175,9 @@ run_script() {
     SHA_RESPONSE="${SHA_RESPONSE:-deadbeefdeadbeef}" \
     MERGE_STATE_RESPONSE="${MERGE_STATE_RESPONSE:-CLEAN}" \
     MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}" \
+    LOG_FAILED_FILE="${LOG_FAILED_FILE:-}" \
+    RERUN_LOG_FILE="${RERUN_LOG_FILE:-}" \
+    WAIT_FOR_CI_RERUN_SENTINEL_FILE="${WAIT_FOR_CI_RERUN_SENTINEL_FILE:-$tmpdir/rerun-sentinel}" \
         "$SCRIPT_UNDER_TEST" "$@"
 }
 
@@ -195,6 +217,27 @@ write_failure_response() {
   "check_runs": [
     {"name": "lint",        "status": "completed", "conclusion": "success",  "details_url": "https://example.com/lint"},
     {"name": "$check_name", "status": "completed", "conclusion": "failure",  "details_url": "https://example.com/web-tests"}
+  ]
+}
+JSON
+}
+
+# Write a check-runs response with one failed check whose details_url uses
+# the canonical GitHub Actions URL format. This is what production check-runs
+# actually emit and is required for the auto-rerun classifier path (#4148)
+# to extract a workflow run-id from the URL.
+#
+# Args: <file> <check_name> <run_id> [conclusion]
+write_failure_with_run_id_response() {
+    local file="$1"
+    local check_name="${2:-schema-drift-check}"
+    local run_id="${3:-25418711047}"
+    local conclusion="${4:-failure}"
+    cat > "$file" << JSON
+{
+  "check_runs": [
+    {"name": "lint",        "status": "completed", "conclusion": "success",  "details_url": "https://example.com/lint"},
+    {"name": "$check_name", "status": "completed", "conclusion": "$conclusion", "details_url": "https://github.com/judgemind/judgemind/actions/runs/$run_id/job/72104555100"}
   ]
 }
 JSON
@@ -518,6 +561,192 @@ test_double_ci_passed_entries_resolves_success() {
     fi
 }
 
+# Test 11 (#4148): Auto-rerun on known flake. The mock returns a failed
+# `schema-drift-check` job on the first poll (with a parseable run-id in
+# `details_url`). The mocked `gh run view --log-failed` returns the canonical
+# postgres-startup error string, so the classifier emits `flake/postgres-startup`.
+# The script must:
+#   - log `flake detected: postgres-startup` on stdout (AC#3),
+#   - call `gh run rerun <run-id> --failed` exactly once,
+#   - continue polling (the second response is all-success → exit 0).
+test_auto_rerun_on_postgres_startup_flake() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "schema-drift-check" "25418711047"
+    write_all_success_response "$tmpdir/responses/02.json"
+
+    # Canned failed-job log that classifies as flake/postgres-startup.
+    local log_file rerun_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    cat > "$log_file" << 'LOG'
+schema-drift-check / check-schema (pull_request) ...
++ docker run -d --name judgemind-schema-check ...
++ docker exec judgemind-schema-check pg_isready
+ERROR: postgres failed to start within 30 seconds
+##[error]Process completed with exit code 1.
+LOG
+
+    local output exit_code
+    exit_code=0
+    output=$(LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 60 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "auto_rerun_postgres: exits 0 after rerun + success poll"
+    else
+        fail "auto_rerun_postgres: exits 0 after rerun + success poll" "exit=$exit_code output=$output"
+    fi
+
+    # AC#3: stdout must name the matched pattern.
+    if echo "$output" | grep -q "flake detected: postgres-startup"; then
+        pass "auto_rerun_postgres: stdout names matched pattern"
+    else
+        fail "auto_rerun_postgres: stdout names matched pattern" "output=$output"
+    fi
+
+    # AC#2 first half: rerun fired exactly once.
+    local rerun_count=0
+    if [ -f "$rerun_log" ]; then
+        rerun_count=$(wc -l < "$rerun_log" | tr -d ' ')
+    fi
+    if [ "$rerun_count" = "1" ]; then
+        pass "auto_rerun_postgres: gh run rerun fired exactly once"
+    else
+        fail "auto_rerun_postgres: gh run rerun fired exactly once" "rerun_count=$rerun_count log=$(cat "$rerun_log" 2>/dev/null || echo none)"
+    fi
+
+    # The rerun call must include the parsed run-id.
+    if [ -f "$rerun_log" ] && grep -q "25418711047" "$rerun_log"; then
+        pass "auto_rerun_postgres: rerun call carries the parsed run-id"
+    else
+        fail "auto_rerun_postgres: rerun call carries the parsed run-id" "log=$(cat "$rerun_log" 2>/dev/null || echo none)"
+    fi
+}
+
+# Test 12 (#4148 AC#2 second half): Two consecutive flakes on the same run
+# must exit 1 — auto-rerun fires once, then a second flake response on the
+# next poll falls through to exit 1.
+test_two_consecutive_flakes_exit_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    # Both polls return the same flake failure on the same run-id.
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "schema-drift-check" "25418711047"
+    write_failure_with_run_id_response "$tmpdir/responses/02.json" "schema-drift-check" "25418711047"
+
+    local log_file rerun_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    cat > "$log_file" << 'LOG'
+ERROR: postgres failed to start within 30 seconds
+LOG
+
+    local output exit_code
+    exit_code=0
+    output=$(LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 60 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "two_consecutive_flakes: exits 1 on second flake"
+    else
+        fail "two_consecutive_flakes: exits 1 on second flake" "exit=$exit_code output=$output"
+    fi
+
+    # AC#2: rerun fired exactly once total — never twice.
+    local rerun_count=0
+    if [ -f "$rerun_log" ]; then
+        rerun_count=$(wc -l < "$rerun_log" | tr -d ' ')
+    fi
+    if [ "$rerun_count" = "1" ]; then
+        pass "two_consecutive_flakes: rerun fired exactly once total"
+    else
+        fail "two_consecutive_flakes: rerun fired exactly once total" "rerun_count=$rerun_count"
+    fi
+
+    # The "rerun already fired" message should appear in output.
+    if echo "$output" | grep -q "rerun already fired"; then
+        pass "two_consecutive_flakes: stderr explains the rerun-already-fired condition"
+    else
+        fail "two_consecutive_flakes: stderr explains the rerun-already-fired condition" "output=$output"
+    fi
+}
+
+# Test 13 (#4148): Real (non-flake) failure must NOT trigger auto-rerun.
+# The failed job log here has no flake-pattern string, so the classifier
+# emits `real` and the script falls through to exit 1 with no rerun.
+test_real_failure_no_rerun() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "unit-tests" "12345678"
+
+    local log_file rerun_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    cat > "$log_file" << 'LOG'
+test_foo (TestBar) ... FAIL
+AssertionError: expected 1 got 2
+ran 17 tests in 0.234s
+FAILED (failures=1)
+LOG
+
+    local output exit_code
+    exit_code=0
+    output=$(LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 60 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "real_failure_no_rerun: exits 1 on real failure"
+    else
+        fail "real_failure_no_rerun: exits 1 on real failure" "exit=$exit_code output=$output"
+    fi
+
+    if [ ! -f "$rerun_log" ] || [ ! -s "$rerun_log" ]; then
+        pass "real_failure_no_rerun: gh run rerun was NOT called"
+    else
+        fail "real_failure_no_rerun: gh run rerun was NOT called" "rerun_log=$(cat "$rerun_log")"
+    fi
+
+    if echo "$output" | grep -q "flake detected"; then
+        fail "real_failure_no_rerun: must NOT log 'flake detected' on real failure" "output=$output"
+    else
+        pass "real_failure_no_rerun: does not falsely claim flake"
+    fi
+}
+
+# Test 14 (#4148): --no-auto-rerun must disable the classifier path entirely
+# even when a flake pattern is present in the job log.
+test_no_auto_rerun_flag_disables_classifier() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "schema-drift-check" "25418711047"
+
+    local log_file rerun_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    cat > "$log_file" << 'LOG'
+ERROR: postgres failed to start within 30 seconds
+LOG
+
+    local output exit_code
+    exit_code=0
+    output=$(LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        run_script "$tmpdir" 42 --no-auto-rerun --poll-interval 0 --timeout-secs 60 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "no_auto_rerun_flag: exits 1 with --no-auto-rerun"
+    else
+        fail "no_auto_rerun_flag: exits 1 with --no-auto-rerun" "exit=$exit_code output=$output"
+    fi
+
+    if [ ! -f "$rerun_log" ] || [ ! -s "$rerun_log" ]; then
+        pass "no_auto_rerun_flag: gh run rerun was NOT called"
+    else
+        fail "no_auto_rerun_flag: gh run rerun was NOT called" "rerun_log=$(cat "$rerun_log")"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -530,6 +759,10 @@ test_all_checks_complete_path
 test_no_regression_in_progress_ci_passed
 test_no_regression_failure_short_circuits_fastpath
 test_double_ci_passed_entries_resolves_success
+test_auto_rerun_on_postgres_startup_flake
+test_two_consecutive_flakes_exit_1
+test_real_failure_no_rerun
+test_no_auto_rerun_flag_disables_classifier
 
 echo ""
 echo "────────────────────────────────────────────"
