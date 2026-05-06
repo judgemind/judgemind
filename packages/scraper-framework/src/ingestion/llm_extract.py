@@ -629,6 +629,92 @@ _MAX_CHUNKS = 10
 # Overlap characters between consecutive chunks for context continuity.
 _CHUNK_OVERLAP = 500
 
+# Deterministic-chunk-failure instrumentation (#4233).
+# When the same ``document_id`` accumulates this many ``call_llm`` failures
+# (i.e. ``llm_extract.chunk_api_failure`` events) within a single reingest
+# run, emit ``llm_extract.deterministic_chunk_failure`` once with the
+# failing chunk's content SHA-256 and a 200-char preview so future log
+# queries can group hits by content and identify the documents that
+# deterministically trip the LLM provider.
+_DETERMINISTIC_FAILURE_THRESHOLD = 3
+_DETERMINISTIC_FAILURE_PREVIEW_CHARS = 200
+
+# Process-local counters for the deterministic-chunk-failure instrumentation.
+# The reingest worker is a per-task ECS process — these dicts live for the
+# duration of the run.  Thread-safe under the ``_DETERMINISTIC_FAILURE_LOCK``
+# because multi-chunk documents fan out via ``ThreadPoolExecutor``.
+_DETERMINISTIC_FAILURE_LOCK = threading.Lock()
+_DETERMINISTIC_FAILURE_COUNTS: dict[str, int] = {}
+_DETERMINISTIC_FAILURE_FIRED: set[str] = set()
+
+
+def _record_deterministic_chunk_failure(
+    *,
+    document_id: str | None,
+    chunk_index: int,
+    chunk_text: str,
+    provider: str | None,
+    model: str | None,
+) -> None:
+    """Increment the per-document chunk-failure counter (#4233).
+
+    When the same ``document_id`` accumulates
+    ``_DETERMINISTIC_FAILURE_THRESHOLD`` failed ``call_llm`` invocations
+    within this process's lifetime, emit
+    ``llm_extract.deterministic_chunk_failure`` once with the current
+    chunk's content SHA-256 and a 200-char preview so operators can
+    group log entries by content and identify the documents that
+    deterministically trip the LLM provider.
+
+    No-op when ``document_id`` is ``None`` (legacy callers).  Thread-safe
+    via the module-level lock — concurrent chunk extractions for the
+    same document_id race-correctly.
+    """
+    if not document_id:
+        return
+
+    with _DETERMINISTIC_FAILURE_LOCK:
+        new_count = _DETERMINISTIC_FAILURE_COUNTS.get(document_id, 0) + 1
+        _DETERMINISTIC_FAILURE_COUNTS[document_id] = new_count
+        already_fired = document_id in _DETERMINISTIC_FAILURE_FIRED
+        if new_count >= _DETERMINISTIC_FAILURE_THRESHOLD and not already_fired:
+            _DETERMINISTIC_FAILURE_FIRED.add(document_id)
+            should_emit = True
+        else:
+            should_emit = False
+
+    if not should_emit:
+        return
+
+    preview = chunk_text[:_DETERMINISTIC_FAILURE_PREVIEW_CHARS]
+    content_sha256 = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+    logger.warning(
+        "llm_extract.deterministic_chunk_failure",
+        document_id=document_id,
+        chunk_index=chunk_index,
+        failure_count=new_count,
+        threshold=_DETERMINISTIC_FAILURE_THRESHOLD,
+        provider=provider,
+        model=model,
+        chunk_content_sha256=content_sha256,
+        chunk_preview=preview,
+        chunk_len=len(chunk_text),
+        chunk_kind="text",
+    )
+
+
+def reset_deterministic_chunk_failure_state() -> None:
+    """Reset the per-process deterministic-failure counters (#4233).
+
+    Used by tests and by long-lived processes that want to scope the
+    counter to a particular run.  No-op if no failures have been
+    recorded yet.
+    """
+    with _DETERMINISTIC_FAILURE_LOCK:
+        _DETERMINISTIC_FAILURE_COUNTS.clear()
+        _DETERMINISTIC_FAILURE_FIRED.clear()
+
+
 # Patterns that indicate natural split boundaries in text.
 _PAGE_BREAK_RE = re.compile(r"\f")  # Form feed (pymupdf page separator)
 _HR_RE = re.compile(r"<HR[^>]*>", re.IGNORECASE)
@@ -806,6 +892,7 @@ def extract_fields_llm(
     token_tracker: TokenTracker | None = None,
     max_tokens: int = 4096,
     bust_cache: bool = False,
+    document_id: str | None = None,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -856,6 +943,15 @@ def extract_fields_llm(
             from the fresh result.  Used by the ``--bust-llm-cache``
             reingest flag (#2424) to force fresh LLM output after a
             prompt change, without invalidating the cache permanently.
+        document_id: Optional source ``derived.documents`` UUID.  When
+            provided, ``call_llm`` failures for this doc are counted in
+            a process-local map; once
+            ``_DETERMINISTIC_FAILURE_THRESHOLD`` is reached within
+            a single reingest run,
+            ``llm_extract.deterministic_chunk_failure`` is emitted with
+            the failing chunk's content SHA-256 and a 200-char preview
+            so future log queries can group by content (#4233).  Has no
+            effect on cache key.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -931,7 +1027,18 @@ def extract_fields_llm(
             max_tokens=max_tokens,
         )
         if llm_response is None:
-            logger.warning("llm_extract.chunk_api_failure", chunk_index=i)
+            logger.warning(
+                "llm_extract.chunk_api_failure",
+                chunk_index=i,
+                document_id=document_id,
+            )
+            _record_deterministic_chunk_failure(
+                document_id=document_id,
+                chunk_index=i,
+                chunk_text=chunk,
+                provider=provider,
+                model=model,
+            )
             return None
         if token_tracker is not None:
             token_tracker.add(llm_response.input_tokens, llm_response.output_tokens)
