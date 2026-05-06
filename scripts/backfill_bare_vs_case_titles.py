@@ -45,18 +45,15 @@ logger = logging.getLogger(__name__)
 # then ends with whitespace + v/vs/vs. (case-insensitive).
 # Uses keyset pagination on (id) for efficient batching.
 #
-# NOTE: The `county` column does not exist on `derived.cases` (it lives on
-# `derived.courts`). This SELECT is broken and will fail at runtime; the
-# proper fix joins courts via court_id. Tracked separately so the new
-# unqualified-column check (#4271) can ship without bundling unrelated
-# bug fixes. See follow-up filed at PR-merge time.
-# sql-check:ignore
+# `county` lives on `derived.courts` (not `derived.cases`), so we JOIN courts
+# via `cases.court_id` to attach the per-county breakdown for logging.
 FETCH_QUERY = """
-    SELECT id, case_title, county
-    FROM derived.cases
-    WHERE case_title ~* '^[A-Z][^.]*\\s+v[s]?\\.?\\s*$'
-      AND id > %s
-    ORDER BY id
+    SELECT c.id, c.case_title, ct.county
+    FROM derived.cases c
+    JOIN derived.courts ct ON ct.id = c.court_id
+    WHERE c.case_title ~* '^[A-Z][^.]*\\s+v[s]?\\.?\\s*$'
+      AND c.id > %s
+    ORDER BY c.id
     LIMIT %s
 """
 
