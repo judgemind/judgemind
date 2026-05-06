@@ -3938,6 +3938,19 @@ fi
 if command -v python3 >/dev/null 2>&1; then
     ln -sf "$(command -v python3)" "$t41_stub_bin/python3"
 fi
+# #4172: timeout passthrough — run_claude_phase wraps the ``claude`` call
+# in ``timeout "$_phase_timeout" claude -p ...`` (#3683/#3766). macOS does
+# not ship coreutils' ``timeout(1)``, so on operator laptops the call
+# fails with rc=127 before claude is ever exec'd — the subshell exits,
+# the dispatcher-output file is still read, and the verdict envelope
+# returns successfully. The peer assertions (verdict=resolved, git
+# add/commit, resolved file contents) still pass, but the
+# ``claude -p fix-conflict was invoked`` assertion fails because
+# CLAUDE_INVOKED is never appended to claude-log.txt. Symlink the
+# shared passthrough stub from $STUB_BIN to make the fix-conflict path
+# cross-platform; T3777 (which exercises the rc=124 timeout-fired branch)
+# overrides this with its own per-test stub via PATH ordering.
+ln -sf "$STUB_BIN/timeout" "$t41_stub_bin/timeout"
 
 # Phase input shim — write an empty fix-conflict.json so
 # write_phase_input succeeds.
@@ -5977,6 +5990,13 @@ cat > "$t58_stub_bin/gh" <<'T58GHEOF'
 exit 0
 T58GHEOF
 chmod +x "$t58_stub_bin/gh"
+
+# #4172: timeout passthrough — see the matching note above the T41
+# timeout stub (line ~3816). PATH is "$t58_stub_bin:$PATH" so without
+# this symlink macOS lookups would miss coreutils' timeout(1) and the
+# claude invocation in run_claude_phase would never run on operator
+# laptops.
+ln -sf "$STUB_BIN/timeout" "$t58_stub_bin/timeout"
 
 # transition_for stub: returns advance_with_status\toperational_done\tsucceeded\t
 # for the operational phase. Extracted as a shell function replacement below.
