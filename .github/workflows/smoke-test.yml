@@ -320,6 +320,13 @@ jobs:
         if: >-
           steps.smoke.outputs.has_failures == 'false' &&
           steps.rest-smoke.outputs.has_failures == 'false'
+        # Best-effort cleanup — the actual smoke tests already passed at this
+        # point, so a transient GitHub-API 5xx (e.g. GraphQL 504) here should
+        # NOT fail the workflow run. The auto-close step is idempotent: any
+        # smoke-test-failure issue it doesn't get to close on this run will be
+        # closed on the next workflow trigger. See #4234 (and #4231 for the
+        # observed flake class).
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
