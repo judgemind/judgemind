@@ -298,7 +298,7 @@ def fetch_capture_count(conn: object, scraper_id: str, since: datetime) -> int:
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
             "SELECT COUNT(*) FROM derived.documents "
-            "WHERE scraper_id = %s AND capture_timestamp >= %s",
+            "WHERE scraper_id = %s AND captured_at >= %s",
             (scraper_id, since),
         )
         row = cur.fetchone()
@@ -308,7 +308,7 @@ def fetch_capture_count(conn: object, scraper_id: str, since: datetime) -> int:
 def fetch_sample_keys(conn: object, scraper_id: str, sample_size: int) -> list[str]:
     """Return up to *sample_size* recent s3_key values for *scraper_id*.
 
-    Ordered by capture_timestamp DESC so the audit always inspects the
+    Ordered by captured_at DESC so the audit always inspects the
     freshest envelopes -- field drift is most visible at the leading
     edge of capture.  Empty s3_key rows are excluded.
     """
@@ -316,7 +316,7 @@ def fetch_sample_keys(conn: object, scraper_id: str, sample_size: int) -> list[s
         cur.execute(
             "SELECT s3_key FROM derived.documents "
             "WHERE scraper_id = %s AND s3_key IS NOT NULL AND s3_key != '' "
-            "ORDER BY capture_timestamp DESC NULLS LAST "
+            "ORDER BY captured_at DESC NULLS LAST "
             "LIMIT %s",
             (scraper_id, sample_size),
         )
