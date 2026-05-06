@@ -403,6 +403,25 @@ When wiring a `scripts/check-no-*.sh`, `scripts/check-forbidden-*.sh`, or `scrip
 
 The peer guard tests under `scripts/tests/test_check_*.sh` include a self-match assertion (see `scripts/tests/_guard_self_match_helpers.sh`) that catches this at test time. When adding a new string-forbidding guard, add an `assert_no_self_match_on_ci_step_name` call to its test.
 
+### Test profiling — find the long pole in a shell test
+
+When a `scripts/tests/test_*.sh` shell test gets slow and the cost is unclear ("which `# Test N:` section is dominant?"), run `scripts/profile-shell-test.sh` against it:
+
+```
+scripts/profile-shell-test.sh scripts/tests/test_agent_runner_entrypoint.sh
+```
+
+The wrapper:
+
+1. Detects section boundaries (default regex: `^#\s+Tests?\s+\d+:`) and injects `_section_start` / `_section_end` markers around each.
+2. Runs the instrumented copy in place (preserves `${BASH_SOURCE[0]}`-based path discovery).
+3. Writes one `<elapsed_seconds>\t<section_label>` row per section to a TSV.
+4. Prints the top-20 longest sections to stdout in sorted order.
+
+The wrapped test's exit code and PASS/FAIL count are preserved verbatim — the wrapper is a pure observer. Use `--section-pattern` for files that use a different convention (e.g. `# T57a:` sub-test markers), `--top N` to control the summary length, and `--tsv PATH` to write the TSV somewhere predictable instead of the default tempfile.
+
+The check exists because issue #4139's wall-clock optimization wasted iterations on a wrong hypothesis ("parse cost dominates") that this profiler would have falsified in one tool invocation — the actual cost was unconfigured `CI_POLL_INTERVAL=60` / `DEPLOY_GRACE_SECONDS=90` defaults sleeping 60-120s on `awaiting_ci`/`awaiting_deploy` sections. See #4176 for the full rationale.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.

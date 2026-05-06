@@ -50,12 +50,15 @@ shopt -s nullglob
 # SLOW_TESTS — paths that should run on the shell-slow shard, not shell-fast.
 # Tracked observed wall-clock from CI run 25401898705 (#4067):
 #   * test_agent_runner_entrypoint.sh    — ~11 min  (long pole)
+#   * test_profile_shell_test.sh         — ~3-4 min (#4176; transitively
+#                                          runs the entrypoint test once
+#                                          inside its AC integration check)
 # Add a path here when one climbs past ~5 min on a triggering CI run.
 # test_dev_db_query.sh (~5m25s) is the next-largest single test; it stays in
 # shell-fast for now so shell-slow doesn't sequentially run two long poles
 # (which would push max parallel wall-clock past the issue's ≤10 min target
 # in the wrong direction).
-: "${SLOW_TESTS:=scripts/tests/test_agent_runner_entrypoint.sh}"
+: "${SLOW_TESTS:=scripts/tests/test_agent_runner_entrypoint.sh scripts/tests/test_profile_shell_test.sh}"
 
 case "$SHARD_FILTER" in
     ""|slow|not-slow)
