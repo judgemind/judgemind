@@ -680,6 +680,14 @@ jobs:
       - name: Check docs describe the actual rebuild_db.py CLI
         if: matrix.shard == 'python'
         run: scripts/check-no-rebuild-db-skip-reset.sh
+      # Issue #4119: every aws_cloudwatch_metric_alarm in
+      # infra/terraform/modules/ must have a row in docs/agent/infrastructure-reference.md
+      # (§"CloudWatch Alarms"). Drift accumulates silently otherwise — the
+      # docs table is the only place an operator can find "what alarms
+      # exist and what do they fire on" without reading every Terraform module.
+      - name: Verify every CloudWatch alarm has a docs row
+        if: matrix.shard == 'python'
+        run: scripts/check-cloudwatch-alarm-docs.sh
       - name: Check tests use POSIX sed instead of GNU head negative count
         if: matrix.shard == 'python'
         run: scripts/check-no-gnu-head.sh
