@@ -1068,6 +1068,22 @@ jobs:
         run: scripts/check-no-redos-pattern.sh
 
   # ---------------------------------------------------------------
+  # parse_document reingest-safety marker guard: every Live-only
+  # parse_document under packages/scraper-framework/src/courts/ must
+  # carry a docstring marker that names the reingest hazard.  Closes
+  # the recurrence shape behind audit #4046 / production incident
+  # #3986 (CourtListener returned doc unchanged on the reingest path,
+  # producing rulings whose JSON envelope was decoded as ruling_text
+  # and hit the 50000-char truncation cap).  See #4141.
+  # ---------------------------------------------------------------
+  parse-document-reingest-safety-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify Live-only parse_document docstrings name the reingest hazard
+        run: scripts/check-parse-document-reingest-safety.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded model guard: enforce model ID centralization
   # ---------------------------------------------------------------
   hardcoded-models-check:
@@ -1679,7 +1695,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
