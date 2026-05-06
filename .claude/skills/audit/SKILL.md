@@ -425,6 +425,8 @@ Each issue body should include:
 - **Suggested fix:** concrete steps to resolve
 - **Related PRs:** if found during adversarial review, link the PR that introduced the issue
 
+**Cleanup AC SQL rule.** When filing an issue whose acceptance criteria gate "the cleanup is done" on a row count from `derived.rulings`, `derived.cases`, `derived.judges`, or any other table whose source-of-truth is a `derived.documents` row, every `Verify:` SELECT MUST `JOIN derived.documents d ON d.id = <row>.document_id WHERE d.status = 'active'`. Supersede chains (post-#3722 multimodal-fix and similar reingest events) leave OLD-case-number / OLD-case-title rows behind as `status = 'superseded'`; a naive count picks them up as live regression and the AC reads as failing long after the fix has shipped. See `docs/agent/issue-authoring.md` §Cleanup AC queries — anchor on document status (and #4236 / #3629 for the incident) for the full pattern and a worked example.
+
 ---
 
 ## Step 4 — Write summary report

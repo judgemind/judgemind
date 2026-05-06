@@ -51,6 +51,25 @@ Use one of these three approved forms instead, in preference order:
    ```
    The `{worktree}/tmp/` directory is the approved location for agent temp files (not `/tmp/`).
 
+### Cleanup AC queries — anchor on document status
+
+When writing an AC that counts/filters `derived.rulings`, `derived.cases`, `derived.judges`, `derived.attorneys`, `derived.parties`, or any other row whose source-of-truth is a `derived.documents` row, always join `derived.documents` and filter `d.status = 'active'`. Supersede chains (post-#3722 multimodal-fix and similar reingest events) routinely leave rows with the OLD case_number / OLD case_title / null judge_id behind under `status = 'superseded'`, and a naive count picks up that noise as if it were live regression. The cleanup AC then looks unmet long after the fix has actually landed and re-extracted everything.
+
+Required shape — join + status filter on every cleanup-driving SELECT:
+
+```sql
+SELECT COUNT(*)
+FROM derived.rulings r
+JOIN derived.cases c ON c.id = r.case_id
+JOIN derived.documents d ON d.id = r.document_id  -- ← required
+WHERE d.status = 'active'                          -- ← required
+  AND c.case_number LIKE 'UNKNOWN-%';
+```
+
+Without the `derived.documents` join + `d.status = 'active'` filter, supersede children inflate the count and the cleanup AC reads as failing even after the fix has shipped. Concrete example surfaced via #3629 verification (2026-05-06): an AC#2 query against Orange County department `N15` returned `10/12 (83.3%) UNKNOWN` until the active-status filter was added — then `0/2 (0%)`. All 10 UNKNOWN rows were `status = 'superseded'` from the post-#3722 supersede chain and not visible in any user-facing surface. See #4236 for the full incident.
+
+This applies to any AC that gates "the cleanup is done" on a row count — file/issue authors filing such ACs and agents implementing them should both verify the SELECT carries the `derived.documents` join + `d.status = 'active'` filter before treating the count as authoritative.
+
 ## Verify the gap exists before filing
 
 Before filing a "does X" / "enable X" / "add X" issue, run a single command that verifies X is not already the case. This rule exists because an agent-runner cycle spent re-creating state that already exists is pure waste — the canonical example is #3146, where an issue was filed to "enable Container Insights on the ECS cluster" after the Terraform attribute `enable_container_insights = true` had already shipped in a prior PR. The agent spent a full cycle discovering, through probing, that there was nothing to do. A thirty-second check before filing would have surfaced that immediately. This is a sibling of the external-integration feasibility note in §Writing Acceptance Criteria (line 15): both rules say "verify the precondition before you ask an agent to build on top of it."
