@@ -1,0 +1,29 @@
+# check-terraform-ecs-entrypoint-allowlist.txt
+#
+# Waivers for aws_ecs_task_definition resources whose container `command`
+# begins with an interpreter (python, python3, bash, sh, node) but
+# legitimately do not declare an `entryPoint` override -- because the
+# Dockerfile ENTRYPOINT is itself an argv-passthrough shim that exec's
+# the command verbatim.
+#
+# Each entry is:
+#
+#   <path>:<resource_name>:<container_name>  # issue #NNNN — justification
+#
+# The path is compared against the scanned file path (absolute or
+# relative-suffix match against the repo root).
+#
+# Add an entry here only when the image's Dockerfile ENTRYPOINT is a
+# transparent argv-passthrough (e.g. /bin/sh -c "exec \"$@\"" --) and the
+# `command` is therefore the actual argv exec'd inside the container.
+# Otherwise, FIX the task def by adding an explicit `entryPoint` override.
+
+# dispatcher-v3 task defs (#4270): the dispatcher-v3 image's Dockerfile
+# ENTRYPOINT is ["/bin/sh", "-c", "exec \"$@\"", "--"] -- a transparent
+# argv-passthrough shim. The container `command` IS the actual argv
+# exec'd inside the container, so an interpreter prefix here is correct.
+# See Dockerfile.dispatcher-v3 lines 286-309 for the design rationale.
+infra/terraform/modules/dispatcher-v3-task-defs/main.tf:launcher:launcher  # issue #4270 — dispatcher-v3 ENTRYPOINT is argv-passthrough sh -c exec
+infra/terraform/modules/dispatcher-v3-task-defs/main.tf:task_runner:task-runner  # issue #4270 — dispatcher-v3 ENTRYPOINT is argv-passthrough sh -c exec
+infra/terraform/modules/dispatcher-v3-task-defs/main.tf:diagnoser:diagnoser  # issue #4270 — dispatcher-v3 ENTRYPOINT is argv-passthrough sh -c exec
+infra/terraform/modules/dispatcher-v3-task-defs/main.tf:scheduled_skill:scheduled-skill  # issue #4270 — dispatcher-v3 ENTRYPOINT is argv-passthrough sh -c exec

@@ -1161,6 +1161,21 @@ jobs:
         run: scripts/check-terraform-empty-resource-risk.sh
 
   # ---------------------------------------------------------------
+  # Terraform ECS entryPoint guard (#4270): detect aws_ecs_task_definition
+  # resources whose container command starts with an interpreter
+  # (python, python3, bash, sh, node) without an entryPoint override.
+  # The scraper image's Dockerfile ENTRYPOINT is ["python", "-m"] so an
+  # implicit interpreter prefix in command produces silent task failure
+  # (No module named python3). Same root cause class as #2840.
+  # ---------------------------------------------------------------
+  terraform-ecs-entrypoint-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate ECS task defs declare entryPoint when command begins with interpreter
+        run: scripts/check-terraform-ecs-entrypoint.sh
+
+  # ---------------------------------------------------------------
   # Placeholder gates guard: prevent stub security gates
   # ---------------------------------------------------------------
   placeholder-gates-check:
@@ -1827,7 +1842,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, terraform-ecs-entrypoint-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

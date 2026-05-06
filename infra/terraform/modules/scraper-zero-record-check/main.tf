@@ -132,10 +132,19 @@ resource "aws_ecs_task_definition" "zero_record_check" {
 
   container_definitions = jsonencode([
     {
-      name      = "zero-record-check"
-      image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
-      command   = ["python3", "scripts/check-scraper-zero-record-runner.py"]
-      essential = true
+      name  = "zero-record-check"
+      image = "${var.ecr_repository_url}:${var.scraper_image_tag}"
+      # Override the scraper image's ENTRYPOINT (["python", "-m"]).
+      # Without this override the rendered command becomes
+      # `python -m python3 scripts/...` -> "No module named python3"
+      # and the task silently exits 1 every fire (see #4270).
+      # Mirror of the fix landed in #4260 for the field-population-audit
+      # sibling module — the same root cause class. The CI guard
+      # `scripts/check-terraform-ecs-entrypoint.sh` (added in #4270)
+      # prevents this regression class going forward.
+      entryPoint = ["python3"]
+      command    = ["scripts/check-scraper-zero-record-runner.py"]
+      essential  = true
 
       environment = [
         { name = "AWS_REGION", value = data.aws_region.current.id },
