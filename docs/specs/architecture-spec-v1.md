@@ -231,6 +231,26 @@ The transcription LLM prompt describes **visual structure, not text heuristics**
 
 **Reingestion.** Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. Operates on **existing database records only** — it queries `documents` to find S3 keys to reprocess. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>`, which discovers documents directly from S3 keys.
 
+#### 3.3.2.1 Dual LLM extraction paths
+
+Two distinct LLM extraction modules cohabit in `packages/scraper-framework/src/`. **They are not interchangeable** — each owns a different stage of the pipeline, with different retry/cache/chunking strategies. Knowing which path a given document flows through is required for any work that touches LLM extraction (instrumentation, prompt changes, cache invalidation, error-class handling).
+
+| Path | Module | Used by | Purpose |
+|---|---|---|---|
+| **A — Splitting / multimodal** | `framework/llm_extractor.py` (`LlmExtractor.extract()` / `.extract_from_pdf()`) | `ingestion/worker.py::_llm_split_document` | Splits multi-case documents into one `ExtractedRuling` per case; multimodal per-page extraction for image-based PDFs (e.g. OC); recursive sub-chunk retry on partial failure. |
+| **B — Per-document field fill** | `ingestion/llm_extract.py` (`extract_fields_llm()`) | `ingestion/worker.py::process_event` (line ~1906); `scripts/reingest_from_s3.py` (line ~1266) | Populates remaining scalar fields on already-split rulings; fans chunks out via `ThreadPoolExecutor` for per-document parallelism. |
+
+**Failure-event log shape (#4246, #4249).** Each path emits its own structured log event when an LLM API call fails on a chunk:
+
+- Path A: `llm_extractor.google_api_failure` — `framework/llm_extractor.py:3126`
+- Path B: `llm_extract.chunk_api_failure` — `ingestion/llm_extract.py:961`
+
+Both call sites include `document_id=` in the structured log payload. `scripts/check-llm-paths-symmetry.sh` enforces this rule in CI.
+
+**Canonical change rule.** When an issue mentions "instrument the LLM extraction path," "the LLM extraction failure event," or any single-path framing, **check both modules**. The duplication is intentional today (different retry strategies, different cache layouts, different chunking) but the names `llm_extractor` vs `llm_extract` are deliberately confusable — instrumentation, log-shape changes, and field-coverage audits that touch only one path will silently miss the other. The recurring failure mode that this rule prevents is shipping an instrumentation PR for path A based on a hypothesis check, then discovering post-deploy that the actually-failing documents flow through path B (the #4246 → #4249 sequence).
+
+If you are considering consolidating the two paths, file a `type/decision` issue first. Long-term consolidation is desirable, but the existing strategies differ enough that a naive merge regresses today's behavior.
+
 ### 3.3.3 Scraper Development Constraints
 
 Rules every scraper author and reviewer must follow. These apply to new scrapers and changes to existing ones.
