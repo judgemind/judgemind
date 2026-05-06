@@ -81,8 +81,12 @@
 #   * A `AGENT_RUNNER_DRY_RUN=1` env switch that stops before the
 #     first `claude -p` invocation so a test can assert on pre-phase
 #     setup in isolation.
-
-set -euo pipefail
+#
+# #4137: ``set -euo pipefail`` and ``exec 3>&1`` moved into ``main()``
+# (defined at the bottom of this file) so sourcing the script is
+# side-effect free. The script remains executable as an entrypoint via
+# the sourcing guard at the very end (``if [[ "${BASH_SOURCE[0]}" ==
+# "${0}" ]]; then main "$@"; fi``).
 
 # ── Logging -----------------------------------------------------------------
 #
@@ -111,14 +115,11 @@ log() {
         "$_ts" "$_event" "${AGENT_ID:-unknown}" "$_extra" >&3
 }
 
-# Wire fd 3 to stdout. CloudWatch captures both stdout and stderr, so
-# the user sees identical output. Functions that need to return a
-# value via stdout (run_claude_phase, read_current_phase, etc.) do
-# NOT need to redirect fd 3 — log() writes to fd 3 which is still
-# stdout of the top process, while the function's own `printf` goes
-# to the function's captured stdout. `$( )` substitution captures fd
-# 1 only, so log noise never pollutes captured function output.
-exec 3>&1
+# #4137: ``exec 3>&1`` moved into ``main()`` so sourcing this file does
+# not redirect fd 3 in the calling shell. ``log()`` continues to write
+# to fd 3; tests that source individual handler functions explicitly
+# install their own ``exec 3>&1`` in their fixture shell (see e.g.
+# ``test_agent_runner_entrypoint.sh`` line ~3650).
 
 die() {
     log "fatal" "reason=$1"
@@ -136,13 +137,17 @@ DATABASE_URL="${DATABASE_URL:-}"
 AGENT_WORKSPACE="${AGENT_WORKSPACE:-/var/lib/agent-runner}"
 AGENT_RUNNER_DRY_RUN="${AGENT_RUNNER_DRY_RUN:-0}"
 
-if [[ -z "$AGENT_ID" ]]; then
-    die "AGENT_ID_unset"
-fi
+# #4137: validation of required env vars wrapped in ``_validate_required_env``
+# so it runs from ``main()`` (not at top level on source).
+_validate_required_env() {
+    if [[ -z "$AGENT_ID" ]]; then
+        die "AGENT_ID_unset"
+    fi
 
-if [[ -z "$DATABASE_URL" ]]; then
-    die "DATABASE_URL_unset"
-fi
+    if [[ -z "$DATABASE_URL" ]]; then
+        die "DATABASE_URL_unset"
+    fi
+}
 
 # ── START_PHASE early validation (#3366) ───────────────────────────────────
 #
@@ -157,32 +162,42 @@ fi
 # for parity by ``scripts/tests/test_agent_runner_start_phase.sh``.
 AGENT_RUNNER_VALID_START_PHASES="planning setup ralph summary push_and_pr awaiting_ci fix_ci merge awaiting_deploy verify"
 
-if [[ -n "${START_PHASE:-}" ]]; then
-    _start_phase_valid=0
-    for _vp in $AGENT_RUNNER_VALID_START_PHASES; do
-        if [[ "$START_PHASE" == "$_vp" ]]; then
-            _start_phase_valid=1
-            break
+# #4137: START_PHASE early validation wrapped in
+# ``_validate_start_phase_early`` so it runs from ``main()``.
+_validate_start_phase_early() {
+    if [[ -n "${START_PHASE:-}" ]]; then
+        _start_phase_valid=0
+        for _vp in $AGENT_RUNNER_VALID_START_PHASES; do
+            if [[ "$START_PHASE" == "$_vp" ]]; then
+                _start_phase_valid=1
+                break
+            fi
+        done
+        if [[ "$_start_phase_valid" -ne 1 ]]; then
+            log "start_phase_override_invalid" \
+                "requested=$START_PHASE" \
+                "valid_phases=$AGENT_RUNNER_VALID_START_PHASES"
+            printf '[agent-runner-entrypoint] START_PHASE=%s is not in the valid set: %s\n' \
+                "$START_PHASE" "$AGENT_RUNNER_VALID_START_PHASES" >&2
+            exit 1
         fi
-    done
-    if [[ "$_start_phase_valid" -ne 1 ]]; then
-        log "start_phase_override_invalid" \
-            "requested=$START_PHASE" \
-            "valid_phases=$AGENT_RUNNER_VALID_START_PHASES"
-        printf '[agent-runner-entrypoint] START_PHASE=%s is not in the valid set: %s\n' \
-            "$START_PHASE" "$AGENT_RUNNER_VALID_START_PHASES" >&2
-        exit 1
+        log "start_phase_override" "start_phase=$START_PHASE"
     fi
-    log "start_phase_override" "start_phase=$START_PHASE"
-fi
+}
 
-# Derive a short id for branch naming (first 8 chars of the agent uuid).
-SHORT_ID=$(printf '%s' "$AGENT_ID" | cut -c1-8)
-if [[ -z "$BRANCH_NAME" ]]; then
-    BRANCH_NAME="agent/$SHORT_ID"
-fi
+# #4137: branch-name derivation wrapped in ``_init_branch_naming`` so it
+# runs from ``main()``. The function reads + writes the SHORT_ID and
+# BRANCH_NAME global vars (referenced later by ``_checkout_branch`` and
+# the phase loop) — same scope as before, just delayed until main().
+_init_branch_naming() {
+    # Derive a short id for branch naming (first 8 chars of the agent uuid).
+    SHORT_ID=$(printf '%s' "$AGENT_ID" | cut -c1-8)
+    if [[ -z "$BRANCH_NAME" ]]; then
+        BRANCH_NAME="agent/$SHORT_ID"
+    fi
 
-log "startup" "issue_number=$ISSUE_NUMBER" "branch=$BRANCH_NAME" "short_id=$SHORT_ID"
+    log "startup" "issue_number=$ISSUE_NUMBER" "branch=$BRANCH_NAME" "short_id=$SHORT_ID"
+}
 
 # ── Workspace + clone -------------------------------------------------------
 #
@@ -192,38 +207,49 @@ log "startup" "issue_number=$ISSUE_NUMBER" "branch=$BRANCH_NAME" "short_id=$SHOR
 # no sweep-between-runs.
 
 REPO_ROOT="$AGENT_WORKSPACE/repo"
-mkdir -p "$AGENT_WORKSPACE"
 
-if [[ ! -d "$REPO_ROOT/.git" ]]; then
-    log "clone_begin" "repo_url=$REPO_URL"
-    # Shallow clone keeps the container light — per-agent lifetimes are
-    # ~20-90m and phases never need `git log --all`. `--no-tags` shaves
-    # another few MB.
-    git clone --depth=100 --no-tags "$REPO_URL" "$REPO_ROOT"
-    log "clone_done"
-else
-    # Defensive — production tasks start with an empty workspace, but
-    # local `docker run` invocations reusing a volume would skip the
-    # clone. Fetch to refresh origin/main.
-    log "clone_skip_existing"
-    git -C "$REPO_ROOT" fetch origin main --depth=100 --no-tags
-fi
+# #4137: workspace mkdir + clone wrapped in ``_setup_workspace_and_clone``.
+# Body kept at original indentation; bash ignores indentation.
+_setup_workspace_and_clone() {
+    mkdir -p "$AGENT_WORKSPACE"
 
-# Authenticate gh + git against the scoped PAT if available. `gh auth
-# setup-git` wires the helper into ~/.gitconfig so every subsequent
-# `git push` uses the PAT.
-if [[ -n "$GITHUB_TOKEN" ]]; then
-    log "gh_auth_begin"
-    printf '%s' "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
-    gh auth setup-git >/dev/null 2>&1 || true
-    log "gh_auth_done"
-fi
+    if [[ ! -d "$REPO_ROOT/.git" ]]; then
+        log "clone_begin" "repo_url=$REPO_URL"
+        # Shallow clone keeps the container light — per-agent lifetimes are
+        # ~20-90m and phases never need `git log --all`. `--no-tags` shaves
+        # another few MB.
+        git clone --depth=100 --no-tags "$REPO_URL" "$REPO_ROOT"
+        log "clone_done"
+    else
+        # Defensive — production tasks start with an empty workspace, but
+        # local `docker run` invocations reusing a volume would skip the
+        # clone. Fetch to refresh origin/main.
+        log "clone_skip_existing"
+        git -C "$REPO_ROOT" fetch origin main --depth=100 --no-tags
+    fi
+}
 
-cd "$REPO_ROOT"
+# #4137: gh auth wrapped in ``_setup_gh_auth``.
+_setup_gh_auth() {
+    # Authenticate gh + git against the scoped PAT if available. `gh auth
+    # setup-git` wires the helper into ~/.gitconfig so every subsequent
+    # `git push` uses the PAT.
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        log "gh_auth_begin"
+        printf '%s' "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
+        gh auth setup-git >/dev/null 2>&1 || true
+        log "gh_auth_done"
+    fi
+}
 
-# Create the per-agent branch off origin/main.
-git checkout -B "$BRANCH_NAME" origin/main
-log "branch_ready" "branch=$BRANCH_NAME"
+# #4137: cd + git checkout wrapped in ``_checkout_branch``.
+_checkout_branch() {
+    cd "$REPO_ROOT"
+
+    # Create the per-agent branch off origin/main.
+    git checkout -B "$BRANCH_NAME" origin/main
+    log "branch_ready" "branch=$BRANCH_NAME"
+}
 
 # ── Install Fargate-narrowed preflight hook (#3757) -------------------------
 #
@@ -242,7 +268,9 @@ log "branch_ready" "branch=$BRANCH_NAME"
 
 # shellcheck source=./agent_runner_install_fargate_hook.sh
 source "$(dirname "${BASH_SOURCE[0]}")/agent_runner_install_fargate_hook.sh"
-install_fargate_preflight_hook
+# #4137: ``install_fargate_preflight_hook`` invocation moved into ``main()``.
+# The ``source`` line stays at top level so sourcing the entrypoint also
+# exposes the helper's function definitions in the calling shell.
 
 # ── Layer 4 silent-ralph fallback helper (#3782) ----------------------------
 #
@@ -308,7 +336,7 @@ apply_prior_patch() {
     fi
 }
 
-apply_prior_patch
+# #4137: ``apply_prior_patch`` invocation moved into ``main()``.
 
 # ── DB helpers --------------------------------------------------------------
 
@@ -442,10 +470,11 @@ EOF
     log "agent_task_arn_captured" "task_arn=$_task_arn"
 }
 
-# Run the capture as early as possible — right after the DB helpers are
-# defined. Skipped automatically when ``ECS_CONTAINER_METADATA_URI_V4``
-# is unset (subprocess mode + tests).
-set_agent_task_arn_from_metadata
+# #4137: ``set_agent_task_arn_from_metadata`` invocation moved into
+# ``main()``. The capture still runs as early as possible — right after
+# the DB helpers are defined and main() has set up the workspace + clone.
+# Skipped automatically when ``ECS_CONTAINER_METADATA_URI_V4`` is unset
+# (subprocess mode + tests).
 
 # ── Python helper: phase_transitions bridge --------------------------------
 #
@@ -467,7 +496,10 @@ export PHASE_TRANSITIONS_DIR PHASE_TRANSITIONS_PARENT
 
 TRANSITION_SHIM="${AGENT_RUNNER_TRANSITION_SHIM:-$AGENT_WORKSPACE/phase_transitions_shim.py}"
 
-if [[ "$TRANSITION_SHIM" == "$AGENT_WORKSPACE/phase_transitions_shim.py" ]]; then
+# #4137: TRANSITION_SHIM stamp + smoke validation wrapped in
+# ``_setup_transition_shim`` so it runs from ``main()``.
+_setup_transition_shim() {
+    if [[ "$TRANSITION_SHIM" == "$AGENT_WORKSPACE/phase_transitions_shim.py" ]]; then
     # The shim is short enough to keep as an external file we stamp at
     # boot rather than a heredoc (heredocs are blocked by the preflight
     # hook in operator shells; this script only runs in-container but
@@ -571,6 +603,7 @@ if [[ "$_shim_smoke_rc" -ne 0 ]] || ! printf '%s' "$_shim_smoke_out" | grep -q $
     die "transition_shim_invalid"
 fi
 log "transition_shim_ok" "path=$TRANSITION_SHIM"
+}
 
 transition_for() {
     # $1 = current phase, $2 = output JSON string (defaults to "{}").
@@ -627,7 +660,10 @@ transition_for() {
 
 PHASE_INPUT_SHIM="${AGENT_RUNNER_PHASE_INPUT_SHIM:-$AGENT_WORKSPACE/phase_input_shim.py}"
 
-if [[ "$PHASE_INPUT_SHIM" == "$AGENT_WORKSPACE/phase_input_shim.py" ]]; then
+# #4137: PHASE_INPUT_SHIM stamping wrapped in ``_setup_phase_input_shim``
+# so it runs from ``main()``.
+_setup_phase_input_shim() {
+    if [[ "$PHASE_INPUT_SHIM" == "$AGENT_WORKSPACE/phase_input_shim.py" ]]; then
     _input_shim_path="$AGENT_WORKSPACE/phase_input_shim.py"
     cat <<'PYEOF' > "$_input_shim_path"
 """Entrypoint-internal shim: build ``dispatcher-input/<phase>.json``.
@@ -1928,6 +1964,7 @@ if __name__ == "__main__":
     sys.exit(main())
 PYEOF
 fi
+}
 
 # ── run_claude_phase helper (#3775) ----------------------------------------
 #
@@ -4984,7 +5021,15 @@ handle_awaiting_deploy() {
 # rather than an inline `python -c` heredoc (the preflight hook blocks
 # multi-line `python -c` on operator shells).
 TERMINAL_SHIM="${AGENT_RUNNER_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_terminal_shim.py}"
-if [[ "$TERMINAL_SHIM" == "$AGENT_WORKSPACE/phase_terminal_shim.py" ]]; then
+# Issue #3166: sibling shim for agent STATUS terminal check.
+# Mirrors TERMINAL_SHIM / is_terminal() above but queries TERMINAL_STATUSES
+# (agent-level) via is_terminal_status() instead of TERMINAL_PHASES.
+STATUS_TERMINAL_SHIM="${AGENT_RUNNER_STATUS_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_status_terminal_shim.py}"
+
+# #4137: TERMINAL_SHIM + STATUS_TERMINAL_SHIM stamping wrapped in
+# ``_setup_terminal_shims`` so they run from ``main()``.
+_setup_terminal_shims() {
+    if [[ "$TERMINAL_SHIM" == "$AGENT_WORKSPACE/phase_terminal_shim.py" ]]; then
     cat <<'TERMEOF' > "$TERMINAL_SHIM"
 """Print 'yes' or 'no' for whether the phase on stdin is terminal."""
 import os
@@ -5005,17 +5050,7 @@ sys.stdout.write("yes" if pt.is_terminal_phase(phase) else "no")
 TERMEOF
 fi
 
-is_terminal() {
-    _phase="$1"
-    _result=$(printf '%s' "$_phase" | python3 "$TERMINAL_SHIM" 2>/dev/null || printf 'unknown')
-    [[ "$_result" == "yes" ]]
-}
-
-# Issue #3166: sibling shim for agent STATUS terminal check.
-# Mirrors TERMINAL_SHIM / is_terminal() above but queries TERMINAL_STATUSES
-# (agent-level) via is_terminal_status() instead of TERMINAL_PHASES.
-STATUS_TERMINAL_SHIM="${AGENT_RUNNER_STATUS_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_status_terminal_shim.py}"
-if [[ "$STATUS_TERMINAL_SHIM" == "$AGENT_WORKSPACE/phase_status_terminal_shim.py" ]]; then
+    if [[ "$STATUS_TERMINAL_SHIM" == "$AGENT_WORKSPACE/phase_status_terminal_shim.py" ]]; then
     cat <<'STERMEOF' > "$STATUS_TERMINAL_SHIM"
 """Print 'yes' or 'no' for whether the agent status on stdin is terminal."""
 import os
@@ -5035,6 +5070,13 @@ status = sys.stdin.read().strip()
 sys.stdout.write("yes" if pt.is_terminal_status(status) else "no")
 STERMEOF
 fi
+}
+
+is_terminal() {
+    _phase="$1"
+    _result=$(printf '%s' "$_phase" | python3 "$TERMINAL_SHIM" 2>/dev/null || printf 'unknown')
+    [[ "$_result" == "yes" ]]
+}
 
 is_terminal_status() {
     _status="$1"
@@ -5059,25 +5101,32 @@ is_terminal_status() {
 #
 # …and exit 0. The test harness preseeds the git + psql stubs and
 # inspects the invocation logs + log events post-exit.
-if [[ "${AGENT_RUNNER_WATCHER_TEST_MODE:-0}" == "1" ]]; then
-    log "watcher_test_mode_begin"
-    start_ralph_head_watcher
-    # Give the subshell a moment to take its baseline snapshot (an
-    # empty origin/main..HEAD, since the watcher starts before ralph
-    # has committed anything). Then seed commits so the NEXT tick
-    # sees them as new.
-    sleep 0.2 2>/dev/null || sleep 1
-    if [[ -n "${AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS:-}" \
-            && -f "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" \
-            && -n "${RALPH_HEAD_WATCHER_COMMITS_FILE:-}" ]]; then
-        cp "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" "$RALPH_HEAD_WATCHER_COMMITS_FILE"
-        log "watcher_test_mode_seeded" "src=$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS"
+#
+# #4137: wrapped in ``_maybe_run_watcher_test_mode`` so it runs from
+# ``main()``. The ``exit 0`` branch still terminates the whole shell
+# (bash ``exit`` is process-level, not function-level), preserving the
+# test contract.
+_maybe_run_watcher_test_mode() {
+    if [[ "${AGENT_RUNNER_WATCHER_TEST_MODE:-0}" == "1" ]]; then
+        log "watcher_test_mode_begin"
+        start_ralph_head_watcher
+        # Give the subshell a moment to take its baseline snapshot (an
+        # empty origin/main..HEAD, since the watcher starts before ralph
+        # has committed anything). Then seed commits so the NEXT tick
+        # sees them as new.
+        sleep 0.2 2>/dev/null || sleep 1
+        if [[ -n "${AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS:-}" \
+                && -f "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" \
+                && -n "${RALPH_HEAD_WATCHER_COMMITS_FILE:-}" ]]; then
+            cp "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" "$RALPH_HEAD_WATCHER_COMMITS_FILE"
+            log "watcher_test_mode_seeded" "src=$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS"
+        fi
+        sleep "${AGENT_RUNNER_WATCHER_TEST_SLEEP:-2}"
+        stop_ralph_head_watcher
+        log "watcher_test_mode_end"
+        exit 0
     fi
-    sleep "${AGENT_RUNNER_WATCHER_TEST_SLEEP:-2}"
-    stop_ralph_head_watcher
-    log "watcher_test_mode_end"
-    exit 0
-fi
+}
 
 # ── START_PHASE row update (#3366) ─────────────────────────────────────────
 #
@@ -5090,15 +5139,19 @@ fi
 # reflect foo. Idempotent — UPDATE only when the row's phase doesn't
 # already match.
 
-if [[ -n "${START_PHASE:-}" ]]; then
-    db_exec "UPDATE dispatcher.agents
-                SET phase = '$START_PHASE'
-              WHERE agent_id = '$AGENT_ID'
-                AND phase IS DISTINCT FROM '$START_PHASE';" \
-        > "$AGENT_WORKSPACE/start-phase-update.stdout.log" \
-        2> "$AGENT_WORKSPACE/start-phase-update.stderr.log" \
-        || true
-fi
+# #4137: START_PHASE row update wrapped in
+# ``_apply_start_phase_row_update`` so it runs from ``main()``.
+_apply_start_phase_row_update() {
+    if [[ -n "${START_PHASE:-}" ]]; then
+        db_exec "UPDATE dispatcher.agents
+                    SET phase = '$START_PHASE'
+                  WHERE agent_id = '$AGENT_ID'
+                    AND phase IS DISTINCT FROM '$START_PHASE';" \
+            > "$AGENT_WORKSPACE/start-phase-update.stdout.log" \
+            2> "$AGENT_WORKSPACE/start-phase-update.stderr.log" \
+            || true
+    fi
+}
 
 # ── Main phase loop ---------------------------------------------------------
 #
@@ -5106,11 +5159,19 @@ fi
 # itself forever the container would run indefinitely (Fargate has no
 # per-task timeout). 40 phase transitions is well above the happy-path
 # depth (~10) and any realistic fix-ci loop.
+#
+# #4137: wrapped in ``phase_loop()`` so the entrypoint is sourceable
+# without spinning the loop. ``main()`` calls ``phase_loop`` after setup.
+# Behavior parity: ``exit N`` from inside the loop still terminates the
+# whole shell (bash semantics for `exit` from a function), and `set -e`
+# inherits from the caller (main()) so the loop's error-on-failure
+# behavior is preserved.
 
 MAX_PHASE_ITERATIONS="${AGENT_RUNNER_MAX_PHASE_ITERATIONS:-40}"
-_iter=0
 
-while true; do
+phase_loop() {
+    _iter=0
+    while true; do
     _iter=$((_iter + 1))
     if [[ $_iter -gt $MAX_PHASE_ITERATIONS ]]; then
         log "phase_iteration_cap_hit" "cap=$MAX_PHASE_ITERATIONS"
@@ -5704,4 +5765,61 @@ while true; do
                 "dispatch loop saw unknown phase=$_current (not wired in agent-runner-entrypoint.sh)"
             ;;
     esac
-done
+    done
+}
+
+# ── main() and sourcing guard (#4137) ──────────────────────────────────────
+#
+# All top-level executable side effects live inside ``main()`` so the
+# script is sourceable without running. Sourcing exposes every
+# top-level function (including ``main``, ``phase_loop``, and every
+# ``handle_*``) and the per-phase ``*_SHIM`` / timeout constants in
+# the calling shell, but produces zero output and zero filesystem /
+# network side effects.
+#
+# Behavior parity with the pre-#4137 top-level layout:
+#
+#   * ``set -euo pipefail`` is the FIRST statement inside ``main()``,
+#     so the validation ``die``s, clone failures, and every subsequent
+#     handler invocation see the same errexit / nounset / pipefail
+#     semantics they saw at top level. (``set -e`` is shell-wide, not
+#     per-function, so the flag propagates into every function call
+#     ``main()`` makes — same as the prior top-level setup.)
+#   * ``exec 3>&1`` runs inside ``main()`` so sourcing the script does
+#     NOT redirect the calling shell's fd 3.
+#   * ``exit N`` calls inside ``phase_loop`` and the helpers continue
+#     to terminate the whole shell (bash's ``exit`` is process-level,
+#     not function-level).
+main() {
+    set -euo pipefail
+
+    # Wire fd 3 to stdout. CloudWatch captures both stdout and stderr,
+    # so the user sees identical output. Functions that need to return
+    # a value via stdout (run_claude_phase, read_current_phase, etc.)
+    # do NOT need to redirect fd 3 — log() writes to fd 3 which is
+    # still stdout of the top process, while the function's own
+    # ``printf`` goes to the function's captured stdout. ``$( )``
+    # substitution captures fd 1 only, so log noise never pollutes
+    # captured function output.
+    exec 3>&1
+
+    _validate_required_env
+    _validate_start_phase_early
+    _init_branch_naming
+    _setup_workspace_and_clone
+    _setup_gh_auth
+    _checkout_branch
+    install_fargate_preflight_hook
+    apply_prior_patch
+    set_agent_task_arn_from_metadata
+    _setup_transition_shim
+    _setup_phase_input_shim
+    _setup_terminal_shims
+    _maybe_run_watcher_test_mode
+    _apply_start_phase_row_update
+    phase_loop
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

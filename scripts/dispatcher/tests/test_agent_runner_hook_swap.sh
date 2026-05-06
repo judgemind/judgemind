@@ -295,12 +295,18 @@ run_entrypoint_invokes_swap_test() {
     # The invocation must come after the branch checkout and before
     # apply_prior_patch (per #3757's fix-shape spec). Use awk to find
     # the line numbers and assert the ordering.
+    #
+    # #4137: ``main()`` now wraps the top-level executable code; the
+    # ``git checkout`` is inside ``_checkout_branch`` (indented), and
+    # ``apply_prior_patch`` is called from inside main() (also
+    # indented). The call ordering inside main() is what matters for
+    # the #3757 fix-shape, so the regexes match the indented forms too.
     local checkout_line
     local install_line
     local apply_prior_line
-    checkout_line=$(grep -n "^git checkout -B \"\$BRANCH_NAME\" origin/main" "$entrypoint" | head -1 | cut -d: -f1 || true)
+    checkout_line=$(grep -n "git checkout -B \"\$BRANCH_NAME\" origin/main" "$entrypoint" | head -1 | cut -d: -f1 || true)
     install_line=$(grep -n "install_fargate_preflight_hook" "$entrypoint" | grep -v "^[^:]*:#" | head -1 | cut -d: -f1 || true)
-    apply_prior_line=$(grep -n "^apply_prior_patch$" "$entrypoint" | head -1 | cut -d: -f1 || true)
+    apply_prior_line=$(grep -n "apply_prior_patch$" "$entrypoint" | grep -v "^[^:]*:#" | head -1 | cut -d: -f1 || true)
 
     if [[ -z "$checkout_line" || -z "$install_line" || -z "$apply_prior_line" ]]; then
         fail "entrypoint ordering: all three landmarks present" \
