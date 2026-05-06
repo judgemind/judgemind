@@ -169,8 +169,8 @@ while IFS= read -r f; do
     tf_files+=("$f")
 done < <(find "$MODULES_DIR" -type f -name '*.tf' -print | sort)
 
-declare -a missing
-declare -a unresolved
+missing=()
+unresolved=()
 
 for tf in "${tf_files[@]}"; do
     module_dir="$(dirname "$tf")"
