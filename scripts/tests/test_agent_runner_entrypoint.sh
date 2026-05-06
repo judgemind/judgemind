@@ -81,6 +81,15 @@ cleanup() {
 trap cleanup EXIT
 
 TEST_TMP=$(mktemp -d)
+# Canonicalize via ``pwd -P`` so paths compare cleanly against shim
+# output on macOS (#4126). ``mktemp -d`` returns ``/var/folders/...``
+# but BSD's ``/var`` is a symlink to ``/private/var``; tests that
+# compare a fixture path against ``Path(...).resolve()`` output from
+# ``phase_input_shim.py`` see the ``/private/`` prefix and mismatch.
+# Resolving once at fixture root fixes every downstream comparison
+# without per-test wrapping. Linux is unaffected — ``/tmp`` is not
+# symlinked, so ``pwd -P`` is a no-op.
+TEST_TMP=$(cd "$TEST_TMP" && pwd -P)
 
 # ── Build a stub-bin directory on PATH ─────────────────────────────────────
 #
