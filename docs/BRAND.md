@@ -132,3 +132,51 @@ colors: {
   },
 }
 ```
+
+### Borders
+
+Three near-synonymous spellings exist for the same conceptual hairline. All
+three render identically today because `--border` ≡ `--input` in
+`packages/web/src/app/globals.css`, so the choice between them is intent-only
+— but the intent matters when the theme is rebalanced.
+
+- `border` (bare) — default 1px hairline, color cascades from the global
+  `* { @apply border-border }` rule. Use when you just want a hairline that
+  matches the rest of the chrome.
+- `border-border` — explicit version of the above; semantically identical,
+  more readable in code review.
+- `border-input` — RESERVED for shadcn form inputs (`<Input>`, `<Select>`
+  trigger, `border border-input bg-background` outline button variant). Do
+  not use on non-form chrome — the `--input` token may be re-themed
+  independently of `--border` to differentiate input affordances. Today's
+  theme has them identical (`33 10% 90%` light, `30 5% 16%` dark), so the
+  distinction is intent-only.
+
+### Surfaces
+
+Five tokens map to two effective surfaces today:
+`bg-background` ≡ `bg-card` ≡ `bg-popover` (page surface), and
+`bg-muted` ≡ `bg-secondary` ≡ `bg-accent` (subtle gray surface). Within
+each cluster the visual result is identical; across-cluster they differ by
+~4-9% lightness. As with borders, pick the token whose name matches the
+element's role so future theme rebalances flow naturally.
+
+- `bg-background` — the page surface (white in light, near-black in dark).
+  Use for the body / outermost frame.
+- `bg-card` — semantically identical to `bg-background` today; reserved for
+  "card-shaped containers" (Card primitive, dialog interiors). Use when the
+  element conceptually represents a card.
+- `bg-popover` — semantically identical to `bg-background` today; reserved
+  for floating overlays (dropdown content, tooltip, popover). Use when the
+  element is a floating layer.
+- `bg-muted` — subtle gray surface. Use for subdued chrome (header rows,
+  info pills, "no data" placeholder fills, code blocks).
+- `bg-secondary` — semantically identical to `bg-muted` today; reserved for
+  the "secondary action" filled state (intended pair:
+  `<Button variant="secondary">`). Avoid on bare elements — the same
+  always-visible-shadcn-token footgun that prompted the `bg-accent` guard
+  applies here.
+- `bg-accent` — the shadcn hover surface, NOT the brand amber. Always pair
+  with a modifier (`hover:bg-accent`, `data-[selected=true]:bg-accent`).
+  Bare always-visible `bg-accent` is blocked by
+  `scripts/check-bare-shadcn-accent.sh` (see the footgun callout above).

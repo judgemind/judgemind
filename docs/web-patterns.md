@@ -378,3 +378,4 @@ These rules prevent the divergence problem:
 3. **No information hiding.** If a list page shows items that have outcomes, show the outcomes. Don't make the user click into a detail page to see the most important field.
 4. **Detail pages show context.** A ruling detail page shows case context. A case detail page lets you read rulings. Don't force navigation back and forth.
 5. **One badge style per concept.** Outcomes look the same everywhere. Case types look the same everywhere. Motion types look the same everywhere.
+6. **One token per intent.** Borders and surfaces have multiple Tailwind class spellings that render identically today (`border` / `border-border` / `border-input`; `bg-background` / `bg-card` / `bg-popover`; `bg-muted` / `bg-secondary` / `bg-accent`). Pick the token whose name matches the element's role — see [`docs/BRAND.md` §Tailwind Token Mapping](BRAND.md#tailwind-token-mapping) (Borders and Surfaces subsections) for which token to use when.
