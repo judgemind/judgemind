@@ -30,6 +30,14 @@ on:
       # Same shared-script convention — a regression there silently breaks
       # every scraper deploy's task-def render. See #4073.
       - "scripts/ecs-render-task-def.sh"
+      # Oneshot scripts baked into the scraper image (#4255 Dockerfile
+      # change). Without these on the path-filter, an edit to one of
+      # these scripts ships as code-only without rebuilding the image
+      # the EventBridge-scheduled tasks actually run.
+      - "scripts/audit_scraper_field_population.py"
+      - "scripts/check-scraper-zero-record-runner.py"
+      - "scripts/check-scraper-zero-record-streak.py"
+      - "scripts/notify-telegram.sh"
   workflow_dispatch:
     inputs:
       image_tag:

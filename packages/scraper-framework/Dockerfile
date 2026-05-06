@@ -65,6 +65,18 @@ RUN ! pip show google-generativeai >/dev/null 2>&1
 # context is the repo root, so this file is accessible.  See #2323.
 COPY data-quality-baselines.json /app/data-quality-baselines.json
 
+# Embed the EventBridge-driven oneshot scripts that share this image as
+# their runtime.  These are the scripts referenced from ECS task
+# definitions wired by `infra/terraform/modules/scraper-*-check` and
+# `infra/terraform/modules/scraper-field-population-audit`.  Without
+# this COPY, the ECS task fails with "No such file or directory" --
+# the existing zero-record-check task hits exactly that error today.
+# See #4255 (this audit) and the predecessor zero-record bug.
+COPY scripts/audit_scraper_field_population.py /app/scripts/audit_scraper_field_population.py
+COPY scripts/check-scraper-zero-record-runner.py /app/scripts/check-scraper-zero-record-runner.py
+COPY scripts/check-scraper-zero-record-streak.py /app/scripts/check-scraper-zero-record-streak.py
+COPY scripts/notify-telegram.sh /app/scripts/notify-telegram.sh
+
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
 
