@@ -1268,6 +1268,26 @@ jobs:
         run: scripts/check-no-graphql-instanceof.sh
 
   # ---------------------------------------------------------------
+  # HTTP-status assertion guard: api test titles that name an HTTP
+  # status (e.g. "returns 400 for invalid UUID", "rejects with HTTP
+  # 401") must include a corresponding statusCode assertion in the
+  # test body. Without this, the title gives false confidence and
+  # regressions like #4129 (cost-cap rejections regressed from HTTP
+  # 400 to HTTP 500 between #4112 and #4218) slip through. PR #4218
+  # added the missing assertion; this guard prevents the recurrence.
+  # The step name intentionally avoids quoting the forbidden pattern
+  # (per docs/agent/code-standards.md §Hygiene-check CI steps).
+  # ---------------------------------------------------------------
+  test-statuscode-assertions-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require response-status assertions in API tests that name a status
+        run: scripts/check-test-statuscode-assertions.sh
+
+  # ---------------------------------------------------------------
   # Dispatcher terminal-status sync guard (#2863)
   # ---------------------------------------------------------------
   dispatcher-terminal-statuses-check:
@@ -1769,7 +1789,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
