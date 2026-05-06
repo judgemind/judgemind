@@ -187,13 +187,26 @@ describe('costLimitPlugin (issues #4112, #4101)', () => {
     }
   });
 
-  it('rejects a 40-unit-over-cap query with HTTP 400 + complexityLimitExceeded', async () => {
+  it('rejects a 40-unit-over-cap query with HTTP 400 + complexityLimitExceeded (regression: #4129)', async () => {
+    // Regression for #4129: between #4112 (which moved the cost cap from a
+    // `validationRules` entry to an Apollo plugin throwing from
+    // `didResolveOperation`) and the fix, this returned HTTP 500. Apollo
+    // Server's default `sendErrorResponse` defaults to 500 for any error
+    // without an `extensions.http.status` — the previous library's
+    // validation-rule wiring tagged 400 implicitly because validation
+    // errors are caught at an earlier pipeline phase. The fix adds
+    // `extensions.http: { status: 400 }` to the thrown GraphQLError; this
+    // assertion would have caught the regression. The body-shape AC2
+    // assertions below also confirm the `http` key is stripped from the
+    // formatted error (Apollo's `errorNormalize.js` deletes it after
+    // promoting it to the response status).
     const res = await app.inject({
       method: 'POST',
       url: '/graphql',
       headers: { 'content-type': 'application/json' },
       payload: JSON.stringify({ query: OVER_CAP_QUERY }),
     });
+    expect(res.statusCode).toBe(400);
     const body = JSON.parse(res.body);
     expect(body.errors).toBeDefined();
     expect(body.errors.length).toBeGreaterThanOrEqual(1);
@@ -203,8 +216,41 @@ describe('costLimitPlugin (issues #4112, #4101)', () => {
       }) => e.extensions?.complexityLimitExceeded === true,
     );
     expect(exceeded).toBeDefined();
+    // AC2 of #4129: structured error body is unchanged.
+    expect(exceeded.extensions.code).toBe('GRAPHQL_VALIDATION_FAILED');
+    expect(exceeded.extensions.complexityLimitExceeded).toBe(true);
     expect(exceeded.extensions.actualCost).toBeGreaterThan(1000);
     expect(exceeded.extensions.maximumCost).toBe(1000);
+    // The `http` key is an Apollo-internal status hint and must not leak
+    // into the formatted error returned to the client.
+    expect(exceeded.extensions.http).toBeUndefined();
+  });
+
+  it('AC3 of #4129: resolver-level errors continue to map to HTTP 200', async () => {
+    // The `dispatcherState` field is admin-gated (`requireDispatcherAdmin`
+    // throws `NOT_FOUND` from the resolver). Hitting it without an auth
+    // cookie produces a resolver error — Apollo Server defaults the HTTP
+    // status to 200 for resolver errors (only validation / parse errors
+    // and explicit `extensions.http.status` errors flip the status). This
+    // test ensures the cost-cap fix didn't accidentally flip every
+    // GraphQLError to 400. A small (under-cap) query is used so the
+    // request makes it past the cost gate to the resolver.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/graphql',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        query: '{ dispatcherState { queueDepth } }',
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.errors).toBeDefined();
+    const notFound = body.errors.find(
+      (e: { extensions?: { code?: string } }) =>
+        e.extensions?.code === 'NOT_FOUND',
+    );
+    expect(notFound).toBeDefined();
   });
 
   it('emits a `graphql.cost` log entry with `cost`, `operationName`, and `breakdown` (issue #4101)', async () => {
