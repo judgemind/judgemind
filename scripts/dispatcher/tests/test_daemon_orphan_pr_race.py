@@ -273,6 +273,9 @@ class TestPickCandidateOrphanPrDeferral:
         # Only 3499 is deferred; 3500 is not.
         d._orphan_pr_recovery_pending = lambda n: n == 3499  # type: ignore[method-assign]
         d._issue_author_trusted = lambda n: True  # type: ignore[method-assign]
+        # #4211 — stub the shipped-zombie hook so this test doesn't
+        # shell out to scripts/check-shipped-pr.sh on the test runner.
+        d._issue_already_shipped = lambda n: None  # type: ignore[method-assign]
 
         result = d._pick_candidate_issue([3499, 3500])
 

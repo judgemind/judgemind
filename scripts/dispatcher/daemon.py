@@ -379,6 +379,16 @@ QUEUE_SCAN_PAGE_LIMIT = 200
 #: anything over ~10s here would conflict with the next tick's own call.
 QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS = 10
 
+#: Per-candidate timeout for ``scripts/check-shipped-pr.sh`` invoked from
+#: :meth:`DispatcherDaemon._issue_already_shipped` (#4211).  The script
+#: itself runs one ``gh issue view`` + up to a handful of ``gh api commits``
+#: + ``gh pr view`` calls per candidate file path; typical wall-clock is
+#: <1s for the not-shipped case (no candidate files in the issue body) and
+#: <2s for the shipped case.  The 10s ceiling matches
+#: :data:`QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS` — we don't want a stuck
+#: ``gh`` call to wedge the queue-scan filter past the next scheduler tick.
+SHIPPED_CHECK_SUBPROCESS_TIMEOUT_SECONDS = 10
+
 #: Throttle window for the per-tick `_scan_queue_and_snapshot` call.
 #: Decoupled from `tick_scheduler_seconds` so the tick can fire at 5s
 #: (fast state transitions) while the GitHub `gh issue list` queue scan
@@ -5118,6 +5128,17 @@ class DispatcherDaemon:
            the scheduler touches the issue again.
         3. Run the trust check (``scripts/check-issue-author.sh``). Skip
            on any non-zero exit.
+        4. **Already-shipped zombie check (#4211):** run
+           ``scripts/check-shipped-pr.sh`` (the same script the /task
+           skill runs in §4a.2). If the script reports a high-confidence
+           shipped match (exit 0), inline-cleanup the zombie via
+           :meth:`_handle_shipped_zombie` (post a verification-evidence
+           comment, close the issue, strip the queue-scan labels) and
+           skip the candidate. This catches zombies one layer earlier
+           than the /task pivot — eliminating the worktree-setup +
+           `git fetch` + `claim` overhead the agent-side pivot still
+           pays per zombie. Exit 1 (not-shipped) and exit 2 (error)
+           both proceed normally — fail-open.
 
         Returns the chosen issue number, or ``None`` if no candidate is
         eligible.
@@ -5172,6 +5193,33 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                         "issue_number": issue_number,
                         "reason": "untrusted_author",
+                    },
+                )
+                continue
+            # Shipped-zombie pivot (#4211). Runs AFTER the trust check
+            # so we never invoke ``check-shipped-pr.sh`` (a few ``gh
+            # api`` calls) on an untrusted issue. The check is cheap
+            # for the negative case (one ``gh issue view`` against an
+            # issue body with no candidate file paths returns instantly
+            # with exit 1), so the per-tick cost amortises well across
+            # the ~queue-depth-many candidates we scan. On a positive
+            # match we DO take a side-effect (close + comment + label
+            # strip) before continuing — the alternative would burn the
+            # full /task subagent + worktree-setup cost on the same
+            # zombie. AC #4 in #4211 budgets ≤2s wall-clock per
+            # candidate; the script's own timeout (10s) is the hard
+            # ceiling, but typical responses come back in <1s.
+            shipped_summary = self._issue_already_shipped(issue_number)
+            if shipped_summary is not None:
+                self._handle_shipped_zombie(issue_number, shipped_summary)
+                self._log.info(
+                    "daemon.candidate_skipped",
+                    extra={
+                        "event": "candidate_skipped",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "reason": "shipped_zombie",
+                        "shipped_pr": shipped_summary.get("shipped_pr"),
                     },
                 )
                 continue
@@ -5427,6 +5475,263 @@ class DispatcherDaemon:
             },
         )
         return False
+
+    def _issue_already_shipped(self, issue_number: int) -> dict[str, Any] | None:
+        """Run ``scripts/check-shipped-pr.sh`` and return the JSON summary
+        if the script reports a high-confidence shipped match (exit 0).
+
+        Issue #4211. Mirrors the /task SKILL.md §4a.2 pivot — but at the
+        queue-scan layer, before any /task agent + worktree is spawned.
+        The agent-side check stays in place as defense-in-depth in case
+        the daemon-side check is bypassed (e.g. operator hand-dispatch).
+
+        Return shape:
+
+        * ``None`` — no shipped match. The caller proceeds with the
+          normal claim path. Covers exit 1 (``not-shipped:``), exit 2
+          (``error:``), subprocess timeout, missing script, and any
+          stdout that does not start with the ``shipped:`` sentinel.
+          Fail-open by design: an upstream ``gh`` flake or a malformed
+          stdout must NEVER permanently block a claim — the next
+          scheduler tick re-runs the check.
+        * ``dict`` — shipped match. The dict is the parsed JSON summary
+          emitted on stdout after the ``shipped:`` line. Stable keys
+          (see ``scripts/_check_shipped_pr_summary.py``):
+
+          - ``issue`` (int)
+          - ``shipped_pr`` (int)
+          - ``overlap_count`` (int)
+          - ``overlap_files`` (list[str])
+          - ``added_files`` (list[str])
+          - ``candidate_files`` (list[str])
+
+        The caller passes the returned dict to
+        :meth:`_handle_shipped_zombie` for inline cleanup.
+
+        ``check-shipped-pr.sh`` legitimately exits 1 in the common
+        not-shipped case, so this method MUST NOT route through
+        :meth:`_subprocess_with_retry` (which treats any non-zero exit
+        as a flake worth retrying — burning 3s per scheduler tick on
+        every non-zombie issue).  Plain ``subprocess.run`` matches the
+        :meth:`_issue_author_trusted` pattern.
+
+        Per-tick latency: AC #4 in #4211 budgets ≤2s per candidate.
+        Typical script runs return in <1s for the negative case (one
+        ``gh issue view`` + zero ``gh api commits`` calls when the
+        issue body has no candidate file paths) and <2s for the
+        positive case (a few ``gh api commits`` + ``gh pr view`` calls
+        for candidate PRs). The :data:`SHIPPED_CHECK_SUBPROCESS_TIMEOUT_SECONDS`
+        guard is the worst-case ceiling — if the script blows past it,
+        we fail-open and let the next tick try again rather than
+        wedging the orchestration thread.
+        """
+        cmd = [
+            "scripts/check-shipped-pr.sh",
+            str(issue_number),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=SHIPPED_CHECK_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log.warning(
+                "daemon.shipped_check_missing",
+                extra={
+                    "event": "shipped_check_missing",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.shipped_check_timeout",
+                extra={
+                    "event": "shipped_check_timeout",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "timeout_seconds": SHIPPED_CHECK_SUBPROCESS_TIMEOUT_SECONDS,
+                },
+            )
+            return None
+        if result.returncode != 0:
+            # Exit 1 is "not-shipped" (the common case). Exit 2 is a
+            # script-level error ("error:" line on stderr). Both proceed
+            # normally — fail-open. Logging at debug level only would
+            # silence the not-shipped case (most of every tick) while
+            # still letting operators see the exit-2 error trail; we
+            # log only the exit-2 case at info to avoid CloudWatch
+            # spam.
+            if result.returncode == 2:
+                self._log.info(
+                    "daemon.shipped_check_error",
+                    extra={
+                        "event": "shipped_check_error",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "exit_code": result.returncode,
+                        "stderr_tail": _stderr_tail(result.stderr),
+                    },
+                )
+            return None
+        # Exit 0 — parse the JSON summary that follows the ``shipped:``
+        # sentinel line. The script always emits the JSON when exit 0
+        # fires; if parsing fails, fail-open (treat as not-shipped) so
+        # we never wedge the queue-scan path on a malformed stdout.
+        stdout = result.stdout or ""
+        # Strip the leading ``shipped: ...`` sentinel line; everything
+        # after the first newline is the JSON object.
+        _, _, json_text = stdout.partition("\n")
+        try:
+            summary = json.loads(json_text)
+        except (json.JSONDecodeError, ValueError):
+            self._log.warning(
+                "daemon.shipped_check_unparsable",
+                extra={
+                    "event": "shipped_check_unparsable",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "stdout_tail": _stderr_tail(stdout),
+                },
+            )
+            return None
+        if not isinstance(summary, dict):
+            self._log.warning(
+                "daemon.shipped_check_unparsable",
+                extra={
+                    "event": "shipped_check_unparsable",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "stdout_tail": _stderr_tail(stdout),
+                },
+            )
+            return None
+        return summary
+
+    def _handle_shipped_zombie(
+        self, issue_number: int, summary: dict[str, Any]
+    ) -> None:
+        """Inline-cleanup a shipped zombie issue (#4211).
+
+        Invoked by :meth:`_pick_candidate_issue` when
+        :meth:`_issue_already_shipped` returns a non-None summary. The
+        cleanup steps mirror /task SKILL.md §4a.2.1's verify-and-close
+        pivot, minus the per-AC mechanical ``Verify:`` runs (those need
+        a Claude subagent — too expensive for the queue-scan hot path).
+        Operators can still re-run the AC verifies by hand if they doubt
+        the close decision; the script's ``≥1 added overlap`` threshold
+        is conservative enough that false positives are rare.
+
+        Steps (each best-effort; failures logged but never raised):
+
+        1. Post a verification-evidence comment naming the shipped PR
+           and the overlap files. The comment cites #4211 so future
+           operators can find this code path. Uses
+           :meth:`_gh_issue_comment` so the same retry envelope as
+           every other diagnoser-side comment applies.
+        2. Close the issue with ``--reason completed`` via
+           :meth:`_gh_issue_close`. The close comment names the
+           shipped PR so the issue thread is self-explanatory.
+        3. Strip ``agent/ready`` AND ``status/in-progress`` via
+           :meth:`_gh_issue_remove_labels`. Both are idempotent — the
+           queue-scan filter already excludes ``status/in-progress``,
+           but stripping both belt-and-suspenders the cleanup against
+           any race that flipped the label after the snapshot.
+
+        Best-effort by design: the worst-case "we noticed a zombie but
+        the cleanup partially failed" outcome leaves the issue in the
+        same state the manual /task pivot would (open, ``agent/ready``
+        attached) — the next scheduler tick re-runs this check and
+        retries the cleanup. The primary correctness invariant — "no
+        /task agent spawns on this candidate this tick" — is already
+        satisfied by the time this method runs (the caller `continue`s
+        to the next candidate after the inline cleanup).
+        """
+        shipped_pr = summary.get("shipped_pr")
+        overlap_count = summary.get("overlap_count", 0)
+        overlap_files = summary.get("overlap_files") or []
+        added_files = summary.get("added_files") or []
+
+        self._log.info(
+            "daemon.shipped_zombie_cleanup_begin",
+            extra={
+                "event": "shipped_zombie_cleanup_begin",
+                "run_id": self._run_id,
+                "issue_number": issue_number,
+                "shipped_pr": shipped_pr,
+                "overlap_count": overlap_count,
+            },
+        )
+
+        # Compose the verification-evidence comment.  Naming the PR +
+        # overlap files + the cleanup origin (#4211) makes the comment
+        # self-explanatory in the issue thread; operators reading it
+        # later can grep for #4211 to find this code path.  Markdown
+        # bullet lists for overlap_files / added_files render cleanly
+        # in the GitHub UI.
+        overlap_lines = (
+            "\n".join(f"- `{path}`" for path in overlap_files)
+            if overlap_files
+            else "- (none reported)"
+        )
+        added_section = ""
+        if added_files:
+            added_lines = "\n".join(f"- `{path}`" for path in added_files)
+            added_section = f"\n\nFiles **added** by PR #{shipped_pr}:\n{added_lines}"
+        comment_body = (
+            "## Autonomous shipped-zombie cleanup (#4211)\n\n"
+            f"`scripts/check-shipped-pr.sh` reports that PR #{shipped_pr} "
+            f"already shipped this issue's work — the PR landed on `main` "
+            f"and modified files that this issue's body cited as the locus "
+            f"of changes. The PR did not auto-close this issue, typically "
+            f"because the PR body lacked a `Closes #N` keyword (a pre-#3994 "
+            f"placeholder-title pattern).\n\n"
+            f"**Shipped PR:** #{shipped_pr}\n"
+            f"**Overlap files** (the file paths cited in this issue body "
+            f"that PR #{shipped_pr} also modified):\n{overlap_lines}"
+            f"{added_section}\n\n"
+            f"Closing as completed.  If the AC's intent is genuinely "
+            f"unmet, reopen and add `agent/ready` — the scheduler will "
+            f"re-route normally.  The /task skill's §4a.2 agent-side "
+            f"pivot remains as a defense-in-depth backup for any zombie "
+            f"that bypasses this queue-scan filter."
+        )
+        self._gh_issue_comment(issue_number, comment_body)
+
+        # Close the issue with --reason completed.  Naming the PR in
+        # the close comment keeps the close action visible alongside
+        # the (longer) verification-evidence comment.
+        close_comment = (
+            f"Closed by PR #{shipped_pr} (autonomous shipped-zombie cleanup, #4211)."
+        )
+        self._gh_issue_close(issue_number, comment=close_comment, reason="completed")
+
+        # Strip the queue-scan labels so the issue does not reappear
+        # on the next scheduler tick.  Both removes are idempotent.
+        # ``agent/ready`` is the primary label that surfaced the issue
+        # in :meth:`_fetch_agent_ready_issues`; stripping it is what
+        # actually drops the issue from the next snapshot.
+        # ``status/in-progress`` is stripped belt-and-suspenders — it
+        # SHOULD be absent (we never claimed) but the post-claim race
+        # window in #2927 means another actor could have flipped it.
+        self._gh_issue_remove_labels(
+            issue_number, ["agent/ready", STATUS_IN_PROGRESS_LABEL]
+        )
+
+        self._log.info(
+            "daemon.shipped_zombie_cleanup_done",
+            extra={
+                "event": "shipped_zombie_cleanup_done",
+                "run_id": self._run_id,
+                "issue_number": issue_number,
+                "shipped_pr": shipped_pr,
+                "overlap_count": overlap_count,
+            },
+        )
 
     def _atomic_claim(
         self,

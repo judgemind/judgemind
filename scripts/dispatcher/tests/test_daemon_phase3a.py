@@ -1123,6 +1123,9 @@ class TestPickCandidate:
 
         d._issue_already_attempted = lambda n: n in attempted  # type: ignore[method-assign]
         d._issue_author_trusted = lambda n: n not in untrusted  # type: ignore[method-assign]
+        # #4211 — stub the shipped-zombie hook so tests don't shell out
+        # to scripts/check-shipped-pr.sh on the test runner.
+        d._issue_already_shipped = lambda n: None  # type: ignore[method-assign]
 
         assert d._pick_candidate_issue([1, 2, 3, 4]) == 3
 
@@ -1130,6 +1133,8 @@ class TestPickCandidate:
         d, _conn, handler = _make_daemon(tmp_path)
         d._issue_already_attempted = lambda n: True  # type: ignore[method-assign]
         d._issue_author_trusted = lambda n: False  # type: ignore[method-assign]
+        # #4211 — stub the shipped-zombie hook (see above).
+        d._issue_already_shipped = lambda n: None  # type: ignore[method-assign]
         assert d._pick_candidate_issue([1, 2, 3]) is None
         # Three skip events logged (all "already attempted" since that's
         # checked first).
