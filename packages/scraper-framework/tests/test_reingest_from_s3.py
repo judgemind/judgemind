@@ -698,6 +698,316 @@ class TestReparseDocumentMergeAsymmetry:
 
 
 # ---------------------------------------------------------------------------
+# _full_reparse_document tests — symmetric merge regression (#4145)
+# ---------------------------------------------------------------------------
+
+
+class TestFullReparseDocumentMergeAsymmetry:
+    """Regression coverage for #4145 (sibling of #4142).
+
+    Pre-fix, the ``_full_reparse_document`` split-doc path at lines
+    ~1404-1449 of ``scripts/reingest_from_s3.py`` extracted
+    ``doc_judge_name`` / ``doc_department`` unconditionally from
+    ``parsed.X`` and defaulted to ``None`` on every fall-through path
+    (top-of-function init, except-Exception branch, no-scraper-cls
+    else).  These doc-level values then flowed into every per-ruling
+    extracted dict at lines ~1510 / 1518 — silently clobbering the
+    DB-seeded ``judge_name`` / ``department`` carried on
+    ``doc_meta`` whenever a Live-only no-op ``parse_document`` ran
+    through a scraper that *also* had a ``_SPLIT_REGISTRY`` entry.
+
+    Post-fix, all four code paths default to ``doc_meta.get("X")``
+    rather than ``None``, mirroring the #4142 fix in the sibling
+    ``_reparse_document`` function.  The behaviour matches the
+    ``case_number`` / ``case_title`` symmetric-merge pattern: prefer
+    the parser's value, fall back to the DB seed.
+
+    See ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+    for the per-scraper audit and #3986 for the bug-class root cause.
+    """
+
+    def _doc_meta(
+        self,
+        *,
+        judge_name: str | None = None,
+        department: str | None = None,
+    ) -> dict:
+        """Build a doc_meta dict mirroring the production shape (lines ~2408-2432).
+
+        ``judge_name`` and ``department`` ride along on every doc_meta
+        (the rulings row's canonical_name and department, see
+        FETCH_DOCUMENTS_QUERY).
+        """
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Riverside",
+            "court_name": "Riverside Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": "RIC-24-12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-riverside-tentatives",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+            "judge_name": judge_name,
+            "department": department,
+        }
+
+    def _live_only_no_op_parsed(self) -> MagicMock:
+        """Build a parsed mock that mirrors a Live-only no-op parse_document.
+
+        Live-only scrapers (e.g. ``ca/sf_civil_tentatives.py:1153``) return
+        ``doc`` unchanged from ``parse_document``.  The ``cap_doc`` built
+        inside ``_full_reparse_document`` carries only ``raw_content``
+        and identifiers, so the parsed object's structured fields are
+        all falsy — exactly the input shape that this regression test
+        exercises.
+        """
+        parsed = MagicMock()
+        parsed.case_number = None
+        parsed.case_title = None
+        parsed.judge_name = None
+        parsed.outcome = None
+        parsed.motion_type = None
+        parsed.department = None
+        parsed.parties = []
+        parsed.hearing_date = None
+        return parsed
+
+    def _make_split_rulings(self, count: int = 2) -> list:
+        """Build a list of SplitRuling objects with no per-ruling judge/department.
+
+        Mirrors a multi-ruling document where the splitter populates
+        case-level fields (case_number, case_title, outcome,
+        motion_type) but leaves doc-level fields (judge_name,
+        department) for ``_full_reparse_document`` to fill in from the
+        parsed doc-level metadata.  When per-ruling ``department`` is
+        ``None``, the function falls back to ``doc_department`` at
+        line ~1478.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        return [
+            SplitRuling(
+                i + 1,
+                f"RIC-24-{1000 + i}",
+                "Ruling text",
+                f"Smith v. Jones {i + 1}",
+                "demurrer",
+                "granted",
+                None,  # department — None forces fallback to doc_department
+            )
+            for i in range(count)
+        ]
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_full_reparse_merge_asymmetry_live_only_no_op_preserves_db_seed(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A no-op parse_document MUST NOT clobber DB-seeded fields in the split path.
+
+        Pre-fix, ``doc_judge_name = parsed.judge_name`` and
+        ``doc_department = parsed.department`` set both to ``None``
+        when the parser returned a no-op cap_doc.  Each per-ruling
+        extracted dict then propagated those ``None`` values to the
+        DB write path, silently wiping the rulings row.  Post-fix,
+        the DB seed survives because ``parsed.X`` is falsy and the
+        ``or doc_meta.get("X")`` fallback returns the seed.
+        """
+        mock_extract.return_value = "pdf text"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-live-only-split"] = mock_scraper_cls
+        reingest._SPLIT_REGISTRY["test-live-only-split"] = MagicMock(
+            return_value=self._make_split_rulings(count=2)
+        )
+
+        try:
+            results = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-live-only-split",
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. Jane Smith"
+                assert ruling["department"] == "C-32"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-live-only-split", None)
+            reingest._SPLIT_REGISTRY.pop("test-live-only-split", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_full_reparse_merge_asymmetry_reingest_aware_overrides_db_seed(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A reingest-aware parse_document's value MUST win over the DB seed.
+
+        The fallback only fires when ``parsed.X`` is falsy.  When the
+        parser produces a real value (the reingest-aware happy path),
+        that value supersedes any DB seed.
+        """
+        mock_extract.return_value = "pdf text"
+        parsed = self._live_only_no_op_parsed()
+        parsed.judge_name = "Hon. John Parsed"
+        parsed.department = "D-1"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+        reingest._SCRAPER_REGISTRY["test-reingest-aware-split"] = mock_scraper_cls
+        # Use a 2-ruling split to exercise the multi-ruling branch — a
+        # 1-element split falls through to ``_reparse_document`` instead
+        # of running the doc_judge_name/doc_department merge in the
+        # split path.
+        reingest._SPLIT_REGISTRY["test-reingest-aware-split"] = MagicMock(
+            return_value=self._make_split_rulings(count=2)
+        )
+
+        try:
+            results = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-reingest-aware-split",
+                self._doc_meta(judge_name="Hon. DB Seed", department="D-X"),
+            )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. John Parsed"
+                assert ruling["department"] == "D-1"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-reingest-aware-split", None)
+            reingest._SPLIT_REGISTRY.pop("test-reingest-aware-split", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_full_reparse_merge_asymmetry_except_path_falls_back_to_db_seed(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When parse_document raises, the DB seed MUST still flow through.
+
+        Pre-fix, the ``except Exception`` branch set ``doc_department = None``
+        unconditionally and left ``doc_judge_name`` at its top-of-function
+        ``None``.  Post-fix, the except branch defaults ``doc_department``
+        to ``doc_meta.get("department")`` and the top-of-function init
+        already loaded ``doc_judge_name`` from the seed.
+        """
+        mock_extract.return_value = "pdf text"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.side_effect = RuntimeError("scraper exploded")
+        reingest._SCRAPER_REGISTRY["test-except-path"] = mock_scraper_cls
+        reingest._SPLIT_REGISTRY["test-except-path"] = MagicMock(
+            return_value=self._make_split_rulings(count=2)
+        )
+
+        try:
+            results = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-except-path",
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. Jane Smith"
+                assert ruling["department"] == "C-32"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-except-path", None)
+            reingest._SPLIT_REGISTRY.pop("test-except-path", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_full_reparse_merge_asymmetry_no_scraper_cls_falls_back_to_db_seed(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When the scraper class is missing, the DB seed MUST still flow through.
+
+        Pre-fix, the ``else`` branch (``scraper_cls`` falsy) set
+        ``doc_department = None`` unconditionally and ``doc_judge_name``
+        was left at its top-of-function ``None``.  Post-fix, both default
+        to ``doc_meta.get("X")`` so a split scraper without a registered
+        class — e.g. a future LLM-only split — still preserves the DB
+        seed.
+        """
+        mock_extract.return_value = "pdf text"
+        # Critical: no entry in _SCRAPER_REGISTRY.  The split function
+        # is registered, the scraper class is not — exercising the
+        # else branch on line ~1448.
+        reingest._SCRAPER_REGISTRY.pop("test-no-scraper-cls", None)
+        reingest._SPLIT_REGISTRY["test-no-scraper-cls"] = MagicMock(
+            return_value=self._make_split_rulings(count=2)
+        )
+
+        try:
+            results = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-no-scraper-cls",
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. Jane Smith"
+                assert ruling["department"] == "C-32"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-no-scraper-cls", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_full_reparse_merge_asymmetry_doc_meta_missing_keys_does_not_crash(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """``doc_meta.get("X")`` returns ``None`` when the key is absent.
+
+        Older callers (or future call sites that build a minimal
+        doc_meta) might omit the ``judge_name`` / ``department`` keys
+        entirely.  ``.get()`` returns ``None`` in that case — same
+        behaviour as pre-fix without the KeyError risk that bare
+        ``doc_meta["judge_name"]`` would have introduced.
+        """
+        mock_extract.return_value = "pdf text"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-missing-keys-split"] = mock_scraper_cls
+        reingest._SPLIT_REGISTRY["test-missing-keys-split"] = MagicMock(
+            return_value=self._make_split_rulings(count=2)
+        )
+
+        # Build a doc_meta WITHOUT judge_name / department keys.
+        meta = self._doc_meta()
+        meta.pop("judge_name", None)
+        meta.pop("department", None)
+
+        try:
+            results = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-missing-keys-split",
+                meta,
+            )
+            assert len(results) == 2
+            for ruling in results:
+                # The regex fallback at line ~1452 may populate
+                # judge_name from the synthetic "pdf text" — but on this
+                # text it will not match, so the field stays None.
+                assert ruling["judge_name"] is None
+                assert ruling["department"] is None
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-missing-keys-split", None)
+            reingest._SPLIT_REGISTRY.pop("test-missing-keys-split", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — DB format='txt' regression (#4122)
 # ---------------------------------------------------------------------------
 
