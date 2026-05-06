@@ -52,9 +52,12 @@ Phase 1 implementation: #2609
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import time
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urljoin
 
 import httpx
@@ -475,6 +478,15 @@ class CCTentativesPortalScraper(BaseScraper):
     ) -> CapturedDocument | None:
         """Fetch the detail page and PDF for a single listing row.
 
+        Builds a JSON envelope as ``raw_content`` so that
+        ``parse_document`` can populate every structured field from
+        ``raw_content`` alone — the reingest path
+        (``scripts/reingest_from_s3.py::_reparse_document``) constructs a
+        fresh ``CapturedDocument`` carrying only ``raw_content`` and DB
+        identifiers, so anything not in the envelope is unrecoverable on
+        reingest. See ``_populate_from_envelope`` for the field mapping
+        and #4133 / #3986 for the refactor history.
+
         Args:
             client: The shared httpx client.
             row: Parsed row dict from _parse_listing_table.
@@ -491,8 +503,9 @@ class CCTentativesPortalScraper(BaseScraper):
         detail_response = client.get(detail_url)
         detail_response.raise_for_status()
         detail_html_bytes = detail_response.content
+        detail_html_text = detail_response.text
 
-        detail = _parse_detail_page(detail_response.text)
+        detail = _parse_detail_page(detail_html_text)
 
         pdf_url = detail.get("pdf_url")
         if not pdf_url:
@@ -505,27 +518,102 @@ class CCTentativesPortalScraper(BaseScraper):
         pdf_response.raise_for_status()
         pdf_bytes = pdf_response.content
 
-        # Build document (PDF as primary raw content, per CC pipeline pattern)
+        # Build the JSON envelope (#4133 — Option A from the issue).  This
+        # is the single source of truth for every structured field,
+        # archived to S3 verbatim and round-tripped on reingest.  PDF and
+        # detail HTML bytes are base64-encoded so the envelope is valid
+        # UTF-8 / valid JSON; ``json.dumps(default=str)`` handles the
+        # ``hearing_date`` datetime in the row dict.
+        envelope = {
+            "row": row,
+            "detail_html_b64": base64.b64encode(detail_html_bytes).decode("ascii"),
+            "pdf_url": pdf_url,
+            "pdf_bytes_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+            "judge_id": judge_id,
+            "judge_name_dropdown": judge_name_dropdown,
+        }
+        envelope_bytes = json.dumps(envelope, default=str).encode("utf-8")
+
+        # ``ContentFormat.TEXT`` so the reingest text-extractor decodes
+        # the envelope as UTF-8 (rather than handing it to pdfplumber as
+        # if it were PDF bytes).  ``parse_document`` overwrites the
+        # JSON-as-text ``ruling_text`` with the structured ruling text.
         doc = self._make_base_doc(
             source_url=detail_url,
-            raw_content=pdf_bytes,
-            content_format=ContentFormat.PDF,
+            raw_content=envelope_bytes,
+            content_format=ContentFormat.TEXT,
         )
 
-        # Populate scraper-provided fields
+        self._populate_from_envelope(doc, envelope=envelope)
+        return doc
+
+    def _populate_from_envelope(
+        self,
+        doc: CapturedDocument,
+        *,
+        envelope: dict[str, Any],
+    ) -> None:
+        """Populate structured fields on ``doc`` from a CC-portal JSON envelope.
+
+        Single source of truth for the field-mapping logic shared by the
+        live capture path (``_fetch_single_ruling``) and the reingest
+        path (``parse_document``).  Mutates ``doc`` in place.  Mirrors
+        the #3986 ``_populate_from_envelope`` shape used by the
+        ``CourtListenerScraper``.
+
+        The envelope shape is:
+
+        ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
+        ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
+        ``"judge_id": <str>, "judge_name_dropdown": <str>}``
+
+        Args:
+            doc: The document to populate.
+            envelope: The decoded JSON envelope dict.
+        """
+        row = envelope.get("row") or {}
+        if not isinstance(row, dict):
+            row = {}
+
+        pdf_url = envelope.get("pdf_url")
+        judge_name_dropdown = envelope.get("judge_name_dropdown") or ""
+
+        # Decode the detail HTML so we can re-derive ruling_text /
+        # ruling_text_html / aside-judge_name without a network call.
+        detail_html_b64 = envelope.get("detail_html_b64") or ""
+        detail_html_bytes = b""
+        detail_html_text = ""
+        if detail_html_b64:
+            try:
+                detail_html_bytes = base64.b64decode(detail_html_b64)
+                detail_html_text = detail_html_bytes.decode("utf-8", errors="replace")
+            except (ValueError, TypeError):
+                detail_html_bytes = b""
+                detail_html_text = ""
+        detail = _parse_detail_page(detail_html_text) if detail_html_text else {}
+
+        # --- Listing-row-derived fields ---
         doc.case_number = row.get("case_number")
         doc.case_title = row.get("case_title")
-        doc.hearing_date = row.get("hearing_date")
         doc.motion_type = row.get("motion_type")
+
+        # ``hearing_date`` may be a datetime (live path) or an ISO-8601
+        # string (reingest path — json.dumps(default=str) wrote it that
+        # way).  Coerce to datetime so the schema gets a consistent type.
+        hearing_date_raw = row.get("hearing_date")
+        doc.hearing_date = _coerce_hearing_date(hearing_date_raw)
+
+        # --- Detail-page-derived fields ---
         doc.ruling_text = detail.get("ruling_text")
         doc.ruling_text_html = detail.get("ruling_text_html")
 
-        # Judge name: prefer the aside (more specific), fall back to dropdown name
+        # Judge name: prefer aside (most specific), fall back to dropdown name.
         judge_name_aside = detail.get("judge_name")
-        doc.judge_name = judge_name_aside or judge_name_dropdown
+        doc.judge_name = judge_name_aside or judge_name_dropdown or None
 
-        # Department from PDF filename (derivable, not from a structured field)
-        pdf_filename = pdf_url.rsplit("/", 1)[-1] if "/" in pdf_url else pdf_url
+        # --- PDF-URL-derived fields ---
+        # Department from PDF filename (16_012925.pdf -> "16").  Courthouse
+        # from CC's per-department mapping (cc_tentatives._cc_courthouse).
         dept = _cc_dept_from_filename(pdf_url)
         if dept:
             doc.department = dept
@@ -535,47 +623,116 @@ class CCTentativesPortalScraper(BaseScraper):
             if courthouse:
                 doc.courthouse = courthouse
 
-        # Store secondary artifacts and metadata in extra
+        # --- Secondary artifacts in extra ---
+        # Keep the same shape as the pre-#4133 version so downstream
+        # consumers (S3 archival, the worker, tests) see no change.
+        # ``detail_html`` stays in ``extra`` as bytes for backwards
+        # compatibility with code that reads it (currently only tests).
+        pdf_filename: str | None = None
+        if pdf_url and "/" in pdf_url:
+            pdf_filename = pdf_url.rsplit("/", 1)[-1]
+        elif pdf_url:
+            pdf_filename = pdf_url
+
         doc.extra["detail_html"] = detail_html_bytes
-        doc.extra["detail_url"] = detail_url
+        doc.extra["detail_url"] = row.get("detail_url") or doc.source_url
         doc.extra["pdf_url"] = pdf_url
         doc.extra["pdf_filename"] = pdf_filename
-        doc.extra["slug"] = slug
+        doc.extra["slug"] = row.get("slug")
         doc.extra["case_type"] = row.get("case_type")
-        doc.extra["judge_id"] = judge_id
-
-        return doc
+        doc.extra["judge_id"] = envelope.get("judge_id")
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """No-op on the live-capture path — all fields are populated during
-        ``fetch_documents`` via ``_fetch_single_ruling``.
+        """Parse structured fields from ``doc.raw_content``.
 
-        The portal detail page provides structured HTML ruling text directly,
-        so no PDF text extraction or LLM parsing is needed during live
-        capture. This mirrors the SF civil tentatives pattern where
-        extraction happens during fetch.
+        Single source of truth for both the live capture path
+        (``_fetch_single_ruling`` calls ``_populate_from_envelope`` after
+        building the JSON envelope) and the reingest path
+        (``scripts/reingest_from_s3.py::_reparse_document`` constructs a
+        fresh ``CapturedDocument`` carrying only ``raw_content`` and
+        calls this method).  Mirrors the #3986 fix shape on
+        ``CourtListenerScraper.parse_document``.
 
-        **Reingest hazard (audit #4046, follow-up #4133):** this method is
-        also called from ``scripts/reingest_from_s3.py::_reparse_document``
-        with a fresh ``CapturedDocument`` carrying only ``raw_content``
-        (PDF bytes). Returning the doc unchanged means ``judge_name``,
-        ``department``, ``parties``, ``outcome``, and ``motion_type`` get
-        cleared by the reingest merge logic, ``ruling_text_html`` is
-        permanently lost (it lives in ``extra["detail_html"]`` at capture
-        time, not in ``raw_content``), and only ``ruling_text`` is
-        recovered (via pdfplumber on the PDF bytes) plus the DB-seeded
-        ``case_number/case_title/hearing_date``. **Reingest of CC-portal
-        documents is NOT fully supported** — the surviving fields are a
-        subset of the original capture. #4133 tracks the refactor along
-        the #3986 ``_populate_from_envelope`` shape.
+        The raw_content is the JSON envelope built by
+        ``_fetch_single_ruling`` (since #4133):
+
+        ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
+        ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
+        ``"judge_id": <str>, "judge_name_dropdown": <str>}``
+
+        Tolerates ``raw_content`` that is not valid JSON or is missing
+        the expected ``row`` key — pre-#4133 captures archived raw PDF
+        bytes, so the envelope decode will fail.  In those cases the doc
+        is returned unchanged so the reingest caller falls back to
+        pdfplumber on the PDF bytes (via ``_extract_text_from_content``)
+        and the DB-seeded ``case_number`` / ``case_title`` /
+        ``hearing_date`` / ``judge_name`` / ``department`` from the
+        rulings row (via the symmetric merge in #4142).
 
         Args:
             doc: The document to parse.
 
         Returns:
-            The document unchanged.
+            The document with structured fields populated (envelope
+            decode succeeded) or unchanged (envelope decode failed).
         """
+        if not doc.raw_content:
+            return doc
+
+        try:
+            payload = json.loads(doc.raw_content)
+        except (ValueError, TypeError):
+            # Not valid JSON — likely a pre-#4133 capture (raw PDF bytes).
+            # Return unchanged so the reingest caller falls back to its
+            # PDF-text-extract path plus DB-seeded fields.
+            return doc
+
+        if not isinstance(payload, dict):
+            return doc
+
+        if not isinstance(payload.get("row"), dict):
+            # Envelope shape doesn't match what we wrote — leave the doc
+            # untouched rather than risk populating with garbage.
+            return doc
+
+        self._populate_from_envelope(doc, envelope=payload)
         return doc
+
+
+def _coerce_hearing_date(value: Any) -> datetime | None:
+    """Coerce a hearing_date value (datetime, ISO string, or None) to datetime.
+
+    The listing-row dict carries a real ``datetime`` on the live path,
+    but ``json.dumps(default=str)`` serializes it to an ISO-8601 string
+    that round-trips through reingest.  Accept either shape.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        # ``str(datetime)`` produces "2025-01-29 16:31:00+00:00".
+        # ``datetime.isoformat()`` produces "2025-01-29T16:31:00+00:00".
+        # ``fromisoformat`` accepts both forms in Python 3.11+.
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        # Fallback: try the older forms used by the live-path parser.
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return parsed
+            except ValueError:
+                continue
+    return None
 
 
 # ---------------------------------------------------------------------------
