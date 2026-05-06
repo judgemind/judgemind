@@ -174,6 +174,107 @@ def _make_daemon(
     return d, conn, handler
 
 
+# Sentinel for "caller did not pass this kwarg" — distinct from ``None``,
+# which is a meaningful queue entry meaning "row absent / missing".
+_UNSET: Any = object()
+
+
+def _scheduler_tick_fetch_queue(
+    *,
+    cap: int | None = 1,
+    cap_flipped_by: Any = _UNSET,
+    paused: Any = _UNSET,
+    active_count: Any = _UNSET,
+) -> list[Any]:
+    """Build the positional ``fetch_queue`` for one ``scheduler_tick`` call.
+
+    Issue #3188: ``scheduler_tick`` consumes a fixed ordered sequence of
+    ``fetchone()`` calls — see :class:`TestSchedulerGate` for the
+    authoritative description. Fresh tests that exercise the gate path
+    re-discovered the four-entry invariant by hand and shipped tests
+    with three-entry queues that silently passed for the wrong reason
+    (the orphan-detection bug behind #3184). This helper returns the
+    canonical queue so test authors describe **semantic state**, not raw
+    cursor returns.
+
+    Semantic mapping (default cap=1 spawn-path tick):
+
+    1. ``(cap,)`` — ``concurrency_cap`` SELECT. ``cap=0`` or ``cap=None``
+       short-circuits before entries 2-4, so the helper returns a
+       1-entry queue in those cases.
+    2. ``cap_flipped_by`` — ``_read_cap_flipped_by`` (circuit-breaker
+       auto-close). Defaults to ``None`` (no breaker flip). Pass any
+       row tuple to simulate a flipped breaker.
+    3. ``paused`` — ``_is_paused`` SELECT. Defaults to ``None`` (not
+       paused). Pass any row tuple to simulate a paused dispatcher.
+    4. ``(active_count,)`` — ``_active_agent_count`` ``SELECT COUNT(*)``.
+       Defaults to ``0`` (gate open) when omitted. Pass an explicit
+       ``int`` to close the gate, or ``None`` to simulate a missing
+       ``COUNT(*)`` row (treated as zero by the daemon).
+
+    Examples:
+
+    - Spawn path, cap=1, no agents running::
+
+          conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue()
+
+    - Cap-zero short-circuit (only entry 1)::
+
+          conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(cap=0)
+
+    - Cap=2 with one running agent (gate still open per #3199)::
+
+          conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(
+              cap=2, active_count=1,
+          )
+
+    - Active-agent-blocks-spawn (cap=1, count=1)::
+
+          conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(
+              cap=1, active_count=1,
+          )
+
+    The helper enforces the cap-zero short-circuit by raising
+    :class:`ValueError` if a caller passes ``cap=0`` together with any
+    of the downstream kwargs — that combination would silently
+    misrepresent the daemon's branching and is the exact mistake this
+    helper is meant to prevent.
+    """
+    cap_entry: Any = (cap,) if cap is not None else None
+
+    # When cap == 0 or cap is None, the daemon never reads entries 2-4.
+    # Reject downstream kwargs in that case so a copy-paste error
+    # (``cap=0`` plus a hopeful ``active_count=5``) fails loudly here
+    # rather than producing a misleadingly green test.
+    if cap is None or cap == 0:
+        downstream = {
+            "cap_flipped_by": cap_flipped_by,
+            "paused": paused,
+            "active_count": active_count,
+        }
+        passed = {k: v for k, v in downstream.items() if v is not _UNSET}
+        if passed:
+            raise ValueError(
+                "_scheduler_tick_fetch_queue: cap=0 / cap=None short-circuits "
+                "before reading cap_flipped_by / paused / active_count — "
+                f"do not pass these kwargs together with cap={cap!r}. "
+                f"Got: {passed!r}"
+            )
+        return [cap_entry]
+
+    cap_flipped_by_entry: Any = None if cap_flipped_by is _UNSET else cap_flipped_by
+    paused_entry: Any = None if paused is _UNSET else paused
+    if active_count is _UNSET:
+        active_count_resolved: int | None = 0  # default: zero running agents
+    else:
+        active_count_resolved = active_count
+    active_count_entry: Any = (
+        (active_count_resolved,) if active_count_resolved is not None else None
+    )
+
+    return [cap_entry, cap_flipped_by_entry, paused_entry, active_count_entry]
+
+
 # --------------------------------------------------------------------------
 # _FakeCursor dispatcher unit tests (issue #2793)
 # --------------------------------------------------------------------------
@@ -416,6 +517,14 @@ class TestSchedulerGate:
     Entries 2–4 are **skipped** when ``cap == 0`` or the cap row is
     missing (``None``) — those ticks consume only entry 1 and return
     early.  Any test exercising the spawn path needs all four entries.
+
+    **Preferred call site (issue #3188):** rather than re-discovering
+    the 4-entry invariant by hand, fresh tests should use
+    :func:`_scheduler_tick_fetch_queue` to describe the semantic state
+    they need (``cap=1, active_count=0`` etc.) and let the helper build
+    the queue. The helper also raises ``ValueError`` if ``cap=0`` is
+    combined with downstream kwargs — a class of mistake that motivated
+    this fixture (see :class:`TestSchedulerGateOrphanDetectionExample`).
     """
 
     def test_does_not_claim_when_concurrency_cap_zero(self, tmp_path: Path) -> None:
@@ -514,6 +623,171 @@ class TestSchedulerGate:
         d.scheduler_tick()
         assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
         assert len(conn.cursor_instance.executed) >= 4
+
+
+# --------------------------------------------------------------------------
+# _scheduler_tick_fetch_queue helper (issue #3188)
+# --------------------------------------------------------------------------
+
+
+class TestSchedulerTickFetchQueueHelper:
+    """Unit tests for the :func:`_scheduler_tick_fetch_queue` helper.
+
+    Issue #3188: fresh test authors re-discovered the 4-entry queue
+    invariant by hand and shipped tests with three-entry queues that
+    silently passed for the wrong reason. These tests lock in the
+    helper's contract so downstream tests can rely on it.
+    """
+
+    def test_default_args_is_spawn_path_cap_one(self) -> None:
+        """Bare call returns the documented 4-entry cap=1 spawn-path queue."""
+        assert _scheduler_tick_fetch_queue() == [(1,), None, None, (0,)]
+
+    def test_cap_zero_is_one_entry_short_circuit(self) -> None:
+        """``cap=0`` returns only the cap entry — entries 2-4 never fire."""
+        assert _scheduler_tick_fetch_queue(cap=0) == [(0,)]
+
+    def test_cap_none_is_one_entry_short_circuit(self) -> None:
+        """``cap=None`` (missing config row) returns only the ``None`` entry."""
+        assert _scheduler_tick_fetch_queue(cap=None) == [None]
+
+    def test_cap_zero_with_downstream_kwargs_raises(self) -> None:
+        """Combining ``cap=0`` with downstream kwargs is a copy-paste error.
+
+        The daemon never reads entries 2-4 when cap=0; silently
+        accepting these kwargs would let a test pass for the wrong
+        reason. Fail loudly here instead.
+        """
+        with pytest.raises(ValueError, match="cap=0 / cap=None short-circuits"):
+            _scheduler_tick_fetch_queue(cap=0, active_count=5)
+
+        with pytest.raises(ValueError, match="cap=0 / cap=None short-circuits"):
+            _scheduler_tick_fetch_queue(cap=None, paused=(True,))
+
+        # ``active_count=0`` looks innocuous but combining it with cap=0
+        # is still a contradiction (the daemon never reads it), so the
+        # helper rejects it too — using ``_UNSET`` as the sentinel
+        # rather than ``0``.
+        with pytest.raises(ValueError, match="cap=0 / cap=None short-circuits"):
+            _scheduler_tick_fetch_queue(cap=0, active_count=0)
+
+    def test_cap_one_with_active_count_one_closes_gate(self) -> None:
+        """cap=1, active_count=1 → 4-entry queue with ``(1,)`` count."""
+        assert _scheduler_tick_fetch_queue(cap=1, active_count=1) == [
+            (1,),
+            None,
+            None,
+            (1,),
+        ]
+
+    def test_cap_two_with_active_count_zero_open_gate(self) -> None:
+        """cap=2, active_count=0 → ``(2,)`` cap, ``(0,)`` count."""
+        assert _scheduler_tick_fetch_queue(cap=2, active_count=0) == [
+            (2,),
+            None,
+            None,
+            (0,),
+        ]
+
+    def test_cap_flipped_by_pre_seeded(self) -> None:
+        """Passing ``cap_flipped_by`` simulates a tripped circuit breaker."""
+        flipped_row = ("operator", "2026-01-01T00:00:00Z")
+        queue = _scheduler_tick_fetch_queue(cap=1, cap_flipped_by=flipped_row)
+        assert queue == [(1,), flipped_row, None, (0,)]
+
+    def test_paused_pre_seeded(self) -> None:
+        """Passing ``paused`` simulates a paused dispatcher."""
+        paused_row = (True,)
+        queue = _scheduler_tick_fetch_queue(cap=1, paused=paused_row)
+        assert queue == [(1,), None, paused_row, (0,)]
+
+    def test_active_count_none_means_missing_count_row(self) -> None:
+        """Explicit ``active_count=None`` simulates a missing COUNT(*) row."""
+        assert _scheduler_tick_fetch_queue(cap=1, active_count=None) == [
+            (1,),
+            None,
+            None,
+            None,
+        ]
+
+    def test_helper_output_drives_real_scheduler_tick(self, tmp_path: Path) -> None:
+        """End-to-end: feed the helper output into a live ``scheduler_tick``.
+
+        AC3: a fresh test can assert on the gate path without
+        re-discovering the 4-entry invariant by hand.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(
+            cap=1, active_count=0
+        )
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 1
+        assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
+
+
+class TestSchedulerGateOrphanDetectionExample:
+    """End-to-end demonstration that the helper supports AC3.
+
+    Issue #3188 AC3: a fresh test (modeling the orphan-detection path
+    that motivated #3184) can assert on the gate path without
+    re-discovering the 4-entry invariant by hand. These two tests are
+    written exactly the way a future #3184-style test author would
+    write them — using :func:`_scheduler_tick_fetch_queue` and naming
+    the semantic state, never the raw queue position.
+    """
+
+    def test_orphan_thread_with_no_active_agent_does_not_block_spawn(
+        self, tmp_path: Path
+    ) -> None:
+        """An orphan-counter increment scenario where the gate is open.
+
+        Models the #3184 case: a previous orchestration thread exited
+        silently but its ``status='running'`` row was reaped — so
+        ``active_agent_count==0`` and the gate must be open. The
+        helper makes this expression direct: ``cap=1, active_count=0``.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(
+            cap=1, active_count=0
+        )
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        spawn = MagicMock(return_value=True)
+        d._maybe_spawn_orchestration_thread = spawn  # type: ignore[method-assign]
+
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 1
+        assert spawn.call_count == 1
+        # Sanity: the helper sized the queue correctly. Pre-#3188 a
+        # hand-written 3-entry queue would have made fetchone return
+        # ``None`` for the COUNT(*) read instead of ``(0,)``, which the
+        # daemon also treats as zero — the test would still pass and
+        # mask a real downstream bug.
+        assert conn.cursor_instance.fetch_queue == []
+
+    def test_orphan_row_lingering_blocks_spawn(self, tmp_path: Path) -> None:
+        """The complementary case: a stale ``status='running'`` row is still alive.
+
+        ``active_count=1`` with ``cap=1`` closes the gate. The helper's
+        keyword argument names the post-condition; the test reads as
+        plain English instead of `(1,), None, None, (1,)`.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = _scheduler_tick_fetch_queue(
+            cap=1, active_count=1
+        )
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        spawn = MagicMock(
+            side_effect=AssertionError("must not spawn when active_count == cap")
+        )
+        d._maybe_spawn_orchestration_thread = spawn  # type: ignore[method-assign]
+
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 0
+        assert spawn.call_count == 0
 
 
 # --------------------------------------------------------------------------
