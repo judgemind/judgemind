@@ -767,6 +767,26 @@ $ gh api /repos/judgemind/judgemind/pulls/4053/merge -X PUT -f merge_method=squa
 $ gh api /repos/judgemind/judgemind/git/refs/heads/worktree-agent-... -X DELETE
 ```
 
+**Fallback — `gh pr merge` returns 5xx / 504 Gateway Timeout (#4231).**
+
+GitHub's `gh pr merge` periodically returns transient `5xx` / `504 Gateway Timeout` responses (sometimes wrapped in a multi-KB HTML error page that floods the agent transcript) **after the underlying REST endpoint has already accepted the squash on the GitHub side.** The 504 looks like a merge failure but is not — the merge already happened. Naively retrying `gh pr merge` here is wrong because the second call will fail with `Pull request is already closed` or similar, and the loud HTML response makes the failure mode look worse than it is. A concrete observed instance: PR #4230 (issue #4227, 2026-05-06) — two retries of `gh pr merge --squash --delete-branch` both returned 5xx; the PR had actually merged on the first call (`merged_at: 2026-05-06T15:54:59Z`), but `--delete-branch` did not run, leaving the head ref alive.
+
+**Recipe — on 5xx / 504 / HTML response from `gh pr merge`, do NOT retry the merge call. Re-fetch PR state and treat closed-with-merged_at as success.**
+
+```
+mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
+```
+
+Inspect the response:
+
+- **`state: "closed"` and `merged_at: "<timestamp>"` is set** → the squash succeeded. The 5xx was a response-side failure, not a merge-side failure. Skip re-running `gh pr merge` entirely. If the head branch still exists (check `headRefName` against `gh api /repos/judgemind/judgemind/git/refs/heads/<branch>`), delete it explicitly with the same call from the `#4058` recipe above:
+  ```
+  gh api /repos/judgemind/judgemind/git/refs/heads/<branch-name> -X DELETE
+  ```
+  If that DELETE returns 422 / "Reference does not exist," the branch is already gone — no action needed. Continue to A.8.
+- **`state: "open"` and `merged_at: null`** → the merge truly did not happen. Diagnose the underlying GitHub 5xx (rate limit, GitHub Status incident, branch protection) and retry `gh pr merge` once. If the second attempt also returns 5xx **and** PR state is still open, fall through to the API-merge fallback above (`gh api .../pulls/<N>/merge -X PUT`) — the REST endpoint and GraphQL endpoints take different paths through GitHub's infra and the REST one usually succeeds when GraphQL is degraded.
+- **`state: "closed"` with `merged_at: null`** → the PR was declined or auto-closed during the failed merge attempt; do not re-attempt. Comment on the issue explaining and stop.
+
 The dispatcher daemon takes a *different* path for this same failure mode — it pushes an empty commit to force a fresh rollup evaluation and re-enters `awaiting_ci` (#2641, see `docs/specs/dispatcher-v2-spec.md` §"Merge-phase stale-rollup auto-unstick"). That path exists because the daemon must drive the phase machine forward without operator intervention; the `/task` interactive path can take the simpler API-merge shortcut because the agent has already verified the canonical gate is green.
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
