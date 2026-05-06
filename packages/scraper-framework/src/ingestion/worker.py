@@ -1912,6 +1912,7 @@ class IngestionWorker:
                 model=self._llm_model,
                 timeout=self._llm_timeout,
                 max_tokens=_llm_max_tokens,
+                document_id=document_id,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 

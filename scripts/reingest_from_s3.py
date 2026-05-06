@@ -1260,6 +1260,7 @@ def _reparse_document(
                 token_tracker=token_tracker,
                 max_tokens=_llm_max_tokens,
                 bust_cache=bust_llm_cache,
+                document_id=doc_meta["document_id"],
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
