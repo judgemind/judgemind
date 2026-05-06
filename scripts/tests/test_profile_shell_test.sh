@@ -289,6 +289,35 @@ else
     fi
 fi
 
+# ─── Test T_issue4183: default pattern covers Test N + T_issue<N> + T<N><a-z> ─
+# Issue #4183 acceptance: the default --section-pattern must match all three
+# header forms in `scripts/tests/`:
+#   * legacy `# Test N:`       (T44–T59 grandfathered)
+#   * new   `# Test T_issue<N>:`
+#   * new   `# Test T<N><a-z>:` (same-issue disambiguation)
+# Without this, an agent profiling a newly-authored test sees
+# "Sections recorded: 0" and has to re-run with an explicit
+# --section-pattern, defeating the "single-tool-invocation surfaces the
+# long pole" property the profiler exists for. See #4183 for the bug.
+fixture_t4183=$(make_fixture "fixture_t_issue4183.sh" '#!/usr/bin/env bash
+set -euo pipefail
+
+# Test 1: legacy sequential
+sleep 0.01
+
+# Test T_issue3656: post-#3666 issue-numbered convention
+sleep 0.02
+
+# Test T3656a: same-issue disambiguation letter suffix
+sleep 0.03
+
+exit 0
+')
+tsv_t4183="$TMPDIR_TEST/fixture_t4183.tsv"
+"$PROFILER" --tsv "$tsv_t4183" "$fixture_t4183" >/dev/null 2>&1
+sections_t4183=$(wc -l < "$tsv_t4183" | tr -d ' ')
+assert_eq "default pattern catches Test N + T_issue<N> + T<N><a-z>" "$sections_t4183" "3"
+
 # ─── Summary ─────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"

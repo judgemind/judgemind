@@ -2,9 +2,12 @@
 # profile-shell-test.sh — Wrap a shell test file with per-section timing.
 #
 # Reads a `.sh` test file, finds all section boundaries (default: lines
-# matching `^# Tests? +N:`), injects timing markers around each section,
-# runs the instrumented copy, and prints the top-N longest-running
-# sections in sorted order.
+# matching `^# Tests? +(T(_issue)?)?N(a-z)?:`, which covers both the
+# legacy `# Test 1:` and the post-#3666 `# Test T_issue3656:` /
+# `# Test T3675:` / `# Test T3656a:` conventions described in
+# `docs/agent/code-standards.md` §Test marker convention), injects
+# timing markers around each section, runs the instrumented copy, and
+# prints the top-N longest-running sections in sorted order.
 #
 # Why this exists
 # ---------------
@@ -25,7 +28,17 @@
 # -------
 #   --section-pattern REGEX
 #       Extended regex that identifies a section header line.
-#       Default: ^#[[:space:]]+Tests?[[:space:]]+[0-9]+:
+#       Default: ^#[[:space:]]+Tests?[[:space:]]+(T(_issue)?)?[0-9]+[a-z]?:
+#       This covers all four header forms used in scripts/tests/:
+#         * `# Test 1:`           (legacy sequential — T44–T59 grandfathered)
+#         * `# Test T3675:`       (new convention, bare T<N>)
+#         * `# Test T_issue3656:` (new convention, T_issue<N>)
+#         * `# Test T3656a:`      (same-issue disambiguation, T<N><a-z>)
+#       See `docs/agent/code-standards.md` §Test marker convention. The
+#       trailing `[a-z]?` covers same-issue disambiguation; sub-test
+#       markers like `# T57a:` (no leading `Test` keyword) are out of
+#       scope for the default and require an explicit
+#       `--section-pattern '^# T[0-9]+[a-z]?:'` override.
 #   --top N
 #       Number of slowest sections to print at the end (default 20).
 #   --tsv PATH
@@ -58,7 +71,7 @@
 set -euo pipefail
 
 # ─── Defaults ────────────────────────────────────────────────────────────
-SECTION_PATTERN='^#[[:space:]]+Tests?[[:space:]]+[0-9]+:'
+SECTION_PATTERN='^#[[:space:]]+Tests?[[:space:]]+(T(_issue)?)?[0-9]+[a-z]?:'
 TOP_N=20
 TSV_PATH=""
 KEEP=0
@@ -66,7 +79,7 @@ INPUT=""
 
 # ─── Argument parsing ────────────────────────────────────────────────────
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
