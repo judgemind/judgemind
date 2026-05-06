@@ -848,6 +848,136 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
             methods.setdefault("case_type", "motion_type")
 
 
+def _extract_doc_level_judge_department(
+    doc_meta: dict,
+    scraper_id: str,
+    raw_content: bytes,
+    *,
+    parsed: Any | None = None,
+) -> tuple[str | None, str | None]:
+    """Return ``(doc_judge_name, doc_department)`` with the symmetric DB-seed merge.
+
+    Centralises the #4142 / #4145 / #4150 fixes so future scrapers added to
+    ``_SCRAPER_REGISTRY`` automatically inherit the symmetric-merge behaviour.
+    Pre-fix, three near-identical inline copies of this logic lived at the
+    three reingest call sites — ``_reparse_document``,
+    ``_full_reparse_document``, and ``_reparse_document_multimodal`` — and
+    each was patched independently when the same silent-data-loss bug surfaced
+    (#3986 root cause). #4154 hoists the merge into one place.
+
+    Always: prefer ``parsed.X``, fall back to ``doc_meta.get("X")``, default
+    both to ``doc_meta.get("X")`` on every fall-through (no scraper class
+    registered, ``parse_document`` raises, ``parse_document`` returns falsy
+    values).  This mirrors the ``case_number`` / ``case_title`` symmetric-
+    merge pattern already used elsewhere in this script.
+
+    Why a DB-seed fallback exists at all: ``doc_meta`` carries
+    ``judge_name`` and ``department`` from the rulings row (via
+    ``FETCH_DOCUMENTS_QUERY``).  A no-op ``parse_document`` on a Live-only
+    scraper (e.g. ``cc_tentatives_portal``, ``oc_tentatives``,
+    ``sf_civil_tentatives``) returns the cap_doc unchanged with
+    ``judge_name`` / ``department`` equal to ``None``.  Without this
+    fallback those values silently overwrite the DB-seeded values pulled
+    from the rulings row at the DB-write path, which is the same silent-
+    data-loss path #3986 surfaced for CourtListener.  See
+    ``docs/investigations/parse_document-reingest-safety-2026-05.md`` for
+    the per-scraper audit.
+
+    Parameters
+    ----------
+    doc_meta : dict
+        Document metadata from ``FETCH_DOCUMENTS_QUERY``.  Carries the
+        DB-seeded ``judge_name`` / ``department`` (from the rulings row's
+        ``canonical_name`` and ``department``).  Both keys are optional —
+        ``.get()`` returns ``None`` when absent (no KeyError).
+    scraper_id : str
+        Scraper ID (e.g. ``"ca-sf-civil-tentatives"``).  Used to look up
+        the registered scraper class from ``_SCRAPER_REGISTRY``.
+    raw_content : bytes
+        Raw document bytes from S3.  Used to build a ``CapturedDocument``
+        when this helper drives the ``parse_document`` call itself
+        (``parsed`` is ``None``).
+    parsed : Any | None, keyword-only
+        Pre-computed ``parse_document`` result.  Some callers (e.g.
+        ``_reparse_document``) already invoke ``parse_document`` for other
+        fields (ruling_text, case_number, case_title, etc.) and pass the
+        result in to avoid a second call.  When ``None``, the helper
+        builds a ``CapturedDocument`` and calls ``parse_document``
+        itself — matching the dedicated doc-level extraction blocks in
+        ``_full_reparse_document`` and ``_reparse_document_multimodal``.
+
+    Returns
+    -------
+    tuple[str | None, str | None]
+        ``(doc_judge_name, doc_department)`` with the symmetric DB-seed
+        fallback applied.  Either may be ``None`` when neither
+        ``parsed.X`` nor ``doc_meta`` carries a value for that field.
+
+    Notes
+    -----
+    Post-helper text-based regex fallbacks (``extract_judge_name(text)``
+    in ``_full_reparse_document`` and the ``DEPT NNN`` regex in
+    ``_reparse_document_multimodal``) intentionally stay at the call
+    sites — they are path-specific (text-availability, format-specific
+    regexes) and not part of the shared bug class.
+    """
+    judge_seed = doc_meta.get("judge_name")
+    dept_seed = doc_meta.get("department")
+
+    # Caller-provided parsed object: skip the parse_document call and
+    # apply the symmetric merge directly.  ``getattr`` defends against
+    # parsed objects that omit the attribute entirely (defensive — the
+    # production ``CapturedDocument`` always carries both, but a future
+    # alternate parsed shape could not).
+    if parsed is not None:
+        return (
+            getattr(parsed, "judge_name", None) or judge_seed,
+            getattr(parsed, "department", None) or dept_seed,
+        )
+
+    scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
+    if scraper_cls is None:
+        # No scraper class registered (e.g. ``rebuild-ca-san_diego``
+        # synthetic scraper_id, or a future LLM-only split scraper):
+        # the DB seed is the only source of doc-level judge/department.
+        return judge_seed, dept_seed
+
+    try:
+        config = ScraperConfig(
+            scraper_id=scraper_id,
+            state=doc_meta["state"],
+            county=doc_meta["county"],
+            court=doc_meta["court_name"],
+            target_urls=[],
+        )
+        scraper = scraper_cls(config=config)
+        cap_doc = CapturedDocument(
+            document_id=doc_meta["document_id"],
+            scraper_id=scraper_id,
+            state=doc_meta["state"],
+            county=doc_meta["county"],
+            court=doc_meta["court_name"],
+            source_url=doc_meta["source_url"],
+            capture_timestamp=doc_meta["captured_at"],
+            content_format=ContentFormat.from_db_value(doc_meta["format"]),
+            raw_content=raw_content,
+            content_hash=doc_meta.get("content_hash", ""),
+        )
+        parsed_result = scraper.parse_document(cap_doc)
+        return (
+            parsed_result.judge_name or judge_seed,
+            parsed_result.department or dept_seed,
+        )
+    except Exception:
+        logger.warning(
+            "Scraper parse_document failed during doc-level judge/department extraction",
+            document_id=doc_meta.get("document_id"),
+            scraper_id=scraper_id,
+            exc_info=True,
+        )
+        return judge_seed, dept_seed
+
+
 def _reparse_document(
     raw_content: bytes,
     scraper_id: str,
@@ -946,17 +1076,17 @@ def _reparse_document(
             extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
-            # Symmetric merge with DB-seeded fallback (#4142).  A no-op
-            # ``parse_document`` on a Live-only scraper (e.g. SF civil
-            # tentatives, CC tentatives portal) returns the cap_doc
-            # unchanged with ``judge_name`` / ``department`` / ``parties``
-            # equal to ``None`` / ``[]``.  Without this fallback those
-            # values silently overwrite the DB-seeded values pulled from
-            # the rulings row at lines ~2408-2432, which is the same
-            # silent-data-loss path #3986 surfaced for CourtListener.
-            # See ``docs/investigations/parse_document-reingest-safety-2026-05.md``
-            # for the full per-scraper audit.
-            extracted["judge_name"] = parsed.judge_name or doc_meta.get("judge_name")
+            # Symmetric DB-seed merge for doc-level judge_name and department
+            # (#4142, refactored in #4154 — see
+            # ``_extract_doc_level_judge_department``).  This is the shared
+            # helper that owns the merge formula across all three reingest
+            # entry points; passing the existing ``parsed`` in avoids a
+            # second ``parse_document`` call.
+            extracted["judge_name"], extracted["department"] = (
+                _extract_doc_level_judge_department(
+                    doc_meta, scraper_id, raw_content, parsed=parsed
+                )
+            )
             # ``outcome`` and ``motion_type`` legitimately fall back to
             # ``None`` here rather than a DB seed: ``doc_meta`` does not
             # carry these fields (FETCH_DOCUMENTS_QUERY at lines ~380-403
@@ -974,7 +1104,6 @@ def _reparse_document(
                 if parsed.motion_type
                 else None
             )
-            extracted["department"] = parsed.department or doc_meta.get("department")
             # ``parties`` falls back to the prior ``extracted["parties"]``
             # (initialized to ``[]`` at line 911) because ``doc_meta``
             # does not carry a parties seed.  The LLM and enrichment
@@ -1398,27 +1527,14 @@ def _full_reparse_document(
     if not content_hash:
         content_hash = hashlib.sha256(raw_content).hexdigest()
 
-    # Extract hearing date and judge name from the full PDF text
-    # (these are document-level, shared across all rulings).
-    #
-    # Symmetric merge with DB-seeded fallback (#4145, sibling of #4142).
-    # The four code paths below — top-of-function init, try-success,
-    # except-Exception, and the no-scraper-cls else — all default
-    # ``doc_judge_name`` / ``doc_department`` to ``doc_meta.get("X")``
-    # rather than ``None``.  This mirrors the #4142 fix in the sibling
-    # ``_reparse_document`` path and protects against the same silent
-    # data-loss class: a Live-only no-op ``parse_document`` (e.g.
-    # ``cc_tentatives_portal``, ``oc_tentatives``, ``sf_civil_tentatives``)
-    # registered with a ``_SPLIT_REGISTRY`` entry would otherwise silently
-    # clobber the DB-seeded ``judge_name`` / ``department`` ridden along
-    # on ``doc_meta`` (the rulings row's ``canonical_name`` and
-    # ``department``, see ``FETCH_DOCUMENTS_QUERY``).  See
-    # ``docs/investigations/parse_document-reingest-safety-2026-05.md``
-    # for the per-scraper audit and #3986 for the bug-class root cause.
+    # Extract hearing date from the full PDF text (document-level, shared
+    # across all rulings).  ``doc_hearing_date`` is path-specific to
+    # ``_full_reparse_document`` — it does not apply to the single-doc
+    # ``_reparse_document`` path or the multimodal path's per-ruling
+    # ``hearing_date_val`` flow — so it stays inline here.
     scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
-    doc_judge_name: str | None = doc_meta.get("judge_name")
     doc_hearing_date: Any = doc_meta.get("hearing_date")
-    doc_department: str | None = doc_meta.get("department")
+    parsed: Any | None = None
 
     if scraper_cls:
         try:
@@ -1445,24 +1561,31 @@ def _full_reparse_document(
                 content_hash=content_hash,
             )
             parsed = scraper.parse_document(cap_doc)
-            doc_judge_name = parsed.judge_name or doc_meta.get("judge_name")
             if parsed.hearing_date:
                 doc_hearing_date = (
                     parsed.hearing_date.date()
                     if isinstance(parsed.hearing_date, datetime)
                     else parsed.hearing_date
                 )
-            # Also try department from parsed doc
-            doc_department = parsed.department or doc_meta.get("department")
         except Exception:
             logger.warning(
                 "Scraper parse_document failed during full-reparse",
                 document_id=doc_meta["document_id"],
                 exc_info=True,
             )
-            doc_department = doc_meta.get("department")
-    else:
-        doc_department = doc_meta.get("department")
+            parsed = None
+
+    # Symmetric DB-seed merge for doc-level judge_name and department
+    # (#4145, refactored in #4154 — see
+    # ``_extract_doc_level_judge_department``).  Single source of truth
+    # for the merge formula across all three reingest entry points.
+    # When ``parsed`` is ``None`` (no scraper class registered, or
+    # ``parse_document`` raised), the helper falls back to the DB seed
+    # carried on ``doc_meta`` — protecting against the silent
+    # data-loss class #3986 surfaced for CourtListener.
+    doc_judge_name, doc_department = _extract_doc_level_judge_department(
+        doc_meta, scraper_id, raw_content, parsed=parsed
+    )
 
     # Fall back to regex for judge name if scraper didn't provide one
     if not doc_judge_name:
@@ -1953,63 +2076,19 @@ def _reparse_document_multimodal(
         result["llm_outcome"] = "multimodal_fallback"
         return [result]
 
-    # Extract doc-level judge_name and department from the full PDF text
-    # as a fallback for individual rulings where the LLM didn't extract
-    # these fields.  This mirrors _full_reparse_document() lines 971-1023
-    # and matches the worker's fallback at worker.py line 1570.  (#2063)
+    # Extract doc-level judge_name and department as a fallback for
+    # individual rulings where the LLM didn't extract these fields.
+    # Matches the worker's fallback at worker.py line 1570 (#2063).
     #
-    # Symmetric merge with DB-seeded fallback (#4150, sibling of #4142
-    # and #4145).  All three code paths below — top-of-function init,
-    # try-success, and except-Exception — default ``doc_judge_name`` /
-    # ``doc_department`` to ``doc_meta.get("X")`` rather than ``None``.
-    # This mirrors the #4142 / #4145 fixes in the sibling
-    # ``_reparse_document`` and ``_full_reparse_document`` paths and
-    # protects against the same silent data-loss class: a Live-only
-    # no-op ``parse_document`` (e.g. ``cc_tentatives_portal``,
-    # ``oc_tentatives``, ``sf_civil_tentatives``) running through the
-    # multimodal mode would otherwise silently clobber the DB-seeded
-    # ``judge_name`` / ``department`` ridden along on ``doc_meta`` (the
-    # rulings row's ``canonical_name`` and ``department``, see
-    # ``FETCH_DOCUMENTS_QUERY``).  See
-    # ``docs/investigations/parse_document-reingest-safety-2026-05.md``
-    # for the per-scraper audit and #3986 for the bug-class root cause.
-    doc_judge_name: str | None = doc_meta.get("judge_name")
-    doc_department: str | None = doc_meta.get("department")
-
-    scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
-    if scraper_cls:
-        try:
-            config = ScraperConfig(
-                scraper_id=scraper_id,
-                state=doc_meta["state"],
-                county=doc_meta["county"],
-                court=doc_meta["court_name"],
-                target_urls=[],
-            )
-            scraper = scraper_cls(config=config)
-            cap_doc = CapturedDocument(
-                document_id=doc_meta["document_id"],
-                scraper_id=scraper_id,
-                state=doc_meta["state"],
-                county=doc_meta["county"],
-                court=doc_meta["court_name"],
-                source_url=doc_meta["source_url"],
-                capture_timestamp=doc_meta["captured_at"],
-                content_format=ContentFormat.from_db_value(doc_meta["format"]),
-                raw_content=raw_content,
-                content_hash=doc_meta.get("content_hash", ""),
-            )
-            parsed = scraper.parse_document(cap_doc)
-            doc_judge_name = parsed.judge_name or doc_meta.get("judge_name")
-            doc_department = parsed.department or doc_meta.get("department")
-        except Exception:
-            logger.warning(
-                "Scraper parse_document failed during multimodal reparse",
-                document_id=doc_meta["document_id"],
-                exc_info=True,
-            )
-            doc_judge_name = doc_meta.get("judge_name")
-            doc_department = doc_meta.get("department")
+    # Symmetric DB-seed merge (#4150, refactored in #4154 — see
+    # ``_extract_doc_level_judge_department``).  Single source of truth
+    # for the merge formula across all three reingest entry points;
+    # protects against the silent data-loss class #3986 surfaced for
+    # CourtListener (Live-only ``parse_document`` returning a no-op
+    # cap_doc clobbering the DB-seeded ``judge_name`` / ``department``).
+    doc_judge_name, doc_department = _extract_doc_level_judge_department(
+        doc_meta, scraper_id, raw_content
+    )
 
     # Fall back to regex extraction from the full PDF text if the scraper
     # didn't provide a judge name (e.g. OC scraper's parse_document is a no-op).
