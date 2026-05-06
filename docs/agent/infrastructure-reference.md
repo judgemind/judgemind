@@ -408,14 +408,16 @@ This closes the race window observed in PR #2907 where a new resolver shipped on
 | `scripts/ecs-run-task.sh` | All data scripts (backfills, migrations, audits) | Reliable | Standalone Fargate task, CloudWatch logs, no session timeout |
 | `scripts/dev-db-query.sh` | Quick SQL queries | Good for short queries | Uses ECS Exec internally; may drop on long queries |
 | `scripts/ecs-run.sh` | Interactive debugging only | Unreliable | SSM sessions drop after seconds; never use for scripts |
+| `scripts/ecs-wait-task.sh` | Wait on a `--detach`'d oneshot until STOPPED | Reliable | 60s polling, no upper time limit, propagates container exitCode |
 
 ```
 # Run a script and wait for completion (default)
 scripts/ecs-run-task.sh scripts/backfill_llm_enrichment.py -- --dry-run
 
-# Long-running tasks: launch and detach, check logs later
+# Long-running tasks: launch and detach, then wait via the helper
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
-scripts/ecs-run-task.sh --logs <task-arn>
+scripts/ecs-wait-task.sh                    # reads tmp/last-ecs-task.arn auto-saved on detach
+scripts/ecs-run-task.sh --logs <task-arn>   # alternative: stream logs after the fact
 
 # Initial population of a county with S3 data but no DB records
 scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange"
@@ -427,6 +429,8 @@ scripts/ecs-task-logs.sh <task-id> --follow
 # Override CPU/memory (default: 1024 CPU / 4096 MB)
 scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completeness.py
 ```
+
+**Long oneshots: prefer `scripts/ecs-wait-task.sh` over `aws ecs wait tasks-stopped`.** The native `aws ecs wait tasks-stopped` polls 100 times at 6s intervals = 10 min hard cap, which is too short for typical reingests/rebuilds (30-180 min). `scripts/ecs-wait-task.sh` polls every 60s with no upper time limit, emits one-line liveness notes the agent transcript can use to verify progress, and propagates the container's `exitCode` as the script's exit code. It reads the ARN from `tmp/last-ecs-task.arn` (auto-written by `ecs-run-task.sh --detach`) when no positional ARN is passed. See #4252 and `scripts/ecs-wait-task.sh --help`.
 
 **Large-county rebuilds need memory override.** `rebuild_db.py --county <name>` holds per-worker OpenSearch/Postgres clients and LLM batch state for every document in the county. At the default 4096 MB, counties with thousands of documents (Los Angeles, Santa Clara, Orange) can exit 137 (OOM). Use `--cpu 2048 --memory 8192` for these rebuilds (see #2481):
 
