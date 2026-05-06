@@ -28,15 +28,35 @@ if [[ "${1:-}" == "--ci" ]]; then
         -e POSTGRES_USER=judgemind \
         -e POSTGRES_PASSWORD=localdev \
         postgres:16-alpine > /dev/null
-    # Wait for postgres to be ready
-    for i in $(seq 1 30); do
+    # Wait for postgres to be ready.
+    #
+    # 90s ceiling (#4159): the container's `initdb` + `pg_ctl start` sequence
+    # can exceed 30s when the host is under load — concurrent CI runs pulling
+    # the same image, IO contention, etc. — and a `--failed` rerun virtually
+    # always passes once the image is warm and the host is idle. 90s is the
+    # ceiling for *transient* slowness; a genuinely-broken container exits
+    # via the inner `docker inspect` short-circuit below.
+    #
+    # Fast-fail short-circuit (#4159): if the container has stopped running
+    # (exited / OOM-killed / failed to start at all because of a bad env
+    # var like `POSTGRES_PASSWORD=`), break out of the loop immediately
+    # rather than burn the full 90s polling a dead container. The outer
+    # `pg_isready` check below then surfaces the real error.
+    for i in $(seq 1 90); do
         if docker exec "$CONTAINER" pg_isready -U judgemind -q 2>/dev/null; then
             break
+        fi
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]]; then
+            echo "ERROR: postgres container '$CONTAINER' is not running (exited unexpectedly)"
+            echo "Container logs:"
+            docker logs "$CONTAINER" 2>&1 | tail -20 || true
+            docker rm -f "$CONTAINER" > /dev/null 2>&1
+            exit 1
         fi
         sleep 1
     done
     if ! docker exec "$CONTAINER" pg_isready -U judgemind -q 2>/dev/null; then
-        echo "ERROR: postgres failed to start within 30 seconds"
+        echo "ERROR: postgres failed to start within 90 seconds"
         docker rm -f "$CONTAINER" > /dev/null 2>&1
         exit 1
     fi
