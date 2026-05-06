@@ -1957,8 +1957,24 @@ def _reparse_document_multimodal(
     # as a fallback for individual rulings where the LLM didn't extract
     # these fields.  This mirrors _full_reparse_document() lines 971-1023
     # and matches the worker's fallback at worker.py line 1570.  (#2063)
-    doc_judge_name: str | None = None
-    doc_department: str | None = None
+    #
+    # Symmetric merge with DB-seeded fallback (#4150, sibling of #4142
+    # and #4145).  All three code paths below — top-of-function init,
+    # try-success, and except-Exception — default ``doc_judge_name`` /
+    # ``doc_department`` to ``doc_meta.get("X")`` rather than ``None``.
+    # This mirrors the #4142 / #4145 fixes in the sibling
+    # ``_reparse_document`` and ``_full_reparse_document`` paths and
+    # protects against the same silent data-loss class: a Live-only
+    # no-op ``parse_document`` (e.g. ``cc_tentatives_portal``,
+    # ``oc_tentatives``, ``sf_civil_tentatives``) running through the
+    # multimodal mode would otherwise silently clobber the DB-seeded
+    # ``judge_name`` / ``department`` ridden along on ``doc_meta`` (the
+    # rulings row's ``canonical_name`` and ``department``, see
+    # ``FETCH_DOCUMENTS_QUERY``).  See
+    # ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+    # for the per-scraper audit and #3986 for the bug-class root cause.
+    doc_judge_name: str | None = doc_meta.get("judge_name")
+    doc_department: str | None = doc_meta.get("department")
 
     scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
     if scraper_cls:
@@ -1984,14 +2000,16 @@ def _reparse_document_multimodal(
                 content_hash=doc_meta.get("content_hash", ""),
             )
             parsed = scraper.parse_document(cap_doc)
-            doc_judge_name = parsed.judge_name
-            doc_department = parsed.department
+            doc_judge_name = parsed.judge_name or doc_meta.get("judge_name")
+            doc_department = parsed.department or doc_meta.get("department")
         except Exception:
             logger.warning(
                 "Scraper parse_document failed during multimodal reparse",
                 document_id=doc_meta["document_id"],
                 exc_info=True,
             )
+            doc_judge_name = doc_meta.get("judge_name")
+            doc_department = doc_meta.get("department")
 
     # Fall back to regex extraction from the full PDF text if the scraper
     # didn't provide a judge name (e.g. OC scraper's parse_document is a no-op).

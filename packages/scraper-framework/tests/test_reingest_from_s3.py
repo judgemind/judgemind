@@ -1008,6 +1008,315 @@ class TestFullReparseDocumentMergeAsymmetry:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document_multimodal merge-asymmetry tests (#4150)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentMultimodalMergeAsymmetry:
+    """Regression coverage for #4150 (sibling of #4142 and #4145).
+
+    Pre-fix, the ``_reparse_document_multimodal`` path at lines
+    ~1956-1994 of ``scripts/reingest_from_s3.py`` extracted
+    ``doc_judge_name`` / ``doc_department`` unconditionally from
+    ``parsed.X`` and defaulted both to ``None`` on every fall-through
+    path (top-of-function init, except-Exception branch, and the
+    no-scraper-cls case where the ``if scraper_cls:`` block is skipped
+    entirely).  These doc-level values then flowed into every
+    per-ruling extracted dict at lines ~2068 / 2071 — silently
+    clobbering the DB-seeded ``judge_name`` / ``department`` carried on
+    ``doc_meta`` whenever a Live-only no-op ``parse_document`` ran
+    through the multimodal path (today: Riverside dispatch, depending
+    on per-document multi-ruling status).
+
+    Post-fix, all three code paths default to ``doc_meta.get("X")``
+    rather than ``None``, mirroring the #4142 / #4145 fixes in the
+    sibling ``_reparse_document`` and ``_full_reparse_document``
+    functions.  The per-ruling layering at lines ~2068 / 2071 stays the
+    same — ``cr.X or doc_X`` — and now correctly preserves the DB seed
+    when both per-ruling and parsed doc-level values are falsy.
+
+    See ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+    for the per-scraper audit and #3986 for the bug-class root cause.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_enrich(self) -> Any:
+        """Patch enrich_ruling_with_retry to a no-op for these tests.
+
+        Mirrors ``TestReparseDocumentMultimodal._patch_enrich`` (line
+        ~7352).  Without this patch, the MagicMock extractor's
+        ``_client`` attribute is a truthy MagicMock that triggers real
+        ``enrich_ruling_with_retry`` calls which would fail in this
+        non-enrichment regression suite.
+        """
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=None):
+            yield
+
+    def _doc_meta(
+        self,
+        *,
+        judge_name: str | None = None,
+        department: str | None = None,
+    ) -> dict:
+        """Build a doc_meta dict mirroring the production shape (lines ~2408-2432).
+
+        ``judge_name`` and ``department`` ride along on every doc_meta
+        (the rulings row's canonical_name and department, see
+        FETCH_DOCUMENTS_QUERY).
+        """
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Riverside",
+            "court_name": "Riverside Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": "RIC-24-12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-riverside-tentatives",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+            "judge_name": judge_name,
+            "department": department,
+        }
+
+    def _live_only_no_op_parsed(self) -> MagicMock:
+        """Build a parsed mock that mirrors a Live-only no-op parse_document.
+
+        Live-only scrapers (e.g. ``ca/sf_civil_tentatives.py:1153``)
+        return ``doc`` unchanged from ``parse_document``.  The
+        ``cap_doc`` built inside ``_reparse_document_multimodal``
+        carries only ``raw_content`` and identifiers, so the parsed
+        object's structured fields are all falsy — exactly the input
+        shape that this regression test exercises.
+        """
+        parsed = MagicMock()
+        parsed.case_number = None
+        parsed.case_title = None
+        parsed.judge_name = None
+        parsed.outcome = None
+        parsed.motion_type = None
+        parsed.department = None
+        parsed.parties = []
+        parsed.hearing_date = None
+        return parsed
+
+    def _make_extracted_rulings(self, count: int = 2) -> list:
+        """Build a list of ExtractedRuling objects with no per-ruling judge/department.
+
+        Mirrors a multi-ruling PDF where multimodal extraction populates
+        case-level fields (case_number, case_title, ruling_text) but
+        leaves doc-level fields (judge_name, department) for
+        ``_reparse_document_multimodal`` to fill in from the parsed
+        doc-level metadata.  When per-ruling ``cr.judge_name`` /
+        ``cr.department`` is ``None``, the function falls back to
+        ``doc_judge_name`` / ``doc_department`` at lines ~2068 / 2071.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        return [
+            ExtractedRuling(
+                extracted_case_number=f"RIC-24-{1000 + i}",
+                extracted_case_title=f"Smith v. Jones {i + 1}",
+                ruling_text=f"Ruling text {i + 1}",
+            )
+            for i in range(count)
+        ]
+
+    def test_multimodal_merge_asymmetry_live_only_no_op_preserves_db_seed(
+        self,
+    ) -> None:
+        """A no-op parse_document MUST NOT clobber DB-seeded fields in multimodal path.
+
+        Pre-fix, ``doc_judge_name = parsed.judge_name`` and
+        ``doc_department = parsed.department`` set both to ``None``
+        when the parser returned a no-op cap_doc.  Each per-ruling
+        extracted dict then propagated those ``None`` values to the
+        DB write path, silently wiping the rulings row.  Post-fix,
+        the DB seed survives because ``parsed.X`` is falsy and the
+        ``or doc_meta.get("X")`` fallback returns the seed.
+        """
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = self._make_extracted_rulings(count=2)
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-multimodal-live-only"] = mock_scraper_cls
+
+        try:
+            with patch.object(reingest, "_apply_regex_fallbacks"):
+                results = reingest._reparse_document_multimodal(
+                    b"%PDF-1.4 fake pdf",
+                    "test-multimodal-live-only",
+                    self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+                    mock_extractor,
+                )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. Jane Smith"
+                assert ruling["department"] == "C-32"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-multimodal-live-only", None)
+
+    def test_multimodal_merge_asymmetry_reingest_aware_overrides_db_seed(
+        self,
+    ) -> None:
+        """A reingest-aware parse_document's value MUST win over the DB seed.
+
+        The fallback only fires when ``parsed.X`` is falsy.  When the
+        parser produces a real value (the reingest-aware happy path),
+        that value supersedes any DB seed.
+        """
+        parsed = self._live_only_no_op_parsed()
+        parsed.judge_name = "Hon. John Parsed"
+        parsed.department = "D-1"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = self._make_extracted_rulings(count=2)
+        reingest._SCRAPER_REGISTRY["test-multimodal-reingest-aware"] = mock_scraper_cls
+
+        try:
+            with patch.object(reingest, "_apply_regex_fallbacks"):
+                results = reingest._reparse_document_multimodal(
+                    b"%PDF-1.4 fake pdf",
+                    "test-multimodal-reingest-aware",
+                    self._doc_meta(judge_name="Hon. DB Seed", department="D-X"),
+                    mock_extractor,
+                )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. John Parsed"
+                assert ruling["department"] == "D-1"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-multimodal-reingest-aware", None)
+
+    def test_multimodal_merge_asymmetry_except_path_falls_back_to_db_seed(
+        self,
+    ) -> None:
+        """When parse_document raises, the DB seed MUST still flow through.
+
+        Pre-fix, the ``except Exception`` branch did not assign
+        ``doc_judge_name`` / ``doc_department`` at all, leaving both at
+        their top-of-function ``None``.  Post-fix, the except branch
+        explicitly resets both to ``doc_meta.get("X")`` so the DB seed
+        is preserved even when the scraper's ``parse_document`` blows
+        up mid-call.
+        """
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.side_effect = RuntimeError("scraper exploded")
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = self._make_extracted_rulings(count=2)
+        reingest._SCRAPER_REGISTRY["test-multimodal-except-path"] = mock_scraper_cls
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                # The except path's ``if not doc_judge_name`` regex fallback
+                # at line ~1998 calls _extract_text_from_content; patch it
+                # to a no-op so it doesn't try pdfplumber on the fake PDF.
+                patch.object(reingest, "_extract_text_from_content", return_value=""),
+            ):
+                results = reingest._reparse_document_multimodal(
+                    b"%PDF-1.4 fake pdf",
+                    "test-multimodal-except-path",
+                    self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+                    mock_extractor,
+                )
+            assert len(results) == 2
+            for ruling in results:
+                assert ruling["judge_name"] == "Hon. Jane Smith"
+                assert ruling["department"] == "C-32"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-multimodal-except-path", None)
+
+    def test_multimodal_merge_asymmetry_no_scraper_cls_falls_back_to_db_seed(
+        self,
+    ) -> None:
+        """When the scraper class is missing, the DB seed MUST still flow through.
+
+        Pre-fix, the ``if scraper_cls:`` block was skipped entirely
+        when the scraper class wasn't registered, leaving both
+        ``doc_judge_name`` and ``doc_department`` at their
+        top-of-function ``None``.  Post-fix, the top-of-function init
+        defaults both to ``doc_meta.get("X")``, so the DB seed is
+        preserved even when no scraper class is registered.
+        """
+        # Critical: no entry in _SCRAPER_REGISTRY.  This exercises the
+        # path where ``if scraper_cls:`` is falsy and the entire block
+        # is skipped — leaving the top-of-function init values intact.
+        reingest._SCRAPER_REGISTRY.pop("test-multimodal-no-scraper-cls", None)
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = self._make_extracted_rulings(count=2)
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            # The ``if not doc_judge_name`` fall-through at line ~1998
+            # calls _extract_text_from_content; patch it so the test is
+            # deterministic (the regex-fallback would otherwise probe
+            # the fake PDF bytes and yield unpredictable results).
+            patch.object(reingest, "_extract_text_from_content", return_value=""),
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "test-multimodal-no-scraper-cls",
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+                mock_extractor,
+            )
+        assert len(results) == 2
+        for ruling in results:
+            assert ruling["judge_name"] == "Hon. Jane Smith"
+            assert ruling["department"] == "C-32"
+
+    def test_multimodal_merge_asymmetry_doc_meta_missing_keys_does_not_crash(
+        self,
+    ) -> None:
+        """``doc_meta.get("X")`` returns ``None`` when the key is absent.
+
+        Older callers (or future call sites that build a minimal
+        doc_meta) might omit the ``judge_name`` / ``department`` keys
+        entirely.  ``.get()`` returns ``None`` in that case — same
+        behaviour as pre-fix without the KeyError risk that bare
+        ``doc_meta["judge_name"]`` would have introduced.
+        """
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-multimodal-missing-keys"] = mock_scraper_cls
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = self._make_extracted_rulings(count=2)
+
+        # Build a doc_meta WITHOUT judge_name / department keys.
+        meta = self._doc_meta()
+        meta.pop("judge_name", None)
+        meta.pop("department", None)
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                patch.object(reingest, "_extract_text_from_content", return_value=""),
+            ):
+                results = reingest._reparse_document_multimodal(
+                    b"%PDF-1.4 fake pdf",
+                    "test-multimodal-missing-keys",
+                    meta,
+                    mock_extractor,
+                )
+            assert len(results) == 2
+            for ruling in results:
+                # The regex fallback at line ~1998 may populate
+                # judge_name from the synthetic empty text — but on
+                # an empty string it will not match, so the field
+                # stays None.
+                assert ruling["judge_name"] is None
+                assert ruling["department"] is None
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-multimodal-missing-keys", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — DB format='txt' regression (#4122)
 # ---------------------------------------------------------------------------
 
