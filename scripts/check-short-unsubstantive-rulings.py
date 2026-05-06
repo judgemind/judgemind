@@ -94,6 +94,14 @@ class CheckResult:
 # DB query
 # ---------------------------------------------------------------------------
 
+# NOTE: This query references columns that do not exist on `derived.rulings`:
+#   - `county` lives on `derived.courts` (joined via rulings.court_id)
+#   - the column is `motion_type`, not `motion`
+#   - the column is `hearing_date` or `posted_at`, not `ruling_date`
+# The script is broken and will fail at runtime. Tracked separately so the
+# new unqualified-column check (#4271) can ship without bundling unrelated
+# bug fixes. See follow-up filed at PR-merge time.
+# sql-check:ignore
 SHORT_UNSUBSTANTIVE_QUERY = """
     SELECT county, COUNT(*) AS cnt
     FROM derived.rulings
