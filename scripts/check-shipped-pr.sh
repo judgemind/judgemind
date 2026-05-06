@@ -105,7 +105,11 @@ fi
 # ─── Find candidate PRs that touched any of those files ────────────────────
 
 # Collect (PR number, comma-separated unique). For each file path, list
-# recent commits on main; parse `(#N)` from the headline; accumulate.
+# recent commits on main; parse EVERY `(#N)` token from each headline
+# via the Python helper (bash regex match captures only the first
+# token, which silently drops the squash-merge PR when the conventional-
+# commits subject already references a closed-by issue, e.g.
+# `fix(ci): squash-merge fix (#2837) (#3170)` — see issue #4214).
 candidate_prs=""
 while IFS= read -r file_path; do
     [[ -z "$file_path" ]] && continue
@@ -117,24 +121,27 @@ while IFS= read -r file_path; do
         2>/dev/null); then
         continue
     fi
-    # Extract `(#N)` tokens from each headline.
-    while IFS= read -r commit_message; do
-        [[ -z "$commit_message" ]] && continue
-        # Get the first line only (headline)
-        headline="${commit_message%%$'\n'*}"
-        # Match `(#NNN)` at end-of-line or before whitespace
-        if [[ "$headline" =~ \(#([0-9]+)\) ]]; then
-            pr_num="${BASH_REMATCH[1]}"
-            # Append if not already present
-            if [[ ",${candidate_prs}," != *",${pr_num},"* ]]; then
-                if [[ -z "$candidate_prs" ]]; then
-                    candidate_prs="$pr_num"
-                else
-                    candidate_prs="${candidate_prs},${pr_num}"
-                fi
+    # Extract EVERY `(#N)` token across all headlines via the Python
+    # helper. The downstream vetting loop (lines below) filters out
+    # issue numbers and unknown PRs via `gh pr view --json mergedAt`
+    # (returns null for non-PR numbers).
+    pr_nums=""
+    if ! pr_nums=$(printf '%s\n' "$commits_json" | python3 \
+        "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_extract_pr_nums.py" \
+        2>/dev/null); then
+        continue
+    fi
+    while IFS= read -r pr_num; do
+        [[ -z "$pr_num" ]] && continue
+        # Append if not already present
+        if [[ ",${candidate_prs}," != *",${pr_num},"* ]]; then
+            if [[ -z "$candidate_prs" ]]; then
+                candidate_prs="$pr_num"
+            else
+                candidate_prs="${candidate_prs},${pr_num}"
             fi
         fi
-    done <<< "$commits_json"
+    done <<< "$pr_nums"
 done <<< "$candidate_files"
 
 if [[ -z "$candidate_prs" ]]; then

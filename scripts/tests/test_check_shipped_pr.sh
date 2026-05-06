@@ -455,6 +455,80 @@ else
     fail "strips leading '#' from issue argument" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 13: multi-`(#N)` headline picks up the squash-merge PR (#4214) ──
+
+# Regression for #4214. Commit headline contains TWO `(#N)` tokens — the
+# first is a closed-by issue reference baked into the conventional-
+# commits subject, the second is the auto-appended squash-merge PR.
+# Pre-fix, bash captured only the first token (`2837`) and the candidate
+# was silently skipped because `gh pr view 2837 --json files` errored
+# (2837 was an issue, not a PR). Post-fix, BOTH tokens are tried; the
+# downstream vetting loop drops the issue (`mergedAt: null`) and keeps
+# the PR (`mergedAt: <timestamp>`), so the script returns shipped.
+#
+# Mock behavior: `gh pr view 2837` returns `mergedAt: null` (simulating
+# the issue number being passed to `gh pr view` and returning a null
+# mergedAt — which is the same eligibility-fail path the overlap helper
+# already takes on closed-without-merge PRs). `gh pr view 3170` returns
+# the merged PR with the candidate file in its `files` list. The
+# downstream loop must reach 3170; pre-fix it could not.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Bug in .github/workflows/vercel-deploy-status.yml — squash-merge false-fails.", "title": "fix(ci): vercel-deploy-status false-fails on squash-merge"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        # Single commit headline carrying TWO `(#N)` tokens — the
+        # closed-by issue (#2837) and the squash-merge PR (#3170).
+        echo "fix(ci): vercel-deploy-status no longer false-fails on squash-merge (#2837) (#3170)"
+        exit 0
+        ;;
+    pr)
+        # gh pr view <N> --repo ... — vary the response by PR number.
+        if [[ "${2:-}" == "view" ]]; then
+            case "${3:-}" in
+                2837)
+                    # The closed-by ISSUE — `gh pr view <issue-num>`
+                    # returns a null mergedAt because issues are not
+                    # mergeable. The overlap helper drops it.
+                    cat << 'JSON'
+{"baseRefName": "main", "files": [], "mergedAt": null, "number": 2837, "title": "[issue not PR]"}
+JSON
+                    exit 0
+                    ;;
+                3170)
+                    # The actual squash-merge PR — eligible. Mocked
+                    # with deletions=0 so the candidate registers as an
+                    # `added` overlap and clears the high-confidence
+                    # threshold (≥1 added OR ≥2 total) on a single
+                    # candidate path.
+                    cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": ".github/workflows/vercel-deploy-status.yml", "additions": 50, "deletions": 0}], "mergedAt": "2026-04-15T00:00:00Z", "number": 3170, "title": "fix(ci): vercel-deploy-status no longer false-fails on squash-merge"}
+JSON
+                    exit 0
+                    ;;
+            esac
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2979 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3170"* ]]; then
+    pass "extracts EVERY (#N) token from multi-token headline (regression #4214)"
+else
+    fail "extracts EVERY (#N) token from multi-token headline (regression #4214)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
