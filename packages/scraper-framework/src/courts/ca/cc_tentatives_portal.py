@@ -547,11 +547,27 @@ class CCTentativesPortalScraper(BaseScraper):
         return doc
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """No-op — all fields are populated during fetch_documents.
+        """No-op on the live-capture path — all fields are populated during
+        ``fetch_documents`` via ``_fetch_single_ruling``.
 
         The portal detail page provides structured HTML ruling text directly,
-        so no PDF text extraction or LLM parsing is needed. This mirrors the
-        SF civil tentatives pattern where extraction happens during fetch.
+        so no PDF text extraction or LLM parsing is needed during live
+        capture. This mirrors the SF civil tentatives pattern where
+        extraction happens during fetch.
+
+        **Reingest hazard (audit #4046, follow-up #4133):** this method is
+        also called from ``scripts/reingest_from_s3.py::_reparse_document``
+        with a fresh ``CapturedDocument`` carrying only ``raw_content``
+        (PDF bytes). Returning the doc unchanged means ``judge_name``,
+        ``department``, ``parties``, ``outcome``, and ``motion_type`` get
+        cleared by the reingest merge logic, ``ruling_text_html`` is
+        permanently lost (it lives in ``extra["detail_html"]`` at capture
+        time, not in ``raw_content``), and only ``ruling_text`` is
+        recovered (via pdfplumber on the PDF bytes) plus the DB-seeded
+        ``case_number/case_title/hearing_date``. **Reingest of CC-portal
+        documents is NOT fully supported** — the surviving fields are a
+        subset of the original capture. #4133 tracks the refactor along
+        the #3986 ``_populate_from_envelope`` shape.
 
         Args:
             doc: The document to parse.

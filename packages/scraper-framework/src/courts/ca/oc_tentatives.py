@@ -167,6 +167,14 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
         and enrichment (case_number, hearing_date, case_title, etc.) are
         performed downstream by the ingestion pipeline using multimodal
         LLM page-image analysis. The scraper does not parse PDF content.
+
+        This is also a no-op on the reingest path
+        (``scripts/reingest_from_s3.py``). Reingest of OC civil documents
+        relies entirely on the downstream multimodal LLM extraction; with
+        ``ENABLE_*_LLM_EXTRACTION`` disabled, every structured field
+        except ``ruling_text`` (recovered via pdfplumber on the PDF
+        bytes) and the DB-seeded ``case_number/case_title/hearing_date``
+        will be empty. See audit #4046 / follow-up #4135.
         """
         return doc
 
