@@ -31,15 +31,37 @@ Fakes & fixtures
 ----------------
 ``_FakeCursor`` is the shared DB cursor stub used throughout this file.
 
-**Preferred pattern — dict-keyed responses (issue #2793):**
-Set ``cursor.fetch_responses`` to a ``dict[str, Any]`` that maps SQL
-fragment strings to the value ``fetchone()`` should return.  On each
-``fetchone()`` call the cursor inspects the last executed SQL
-(``self.executed[-1][0]``) and returns the value whose key is a
-substring of that SQL (insertion-order, first match wins).  This is
-robust against positional reordering of DB calls.
+**Preferred pattern — dict-keyed responses (issues #2793, #4213):**
+Set ``cursor.fetch_responses`` to a ``dict[str, Any]`` that maps a
+*fragment* (matched against the last executed SQL **or** its bound
+parameters) to the value ``fetchone()`` should return.  On each
+``fetchone()`` call the cursor inspects the last executed
+``(sql, params)`` pair and returns the value whose key is a substring
+of either the SQL string or ``repr(params)`` (insertion-order, first
+match wins).  This is robust against positional reordering of DB
+calls.
 
-Example::
+The param haystack matters for call sites where one generic SQL
+template is reused with different bound values — most notably
+``SELECT value FROM dispatcher.config WHERE key = %s`` which fires
+three times per ``scheduler_tick`` (``concurrency_cap``,
+``cap_flipped_by``, ``paused``).  Keying the dispatcher on the param
+value (``"concurrency_cap"``) disambiguates them; keying on the SQL
+fragment alone could not.  See #4213.
+
+Example — disambiguating the three ``dispatcher.config`` reads in one
+``scheduler_tick`` plus the ``COUNT(*)`` from
+``_active_agent_count``::
+
+    conn.cursor_instance.fetch_responses = {
+        "concurrency_cap": (1,),       # matches params=("concurrency_cap",)
+        "cap_flipped_by": None,        # matches params=("cap_flipped_by",)
+        "paused": None,                # matches params=("paused",)
+        "COUNT(*)": (0,),              # matches the SQL string
+    }
+
+Example — the original SQL-only matching still works (existing
+``test_claims_runs_phases_pushes_and_opens_pr`` integration test)::
 
     conn.cursor_instance.fetch_responses = {
         "status = 'retrying'": None,
@@ -103,9 +125,21 @@ class _FakeCursor:
 
     def fetchone(self) -> Any:
         if self.fetch_responses and self.executed:
-            last_sql = self.executed[-1][0]
+            last_sql, last_params = self.executed[-1]
+            # Build a haystack of "what the caller asked for" — both the
+            # raw SQL and a string rendering of the bound parameters.
+            # This lets test authors key the dispatcher on a *param value*
+            # (e.g. ``"concurrency_cap"``) when the SQL itself is generic
+            # and identical across multiple call sites — for example
+            # ``SELECT value FROM dispatcher.config WHERE key = %s`` is
+            # used three times in a single ``scheduler_tick`` (once each
+            # for ``concurrency_cap``, ``cap_flipped_by``, ``paused``)
+            # and a SQL-only fragment cannot disambiguate them. The
+            # SQL-substring match still works exactly as before — the
+            # param haystack is additive, not a replacement. See #4213.
+            params_repr = "" if last_params is None else repr(last_params)
             for fragment, value in self.fetch_responses.items():
-                if fragment in last_sql:
+                if fragment in last_sql or fragment in params_repr:
                     return value
         if not self.fetch_queue:
             return None
@@ -351,6 +385,106 @@ class TestFakeCursorDispatcher:
         cur.execute("SELECT 4")
         assert cur.fetchone() is None
 
+    # --- Param-matching extension (#4213) ---------------------------------
+    # The next four tests cover the param-haystack lookup added in #4213.
+    # They are explicit unit-level coverage for ``_FakeCursor.fetchone``;
+    # the integrated coverage lives in ``TestSchedulerGate`` /
+    # ``TestSchedulerGateCapGreaterThanOne`` after the migration.
+
+    def test_fetch_responses_param_match_returns_mapped_value(self) -> None:
+        """A key that appears in the bound params returns its mapped value.
+
+        Models the canonical #4213 case: a generic ``WHERE key = %s``
+        SELECT with the param differentiating the call site.
+        """
+        cur = _FakeCursor()
+        cur.fetch_responses = {"concurrency_cap": (1,)}
+        cur.execute(
+            "SELECT value FROM dispatcher.config WHERE key = %s",
+            ("concurrency_cap",),
+        )
+        assert cur.fetchone() == (1,)
+
+    def test_fetch_responses_param_match_disambiguates_identical_sql(
+        self,
+    ) -> None:
+        """Three SELECTs with identical SQL but different params resolve correctly.
+
+        This is the AC3-style end-to-end mini-scenario for the param
+        match: the same generic ``dispatcher.config`` read fires three
+        times with three different keys, and each call returns its
+        own mapped value (not the first one in insertion order — that
+        would be a SQL-only-matcher bug).
+        """
+        cur = _FakeCursor()
+        cur.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": (False,),
+        }
+        sql = "SELECT value FROM dispatcher.config WHERE key = %s"
+
+        cur.execute(sql, ("concurrency_cap",))
+        assert cur.fetchone() == (1,)
+        cur.execute(sql, ("cap_flipped_by",))
+        assert cur.fetchone() is None
+        cur.execute(sql, ("paused",))
+        assert cur.fetchone() == (False,)
+
+    def test_fetch_responses_sql_fragment_still_wins_when_first(self) -> None:
+        """SQL-fragment match wins when it appears earlier in insertion order.
+
+        Locks in that the param-haystack extension is *additive* — it
+        does not subtly change the existing SQL-substring contract.
+        """
+        cur = _FakeCursor()
+        cur.fetch_responses = {
+            "FROM dispatcher.config": "sql-match",
+            "concurrency_cap": "param-match",
+        }
+        cur.execute(
+            "SELECT value FROM dispatcher.config WHERE key = %s",
+            ("concurrency_cap",),
+        )
+        # First insertion wins per existing contract.
+        assert cur.fetchone() == "sql-match"
+
+    def test_fetch_responses_no_param_match_falls_back_to_fetch_queue(
+        self,
+    ) -> None:
+        """If neither SQL nor params contain any key, fall through to fetch_queue.
+
+        Verification for AC4: removing a key from a migrated test's
+        ``fetch_responses`` dict makes ``fetchone`` return ``None`` (the
+        empty-fetch_queue fallback) — which the daemon treats as a
+        missing config row and the relevant gate test fails with a
+        clear assertion mismatch rather than silently passing.
+        """
+        cur = _FakeCursor()
+        cur.fetch_responses = {"some_other_key": "should_not_return"}
+        cur.fetch_queue = ["from_queue"]
+        cur.execute(
+            "SELECT value FROM dispatcher.config WHERE key = %s",
+            ("concurrency_cap",),
+        )
+        # Neither the SQL nor the params contain "some_other_key" — fall
+        # through to the positional queue.
+        assert cur.fetchone() == "from_queue"
+
+    def test_fetch_responses_none_params_does_not_crash_param_match(
+        self,
+    ) -> None:
+        """``execute(sql)`` with no params (params=None) must not crash the matcher.
+
+        Defensive: the dispatcher renders ``None`` as the empty string
+        for the haystack, so a missing-params call falls through to
+        SQL-only matching exactly as before #4213.
+        """
+        cur = _FakeCursor()
+        cur.fetch_responses = {"FROM dispatcher.queue_snapshots": "matched"}
+        cur.execute("SELECT snapshot FROM dispatcher.queue_snapshots ORDER BY id DESC")
+        assert cur.fetchone() == "matched"
+
 
 # --------------------------------------------------------------------------
 # _priority_rank (issue #2835)
@@ -499,37 +633,58 @@ class TestSchedulerGate:
     mocking the spawn helper directly. The thread-side behavior is
     covered by :class:`TestOrchestrationWorkerThread` in this file.
 
-    Fake ``fetch_queue`` consumption order for a default cap=1 tick
-    -----------------------------------------------------------------
-    ``scheduler_tick`` makes exactly four ``fetchone()`` calls (via the
-    positional ``fetch_queue``) when ``concurrency_cap >= 1``:
+    Fake fetch consumption per ``scheduler_tick`` (``concurrency_cap >= 1``)
+    ----------------------------------------------------------------------
+    ``scheduler_tick`` makes exactly four ``fetchone()`` calls in this
+    order:
 
     1. ``(cap,)`` — ``dispatcher.config`` SELECT for ``concurrency_cap``
-       (``daemon.py`` line ~2459).
+       (``daemon.py`` line ~3197).
     2. ``cap_flipped_by`` row or ``None`` — ``_read_cap_flipped_by``
        inside ``_check_circuit_breaker_auto_close``; fires only when
-       ``cap >= 1`` (``daemon.py`` line ~16677).
+       ``cap >= 1`` (``daemon.py`` line ~20127).
     3. ``paused`` row or ``None`` — ``_is_paused`` check
-       (``daemon.py`` line ~3279).
+       (``daemon.py`` line ~4162).
     4. ``(count,)`` or ``None`` — ``_active_agent_count``'s
-       ``SELECT COUNT(*)`` (``daemon.py`` line ~3951).
+       ``SELECT COUNT(*)`` (``daemon.py`` line ~4865).
 
     Entries 2–4 are **skipped** when ``cap == 0`` or the cap row is
     missing (``None``) — those ticks consume only entry 1 and return
-    early.  Any test exercising the spawn path needs all four entries.
+    early.  Any test exercising the spawn path needs all four reads.
 
-    **Preferred call site (issue #3188):** rather than re-discovering
-    the 4-entry invariant by hand, fresh tests should use
-    :func:`_scheduler_tick_fetch_queue` to describe the semantic state
-    they need (``cap=1, active_count=0`` etc.) and let the helper build
-    the queue. The helper also raises ``ValueError`` if ``cap=0`` is
-    combined with downstream kwargs — a class of mistake that motivated
-    this fixture (see :class:`TestSchedulerGateOrphanDetectionExample`).
+    **Preferred pattern for fresh tests (issue #4213) — dict-keyed
+    ``fetch_responses``:** because the three ``dispatcher.config`` reads
+    use the *same* SQL and differ only in their bound param, key the
+    dispatcher dict on the param value instead of the SQL fragment::
+
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),       # matches params=("concurrency_cap",)
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (0,),              # matches the SQL string
+        }
+
+    This expresses the test's *semantic state* (cap=1, no breaker
+    flip, not paused, zero agents running) and is robust against the
+    daemon reordering its fetch sequence — a future swap of, say,
+    ``_is_paused`` and ``_check_circuit_breaker_auto_close`` would not
+    require touching any of these tests.
+
+    **Fallback for tests that intentionally lock in ordering:** the
+    positional :func:`_scheduler_tick_fetch_queue` helper (issue #3188)
+    is still the right tool when a test exists *specifically* to assert
+    the documented call order — for example
+    :meth:`test_fetch_queue_order_matches_documented_invariant` below.
+    The helper raises ``ValueError`` if ``cap=0`` is combined with
+    downstream kwargs — a class of mistake that motivated the fixture
+    (see :class:`TestSchedulerGateOrphanDetectionExample`).
     """
 
     def test_does_not_claim_when_concurrency_cap_zero(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(0,)]
+        # cap=0 short-circuits before reading cap_flipped_by / paused /
+        # COUNT(*). Only the concurrency_cap read fires.
+        conn.cursor_instance.fetch_responses = {"concurrency_cap": (0,)}
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not be called with cap=0")
@@ -540,7 +695,9 @@ class TestSchedulerGate:
 
     def test_does_not_claim_when_concurrency_cap_missing(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [None]
+        # Missing concurrency_cap row → cap is None → short-circuit
+        # identical to cap=0.
+        conn.cursor_instance.fetch_responses = {"concurrency_cap": None}
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock()  # type: ignore[method-assign]
         d.scheduler_tick()
@@ -548,9 +705,14 @@ class TestSchedulerGate:
 
     def test_claims_when_cap_nonzero_and_no_active_agent(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
-        # 3) paused=None (not paused); 4) active_agent_count=None (zero agents).
-        conn.cursor_instance.fetch_queue = [(1,), None, None, None]
+        # cap=1, no breaker flip, not paused, COUNT(*)=None (treated as
+        # zero agents) → gate open, spawn fires.
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": None,
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -561,9 +723,13 @@ class TestSchedulerGate:
 
     def test_does_not_claim_when_active_agent_exists(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
-        # 3) paused=None (not paused); 4) active_agent_count=(1,) — gate closes.
-        conn.cursor_instance.fetch_queue = [(1,), None, None, (1,)]
+        # cap=1, COUNT(*)=1 → gate closes (1 < 1 is False).
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (1,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock()  # type: ignore[method-assign]
         summary = d.scheduler_tick()
@@ -582,10 +748,14 @@ class TestSchedulerGate:
         :class:`TestOrchestrationWorkerThread`.
         """
         d, conn, handler = _make_daemon(tmp_path)
-        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
-        # 3) paused=None (not paused); 4) active_agent_count=None (zero agents)
-        # — spawn path fires but the spawn helper itself throws.
-        conn.cursor_instance.fetch_queue = [(1,), None, None, None]
+        # cap=1, no breaker flip, not paused, COUNT(*)=None (zero
+        # agents) → spawn path fires but the spawn helper itself throws.
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": None,
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         # Make the spawn path itself raise — covers the
         # ``orchestration_spawn_failed`` branch in the tick.
@@ -611,6 +781,11 @@ class TestSchedulerGate:
         cursor executed at least four SQL statements — so this test
         will fail loudly if the fetch-queue order ever changes without
         updating the docstring.
+
+        **Intentionally positional (#4213).** This test exists
+        specifically to lock in the documented call order. Migrating
+        it to ``fetch_responses`` would defeat its purpose — the
+        positional ``fetch_queue`` is the entire point.
         """
         d, conn, _handler = _make_daemon(tmp_path)
         # Documented 4-entry shape: cap=1, no circuit-breaker flip,
@@ -937,20 +1112,25 @@ class TestSchedulerGateCapGreaterThanOne:
     its ``status='running'`` row is still alive (ECS mode, see #3199).
     """
 
-    # Cursor fetch sequence per scheduler_tick (all via fetchone; the
-    # fetchall-based SELECTs for commands / retry markers / reap pass
-    # do NOT consume positional slots here):
-    #   0: config SELECT ``concurrency_cap`` → wants ``(cap,)``
-    #   1: config SELECT ``cap_flipped_by``  → wants ``None``
-    #      (via ``_check_circuit_breaker_auto_close`` — cap≥1 only)
-    #   2: config SELECT ``paused``          → wants ``None``
-    #      (via ``_is_paused`` before the gate proper)
-    #   3: COUNT(*) ``dispatcher.agents``    → wants ``(count,)``
-    #      (via ``_active_agent_count`` — the #3199 gate denominator)
+    # Migrated to ``fetch_responses`` per #4213 — keys match either the
+    # SQL string or the bound params, so reordering the daemon's
+    # ``concurrency_cap`` / ``cap_flipped_by`` / ``paused`` reads does
+    # not break these tests.
+    #   "concurrency_cap": (cap,)        ← params=("concurrency_cap",)
+    #   "cap_flipped_by":  None          ← params=("cap_flipped_by",)
+    #   "paused":          None          ← params=("paused",)
+    #   "COUNT(*)":        (count,)      ← SQL contains "COUNT(*)"
+    # The semantic mapping is the same as the docstring of
+    # :class:`TestSchedulerGate` above.
     def test_cap_two_with_zero_running_attempts_spawn(self, tmp_path: Path) -> None:
         """cap=2, count=0 → gate open, spawn attempted."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(2,), None, None, (0,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (0,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -969,7 +1149,12 @@ class TestSchedulerGateCapGreaterThanOne:
         opens because ``1 < 2`` is True.
         """
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(2,), None, None, (1,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (1,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -982,7 +1167,12 @@ class TestSchedulerGateCapGreaterThanOne:
     def test_cap_two_with_two_running_closes_gate(self, tmp_path: Path) -> None:
         """cap=2, count=2 → 2 < 2 is False, gate closed, no spawn."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(2,), None, None, (2,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (2,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not spawn when count == cap")
@@ -1012,10 +1202,17 @@ class TestSchedulerGateCapGreaterThanOne:
 
         results: list[dict[str, Any]] = []
         for _ in range(3):
-            # Per-tick fetch_queue: config cap=2, cap_flipped_by None,
+            # Per-tick fetch_responses: config cap=2, cap_flipped_by None,
             # _is_paused None. ``_active_agent_count`` is stubbed above
-            # so we don't feed a COUNT(*) response through fetch_queue.
-            conn.cursor_instance.fetch_queue = [(2,), None, None]
+            # so we don't feed a COUNT(*) response — leaving the
+            # ``COUNT(*)`` key out of the dict means the dispatcher
+            # never returns anything for that read (which it never
+            # makes, since the stub short-circuits the call).
+            conn.cursor_instance.fetch_responses = {
+                "concurrency_cap": (2,),
+                "cap_flipped_by": None,
+                "paused": None,
+            }
             results.append(d.scheduler_tick())
 
         assert results[0]["orchestration_attempted"] == 1
@@ -1036,7 +1233,12 @@ class TestSchedulerGateCapGreaterThanOne:
         ``not _has_active_agent()`` check when no agents are running.
         """
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,), None, None, (0,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (0,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -1052,7 +1254,12 @@ class TestSchedulerGateCapGreaterThanOne:
         ``_has_active_agent()`` check.
         """
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,), None, None, (1,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (1,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (1,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not spawn when count == cap=1")
@@ -1069,7 +1276,12 @@ class TestSchedulerGateCapGreaterThanOne:
         without inspecting the DB.
         """
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(2,), None, None, (1,)]
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (1,),
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -1091,8 +1303,14 @@ class TestSchedulerGateCapGreaterThanOne:
         # short-circuits before reading the agent count.
         d._gh_rate_skip_active = lambda: True  # type: ignore[method-assign]
         # config cap=2 + cap_flipped_by None (circuit-breaker auto-close
-        # check still fires ahead of the rate-skip branch).
-        conn.cursor_instance.fetch_queue = [(2,), None]
+        # check still fires ahead of the rate-skip branch). The
+        # ``paused`` and ``COUNT(*)`` reads are skipped on the
+        # rate-skip path — leaving them out of fetch_responses is the
+        # signal that those reads must not fire.
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+        }
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not spawn when rate-skipped")
@@ -1104,6 +1322,57 @@ class TestSchedulerGateCapGreaterThanOne:
         record = events[-1]
         assert getattr(record, "active_agent_count", "MISSING") is None
         assert getattr(record, "gate_blocked_on_cap", "MISSING") is None
+
+    def test_dispatcher_is_actually_exercised_count_key_drives_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """AC4 (#4213): dropping the ``COUNT(*)`` key flips the gate decision.
+
+        This is the live proof that the dict-keyed dispatcher is being
+        exercised — not silently bypassed. Two ticks with identical
+        ``concurrency_cap``/``cap_flipped_by``/``paused`` keys differ
+        only in the presence of ``COUNT(*)``:
+
+        * **With** ``"COUNT(*)": (2,)`` — gate closes (count == cap=2).
+        * **Without** the key — the COUNT(*) read falls through to the
+          empty positional queue → returns ``None`` → daemon treats
+          missing-row as zero → gate opens.
+
+        The two ticks therefore reach different ``gate_blocked_on_cap``
+        outcomes, which is exactly the failure-mode-on-fragment-removal
+        AC4 calls out: a future daemon-side rename of ``COUNT(*)`` →
+        e.g. ``COUNT(1)`` would make the dispatcher key miss and the
+        relevant test would visibly flip its outcome.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        spawn = MagicMock(return_value=True)
+        d._maybe_spawn_orchestration_thread = spawn  # type: ignore[method-assign]
+
+        # Tick 1: COUNT(*) present, cap == count → gate closes.
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+            "COUNT(*)": (2,),
+        }
+        with_count = d.scheduler_tick()
+
+        # Tick 2: COUNT(*) absent. The cursor's fallback returns None,
+        # which the daemon coerces to zero → gate opens.
+        conn.cursor_instance.fetch_responses = {
+            "concurrency_cap": (2,),
+            "cap_flipped_by": None,
+            "paused": None,
+        }
+        without_count = d.scheduler_tick()
+
+        # The two ticks differ only in whether the COUNT(*) key is in
+        # the dispatch dict — and the outcomes flip accordingly.
+        assert with_count["gate_blocked_on_cap"] == 1
+        assert with_count["orchestration_attempted"] == 0
+        assert without_count["gate_blocked_on_cap"] == 0
+        assert without_count["orchestration_attempted"] == 1
 
 
 # --------------------------------------------------------------------------
