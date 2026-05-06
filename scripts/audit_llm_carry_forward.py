@@ -63,6 +63,7 @@ findings are reported via stdout / JSON / follow-up issues, not exit codes.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json as json_mod
 import logging
 import os
@@ -70,7 +71,22 @@ import re
 import sys
 from typing import Any
 
-import psycopg
+# psycopg is imported lazily inside ``run_audit`` so the module — and its
+# helper primitives — can be imported in a test environment that doesn't
+# have psycopg installed (e.g. CI's scripts-tests (python) job that runs
+# pure-Python script tests without the full scraper-framework venv).
+psycopg: Any = None  # populated by ``_load_psycopg``
+
+
+def _load_psycopg() -> Any:
+    """Lazy-load psycopg. Cached on the module to avoid repeated importlib
+    overhead and to give tests a single attribute to monkey-patch.
+    """
+    global psycopg
+    if psycopg is None:
+        psycopg = importlib.import_module("psycopg")
+    return psycopg
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -382,7 +398,8 @@ def run_audit(
             }
         return counties[county_name]
 
-    with psycopg.connect(dsn) as conn:
+    pg = _load_psycopg()
+    with pg.connect(dsn) as conn:
         with conn.cursor() as cur:
             # Per-row checks (1, 2, 3)
             cur.execute(ruling_sql, params)

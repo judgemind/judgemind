@@ -312,7 +312,12 @@ class TestRunAuditIntegration:
     """``run_audit`` wires the per-row checks plus the cluster check together."""
 
     def _patch_psycopg(self, conn):
-        return patch.object(_script.psycopg, "connect", return_value=conn)
+        # ``run_audit`` calls ``_load_psycopg()`` to lazy-import the module,
+        # then ``pg.connect(dsn)``. Replace the loader with a fake that
+        # returns a stub module exposing ``connect``.
+        fake_pg = MagicMock()
+        fake_pg.connect.return_value = conn
+        return patch.object(_script, "_load_psycopg", return_value=fake_pg)
 
     def test_all_clean(self) -> None:
         # One Riverside ruling, perfectly consistent — no signals.
