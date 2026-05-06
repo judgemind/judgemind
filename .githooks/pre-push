@@ -469,6 +469,29 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done
 
 # -------------------------------------------------------------------
+# ci-passed coverage check — run whenever .github/workflows/ci.yml changes
+# -------------------------------------------------------------------
+# Mirrors the CI `ci-passed-coverage-check` job (#3919) so a missing or
+# stale entry in `ci-passed.needs:` is caught locally before the push
+# reaches CI. Runs BEFORE actionlint so the targeted message fires first:
+# actionlint's `[job-needs]` lint also catches stale entries, but with a
+# generic message that doesn't point at the array — see #2832 / #4207.
+changed_ci_yml_for_coverage=$(echo "$changed_files" | grep -E '^\.github/workflows/ci\.yml$' || true)
+if [ -n "$changed_ci_yml_for_coverage" ]; then
+    echo "pre-push: checking ci-passed.needs: coverage (#3919, #4207)..." >&2
+    if [ -x scripts/check-ci-passed-coverage.py ]; then
+        if ! run_check "_" "scripts/check-ci-passed-coverage.py" \
+            python3 scripts/check-ci-passed-coverage.py; then
+            echo "  Fix the ci-passed.needs: array in .github/workflows/ci.yml" >&2
+            echo "  before pushing. See #3919 (missing) and #2832 (stale)." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-ci-passed-coverage.py not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # GitHub Actions workflow lint (actionlint)
 # -------------------------------------------------------------------
 changed_workflows=$(echo "$changed_files" | grep '^\.github/workflows/' || true)
