@@ -1109,6 +1109,22 @@ jobs:
         run: scripts/check-no-redos-pattern.sh
 
   # ---------------------------------------------------------------
+  # SplitRuling field-propagation guard: every per-county
+  # *SplitRuling dataclass field must be propagated through the
+  # ingestion worker's _try_<county>_split dispatcher AND the
+  # reingest path's _full_reparse_document.  See #4298 for the
+  # check, #4282 for the latent bug class it prevents (LASplitRuling
+  # had no judge_name field for years; the worker carried a stale
+  # comment about its absence and nobody noticed).
+  # ---------------------------------------------------------------
+  split-ruling-propagation-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify SplitRuling fields propagate through worker and reingest paths
+        run: scripts/check-split-ruling-fields-propagated.sh
+
+  # ---------------------------------------------------------------
   # Cleanup-step continue-on-error guard: every workflow step on a
   # primary-success path that calls into the GitHub API for best-effort
   # housekeeping (auto-closing resolved alert issues) must carry
