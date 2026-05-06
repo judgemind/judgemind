@@ -419,19 +419,36 @@ run_ac_infeasible_synthesis_test() {
     pass "AC_INFEASIBLE synthesis: verdict passes through"
 }
 
-# ── Test 5: entrypoint sources the synthesis helper ───────────────────────
+# ── Test 5: entrypoint wires the synthesis helper ─────────────────────────
 #
 # The agent-runner-entrypoint.sh script must source
 # `agent_runner_synthesize_ralph_output.sh` near the top (alongside the
-# fargate-hook helper) AND must call
-# `synthesize_ralph_output_from_done_marker` inside the
-# `_output == "{}"` && `_current == "ralph"` block of the phase loop,
-# BEFORE the `ralph_done_marker_missing` log fires. Without this wiring,
-# the synthesis function exists but is dead code.
+# fargate-hook helper) AND the silent-exit ralph branch must call
+# `synthesize_ralph_output_from_done_marker` BEFORE
+# `log "ralph_done_marker_missing"` so a successful synthesis short-
+# circuits the missing-marker path.
+#
+# #4138: the silent-exit ralph branch was extracted from
+# ``phase_loop()``'s inline ``planning|ralph|summary|verify)`` arm into
+# ``handle_ralph`` in ``scripts/dispatcher/agent_runner_handlers.sh``,
+# mirroring the precedent set by #3775. The synthesis-call/missing-
+# marker-log landmarks now live in the handlers file. The ``source``
+# of the synthesis helper still lives in the entrypoint (handlers file
+# inherits ``synthesize_ralph_output_from_done_marker`` from the same
+# scope when the entrypoint sources both files).
 
 run_entrypoint_wires_helper_test() {
     if [[ ! -f "$ENTRYPOINT" ]]; then
         fail "agent-runner-entrypoint.sh exists" "expected at $ENTRYPOINT"
+        return
+    fi
+
+    # The handlers-file path is the sibling of $ENTRYPOINT and contains
+    # ``handle_ralph`` (#4138). Some landmarks moved there.
+    local HANDLERS
+    HANDLERS="$(dirname "$ENTRYPOINT")/agent_runner_handlers.sh"
+    if [[ ! -f "$HANDLERS" ]]; then
+        fail "agent_runner_handlers.sh exists" "expected at $HANDLERS"
         return
     fi
 
@@ -442,26 +459,27 @@ run_entrypoint_wires_helper_test() {
     fi
     pass "entrypoint sources agent_runner_synthesize_ralph_output.sh"
 
-    if ! grep -q "synthesize_ralph_output_from_done_marker" "$ENTRYPOINT"; then
-        fail "entrypoint calls synthesize_ralph_output_from_done_marker" \
-            "the entrypoint must invoke the synthesis function in the silent-exit branch"
+    # The call to ``synthesize_ralph_output_from_done_marker`` lives in
+    # ``handle_ralph`` post-#4138.
+    if ! grep -q "synthesize_ralph_output_from_done_marker" "$HANDLERS"; then
+        fail "handle_ralph calls synthesize_ralph_output_from_done_marker" \
+            "handle_ralph in agent_runner_handlers.sh must invoke the synthesis function in the silent-exit branch"
         return
     fi
     pass "entrypoint calls synthesize_ralph_output_from_done_marker"
 
     # The synthesis call must come BEFORE the
-    # `ralph_done_marker_missing` log line so a successful synthesis
-    # short-circuits the missing-marker path. We pin the comparison to
-    # the actual `log "ralph_done_marker_missing"` invocation rather
-    # than any string mention of the event name (the file has comments
-    # referencing the event name elsewhere, including inside
-    # `run_claude_phase` ~2119 and the synthesis comment block above the
-    # call).
+    # `ralph_done_marker_missing` log line in the same handler body so
+    # a successful synthesis short-circuits the missing-marker path. We
+    # pin the comparison to the actual `log "ralph_done_marker_missing"`
+    # invocation rather than any string mention of the event name (the
+    # handlers file has comments referencing the event name elsewhere,
+    # including inside the inner-fallback comment block).
     local synth_line
     local missing_line
-    synth_line=$(grep -n 'synthesize_ralph_output_from_done_marker "\$REPO_ROOT"' "$ENTRYPOINT" \
+    synth_line=$(grep -n 'synthesize_ralph_output_from_done_marker "\$REPO_ROOT"' "$HANDLERS" \
         | head -1 | cut -d: -f1 || true)
-    missing_line=$(grep -n '^[[:space:]]*log "ralph_done_marker_missing"' "$ENTRYPOINT" \
+    missing_line=$(grep -n '^[[:space:]]*log "ralph_done_marker_missing"' "$HANDLERS" \
         | head -1 | cut -d: -f1 || true)
 
     if [[ -z "$synth_line" || -z "$missing_line" ]]; then
