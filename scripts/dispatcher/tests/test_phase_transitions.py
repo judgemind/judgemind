@@ -1404,7 +1404,52 @@ class TestTransitionFromOperational:
         assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
         assert result.next_phase == pt.PHASE_OPERATIONAL_DONE
 
-    def test_blocked_advances_to_operational_failed_with_needs_review(self) -> None:
+    def test_blocked_routes_to_diagnoser(self) -> None:
+        """#4272 — ``verdict=blocked`` now routes to the diagnoser
+        (regardless of cause) so the diagnoser can pick between filing
+        an autonomous code-fix tracker and marking ``needs_review``.
+        Pre-#4272 every blocked verdict short-circuited to
+        ``operational_failed / needs_review``, which parked
+        fixable-code-bug blocks indefinitely (source incident #3954).
+        """
+        result = pt.transition_from_operational(
+            {
+                "verdict": "blocked",
+                "block_reason": (
+                    "rebuild_db.py crashes on county=Riverside because the "
+                    "DocumentRow type is missing the new ruling_text_html "
+                    "column added in #4123 — the script needs a code patch"
+                ),
+                "evidence_md": "## Evidence\n\nLast log: AttributeError on .ruling_text_html",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+        assert result.next_phase is None
+        assert result.terminal_status is None
+        # Block context is forwarded so the diagnoser SKILL can read
+        # block_reason from the failure-row details payload.
+        assert result.context.get("verdict") == "BLOCKED"
+        assert "ruling_text_html" in result.context.get("block_reason", "")
+        assert "AttributeError" in result.context.get("evidence_md", "")
+
+    def test_blocked_uppercase_routes_to_diagnoser(self) -> None:
+        """Verdict matching is case-insensitive (#4272)."""
+        result = pt.transition_from_operational({"verdict": "BLOCKED"})
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+        assert result.context.get("verdict") == "BLOCKED"
+
+    def test_blocked_with_operator_only_reason_also_routes_to_diagnoser(
+        self,
+    ) -> None:
+        """#4272 — even operator-only blocks (missing secret, external
+        account state) route through the diagnoser. The diagnoser SKILL
+        applies Action 4 (``mark needs_review``) for those cases, so the
+        prior end-state is preserved for that subset; what changes is
+        that fixable-code-bug blocks are no longer trapped on the
+        old short-circuit path.
+        """
         result = pt.transition_from_operational(
             {
                 "verdict": "blocked",
@@ -1412,20 +1457,12 @@ class TestTransitionFromOperational:
                 "evidence_md": None,
             }
         )
-        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
-        assert result.next_phase == pt.PHASE_OPERATIONAL_FAILED
-        assert result.terminal_status == pt.AgentStatus.NEEDS_REVIEW.value
-        assert result.failure_hint is None
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
         assert (
             result.context.get("block_reason")
             == "JUDGEMIND_DB_URL secret not set in dev"
         )
-
-    def test_blocked_uppercase_still_matches(self) -> None:
-        result = pt.transition_from_operational({"verdict": "BLOCKED"})
-        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
-        assert result.next_phase == pt.PHASE_OPERATIONAL_FAILED
-        assert result.terminal_status == pt.AgentStatus.NEEDS_REVIEW.value
 
     def test_failed_routes_to_diagnoser(self) -> None:
         result = pt.transition_from_operational(
@@ -1534,7 +1571,8 @@ class TestModuleContractInvariants:
         advance_cases = [
             pt.transition_from_plan({}),
             pt.transition_from_operational({"verdict": "succeeded"}),
-            pt.transition_from_operational({"verdict": "blocked"}),
+            # #4272 — operational ``blocked`` now routes to the diagnoser
+            # (moved to ``diagnoser_cases`` below).
             pt.transition_from_ralph({"verdict": "SHIP"}),
             pt.transition_from_summary({}),
             pt.transition_from_push_and_pr({}),
@@ -1571,6 +1609,8 @@ class TestModuleContractInvariants:
             pt.transition_from_awaiting_deploy(deploy_succeeded=False),
             pt.transition_from_operational({"verdict": "failed"}),
             pt.transition_from_operational({}),
+            # #4272 — operational ``blocked`` joins the diagnoser cases.
+            pt.transition_from_operational({"verdict": "blocked"}),
         ]
         for t in diagnoser_cases:
             assert t.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER, (

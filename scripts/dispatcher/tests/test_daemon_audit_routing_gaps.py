@@ -1151,3 +1151,162 @@ class TestFixCiRebaseOutcomeLogEvent:
         events = handler.events("fix_ci_rebase_outcome")
         assert len(events) == 1
         assert getattr(events[0], "rebase_outcome", "MISSING") is None
+
+
+# ==========================================================================
+# #4272 — operational verdict=blocked routes to the diagnoser
+# ==========================================================================
+
+
+class TestOperationalFailedTierRegistration:
+    """``operational_failed`` is the failure category written by
+    ``_run_operational_phase`` when ``transition_from_operational``
+    returns ``ROUTE_TO_DIAGNOSER`` (which #4272 now does for
+    ``verdict=blocked`` in addition to ``verdict=failed`` /
+    ``missing`` / ``unrecognized``).
+
+    Membership in :data:`TIER_2_FIRST_OCCURRENCE_CATEGORIES` is what
+    makes the supervisor's ``_find_diagnoser_candidates`` SQL filter
+    select these failure rows. Without this membership, the row is
+    written but never picked up — exactly the gap described in
+    #4248's investigation.
+    """
+
+    def test_operational_failed_is_tier_2_first_occurrence(self) -> None:
+        assert (
+            daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED
+            in daemon.TIER_2_FIRST_OCCURRENCE_CATEGORIES
+        )
+
+    def test_operational_failed_not_in_auto_retry(self) -> None:
+        """Operational failures are not mechanically retryable — the
+        diagnoser must triage them, not the auto-retry loop."""
+        assert (
+            daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED
+            not in daemon.AUTO_RETRY_CATEGORIES
+        )
+
+    def test_operational_failed_not_in_tier_3(self) -> None:
+        """Tier buckets must be disjoint — the candidate scanner's
+        tier assignment branches on exclusive membership."""
+        assert (
+            daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED not in daemon.TIER_3_CATEGORIES
+        )
+
+    def test_operational_failed_not_in_tier_2_recurrence(self) -> None:
+        """Operational failures diagnose on first occurrence (tier-2
+        first), not on recurrence (which would gate behind a prior
+        same-category row)."""
+        assert (
+            daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED
+            not in daemon.TIER_2_RECURRENCE_CATEGORIES
+        )
+
+
+class TestOperationalFailedCandidatePickup:
+    """End-to-end coverage of the routing chain (#4272 AC #3 + #4272 AC #5
+    structural-defense). A ``dispatcher.failures`` row with
+    ``category='operational_failed'`` must be selected by
+    ``_find_diagnoser_candidates`` and assigned tier 2.
+    """
+
+    def test_row_is_tier_2_candidate(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path, scope="operational_failed_scan")
+        row = _make_failure_row(
+            failure_id=9272,
+            agent_id="agent-op-blocked",
+            category=daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED,
+            details={
+                "issue_number": 4272,
+                "phase": "operational",
+                "verdict": "BLOCKED",
+                "block_reason": (
+                    "rebuild_db.py crashes on county=Riverside "
+                    "because DocumentRow is missing ruling_text_html"
+                ),
+                "evidence_md": "## Evidence\n\nAttributeError on .ruling_text_html",
+                "exit_code": 0,
+                "stderr_tail": "",
+            },
+        )
+        conn.cursor_instance.fetchall_queue = [[row]]
+
+        candidates = d._find_diagnoser_candidates()
+
+        assert len(candidates) == 1
+        cand = candidates[0]
+        assert cand["failure_id"] == 9272
+        assert cand["category"] == daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED
+        assert cand["tier"] == 2
+        assert cand["issue_number"] == 4272
+        # block_reason must be carried through so the diagnoser SKILL
+        # has the signal it needs to pick file_prerequisite_task vs
+        # mark needs_review.
+        assert "ruling_text_html" in cand["details"]["block_reason"]
+
+
+class TestOperationalBlockedEndToEndRouting:
+    """End-to-end coverage of the routing chain (#4272 AC #3 — the
+    investigation's structural defense). Asserts that the chain
+    ``transition_from_operational(verdict=blocked)`` →
+    ``_handle_agent_failure`` → ``dispatcher.failures`` row →
+    ``_find_diagnoser_candidates`` produces exactly one tier-2
+    candidate with the operational block context preserved.
+
+    Pre-#4272 this chain was severed at step 1 (the transition
+    advanced to ``operational_failed / needs_review`` without ever
+    routing to the diagnoser), so this test would have caught the
+    regression at the unit-test layer.
+    """
+
+    def test_full_routing_chain_produces_tier_2_candidate(self, tmp_path: Path) -> None:
+        from dispatcher.phase_transitions import (
+            FAILURE_HINT_OPERATIONAL_FAILED,
+            TransitionAction,
+            transition_from_operational,
+        )
+
+        # Step 1: phase_transitions returns ROUTE_TO_DIAGNOSER.
+        transition = transition_from_operational(
+            {
+                "verdict": "blocked",
+                "block_reason": (
+                    "rebuild_db.py needs --skip-cache flag the operator "
+                    "hasn't shipped yet"
+                ),
+                "evidence_md": "## Evidence\n\nargparse: unrecognized arg --skip-cache",
+            }
+        )
+        assert transition.action == TransitionAction.ROUTE_TO_DIAGNOSER
+        assert transition.failure_hint == FAILURE_HINT_OPERATIONAL_FAILED
+
+        # Step 2: simulate the daemon writing the dispatcher.failures
+        # row that ``_run_operational_phase`` would write via
+        # ``_handle_agent_failure``. We exercise the candidate scan
+        # against the row shape the daemon emits.
+        d, conn, _handler = _make_daemon(tmp_path, scope="operational_e2e")
+        row = _make_failure_row(
+            failure_id=9273,
+            agent_id="agent-e2e",
+            category=daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED,
+            details={
+                "issue_number": 4272,
+                "phase": "operational",
+                "verdict": transition.context.get("verdict"),
+                "block_reason": transition.context.get("block_reason"),
+                "evidence_md": transition.context.get("evidence_md"),
+                "exit_code": 0,
+                "stderr_tail": "",
+            },
+        )
+        conn.cursor_instance.fetchall_queue = [[row]]
+
+        # Step 3: candidate scan picks the row up at tier 2.
+        candidates = d._find_diagnoser_candidates()
+
+        assert len(candidates) == 1
+        cand = candidates[0]
+        assert cand["category"] == daemon.FAILURE_CATEGORY_OPERATIONAL_FAILED
+        assert cand["tier"] == 2
+        assert cand["issue_number"] == 4272
+        assert "--skip-cache" in cand["details"]["block_reason"]

@@ -84,8 +84,8 @@ Exit 0 regardless of verdict. The dispatcher reads the verdict from the JSON, no
 **Verdict rules:**
 
 - `succeeded` — task completed, evidence posted, issue closed (if the AC says to close it). The agent advances to `operational_done` with `status=succeeded`.
-- `blocked` — a bright line was hit, a required secret is missing, the environment is not ready, or any other condition that needs operator action before the task can proceed. Advances to `operational_failed` with `status=needs_review`.
-- `failed` — a genuine execution failure (script errored, DB unreachable, ECS task timed out, unexpected output). Routes to the diagnoser for retry/escalation.
+- `blocked` — a bright line was hit. Could be operator-only (a required secret is missing, the environment is not ready, an external account hit a hard limit) OR a fixable code bug (a script needs a flag the operator hasn't shipped yet, a script crashes on a code path you can identify). Either way the daemon routes this through the diagnoser (`/diagnose-failure`), which reads `block_reason` and either files an autonomous code-fix tracker (`Blocked by #N` + re-add `agent/ready`) when the block names a fixable bug, or marks `needs_review` for genuinely operator-only conditions. Set `block_reason` to a clear sentence that names the gap — the diagnoser uses it to pick the right branch (#4272).
+- `failed` — a genuine execution failure (script errored, DB unreachable, ECS task timed out, unexpected output). Same routing as `blocked` — through the diagnoser, which decides retry / escalation / tracker-filing.
 
 ---
 
@@ -169,8 +169,8 @@ condition and `evidence_md` containing the last validation output. Looping is
 the bug.
 
 **Why:** Repeating the same ECS run or DB query when the underlying data has
-not changed cannot produce a different result. A BLOCKED verdict routes to the
-operator / diagnoser so the root cause (data not populated, wrong script args,
+not changed cannot produce a different result. A BLOCKED verdict routes through
+the diagnoser so the root cause (data not populated, wrong script args,
 missing dependency) can be fixed — rather than burning the 60-min budget and
 having the supervisor catch the agent as stuck anyway.
 
@@ -204,7 +204,7 @@ Write `{worktree}/tmp/dispatcher-output/operational.json` with verdict + evidenc
 
 - **Does not write code.** No edits to source files, no commits, no PR.
 - **Does not deploy to production.** ECS writes are always against dev-tier clusters.
-- **Does not spawn recursive operational agents.** If the task requires a code change, emit `verdict=blocked` with `block_reason` explaining the gap so an operator can file a coding task.
+- **Does not spawn recursive operational agents.** If the task requires a code change, emit `verdict=blocked` with a `block_reason` that names the code-fix gap precisely. The daemon routes blocked verdicts through the diagnoser, which autonomously files a code-fix tracker (`Blocked by #N` + re-adds `agent/ready` on the operational issue) when `block_reason` describes a fixable bug — no operator hand-off needed (#4272).
 
 ## Worked example — Santa Clara county data restore
 

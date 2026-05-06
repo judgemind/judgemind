@@ -285,9 +285,14 @@ PHASE_OPERATIONAL = "operational"
 #: evidence, closed the issue, and completed without creating a PR.
 PHASE_OPERATIONAL_DONE = "operational_done"
 
-#: #3507 — Operational failed terminal. The operational skill returned
-#: ``verdict=blocked`` — the task needs operator review before it can
-#: proceed. Routed to ``needs_review`` status so the operator can see it.
+#: #3507 — Operational failed terminal. Reached when the diagnoser
+#: determines an operational ``verdict=blocked`` / ``verdict=failed`` is
+#: operator-only (missing secret, external account state) and applies
+#: Action 4 (``mark needs_review``). Pre-#4272 the daemon advanced here
+#: directly on every ``verdict=blocked`` regardless of cause, parking
+#: fixable-code-bug blocks indefinitely; that path now routes through
+#: the diagnoser, which only lands on this terminal when the block is
+#: genuinely operator-only.
 PHASE_OPERATIONAL_FAILED = "operational_failed"
 
 # ---------------------------------------------------------------------------
@@ -665,14 +670,18 @@ def transition_from_operational(output: Mapping[str, Any] | None) -> PhaseTransi
       ``operational_done`` with ``status='succeeded'``. No PR, no CI, no
       merge. The skill is expected to have already posted evidence and
       closed the issue before emitting this verdict.
-    * ``blocked`` — the task needs operator attention before it can
-      proceed (e.g. missing secret, environment not ready). Advance to
-      ``operational_failed`` with ``status='needs_review'`` so the
-      operator can see it in the cockpit.
-    * ``failed`` / missing / unrecognized — the skill encountered a
-      genuine failure (script errored, DB unreachable, etc.). Route to
-      the diagnoser with hint ``operational_failed`` so it can decide
-      whether to retry, escalate, or close the issue.
+    * ``blocked`` / ``failed`` / missing / unrecognized — the skill
+      determined it cannot complete the task on its own. Route to the
+      diagnoser with hint ``operational_failed`` so the empowered
+      diagnoser (``/diagnose-failure``) can decide what to do — file a
+      code-fix tracker (``Blocked by #N``) and re-add ``agent/ready``
+      when ``block_reason`` names a fixable code bug, mark
+      ``needs_review`` for operator-only escalations (missing secret,
+      external account state), or close the issue when the work is
+      already done. #4272 — pre-#4272 the ``blocked`` arm short-circuited
+      to ``operational_failed / needs_review`` here, parking issues
+      indefinitely instead of routing through the diagnoser; the source
+      incident #3954 → #4247 → #4248 motivated the unification.
     """
     verdict = _verdict(output)
     if verdict == "SUCCEEDED":
@@ -686,18 +695,11 @@ def transition_from_operational(output: Mapping[str, Any] | None) -> PhaseTransi
                 "action_taken": (output or {}).get("action_taken"),
             },
         )
-    if verdict == "BLOCKED":
-        return PhaseTransition(
-            action=TransitionAction.ADVANCE_WITH_STATUS,
-            next_phase=PHASE_OPERATIONAL_FAILED,
-            terminal_status=AgentStatus.NEEDS_REVIEW.value,
-            reason="operational blocked — needs operator review",
-            context={
-                "block_reason": (output or {}).get("block_reason"),
-                "evidence_md": (output or {}).get("evidence_md"),
-            },
-        )
-    # failed, missing, or unrecognized — route to diagnoser.
+    # blocked, failed, missing, or unrecognized — route to diagnoser
+    # (#4272). The diagnoser SKILL classifies operator-only blocks via
+    # Action 4 (mark needs_review), so the prior needs_review end-state
+    # is preserved for that subset; fixable-code-bug blocks now get an
+    # autonomously-filed tracker instead of parking indefinitely.
     return PhaseTransition(
         action=TransitionAction.ROUTE_TO_DIAGNOSER,
         failure_hint=FAILURE_HINT_OPERATIONAL_FAILED,
