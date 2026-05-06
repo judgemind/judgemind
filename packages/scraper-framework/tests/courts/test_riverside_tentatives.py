@@ -42,10 +42,12 @@ from courts.ca.riverside_tentatives import (
     _PLACEHOLDER_JUDGE_NAMES,
     INDEX_URL,
     RiversideTentativeRulingsScraper,
+    SplitRuling,
     _is_no_tentative_rulings,
     _is_placeholder_judge,
     _riv_courthouse,
     _riv_hearing_date_from_text,
+    _split_rulings,
 )
 from courts.ca.riverside_tentatives import default_config as riv_default_config
 from framework import CapturedDocument, ContentFormat
@@ -1252,3 +1254,287 @@ def test_extract_riverside_multi_entry_drops_no_tentative_row() -> None:
     assert "CVRI2600001" in case_numbers, "Substantive ruling should be kept"
     assert "CVRI2600003" in case_numbers, "Off-calendar entry should be kept"
     assert "CVRI2600002" not in case_numbers, "Stub should be dropped"
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — Riverside multi-case PDF deterministic splitter (#3649)
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the carry-forward bug documented in #3649.
+# The Fresno splitter (#3534) eliminated this same class of bug for Fresno
+# PDFs by splitting before LLM enrichment so each entry's enrichment runs
+# against only its own text.  These tests pin the Riverside splitter to
+# the same contract: each numbered entry is a separate SplitRuling, the
+# preamble is dropped, and "No Tentative Rulings" placeholders return
+# an empty list.
+
+
+class TestRiversidePdfSplit:
+    """Unit tests for _split_rulings against real Riverside fixture PDFs."""
+
+    def test_riverside_pdf_split_ps1_fixture_returns_four_rulings(self) -> None:
+        """riv_ps1.pdf has 4 numbered entries — splitter must return 4 rulings."""
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        assert len(rulings) == 4
+        # Indices match the PDF's printed numbering 1..4.
+        assert [r.ruling_index for r in rulings] == [1, 2, 3, 4]
+
+    def test_riverside_pdf_split_ps1_case_numbers_match_pdf(self) -> None:
+        """Each split must carry the case_number from its own entry header."""
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        case_numbers = [r.case_number for r in rulings]
+        # Ground truth from the fixture PDF.
+        assert case_numbers == [
+            "CVPS2306157",
+            "CVPS2306202",
+            "CVPS2403119",
+            "CVPS2404518",
+        ]
+
+    def test_riverside_pdf_split_ps1_entry_text_contains_only_own_body(self) -> None:
+        """Entry N's ruling_text must contain only its own header + body — no
+        cross-entry contamination from other entries' headers/bodies.
+
+        This is the core invariant the splitter must guarantee: the LLM that
+        runs against ``ruling_text`` should never see another entry's text,
+        which is what enables it to violate the anti-carry-forward rule.
+        """
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        # Entry 1 is YELDELL vs HENSS (CVPS2306157) — its ruling_text
+        # must contain "YELDELL" and "HENSS" but must NOT contain
+        # CRUMP/IRWIN (entry 2), GARCIA/FCA (entry 3), or NIETO (entry 4).
+        r1 = rulings[0]
+        assert "YELDELL" in r1.ruling_text
+        assert "HENSS" in r1.ruling_text
+        assert "CRUMP" not in r1.ruling_text
+        assert "GARCIA vs FCA" not in r1.ruling_text
+        assert "NIETO" not in r1.ruling_text
+        # Entry 2 (CRUMP vs IRWIN) must not contain entry 1's case number.
+        r2 = rulings[1]
+        assert "CRUMP" in r2.ruling_text
+        assert "IRWIN" in r2.ruling_text
+        assert "CVPS2306157" not in r2.ruling_text
+
+    def test_riverside_pdf_split_ps1_preamble_is_dropped(self) -> None:
+        """Page-1 boilerplate (Zoom call-in, court reporter notice) must NOT
+        appear in any per-entry ruling_text.  This guards against the
+        ghost-ruling bug documented in the 2026-05-02 spotcheck comment
+        on #3649 — the LLM was wrapping the procedural footer into a
+        fake UNKNOWN-* ruling.
+        """
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        for r in rulings:
+            # The Zoom/oral-argument boilerplate from the page-1 preamble
+            # should never appear inside a per-entry ruling_text.
+            assert "Call-in Numbers" not in r.ruling_text, (
+                f"Entry {r.ruling_index} contains preamble call-in text"
+            )
+            assert "Meeting Number:" not in r.ruling_text, (
+                f"Entry {r.ruling_index} contains preamble meeting text"
+            )
+
+    def test_riverside_pdf_split_moreno_valley_fixture(self) -> None:
+        """riv_moreno_valley.pdf has 3 numbered entries (CVMV2507098, CVMV2510261, CVMV2510403)."""
+        text = _extract_pdf_text(_load_bytes("riv_moreno_valley.pdf"))
+        rulings = _split_rulings(text)
+        assert len(rulings) == 3
+        case_numbers = [r.case_number for r in rulings]
+        assert case_numbers == ["CVMV2507098", "CVMV2510261", "CVMV2510403"]
+
+    def test_riverside_pdf_split_moreno_valley_outcome_isolation(self) -> None:
+        """Each MV entry's ruling_text contains its own case_number only —
+        regression test for the carry-forward shape from #3649: every
+        ground-truth entry says 'Granted', so we assert each entry's text
+        contains its own granted-disposition substring without leakage
+        from others."""
+        text = _extract_pdf_text(_load_bytes("riv_moreno_valley.pdf"))
+        rulings = _split_rulings(text)
+        all_case_numbers = {"CVMV2507098", "CVMV2510261", "CVMV2510403"}
+        for r in rulings:
+            others = all_case_numbers - {r.case_number}
+            for other in others:
+                assert other not in r.ruling_text, (
+                    f"Entry {r.ruling_index} ({r.case_number}) contains other entry's "
+                    f"case_number {other}"
+                )
+
+    def test_riverside_pdf_split_murrieta_no_tentative_rulings_returns_empty(
+        self,
+    ) -> None:
+        """riv_murrieta.pdf is a 'No Tentative Rulings' boilerplate page —
+        the splitter must return an empty list so the LLM path is bypassed
+        entirely (no LLM call required for a placeholder page).
+        """
+        text = _extract_pdf_text(_load_bytes("riv_murrieta.pdf"))
+        rulings = _split_rulings(text)
+        assert rulings == []
+
+    def test_riverside_pdf_split_hall_of_justice_no_rulings_returns_empty(
+        self,
+    ) -> None:
+        """riv_hall_of_justice.pdf is also a 'No Tentative Rulings' placeholder."""
+        text = _extract_pdf_text(_load_bytes("riv_hall_of_justice.pdf"))
+        rulings = _split_rulings(text)
+        assert rulings == []
+
+    def test_riverside_pdf_split_empty_text_returns_empty(self) -> None:
+        """Empty text returns an empty list (defensive)."""
+        assert _split_rulings("") == []
+
+    def test_riverside_pdf_split_no_numbered_entries_returns_empty(self) -> None:
+        """Text without any numbered entries returns empty (defensive)."""
+        text = "Some random text without any numbered entries"
+        assert _split_rulings(text) == []
+
+    def test_riverside_pdf_split_skips_entry_without_tentative_marker(
+        self,
+    ) -> None:
+        """Entries with no 'Tentative Ruling:' marker are skipped — defends
+        against the ghost-ruling shape from the 2026-05-02 spotcheck where
+        the procedural footer was being wrapped as a fake ruling.
+        """
+        text = (
+            "1.\n"
+            "Some procedural footer text without a tentative ruling marker.\n"
+            "Just rules and instructions on how to request oral argument.\n"
+            "2.\n"
+            "CVPS2400001 SMITH vs JONES\n"
+            "Motion to Compel\n"
+            "Tentative Ruling: Granted.\n"
+            "The motion is granted.\n"
+        )
+        rulings = _split_rulings(text)
+        # Only entry 2 has a tentative ruling marker — entry 1 must be skipped.
+        assert len(rulings) == 1
+        assert rulings[0].ruling_index == 2
+        assert rulings[0].case_number == "CVPS2400001"
+
+    def test_riverside_pdf_split_skips_too_short_entries(self) -> None:
+        """Entries with <30 chars of body are skipped (defensive)."""
+        text = "1.\nTentative Ruling.\n2.\n"
+        rulings = _split_rulings(text)
+        # Entry 1 is too short; entry 2 has empty body.
+        assert rulings == []
+
+    def test_riverside_pdf_split_two_digit_entry_numbers(self) -> None:
+        """Entry indices can be 1-3 digits (defensive — some Riverside PDFs
+        run >9 entries, e.g. department M302's 9-entry calendar called out
+        in the issue body).
+        """
+        text = (
+            "9.\n"
+            "CVRI2400009 ALPHA vs BETA Motion 9\n"
+            "Tentative Ruling: Granted.\nThe motion is granted in full.\n"
+            "10.\n"
+            "CVRI2400010 GAMMA vs DELTA Motion 10\n"
+            "Tentative Ruling: Denied.\nThe motion is denied without prejudice.\n"
+            "11.\n"
+            "CVRI2400011 EPSILON vs ZETA Motion 11\n"
+            "Tentative Ruling: Continue to next month.\nThis matter is continued.\n"
+        )
+        rulings = _split_rulings(text)
+        assert [r.ruling_index for r in rulings] == [9, 10, 11]
+        assert [r.case_number for r in rulings] == [
+            "CVRI2400009",
+            "CVRI2400010",
+            "CVRI2400011",
+        ]
+
+    def test_riverside_pdf_split_does_not_match_inline_citations(self) -> None:
+        """Numeric citations like '(2010) 48 Cal.4th 32' inside the body
+        must NOT be treated as entry boundaries.
+
+        The regex anchors on ``^\\d{1,3}\\.\\s*$`` (number + period on a
+        line by itself), so an inline citation like ``v. Santa Clara County
+        Bd. of Supervisors (2010) 48 Cal.4th 32, 42`` won't trip a false
+        positive even though it contains digits adjacent to a period.
+        """
+        text = (
+            "1.\n"
+            "CVPS2400001 SMITH vs JONES\n"
+            "Motion to Compel\n"
+            "Tentative Ruling: See Foo v. Bar (2010) 48 Cal.4th 32, 42.\n"
+            "The motion is GRANTED based on Section 998. The court relies\n"
+            "on the rule from (2010) 48 Cal.4th at 50.\n"
+            "2.\n"
+            "CVPS2400002 ALPHA vs BETA\n"
+            "Demurrer\n"
+            "Tentative Ruling: Sustained.\nThe demurrer is sustained without leave.\n"
+        )
+        rulings = _split_rulings(text)
+        # Despite the inline 32, 42, 998, 50 numerics, only 2 real entries.
+        assert len(rulings) == 2
+        assert [r.ruling_index for r in rulings] == [1, 2]
+
+    def test_riverside_pdf_split_does_not_extract_motion_or_outcome(self) -> None:
+        """The Riverside splitter intentionally leaves motion_type, outcome,
+        and case_title as ``None`` — those are populated by per-entry LLM
+        enrichment via ``_llm_enrich_fields``.
+
+        This is the key behavioural difference from the Fresno splitter,
+        which extracts those fields deterministically from the structured
+        ``Motion:`` / ``Re:`` / ``Tentative Ruling:`` headers Riverside
+        PDFs don't have.  Riverside relies on per-entry LLM enrichment
+        (each entry processed individually) to fill those fields without
+        any cross-entry carry-forward window.
+        """
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        for r in rulings:
+            assert r.motion_type is None, "splitter must not populate motion_type"
+            assert r.outcome is None, "splitter must not populate outcome"
+            assert r.case_title is None, "splitter must not populate case_title"
+
+    def test_riverside_pdf_split_strips_page_footers(self) -> None:
+        """Per-entry ruling_text must not contain 'Page N of M' footers."""
+        text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+        rulings = _split_rulings(text)
+        for r in rulings:
+            assert "Page 1 of" not in r.ruling_text
+            assert "Page 2 of" not in r.ruling_text
+            assert "Page 3 of" not in r.ruling_text
+            assert "Page 4 of" not in r.ruling_text
+
+
+class TestRiversideSplitRuling:
+    """Unit tests for the SplitRuling dataclass."""
+
+    def test_split_ruling_default_optional_fields(self) -> None:
+        """SplitRuling can be constructed with only required fields."""
+        r = SplitRuling(
+            ruling_index=1,
+            case_number="CVPS2400001",
+            ruling_text="Some ruling text",
+        )
+        assert r.ruling_index == 1
+        assert r.case_number == "CVPS2400001"
+        assert r.ruling_text == "Some ruling text"
+        assert r.case_title is None
+        assert r.motion_type is None
+        assert r.outcome is None
+        assert r.hearing_date is None
+        assert r.department is None
+
+    def test_split_ruling_with_all_fields(self) -> None:
+        """SplitRuling carries all 8 fields in its slots."""
+        r = SplitRuling(
+            ruling_index=42,
+            case_number="CVRI2412345",
+            ruling_text="Ruling text",
+            case_title="Smith v. Jones",
+            motion_type="demurrer",
+            outcome="granted",
+            hearing_date=datetime(2026, 3, 2),
+            department="PS1",
+        )
+        assert r.ruling_index == 42
+        assert r.case_number == "CVRI2412345"
+        assert r.case_title == "Smith v. Jones"
+        assert r.motion_type == "demurrer"
+        assert r.outcome == "granted"
+        assert r.hearing_date == datetime(2026, 3, 2)
+        assert r.department == "PS1"

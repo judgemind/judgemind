@@ -108,6 +108,27 @@ def _make_fresno_event(**overrides: object) -> dict:
     return base
 
 
+def _make_riverside_event(**overrides: object) -> dict:
+    """Return a Riverside PDF-like event payload (#3649)."""
+    base: dict = {
+        "document_id": "aaaaaaaa-0000-0000-0000-000000000005",
+        "scraper_id": "ca-riverside-tentatives-civil",
+        "state": "CA",
+        "county": "Riverside",
+        "court": "Superior Court",
+        "source_url": "https://www.riverside.courts.ca.gov/tentativerulings/5",
+        "content_format": "pdf",
+        "content_hash": "mno345",
+        "s3_key": "ca/riverside/superior_court/raw/mno345.pdf",
+        "s3_bucket": "judgemind-document-archive-dev",
+        "ruling_text": "1.\nCVPS2400001 SMITH vs JONES\nTentative Ruling: Granted.",
+        "hearing_date": "2026-03-05",
+        "capture_timestamp": "2026-03-04T23:00:00",
+    }
+    base.update(overrides)
+    return base
+
+
 def _make_llm_event(**overrides: object) -> dict:
     """Return a generic event for LLM split path testing."""
     base: dict = {
@@ -176,6 +197,20 @@ def _make_fake_fresno_rulings() -> list:
             motion_type=None,
             outcome=None,
             hearing_date=None,
+        )
+        for i in range(3)
+    ]
+
+
+def _make_fake_riverside_rulings() -> list:
+    """Return 3 fake Riverside SplitRuling objects for testing (#3649)."""
+    from courts.ca.riverside_tentatives import SplitRuling
+
+    return [
+        SplitRuling(
+            ruling_index=i + 1,
+            case_number=f"CVPS230000{i}",
+            ruling_text=f"Riverside ruling {i}\nTentative Ruling: Granted.",
         )
         for i in range(3)
     ]
@@ -345,6 +380,41 @@ class TestFirstChildExhaustionDoesNotAbortSiblings:
         assert len(split_calls) == 3
         assert mock_conn.commit.call_count == 2
 
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_riverside_pdf_first_child_exhaustion(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Riverside PDF: first child exhaustion does not abort siblings 2 and 3 (#3649)."""
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+            ("court-uuid-1",),
+            ("case-uuid-2",),
+            (True,),
+        ]
+
+        fake_rulings = _make_fake_riverside_rulings()
+        call_log, side_effect = self._make_side_effect(worker)
+
+        with patch("courts.ca.riverside_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_riverside_event()
+            from ingestion.worker import _try_riverside_pdf_split
+
+            _try_riverside_pdf_split(event, event["document_id"], event["ruling_text"], side_effect)
+
+        split_calls = [c for c in call_log if c.get("_split_processed")]
+        assert len(split_calls) == 3
+        assert mock_conn.commit.call_count == 2
+
     @patch("ingestion.worker.delete_stale_split_children", return_value=0)
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -474,6 +544,42 @@ class TestAllChildExhaustionLogsAndSucceeds:
             from ingestion.worker import _try_fresno_pdf_split
 
             result = _try_fresno_pdf_split(
+                event, event["document_id"], event["ruling_text"], always_exhausted
+            )
+
+        assert result is True
+        critical_msgs = [r for r in caplog.records if r.levelname == "CRITICAL"]
+        assert len(critical_msgs) == 3
+        for record in critical_msgs:
+            assert "per-child enrichment exhausted" in record.getMessage()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_riverside_all_child_exhaustion_logs_and_succeeds(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Riverside PDF: all children exhausted → logged, returns True (no re-raise) (#3649)."""
+        import logging
+
+        fake_rulings = _make_fake_riverside_rulings()
+
+        def always_exhausted(event_data: dict) -> None:
+            if event_data.get("_split_processed"):
+                raise LlmEnrichmentExhaustedError("all exhausted")
+
+        with (
+            patch("courts.ca.riverside_tentatives._split_rulings", return_value=fake_rulings),
+            caplog.at_level(logging.CRITICAL, logger="ingestion.worker"),
+        ):
+            event = _make_riverside_event()
+            from ingestion.worker import _try_riverside_pdf_split
+
+            result = _try_riverside_pdf_split(
                 event, event["document_id"], event["ruling_text"], always_exhausted
             )
 
@@ -709,6 +815,141 @@ class TestNonExhaustionExceptionsReraise:
                 _try_fresno_pdf_split(
                     event, event["document_id"], event["ruling_text"], raises_value_error
                 )
+
+    def test_riverside_pdf_reraises_non_exhaustion_exception(self) -> None:
+        """_try_riverside_pdf_split re-raises ValueError on non-exhaustion exception (#3649)."""
+        fake_rulings = _make_fake_riverside_rulings()  # must be >1 to pass single-ruling guard
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with patch("courts.ca.riverside_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_riverside_event()
+            from ingestion.worker import _try_riverside_pdf_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_riverside_pdf_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    def test_riverside_pdf_split_skips_non_riverside_county(self) -> None:
+        """_try_riverside_pdf_split returns False (skips) when county != Riverside (#3649)."""
+        from ingestion.worker import _try_riverside_pdf_split
+
+        # Fresno event with Riverside-like text — must be skipped because county is wrong.
+        event = _make_fresno_event()
+        result = _try_riverside_pdf_split(
+            event,
+            event["document_id"],
+            "1.\nCVPS2400001 SMITH vs JONES\nTentative Ruling: Granted.",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_riverside_pdf_split_skips_non_pdf_format(self) -> None:
+        """_try_riverside_pdf_split returns False (skips) when content_format != pdf (#3649)."""
+        from ingestion.worker import _try_riverside_pdf_split
+
+        # Riverside event with html format — must be skipped (gate is pdf-only).
+        event = _make_riverside_event(content_format="html")
+        result = _try_riverside_pdf_split(
+            event,
+            event["document_id"],
+            "1.\nCVPS2400001\nTentative Ruling: Granted.",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_riverside_pdf_split_falls_through_for_no_numbered_entries(self) -> None:
+        """_try_riverside_pdf_split returns False when splitter finds no numbered entries.
+
+        This is the "No Tentative Rulings" placeholder path — the LLM
+        (which would otherwise be skipped) should run normally to
+        populate fields for the placeholder, matching the Fresno
+        fall-through behaviour for placeholder PDFs.
+        """
+        from ingestion.worker import _try_riverside_pdf_split
+
+        event = _make_riverside_event()
+        with patch("courts.ca.riverside_tentatives._split_rulings", return_value=[]):
+            result = _try_riverside_pdf_split(
+                event,
+                event["document_id"],
+                "No Tentative Rulings March 2, 2026",
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_riverside_pdf_split_falls_through_for_single_ruling_pdf(self) -> None:
+        """_try_riverside_pdf_split returns False when splitter finds exactly 1 entry.
+
+        The deterministic regex extraction does not populate
+        motion_type/outcome/case_title.  Falling through to the LLM
+        path lets the per-field enrichment fill those fields — there is
+        no carry-forward window with a single entry.
+        """
+        from courts.ca.riverside_tentatives import SplitRuling
+        from ingestion.worker import _try_riverside_pdf_split
+
+        single_ruling = [
+            SplitRuling(ruling_index=1, case_number="CVPS2400001", ruling_text="Lone ruling text")
+        ]
+        event = _make_riverside_event()
+        with patch("courts.ca.riverside_tentatives._split_rulings", return_value=single_ruling):
+            result = _try_riverside_pdf_split(
+                event,
+                event["document_id"],
+                event["ruling_text"],
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_riverside_pdf_split_dispatches_with_split_metadata(self) -> None:
+        """When the splitter finds multiple entries, each dispatched event carries
+        the synthetic split metadata that ``IngestionWorker.process_event`` uses
+        to short-circuit redundant LLM split attempts and route to per-field
+        enrichment (#3649).
+
+        This test pins the dispatch contract: ``_split_processed=True`` (so
+        the worker's outer split-attempt path is skipped on the recursive
+        call), AND ``_llm_extracted`` is NOT set to True (so per-field LLM
+        enrichment STILL runs against each child's ruling_text individually,
+        eliminating the cross-entry carry-forward window).
+        """
+        from ingestion.worker import _try_riverside_pdf_split
+
+        captured: list[dict] = []
+
+        def capture(event_data: dict) -> None:
+            captured.append(event_data)
+
+        fake_rulings = _make_fake_riverside_rulings()
+        with patch("courts.ca.riverside_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_riverside_event()
+            result = _try_riverside_pdf_split(
+                event, event["document_id"], event["ruling_text"], capture
+            )
+
+        assert result is True
+        assert len(captured) == 3
+        for idx, child in enumerate(captured):
+            assert child["_split_processed"] is True, (
+                f"child {idx} missing _split_processed — would re-trigger split path"
+            )
+            # Critical contract: _llm_extracted must NOT be True so per-field
+            # LLM enrichment runs for each child individually.  This is the
+            # key behavioural difference from the Fresno splitter, which
+            # extracts those fields deterministically.
+            assert not child.get("_llm_extracted", False), (
+                f"child {idx} has _llm_extracted=True — would skip per-field "
+                f"enrichment and lose motion_type/outcome/case_title"
+            )
+            assert child["_original_document_id"] == event["document_id"]
+            # Each child's document_id must be unique (split_ids salt by index).
+            assert child["document_id"] != event["document_id"]
+            # Each child carries its own ruling text and case_number.
+            assert child["case_number"] == fake_rulings[idx].case_number
+            assert child["ruling_text"] == fake_rulings[idx].ruling_text
 
     @patch("ingestion.worker.delete_stale_split_children", return_value=0)
     @patch("ingestion.worker.batch_upsert_parties")

@@ -14,18 +14,40 @@ Link text format: "Department {CODE} - Honorable {Firstname Lastname [Suffix]}"
 PDF URL pattern: /system/files/{YYYY-MM}/{CODE}ruling{MMDDYY}.pdf
   Resolved against BASE_URL.
 
-PDF structure (PS1, 4 pages):
-  Page 1: "Tentative Rulings for March 2, 2026\nDepartment PS1\n..."
-  Case entries: "<N>.\\n{CASE_NUMBER} {PARTY_VS_PARTY} {motion}\\nTentative Ruling: ..."
+PDF structure (multi-ruling, e.g. PS1 with 4 rulings):
+  Page 1: "Tentative Rulings for March 2, 2026\\nDepartment PS1\\n..."
+    + departmental boilerplate (Zoom call-in, court reporter notice, etc.)
+  Case entries are numbered sequentially on a line by themselves and
+  followed by 1-3 lines of mixed motion-description and case-number-
+  with-parties text, then a ``Tentative Ruling:`` block:
+
+      1.
+      Hearing re: Demurrer on 1st Amended
+      CVPS2306157 YELDELL vs HENSS Complaint of LACHON YELDELL by
+      ISABELE O'KANE
+      Tentative Ruling: ...
+
+      2.
+      Hearing re: Motion for Terminating
+      CVPS2306202 CRUMP vs IRWIN
+      Sanctions by JOHN W. IRWIN
+      Tentative Ruling: ...
+
   Case number format: prefix + digits, e.g. "CVPS2306157", "RIC1904113"
   Prefixes: CV + location code (CVPS, CVRI, CVMV, etc.), or court location
   codes (RIC, MCC, PSC, SWC, INC) used by some departments.
 
-Ruling splitting:
-  Multi-ruling PDF splitting is handled by the framework-level
-  ``LlmExtractor`` in the ingestion worker using a Riverside-specific
-  system prompt configured in ``framework.extraction_config`` (#1728).
-  The scraper passes whole PDFs through without splitting.
+Ruling splitting (#3649):
+  Multi-ruling Riverside PDFs are split deterministically by the
+  ``_split_rulings`` regex helper below.  The ingestion worker hooks
+  that splitter into the per-document dispatch loop via
+  ``_try_riverside_pdf_split`` in ``ingestion.worker`` so each entry
+  gets its own LLM enrichment pass — eliminating the cross-entry
+  carry-forward window that the LLM was using to copy outcome /
+  motion_type / case_title from one entry onto another.  Single-ruling
+  PDFs (the splitter returns ``[]`` or a 1-element list) fall through
+  to the framework ``LlmExtractor`` path so the existing per-field
+  enrichment fills in motion_type and outcome.
 
 Courthouse mapping (best-effort — Riverside has many locations):
   PS*  → Palm Springs Courthouse
@@ -130,6 +152,213 @@ def _is_no_tentative_rulings(text: str) -> bool:
        is kept for backward compatibility with existing tests.
     """
     return bool(_NO_TENTATIVE_RULINGS_RE.match(text))
+
+
+# ---------------------------------------------------------------------------
+# Multi-ruling PDF splitter (#3649)
+# ---------------------------------------------------------------------------
+#
+# Riverside multi-case PDFs use numbered entries that always start with a
+# bare ``N.\n`` line at the *start* of a line (no surrounding parens).  The
+# body text often contains parenthetical citations like ``(2010) 48 Cal.4th
+# 32, 42`` — the split regex must NOT treat those as entry boundaries, so we
+# anchor on ``^\d{1,3}\.\s*$`` (number + period on its own line) using
+# MULTILINE.  See ``test_riverside_split_*`` tests for ground truth coverage
+# against the real fixture PDFs.
+
+# Entry boundary: a 1-3 digit number followed by a period on its own line.
+# The negative lookahead for "Cal." / "Cal" guards against false positives
+# from California Reporter citations like "Cal.4th 32," that happen to wrap
+# such that a digit-period appears at start of line — rare but cheap to
+# defend against.  The MULTILINE flag makes ^ / $ match at every line.
+_RULING_ENTRY_RE = re.compile(
+    r"^(?P<num>\d{1,3})\.\s*$",
+    re.MULTILINE,
+)
+
+
+# Tentative ruling body marker.  Riverside PDFs always introduce the
+# disposition with ``Tentative Ruling:``; the text before this marker is
+# the entry header (motion description + case number + parties), and the
+# text after is the body.  Used by ``_split_rulings`` to separate the
+# header (which we parse for case_number) from the body (which we keep as
+# ``ruling_text`` for the LLM to enrich downstream).
+_TENTATIVE_RULING_MARKER_RE = re.compile(
+    r"Tentative\s+Ruling:",
+    re.IGNORECASE,
+)
+
+
+# Page-N-of-M footer that appears at the bottom of every page.  Strip
+# these out of the per-entry body so they don't pollute ``ruling_text``.
+_PAGE_FOOTER_RE = re.compile(
+    r"\n\s*Page\s+\d+\s+of\s+\d+\s*$",
+    re.IGNORECASE,
+)
+
+
+class SplitRuling:
+    """A single ruling extracted from a multi-ruling Riverside PDF.
+
+    Mirrors ``courts.ca.fresno_tentatives.SplitRuling`` (#3534) so the
+    deterministic splitter dispatch in ``ingestion.worker._try_riverside_pdf_split``
+    can produce synthetic split events with the same shape as Fresno.
+
+    Only ``case_number`` and ``ruling_text`` are populated by the splitter;
+    motion_type, case_title, and outcome are left to LLM enrichment because
+    the Riverside header text wraps unpredictably and a deterministic regex
+    extraction is not reliable enough to replace the LLM (#3649).  The
+    important property is that each entry's enrichment runs *individually*
+    so the LLM cannot carry-forward a previous entry's fields.
+    """
+
+    __slots__ = (
+        "ruling_index",
+        "case_number",
+        "ruling_text",
+        "case_title",
+        "motion_type",
+        "outcome",
+        "hearing_date",
+        "department",
+    )
+
+    def __init__(
+        self,
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None = None,
+        motion_type: str | None = None,
+        outcome: str | None = None,
+        hearing_date: datetime | None = None,
+        department: str | None = None,
+    ) -> None:
+        self.ruling_index = ruling_index
+        self.case_number = case_number
+        self.ruling_text = ruling_text
+        self.case_title = case_title
+        self.motion_type = motion_type
+        self.outcome = outcome
+        self.hearing_date = hearing_date
+        self.department = department
+
+
+def _strip_page_footers(text: str) -> str:
+    """Remove the trailing 'Page N of M' footer from a per-entry body.
+
+    The PDF text extractor produces these footers as standalone lines at
+    every page boundary.  In a multi-page entry the footer can appear
+    mid-body too; strip every occurrence anywhere in the entry text.
+    """
+    # Strip any "Page N of M" line (anywhere in the body).
+    cleaned = re.sub(
+        r"^\s*Page\s+\d+\s+of\s+\d+\s*$",
+        "",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def _extract_case_number_from_header(header: str) -> str | None:
+    """Pull the case number out of the entry header text.
+
+    The entry header (the text between the ``N.`` boundary and the
+    ``Tentative Ruling:`` marker) always contains the case number on a
+    line by itself or as the first token of a line — but the surrounding
+    text wraps unpredictably.  We use the existing ``_CASE_NUMBER_RE``
+    regex (the same one used by the scraper for case-number sanity
+    checks) so we benefit from the prefix list maintained alongside
+    every other Riverside case-number consumer.
+    """
+    m = _CASE_NUMBER_RE.search(header)
+    return m.group(0).upper() if m else None
+
+
+def _split_rulings(text: str) -> list[SplitRuling]:
+    """Split Riverside multi-ruling PDF text into per-entry ``SplitRuling`` objects.
+
+    The page-1 preamble (Zoom call-in instructions, court reporter notice,
+    Local Rule citations) is excluded by anchoring on the first ``^N.\\s*$``
+    boundary — anything before the first numbered entry is dropped.
+
+    Returns an empty list if no numbered entries are found, which is the
+    expected outcome for "No Tentative Rulings" placeholder PDFs and for
+    single-ruling PDFs that don't follow the numbered-entry format.
+
+    Each returned ``SplitRuling`` has:
+
+      * ``ruling_index`` — the integer from the entry header (e.g. ``1``,
+        ``2``, ``3`` for a PDF with three rulings).
+      * ``case_number`` — extracted via ``_CASE_NUMBER_RE`` from the
+        entry header; ``None`` if the regex fails to match (rare on
+        well-formed Riverside PDFs).
+      * ``ruling_text`` — the **verbatim** entry text from the boundary
+        through the next entry boundary (or the end of the document for
+        the last entry).  This includes the entry's own ``Tentative
+        Ruling:`` body.  We keep it verbatim so downstream LLM enrichment
+        sees exactly the same content the LLM would have seen if we'd
+        sent the whole PDF — minus the cross-entry contamination that
+        causes the carry-forward bug.
+
+    motion_type, case_title, and outcome are left ``None`` on purpose —
+    Riverside PDFs do not have the structured field labels that Fresno
+    PDFs do (``Motion:`` / ``Re:`` / ``Hearing Date:``), so attempting
+    deterministic regex extraction here would produce a high false-
+    negative rate.  Letting the framework ``LlmExtractor`` populate
+    those fields via per-entry enrichment matches the Fresno fall-
+    through path (#3599, AC4 of #3534) and preserves the behaviour the
+    LLM was already producing on single-ruling PDFs.
+    """
+    matches = list(_RULING_ENTRY_RE.finditer(text))
+    if not matches:
+        return []
+
+    rulings: list[SplitRuling] = []
+    for i, match in enumerate(matches):
+        try:
+            entry_num = int(match.group("num"))
+        except (TypeError, ValueError):
+            continue
+
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+
+        body = text[start:end].strip()
+        if not body:
+            continue
+
+        # Defensive: skip anything that looks like a procedural-footer
+        # ghost entry (#3649 comment 3).  Real entries always contain a
+        # ``Tentative Ruling:`` marker; if the body has none, it's most
+        # likely the procedural footer the LLM was previously folding
+        # into a fake UNKNOWN-* ruling.
+        if not _TENTATIVE_RULING_MARKER_RE.search(body):
+            continue
+
+        body = _strip_page_footers(body)
+        if len(body) < 30:
+            # Too short to be a real ruling — skip.
+            continue
+
+        # The header is everything before "Tentative Ruling:"; the body
+        # we keep as ruling_text is the whole entry (including the
+        # header) so downstream LLM enrichment can see motion type and
+        # parties from the header text.
+        marker_match = _TENTATIVE_RULING_MARKER_RE.search(body)
+        header_text = body[: marker_match.start()] if marker_match else body
+        case_number = _extract_case_number_from_header(header_text)
+
+        rulings.append(
+            SplitRuling(
+                ruling_index=entry_num,
+                case_number=case_number,
+                ruling_text=body,
+            )
+        )
+
+    return rulings
 
 
 # ---------------------------------------------------------------------------

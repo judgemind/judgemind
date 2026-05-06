@@ -526,6 +526,155 @@ def _try_fresno_pdf_split(
     return True
 
 
+def _try_riverside_pdf_split(
+    event_data: dict[str, Any],
+    document_id: str,
+    ruling_text: str,
+    dispatch: Any,
+) -> bool:
+    """If *ruling_text* is a Riverside multi-ruling PDF, deterministically split
+    it into per-case rulings and dispatch one synthetic split event per case
+    via *dispatch*.  Returns True if the split ran, False otherwise.
+
+    This path bypasses the framework LLM extractor — Riverside multi-case
+    PDFs use numbered entries (``1.``, ``2.``, ``3.`` on lines by
+    themselves) that are cheap to parse with the regex-based
+    ``_split_rulings`` function in ``courts.ca.riverside_tentatives``.
+    Sending the whole PDF through the LLM previously produced cross-entry
+    contamination (#3649): the LLM violated rule 5b of the Riverside
+    extraction prompt and copied the first entry's ``outcome`` /
+    ``motion_type`` / ``case_title`` onto subsequent entries whose own
+    text said only "Continue ...".
+
+    Detection gate: only triggers when event is Riverside county **and**
+    content format is ``"pdf"`` — avoids false-positive matches on other
+    courts.
+
+    When ``_split_rulings`` returns ``[]`` (no numbered entries — typical
+    of "No Tentative Rulings" placeholder PDFs) or a 1-element list
+    (single-ruling PDF), this function returns ``False`` so the existing
+    LLM path handles enrichment.  The deterministic regex extraction
+    does not populate ``motion_type``/``outcome``/``case_title`` —
+    falling through to the framework ``LlmExtractor`` is what gives
+    those fields per-entry enrichment without any cross-entry carry-
+    forward window (single-ruling PDFs have nothing to carry forward).
+
+    Mirrors the SD/LA/Fresno pattern (``_try_sd_calendar_split`` #2447,
+    ``_try_la_html_split`` #2450, ``_try_fresno_pdf_split`` #3534).
+    """
+    county = event_data.get("county") or ""
+    if county.upper() != "RIVERSIDE":
+        return False
+    if event_data.get("content_format") != "pdf":
+        return False
+
+    # Lazy import to avoid a circular dependency between the worker and
+    # the courts package at module load time.
+    from courts.ca.riverside_tentatives import _split_rulings
+
+    split_rulings = _split_rulings(ruling_text)
+    if not split_rulings:
+        # No numbered entries found — fall through to LLM.
+        logger.info(
+            "riverside_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "no_numbered_entries",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "riverside_pdf_deterministic",
+            },
+        )
+        return False
+    if len(split_rulings) == 1:
+        # Single-ruling PDF — the deterministic regex extraction does not
+        # populate motion_type/outcome/case_title.  Fall through to the
+        # LLM path so framework extraction fills those fields.  There is
+        # no carry-forward window with a single entry, so the LLM is
+        # safe to use here.
+        logger.info(
+            "riverside_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "single_ruling_pdf",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "riverside_pdf_deterministic",
+            },
+        )
+        return False
+
+    logger.info(
+        "Riverside PDF deterministic split dispatching %d ruling(s)",
+        len(split_rulings),
+        extra={
+            "document_id": document_id,
+            "ruling_count": len(split_rulings),
+            "scraper_id": event_data.get("scraper_id"),
+            "extraction_method": "riverside_pdf_deterministic",
+        },
+    )
+
+    from .split_ids import make_split_document_id
+
+    # At this point len(split_rulings) > 1 — always generate split doc IDs.
+    for idx, sr in enumerate(split_rulings):
+        split_doc_id = make_split_document_id(document_id, idx)
+        hearing_date_value: str | None = None
+        if sr.hearing_date is not None:
+            hearing_date_value = (
+                sr.hearing_date.date().isoformat()
+                if isinstance(sr.hearing_date, datetime)
+                else str(sr.hearing_date)
+            )
+
+        # ``_split_processed=True`` short-circuits the worker's per-doc
+        # split-attempt path; ``_llm_extracted`` is intentionally LEFT
+        # FALSE so the synthetic event flows through the per-field LLM
+        # enrichment path (``_llm_enrich_fields``) and motion_type /
+        # outcome / case_title get populated for each entry individually.
+        # This is the key difference from the Fresno splitter, which
+        # extracts those fields deterministically from the structured
+        # ``Re:`` / ``Motion:`` / ``Tentative Ruling:`` headers Riverside
+        # PDFs don't have.  Each entry gets its own LLM call against
+        # only its own text, so cross-entry carry-forward is impossible.
+        split_event: dict[str, Any] = {
+            **event_data,
+            "document_id": split_doc_id,
+            "_original_document_id": document_id,
+            "_split_processed": True,
+            "_split_index": idx,
+            "_split_count": len(split_rulings),
+            "ruling_text": sr.ruling_text,
+            "ruling_text_html": None,
+            "case_number": sr.case_number or event_data.get("case_number"),
+            "case_title": sr.case_title or event_data.get("case_title"),
+            "department": sr.department or event_data.get("department"),
+            "motion_type": sr.motion_type or event_data.get("motion_type"),
+            "outcome": sr.outcome or event_data.get("outcome"),
+            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+        }
+        try:
+            dispatch(split_event)
+        except Exception as _exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                raise
+            logger.critical(
+                "per-child enrichment exhausted on Riverside PDF split — ruling permanently lost",
+                extra={
+                    "document_id": document_id,
+                    "_split_index": idx,
+                    "_split_count": len(split_rulings),
+                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "error": str(_exc),
+                },
+            )
+
+    return True
+
+
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
     "hearing_date",
@@ -3118,6 +3267,28 @@ class IngestionWorker:
         # counties.  Single-ruling PDFs (``_split_rulings`` returns ``[]``)
         # fall through to the normal LLM path below.
         if ruling_text and _try_fresno_pdf_split(
+            event_data, document_id, ruling_text, self.process_event
+        ):
+            return True
+
+        # ------------------------------------------------------------------
+        # Riverside multi-ruling PDF deterministic split (#3649)
+        # ------------------------------------------------------------------
+        # Riverside multi-case PDFs use numbered entries (``1.``, ``2.``,
+        # ``3.`` on lines by themselves).  The LLM previously violated
+        # rule 5b of the Riverside extraction prompt and copied the first
+        # entry's ``outcome`` / ``motion_type`` / ``case_title`` onto
+        # subsequent entries whose own text said only "Continue ...".  The
+        # deterministic ``_split_rulings`` in ``riverside_tentatives`` is
+        # county+format gated (Riverside + pdf only) so it never fires for
+        # other counties.  Single-ruling PDFs and "No Tentative Rulings"
+        # placeholders (``_split_rulings`` returns ``[]`` or a 1-element
+        # list) fall through to the normal LLM path below.  Unlike the
+        # Fresno splitter, the Riverside splitter does NOT extract
+        # motion_type / outcome / case_title — those are left to per-
+        # entry LLM enrichment via ``_llm_enrich_fields`` (each entry
+        # processed individually, so no cross-entry carry-forward window).
+        if ruling_text and _try_riverside_pdf_split(
             event_data, document_id, ruling_text, self.process_event
         ):
             return True
