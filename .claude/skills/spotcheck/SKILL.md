@@ -258,6 +258,8 @@ Title rule: never `"X is broken"`. Always frame as `"X is broken because Y"` or 
 
 Priority rule: `p1` for things actively producing wrong data or blocking workflow; `p2` for most user-visible quality bugs; `p3` for hygiene / docstring / dx. No `p0`.
 
+Cleanup AC SQL rule: any `Verify:` SELECT that counts/filters `derived.rulings`, `derived.cases`, `derived.judges`, etc. to gate "the cleanup is done" MUST `JOIN derived.documents d ON d.id = <row>.document_id WHERE d.status = 'active'`. Supersede chains leave OLD-case-number / OLD-case-title rows behind as `status = 'superseded'`; a naive count picks them up as live regression and the AC reads as failing long after the fix has landed. See `docs/agent/issue-authoring.md` §Cleanup AC queries — anchor on document status (and #4236 / #3629 for the incident) for the full pattern and a worked example.
+
 If the new issue is blocked by another open issue, run `scripts/block-issue.sh <new-issue> <blocker>` after filing — adds `status/blocked` and the `Blocked by #N` mechanic that auto-unblocks on merge.
 
 ### 4c — Comment on existing issue (for new evidence)
