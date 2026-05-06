@@ -79,6 +79,26 @@
 #       A second flake on the same run exits 1 — see #4148.
 #   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
 #
+# ── Flake telemetry (#4163) ──────────────────────────────────────────────────
+#
+# Every time the auto-rerun classifier fires `gh run rerun` for a known flake,
+# one structured JSON line is appended to a stable file so downstream tooling
+# can aggregate flake frequencies without scraping CI logs. The default path
+# is `tmp/wait-for-ci-flakes.jsonl` resolved relative to the script's parent
+# (i.e. the repo or worktree root that contains `scripts/`). Tests override
+# the path via the `WAIT_FOR_CI_FLAKE_LOG` env var.
+#
+# Each line carries a fixed schema (no free-form prose) so a one-liner like
+# `jq -r .label tmp/wait-for-ci-flakes.jsonl | sort | uniq -c` produces the
+# leaderboard. Schema:
+#
+#   {"ts":"<ISO-8601 UTC>","pr":<int>,"sha":"<short sha>","run_id":<int>,
+#    "label":"<flake-label>","check_name":"<failed check name>"}
+#
+# A companion helper `scripts/summarize-ci-flakes.sh` reads the same file and
+# prints a per-label count. Promotion of a label to the auto-rerun table
+# remains a human PR (out of scope for this script).
+#
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -95,6 +115,12 @@ AUTO_RERUN=1
 # `classify-ci-flake.sh` helper without depending on PATH.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLASSIFIER="$SCRIPT_DIR/classify-ci-flake.sh"
+
+# Default flake telemetry log path — `<repo-or-worktree-root>/tmp/wait-for-ci-flakes.jsonl`.
+# `SCRIPT_DIR` is `<root>/scripts`, so the parent is the root itself. Tests
+# override via `WAIT_FOR_CI_FLAKE_LOG` to point at a per-test tmpdir.
+DEFAULT_FLAKE_LOG="$(dirname "$SCRIPT_DIR")/tmp/wait-for-ci-flakes.jsonl"
+FLAKE_LOG="${WAIT_FOR_CI_FLAKE_LOG:-$DEFAULT_FLAKE_LOG}"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -212,6 +238,45 @@ record_rerun_fired() {
     echo "$run_id" >> "$RERUN_SENTINEL_FILE"
 }
 
+# Emit one JSONL line of flake telemetry to $FLAKE_LOG (#4163).
+#
+# Args: <pr> <sha> <run_id> <label> <check_name>
+#
+# The line is built with `jq -cn` so embedded quotes / shell metachars in any
+# field are escaped correctly. We tolerate jq write failures silently — the
+# rerun must still happen even if the disk is full or the parent directory is
+# read-only. The whole helper returns 0 unconditionally so a logging error
+# never wedges the polling loop.
+emit_flake_telemetry() {
+    local pr="$1"
+    local sha="$2"
+    local run_id="$3"
+    local label="$4"
+    local check_name="$5"
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    mkdir -p "$(dirname "$FLAKE_LOG")" 2>/dev/null || return 0
+
+    local short_sha="${sha:0:8}"
+    # Note: `label` is a jq reserved keyword, so we pass it as `$lbl` and
+    # remap to the public field name in the object literal.
+    local line
+    line=$(jq -cn \
+        --arg ts "$ts" \
+        --argjson pr "$pr" \
+        --arg sha "$short_sha" \
+        --argjson run_id "$run_id" \
+        --arg lbl "$label" \
+        --arg check_name "$check_name" \
+        '{ts: $ts, pr: $pr, sha: $sha, run_id: $run_id, label: $lbl, check_name: $check_name}' 2>/dev/null) || return 0
+
+    if [ -n "$line" ]; then
+        printf '%s\n' "$line" >> "$FLAKE_LOG" 2>/dev/null || return 0
+    fi
+    return 0
+}
+
 # ── Poll loop ─────────────────────────────────────────────────────────────────
 
 START_TS=$(date +%s)
@@ -247,23 +312,30 @@ while true; do
             FLAKE_DETECTED=0
             FLAKE_LABEL=""
             FLAKE_RUN_ID=""
+            FLAKE_CHECK_NAME=""
 
-            # Extract one (failed-check, run-id) pair per failed check.
-            # We only need to check the first failed run-id we see —
-            # `gh run rerun --failed` already reruns every failed job on
-            # that run, and rerunning multiple distinct runs from one
-            # script invocation is out of scope (one rerun per SHA per
-            # script call). The first failed check in the rollup is
-            # representative.
+            # Extract (check_name, details_url) pairs for every failed check.
+            # We capture the check name alongside the URL so the telemetry
+            # emitter (#4163) can record which named check fired the flake —
+            # consumers want to know whether postgres-startup is hitting
+            # `schema-drift-check`, `unit-tests`, or somewhere new. We only
+            # need to act on the first failed run-id we see — `gh run rerun
+            # --failed` already reruns every failed job on that run, and
+            # rerunning multiple distinct runs from one script invocation is
+            # out of scope (one rerun per SHA per script call).
+            #
+            # Tab-separated to survive in any plausible check name; check
+            # names with embedded tabs are not a concern (GitHub's check-name
+            # validator forbids control chars).
             FAILED_DETAILS=$(echo "$CHECK_RUNS_JSON" | jq -r '
                 .[]
                 | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled"))
-                | (.details_url // "")
+                | "\(.name // "")\t\(.details_url // "")"
             ')
 
             # Walk failed checks until we find one whose run-id parses AND
             # whose log classifies as a known flake.
-            while IFS= read -r URL; do
+            while IFS=$'\t' read -r CHECK_NAME URL; do
                 [ -z "$URL" ] && continue
                 CANDIDATE_RUN_ID=$(parse_run_id_from_url "$URL")
                 if [ -z "$CANDIDATE_RUN_ID" ]; then
@@ -283,6 +355,7 @@ while true; do
                     FLAKE_DETECTED=1
                     FLAKE_LABEL="${CLASSIFICATION#flake/}"
                     FLAKE_RUN_ID="$CANDIDATE_RUN_ID"
+                    FLAKE_CHECK_NAME="$CHECK_NAME"
                     break
                 fi
             done <<EOF
@@ -300,6 +373,10 @@ EOF
                 echo "flake detected: ${FLAKE_LABEL} (run ${FLAKE_RUN_ID}) — auto-rerunning failed jobs and continuing to poll."
                 if gh run rerun "$FLAKE_RUN_ID" --repo "$REPO" --failed >/dev/null 2>&1; then
                     record_rerun_fired "$FLAKE_RUN_ID"
+                    # Append one structured JSONL line so downstream tooling
+                    # can aggregate flake frequencies (#4163). Best-effort —
+                    # never fails the polling loop.
+                    emit_flake_telemetry "$PR_NUMBER" "$SHA" "$FLAKE_RUN_ID" "$FLAKE_LABEL" "$FLAKE_CHECK_NAME"
                     # Sleep one poll interval so the new run has a moment to
                     # register before the next check-runs fetch.
                     sleep "$POLL_INTERVAL"

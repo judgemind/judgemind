@@ -178,6 +178,7 @@ run_script() {
     LOG_FAILED_FILE="${LOG_FAILED_FILE:-}" \
     RERUN_LOG_FILE="${RERUN_LOG_FILE:-}" \
     WAIT_FOR_CI_RERUN_SENTINEL_FILE="${WAIT_FOR_CI_RERUN_SENTINEL_FILE:-$tmpdir/rerun-sentinel}" \
+    WAIT_FOR_CI_FLAKE_LOG="${WAIT_FOR_CI_FLAKE_LOG:-$tmpdir/flakes-default.jsonl}" \
         "$SCRIPT_UNDER_TEST" "$@"
 }
 
@@ -715,6 +716,156 @@ LOG
     fi
 }
 
+# Test 14b (#4163): When auto-rerun fires for a known flake, exactly one
+# JSONL line is appended to WAIT_FOR_CI_FLAKE_LOG with the documented schema:
+# {ts, pr, sha, run_id, label, check_name}. Aggregators downstream depend on
+# the schema being stable.
+test_flake_telemetry_emits_jsonl_line() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "schema-drift-check" "25418711047"
+    write_all_success_response "$tmpdir/responses/02.json"
+
+    local log_file rerun_log flake_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    flake_log="$tmpdir/flakes.jsonl"
+    cat > "$log_file" << 'LOG'
+ERROR: postgres failed to start within 30 seconds
+LOG
+
+    local output exit_code
+    exit_code=0
+    output=$(LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        WAIT_FOR_CI_FLAKE_LOG="$flake_log" \
+        SHA_RESPONSE="75b03030deadbeef" \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        run_script "$tmpdir" 4162 --poll-interval 0 --timeout-secs 60 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "flake_telemetry: exits 0 after rerun + success poll"
+    else
+        fail "flake_telemetry: exits 0 after rerun + success poll" "exit=$exit_code output=$output"
+    fi
+
+    # AC#1: a single JSONL line with the expected fields.
+    if [ ! -f "$flake_log" ]; then
+        fail "flake_telemetry: jsonl log file exists" "expected at $flake_log"
+        return
+    fi
+
+    local line_count
+    line_count=$(wc -l < "$flake_log" | tr -d ' ')
+    if [ "$line_count" = "1" ]; then
+        pass "flake_telemetry: exactly one JSONL line written"
+    else
+        fail "flake_telemetry: exactly one JSONL line written" "line_count=$line_count contents=$(cat "$flake_log")"
+    fi
+
+    # The line must be valid JSON.
+    if jq -e . "$flake_log" >/dev/null 2>&1; then
+        pass "flake_telemetry: line is valid JSON"
+    else
+        fail "flake_telemetry: line is valid JSON" "contents=$(cat "$flake_log")"
+    fi
+
+    # Schema fields — assert each is present with the expected value.
+    local label pr_field run_id_field sha_field check_name ts_field
+    label=$(jq -r '.label' "$flake_log")
+    pr_field=$(jq -r '.pr' "$flake_log")
+    run_id_field=$(jq -r '.run_id' "$flake_log")
+    sha_field=$(jq -r '.sha' "$flake_log")
+    check_name=$(jq -r '.check_name' "$flake_log")
+    ts_field=$(jq -r '.ts' "$flake_log")
+
+    if [ "$label" = "postgres-startup" ]; then
+        pass "flake_telemetry: label=postgres-startup"
+    else
+        fail "flake_telemetry: label=postgres-startup" "got: $label"
+    fi
+
+    if [ "$pr_field" = "4162" ]; then
+        pass "flake_telemetry: pr=4162 (numeric, not quoted)"
+    else
+        fail "flake_telemetry: pr=4162" "got: $pr_field"
+    fi
+
+    if [ "$run_id_field" = "25418711047" ]; then
+        pass "flake_telemetry: run_id=25418711047 (numeric, not quoted)"
+    else
+        fail "flake_telemetry: run_id=25418711047" "got: $run_id_field"
+    fi
+
+    if [ "$sha_field" = "75b03030" ]; then
+        pass "flake_telemetry: sha=75b03030 (8-char short sha)"
+    else
+        fail "flake_telemetry: sha=75b03030" "got: $sha_field"
+    fi
+
+    if [ "$check_name" = "schema-drift-check" ]; then
+        pass "flake_telemetry: check_name=schema-drift-check"
+    else
+        fail "flake_telemetry: check_name=schema-drift-check" "got: $check_name"
+    fi
+
+    # ts must be ISO-8601 UTC with trailing Z.
+    if echo "$ts_field" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+        pass "flake_telemetry: ts is ISO-8601 UTC (suffix Z)"
+    else
+        fail "flake_telemetry: ts is ISO-8601 UTC" "got: $ts_field"
+    fi
+}
+
+# Test 14c (#4163 AC#3): Two flake events on different runs aggregate via the
+# documented one-liner `jq -r .label | sort | uniq -c`. This guards the
+# "no free-form prose" / "same fields every time" property.
+test_flake_telemetry_aggregatable() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    # Pre-seed the JSONL with two prior events, then the test produces a third.
+    local flake_log="$tmpdir/flakes.jsonl"
+    cat > "$flake_log" << 'JSONL'
+{"ts":"2026-05-04T01:02:03Z","pr":4100,"sha":"aaaaaaaa","run_id":99999,"label":"postgres-startup","check_name":"schema-drift-check"}
+{"ts":"2026-05-04T02:03:04Z","pr":4101,"sha":"bbbbbbbb","run_id":99998,"label":"postgres-startup","check_name":"schema-drift-check"}
+JSONL
+
+    write_failure_with_run_id_response "$tmpdir/responses/01.json" "unit-tests" "12345678"
+    write_all_success_response "$tmpdir/responses/02.json"
+
+    local log_file rerun_log
+    log_file="$tmpdir/log-failed.txt"
+    rerun_log="$tmpdir/rerun.log"
+    cat > "$log_file" << 'LOG'
+Cannot connect to the Docker daemon at unix:///var/run/docker.sock
+LOG
+
+    local exit_code
+    exit_code=0
+    LOG_FAILED_FILE="$log_file" RERUN_LOG_FILE="$rerun_log" \
+        WAIT_FOR_CI_FLAKE_LOG="$flake_log" \
+        SHA_RESPONSE="cccccccc" \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        run_script "$tmpdir" 4163 --poll-interval 0 --timeout-secs 60 >/dev/null 2>&1 || exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        fail "flake_telemetry_aggregatable: rerun + success poll exits 0" "exit=$exit_code"
+        return
+    fi
+
+    # AC#3: aggregator one-liner.
+    local agg
+    agg=$(jq -r .label "$flake_log" | sort | uniq -c | tr -s ' ' | sed 's/^ *//')
+    local expected
+    expected="1 docker-daemon
+2 postgres-startup"
+    if [ "$agg" = "$expected" ]; then
+        pass "flake_telemetry_aggregatable: jq -r .label | sort | uniq -c yields the leaderboard"
+    else
+        fail "flake_telemetry_aggregatable: jq -r .label | sort | uniq -c yields the leaderboard" "got: $agg"
+    fi
+}
+
 # Test 14 (#4148): --no-auto-rerun must disable the classifier path entirely
 # even when a flake pattern is present in the job log.
 test_no_auto_rerun_flag_disables_classifier() {
@@ -763,6 +914,8 @@ test_auto_rerun_on_postgres_startup_flake
 test_two_consecutive_flakes_exit_1
 test_real_failure_no_rerun
 test_no_auto_rerun_flag_disables_classifier
+test_flake_telemetry_emits_jsonl_line
+test_flake_telemetry_aggregatable
 
 echo ""
 echo "────────────────────────────────────────────"
