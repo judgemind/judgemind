@@ -492,10 +492,15 @@ class CourtListenerScraper(BaseScraper):
         if not plain_text_value and not html_text_value:
             return None
 
-        raw_content = json.dumps(
-            {"cluster": cluster, "opinion": opinion},
-            default=str,
-        ).encode("utf-8")
+        # Persist the resolved docket sub-resource alongside cluster + opinion
+        # so reingest / backfill paths can re-derive jurisdiction without
+        # re-fetching from the API.  cluster.court is empty in every
+        # CourtListener API response we capture today; the court reference
+        # is reachable only via docket.court (#4247).
+        envelope: dict[str, Any] = {"cluster": cluster, "opinion": opinion}
+        if docket:
+            envelope["docket"] = docket
+        raw_content = json.dumps(envelope, default=str).encode("utf-8")
 
         # Build source URL from the opinion's absolute_url or resource_uri
         opinion_id = opinion.get("id", "unknown")
@@ -579,13 +584,11 @@ class CourtListenerScraper(BaseScraper):
         )
         canonical_text = plain_text_value or html_text_value
 
-        # Extract court identifier from cluster.
-        # court field is typically a URL like "/api/rest/v4/courts/scotus/"
-        # — extract the short ID from the URL path.
-        court_id = cluster.get("court", "") or ""
-        if "/" in court_id:
-            parts = court_id.rstrip("/").split("/")
-            court_id = parts[-1] if parts else court_id
+        # Extract court identifier — prefer the resolved docket sub-resource
+        # because cluster.court is empty in every CourtListener API response
+        # we capture today (#4247).  Fall back to cluster.court for
+        # backward compatibility with old envelopes / future API shapes.
+        court_id = _resolve_court_id(cluster, docket)
 
         # Resolve jurisdiction from court_id mapping.
         # Default to ("Unknown", "Unknown") on miss and emit a structured warning
@@ -633,6 +636,42 @@ class CourtListenerScraper(BaseScraper):
             "precedential_status": cluster.get("precedential_status"),
             "citation_count": cluster.get("citation_count", 0),
         }
+
+
+def _resolve_court_id(
+    cluster: dict[str, Any],
+    docket: dict[str, Any] | None,
+) -> str:
+    """Resolve the CourtListener court short-id from a cluster + docket pair.
+
+    Resolution order (#4247):
+      1. ``docket.court`` if the docket sub-resource is present and the field is truthy.
+      2. ``cluster.court`` as backward-compat fallback.
+
+    The "court" field is typically a URL path like ``/api/rest/v4/courts/scotus/``;
+    the short-id is extracted from the last path segment.  Bare short-ids
+    (no slashes) are returned verbatim.
+
+    Returns an empty string when neither source has a usable reference.
+    The caller decides what to do on empty (today: fall back to config defaults).
+
+    Why docket-first: ``cluster.court`` is empty in every CourtListener API
+    response we capture today, so reading it first produces Federal/Federal
+    misclassification on every doc.  ``docket.court`` is reliably populated
+    on the resolved docket sub-resource.
+    """
+    candidates: list[str] = []
+    if docket:
+        candidates.append(str(docket.get("court") or ""))
+    candidates.append(str(cluster.get("court") or ""))
+    for raw in candidates:
+        if not raw:
+            continue
+        if "/" in raw:
+            parts = raw.rstrip("/").split("/")
+            return parts[-1] if parts and parts[-1] else raw
+        return raw
+    return ""
 
 
 def _extract_docket_number(

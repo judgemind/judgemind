@@ -2,9 +2,16 @@
 """Backfill CourtListener documents to correct (state, county) jurisdiction.
 
 Selects all documents rows whose scraper_id starts with 'federal-courtlistener'
-then reads the raw JSON from S3, extracts cluster.court, resolves (state, county)
-via _CL_COURT_ID_TO_JURISDICTION, and updates documents.court_id (plus the
+then reads the raw JSON from S3, extracts the court reference (preferring
+docket.court over cluster.court — see #4247), resolves (state, county) via
+_CL_COURT_ID_TO_JURISDICTION, and updates documents.court_id (plus the
 joined rulings.court_id) inside a transaction.
+
+For old envelopes that pre-date docket capture (#4043 / #4247) the script
+falls back to the live CourtListener ``/api/rest/v4/dockets/<id>/`` endpoint
+using ``cluster.docket_id`` (or the absolute docket URL on ``cluster.docket``)
+when ``--fetch-missing-dockets`` is passed. This is opt-in because each
+fallback fetch costs an API call against the CourtListener daily quota.
 
 Emits per-court rebucket counts to stdout for the verify-phase evidence comment.
 
@@ -20,9 +27,12 @@ Usage (local):
            scripts/backfill_courtlistener_jurisdiction.py --dry-run
 
 Options:
-    --dry-run     Show what would change without writing to DB.
-    --limit N     Maximum number of documents to process (default: unbounded).
-    --batch-size  Documents per transaction batch (default: 100).
+    --dry-run                  Show what would change without writing to DB.
+    --limit N                  Maximum number of documents to process (default: unbounded).
+    --batch-size               Documents per transaction batch (default: 100).
+    --fetch-missing-dockets    For old envelopes without a docket key, fetch the
+                               docket sub-resource live from CourtListener.
+                               Each fetch costs one API request.
 """
 
 # venv: scraper-framework
@@ -49,7 +59,11 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
-from courts.federal.courtlistener import _CL_COURT_ID_TO_JURISDICTION  # noqa: E402
+from courts.federal.courtlistener import (  # noqa: E402
+    _CL_COURT_ID_TO_JURISDICTION,
+    CourtListenerClient,
+    _resolve_court_id,
+)
 from framework.logging import configure_structlog  # noqa: E402
 from ingestion.db import upsert_court  # noqa: E402
 
@@ -83,6 +97,14 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Documents per transaction batch (default: 100).",
     )
+    parser.add_argument(
+        "--fetch-missing-dockets",
+        action="store_true",
+        help=(
+            "For old envelopes without a 'docket' key, fetch the docket "
+            "sub-resource live from CourtListener (one API call per doc)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -91,25 +113,99 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _extract_court_id_from_s3(
+def _read_envelope_from_s3(
     s3_client: Any, s3_bucket: str, s3_key: str
-) -> str | None:
-    """Read the raw JSON from S3 and extract the cluster.court short-id."""
+) -> dict[str, Any] | None:
+    """Read and parse the raw JSON envelope from S3.
+
+    Returns the parsed dict, or None on any failure (logged as a warning).
+    """
     try:
         response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
         raw = response["Body"].read()
         data = json.loads(raw)
-        cluster = data.get("cluster", {})
-        court_raw = cluster.get("court", "") or ""
-        if "/" in court_raw:
-            parts = court_raw.rstrip("/").split("/")
-            court_id = parts[-1] if parts else court_raw
-        else:
-            court_id = court_raw
-        return court_id if court_id else None
-    except Exception as exc:
-        logger.warning("Failed to read S3 object", s3_bucket=s3_bucket, s3_key=s3_key, error=str(exc))
+        if isinstance(data, dict):
+            return data
         return None
+    except Exception as exc:
+        logger.warning(
+            "Failed to read S3 object",
+            s3_bucket=s3_bucket,
+            s3_key=s3_key,
+            error=str(exc),
+        )
+        return None
+
+
+def _extract_court_id_from_envelope(
+    envelope: dict[str, Any],
+    *,
+    cl_client: CourtListenerClient | None = None,
+) -> str | None:
+    """Extract the resolved CourtListener court short-id from an S3 envelope.
+
+    Resolution order (#4247):
+      1. ``envelope['docket']['court']`` if the docket sub-resource is in the
+         envelope (newer captures after #4247 store it alongside cluster+opinion).
+      2. ``envelope['cluster']['court']`` for backward compatibility.
+      3. If ``cl_client`` is provided AND neither of the above yields a court,
+         fall back to fetching the docket live from CourtListener using
+         ``cluster.docket_id`` or the absolute URL on ``cluster.docket``.
+
+    Returns the short-id (e.g. ``"texapp14"``) or ``None`` on miss.
+    """
+    cluster = envelope.get("cluster") or {}
+    docket = (
+        envelope.get("docket") if isinstance(envelope.get("docket"), dict) else None
+    )
+
+    court_id = _resolve_court_id(cluster, docket)
+    if court_id:
+        return court_id
+
+    if cl_client is None:
+        return None
+
+    # Old envelope (pre-#4247) — no docket captured.  Live-fetch.
+    docket_url = cluster.get("docket")
+    if not docket_url:
+        docket_id = cluster.get("docket_id")
+        if not docket_id:
+            return None
+        # Build the absolute URL — the API base lives on the client.
+        from courts.federal.courtlistener import API_BASE_URL  # noqa: E402
+
+        docket_url = f"{API_BASE_URL}/dockets/{docket_id}/"
+
+    try:
+        fetched_docket = cl_client.fetch_docket(docket_url)
+    except Exception as exc:
+        logger.warning(
+            "Live docket fetch failed during backfill",
+            docket_url=docket_url,
+            error=str(exc),
+        )
+        return None
+
+    court_id = _resolve_court_id(cluster, fetched_docket)
+    return court_id if court_id else None
+
+
+def _extract_court_id_from_s3(
+    s3_client: Any,
+    s3_bucket: str,
+    s3_key: str,
+    *,
+    cl_client: CourtListenerClient | None = None,
+) -> str | None:
+    """Read the raw JSON from S3 and extract the resolved court short-id.
+
+    Reads the envelope from S3 and delegates to ``_extract_court_id_from_envelope``.
+    """
+    envelope = _read_envelope_from_s3(s3_client, s3_bucket, s3_key)
+    if envelope is None:
+        return None
+    return _extract_court_id_from_envelope(envelope, cl_client=cl_client)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +273,7 @@ def run_backfill(
     dry_run: bool,
     limit: int,
     batch_size: int,
+    cl_client: CourtListenerClient | None = None,
 ) -> dict[str, dict[str, int]]:
     """Run the backfill and return per-court rebucket counts.
 
@@ -188,7 +285,9 @@ def run_backfill(
     # Per-court stats: court_id -> {original_state: count}
     rebucket_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    batch: list[tuple[str, str, str, str]] = []  # (doc_id, new_court_id, new_state, new_county)
+    batch: list[
+        tuple[str, str, str, str]
+    ] = []  # (doc_id, new_court_id, new_state, new_county)
 
     def _flush_batch(batch: list[tuple[str, str, str, str]]) -> None:
         if not batch or dry_run:
@@ -209,9 +308,13 @@ def run_backfill(
             rebucket_counts["_no_s3"]["skipped"] += 1
             continue
 
-        court_id = _extract_court_id_from_s3(s3_client, s3_bucket, s3_key)
+        court_id = _extract_court_id_from_s3(
+            s3_client, s3_bucket, s3_key, cl_client=cl_client
+        )
         if not court_id:
-            logger.warning("Could not extract court_id from S3 — skipping", doc_id=doc_id)
+            logger.warning(
+                "Could not extract court_id from S3 — skipping", doc_id=doc_id
+            )
             rebucket_counts["_unknown"]["skipped"] += 1
             continue
 
@@ -281,14 +384,18 @@ def main() -> None:
         logger.error("DATABASE_URL environment variable not set")
         sys.exit(1)
 
-    s3_bucket_env = os.environ.get("S3_BUCKET", "")
     s3_client = boto3.client("s3")
+
+    cl_client: CourtListenerClient | None = None
+    if args.fetch_missing_dockets:
+        cl_client = CourtListenerClient()
 
     logger.info(
         "Starting CourtListener jurisdiction backfill",
         dry_run=args.dry_run,
         limit=args.limit,
         batch_size=args.batch_size,
+        fetch_missing_dockets=args.fetch_missing_dockets,
     )
 
     with psycopg.connect(database_url) as conn:
@@ -298,6 +405,7 @@ def main() -> None:
             dry_run=args.dry_run,
             limit=args.limit,
             batch_size=args.batch_size,
+            cl_client=cl_client,
         )
 
     # Print summary table
