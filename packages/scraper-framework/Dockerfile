@@ -77,6 +77,18 @@ COPY scripts/check-scraper-zero-record-runner.py /app/scripts/check-scraper-zero
 COPY scripts/check-scraper-zero-record-streak.py /app/scripts/check-scraper-zero-record-streak.py
 COPY scripts/notify-telegram.sh /app/scripts/notify-telegram.sh
 
+# Embed the operator-only reingest/rebuild scripts that target the
+# ingestion-worker image via `scripts/ecs-run-task.sh`.  These are run
+# frequently for backfills, carry-forward sweeps, cache-bust reingest,
+# and county-scoped rebuilds, and the ecs-run-task.sh path uploads them
+# via S3 every time -- baking them into the image lets operators invoke
+# them directly as `python /app/scripts/<name>.py` without the runtime
+# download dance, and pins the executed code to the image build SHA
+# instead of whatever happens to be at HEAD when the task fires.  The
+# combined ~280 KB image-size impact is negligible.  See #4288.
+COPY scripts/reingest_from_s3.py /app/scripts/reingest_from_s3.py
+COPY scripts/rebuild_db.py /app/scripts/rebuild_db.py
+
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
 
