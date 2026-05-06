@@ -90,7 +90,17 @@ Before filing a "does X" / "enable X" / "add X" issue, run a single command that
   ```
   Already fixed if: the offending code path no longer exists, or a recent commit message references the fix.
 
-**Decision after probing:** If the gap is genuinely absent (the feature/setting/doc does not yet exist), file the issue normally. If the gap is already satisfied, either close the draft or pivot scope to a doc-only update that confirms the current state (e.g., "document that Container Insights is enabled and cite the Terraform attribute"). If the probe is ambiguous, treat as real and file normally — agents can do their own probe at pickup time per Step 4b in `.claude/skills/task/SKILL.md`.
+- **`fix(test)` — failing test reproduction** → for any "the test currently fails" issue, re-run the failing test (or grep) against current `origin/main` — **not** your worktree branch — before filing. Worktree branches lag behind `main` the moment they're cut, so a baseline measurement taken from one is stale by definition.
+  ```
+  git fetch origin main
+  git switch --detach origin/main
+  ./scripts/tests/<failing-test>.sh 2>&1 | grep "FAIL"   # whatever the verify line is
+  # …or for pytest:
+  pytest packages/<pkg>/tests/<test_path> -k <failing_test> -x
+  ```
+  Already fixed if: the verify command returns clean (exit 0, no FAIL output) — a load-bearing PR merged after your baseline was captured. The fix in #4173 (macOS jq-1.6 empty-file salvage-prelude) had merged 7.5 hours before #4178 was filed on a stale baseline; running the verify line at file time would have surfaced that immediately. Cite the merging PR in the close comment.
+
+**Decision after probing:** If the gap is genuinely absent (the feature/setting/doc does not yet exist), file the issue normally. If the gap is already satisfied, either close the draft, pivot scope to a doc-only update that confirms the current state (e.g., "document that Container Insights is enabled and cite the Terraform attribute"), or — for `fix(test)` issues whose ACs are exhausted by "the test passes" — skip filing and post the verification-only evidence elsewhere (a comment on the parent issue, or no action at all). If the probe is ambiguous, treat as real and file normally — agents can do their own probe at pickup time per Step 4b in `.claude/skills/task/SKILL.md`.
 
 ## Priority Framework
 
