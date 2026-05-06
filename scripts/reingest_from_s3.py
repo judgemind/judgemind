@@ -718,14 +718,23 @@ def apply_post_extraction_guards(
         extracted["judge_name"] = None
         methods.pop("judge_name", None)
 
-    # Hearing date plausibility guard
+    # Hearing date plausibility guard.
+    #
+    # Probate departments publish multi-week master calendars (#4251) — pass
+    # ``case_type`` so the helper widens the window for ``"probate"``.  Civil
+    # tentatives use the default ±14 day window.
     hearing_date_value = extracted.get("hearing_date")
     if hearing_date_value is not None and capture_timestamp is not None:
-        if not is_plausible_hearing_date(hearing_date_value, capture_timestamp):
+        if not is_plausible_hearing_date(
+            hearing_date_value,
+            capture_timestamp,
+            case_type=extracted.get("case_type"),
+        ):
             logger.info(
                 "post-extraction guard: rejected implausible hearing_date",
                 hearing_date=hearing_date_value,
                 capture_timestamp=capture_timestamp,
+                case_type=extracted.get("case_type"),
             )
             extracted["hearing_date"] = None
             methods.pop("hearing_date", None)
@@ -736,6 +745,7 @@ def finalize_hearing_date(
     extracted_hearing: date | None,
     doc_meta_hearing: date | None,
     capture_timestamp: datetime | None,
+    case_type: str | None = None,
 ) -> date | None:
     """Return the final hearing_date to write, or None if no plausible value.
 
@@ -772,6 +782,10 @@ def finalize_hearing_date(
         ``is_plausible_hearing_date``.  When ``None``, plausibility cannot
         be checked and the first non-None candidate wins (permissive —
         don't drop data we can't verify).
+    case_type : str | None
+        Optional case type passed through to ``is_plausible_hearing_date``.
+        ``"probate"`` widens the window to ±60 days (#4251); other values
+        (and ``None``) keep the civil ±14 day default.
 
     Returns
     -------
@@ -781,7 +795,7 @@ def finalize_hearing_date(
     for candidate in (extracted_hearing, doc_meta_hearing):
         if candidate is None:
             continue
-        if is_plausible_hearing_date(candidate, capture_timestamp):
+        if is_plausible_hearing_date(candidate, capture_timestamp, case_type=case_type):
             return candidate
     return None
 
@@ -2900,11 +2914,12 @@ def reingest_batch(
                     # #2456: single chokepoint owns the fallback chain +
                     # plausibility check so no fallback branch can bypass
                     # the #2370 guard.  See ``finalize_hearing_date`` for
-                    # the full rationale (#2370 / #2405 / #2432).
+                    # the full rationale (#2370 / #2405 / #2432 / #4251).
                     effective_hearing = finalize_hearing_date(
                         extracted_hearing=extracted["hearing_date"],
                         doc_meta_hearing=doc_meta["hearing_date"],
                         capture_timestamp=doc_meta.get("captured_at"),
+                        case_type=extracted.get("case_type"),
                     )
 
                     # For split documents, generate a synthetic content hash

@@ -3145,6 +3145,103 @@ class TestIsPlausibleHearingDate:
         hearing = date(2026, 5, 14)
         assert is_plausible_hearing_date(hearing, None) is True
 
+    # ------------------------------------------------------------------
+    # case_type-aware windowing (#4251)
+    #
+    # Probate departments publish multi-week master calendars in a single
+    # PDF (e.g. CC dept 38 publishes 4-16 hearings spanning 30+ days at a
+    # time).  The civil ±14 day window incorrectly rejects these correctly-
+    # extracted regex dates.  Passing ``case_type="probate"`` widens the
+    # window to ±60 days.
+    # ------------------------------------------------------------------
+
+    def test_probate_future_30_days_is_plausible_with_case_type(self) -> None:
+        """A probate hearing 30 days after capture is plausible — civil's
+        ±14 day default would reject it, but probate's ±60 day window accepts."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 12, 0, 0)
+        hearing = date(2026, 5, 26)  # +30 days
+        # Without case_type: rejected by civil window
+        assert is_plausible_hearing_date(hearing, capture) is False
+        # With case_type="probate": accepted by widened window
+        assert is_plausible_hearing_date(hearing, capture, case_type="probate") is True
+
+    def test_probate_past_24_days_is_plausible_with_case_type(self) -> None:
+        """Dept 38 master calendars publish hearings already past — captured
+        2026-04-26 with a 2026-04-02 entry, delta=-24 days.  Civil rejects;
+        probate accepts (#4251)."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 19, 17, 8)
+        hearing = date(2026, 4, 2)  # -24 days
+        assert is_plausible_hearing_date(hearing, capture) is False
+        assert is_plausible_hearing_date(hearing, capture, case_type="probate") is True
+
+    def test_probate_future_17_days_is_plausible_with_case_type(self) -> None:
+        """Specific reproduction of the dept-38 sample2 NULL case — capture
+        2026-04-26, hearing 2026-05-13 (+17 days).  Civil rejects; probate
+        accepts (#4251)."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 19, 17, 8)
+        hearing = date(2026, 5, 13)  # +17 days
+        assert is_plausible_hearing_date(hearing, capture) is False
+        assert is_plausible_hearing_date(hearing, capture, case_type="probate") is True
+
+    def test_probate_far_future_still_rejected(self) -> None:
+        """Even with the wider probate window, a 90-day-out date is still
+        rejected — that's almost certainly a continuance, not the hearing."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 12, 0, 0)
+        hearing = date(2026, 7, 26)  # +91 days, beyond the 60-day probate window
+        assert is_plausible_hearing_date(hearing, capture, case_type="probate") is False
+
+    def test_civil_case_type_uses_default_window(self) -> None:
+        """Non-probate case_types fall through to the civil ±14 day default."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 12, 0, 0)
+        hearing = date(2026, 5, 26)  # +30 days
+        # case_type="civil" should NOT widen the window — only "probate" does.
+        assert is_plausible_hearing_date(hearing, capture, case_type="civil") is False
+        assert is_plausible_hearing_date(hearing, capture, case_type="family") is False
+        assert is_plausible_hearing_date(hearing, capture, case_type="criminal") is False
+
+    def test_explicit_window_overrides_case_type_default(self) -> None:
+        """Passing ``past_days`` / ``future_days`` explicitly takes precedence
+        over the case_type default — preserves backwards-compat for callers
+        that already tune the window manually."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 4, 26, 12, 0, 0)
+        hearing = date(2026, 5, 26)  # +30 days
+        # Probate default would accept this, but explicit ±5 day override
+        # rejects regardless of case_type.
+        assert (
+            is_plausible_hearing_date(
+                hearing,
+                capture,
+                past_days=5,
+                future_days=5,
+                case_type="probate",
+            )
+            is False
+        )
+
 
 class TestDedupeRepeatedTitleEdgeCases:
     """Branch coverage for dedupe_repeated_title() edge cases (#2370)."""
