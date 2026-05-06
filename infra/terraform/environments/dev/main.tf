@@ -826,6 +826,47 @@ output "zero_record_check_schedule_arn" {
   value       = module.scraper_zero_record_check.schedule_arn
 }
 
+# ─── Scraper field-population audit (EventBridge, #4255) ─────────────────────
+# Daily probe that samples recent S3 envelopes and asserts that load-
+# bearing JSON fields (e.g. CourtListener's docket.court) are non-empty.
+# Catches the silent-drift bug class behind #4247 and #3885 within ~24 h
+# instead of weeks.
+#
+# Reuses the dispatcher PAT (judgemind/dispatcher/github-token) -- same
+# secret already wired into scraper-zero-record-check for issue-write.
+module "scraper_field_population_audit" {
+  source = "../../modules/scraper-field-population-audit"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecs_cluster_arn    = module.compute.cluster_arn
+
+  ecr_repository_url       = module.ecr.repository_url
+  task_execution_role_arn  = module.compute.task_execution_role_arn
+  db_connection_secret_arn = module.database.db_connection_secret_arn
+
+  document_archive_bucket_name = module.document_archive.bucket_id
+  document_archive_bucket_arn  = module.document_archive.bucket_arn
+
+  # Reuse the dispatcher PAT -- already has issues:write per #2700.
+  github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+
+  gh_repo            = "judgemind/judgemind"
+  log_retention_days = 14
+  schedule_enabled   = true
+}
+
+output "field_population_audit_log_group" {
+  description = "Dev CloudWatch log group for field-population audit output"
+  value       = module.scraper_field_population_audit.log_group_name
+}
+
+output "field_population_audit_schedule_arn" {
+  description = "Dev EventBridge schedule ARN for the daily field-population audit"
+  value       = module.scraper_field_population_audit.schedule_arn
+}
+
 output "scraper_log_group" {
   description = "Dev CloudWatch log group for scraper output"
   value       = module.compute.log_group_name
