@@ -158,6 +158,18 @@ variable "diagnoser_fallback_threshold" {
   default     = 2
 }
 
+variable "scheduler_tick_cadence_threshold_seconds" {
+  description = "Threshold (seconds) for the dispatcher-scheduler-tick-cadence-slow alarm. Fires when p95 of TickCadenceSeconds exceeds this value over scheduler_tick_cadence_window_seconds. Default 90 -- well above the 30s healthy cadence and the 60s worst-case ceiling per #2847, so a slip past 90s is unambiguously broken. Distinct from the #3097 stall watchdog (60s WARN / 120s EXIT in the daemon process); this alarm catches a slow-but-running scheduler before it wedges. See #2854."
+  type        = number
+  default     = 90
+}
+
+variable "scheduler_tick_cadence_window_seconds" {
+  description = "CloudWatch alarm period (seconds) for the dispatcher-scheduler-tick-cadence-slow alarm. Default 300 (5 min) -- short enough for fast detection during a real cadence regression, long enough that the p95 statistic is robust against single-tick noise. Pairs with scheduler_tick_cadence_threshold_seconds to define the alarm. See #2854."
+  type        = number
+  default     = 300
+}
+
 # ─── Oneshot task launcher (scripts/ecs-run-task.sh) ────────────────────────
 # When these ARNs are wired, the daemon's task role gets the permission set
 # required by `scripts/ecs-run-task.sh` so ralph phases can launch data
