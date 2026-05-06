@@ -348,6 +348,115 @@ class TestFirstChildExhaustionDoesNotAbortSiblings:
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
     @patch("ingestion.worker.psycopg")
+    def test_la_html_split_passes_judge_name_through(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """LA HTML: split_event carries LASplitRuling.judge_name through to dispatch (AC3, #4282).
+
+        Without this pass-through, dept-25 rulings whose HTML uses the
+        JUDGE/DEPT form-layout header fall through to the directory's
+        primary-assignment judge (Latrice A. G. Byrdsong) instead of the
+        day-of-bench judge (Mkrtchyan) named in the document text.
+        """
+        from courts.ca.la_tentatives import LASplitRuling
+
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # One LASplitRuling with a non-None judge_name.  The worker should
+        # surface that value in the dispatched split_event so downstream
+        # process_event sees a populated judge_name and skips the
+        # dept-to-judge directory fallback.
+        fake_rulings = [
+            LASplitRuling(
+                ruling_index=0,
+                case_number="25STLC05162",
+                ruling_text="LA ruling for dept-25 — Mkrtchyan presiding.",
+                department="25",
+                judge_name="Mkrtchyan",
+            )
+        ]
+        call_log, side_effect = self._make_side_effect(worker)
+
+        with (
+            patch("courts.ca.la_tentatives.is_la_html", return_value=True),
+            patch("courts.ca.la_tentatives._split_rulings", return_value=fake_rulings),
+        ):
+            event = _make_la_event()
+            from ingestion.worker import _try_la_html_split
+
+            _try_la_html_split(event, event["document_id"], event["ruling_text"], side_effect)
+
+        split_calls = [c for c in call_log if c.get("_split_processed")]
+        assert len(split_calls) == 1
+        # AC3 verification: the split_event passed to dispatch carries
+        # judge_name=Mkrtchyan.
+        assert split_calls[0]["judge_name"] == "Mkrtchyan"
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_la_html_split_falls_back_to_event_judge_name(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """LA HTML: when sr.judge_name is None, fall back to event_data['judge_name'] (#4282).
+
+        Preserves the pre-fix behaviour for split rulings whose HTML
+        carries no JUDGE/DEPT or signature line — the original event's
+        judge_name (e.g. seeded from the DB on a reingest) flows through
+        instead of being clobbered to None.
+        """
+        from courts.ca.la_tentatives import LASplitRuling
+
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        fake_rulings = [
+            LASplitRuling(
+                ruling_index=0,
+                case_number="25STLC05162",
+                ruling_text="LA ruling with no JUDGE/DEPT or signature line.",
+                department="25",
+                judge_name=None,
+            )
+        ]
+        call_log, side_effect = self._make_side_effect(worker)
+
+        with (
+            patch("courts.ca.la_tentatives.is_la_html", return_value=True),
+            patch("courts.ca.la_tentatives._split_rulings", return_value=fake_rulings),
+        ):
+            event = _make_la_event(judge_name="DB Seeded Judge")
+            from ingestion.worker import _try_la_html_split
+
+            _try_la_html_split(event, event["document_id"], event["ruling_text"], side_effect)
+
+        split_calls = [c for c in call_log if c.get("_split_processed")]
+        assert len(split_calls) == 1
+        # Fallback: when sr.judge_name is None, use event_data['judge_name'].
+        assert split_calls[0]["judge_name"] == "DB Seeded Judge"
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
     def test_fresno_pdf_first_child_exhaustion(
         self,
         mock_psycopg: MagicMock,

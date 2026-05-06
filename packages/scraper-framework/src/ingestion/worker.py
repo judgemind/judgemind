@@ -351,9 +351,13 @@ def _try_la_html_split(
                 else str(sr.hearing_date)
             )
 
-        # LASplitRuling has no judge_name field — preserve whatever the scraper
-        # provided in the original event (LA judge_name is resolved from the
-        # dept-to-judge directory snapshot).
+        # ``LASplitRuling.judge_name`` carries the in-document presiding judge
+        # extracted from the per-case HTML (JUDGE/DEPT form-layout header or
+        # "<Name> Judge of the Superior Court" signature line, #4282).  When
+        # present it must take precedence over both the original event's
+        # judge_name and the downstream dept-to-judge directory fallback —
+        # otherwise dept-25 Mkrtchyan rulings get misattributed to the
+        # directory's primary-assignment judge (Latrice A. G. Byrdsong).
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -371,6 +375,7 @@ def _try_la_html_split(
             "outcome": sr.outcome or event_data.get("outcome"),
             "hearing_date": hearing_date_value or event_data.get("hearing_date"),
             "parties": sr.parties if sr.parties else event_data.get("parties", []),
+            "judge_name": sr.judge_name or event_data.get("judge_name"),
         }
         try:
             dispatch(split_event)

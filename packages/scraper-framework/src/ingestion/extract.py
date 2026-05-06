@@ -839,6 +839,28 @@ def normalize_motion_type(motion_type: str) -> str | None:
 # names from ruling text that was already stored in the database.
 
 _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
+    # LA: "JUDGE/DEPT: <Surname>/<dept>" form-layout header (Dept-25
+    # Mkrtchyan pattern, #2578 / #4282).  Some LA dept pages print the
+    # presiding judge as a surname followed by a slash and the
+    # department identifier in a header row.  This must come BEFORE the
+    # signature-line pattern below: when both are present, JUDGE/DEPT
+    # carries the day-of-bench judge for the dept whereas the signature
+    # line is sometimes from a different judge who issued an earlier
+    # related order.  The surname may be a single word (Mkrtchyan) or a
+    # compound (Van Der Berg, O'Connor, etc.).  The character class
+    # mirrors ``courts/ca/la_tentatives._JUDGE_DEPT_RE``: letters plus
+    # ``-`` ``'`` ``.`` and space.  We stop at the first ``/`` followed
+    # by a short dept token (alphanumeric, <=8 chars) so trailing
+    # caption text never gets swallowed.  This pattern is the
+    # defense-in-depth fallback — the la_tentatives split path
+    # (``_split_rulings``) populates ``LASplitRuling.judge_name`` with
+    # the same regex earlier in the pipeline (#4282).
+    re.compile(
+        r"JUDGE\s*/\s*DEPT\s*:\s*"
+        r"(?P<judge_name>[A-Za-z][A-Za-z\-\'\. ]*?)"
+        r"\s*/\s*[A-Za-z0-9]{1,8}\b",
+        re.IGNORECASE,
+    ),
     # LA: "William A. Crowfoot Judge of the Superior Court" (now case-insensitive
     # to also match "JARED D. MOSES JUDGE OF THE SUPERIOR COURT").
     #

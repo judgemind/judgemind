@@ -575,6 +575,54 @@ class TestExtractJudgeName:
         text = "Judge Sarah Wu"
         assert extract_judge_name(text) == "Sarah Wu"
 
+    # --- LA JUDGE/DEPT form-layout pattern (#4282) ---
+
+    def test_la_judge_dept_form_layout_simple(self) -> None:
+        """LA JUDGE/DEPT: <surname>/<dept> form-layout header (#4282).
+
+        Defense-in-depth fallback for the case where the la_tentatives
+        split path was bypassed.  The pattern lives at index 0 of
+        _JUDGE_NAME_PATTERNS so it fires before the broader
+        signature-line pattern.
+        """
+        text = "HEARING DATE: April 7, 2026 JUDGE/DEPT: Mkrtchyan/25 CASE NAME: Foo v. Bar"
+        assert extract_judge_name(text) == "Mkrtchyan"
+
+    def test_la_judge_dept_form_layout_compound_surname(self) -> None:
+        """JUDGE/DEPT pattern accepts compound surnames with internal spaces."""
+        text = "JUDGE/DEPT: Van Der Berg/F46 CASE NAME: Acme v. Beta"
+        assert extract_judge_name(text) == "Van Der Berg"
+
+    def test_la_judge_dept_form_layout_apostrophe_surname(self) -> None:
+        """JUDGE/DEPT pattern accepts apostrophe-bearing surnames (O'Connor)."""
+        text = "JUDGE/DEPT: O'Connor/12 CASE NAME: Acme v. Beta"
+        assert extract_judge_name(text) == "O'Connor"
+
+    def test_la_judge_dept_form_layout_alphanumeric_dept(self) -> None:
+        """Department token may be alphanumeric (P, F46, etc.)."""
+        text = "JUDGE/DEPT: Smith/F46 CASE NAME: Foo v. Bar"
+        assert extract_judge_name(text) == "Smith"
+
+    def test_la_judge_dept_takes_precedence_over_signature_line(self) -> None:
+        """When both patterns are present, JUDGE/DEPT wins (#4282).
+
+        The JUDGE/DEPT line carries the day-of-bench judge for the dept;
+        the signature line is sometimes from a different judge who
+        signed an earlier related order.  The pattern ordering in
+        _JUDGE_NAME_PATTERNS encodes this precedence.
+        """
+        text = (
+            "HEARING DATE: April 7, 2026 JUDGE/DEPT: Mkrtchyan/25\n"
+            "Some case ruling text here.\n"
+            "William A. Crowfoot Judge of the Superior Court"
+        )
+        assert extract_judge_name(text) == "Mkrtchyan"
+
+    def test_la_judge_dept_lowercase_label(self) -> None:
+        """Pattern is case-insensitive (handles 'judge/dept:' too)."""
+        text = "judge/dept: Mkrtchyan/25 case name: Foo v. Bar"
+        assert extract_judge_name(text) == "Mkrtchyan"
+
 
 # ---------------------------------------------------------------------------
 # _looks_like_person_name validation

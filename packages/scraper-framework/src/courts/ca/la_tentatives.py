@@ -340,6 +340,13 @@ class LASplitRuling:
     hearing_date: datetime | None = None
     department: str | None = None
     parties: list[dict[str, str]] = dataclass_field(default_factory=list)
+    # In-document judge name extracted from the per-case HTML (#4282).  Captures
+    # both the "JUDGE/DEPT: <Surname>/<dept>" form-layout header (Dept-25
+    # Mkrtchyan pattern, #2578) and the "<Name> Judge of the Superior Court"
+    # signature line.  When non-None, downstream worker / reingest paths must
+    # prefer this value over the dept-to-judge directory fallback so day-of-
+    # bench judge attributions match the document text.
+    judge_name: str | None = None
 
 
 LA_SYSTEM_PROMPT = (
@@ -708,13 +715,19 @@ def _replace_ruling_text_from_html(
 
     Modifies ``rulings`` in-place.  If chunking fails or produces no
     results, leaves the LLM-generated text unchanged.
+
+    Also populates ``LASplitRuling.judge_name`` from the matched chunk
+    when the chunk's HTML carries a deterministic JUDGE/DEPT or
+    "Judge of the Superior Court" line (#4282).  Keeps the LLM and regex
+    split paths in sync — both produce ``LASplitRuling`` objects with the
+    same in-document precedence for judge attribution.
     """
     case_htmls = _split_cases_html(ruling_html)
     if not case_htmls:
         return
 
-    # Build a map from case number to (plain_text, sanitized_html).
-    chunk_data: list[tuple[str | None, str, str | None]] = []
+    # Build a map from case number to (plain_text, sanitized_html, judge_name).
+    chunk_data: list[tuple[str | None, str, str | None, str | None]] = []
     for html_chunk in case_htmls:
         soup = BeautifulSoup(html_chunk, "lxml")
         content = soup.find("div", id="speechSynthesis")
@@ -728,19 +741,29 @@ def _replace_ruling_text_from_html(
         # Extract case number from this chunk for matching.
         case_num_match = _CASE_NUMBER_RE.search(text)
         case_num = case_num_match.group(1) if case_num_match else None
-        chunk_data.append((case_num, text, sanitized))
+        # Extract per-chunk judge_name (#4282) — propagated to the LLM
+        # ruling at match time below.
+        chunk_judge = _extract_judge_name_from_case_section(content, text)
+        chunk_data.append((case_num, text, sanitized, chunk_judge))
 
     # Match each ruling to its HTML chunk.
     for ruling in rulings:
         matched_text: str | None = None
         matched_html: str | None = None
+        matched_judge: str | None = None
 
         if ruling.case_number:
             # Try case-number match.
-            for chunk_case_num, chunk_text, chunk_html in chunk_data:
+            for (
+                chunk_case_num,
+                chunk_text,
+                chunk_html,
+                chunk_judge,
+            ) in chunk_data:
                 if chunk_case_num and chunk_case_num == ruling.case_number:
                     matched_text = chunk_text
                     matched_html = chunk_html
+                    matched_judge = chunk_judge
                     break
             # If case_number was present but didn't match any chunk, do NOT
             # fall back to positional matching — that risks assigning text
@@ -758,11 +781,67 @@ def _replace_ruling_text_from_html(
             if 0 <= idx < len(chunk_data):
                 matched_text = chunk_data[idx][1]
                 matched_html = chunk_data[idx][2]
+                matched_judge = chunk_data[idx][3]
 
         if matched_text and len(matched_text) > 100:
             ruling.ruling_text = matched_text
         if matched_html:
             ruling.ruling_text_html = matched_html
+        # Only overwrite judge_name when the regex actually matched in the
+        # chunk — never clobber a non-None LLM-extracted judge_name with
+        # ``None`` from a chunk that lacked a JUDGE/DEPT or signature line.
+        if matched_judge and not ruling.judge_name:
+            ruling.judge_name = matched_judge
+
+
+def _extract_judge_name_from_case_section(
+    content: BeautifulSoup | None,
+    full_text: str,
+) -> str | None:
+    """Extract a judge name from a single LA per-case HTML section (#4282).
+
+    Mirrors the strategy used by :func:`_extract_ruling_fields` (lines
+    1820-1835) so that the deterministic, non-LLM split path
+    (:func:`_split_rulings`) populates ``LASplitRuling.judge_name`` with the
+    same in-document precedence order as the live-capture / single-doc
+    parse path.
+
+    Strategies, in order:
+
+    1. **JUDGE/DEPT form-layout header** (``JUDGE/DEPT: <Surname>/<dept>``):
+       LA Dept-25 Mkrtchyan pattern (#2578).  Some LA dept pages print the
+       presiding judge as a surname followed by ``/`` and the department
+       identifier in a header row.  The classic
+       "<Name> Judge of the Superior Court" signature regex never matches
+       these pages.
+    2. **Signature line** (``<Name> Judge of the Superior Court``):
+       The traditional LA judge signature appearing on its own ``<div>``
+       at the foot of the ruling.
+
+    Returns the matched name with whitespace collapsed, or ``None`` when
+    neither pattern matches.  Callers that want the broader cross-court
+    regex fallback (LA ALL-CAPS, SB / SF / Riverside / OC patterns from
+    :data:`ingestion.extract._JUDGE_NAME_PATTERNS`) should run that
+    fallback at the worker / reingest layer to keep this helper free of
+    cross-package imports.
+    """
+    # Strategy 1: JUDGE/DEPT form-layout header.
+    judge_dept_match = _JUDGE_DEPT_RE.search(full_text)
+    if judge_dept_match:
+        return " ".join(judge_dept_match.group("name").split())
+
+    # Strategy 2: <X> Judge of the Superior Court signature div.  Only
+    # walked when content is a real BeautifulSoup element — the soup-less
+    # branch falls back to ``None`` since the regex requires HTML structure
+    # and the strategy-1 search above already covered the plain-text case.
+    if content is not None:
+        for div in content.find_all("div"):
+            div_text = div.get_text(separator=" ", strip=True)
+            m = _JUDGE_DIV_RE.match(div_text)
+            if m:
+                return " ".join(m.group(1).split())
+
+    return None
 
 
 def _split_rulings(text: str) -> list[LASplitRuling]:
@@ -775,8 +854,12 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
     The ``text`` parameter is the raw HTML content (for HTML documents,
     ``_extract_text_from_content()`` returns the decoded HTML string).
 
-    Uses ``_split_cases_html()`` for splitting and ``_extract_ruling_fields()``
-    for per-case field extraction via BeautifulSoup.
+    Uses ``_split_cases_html()`` for splitting and per-case BeautifulSoup
+    extraction for header fields, case title, parties, and judge name.
+    The ``judge_name`` field captures the in-document presiding judge so
+    downstream worker / reingest paths can attribute the ruling to the
+    day-of-bench judge instead of the directory's primary-assignment
+    fallback (#4282).
 
     Returns an empty list if no case sections are found.
     """
@@ -821,6 +904,13 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
                 if isinstance(p, dict) and p.get("name") and p.get("role"):
                     parties.append({"name": str(p["name"]), "role": str(p["role"])})
 
+        # Extract in-document judge name (#4282).  Critical for LA pages whose
+        # HTML uses the JUDGE/DEPT form-layout header — without this, the
+        # downstream regex fallback in worker.py / reingest_from_s3.py never
+        # finds the day-of-bench judge and falls through to the directory's
+        # primary-assignment fallback for the department.
+        judge_name = _extract_judge_name_from_case_section(content, ruling_text)
+
         rulings.append(
             LASplitRuling(
                 ruling_index=idx + 1,
@@ -833,6 +923,7 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
                 hearing_date=header.hearing_date,
                 department=header.department,
                 parties=parties,
+                judge_name=judge_name,
             )
         )
 
