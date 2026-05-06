@@ -52,6 +52,25 @@ This is the single most-violated rule. A criterion without a `Verify:` line is a
 
 When a criterion is genuinely subjective (visual design, prose quality), say so explicitly: `Verify: reviewer confirms on read-through.`
 
+### 3a. Verify-pass-already check — skip filing when the verify command already passes
+
+**Run every `Verify:` command on the post-edit tree before calling `gh issue create`. If a criterion's `Verify:` already passes, that criterion is already satisfied and the issue should not be filed at all.**
+
+This is the single most-violated rule for audit-style PRs that resolve a finding **inline** (the audit PR ships the fix in the same commit) AND also file a follow-up issue for "future tracking". The follow-up arrives `agent/ready` against work that already landed on `main`, a /task agent claims it, and the gap-probe in the `/task` skill (Step 4b) immediately discovers the AC is satisfied — costing one full claim → setup → gap-probe → close cycle (~5 minutes of agent time plus several GitHub API writes for label edits and the close comment).
+
+Concrete recurrence — **#4135 / #4136**: the audit PR (#4136) shipped the docstring update that #4135 asked for in the same commit, but the audit also filed #4135 as a follow-up. The /task agent that picked up #4135 found AC #1 already satisfied at claim time and closed it as a no-op. The audit PR's commit message even predicted this — the human author knew the docstring delta was inline and intended only the structural refactors to be tracked as follow-ups, but the issue-filing step did not check whether the verify command would already pass and #4135 went out anyway.
+
+**Procedure:**
+
+1. After drafting the issue body (with `Verify:` lines on every AC), open a shell in the worktree at the same SHA the issue would target — i.e. `origin/main` after the audit PR has been merged, or the audit PR's branch tip if the audit PR has not yet merged but will (the inline change is what matters).
+2. Run each AC's `Verify:` command verbatim.
+3. **Decision:**
+   - **All ACs verify as already passing:** do NOT file the issue. The work is already done. Note the skip in the audit's findings doc / PR description: `Skipped filing follow-up — verify already passes on <SHA>.`
+   - **All ACs verify as failing (the work is genuinely outstanding):** continue to §4 (Labels) and file normally.
+   - **Mixed (some pass, some fail):** narrow the issue body to drop the already-passing criteria and file only the residual. Note the trim in the body so a reader can see what was excluded and why.
+
+This check applies to every issue with `Verify:` lines, not just audit follow-ups — a fast pre-file probe catches accidentally-already-shipped work in any context (DX retros, ralph review-loop outputs, spotcheck findings). The audit-follow-up case is just the most common recurrence.
+
 ### 4. Labels — pick the right ones
 
 - **Type** — exactly one of `type/*` (e.g. `type/bug`, `type/feature`, `type/dx`, `type/docs`, `type/investigation`, `type/decision`, `type/refactor`).
