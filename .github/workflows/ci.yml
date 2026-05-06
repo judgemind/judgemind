@@ -1085,6 +1085,27 @@ jobs:
         run: scripts/check-no-redos-pattern.sh
 
   # ---------------------------------------------------------------
+  # Cleanup-step continue-on-error guard: every workflow step on a
+  # primary-success path that calls into the GitHub API for best-effort
+  # housekeeping (auto-closing resolved alert issues) must carry
+  # `continue-on-error: true` so a transient GitHub-API 5xx in the
+  # cleanup branch does not fail the whole workflow run.  See #4234
+  # / #4238 for the seven workflows that lacked this and the flake
+  # class they exposed; #4241 for this guard.
+  # ---------------------------------------------------------------
+  # The script's own unit tests live at
+  # scripts/tests/test_check_cleanup_step_continue_on_error.sh and are run by
+  # the auto-discovering `scripts-tests` shell-fast shard above; this job
+  # only runs the production check against the live `.github/workflows/`
+  # tree on every PR.
+  cleanup-step-continue-on-error-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify primary-success cleanup steps tolerate transient API failures
+        run: scripts/check-cleanup-step-continue-on-error.sh
+
+  # ---------------------------------------------------------------
   # parse_document reingest-safety marker guard: every Live-only
   # parse_document under packages/scraper-framework/src/courts/ must
   # carry a docstring marker that names the reingest hazard.  Closes
@@ -1792,7 +1813,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
