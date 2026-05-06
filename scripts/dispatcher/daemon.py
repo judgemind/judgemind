@@ -2005,6 +2005,17 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
         # #3656 — ECS-mode silent-hang reaper. Diagnoser inspects the
         # last known phase + log tail to decide retry vs. escalate.
         FAILURE_CATEGORY_AGENT_SILENT_HANG,
+        # #4272 — operational verdict=blocked / verdict=failed. The
+        # diagnoser inspects the block_reason / evidence_md and either
+        # files an autonomous code-fix tracker (Blocked by #N + re-add
+        # agent/ready) when the block names a fixable code bug, or
+        # marks needs_review for genuinely operator-only blocks
+        # (missing secret, external account state). Pre-#4272 the
+        # blocked verdict short-circuited to operational_failed /
+        # needs_review without ever reaching the diagnoser, parking
+        # issues indefinitely (source incident: #3954 sat for 4 days
+        # until manual recovery; investigation #4248).
+        FAILURE_CATEGORY_OPERATIONAL_FAILED,
     }
 )
 
@@ -12218,15 +12229,25 @@ class DispatcherDaemon:
         a script / DB query / gh action directly, posts evidence to the
         issue, and closes the issue on success. No PR, no CI, no merge.
 
-        Mirrors the structure of :meth:`_run_plan_phase` with three
+        Mirrors the structure of :meth:`_run_plan_phase` with two
         possible outcomes:
 
         * ``succeeded`` — advance to ``operational_done`` with
           ``status='succeeded'``.
-        * ``blocked`` — advance to ``operational_failed`` with
-          ``status='needs_review'`` (operator must intervene).
-        * ``failed`` / missing / unrecognized — route through
-          ``_handle_agent_failure`` so the diagnoser picks it up.
+        * ``blocked`` / ``failed`` / missing / unrecognized — route
+          through :meth:`_handle_agent_failure` with
+          :data:`FAILURE_CATEGORY_OPERATIONAL_FAILED` (tier-2
+          first-occurrence) so the diagnoser picks it up. The
+          diagnoser inspects ``block_reason`` / ``evidence_md`` and
+          either files an autonomous code-fix tracker
+          (``Blocked by #N`` + re-add ``agent/ready``) when the block
+          names a fixable code bug, or marks ``needs_review`` for
+          genuinely operator-only conditions (missing secret, external
+          account state). #4272 unified this routing — pre-#4272 the
+          ``blocked`` arm short-circuited to ``operational_failed /
+          needs_review`` without ever reaching the diagnoser, parking
+          issues indefinitely (source incident #3954, investigation
+          #4248).
         """
         from scripts.dispatcher.phase_transitions import transition_from_operational
 
