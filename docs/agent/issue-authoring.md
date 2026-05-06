@@ -123,6 +123,73 @@ Before filing a "does X" / "enable X" / "add X" issue, run a single command that
 
 **Decision after probing:** If the gap is genuinely absent (the feature/setting/doc does not yet exist), file the issue normally. If the gap is already satisfied, either close the draft, pivot scope to a doc-only update that confirms the current state (e.g., "document that Container Insights is enabled and cite the Terraform attribute"), or — for `fix(test)` issues whose ACs are exhausted by "the test passes" — skip filing and post the verification-only evidence elsewhere (a comment on the parent issue, or no action at all). If the probe is ambiguous, treat as real and file normally — agents can do their own probe at pickup time per Step 4b in `.claude/skills/task/SKILL.md`.
 
+## Hypothesis vs. evidence
+
+Bug-fix issues frequently mix three different things into a single body: what was *observed* (symptoms — the data the filer can actually see), what is *suspected* (root cause — the filer's best current theory), and what should *change* (prescribed fix — the code/config edit the filer expects). When all three are run together as "here's the bug, here's the fix," an agent that picks the issue up will mentally lock in on the prescribed fix path before doing any verification — and if the suspected root cause is wrong, the entire ralph cycle is wasted.
+
+This is the same shape as the "Instrument before you guess" principle in `docs/agent/investigation-patterns.md` — both rules say: *don't anchor on an unconfirmed hypothesis*. Issue authoring is the upstream mirror of agent-side investigation. The filer's hypothesis can be wrong for the same reasons an agent's first hypothesis can be wrong: the visible layer that produces the symptom is rarely the same layer where the bug lives, and trace-select-before-validating-fix (inner branches can be dead code if a downstream filter rejects the row) applies to issue authoring too.
+
+### The framing distinction
+
+When filing a bug-fix or investigation-style issue, separate the three pieces explicitly:
+
+- **Observed symptoms** — facts the filer measured. NULL rate is X%, this query returns Y, this PDF has `hearing_date=NULL`, the page renders the wrong number. Symptoms are reproducible and don't require trust in any theory of mechanism.
+- **Suspected root cause** — the filer's best current theory of *why* the symptoms appear. Frame this as a hypothesis the agent should verify, NOT as a known-true premise. "I suspect `_cc_hearing_date_from_pdf`'s regex doesn't match the dept-38 format" is a hypothesis; "extend `_HEARING_DATE_PROBATE_RE` to handle the dept-38 format" is a prescribed fix that assumes the hypothesis is correct.
+- **Hypothesis verification steps** — the cheap probes that confirm or falsify the suspected root cause before any code is written. Download a sample PDF, run the function on it, query the DB, capture the actual return value. These probes typically take 5 minutes and either ratify the prescribed fix or redirect the agent to the real broken layer.
+
+### Worked example — #4251
+
+The pattern in #4251 (the issue that motivated this section): the filer observed that several Orange County department-38 PDFs produced `hearing_date=NULL` and wrote the issue body around a single suspected root cause — `_cc_hearing_date_from_pdf`'s regex doesn't match the dept-38 format — with a prescribed fix to extend `_HEARING_DATE_PROBATE_RE`.
+
+What investigation actually found:
+
+1. The regex *did* match the dept-38 format correctly — the function returned the expected hearing date.
+2. The downstream `is_plausible_hearing_date` filter rejected the correctly-extracted date because dept-38 master probate calendars publish 30+ days ahead, outside the civil ±14-day window the filter enforces.
+3. An agent who blindly followed the prescribed fix would have extended the regex (no-op), found the symptom didn't move, and either hit the iteration cap or — worse — merged a regex change that did nothing because the layer below still rejects the date.
+
+The right framing would have been:
+
+```
+## Observed symptoms
+
+- N PDFs in Orange County department 38 produce `hearing_date=NULL` after parse.
+- Sample input: <S3 key>. Expected output: `hearing_date='2026-06-15'`. Actual: `NULL`.
+
+## Suspected root cause (hypothesis)
+
+`_cc_hearing_date_from_pdf`'s regex (`_HEARING_DATE_PROBATE_RE`) doesn't match the dept-38 PDF format.
+
+## Hypothesis verification steps
+
+Before writing code:
+1. Download `<S3 key>` to {worktree}/tmp/sample.pdf.
+2. Run `_cc_hearing_date_from_pdf` on it directly (write a 5-line probe to {worktree}/tmp/verify.py).
+3. If it returns the expected date, the hypothesis is wrong — root-cause from the observed symptoms instead. The next layer to inspect is `is_plausible_hearing_date`.
+4. If it returns NULL, the hypothesis is confirmed — proceed with the prescribed fix.
+```
+
+The verification-steps section is the thing that converts a wrong-hypothesis trap into at most a 5-minute redirect.
+
+### When this framing applies
+
+Use the explicit Observed / Suspected / Verification structure when:
+
+- The issue is a bug-fix or investigation-style task (`type/bug`, NLP/scraper extraction failures, data-quality regressions, "X returns wrong value").
+- The filer is naming a specific function, regex, or layer they believe is broken.
+- The fix path is more than a one-line edit, OR the failing layer is downstream of other layers that could be the actual root cause.
+
+It is less critical for:
+
+- Pure feature work where there is no existing wrong behaviour to root-cause (the "gap" framing in §Verify the gap exists before filing already covers this).
+- Trivial typo / copy fixes where the symptom and the broken layer are visibly the same line.
+
+When in doubt, including the framing is cheap and saves ralph cycles when the hypothesis turns out to be wrong.
+
+### Cross-references
+
+- `docs/agent/investigation-patterns.md` §"Instrument before you guess" — the agent-side mirror. When the filer's hypothesis is missing or known-thin, the agent ships an instrumentation-only PR first to make the next failure self-diagnosing.
+- `.claude/skills/task/SKILL.md` §4c — the agent-side complement to this section: when picking up a bug-fix issue, the agent runs the issue's hypothesis-verification probe **before** writing implementation code. If the issue body lists explicit verification steps, run those; otherwise run a generic 5-minute probe (download the smallest reproducer, run the function the issue claims is broken, compare to the expected value).
+
 ## Priority Framework
 
 Assign priority by urgency and workflow impact, not by user-visibility.

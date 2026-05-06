@@ -377,6 +377,51 @@ Exit codes:
 - **Gap already satisfied (docs delta remains)** → post comment, pivot to reduced (docs-only) scope, continue as Path A with the reduced scope.
 - **Gap already satisfied (no docs delta — typical `fix(test)` and `test(...)`)** → post comment with the AC's `Verify:` command output as evidence, close issue with `--reason completed`, release `status/in-progress` label, run `scripts/unblock-dependents.sh <N>`. Skip Path A — there is no PR.
 
+### Step 4c — Verify the issue's hypothesis (5-minute probe)
+
+**Trigger condition:** Run this step when the issue is a bug-fix or investigation-style task that names a specific function, regex, layer, or code path the filer believes is broken — i.e. the issue body contains a *suspected root cause* and a *prescribed fix*. Skip when (a) the issue is purely additive and §4b's gap probe already covered it, (b) the symptom and the broken layer are visibly the same line (one-line typo/copy fix), or (c) the issue is `type/dx` workflow / docs / template work where there is no upstream "wrong return value" to verify.
+
+**Why this exists — the verify-the-hypothesis-first pattern.** Issue bodies that mix observed symptoms with a prescribed fix can lock the agent into the wrong-hypothesis path. If the hypothesis is wrong, extending the regex / patching the named function does nothing — the symptom stays unchanged and a full ralph cycle is wasted (or, worse, a no-op regex change merges and the real bug stays unfixed). The fix is to verify the hypothesis with a cheap probe before writing any implementation code. This is the agent-side complement to `docs/agent/issue-authoring.md` §"Hypothesis vs. evidence" — same lesson, applied at pickup time. Same shape as `docs/agent/investigation-patterns.md` §"Instrument before you guess" — don't anchor on an unconfirmed hypothesis.
+
+**Canonical worked example — #4251.** The prescribed fix was "extend `_HEARING_DATE_PROBATE_RE` to match the dept-38 PDF format." Investigation revealed the regex was already returning the correct date — the broken layer was `is_plausible_hearing_date` rejecting the correctly-extracted value because dept-38 master probate calendars publish 30+ days ahead, outside the civil ±14-day window the filter enforces. A 5-minute probe (run `_cc_hearing_date_from_pdf` on the sample PDF and inspect the return value) would have surfaced that immediately. An agent who blindly extended the regex would have found the symptom didn't move and burned the full iteration cap rediscovering the actual broken layer.
+
+**What to do:**
+
+1. **Read the issue body and identify the hypothesis explicitly.** State it back to yourself in one sentence: "The issue claims `<function/regex/layer>` is broken because `<reason>` and the fix is `<edit>`."
+
+2. **Run the issue's verification steps if it lists them.** When the issue body has a `## Hypothesis verification steps` section (or equivalent — `## Verify before fixing`, etc.), run those steps **verbatim** as the §4c probe. The filer already wrote the cheapest possible falsification check; running it first short-circuits the "what to probe for" decision and produces probe output that is also free verification evidence to cite in the A.2b process summary.
+
+3. **Otherwise, run a generic 5-minute probe.** Pick the pattern that matches the hypothesis shape:
+
+   - **"Function X returns wrong value"** — fetch the smallest reproducer mentioned in the issue (S3 key, sample input, DB row id), run X on it, compare the return value to the expected value. If X returns the expected value, the hypothesis is wrong — the symptom must come from a downstream caller or filter. Write the probe to `{worktree}/tmp/verify.py` and run it. Example shape, drawing on #4251:
+     ```python
+     # {worktree}/tmp/verify.py
+     from packages.scraper_framework.src.courts.ca.oc_tentatives import _cc_hearing_date_from_pdf
+     pdf_bytes = open("{worktree}/tmp/sample.pdf", "rb").read()
+     print(repr(_cc_hearing_date_from_pdf(pdf_bytes)))
+     # If this prints the expected date, the regex is fine; the bug is downstream.
+     ```
+   - **"Regex Y doesn't match format Z"** — extract the regex from the named module, run it against a sample of format Z, inspect the match groups. Same falsification pattern: if it matches, the hypothesis is wrong.
+   - **"Filter / validator F rejects valid input"** — run F on the input the issue says is being rejected. If F accepts it, the rejection is happening somewhere else.
+   - **"Query Q returns N rows but should return M"** — run Q against dev (`scripts/dev-db-query.sh`), inspect the actual rows. If the count matches expected, the symptom is in a downstream rendering / aggregation layer.
+
+4. **Trace from observed symptom through every layer to the named hypothesis.** Even if the named function does return the wrong value, ask: is there a SELECT / dispatch / filter upstream that controls whether this code path even runs on the affected rows? The trace-select-before-validating-fix lesson (an inner branch can be dead code if the SELECT/dispatch filters out the rows) applies here — verify the full call chain, not just the bottom layer the issue points at.
+
+**Decision tree:**
+
+- **Hypothesis confirmed** — the named function/regex/layer does in fact produce the wrong value, AND the trace-select check confirms the affected rows actually flow through that code path. Proceed with the prescribed fix as Path A normally.
+- **Hypothesis falsified** — the named function/regex/layer returns the expected value when probed directly. **Do NOT implement the prescribed fix.** Post a comment on the issue stating: (a) the hypothesis verification you ran, (b) the actual return value (with sample input cited), (c) the next layer to inspect (typically the immediate caller or a filter the value passes through). Then either:
+  - Continue investigating to root-cause from observed symptoms (treat the issue as Path B / investigation), OR
+  - Re-scope the issue: post a comment proposing the corrected hypothesis and prescribed fix, and proceed with Path A against the new scope.
+
+  Write the comment to `{worktree}/tmp/hypothesis_falsified_comment.txt` and post it:
+  ```
+  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/hypothesis_falsified_comment.txt
+  ```
+- **Probe ambiguous** (the function returns something unexpected but not clearly right or wrong; the sample input may not be representative): instrument before guessing. Add a structured log to the suspected layer that captures the raw input/output it actually saw, ship that as an instrumentation-only PR (or local probe), and re-trigger. See `docs/agent/investigation-patterns.md` §"Instrument before you guess." Don't extend the prescribed fix on top of an ambiguous probe.
+
+**Cost / benefit.** A 5-minute probe is cheap relative to a 5-15 minute ralph iteration plus the PR / CI / merge round trip the wrong-fix path incurs. Even when the probe ratifies the hypothesis (the common case for well-written issues), the probe output is also free verification evidence to cite in the A.2b process summary and A.8 verification-evidence comment.
+
 ---
 
 
