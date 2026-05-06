@@ -1043,6 +1043,118 @@ resource "aws_cloudwatch_metric_alarm" "diagnoser_fallback_spike" {
   ok_actions    = [var.alert_sns_topic_arn]
 }
 
+# ── Scheduler-tick cadence-slip alarm (#2854) ────────────────────────────────
+# Catches the class of "architectural invariant silently violated" bug where
+# the documented 30s scheduler cadence drifts to multiple minutes without any
+# visible failure (root cause #2847 — orchestration ran inline on the
+# scheduler thread, blocking the loop for the whole plan→ralph→summary→push
+# duration of a claim, while the operator killswitch silently waited for the
+# next "free" tick).
+#
+# Two complementary signals; both are in this module:
+#
+# 1. ``aws_cloudwatch_log_metric_filter.scheduler_tick_cadence`` extracts the
+#    ``inter_tick_seconds`` field from every ``daemon.scheduler_tick`` INFO
+#    event into a ``TickCadenceSeconds`` gauge metric. Stateless extraction
+#    on each log line — no daemon-side metric publication needed.
+#
+# 2. ``aws_cloudwatch_metric_alarm.scheduler_tick_cadence_slow`` alarms when
+#    the p95 of that gauge exceeds the operator-tunable threshold over a
+#    5-minute window. p95 (rather than Maximum) tolerates a single slow tick
+#    without paging — a couple of slow ticks during a deploy roll is normal —
+#    while still firing decisively when the cadence systematically drifts.
+#
+# 3. (Belt-and-braces) ``aws_cloudwatch_log_metric_filter.tick_cadence_slip``
+#    counts ``daemon.tick_cadence_slip`` WARNING events emitted by the daemon
+#    itself when ``inter_tick_seconds > 2 × tick_scheduler_seconds``. This is
+#    a count-based event signal that surfaces in CloudWatch Insights queries
+#    for free even before the p95 alarm fires, and gives operators a fast
+#    "did the cadence slip in the last hour?" query without needing to read
+#    GetMetricData.
+#
+# The alarm is deliberately distinct from the #3097 stall watchdog (which
+# kills the daemon at 120s) — that path catches a wedged scheduler thread,
+# whereas this path catches a scheduler that is running but slow. Both
+# layers fire on a real cadence regression; the alarm reaches the operator
+# before any user-visible failure manifests.
+#
+# The metric filter pattern matches ``$.inter_tick_seconds > 0`` so the
+# first-tick case (where ``inter_tick_seconds`` is null because there's no
+# prior reference point) is excluded — null-or-missing values do not
+# satisfy the inequality and are dropped by the filter.
+
+resource "aws_cloudwatch_log_metric_filter" "scheduler_tick_cadence" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-scheduler-tick-cadence"
+  pattern        = "{ $.event = \"scheduler_tick\" && $.inter_tick_seconds > 0 }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name      = "TickCadenceSeconds"
+    namespace = "Judgemind/Dispatcher"
+    # Extract the numeric value from the event so the metric carries the
+    # actual gap in seconds, not a fixed "1 per slow tick" count.
+    value = "$.inter_tick_seconds"
+    # No default_value: a tick that doesn't match the filter (e.g. the
+    # very first tick after boot, where inter_tick_seconds is null) must
+    # be silently dropped, not coerced to 0 — a 0 gauge would falsely
+    # depress the p95 statistic.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scheduler_tick_cadence_slow" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-scheduler-tick-cadence-slow"
+  alarm_description = "Dispatcher scheduler-tick cadence p95 exceeded ${var.scheduler_tick_cadence_threshold_seconds}s over a ${var.scheduler_tick_cadence_window_seconds}s window (${var.environment}). The 30s cadence is the architectural invariant that powers the operator killswitch (#2847); a slip means the loop is silently slow. Check ${aws_cloudwatch_log_group.dispatcher.name} for the corresponding ``daemon.tick_cadence_slip`` events and ``scheduler_tick_slow_<step>`` warnings."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "TickCadenceSeconds"
+  # Extended statistic — p95 ignores a single slow tick (deploy roll,
+  # transient GitHub slowness) but fires decisively when the cadence
+  # systematically drifts.
+  extended_statistic = "p95"
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.scheduler_tick_cadence_threshold_seconds
+  period              = var.scheduler_tick_cadence_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  # When desired_count=0 (Phase 1) or during a brief deploy gap there are
+  # no datapoints. Treat that as healthy — a real cadence regression
+  # produces datapoints over the window.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+# Belt-and-braces: count of ``daemon.tick_cadence_slip`` WARNING events
+# fired by the daemon's synchronous slip detector (when
+# ``inter_tick_seconds > 2 × tick_scheduler_seconds``). The metric is
+# emitted regardless of the p95 alarm — operators querying "did anything
+# slip in the last hour?" can ``stats sum(TickCadenceSlipCount)`` without
+# pulling GetMetricData. Held as a metric filter (no alarm) because the
+# p95 alarm above is the load-bearing signal; alarming on individual
+# slip events would page on transient single-tick slips that the p95
+# already smooths away.
+
+resource "aws_cloudwatch_log_metric_filter" "tick_cadence_slip" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-tick-cadence-slip"
+  pattern        = "{ $.event = \"tick_cadence_slip\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "TickCadenceSlipCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
 # ─── Supervisor-tick swallow-and-return failure alarms ───────────────────────
 # Each of the five handlers below catches exceptions internally and returns
 # rather than propagating. A single event may be transient; two within the

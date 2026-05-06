@@ -253,6 +253,25 @@ WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD = 20
 #: to a config key if we end up needing per-environment overrides.
 SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS = 5.0
 
+#: Multiplier on ``tick_scheduler_seconds`` above which the scheduler
+#: loop emits a ``daemon.tick_cadence_slip`` WARNING (#2854). The slip
+#: detector measures the gap between consecutive ``scheduler_tick``
+#: emissions — if ``inter_tick_seconds > multiplier * tick_scheduler_seconds``
+#: a structured WARNING is logged so the slip is visible in CloudWatch
+#: Insights and a downstream metric filter / alarm can fire.
+#:
+#: Default ``2.0``: the documented cadence is 30s and the worst-case
+#: ceiling per #2847 is 60s, so 2× catches everything outside spec
+#: while staying quiet on the healthy 30-32s common case. Distinct from
+#: the watchdog at 60s WARN / 120s EXIT (:data:`DEFAULT_SCHEDULER_TICK_STALL_*`)
+#: which exits the daemon — the slip event is observability-only and
+#: never kills the process. The two layers complement each other: the
+#: watchdog catches a wedged scheduler thread, the slip event catches a
+#: scheduler that's running but slow, and the per-tick INFO event
+#: ``inter_tick_seconds`` field powers the ``TickCadenceSeconds``
+#: metric filter even when no slip fired.
+DEFAULT_TICK_CADENCE_SLIP_MULTIPLIER = 2.0
+
 #: Per-step slow-warning threshold for :meth:`supervisor_tick` (#3403).
 #: Mirror of :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS` for the
 #: supervisor sub-steps (heartbeat update, failures count, stuck-agent
@@ -2861,6 +2880,14 @@ class DispatcherDaemon:
         # recovers (gap returns below warn threshold) or (b) the EXIT
         # threshold is hit and we call ``os._exit``.
         self._last_scheduler_tick_at: float = time.monotonic()
+        # #2854 — inter-tick cadence tracking. ``_previous_scheduler_tick_at``
+        # records the monotonic timestamp of the *previous* tick's emission so
+        # the next tick can compute ``inter_tick_seconds`` and decide whether
+        # a ``daemon.tick_cadence_slip`` WARNING is warranted. ``None`` until
+        # the first tick fires (no prior reference point on boot — first tick
+        # never emits a slip event). Single-writer (scheduler thread) with
+        # no concurrent reader, so torn-read safety is not a concern.
+        self._previous_scheduler_tick_at: float | None = None
         self._last_queue_scan: float = 0.0
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
@@ -3532,6 +3559,42 @@ class DispatcherDaemon:
         # while adding the mid-body observability.
         tick_elapsed_s = time.monotonic() - t_tick_entry
         self._last_scheduler_tick_at = time.monotonic()
+        # #2854 — inter-tick cadence + slip-WARN observability. The
+        # ``inter_tick_seconds`` field below is the gap measured against
+        # the previous tick's emission timestamp (``None`` on the first
+        # tick after boot — no prior reference). When the gap exceeds
+        # ``tick_cadence_slip_multiplier × tick_scheduler_seconds`` (default
+        # 2× → 60s on the 30s cadence), a separate ``daemon.tick_cadence_slip``
+        # WARNING is logged with the elapsed and the threshold so the
+        # CloudWatch metric filter can fire an alarm. Distinct from the
+        # #3097 watchdog (which kills the daemon at 120s) — this is
+        # observability-only.
+        prev_tick_at = self._previous_scheduler_tick_at
+        inter_tick_seconds: float | None = None
+        if prev_tick_at is not None:
+            inter_tick_seconds = self._last_scheduler_tick_at - prev_tick_at
+            slip_threshold_seconds = DEFAULT_TICK_CADENCE_SLIP_MULTIPLIER * float(
+                self._cfg.tick_scheduler_seconds
+            )
+            if inter_tick_seconds > slip_threshold_seconds:
+                self._log.warning(
+                    "daemon.tick_cadence_slip",
+                    extra={
+                        "event": "tick_cadence_slip",
+                        "run_id": self._run_id,
+                        "tick_n": self._scheduler_ticks,
+                        "inter_tick_seconds": round(inter_tick_seconds, 3),
+                        "expected_cadence_seconds": int(
+                            self._cfg.tick_scheduler_seconds
+                        ),
+                        "threshold_seconds": round(slip_threshold_seconds, 3),
+                        "multiplier": DEFAULT_TICK_CADENCE_SLIP_MULTIPLIER,
+                    },
+                )
+        # Capture the timestamp for the next tick's gap calculation
+        # before emitting the INFO event so a subsequent exception path
+        # cannot leave ``_previous_scheduler_tick_at`` stale.
+        self._previous_scheduler_tick_at = self._last_scheduler_tick_at
         self._log.info(
             "daemon.scheduler_tick",
             extra={
@@ -3575,6 +3638,21 @@ class DispatcherDaemon:
                 # regressions are visible without waiting for a
                 # ``scheduler_tick_slow_*`` threshold trip.
                 "tick_elapsed_s": round(tick_elapsed_s, 3),
+                # #2854: gap between this tick's emission and the
+                # previous tick's emission, in seconds. ``None`` on the
+                # first tick after boot (no prior reference). Powers the
+                # ``TickCadenceSeconds`` CloudWatch metric filter
+                # (``Judgemind/Dispatcher`` namespace) — p95 over a
+                # 5-min window > 90s alarms via
+                # ``dispatcher-scheduler-tick-cadence-slow``. The
+                # complementary ``daemon.tick_cadence_slip`` WARNING
+                # event fires synchronously above when this exceeds
+                # 2× the configured cadence.
+                "inter_tick_seconds": (
+                    round(inter_tick_seconds, 3)
+                    if inter_tick_seconds is not None
+                    else None
+                ),
                 # #4109 — per-sub-step elapsed_seconds (rounded to 3
                 # decimals). Surfaces happy-path timing on every tick so
                 # CloudWatch Logs Insights queries like
