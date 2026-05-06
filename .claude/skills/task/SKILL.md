@@ -315,21 +315,26 @@ The adoption-to-merge path should be the common case when this check fires — i
 - *"Add metric / alarm"* → `aws cloudwatch list-metrics --namespace <ns>` / `aws cloudwatch describe-alarms --alarm-name-prefix <prefix>`.
 - *"Add / document X"* → `grep -r "X" docs/ .claude/skills/ CLAUDE.md` or `mcp__github__search_code` for the concept.
 - *"Fix code bug / introduce helper"* → grep for the function name or error-message string across `packages/`.
+- *"fix(test) — failing test reproduction"* — when the issue title starts with `fix(test)` (or carries `type/dx` AND has a `Verify: ./scripts/...` / `Verify: pytest ...` / `Verify: npm ...` line in the body), run that verify line **verbatim against the worktree's freshly-rebased base** (Step A.1a already aligned the worktree to `origin/main`). If it returns clean (no FAIL output, exit 0, the failing assertion the issue cites no longer fires), pivot to the "Gap already satisfied" branch and post a comment naming the PR that landed the fix — `git log --oneline --all -- <test-or-source-path>` is the fastest way to identify the load-bearing commit. This pattern came out of the #4178 / #4173 retro: #4178 was filed on a stale baseline 7.5 hours after #4173 had merged the macOS jq-1.6 empty-file salvage-prelude fix, and the agent saved the entire ralph cycle by running the verify line as one of its first tool calls.
 
 **Decision tree:**
 
 - **Gap confirmed real** (the setting is off, the metric does not exist, the doc is absent, the bug is still present): continue to Path A / Path B as usual.
-- **Gap already satisfied** (probe output shows the state already matches the issue's goal): do NOT abandon the task. Post a comment on the issue quoting the probe output and proposing a reduced scope — typically a docs-only PR that documents the current state and cites the prior PR / Terraform attribute that already shipped it. Write the comment to `{worktree}/tmp/gap_probe_comment.txt`, post it, then continue with the reduced docs-only scope:
+- **Gap already satisfied** (probe output shows the state already matches the issue's goal): do NOT abandon the task. Post a comment on the issue quoting the probe output and proposing one of two reduced-scope outcomes:
+  - **Reduced docs-only PR** — when there is a residual docs delta worth producing (e.g. "document that Container Insights is enabled and cite the Terraform attribute that landed it"). The AC's intent usually has a residual of this shape; complete it as a minimal PR before proceeding to merge.
+  - **Verification-only close** — when there is no remaining docs delta, which is the common case for `fix(test)` issues whose acceptance criteria are exhausted by "the test passes." The probe output IS the verification evidence; post it, name the PR that landed the fix, close the issue with `--reason completed`, and run `scripts/unblock-dependents.sh <N>` if anything was blocking on it. Skip Path A entirely — there is no PR to file. The label-interlock teardown (`gh issue edit <N> --remove-label status/in-progress`) still runs at the close.
+
+  Write the comment to `{worktree}/tmp/gap_probe_comment.txt` and post it:
   ```
   gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/gap_probe_comment.txt
   ```
-  The docs delta is worth producing — the AC's intent usually has a residual: "confirm and document that this already works." Complete that as a minimal PR before proceeding to merge.
 - **Probe ambiguous** (e.g. the AWS API returns unexpected output, the grep hits unrelated files, the state is partially configured): treat as "gap real" and continue to Path A.
 
 Exit codes:
 
 - **Gap real or ambiguous** → continue to Path A / Path B.
-- **Gap already satisfied** → post comment, pivot to reduced (docs-only) scope, continue as Path A with the reduced scope.
+- **Gap already satisfied (docs delta remains)** → post comment, pivot to reduced (docs-only) scope, continue as Path A with the reduced scope.
+- **Gap already satisfied (no docs delta — typical fix(test))** → post comment with probe output as evidence, close issue with `--reason completed`, release `status/in-progress` label, run `scripts/unblock-dependents.sh <N>`. Skip Path A — there is no PR.
 
 ---
 
