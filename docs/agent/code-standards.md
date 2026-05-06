@@ -422,6 +422,10 @@ The wrapped test's exit code and PASS/FAIL count are preserved verbatim — the 
 
 The check exists because issue #4139's wall-clock optimization wasted iterations on a wrong hypothesis ("parse cost dominates") that this profiler would have falsified in one tool invocation — the actual cost was unconfigured `CI_POLL_INTERVAL=60` / `DEPLOY_GRACE_SECONDS=90` defaults sleeping 60-120s on `awaiting_ci`/`awaiting_deploy` sections. See #4176 for the full rationale.
 
+### Timing-sensitive shell-test fixtures (sleep-gap rule)
+
+Shell-test fixtures that use `sleep` to produce a deterministic ordering (e.g. asserting "sorted by elapsed desc") must use **at least a 4× gap between successive sleeps**. CI scheduling jitter routinely adds 10s-100s of milliseconds to a `sleep` call under load — gaps narrower than 4× can be reordered, flipping the assertion and producing a flake that gives no signal of being timing-related (see #4188 for the precedent: `0.02 / 0.04 / 0.06` flaked, `0.05 / 0.20 / 0.50` does not). When tempted to shrink the gap to "speed up the test," shrink the smallest sleep instead and keep the 4× ratio.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.
