@@ -1,12 +1,13 @@
 /**
- * Unit tests for the per-field cost breakdown logger (issue #4100).
+ * Unit tests for the per-field cost breakdown walker (issues #4100,
+ * #4101).
  *
- * The logger ships as an early-warning instrument: when an operation's
- * total cost meets `COST_LOG_THRESHOLD` (800), a single CloudWatch line
- * names the top-level fields in descending cost order so operators can
- * identify the next slim without re-deriving the breakdown by hand.
+ * The walker computes a `{ [path]: cost }` map alongside the operation
+ * total. As of #4101 the breakdown is inlined into the `graphql.cost`
+ * structured log line by `cost-limit-plugin.ts`; this file pins the
+ * walker's shape and AC2 invariant (sum of map values equals total).
  *
- * These tests pin three things:
+ * These tests pin four things:
  *   1. The walker computes a value that matches the cost-rule
  *      algorithm (mirrored in `cost-rule-estimator.ts`): scalars cost
  *      `scalarCost` (1), object types cost `objectCost` (0), and each
@@ -14,24 +15,23 @@
  *      post-#4100 polled query computes to ≤ 1000, the pre-#4100
  *      polled query (with the four trimmed fields restored) to > 1000
  *      — that is the regression-of-regression guard.
- *   2. `__typename` injection (Apollo Client default on every selection
- *      set) is counted, matching what the cost rule sees over the wire
- *      after Apollo Client expands the document.
- *   3. The `costBreakdownPlugin` only emits a log line when the total
- *      meets the threshold — keeps log volume bounded.
+ *   2. AC2 of #4101: `Object.values(breakdown).reduce((a, b) => a + b)`
+ *      equals `total` for the polled query and for arbitrary
+ *      operations exercised here.
+ *   3. AC1 of #4101: the breakdown is a `{ [path]: cost }` map keyed by
+ *      GraphQL path, with depth-2 paths like
+ *      `dispatcherState.activeAgents` for the polled query.
+ *   4. `__typename` injection (Apollo Client default on every selection
+ *      set) is counted, matching what the cost rule sees over the wire.
  *
  * The agreement between this walker and the production cost rule
- * (`createComplexityRule({ estimators: [judgemindEstimator] })`) is
- * pinned by AC3 in `cost-rule-estimator.unit.test.ts` — that test runs
+ * (`getComplexity({ estimators: [judgemindEstimator] })`) is pinned by
+ * AC3 in `cost-rule-estimator.unit.test.ts` — that test runs
  * `getComplexity(...)` against the same document and asserts equality
- * with what `computeBreakdown(...)` here returns. The pre-#4112 cost
- * library had a structural TypeInfo bug that made standalone
- * `validate()` underreport cost ~10× — we no longer have to dance
- * around it because the new library (`graphql-query-complexity`)
- * computes correctly.
+ * with what `computeBreakdown(...)` here returns.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   buildSchema,
   parse,
@@ -39,7 +39,7 @@ import {
   type DocumentNode,
 } from 'graphql';
 
-import { computeBreakdown, costBreakdownPlugin } from './cost-breakdown';
+import { computeBreakdown, __testing } from './cost-breakdown';
 import { typeDefs } from './schema';
 
 /**
@@ -158,30 +158,49 @@ const POLLED_QUERY_SOURCE = /* GraphQL */ `
 
 const schema = buildSchema(typeDefs);
 
-describe('computeBreakdown — DispatcherState polled query (issue #4100)', () => {
-  it('emits one row per top-level field, sorted by cost descending', () => {
+function sumValues(breakdown: Record<string, number>): number {
+  return Object.values(breakdown).reduce((acc, v) => acc + v, 0);
+}
+
+describe('computeBreakdown — DispatcherState polled query (issues #4100, #4101)', () => {
+  it('returns a `{ [path]: cost }` map with depth-2 paths under `dispatcherState`', () => {
     const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
     const result = computeBreakdown(schema, document, 'DispatcherState');
     expect(result.operationName).toBe('DispatcherState');
-    // Two top-level fields after Apollo Client's `__typename` injection
-    // — `dispatcherState` (the data field) and `__typename` (the
-    // operation-level meta-field). Sorted by cost desc puts the
-    // dominant data field first.
-    expect(result.fields[0].path).toBe('dispatcherState');
+    // Plain map shape — not an array.
+    expect(typeof result.breakdown).toBe('object');
+    expect(Array.isArray(result.breakdown)).toBe(false);
+    // The polled query's heavy children show up at depth 2 — exactly
+    // the diagnostic shape #4101 calls for.
+    const keys = Object.keys(result.breakdown);
+    expect(keys).toContain('dispatcherState.activeAgents');
+    expect(keys).toContain('dispatcherState.recentCompletions');
+    expect(keys).toContain('dispatcherState.recentFailures');
+    expect(keys).toContain('dispatcherState.queueReady');
+    expect(keys).toContain('dispatcherState.queueBlocked');
+    expect(keys).toContain('dispatcherState.queueDepth');
   });
 
-  it('per-list-field sub-totals are recoverable by walking the document', () => {
-    // Re-walk the post-#4100 polled query and assert the dominant
-    // top-level field's cost is well above the early-warning threshold,
-    // so operators see the breakdown when the cap is being approached.
+  it('AC2 of #4101: sum of breakdown values equals the operation total', () => {
     const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
     const result = computeBreakdown(schema, document, 'DispatcherState');
-    // dispatcherState is the dominant top-level field.
-    const dispatcherStateRow = result.fields.find(
-      (f) => f.path === 'dispatcherState',
+    expect(sumValues(result.breakdown)).toBe(result.total);
+  });
+
+  it('the dominant child entry is well above the early-warning threshold (~800)', () => {
+    // The ten-element list-of-objects fields under `dispatcherState`
+    // dominate the cost. At least one of them should be in the top-five
+    // by cost so operators see the cost driver named in the breakdown.
+    const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
+    const result = computeBreakdown(schema, document, 'DispatcherState');
+    const total = result.total;
+    expect(total).toBeGreaterThan(800);
+    const sorted = Object.entries(result.breakdown).sort(
+      (a, b) => b[1] - a[1],
     );
-    expect(dispatcherStateRow).toBeDefined();
-    expect(dispatcherStateRow!.cost).toBeGreaterThan(800);
+    // The top entry is one of the list-of-objects children, which
+    // contributes at least 80 (LIST_FACTOR × scalarCount) to the total.
+    expect(sorted[0]![1]).toBeGreaterThanOrEqual(80);
   });
 
   it('pre-#4100 polled shape exceeds the 1000 cap (regression-of-regression)', () => {
@@ -238,84 +257,88 @@ describe('computeBreakdown — DispatcherState polled query (issue #4100)', () =
     ).total;
     expect(injectedTotal).toBeGreaterThan(rawTotal + 100);
   });
+
+  it('breakdown still sums to total when typename injection is on', () => {
+    // Cross-check the AC2 invariant under the production-shaped (with
+    // injected typename) document.
+    const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
+    const { total, breakdown } = computeBreakdown(
+      schema,
+      document,
+      'DispatcherState',
+    );
+    expect(sumValues(breakdown)).toBe(total);
+  });
 });
 
 describe('computeBreakdown — multi-root operation', () => {
-  it('returns one row per root field when an operation selects multiple roots', () => {
+  it('emits one entry per top-level scalar root', () => {
+    // `health` and `distinctCounties` are both real top-level Query
+    // fields (the latter is `[String!]!` which contributes a list
+    // factor of 10). Sum of breakdown values must equal total.
     const source = /* GraphQL */ `
       query Multi {
-        queueDepth
-        blockedDepth
+        health
+        distinctCounties
       }
     `;
     const document = parse(source);
     const result = computeBreakdown(schema, document, 'Multi');
-    expect(result.fields.map((f) => f.path).sort()).toEqual([
-      'blockedDepth',
-      'queueDepth',
-    ]);
+    const keys = Object.keys(result.breakdown).sort();
+    expect(keys).toEqual(['distinctCounties', 'health']);
+    expect(sumValues(result.breakdown)).toBe(result.total);
+    // health: String! → 1, distinctCounties: [String!]! → 10.
+    expect(result.breakdown.health).toBe(1);
+    expect(result.breakdown.distinctCounties).toBe(10);
   });
 });
 
-describe('costBreakdownPlugin — threshold gating', () => {
-  /**
-   * Drive one request lifecycle through the plugin and return the
-   * captured log calls. Wraps the type gymnastics needed to call
-   * `requestDidStart` and `didResolveOperation` directly without an
-   * Apollo Server instance — the plugin object is structurally typed
-   * (`{requestDidStart: () => Promise<void | GraphQLRequestListener>}`)
-   * so the type cast keeps the test ergonomic without losing safety on
-   * the observable contract.
-   */
-  async function runOnce(operationName: string, document: DocumentNode) {
-    const log = vi.fn();
-    const plugin = costBreakdownPlugin(log);
-    const reqDidStart = plugin.requestDidStart;
-    expect(reqDidStart).toBeDefined();
-    // The Apollo Server lifecycle: requestDidStart returns a listener
-    // (or void). We pass a minimal context object — only `schema`,
-    // `document`, and `operationName` are read by `didResolveOperation`.
-    const ctx = { schema, document, operationName } as Parameters<
-      NonNullable<typeof reqDidStart>
-    >[0];
-    const listener = await reqDidStart!(ctx);
-    expect(listener).toBeDefined();
-    const handler = (
-      listener as { didResolveOperation?: (c: typeof ctx) => Promise<void> }
-    ).didResolveOperation;
-    expect(handler).toBeDefined();
-    await handler!(ctx);
-    return log.mock.calls;
-  }
-
-  it('does NOT log when total cost is below the 800 threshold', async () => {
-    const cheapDoc = parse(/* GraphQL */ `
-      query Cheap {
-        queueDepth
-      }
-    `);
-    const calls = await runOnce('Cheap', cheapDoc);
-    expect(calls).toHaveLength(0);
+describe('computeBreakdown — depth control', () => {
+  it('depth=1 emits at top-level only and still sums to total', () => {
+    const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
+    const { total, breakdown } = computeBreakdown(
+      schema,
+      document,
+      'DispatcherState',
+      { depth: 1 },
+    );
+    // At depth 1 the polled query has exactly one data root
+    // (`dispatcherState`) plus the operation-level `__typename` bucket.
+    // Both contributions sum to total.
+    expect(sumValues(breakdown)).toBe(total);
+    expect(Object.keys(breakdown)).toContain('dispatcherState');
   });
 
-  it('logs once with breakdown when total cost meets the threshold', async () => {
+  it('depth=3 emits deeper paths and still sums to total', () => {
     const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
-    const calls = await runOnce('DispatcherState', document);
-    expect(calls).toHaveLength(1);
-    const entry = calls[0]![0]! as {
-      operationName: string;
-      cost: number;
-      breakdown: { path: string; cost: number }[];
-    };
-    expect(entry.operationName).toBe('DispatcherState');
-    expect(entry.cost).toBeGreaterThanOrEqual(800);
-    expect(entry.breakdown.length).toBeGreaterThan(0);
-    // Sorted by cost descending.
-    for (let i = 1; i < entry.breakdown.length; i++) {
-      expect(entry.breakdown[i - 1]!.cost).toBeGreaterThanOrEqual(
-        entry.breakdown[i]!.cost,
-      );
-    }
+    const { total, breakdown } = computeBreakdown(
+      schema,
+      document,
+      'DispatcherState',
+      { depth: 3 },
+    );
+    expect(sumValues(breakdown)).toBe(total);
+    // At depth 3 the deepest paths name children-of-children.
+    const keys = Object.keys(breakdown);
+    expect(keys.some((k) => k.startsWith('dispatcherState.activeAgents.'))).toBe(
+      true,
+    );
+  });
+});
+
+describe('computeBreakdown — fieldCap truncation', () => {
+  it('truncating preserves total via a `__truncated` bucket', () => {
+    // Force truncation by setting a tiny fieldCap.
+    const document = withTypenameInjected(parse(POLLED_QUERY_SOURCE));
+    const { total, breakdown } = computeBreakdown(
+      schema,
+      document,
+      'DispatcherState',
+      { fieldCap: 3 },
+    );
+    expect(Object.keys(breakdown).length).toBeLessThanOrEqual(3);
+    expect(sumValues(breakdown)).toBe(total);
+    expect(breakdown[__testing.TRUNCATED_KEY]).toBeGreaterThan(0);
   });
 });
 
