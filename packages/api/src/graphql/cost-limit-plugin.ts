@@ -125,6 +125,19 @@ export function costLimitPlugin(
                   complexityLimitExceeded: true,
                   actualCost: cost,
                   maximumCost,
+                  // Apollo Server v4 reads `extensions.http` off thrown
+                  // GraphQLErrors and merges it into the response status
+                  // (`errorNormalize.js` → `requestPipeline.js`'s
+                  // `sendErrorResponse`). Without this, an error thrown
+                  // from `didResolveOperation` falls into the default
+                  // 500 branch (#4129) — the retired predecessor library's
+                  // validation-rule wiring returned 400 because validation
+                  // errors are caught at an earlier pipeline phase and
+                  // tagged with 400 by Apollo itself. The `http` key is
+                  // stripped from the formatted error before it reaches
+                  // the client (errorNormalize.js `delete extensions.http`),
+                  // so the body shape stays exactly what AC2 specifies.
+                  http: { status: 400 },
                 },
               },
             );
