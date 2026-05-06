@@ -1400,9 +1400,25 @@ def _full_reparse_document(
 
     # Extract hearing date and judge name from the full PDF text
     # (these are document-level, shared across all rulings).
+    #
+    # Symmetric merge with DB-seeded fallback (#4145, sibling of #4142).
+    # The four code paths below — top-of-function init, try-success,
+    # except-Exception, and the no-scraper-cls else — all default
+    # ``doc_judge_name`` / ``doc_department`` to ``doc_meta.get("X")``
+    # rather than ``None``.  This mirrors the #4142 fix in the sibling
+    # ``_reparse_document`` path and protects against the same silent
+    # data-loss class: a Live-only no-op ``parse_document`` (e.g.
+    # ``cc_tentatives_portal``, ``oc_tentatives``, ``sf_civil_tentatives``)
+    # registered with a ``_SPLIT_REGISTRY`` entry would otherwise silently
+    # clobber the DB-seeded ``judge_name`` / ``department`` ridden along
+    # on ``doc_meta`` (the rulings row's ``canonical_name`` and
+    # ``department``, see ``FETCH_DOCUMENTS_QUERY``).  See
+    # ``docs/investigations/parse_document-reingest-safety-2026-05.md``
+    # for the per-scraper audit and #3986 for the bug-class root cause.
     scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
-    doc_judge_name: str | None = None
+    doc_judge_name: str | None = doc_meta.get("judge_name")
     doc_hearing_date: Any = doc_meta.get("hearing_date")
+    doc_department: str | None = doc_meta.get("department")
 
     if scraper_cls:
         try:
@@ -1429,7 +1445,7 @@ def _full_reparse_document(
                 content_hash=content_hash,
             )
             parsed = scraper.parse_document(cap_doc)
-            doc_judge_name = parsed.judge_name
+            doc_judge_name = parsed.judge_name or doc_meta.get("judge_name")
             if parsed.hearing_date:
                 doc_hearing_date = (
                     parsed.hearing_date.date()
@@ -1437,16 +1453,16 @@ def _full_reparse_document(
                     else parsed.hearing_date
                 )
             # Also try department from parsed doc
-            doc_department = parsed.department
+            doc_department = parsed.department or doc_meta.get("department")
         except Exception:
             logger.warning(
                 "Scraper parse_document failed during full-reparse",
                 document_id=doc_meta["document_id"],
                 exc_info=True,
             )
-            doc_department = None
+            doc_department = doc_meta.get("department")
     else:
-        doc_department = None
+        doc_department = doc_meta.get("department")
 
     # Fall back to regex for judge name if scraper didn't provide one
     if not doc_judge_name:
