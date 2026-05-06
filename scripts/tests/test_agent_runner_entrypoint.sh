@@ -633,6 +633,108 @@ setup_fixtures() {
     : > "$INVOCATIONS_DIR/gh.log"
 }
 
+# ── Source-once entrypoint, then call main() per-test (#4139) ──────────────
+#
+# Pre-#4139 every full-pipeline test invoked the entrypoint as a fresh
+# bash process, spawning a new interpreter + parsing 5300+ lines per
+# case (~30 cases × ~10s each = ~5 min just on parse). #4137 made the
+# entrypoint sourceable without side effects (``set -euo pipefail`` and
+# ``exec 3>&1`` moved inside ``main()``); #4138 extracted the per-phase
+# case-arm bodies into ``agent_runner_handlers.sh``; this helper
+# exploits both: source the entrypoint ONCE at file scope (next block)
+# so every later ``run_entrypoint_main`` call inherits the parent's
+# parsed function table from the ``$( … )`` subshell with zero re-parse
+# cost.
+#
+# Rebinding AGENT_WORKSPACE-derived globals
+# ------------------------------------------
+# A handful of top-level constants in the entrypoint (REPO_ROOT,
+# TRANSITION_SHIM, PHASE_INPUT_SHIM, TERMINAL_SHIM, STATUS_TERMINAL_SHIM)
+# capture ``$AGENT_WORKSPACE`` at SOURCE time, not ``main()`` time. The
+# parent shell's source happened with no AGENT_WORKSPACE in env, so
+# those constants point at ``/var/lib/agent-runner/...`` which doesn't
+# exist on the test host. Each test passes its own AGENT_WORKSPACE
+# via env-prefix on the function call (``AGENT_WORKSPACE=… run_entrypoint_main``);
+# the helper re-evaluates the dependent constants from the now-correct
+# AGENT_WORKSPACE before calling ``main``. Same shape as
+# ``${VAR:-…}`` defaults in the entrypoint, just hoisted into the
+# wrapper because we can't re-source the file per call.
+#
+# T1 + T2 retain the original ``bash $ENTRYPOINT`` form so the
+# executable-mode path stays exercised end-to-end (AC: ≤ 4 retained
+# smoke invocations).
+# Most of the variables below appear "unused" to shellcheck because their
+# only readers are inside ``main()`` / the per-phase handlers, which
+# shellcheck doesn't trace from a function definition. They ARE read —
+# silence the warnings rather than littering each line.
+# shellcheck disable=SC2034,SC2120
+run_entrypoint_main() {
+    # AGENT_WORKSPACE-anchored paths.
+    REPO_ROOT="$AGENT_WORKSPACE/repo"
+    TRANSITION_SHIM="${AGENT_RUNNER_TRANSITION_SHIM:-$AGENT_WORKSPACE/phase_transitions_shim.py}"
+    PHASE_INPUT_SHIM="${AGENT_RUNNER_PHASE_INPUT_SHIM:-$AGENT_WORKSPACE/phase_input_shim.py}"
+    TERMINAL_SHIM="${AGENT_RUNNER_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_terminal_shim.py}"
+    STATUS_TERMINAL_SHIM="${AGENT_RUNNER_STATUS_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_status_terminal_shim.py}"
+    # AGENT_RUNNER_*-derived constants. The entrypoint binds each at
+    # source time (line numbers below match
+    # ``scripts/dispatcher/agent-runner-entrypoint.sh``); since we
+    # source once at file scope, the parent shell's binding sticks
+    # through every later subshell — env-prefixed overrides on the
+    # ``run_entrypoint_main`` call site never take effect without this
+    # re-bind. Each line below mirrors the entrypoint's ``${VAR:-…}``
+    # default so the override semantics match exactly.
+    AGENT_RUNNER_DRY_RUN="${AGENT_RUNNER_DRY_RUN:-0}"                                      # entrypoint:138
+    RALPH_HEAD_POLL_INTERVAL="${AGENT_RUNNER_RALPH_HEAD_POLL_INTERVAL:-30}"                # entrypoint:3490
+    AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL="${AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL:-5}"  # entrypoint:3776
+    # Test-friendly defaults (#4139): the entrypoint's runtime defaults
+    # (60-second polls, 90-second deploy grace, 30-minute CI timeout,
+    # 30-minute deploy timeout) make the test's full-pipeline traversal
+    # take 2-3 minutes per call (T6 + similar). The previous test wrapper
+    # (``bash $ENTRYPOINT``) inherited those long defaults too — that's
+    # the bulk of the pre-#4139 11-minute baseline. Tests that need to
+    # exercise specific timeout / grace behavior (T33, T60a, T60b)
+    # still set the env-prefix vars explicitly; they continue to work
+    # because the env-prefix takes precedence over the wrapper's default.
+    # Tests that DON'T care about polling timing inherit the fast
+    # defaults below — happy-path traversal becomes ~1s instead of ~120s.
+    CI_POLL_INTERVAL="${AGENT_RUNNER_CI_POLL_INTERVAL:-0}"                                 # entrypoint:4181 (test default 0; entrypoint runtime 60)
+    DEPLOY_POLL_INTERVAL="${AGENT_RUNNER_DEPLOY_POLL_INTERVAL:-0}"                         # entrypoint:4182 (test default 0; entrypoint runtime 60)
+    AWAITING_CI_TIMEOUT_SECONDS="${AGENT_RUNNER_AWAITING_CI_TIMEOUT_SECONDS:-3600}"        # entrypoint:4187
+    AWAITING_DEPLOY_TIMEOUT_SECONDS="${AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS:-1800}" # entrypoint:4188
+    DEPLOY_GRACE_SECONDS="${AGENT_RUNNER_DEPLOY_GRACE_SECONDS:-0}"                         # entrypoint:4195 (test default 0; entrypoint runtime 90)
+    MERGE_UNSTICK_MAX_ATTEMPTS="${AGENT_RUNNER_MERGE_UNSTICK_MAX_ATTEMPTS:-1}"             # entrypoint:4199
+    FIX_CONFLICT_MAX_ATTEMPTS="${AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS:-2}"               # entrypoint:4208
+    NETWORK_TIMEOUT_SECONDS="${AGENT_RUNNER_NETWORK_TIMEOUT_SECONDS:-300}"                 # entrypoint:4228
+    CLAUDE_PHASE_TIMEOUT_SECONDS="${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-1800}"      # entrypoint:4244
+    LOCAL_GIT_TIMEOUT_SECONDS="${AGENT_RUNNER_LOCAL_GIT_TIMEOUT_SECONDS:-120}"             # entrypoint:4268
+    PUSH_AND_PR_PHASE_DEADLINE_SECONDS="${AGENT_RUNNER_PUSH_AND_PR_DEADLINE_SECONDS:-600}" # entrypoint:4279
+    DEPLOY_WORKFLOW_NAMES_BASH="${AGENT_RUNNER_DEPLOY_WORKFLOW_NAMES:-Deploy API|Deploy Dispatcher|Deploy Scraper|Deploy Production|Deploy Production (Web)|Terraform|Deploy Agent Runner}" # entrypoint:4292
+    MAX_PHASE_ITERATIONS="${AGENT_RUNNER_MAX_PHASE_ITERATIONS:-40}"                        # entrypoint:5184
+    main "$@"
+}
+
+# Source the entrypoint once. After #4137 + #4138 this exposes
+# ``main``, ``phase_loop``, every ``handle_*`` function, and every helper
+# (``log``, ``persist_phase_output``, ``run_claude_phase``, etc.) in
+# the parent shell's function table. ``$( … )`` subshells inherit the
+# parent's function table for free — no re-parse, no re-source.
+#
+# REPO_ROOT collision (#4139): the entrypoint sets ``REPO_ROOT=
+# "$AGENT_WORKSPACE/repo"`` at top-level (line ~209) — its semantic is
+# the per-agent clone path. The test file's REPO_ROOT (line 34) is the
+# WORKTREE root used to locate $ENTRYPOINT, the stubs, and to interpolate
+# into ``PHASE_TRANSITIONS_DIR=$REPO_ROOT/scripts/dispatcher`` env-prefix
+# lines on every test call. Sourcing without protection clobbers the
+# test's value. Save it before the source, restore immediately after —
+# the entrypoint's per-call REPO_ROOT semantic is re-established inside
+# ``run_entrypoint_main`` from each subshell's AGENT_WORKSPACE, so the
+# parent's value can stay anchored to the worktree root.
+_test_REPO_ROOT_save="$REPO_ROOT"
+# shellcheck source=../dispatcher/agent-runner-entrypoint.sh
+source "$ENTRYPOINT"
+REPO_ROOT="$_test_REPO_ROOT_save"
+unset _test_REPO_ROOT_save
+
 # ══════════════════════════════════════════════════════════════════════════
 # Test 1: Immediate terminal — agent row already at `done`
 # ══════════════════════════════════════════════════════════════════════════
@@ -648,6 +750,11 @@ t1_workspace="$TEST_TMP/t1-workspace"
 mkdir -p "$t1_workspace"
 
 set +e
+# T1 retains the bash $ENTRYPOINT invocation (vs. run_entrypoint_main)
+# so the executable-mode path stays exercised end-to-end on every test
+# run. Pairs with T2 (happy path); the other ~28 cases use
+# run_entrypoint_main to skip the per-case 5300-line
+# bash-startup-and-parse cost. See #4139.
 out=$(AGENT_ID="00000000-1111-2222-3333-444444444444" \
       ISSUE_NUMBER="9999" \
       DATABASE_URL="postgres://test" \
@@ -715,6 +822,9 @@ t2_workspace="$TEST_TMP/t2-workspace"
 mkdir -p "$t2_workspace"
 
 set +e
+# T2 (happy-path) retains the bash $ENTRYPOINT invocation for the same
+# reason as T1 — full executable-mode coverage of the entrypoint as a
+# script. See #4139.
 out=$(AGENT_ID="11111111-2222-3333-4444-555555555555" \
       ISSUE_NUMBER="3090" \
       DATABASE_URL="postgres://test" \
@@ -951,7 +1061,7 @@ out=$(AGENT_ID="22222222-3333-4444-5555-666666666666" \
       CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -980,13 +1090,19 @@ fi
 setup_fixtures
 
 set +e
-out=$(DATABASE_URL="postgres://test" \
+# Explicit AGENT_ID="" overrides the parent shell's empty default that
+# was bound at file-scope source time. Without it, subshells silently
+# inherit the parent's AGENT_ID (set to "" by line 131 of the entrypoint
+# at source), which is identical to the missing-env behavior anyway,
+# but the explicit empty-string env-prefix makes the test self-documenting.
+out=$(AGENT_ID="" \
+      DATABASE_URL="postgres://test" \
       AGENT_WORKSPACE="$TEST_TMP/t4-workspace" \
       PATH="$STUB_BIN:$PATH" \
       INVOCATIONS_DIR="$INVOCATIONS_DIR" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1009,13 +1125,15 @@ fi
 setup_fixtures
 
 set +e
+# Explicit DATABASE_URL="" — same rationale as T4's explicit AGENT_ID="".
 out=$(AGENT_ID="33333333-4444-5555-6666-777777777777" \
+      DATABASE_URL="" \
       AGENT_WORKSPACE="$TEST_TMP/t5-workspace" \
       PATH="$STUB_BIN:$PATH" \
       INVOCATIONS_DIR="$INVOCATIONS_DIR" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1068,7 +1186,7 @@ out=$(AGENT_ID="66666666-7777-8888-9999-aaaaaaaaaaaa" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1135,7 +1253,7 @@ out=$(AGENT_ID="77777777-8888-9999-aaaa-bbbbbbbbbbbb" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1189,7 +1307,7 @@ out=$(AGENT_ID="88888888-9999-aaaa-bbbb-cccccccccccc" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1256,7 +1374,7 @@ out=$(AGENT_ID="99999999-aaaa-bbbb-cccc-dddddddddddd" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
       GIT_REV_LIST_COUNT=0 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1321,7 +1439,7 @@ out=$(AGENT_ID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1375,7 +1493,7 @@ out=$(AGENT_ID="bbbbbbbb-cccc-dddd-eeee-ffffffffffff" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1429,7 +1547,7 @@ out=$(AGENT_ID="cccccccc-dddd-eeee-ffff-000000000000" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1513,7 +1631,7 @@ out=$(AGENT_ID="dddddddd-eeee-ffff-0000-111111111111" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1569,7 +1687,7 @@ out=$(AGENT_ID="eeeeeeee-ffff-0000-1111-222222222222" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1640,7 +1758,7 @@ out=$(AGENT_ID="15151515-1515-1515-1515-151515151515" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=2 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1746,7 +1864,7 @@ out=$(AGENT_ID="16161616-1616-1616-1616-161616161616" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=2 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -1786,24 +1904,34 @@ mkdir -p "$shim_workspace"
 
 # Run the entrypoint with AGENT_RUNNER_DRY_RUN=1 so it stamps the shim
 # file under $AGENT_WORKSPACE and then short-circuits the phase loop.
+# #4139: ``run_entrypoint_main`` runs in the calling shell context and
+# its inner ``main()`` may ``exit`` (e.g. via ``die`` on validation
+# failure or by reaching a terminal phase via ``mark_ended``); wrap in
+# a subshell ``( … )`` so any inner ``exit`` only terminates the
+# subshell, not the test script. ``$( … )`` command substitutions are
+# already implicit subshells; this case wants the side effect (file
+# stamped on disk) but not the captured output, so the explicit
+# ``( … )`` is needed.
 PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-shim-extract.txt"
 printf 'done\n' > "$PHASE_FIXTURE_FILE"
 set +e
-AGENT_ID="00000000-0000-0000-0000-000000000000" \
-    ISSUE_NUMBER="3135" \
-    DATABASE_URL="postgres://test" \
-    GITHUB_TOKEN="" \
-    AGENT_WORKSPACE="$shim_workspace" \
-    REPO_URL="https://example.invalid/repo.git" \
-    PATH="$STUB_BIN:$PATH" \
-    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
-    PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
-    PRIOR_PATCH_FIXTURE="" \
-    CLAUDE_VERDICT_FIXTURE="" \
-    PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
-    PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
-    AGENT_RUNNER_DRY_RUN=1 \
-    bash "$ENTRYPOINT" >/dev/null 2>&1
+(
+    AGENT_ID="00000000-0000-0000-0000-000000000000" \
+        ISSUE_NUMBER="3135" \
+        DATABASE_URL="postgres://test" \
+        GITHUB_TOKEN="" \
+        AGENT_WORKSPACE="$shim_workspace" \
+        REPO_URL="https://example.invalid/repo.git" \
+        PATH="$STUB_BIN:$PATH" \
+        INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+        PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+        PRIOR_PATCH_FIXTURE="" \
+        CLAUDE_VERDICT_FIXTURE="" \
+        PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+        PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+        AGENT_RUNNER_DRY_RUN=1 \
+        run_entrypoint_main >/dev/null 2>&1
+)
 set -e
 
 SHIM_PY="$shim_workspace/phase_input_shim.py"
@@ -2469,7 +2597,9 @@ run_watcher_test() {
                 export "$_tok"
             done
         fi
-        bash "$ENTRYPOINT" 2>&1
+        # #4139: run_entrypoint_main reuses the parent's already-sourced
+        # entrypoint function table (via $( … ) subshell inheritance).
+        run_entrypoint_main 2>&1
     )
     _wtest_rc=$?
     set -e
@@ -2812,7 +2942,9 @@ run_post_pr_phase() {
         for _tok in "$@"; do
             export "$_tok"
         done
-        bash "$ENTRYPOINT" 2>&1
+        # #4139: run_entrypoint_main reuses the parent's already-sourced
+        # entrypoint function table (via $( … ) subshell inheritance).
+        run_entrypoint_main 2>&1
     )
     _rpp_rc=$?
     set -e
@@ -5135,7 +5267,7 @@ out=$(AGENT_ID="50000000-1111-2222-3333-444444444444" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -5202,7 +5334,7 @@ out=$(AGENT_ID="51000000-1111-2222-3333-444444444444" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -5272,7 +5404,7 @@ out=$(AGENT_ID="52000000-1111-2222-3333-444444444444" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 rc=$?
 set -e
 
@@ -5613,7 +5745,7 @@ _t57a_test_terminal_phase() {
         PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
         PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
         AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-        bash "$ENTRYPOINT" 2>&1
+        run_entrypoint_main 2>&1
     )
     _t57a_rc=$?
     set -e
@@ -5673,7 +5805,7 @@ _t57b_out=$(
     PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
     PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
     AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-    bash "$ENTRYPOINT" 2>&1
+    run_entrypoint_main 2>&1
 )
 _t57b_rc=$?
 set -e
@@ -9598,7 +9730,7 @@ T3694_TEST_OUT=$(AGENT_ID="36943694-3694-3694-3694-369436943694" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3694_TEST_RC=$?
 set -e
 
@@ -9717,7 +9849,7 @@ T3694B_TEST_OUT=$(AGENT_ID="36943694-3694-3694-3694-369436943695" \
       AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3694B_TEST_RC=$?
 set -e
 
@@ -9856,7 +9988,7 @@ T3777_TEST_OUT=$(AGENT_ID="37773777-3777-3777-3777-377737773777" \
       AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
       AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3777_TEST_RC=$?
 set -e
 
@@ -9955,7 +10087,7 @@ T3777B_TEST_OUT=$(AGENT_ID="37773777-3777-3777-3777-377737773778" \
       AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
       GIT_REV_LIST_COUNT=1 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3777B_TEST_RC=$?
 set -e
 
@@ -10024,7 +10156,7 @@ T3778_TEST_OUT=$(AGENT_ID="37783778-3778-3778-3778-377837783778" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3778_TEST_RC=$?
 set -e
 
@@ -10118,7 +10250,7 @@ T3778B_TEST_OUT=$(AGENT_ID="37783778-3778-3778-3778-377837783779" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
-      bash "$ENTRYPOINT" 2>&1)
+      run_entrypoint_main 2>&1)
 T3778B_TEST_RC=$?
 set -e
 
