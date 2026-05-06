@@ -5053,3 +5053,89 @@ class TestAppendRulingFromCaseMetadataFallback:
         )
         assert len(rulings) == 1
         assert rulings[0].extracted_case_number is None
+
+
+# ---------------------------------------------------------------------------
+# Multimodal deterministic chunk-failure instrumentation (#4233)
+# ---------------------------------------------------------------------------
+
+
+class TestMultimodalDeterministicChunkFailure:
+    """Verify the multimodal per-page-image failure path also fires the
+    ``llm_extract.deterministic_chunk_failure`` event after 3+ failures
+    on the same document_id (#4233).
+    """
+
+    def test_pdf_page_failures_fire_deterministic_event(self, sample_pdf_bytes: bytes) -> None:
+        """Three consecutive per-page failures with a document_id fire the event."""
+        from framework import llm_extractor as mod
+
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.0
+        # max_retries=3 -> the loop in _extract_single_page records up to 3
+        # failures (attempts 1, 2 record into the retry branch; attempt 3
+        # records into the exhaustion branch). That's enough to cross the
+        # threshold of 3 for a single PDF page.
+        ext._max_retries = 3
+
+        page_image = b"\x89PNG_only_page"
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(page_image, "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=None,
+            ),
+            patch.object(mod, "logger") as mock_logger,
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes, document_id="multimodal-doc")
+
+        assert rulings == []
+        fail_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
+        ]
+        assert len(fail_events) == 1
+        payload = fail_events[0].kwargs
+        assert payload["document_id"] == "multimodal-doc"
+        assert payload["chunk_kind"] == "image"
+        # SHA-256 of the image bytes is recorded.
+        import hashlib
+
+        assert payload["chunk_content_sha256"] == hashlib.sha256(page_image).hexdigest()
+        # Image path leaves the text preview empty by design.
+        assert payload["chunk_preview"] == ""
+        assert payload["chunk_len"] == len(page_image)
+
+    def test_pdf_no_event_without_document_id(self, sample_pdf_bytes: bytes) -> None:
+        """Multimodal failures without document_id do not fire the event."""
+        from framework import llm_extractor as mod
+
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.0
+        ext._max_retries = 3
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_x", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=None,
+            ),
+            patch.object(mod, "logger") as mock_logger,
+        ):
+            ext.extract_from_pdf(sample_pdf_bytes)  # no document_id
+
+        fail_events = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "llm_extract.deterministic_chunk_failure"
+        ]
+        assert fail_events == []

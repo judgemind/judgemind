@@ -3164,7 +3164,9 @@ class IngestionWorker:
             if multimodal_extractor is not None:
                 try:
                     extracted_rulings = multimodal_extractor.extract_from_pdf(
-                        raw_pdf_bytes, metadata=metadata or None
+                        raw_pdf_bytes,
+                        metadata=metadata or None,
+                        document_id=document_id,
                     )
                     extraction_method = "multimodal"
                     if extracted_rulings:
@@ -3232,6 +3234,7 @@ class IngestionWorker:
                     ruling_text,
                     metadata=metadata or None,
                     system_prompt=county_prompt,
+                    document_id=document_id,
                 )
             except Exception as exc:
                 llm_latency_ms = round((time.monotonic() - t0) * 1000)
