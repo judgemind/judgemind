@@ -58,9 +58,10 @@
  * #4003 1000-cap (cost: 1035); CloudWatch on `/ecs/judgemind-api-dev`
  * showed every cockpit poll returning HTTP 400 with `Query exceeded
  * complexity`. Per-field breakdown (computed offline from the cost-
- * rule algorithm; the `costBreakdownPlugin` in
- * `packages/api/src/graphql/cost-breakdown.ts` will print this in
- * CloudWatch on each near-cap operation going forward) showed the
+ * rule algorithm; after issue #4101 the `graphql.cost` log line in
+ * `packages/api/src/graphql/cost-limit-plugin.ts` now carries a
+ * `breakdown` map keyed by GraphQL path on every API request, so
+ * future near-cap diagnoses are a single CloudWatch query) showed the
  * biggest remaining contributor was `activeAgents`'s 12-field scalar
  * list. Trimmed to the eight fields `ActiveAgentRow` actually reads
  * to render the row — `id` (key + native title for full UUID),
