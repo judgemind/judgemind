@@ -157,6 +157,12 @@ jobs:
 
       - name: Post-run audit — check for remaining blocked issues
         if: always()
+        # Best-effort observability — the actual unblock step has already
+        # completed by this point. This audit only emits warnings about
+        # potentially-misfired blocks; a transient GitHub-API 5xx in the
+        # `gh issue list` calls below should NOT fail the workflow run. See
+        # #4234 / #4238.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
