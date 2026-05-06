@@ -56,6 +56,7 @@ from validation.deterministic import (
 from validation.gate import ValidationResult, insert_validation_result, validate_document
 from validation.issue_filer import file_validation_issue
 
+from .case_type_resolver import resolve_case_type
 from .db import (
     batch_upsert_parties,
     delete_stale_split_children,
@@ -72,10 +73,6 @@ from .extract import (
     clean_case_title,
     dedupe_repeated_title,
     extract_case_number,
-    extract_case_type_from_motion_type,
-    extract_case_type_from_number,
-    extract_case_type_from_scraper_id,
-    extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
     has_bare_vs_suffix,
@@ -2269,10 +2266,23 @@ class IngestionWorker:
                         extraction_methods["judge_name"] = "regex_post_llm"
 
             # case_type from case number — does not require ruling_text.
+            # Uses the shared resolver (#4295) so this and the post-LLM
+            # block stay in lock-step with the reingest path; only the
+            # case_number signal is available here, so the resolver only
+            # exercises its first fallback step (returns method="regex"
+            # on a hit).
             if case_type is None and case_number:
-                case_type = extract_case_type_from_number(case_number)
-                if case_type:
-                    extraction_methods.setdefault("case_type", "regex")
+                resolved_ct, resolved_method = resolve_case_type(
+                    case_type=None,
+                    case_number=case_number,
+                    scraper_id=None,
+                    motion_type=None,
+                    case_title=None,
+                )
+                if resolved_ct:
+                    case_type = resolved_ct
+                    assert resolved_method is not None
+                    extraction_methods.setdefault("case_type", resolved_method)
 
             # Clean ruling text for display — the cleaned version is stored
             # in Postgres.
@@ -2453,41 +2463,24 @@ class IngestionWorker:
                     },
                 )
 
-        # Fallback case_type from case number prefix (#706).
-        if case_type is None and case_number:
-            case_type = extract_case_type_from_number(case_number)
-            if case_type:
-                extraction_methods.setdefault("case_type", "regex")
-
-        # Fallback case_type from scraper_id (#1524).
-        # When the case number is absent or doesn't encode a type prefix
-        # (e.g. OC North JC PDFs have no case numbers), infer from the
-        # scraper_id which encodes the case category in its suffix.
-        if case_type is None and scraper_id:
-            case_type = extract_case_type_from_scraper_id(scraper_id)
-            if case_type:
-                extraction_methods.setdefault("case_type", "scraper_id")
-
-        # Fallback case_type from motion_type (#1702).
-        # Final fallback for cases where the case number has no embedded
-        # type code and the scraper_id is generic (e.g. Ventura's
-        # all-digit case numbers like 202300574258).  Many civil motion
-        # types unambiguously identify the case type.
-        if case_type is None and motion_type:
-            case_type = extract_case_type_from_motion_type(motion_type)
-            if case_type:
-                extraction_methods.setdefault("case_type", "motion_type")
-
-        # Fallback case_type from case title (#2062).
-        # Final fallback for cases where no other signal determined the
-        # case type.  Probate-style titles ("In the Matter of...",
-        # "Conservatorship of...", "Guardianship of...") are unambiguous.
-        if case_type is None:
-            eff_title = case_title or event_data.get("case_title")
-            if eff_title:
-                case_type = extract_case_type_from_title(eff_title)
-                if case_type:
-                    extraction_methods.setdefault("case_type", "title")
+        # Post-LLM-enrichment case_type fallback chain — case_number
+        # prefix (#706) -> scraper_id (#1524) -> motion_type (#1702) ->
+        # case_title (#2062).  See ``ingestion.case_type_resolver`` for
+        # the canonical chain definition; the same resolver is invoked
+        # by ``_apply_regex_fallbacks`` in ``scripts/reingest_from_s3.py``
+        # so live ingestion and reparse cannot diverge by construction
+        # (#4295, follow-on to the #4290 hygiene guard).
+        eff_title = case_title or event_data.get("case_title")
+        resolved_ct, resolved_method = resolve_case_type(
+            case_type=case_type,
+            case_number=case_number,
+            scraper_id=scraper_id,
+            motion_type=motion_type,
+            case_title=eff_title,
+        )
+        if resolved_method is not None:
+            case_type = resolved_ct
+            extraction_methods.setdefault("case_type", resolved_method)
 
         if extraction_methods:
             logger.info(

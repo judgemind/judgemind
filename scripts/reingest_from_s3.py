@@ -207,13 +207,10 @@ from ingestion.db import (  # noqa: E402
     upsert_case_judge,
 )
 from ingestion.doc_timing import DocTiming, emit_via_structlog_logger  # noqa: E402
+from ingestion.case_type_resolver import resolve_case_type  # noqa: E402
 from ingestion.extract import (  # noqa: E402
     dedupe_repeated_title,
     extract_case_number,
-    extract_case_type_from_motion_type,
-    extract_case_type_from_number,
-    extract_case_type_from_scraper_id,
-    extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
     is_plausible_hearing_date,
@@ -834,50 +831,22 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
             extracted["hearing_date"] = val
             methods.setdefault("hearing_date", "regex")
 
-    # Fallback case_type from case number prefix (#706).
-    if not extracted["case_type"] and extracted["case_number"]:
-        val = extract_case_type_from_number(extracted["case_number"])
-        if val:
-            extracted["case_type"] = val
-            methods.setdefault("case_type", "regex")
-
-    # Fallback case_type from scraper_id (#1524 / #1836).
-    # When the case number is absent or doesn't encode a type prefix
-    # (e.g. OC North JC PDFs have no case numbers), infer from the
-    # scraper_id which encodes the case category in its suffix.
-    if not extracted["case_type"] and scraper_id:
-        val = extract_case_type_from_scraper_id(scraper_id)
-        if val:
-            extracted["case_type"] = val
-            methods.setdefault("case_type", "scraper_id")
-
-    # Fallback case_type from motion_type (#1731).
-    # Final fallback for cases where the case number has no embedded
-    # type code and the scraper_id is generic (e.g. Ventura's
-    # all-digit case numbers like 202300574258).  Many civil motion
-    # types unambiguously identify the case type.
-    if not extracted["case_type"] and extracted["motion_type"]:
-        val = extract_case_type_from_motion_type(extracted["motion_type"])
-        if val:
-            extracted["case_type"] = val
-            methods.setdefault("case_type", "motion_type")
-
-    # Fallback case_type from case title (#2062).  Mirrors
-    # ``packages/scraper-framework/src/ingestion/worker.py`` lines 2331-2336
-    # so reingest produces the same case_type as live ingestion.  Probate-
-    # style titles ("In the Matter of...", "Conservatorship of...",
-    # "Guardianship of...", "Estate of...") are unambiguous — without this
-    # fallback, the CC dept-38 ``MSP*`` and dept-NULL ``N*`` rulings whose
-    # case-number prefix doesn't match any pattern in
-    # ``_CASE_TYPE_PREFIX_PATTERNS`` fall into the civil ±14 day
-    # plausibility window in ``apply_post_extraction_guards`` and lose
-    # their correctly-extracted multi-week-master-calendar hearing dates
-    # (#4263, follow-up to #4256).
-    if not extracted["case_type"] and extracted.get("case_title"):
-        val = extract_case_type_from_title(extracted["case_title"])
-        if val:
-            extracted["case_type"] = val
-            methods.setdefault("case_type", "title")
+    # case_type fallback chain — case_number prefix (#706) -> scraper_id
+    # (#1524 / #1836) -> motion_type (#1731) -> case_title (#2062, surfaced
+    # via #4263 / #4256).  Delegated to the shared resolver in
+    # ``ingestion.case_type_resolver`` so this and the live ingestion
+    # path (worker.py) cannot diverge by construction (#4295, follow-on
+    # to the #4290 hygiene guard).
+    resolved_ct, resolved_method = resolve_case_type(
+        case_type=extracted["case_type"],
+        case_number=extracted["case_number"],
+        scraper_id=scraper_id,
+        motion_type=extracted["motion_type"],
+        case_title=extracted.get("case_title"),
+    )
+    if resolved_method is not None:
+        extracted["case_type"] = resolved_ct
+        methods.setdefault("case_type", resolved_method)
 
 
 def _extract_doc_level_judge_department(
@@ -2258,11 +2227,22 @@ def _reparse_document_multimodal(
             # extract case_type from case_number.  See #2270.
             # Party extraction from captions was removed in #2178 — LLM
             # enrichment handles party extraction.
-            if not extracted["case_type"] and extracted["case_number"]:
-                val = extract_case_type_from_number(extracted["case_number"])
-                if val:
-                    extracted["case_type"] = val
-                    extracted["extraction_methods"].setdefault("case_type", "regex")
+            #
+            # Uses the shared resolver (#4295) so this and the
+            # ``_apply_regex_fallbacks`` path stay in lock-step with the
+            # live worker.  Only the case_number signal is meaningful
+            # here — the resolver only exercises its first fallback
+            # step on a hit (returns method="regex").
+            resolved_ct, resolved_method = resolve_case_type(
+                case_type=extracted["case_type"],
+                case_number=extracted["case_number"],
+                scraper_id=None,
+                motion_type=None,
+                case_title=None,
+            )
+            if resolved_method is not None:
+                extracted["case_type"] = resolved_ct
+                extracted["extraction_methods"].setdefault("case_type", resolved_method)
         extracted["regex_fallback_ms"] = (time.perf_counter() - _regex_t0) * 1000.0
         # Multimodal does not invoke pdfplumber; ``parse_document_ms`` is
         # 0 for this path.  The multimodal LLM call itself is timed

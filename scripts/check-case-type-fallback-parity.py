@@ -16,11 +16,24 @@ a reingest, which has caused multi-hour investigations and reingest re-runs
 six times over four years (#1731, #1749, #1763, #1836, #2062 surfaced as
 #4263, #2406).  This script is the cheap structural defense — see #4290.
 
+Defense-in-depth status (#4295):  As of #4295, both paths invoke
+``ingestion.case_type_resolver.resolve_case_type`` — a single shared
+helper that encodes the canonical fallback chain.  When that refactor
+holds, **both scanned sets are empty** ("(empty) == (empty)") and the
+guard reports ``All clean`` trivially.  The guard intentionally remains
+in place as defense-in-depth: if a future change re-inlines a call to
+``extract_case_type_from_<x>`` in either path without adding the same
+call to the other (the historical divergence shape), this guard fires
+again.  The shared resolver makes divergence impossible at the source
+level; this guard catches re-divergence.
+
 Usage:
     scripts/check-case-type-fallback-parity.py
 
 Exit codes:
-    0 — Both files reference the same set of helpers.
+    0 — Both files reference the same set of helpers (including the
+        post-#4295 case where both sets are empty because the chain is
+        delegated to ``case_type_resolver.resolve_case_type``).
     1 — Sets diverge (or a required file is missing).
 
 Test override:
