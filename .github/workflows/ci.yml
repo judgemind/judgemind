@@ -1174,19 +1174,22 @@ jobs:
         run: scripts/check-vitest-environment-deps.sh
 
   # ---------------------------------------------------------------
-  # Repo-wide brand-accent guard: block bare shadcn accent tokens
-  # anywhere under packages/web/src/ so readability regressions like
-  # #2816 (invisible gray issue/PR links on /admin/dispatcher) don't
-  # recur on any other surface. The narrow #2816 guard has been
-  # superseded by this repo-wide expansion (#2832); legitimate
-  # selected-row idioms are waived via inline
+  # Repo-wide shadcn token-pair guard: block bare shadcn tokens
+  # anywhere under packages/web/src/ so invisible-chrome regressions
+  # like #2816 (gray issue/PR links on /admin/dispatcher) don't recur
+  # on any other surface. The narrow #2816 guard was superseded by the
+  # repo-wide accent expansion (#2832); the #4225 expansion (parent
+  # of this comment) generalises to the foreground family
+  # (primary, secondary, card, popover, destructive, accent) plus
+  # the symmetric background/foreground swap. Legitimate selected-row
+  # and parent-paired idioms are waived via inline
   # `shadcn-accent: intentional` comments.
   # ---------------------------------------------------------------
   bare-shadcn-accent-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Enforce brand-accent on always-visible web chrome
+      - name: Enforce shadcn token pairing on always-visible web chrome
         run: scripts/check-bare-shadcn-accent.sh
 
   # ---------------------------------------------------------------

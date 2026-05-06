@@ -186,6 +186,7 @@ export function Autocomplete({
               className={`cursor-pointer px-3 py-2 text-sm ${
                 i === activeIndex
                   ? 'bg-brand-accent-surface text-amber-900 dark:bg-amber-900/30 dark:text-amber-100'
+                  // shadcn-accent: intentional - text-popover-foreground sits on the parent <ul>'s bg-popover surface (line 174); hover:bg-accent is the canonical shadcn hover idiom (#4225).
                   : 'text-popover-foreground hover:bg-accent'
               }`}
             >

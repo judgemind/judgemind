@@ -108,6 +108,18 @@ A `bg-stone-200` in production code will fail CI.
 > surfaces (sidebar active nav, filter pills) waive the check with an
 > inline `shadcn-accent: intentional` comment. When in doubt, grep the
 > Wordmark component for the canonical brand-accent pattern.
+>
+> The same guard was generalised in #4225 to cover the broader
+> invisible-chrome family: bare `(text|bg|border|ring)-X-foreground`
+> for X in {`primary`, `secondary`, `card`, `popover`, `destructive`,
+> `accent`} unless paired with the corresponding `(bg|text|border|ring)-X`
+> surface on the same element, plus the symmetric `text-background` /
+> `bg-foreground` token swap (white-on-white in light mode,
+> near-black-on-near-black in dark mode). `text-muted-foreground` is
+> allowlisted unconditionally — it is the legitimate body-color
+> idiom (Stone 500 in §Color Palette). The same
+> `shadcn-accent: intentional` marker waives violations across the
+> full family.
 
 ```
 // packages/web/tailwind.config.ts
