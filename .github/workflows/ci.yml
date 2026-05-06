@@ -1101,6 +1101,24 @@ jobs:
         run: scripts/check-parse-document-reingest-safety.sh
 
   # ---------------------------------------------------------------
+  # Tests-use-reingest-helper guard: every reingest-shape regression
+  # test under packages/scraper-framework/tests/courts/ must use the
+  # shared make_reingest_cap_doc helper instead of constructing the
+  # cap_doc inline.  Test-side analog of parse-document-reingest-safety
+  # (#4141 production-side guard).  Closes the migration loop where
+  # #4134 had to be re-migrated in #4165 because it landed before the
+  # helper.  See #4190.  Note: do not quote the forbidden string in
+  # the step name (per docs/agent/code-standards.md §Hygiene-check
+  # CI steps).
+  # ---------------------------------------------------------------
+  tests-use-reingest-helper-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify reingest-shape regression tests use the shared helper
+        run: scripts/check-tests-use-reingest-helper.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded model guard: enforce model ID centralization
   # ---------------------------------------------------------------
   hardcoded-models-check:
@@ -1726,7 +1744,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
