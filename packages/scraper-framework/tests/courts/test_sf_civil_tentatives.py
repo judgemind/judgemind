@@ -1797,3 +1797,347 @@ class TestFixtureRegression:
             rulings = parse_api_response(_load_fixture(name))
             total += len(rulings)
         assert total == 33  # 12 + 11 + 10
+
+
+# ---------------------------------------------------------------------------
+# parse_document — reingest safety (#4134)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDocumentReingestSafety:
+    """parse_document must populate every structured field from raw_content
+    on the reingest path (#4134).
+
+    On the reingest path, ``scripts/reingest_from_s3.py::_reparse_document``
+    constructs a fresh ``CapturedDocument`` carrying only ``raw_content`` and
+    calls ``scraper.parse_document(cap_doc)``.  Before #4134, ``raw_content``
+    was the bare per-ruling HTML and ``parse_document`` was a no-op, so the
+    reingest merge silently cleared ``judge_name``/``department``/``parties``/
+    ``outcome``/``motion_type``.  After #4134, ``raw_content`` is a JSON
+    envelope and ``parse_document`` repopulates every field.
+    """
+
+    @staticmethod
+    def _build_envelope_raw_content(**overrides: object) -> bytes:
+        """Build the JSON envelope ``_ruling_to_document`` writes today."""
+        import json as _json
+
+        envelope: dict[str, object] = {
+            "case_number": "CPF23518377",
+            "case_title": "MAIBACH VS. ABC CORP",
+            "court_date": "2026-03-23 09:00 AM",
+            "calendar_matter": "MOTION FOR SUMMARY JUDGMENT",
+            "ruling_text": "The motion is GRANTED. Plaintiff to prepare order.",
+            "ruling_html": ("<p>The motion is <b>GRANTED</b>. Plaintiff to prepare order.</p>"),
+            "case_info_url": "/CaseInfo.dll?ID=CPF23518377",
+            "ruling_id": 10,
+            "department": "301",
+        }
+        envelope.update(overrides)
+        return _json.dumps(envelope).encode("utf-8")
+
+    @staticmethod
+    def _make_reingest_cap_doc(raw_content: bytes) -> Any:
+        """Construct the shape of CapturedDocument the reingest path passes."""
+        from datetime import UTC, datetime
+
+        from framework import CapturedDocument, ContentFormat
+
+        return CapturedDocument(
+            document_id="00000000-0000-0000-0000-000000000001",
+            scraper_id="ca-sf-tentatives-civil",
+            state="CA",
+            county="San Francisco",
+            court="Superior Court",
+            source_url="https://webapps.sftc.org/tr/tr.dll?RulingID=10",
+            capture_timestamp=datetime(2026, 3, 23, tzinfo=UTC),
+            content_format=ContentFormat.HTML,
+            raw_content=raw_content,
+            content_hash="0" * 64,
+        )
+
+    def _make_scraper(
+        self, dept_judge_map: dict[str, str] | None = None
+    ) -> SFCivilTentativeRulingsScraper:
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        return SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+            dept_judge_map=dept_judge_map,
+        )
+
+    def test_reingest_populates_case_number(self) -> None:
+        """parse_document populates case_number from the envelope."""
+        raw = self._build_envelope_raw_content(case_number="CGC22602981")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.case_number == "CGC22602981"
+
+    def test_reingest_populates_case_title_normalized(self) -> None:
+        """parse_document populates case_title via normalize_case_title."""
+        raw = self._build_envelope_raw_content(case_title="MAIBACH VS. ABC CORP")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        # ALL CAPS gets title-cased
+        assert parsed.case_title == "Maibach Vs. Abc Corp"
+
+    def test_reingest_populates_hearing_date(self) -> None:
+        """parse_document parses hearing_date from court_date."""
+        from datetime import datetime
+
+        raw = self._build_envelope_raw_content(court_date="2026-03-23 09:00 AM")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.hearing_date == datetime(2026, 3, 23, 9, 0)
+
+    def test_reingest_populates_ruling_text_and_html(self) -> None:
+        """parse_document populates ruling_text + ruling_text_html."""
+        raw = self._build_envelope_raw_content(
+            ruling_text="The motion is DENIED.",
+            ruling_html="<p>The motion is <b>DENIED</b>.</p>",
+        )
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.ruling_text == "The motion is DENIED."
+        assert parsed.ruling_text_html == "<p>The motion is <b>DENIED</b>.</p>"
+
+    def test_reingest_populates_motion_type(self) -> None:
+        """parse_document populates motion_type from calendar_matter."""
+        raw = self._build_envelope_raw_content(calendar_matter="DEMURRER")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.motion_type == "DEMURRER"
+
+    def test_reingest_populates_outcome(self) -> None:
+        """parse_document extracts outcome from ruling_text via regex."""
+        raw = self._build_envelope_raw_content(
+            ruling_text="The motion is GRANTED. The court rules as follows.",
+        )
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.outcome == "granted"
+
+    def test_reingest_populates_parties(self) -> None:
+        """parse_document extracts parties from case_title via VS. split."""
+        raw = self._build_envelope_raw_content(case_title="JOHN DOE VS. ACME INC")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        roles = {p["role"]: p["name"] for p in parsed.parties}
+        assert roles == {"plaintiff": "John Doe", "defendant": "Acme Inc"}
+
+    def test_reingest_populates_department_and_courthouse(self) -> None:
+        """parse_document populates department + courthouse from envelope."""
+        raw = self._build_envelope_raw_content(department="302")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.department == "302"
+        assert parsed.courthouse == "San Francisco Courthouse"
+
+    def test_reingest_populates_judge_name_from_dept_map(self) -> None:
+        """parse_document looks up judge_name via dept_judge_map (#4134)."""
+        raw = self._build_envelope_raw_content(department="301")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper(
+            dept_judge_map={"301": "Curtis E.A. Karnow"},
+        )
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.judge_name == "Curtis E.A. Karnow"
+
+    def test_reingest_judge_name_none_when_no_dept_map(self) -> None:
+        """parse_document leaves judge_name None when dept_judge_map empty."""
+        raw = self._build_envelope_raw_content(department="301")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.judge_name is None
+
+    def test_reingest_populates_extra_metadata(self) -> None:
+        """parse_document populates extra.ruling_id, dept_type, case_info_url."""
+        raw = self._build_envelope_raw_content(
+            ruling_id=10,
+            case_info_url="/CaseInfo.dll?ID=CPF23518377",
+        )
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.extra["ruling_id"] == 10
+        assert parsed.extra["dept_type"] == "Law & Motion/Discovery (odd)"
+        assert parsed.extra["case_info_url"] == "/CaseInfo.dll?ID=CPF23518377"
+
+    def test_reingest_legacy_html_body_returns_unchanged(self) -> None:
+        """Legacy archives (bare HTML body bytes, not JSON) return unchanged.
+
+        Pre-#4134 archives wrote the per-ruling HTML body to raw_content.
+        parse_document must tolerate those without raising — returning the
+        doc unchanged so reingest's existing UTF-8 decode + DB-seeded
+        metadata fallback keeps working.
+        """
+        raw = b"<p>The motion is GRANTED.</p>"
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        # No exception, no envelope-derived fields populated.
+        assert parsed.case_number is None
+        assert parsed.ruling_text is None
+        assert parsed.case_title is None
+
+    def test_reingest_invalid_json_returns_unchanged(self) -> None:
+        """Garbage raw_content (not JSON, not HTML) returns unchanged."""
+        raw = b"\x00\x01\x02not-json-not-html"
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.case_number is None
+        assert parsed.ruling_text is None
+
+    def test_reingest_json_without_envelope_keys_returns_unchanged(self) -> None:
+        """Valid JSON without ruling_id/department keys returns unchanged.
+
+        Defensive — an externally tampered archive that decodes to a dict
+        but lacks the envelope's required keys should not crash and
+        should not populate fields with garbage.
+        """
+        import json as _json
+
+        raw = _json.dumps({"unrelated": "shape", "foo": 42}).encode("utf-8")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.case_number is None
+        assert parsed.ruling_text is None
+
+    def test_reingest_empty_raw_content_returns_unchanged(self) -> None:
+        """Empty raw_content returns unchanged without raising."""
+        cap_doc = self._make_reingest_cap_doc(b"")
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.case_number is None
+        assert parsed.ruling_text is None
+
+    def test_reingest_envelope_with_string_ruling_id_coerces_to_int(self) -> None:
+        """JSON-stringified ruling_id (defensive) gets coerced back to int.
+
+        json.dumps preserves int round-trip, but a tampered archive could
+        ship a string. _populate_from_envelope must coerce so dept_type
+        lookup still works.
+        """
+        import json as _json
+
+        envelope = {
+            "case_number": "CPF23518377",
+            "case_title": "TEST CASE",
+            "court_date": None,
+            "calendar_matter": None,
+            "ruling_text": None,
+            "ruling_html": None,
+            "case_info_url": None,
+            "ruling_id": "10",  # string instead of int
+            "department": "301",
+        }
+        raw = _json.dumps(envelope).encode("utf-8")
+        cap_doc = self._make_reingest_cap_doc(raw)
+        scraper = self._make_scraper()
+
+        parsed = scraper.parse_document(cap_doc)
+
+        assert parsed.extra["ruling_id"] == 10
+        assert parsed.extra["dept_type"] == "Law & Motion/Discovery (odd)"
+
+    def test_live_capture_envelope_round_trips_through_parse_document(self) -> None:
+        """End-to-end: docs from fetch_documents survive a parse_document round-trip.
+
+        Construct a fresh CapturedDocument from the live doc's raw_content
+        (mimicking what reingest does) and assert parse_document recovers
+        the same field values as the live capture.
+        """
+        from datetime import UTC, datetime
+
+        from framework import CapturedDocument, ContentFormat
+
+        json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        _mock_rest_api(json_text)
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+            dept_judge_map={"301": "Curtis E.A. Karnow"},
+        )
+
+        with respx.mock:
+            _mock_rest_api(json_text)
+            docs = scraper.fetch_documents()
+
+        live_doc = next(d for d in docs if d.department == "301")
+
+        # Mimic reingest's CapturedDocument construction — only raw_content
+        # carries content into parse_document, every other field is the
+        # DB-seeded shape.
+        reingest_doc = CapturedDocument(
+            document_id=live_doc.document_id,
+            scraper_id=live_doc.scraper_id,
+            state=live_doc.state,
+            county=live_doc.county,
+            court=live_doc.court,
+            source_url=live_doc.source_url,
+            capture_timestamp=datetime(2026, 3, 23, tzinfo=UTC),
+            content_format=ContentFormat.HTML,
+            raw_content=live_doc.raw_content,
+            content_hash="0" * 64,
+        )
+
+        parsed = scraper.parse_document(reingest_doc)
+
+        assert parsed.case_number == live_doc.case_number
+        assert parsed.case_title == live_doc.case_title
+        assert parsed.hearing_date == live_doc.hearing_date
+        assert parsed.ruling_text == live_doc.ruling_text
+        assert parsed.ruling_text_html == live_doc.ruling_text_html
+        assert parsed.motion_type == live_doc.motion_type
+        assert parsed.outcome == live_doc.outcome
+        assert parsed.parties == live_doc.parties
+        assert parsed.department == live_doc.department
+        assert parsed.courthouse == live_doc.courthouse
+        assert parsed.judge_name == live_doc.judge_name
+        assert parsed.extra.get("ruling_id") == live_doc.extra.get("ruling_id")
+        assert parsed.extra.get("dept_type") == live_doc.extra.get("dept_type")

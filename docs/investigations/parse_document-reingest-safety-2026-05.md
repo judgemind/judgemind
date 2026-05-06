@@ -87,18 +87,22 @@ lives in `pdf_link_scraper.py`, which is a shared base class consumed by
 | `ca/sd_calendar.py:578` | **Reingest-aware** | HTML bytes | Yes — primary path | Docstring explicitly names "during reingest" as the main use case. `doc.raw_content.decode("utf-8")` → `parse_calendar_page(html)` matched by `doc.case_number`. Safe and explicitly documented. |
 | `ca/sd_pipeline.py:188` | **Reingest-aware** (delegating) | HTML bytes | Yes | Delegates to `SDTentativeRulingsScraper.parse_document` (sd_tentatives.py). Safe. |
 | `ca/sd_tentatives.py:843` | **Reingest-aware** | HTML bytes | Yes | `doc.raw_content.decode("utf-8")` → `parse_roa_page(html)`. LLM supplements outcome/motion_type when enabled. Safe. |
-| `ca/sf_civil_tentatives.py:1153` | **Live-only (no-op)** | HTML bytes (per-ruling AJAX response text) | Yes (via `_reparse_document`) | Returns `doc` unchanged. `raw_content` is the per-ruling HTML text from the AJAX API, so `_extract_text_from_content` UTF-8-decodes it into `extracted["ruling_text"]` (cf. CourtListener: there `raw_content` was a JSON envelope, so the decode produced a JSON string — that was the #3986 bug). **No truncation hazard like #3986** because the body is HTML text rather than a JSON envelope. **But:** `case_number`, `case_title`, `hearing_date`, `motion_type`, `judge_name`, `department`, `parties`, `ruling_text_html`, `outcome` all populated only in `_ruling_to_document` from the AJAX response's structured fields. Reingest can recover `case_number/case_title/hearing_date` from `doc_meta`; `judge_name`/`department`/`parties` are unconditionally cleared (see "How `_reparse_document` consumes" §5 above). Existing docstring is misleading — says fields are "pre-populated during fetch" but doesn't mention reingest. **Same shape as #3986 minus the JSON-envelope-as-ruling_text symptom.** |
+| `ca/sf_civil_tentatives.py:1153` | **Reingest-aware (post-#4134)** | JSON envelope bytes (ParsedRuling fields + ruling_id + department) | Yes — primary path | Post-fix: `_ruling_to_document` archives a JSON envelope to `raw_content`, and `parse_document` JSON-decodes + calls `_populate_from_envelope` (single source of truth for both code paths). Tolerates legacy bare-HTML archives — returns doc unchanged so reingest's UTF-8 decode + DB-seed fallback still applies. Safe. |
 | `ca/sf_tentatives.py:214` | **Reingest-aware** (via super) | PDF bytes | Yes | `super().parse_document(doc)` + judge / hearing-date / case-title from PDF text. Safe. |
 | `ca/ventura_tentatives.py:518` | **Reingest-aware** | PDF or HTML bytes | Yes | Branches on `doc.content_format`; both branches call `_extract_pdf_text`/`_extract_html_text` and populate fields. Safe. |
 | `federal/courtlistener.py:513` | **Reingest-aware** (post-#3986) | JSON envelope bytes | Yes — primary path | Post-fix: `parse_document` calls `_populate_from_envelope` for both live-capture and reingest. Single source of truth. Safe. |
 
 ## Summary by class
 
-- **Reingest-aware (or Mixed → Reingest-aware in the reingest branch):** 17 implementations. All safe.
-- **Live-only (no-op):** 3 implementations:
+- **Reingest-aware (or Mixed → Reingest-aware in the reingest branch):** 18 implementations (post-#4134). All safe.
+- **Live-only (no-op):** 2 implementations:
   1. `ca/cc_tentatives_portal.py:549`
   2. `ca/oc_tentatives.py:162` (intentional — LLM-handled, already documented)
-  3. `ca/sf_civil_tentatives.py:1153`
+
+  Previously `ca/sf_civil_tentatives.py:1153` was on this list; #4134 moved
+  it to Reingest-aware by switching ``raw_content`` to a JSON envelope and
+  routing both ``_ruling_to_document`` and ``parse_document`` through a
+  shared ``_populate_from_envelope`` helper.
 
 ## Live-only triage
 
@@ -114,13 +118,20 @@ lives in `pdf_link_scraper.py`, which is a shared base class consumed by
   field (modulo `doc_meta` seeds for `case_number/case_title/hearing_date`).
 - **Action:** filed follow-up issue (see below) to refactor along the #3986 shape — extract a `_populate_from_pdf_or_listing_envelope` helper so `parse_document` can populate fields from PDF text at minimum, and document that `ruling_text_html` is unrecoverable on reingest (or change the archive shape to include detail HTML).
 
-### `ca/sf_civil_tentatives.py:1153` — UNSAFE for reingest (no-op clobber)
+### `ca/sf_civil_tentatives.py:1153` — RESOLVED in #4134
 
-- `raw_content` is the per-ruling HTML text — `ruling_text` would round-trip via UTF-8 decode.
-- Structured fields (`case_number/case_title/hearing_date/motion_type/judge_name/department/parties/ruling_text_html/outcome`) come from the AJAX API's structured response, parsed in `_ruling_to_document`. None of those structured fields survive in `raw_content`.
-- The no-op `parse_document` returns `doc` unchanged, so `_reparse_document` clears `judge_name/department/parties` to `None`/`[]` (see §5 above). DB-seeded `case_number/case_title/hearing_date` survive; everything else is gone.
-- **No truncation-cap hazard** like #3986 because the body is HTML rather than a JSON envelope, but the structural-field loss is the same shape.
-- **Action:** filed follow-up issue (see below) to either (a) refactor `_ruling_to_document` so that the AJAX response is archived as a JSON envelope into `raw_content` and `parse_document` re-populates from it (mirrors CourtListener's #3986 fix), or (b) explicitly document that this scraper is not reingest-safe and add a runtime guard that refuses to reingest documents from `scraper_id="ca-sf-tentatives-civil"` until the refactor lands.
+- Resolution: chose Option A from the follow-up — `_ruling_to_document`
+  now archives a JSON envelope (ParsedRuling fields + ruling_id +
+  department) to `raw_content`, and `parse_document` JSON-decodes +
+  routes through a new shared `_populate_from_envelope` helper. Single
+  source of truth for live capture and reingest.
+- Legacy archives: `parse_document` tolerates pre-#4134 bare-HTML
+  bodies — returns doc unchanged so reingest's UTF-8 decode + DB-seed
+  fallback still applies. Backfilling legacy archives to the new
+  envelope shape is out of scope (separate p3 follow-up if needed).
+- See the table row above for the post-fix classification and PR #4134
+  for the regression test in
+  `tests/courts/test_sf_civil_tentatives.py::TestParseDocumentReingestSafety`.
 
 ### `ca/oc_tentatives.py:162` — Documented as LLM-handled
 

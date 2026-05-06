@@ -526,6 +526,42 @@ def normalize_case_title(raw_title: str | None) -> str | None:
     return title
 
 
+def _build_ruling_envelope(
+    ruling: ParsedRuling,
+    ruling_id: int,
+    department: str,
+) -> dict[str, Any]:
+    """Build the JSON envelope archived in ``raw_content`` (#4134).
+
+    The envelope captures everything ``_populate_from_envelope`` needs to
+    reconstruct the document on the reingest path. Live capture writes
+    this envelope to ``raw_content`` and immediately calls
+    ``_populate_from_envelope`` with the same dict; reingest JSON-decodes
+    ``raw_content`` and calls ``_populate_from_envelope`` with the
+    decoded dict. Single shape, two callers.
+
+    Args:
+        ruling: The parsed ruling data from the AJAX response.
+        ruling_id: The RulingID used to fetch this ruling.
+        department: The department number resolved from RulingID.
+
+    Returns:
+        A dict suitable for ``json.dumps`` — keys are str, values are
+        primitive (str/int/None/list).
+    """
+    return {
+        "case_number": ruling.case_number,
+        "case_title": ruling.case_title,
+        "court_date": ruling.court_date,
+        "calendar_matter": ruling.calendar_matter,
+        "ruling_text": ruling.ruling_text,
+        "ruling_html": ruling.ruling_html,
+        "case_info_url": ruling.case_info_url,
+        "ruling_id": ruling_id,
+        "department": department,
+    }
+
+
 def extract_session_id(html: str) -> str | None:
     """Extract the seshID from tr.dll page HTML.
 
@@ -1102,11 +1138,15 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
     ) -> CapturedDocument:
         """Convert a ParsedRuling into a CapturedDocument.
 
-        The raw_content is the per-ruling HTML text. Each ruling gets
-        unique raw_content so that content-addressed archival (SHA-256 hash
-        → document_id) produces a unique document per ruling. Archiving the
-        full JSON response would cause all rulings from the same API call
-        to share the same content_hash and collapse into one document.
+        The raw_content is a JSON envelope of the ParsedRuling fields plus
+        the ``ruling_id`` and ``department`` (#4134). The envelope shape
+        lets ``parse_document`` reconstruct every field on the reingest
+        path — without it, only ``ruling_text``/``ruling_text_html`` would
+        survive (the legacy bare-HTML shape this method used to write).
+
+        Each ruling's envelope is unique (different case number + ruling
+        text + ruling_id), so content-addressed archival (SHA-256 hash →
+        document_id) still produces one document per ruling.
 
         Args:
             ruling: The parsed ruling data.
@@ -1116,9 +1156,12 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         Returns:
             A populated CapturedDocument.
         """
-        # Use the ruling HTML as raw content for archival
-        content = ruling.ruling_html or ruling.ruling_text or ""
-        raw_content = content.encode("utf-8")
+        envelope = _build_ruling_envelope(
+            ruling=ruling,
+            ruling_id=ruling_id,
+            department=department,
+        )
+        raw_content = json.dumps(envelope, default=str).encode("utf-8")
 
         source_url = f"{CIVIL_API_URL}?RulingID={ruling_id}"
 
@@ -1128,59 +1171,124 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
             content_format=ContentFormat.HTML,
         )
 
-        doc.department = department
-        doc.courthouse = "San Francisco Courthouse"
-        doc.case_number = ruling.case_number
-        doc.case_title = normalize_case_title(ruling.case_title)
-        doc.hearing_date = parse_hearing_date(ruling.court_date)
-        doc.ruling_text = ruling.ruling_text
-        doc.ruling_text_html = ruling.ruling_html
-        doc.motion_type = ruling.calendar_matter
-        doc.outcome = extract_outcome(ruling.ruling_text)
-        doc.parties = extract_parties_from_title(ruling.case_title)
-
-        # Resolve judge name from department via court roster
-        doc.judge_name = self._dept_judge_map.get(department)
-
-        # Store metadata for downstream processing
-        doc.extra["ruling_id"] = ruling_id
-        doc.extra["dept_type"] = RULING_ID_MAP[ruling_id]["type"]
-        if ruling.case_info_url:
-            doc.extra["case_info_url"] = ruling.case_info_url
-
+        self._populate_from_envelope(doc, envelope)
         return doc
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """No-op on the live-capture path — all fields are populated during
-        ``fetch_documents`` via ``_ruling_to_document`` from the AJAX
-        response's structured data.
+        """Populate structured fields from ``doc.raw_content`` (#4134).
 
-        **Reingest hazard (audit #4046, follow-up #4134):** this method is
-        also called from ``scripts/reingest_from_s3.py::_reparse_document``
-        with a fresh ``CapturedDocument`` carrying only ``raw_content``
-        (per-ruling HTML bytes). ``raw_content`` does NOT contain the AJAX
-        response's structured fields — those existed only in the live
-        ``ParsedRuling``. Returning the doc unchanged means ``judge_name``,
-        ``department``, ``parties``, ``outcome``, ``motion_type``, and
-        ``ruling_text_html`` get cleared by the reingest merge logic,
-        and only ``ruling_text`` (via UTF-8 decode of the HTML body) plus
-        the DB-seeded ``case_number/case_title/hearing_date`` survive.
-        **Reingest of SF-civil-tentatives documents is NOT fully
-        supported** — the surviving fields are a subset of the original
-        capture. Unlike #3986 there is no truncation-cap symptom because
-        the body is HTML rather than a JSON envelope, but the structural
-        loss is the same shape. #4134 tracks the refactor along the
-        #3986 ``_populate_from_envelope`` shape.
+        Single source of truth for both the live capture path
+        (``_ruling_to_document`` calls ``_populate_from_envelope`` after
+        building ``raw_content``) and the reingest path
+        (``scripts/reingest_from_s3.py::_reparse_document`` constructs a
+        fresh ``CapturedDocument`` carrying only ``raw_content`` and calls
+        this method).
 
-        Args:
-            doc: The document to parse.
+        After #4134, ``raw_content`` is a JSON envelope of the
+        ``ParsedRuling`` fields plus ``ruling_id``/``department``. Decoded
+        and routed through ``_populate_from_envelope``, every structured
+        field — ``case_number``, ``case_title``, ``hearing_date``,
+        ``ruling_text``, ``ruling_text_html``, ``motion_type``,
+        ``outcome``, ``parties``, ``judge_name``, ``department``,
+        ``courthouse``, plus ``extra.ruling_id`` and
+        ``extra.case_info_url`` — is repopulated identically to the live
+        path. The previous bare-``return doc`` no-op silently cleared
+        ``judge_name``/``department``/``parties``/``outcome``/``motion_type``
+        on the reingest merge (audit #4046).
 
-        Returns:
-            The document unchanged.
+        Tolerates legacy archives whose ``raw_content`` is the pre-#4134
+        bare HTML body (not valid JSON, or JSON without the expected
+        envelope keys): in that case the doc is returned unchanged so the
+        reingest caller falls back to its existing UTF-8 decode + DB-
+        seeded fields. Out of scope is backfilling those legacy archives
+        to the new envelope shape — that's a follow-up p3 task.
         """
-        # Fields are pre-populated during fetch — no additional parsing needed
-        # since the AJAX API returns structured data.
+        if not doc.raw_content:
+            return doc
+
+        try:
+            payload = json.loads(doc.raw_content)
+        except (ValueError, TypeError):
+            # Legacy archive — bare HTML body bytes. Return unchanged so
+            # reingest's existing fallback (UTF-8 decode + DB-seeded
+            # metadata) keeps working.
+            return doc
+
+        if not isinstance(payload, dict):
+            return doc
+
+        # Envelope sanity check — every #4134 envelope carries the
+        # ``ruling_html``/``ruling_text``/``ruling_id`` triad.  If any of
+        # those is missing the payload was written by some other shape
+        # (e.g. an externally-tampered archive); don't risk populating
+        # with garbage.
+        required_keys = {"ruling_id", "department"}
+        if not required_keys.issubset(payload.keys()):
+            return doc
+
+        self._populate_from_envelope(doc, payload)
         return doc
+
+    def _populate_from_envelope(
+        self,
+        doc: CapturedDocument,
+        envelope: dict[str, Any],
+    ) -> None:
+        """Populate structured fields on ``doc`` from a ParsedRuling envelope.
+
+        Single source of truth for the field-mapping logic shared by the
+        live capture path (``_ruling_to_document``) and the reingest path
+        (``parse_document``). Mutates ``doc`` in place.
+
+        Envelope keys (all optional except ``ruling_id``/``department``):
+            case_number, case_title, court_date, calendar_matter,
+            ruling_text, ruling_html, case_info_url, ruling_id, department.
+        """
+        ruling_id = envelope.get("ruling_id")
+        department = envelope.get("department") or ""
+
+        case_title_raw = envelope.get("case_title")
+        ruling_text = envelope.get("ruling_text")
+        ruling_html = envelope.get("ruling_html")
+        court_date = envelope.get("court_date")
+        calendar_matter = envelope.get("calendar_matter")
+        case_info_url = envelope.get("case_info_url")
+
+        doc.department = department or None
+        doc.courthouse = "San Francisco Courthouse"
+        doc.case_number = envelope.get("case_number")
+        doc.case_title = normalize_case_title(case_title_raw)
+        doc.hearing_date = parse_hearing_date(court_date)
+        doc.ruling_text = ruling_text
+        doc.ruling_text_html = ruling_html
+        doc.motion_type = calendar_matter
+        doc.outcome = extract_outcome(ruling_text)
+        doc.parties = extract_parties_from_title(case_title_raw)
+
+        # Resolve judge name from department via court roster.  Empty
+        # string department (defensive) maps to None lookup.
+        doc.judge_name = self._dept_judge_map.get(department) if department else None
+
+        # Store metadata for downstream processing.  Coerce ruling_id
+        # back to int when possible — JSON round-tripping preserves int
+        # but a tampered envelope might ship a string.
+        if isinstance(ruling_id, int):
+            doc.extra["ruling_id"] = ruling_id
+            dept_type = RULING_ID_MAP.get(ruling_id, {}).get("type")
+            if dept_type:
+                doc.extra["dept_type"] = dept_type
+        else:
+            try:
+                rid_int = int(ruling_id) if ruling_id is not None else None
+            except (TypeError, ValueError):
+                rid_int = None
+            if rid_int is not None:
+                doc.extra["ruling_id"] = rid_int
+                dept_type = RULING_ID_MAP.get(rid_int, {}).get("type")
+                if dept_type:
+                    doc.extra["dept_type"] = dept_type
+        if case_info_url:
+            doc.extra["case_info_url"] = case_info_url
 
 
 def default_config(s3_bucket: str = "") -> ScraperConfig:
