@@ -924,7 +924,7 @@ def _reparse_document(
                 court=doc_meta["court_name"],
                 source_url=doc_meta["source_url"],
                 capture_timestamp=doc_meta["captured_at"],
-                content_format=ContentFormat(doc_meta["format"]),
+                content_format=ContentFormat.from_db_value(doc_meta["format"]),
                 raw_content=raw_content,
                 content_hash=doc_meta["content_hash"],
             )
@@ -1388,7 +1388,7 @@ def _full_reparse_document(
                 court=doc_meta["court_name"],
                 source_url=doc_meta["source_url"],
                 capture_timestamp=doc_meta["captured_at"],
-                content_format=ContentFormat(doc_meta["format"]),
+                content_format=ContentFormat.from_db_value(doc_meta["format"]),
                 raw_content=raw_content,
                 content_hash=content_hash,
             )
@@ -1918,7 +1918,7 @@ def _reparse_document_multimodal(
                 court=doc_meta["court_name"],
                 source_url=doc_meta["source_url"],
                 capture_timestamp=doc_meta["captured_at"],
-                content_format=ContentFormat(doc_meta["format"]),
+                content_format=ContentFormat.from_db_value(doc_meta["format"]),
                 raw_content=raw_content,
                 content_hash=doc_meta.get("content_hash", ""),
             )

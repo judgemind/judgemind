@@ -36,6 +36,39 @@ class ContentFormat(StrEnum):
     DOCX = "docx"
     TEXT = "text"
 
+    @classmethod
+    def from_db_value(cls, db_value: str) -> ContentFormat:
+        """Map ``derived.documents.format`` enum values to ``ContentFormat`` members.
+
+        DB enum (``packages/api/migrations/1_initial-schema.sql``):
+            ``('html', 'pdf', 'docx', 'txt')``
+        Python enum (this class):
+            ``HTML='html'``, ``PDF='pdf'``, ``DOCX='docx'``, ``TEXT='text'``
+
+        The DB stores ``'txt'`` while the Python enum spells the textual
+        format ``'text'``.  The bare ``ContentFormat(<db value>)`` constructor
+        therefore raises ``ValueError`` for every ``'txt'`` row — the failure
+        mode that produced #4122 (silently swallowed by reingest_from_s3.py's
+        ``except Exception:`` block, masking 98% of Federal CourtListener
+        documents from the case-title mapper fix in #3970).
+
+        This helper is the single sanctioned bridge between the two value
+        sets and is one-way: it accepts only DB enum values, not Python enum
+        values.  Round-tripping ``'text'`` through here intentionally raises
+        ``ValueError`` so a future "make it bidirectional" refactor cannot
+        silently re-introduce the original bug class.
+        """
+        mapping = {
+            "html": cls.HTML,
+            "pdf": cls.PDF,
+            "docx": cls.DOCX,
+            "txt": cls.TEXT,
+        }
+        try:
+            return mapping[db_value]
+        except KeyError as exc:
+            raise ValueError(f"{db_value!r} is not a valid derived.documents.format value") from exc
+
 
 # ---------------------------------------------------------------------------
 # Scraper configuration
