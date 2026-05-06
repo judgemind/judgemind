@@ -15,9 +15,29 @@ import re
 from pathlib import Path
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[1] / "agent-runner-entrypoint.sh"
+# #4138 — per-phase case-arm bodies were extracted from the entrypoint
+# into ``agent_runner_handlers.sh`` (mirroring the precedent set by
+# #3775's ``agent_runner_run_claude_phase.sh``). The two files together
+# now constitute "the agent runner script" for content-pattern lint
+# purposes, so this test reads their concatenation. Tests that
+# specifically need to assert *where* a pattern lives still narrow the
+# search via dedicated block-extraction helpers below.
+_HANDLERS_PATH = Path(__file__).resolve().parents[1] / "agent_runner_handlers.sh"
 
 
 def _script_text() -> str:
+    return (
+        _ENTRYPOINT_PATH.read_text(encoding="utf-8")
+        + "\n"
+        + _HANDLERS_PATH.read_text(encoding="utf-8")
+    )
+
+
+def _entrypoint_text() -> str:
+    """Pre-#4138 ``_script_text`` — entrypoint-only. Used by tests that
+    must distinguish the entrypoint's case-statement from the handlers
+    file's function bodies (e.g. ``test_push_and_pr_arm_calls_dispatch_helper``
+    finds the ``push_and_pr)`` arm inside ``phase_loop()``)."""
     return _ENTRYPOINT_PATH.read_text(encoding="utf-8")
 
 
@@ -123,17 +143,38 @@ class TestPushAndPrCaseArmRoutesViaCentralizedHelper:
     into ``dispatch_transition_action`` — but the bug-class invariant
     is preserved: the action vocabulary AND the hint are handled
     SOMEWHERE the push_and_pr) arm reaches at runtime.
+
+    #4138: the case-arm body for push_and_pr was moved out of
+    ``phase_loop()`` into ``handle_push_and_pr_arm`` in
+    ``agent_runner_handlers.sh`` (mirroring #3775). The arm in the
+    entrypoint is now ``push_and_pr) handle_push_and_pr_arm ;;``, and
+    the dispatch-helper invocation lives inside the handler body. The
+    assertions below now lint the handler function body, since that is
+    where the dispatch site actually lives at runtime.
     """
 
     @staticmethod
-    def _push_and_pr_block(text: str) -> str:
-        """Return the substring between ``push_and_pr)`` and the next
-        top-level ``fix_conflict)`` arm."""
-        start = text.find("        push_and_pr)\n")
-        end = text.find("        fix_conflict)\n", start)
-        assert start != -1, "push_and_pr) arm not found in entrypoint"
-        assert end != -1, "fix_conflict) arm not found after push_and_pr) arm"
-        return text[start:end]
+    def _push_and_pr_block(_text: str) -> str:  # noqa: ARG004
+        """Return the body of ``handle_push_and_pr_arm`` from
+        ``agent_runner_handlers.sh``. Pre-#4138 this returned the
+        substring between ``push_and_pr)`` and ``fix_conflict)`` in the
+        entrypoint's ``phase_loop`` case-statement; #4138 moved that
+        body into a named function in the handlers file. The assertions
+        downstream (``dispatch_transition_action`` is called, with the
+        phase name as the first arg) hold equivalently against the
+        handler body."""
+        handlers = _HANDLERS_PATH.read_text(encoding="utf-8")
+        start = handlers.find("handle_push_and_pr_arm() {")
+        assert start != -1, (
+            "handle_push_and_pr_arm() not found in agent_runner_handlers.sh (#4138)"
+        )
+        # The function ends at the first ``\n}\n`` line at column 0 after
+        # ``start``.
+        end = handlers.find("\n}\n", start)
+        assert end != -1, (
+            "Could not locate end of handle_push_and_pr_arm() function (#4138)"
+        )
+        return handlers[start:end]
 
     @staticmethod
     def _dispatch_helper_body(text: str) -> str:
