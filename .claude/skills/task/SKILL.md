@@ -303,6 +303,44 @@ Evaluate:
 
 The adoption-to-merge path should be the common case when this check fires — if a prior agent got far enough to open a PR, they almost always got far enough to need someone to push the merge button.
 
+#### 4a.2 — Already-shipped check (zombie-issue pivot, MANDATORY when 4a returned exit 1)
+
+**Why this runs after 4a:** `check-duplicate-pr.sh` only finds *open* PRs. It cannot catch the case where the issue's code already shipped via a *closed and merged* PR that didn't auto-close the issue — typically because the PR carried a placeholder title (`WIP: ralph output`) or a null body with no `Closes #N` keyword, so GitHub's auto-close never fired and the issue stayed `agent/ready` indefinitely. Issue #2831 ↔ PR #3229 is the canonical example: PR shipped 2026-04-24, issue stayed `agent/ready` for 12 days until a human noticed and closed it manually. CLAUDE.md and `pr-title-check.yml` (#3994) now ban placeholder titles, so the bug class stops accruing — but the back-catalog of pre-#3994 issues can keep re-entering the queue. This check finds them in one cheap `gh issue view` + a few `gh api commits` calls per file path in the issue body, and pivots /task to a "verify and close" path.
+
+Run the check as a single tool call (only after `check-duplicate-pr.sh` returned exit 1):
+
+```
+{worktree}/scripts/check-shipped-pr.sh <N>
+```
+
+Exit codes:
+
+- **Exit 1 (`not-shipped:` line on stdout) — no high-confidence shipped match.** Continue to Step 4b. This is the common case.
+- **Exit 0 (`shipped:` line on stdout + JSON summary) — a closed PR merged onto `main` already shipped this issue's work.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, etc.).** Fail-open: continue to Step 4b.
+
+The high-confidence threshold the script applies is **≥1 added overlap OR ≥2 total overlap** between the file paths in the issue body and the file paths the candidate PR landed (with the PR's `mergedAt` non-null and `baseRefName == main`). A single *modified*-file overlap is intentionally below the threshold — that case routinely fires on adjacent scripts the issue cites as references rather than load-bearing targets.
+
+##### 4a.2.1 — Verify-and-close pivot (only runs on exit 0)
+
+Read the JSON summary from stdout (the `shipped_pr` field names the merged PR; `overlap_files` and `added_files` show what landed). Then:
+
+1. **Run any acceptance-criteria `Verify:` commands that look mechanical.** Walk the issue body, extract each `Verify:` line, and run only those that are concrete commands (e.g. `Verify: scripts/foo.sh exits 0`, `Verify: pytest -k test_x`, `Verify: grep -n <pattern> <file>`). Skip free-form prose verifies ("Verify: manual sanity — flip a hex...") — those need a human.
+2. **All-green path:** if every mechanical `Verify:` command exits clean, the issue is done. Post a verification-evidence comment quoting the verify commands + their output + naming the shipped PR, close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
+
+   ```
+   gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
+   gh issue close <N> --repo judgemind/judgemind --reason completed
+   {worktree}/scripts/unblock-dependents.sh <N>
+   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+   ```
+
+   This is exactly the manual flow that closed #2831 today — turning that flow into a one-shot pivot is the entire point of this check.
+3. **Any-failure path:** if any mechanical `Verify:` command fails (or the issue has no mechanical verifies and a human-judgment residual remains), post a comment naming the partially-shipped PR + the failed verify line, leave the issue open with `agent/ready` re-attached, and **fall through to Step 4b.** Normal /task flow continues from there. The comment should make explicit that the agent ran `check-shipped-pr.sh`, found PR #N, but at least one AC is still unmet — so a human or a follow-up agent can decide whether to file a follow-up issue or close.
+4. **Reduced docs-only PR is NOT the default here.** The verify-and-close pivot is for "the AC's intent has already been satisfied by the shipped PR; we just need to close the loop." If a docs delta is genuinely missing (e.g. the AC said "wire this into SKILL.md and ship a Verify command" and only the script shipped), treat it as the any-failure path: post a comment, leave the issue open, fall through.
+
+The verify-and-close path should be the common case when this check fires — pre-#3994 placeholder-title PRs almost always landed everything the AC asked for, the only thing missing is the issue closure.
+
 ---
 
 ### Step 4b — Verify gap is real (current state probe)
