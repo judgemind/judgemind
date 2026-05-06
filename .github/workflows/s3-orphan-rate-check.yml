@@ -283,6 +283,12 @@ jobs:
 
       - name: Auto-close resolved orphan-rate issues
         if: steps.check.outputs.healthy == 'true'
+        # Best-effort cleanup — the orphan-rate check already passed at this
+        # point, so a transient GitHub-API 5xx here should NOT fail the
+        # workflow run. The auto-close step is idempotent: any
+        # s3-orphan-rate-alert issue it doesn't get to close on this run will
+        # be closed on the next workflow trigger. See #4234 / #4238.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
