@@ -262,6 +262,8 @@ To opt out (e.g. ad-hoc runs that don't need the extra `gh` API calls), pass `--
 
 #### Filing issues
 
+> Before calling `gh issue create`, run the §3a "Verify-pass-already" check in `.claude/skills/file-issue/SKILL.md` — if the AC's `Verify:` command already passes against the post-audit tree, skip the issue.
+
 For each threshold violation or trend regression, file a `priority/p1` `type/dx` issue with:
 
 - Which job(s) are slow and their current duration (mean and max over the sampled runs, **counting only runs where the job executed**).
@@ -336,10 +338,14 @@ The same check runs in CI as the `script-headers-check` job and in `.githooks/pr
 
 #### Filing issues
 
+> Before calling `gh issue create`, run the §3a "Verify-pass-already" check in `.claude/skills/file-issue/SKILL.md` — if the AC's `Verify:` command already passes against the post-audit tree, skip the issue.
+
 For script count threshold violations, file a `priority/p2` `type/chore` issue with:
 - Current `total`, `permanent`, `one_off` counts and the computed threshold (`permanent + 5`).
 - List of scripts carrying `# one-off: true` — these are the archival candidates. Permanent utilities are at baseline by design; they should NOT be listed as candidates.
 - Suggested action: archive completed one-off scripts to `scripts/archive/`.
+
+> Before calling `gh issue create`, run the §3a "Verify-pass-already" check in `.claude/skills/file-issue/SKILL.md` — if the AC's `Verify:` command already passes against the post-audit tree, skip the issue.
 
 For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed. Include the verbatim output of `scripts/check-script-headers.sh` in the body so the fix is mechanical. Each listed script should get either `# one-off: true` (if finite-lifetime) or `# permanent: true` (if re-runnable utility).
 
@@ -392,6 +398,8 @@ If the issue has been closed since the list was fetched, treat the finding as ne
 ## Step 3 — File issues
 
 **Write status: `phase: audit-file-issues`, `summary: Filing issues for non-duplicate findings`** before starting this step.
+
+> Before calling `gh issue create`, run the §3a "Verify-pass-already" check in `.claude/skills/file-issue/SKILL.md` — if the AC's `Verify:` command already passes against the post-audit tree, skip the issue.
 
 For each non-duplicate finding:
 
