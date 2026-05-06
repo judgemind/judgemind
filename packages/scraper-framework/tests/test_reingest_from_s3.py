@@ -60,6 +60,7 @@ def _make_document_row(
     scraper_id: str = "ca-la-tentatives-civil",
     case_number: str = "24STCV12345",
     case_title: str = "Smith v. Jones",
+    case_type: str | None = None,
     hearing_date: date | None = _HEARING_DATE,
     ruling_hearing_date: date | None = _HEARING_DATE,
     stored_ruling_text: str | None = None,
@@ -84,6 +85,7 @@ def _make_document_row(
         "Los Angeles Superior Court",  # ct.court_name
         case_number,  # c.case_number
         case_title,  # c.case_title
+        case_type,  # c.case_type (#4263)
         ruling_hearing_date,  # ruling_hearing_date (subquery)
         stored_ruling_text,  # stored_ruling_text (subquery)
         ruling_department,  # ruling_department (subquery)
@@ -281,8 +283,9 @@ class TestLlmCacheKeyParity:
         # the full reingest_batch pipeline because the full pipeline
         # requires DB / S3 mocks for every step, and this test only
         # cares about the judge_name/department propagation.
-        ruling_department = row[18]
-        ruling_judge_name = row[19]
+        # Row indices shifted +1 by #4263 (case_type column added at index 16).
+        ruling_department = row[19]
+        ruling_judge_name = row[20]
 
         doc_meta = {
             "format": "pdf",
@@ -354,8 +357,9 @@ class TestLlmCacheKeyParity:
             ruling_department=None,
             ruling_judge_name=None,
         )
-        ruling_department = row[18]
-        ruling_judge_name = row[19]
+        # Row indices shifted +1 by #4263 (case_type column added at index 16).
+        ruling_department = row[19]
+        ruling_judge_name = row[20]
 
         doc_meta = {
             "format": "pdf",
@@ -4621,6 +4625,207 @@ class TestReparseDocumentCaseTypeFromScraperId:
 
         assert result["case_type"] == "family"
         assert result["extraction_methods"].get("case_type") != "scraper_id"
+
+
+class TestApplyRegexFallbacksCaseTypeFromTitle:
+    """Tests for the case_title fallback in _apply_regex_fallbacks (#4263).
+
+    Mirrors ``packages/scraper-framework/src/ingestion/worker.py`` lines
+    2331-2336 so reingest produces the same case_type as live ingestion.
+    Fires last in the fallback chain — after case_number prefix, scraper_id,
+    and motion_type.
+    """
+
+    def test_probate_title_conservatorship_yields_probate(self) -> None:
+        """``Conservatorship of...`` titles produce probate when no other signal."""
+        # CC dept-38 ``MSP*`` case numbers that don't match the prefix regex,
+        # with no scraper_id signal and no motion_type — title fallback should
+        # fire and yield probate so the post-extraction plausibility guard uses
+        # the ±60 day window.
+        extracted: dict = {
+            "judge_name": "Hon. Jane Doe",
+            "case_number": "MSP21-00229",  # No prefix-pattern match
+            "hearing_date": None,
+            "case_type": None,
+            "motion_type": None,
+            "case_title": "Conservatorship of You Wei Dong",
+            "extraction_methods": {},
+        }
+        reingest._apply_regex_fallbacks(extracted, "ruling text", scraper_id="ca-cc-tentatives")
+        assert extracted["case_type"] == "probate"
+        assert extracted["extraction_methods"]["case_type"] == "title"
+
+    def test_probate_title_in_the_matter_of_yields_probate(self) -> None:
+        """``In the Matter of...`` titles produce probate (CC dept-NULL N* case)."""
+        extracted: dict = {
+            "judge_name": None,
+            "case_number": "N26-0125",  # No prefix-pattern match
+            "hearing_date": None,
+            "case_type": None,
+            "motion_type": None,
+            "case_title": "In the Matter of: Daniel Rodriguez",
+            "extraction_methods": {},
+        }
+        reingest._apply_regex_fallbacks(extracted, "ruling text", scraper_id="ca-cc-tentatives")
+        assert extracted["case_type"] == "probate"
+        assert extracted["extraction_methods"]["case_type"] == "title"
+
+    def test_civil_title_yields_no_case_type(self) -> None:
+        """Civil-style titles (X v. Y) do not produce a case_type from the title."""
+        extracted: dict = {
+            "judge_name": None,
+            "case_number": None,
+            "hearing_date": None,
+            "case_type": None,
+            "motion_type": None,
+            "case_title": "Smith v. Jones",
+            "extraction_methods": {},
+        }
+        reingest._apply_regex_fallbacks(extracted, "ruling text", scraper_id="")
+        assert extracted["case_type"] is None
+        assert "case_type" not in extracted["extraction_methods"]
+
+    def test_title_fallback_does_not_override_existing_case_type(self) -> None:
+        """When case_type is already set (e.g. from doc_meta seed), title fallback skips."""
+        extracted: dict = {
+            "judge_name": None,
+            "case_number": "N26-0156",
+            "hearing_date": None,
+            # Pre-set from doc_meta seed (cases-row case_type) — must not be overridden.
+            "case_type": "civil",
+            "motion_type": None,
+            "case_title": "In the Matter of: Alyssa Martinez",
+            "extraction_methods": {"case_type": "db_seed"},
+        }
+        reingest._apply_regex_fallbacks(extracted, "ruling text", scraper_id="ca-cc-tentatives")
+        assert extracted["case_type"] == "civil"
+        assert extracted["extraction_methods"]["case_type"] == "db_seed"
+
+    def test_title_fallback_runs_after_motion_type_fallback(self) -> None:
+        """motion_type fallback fires before title fallback when both would match."""
+        # motion_type='petition_for_probate' resolves to probate (line 1176 of
+        # ingestion/extract.py).  Title-based fallback would also resolve probate
+        # for "Estate of...".  The provenance must reflect motion_type, not title.
+        extracted: dict = {
+            "judge_name": None,
+            "case_number": None,
+            "hearing_date": None,
+            "case_type": None,
+            "motion_type": "petition_for_probate",
+            "case_title": "Estate of John Smith",
+            "extraction_methods": {},
+        }
+        reingest._apply_regex_fallbacks(extracted, "ruling text", scraper_id="")
+        assert extracted["case_type"] == "probate"
+        assert extracted["extraction_methods"]["case_type"] == "motion_type"
+
+
+class TestFetchDocumentsQuerySelectsCaseType:
+    """Verifies FETCH_DOCUMENTS_QUERY selects c.case_type (#4263).
+
+    The query previously omitted ``c.case_type``, so reingest could not
+    surface the existing cases-row case_type as a doc_meta seed.  Without
+    the seed, ``apply_post_extraction_guards`` ran with ``case_type=None``
+    for any ruling whose case-number prefix didn't match the
+    ``_CASE_TYPE_PREFIX_PATTERNS`` list (e.g. CC ``MSP*``, ``N*``) — the
+    civil ±14 day plausibility window then rejected correctly-extracted
+    multi-week-master-calendar hearing dates.
+    """
+
+    def test_query_selects_case_type(self) -> None:
+        """The SELECT clause must include ``c.case_type``."""
+        # Match either ``c.case_type,`` (with trailing comma) or ``c.case_type\n``
+        # (last column).  The exact placement may shift across edits — the
+        # invariant is presence somewhere in the SELECT.
+        assert "c.case_type" in reingest.FETCH_DOCUMENTS_QUERY, (
+            "FETCH_DOCUMENTS_QUERY must select c.case_type so reingest can "
+            "seed extracted['case_type'] from the existing cases row "
+            "(#4263)."
+        )
+
+
+class TestFullReparseDocumentCaseTypeFromTitle:
+    """Tests that _full_reparse_document's split path picks up case_type from
+    title when neither LLM split nor case_number prefix yields one (#4263)."""
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Contra Costa",
+            "court_name": "Contra Costa Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": None,
+            "case_title": None,
+            "case_type": None,  # No seed — exercise the regex fallback chain.
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-cc-tentatives",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_picks_up_case_type_from_title(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM-split rulings whose case_number prefix doesn't match get case_type
+        from title via _apply_regex_fallbacks (#4263)."""
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        # CC ``MSP*`` style case numbers that don't match any prefix in
+        # _CASE_TYPE_PREFIX_PATTERNS, paired with conservatorship titles.
+        rulings = [
+            SplitRuling(
+                1,
+                "MSP21-00229",
+                "Ruling text",
+                "Conservatorship of You Wei Dong",
+                "petition",
+                None,
+                None,
+            ),
+            SplitRuling(
+                2,
+                "MSP12-00341",
+                "Other ruling",
+                "Conservatorship of Kenneth S. O'Day",
+                "petition",
+                None,
+                None,
+            ),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["ca-cc-tentatives"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("ca-cc-tentatives", None)
+        mock_extract.return_value = "pdf text without HEARING DATE marker"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "ca-cc-tentatives",
+                self._doc_meta(),
+            )
+
+            assert len(result) == 2
+            # Both pick up probate from the case title via the regex
+            # fallback chain — neither MSP* nor scraper_id ``ca-cc-tentatives``
+            # nor ``petition`` motion_type (excluded per #3691) yields
+            # a case_type.  Only the title fallback closes the gap.
+            assert result[0]["case_type"] == "probate"
+            assert result[0]["extraction_methods"]["case_type"] == "title"
+            assert result[1]["case_type"] == "probate"
+            assert result[1]["extraction_methods"]["case_type"] == "title"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("ca-cc-tentatives", None)
 
 
 class TestFullReparseDocumentScraperIdFallback:

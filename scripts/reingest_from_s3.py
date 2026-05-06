@@ -213,6 +213,7 @@ from ingestion.extract import (  # noqa: E402
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
+    extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
     is_plausible_hearing_date,
@@ -383,7 +384,7 @@ FETCH_DOCUMENTS_QUERY = """
         d.content_hash, d.source_url, d.scraper_id, d.captured_at,
         d.hearing_date, d.format,
         ct.state, ct.county, ct.court_name,
-        c.case_number, c.case_title,
+        c.case_number, c.case_title, c.case_type,
         (SELECT r.hearing_date FROM rulings r
          WHERE r.document_id = d.id LIMIT 1) AS ruling_hearing_date,
         (SELECT r.ruling_text FROM rulings r
@@ -860,6 +861,23 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
         if val:
             extracted["case_type"] = val
             methods.setdefault("case_type", "motion_type")
+
+    # Fallback case_type from case title (#2062).  Mirrors
+    # ``packages/scraper-framework/src/ingestion/worker.py`` lines 2331-2336
+    # so reingest produces the same case_type as live ingestion.  Probate-
+    # style titles ("In the Matter of...", "Conservatorship of...",
+    # "Guardianship of...", "Estate of...") are unambiguous — without this
+    # fallback, the CC dept-38 ``MSP*`` and dept-NULL ``N*`` rulings whose
+    # case-number prefix doesn't match any pattern in
+    # ``_CASE_TYPE_PREFIX_PATTERNS`` fall into the civil ±14 day
+    # plausibility window in ``apply_post_extraction_guards`` and lose
+    # their correctly-extracted multi-week-master-calendar hearing dates
+    # (#4263, follow-up to #4256).
+    if not extracted["case_type"] and extracted.get("case_title"):
+        val = extract_case_type_from_title(extracted["case_title"])
+        if val:
+            extracted["case_type"] = val
+            methods.setdefault("case_type", "title")
 
 
 def _extract_doc_level_judge_department(
@@ -1660,7 +1678,19 @@ def _full_reparse_document(
             # incoming ``NULL`` preserves the existing non-null title
             # instead of erasing it.
             "case_title": ruling.case_title,
-            "case_type": doc_meta.get("case_type"),
+            # Prefer the LLM split's per-ruling ``case_type`` over the
+            # doc-level seed.  CC's split path (and any future LLM-split
+            # scraper) is per-case_type capable — dropping its output on
+            # the floor was the original silent-data-loss leg of #4263.
+            # Falls back to ``doc_meta.get("case_type")`` (the cases-row
+            # seed surfaced via ``FETCH_DOCUMENTS_QUERY``) when the LLM
+            # didn't produce one for this ruling.  The downstream regex
+            # fallback chain in ``_apply_regex_fallbacks`` adds one more
+            # tier — case_number prefix, scraper_id, motion_type, title —
+            # for cases that get this far without a value.
+            "case_type": (
+                getattr(ruling, "case_type", None) or doc_meta.get("case_type")
+            ),
             "judge_name": doc_judge_name,
             "outcome": normalize_outcome(ruling.outcome),
             # Normalize split-provided motion_type to snake_case (#1849).
@@ -1684,6 +1714,12 @@ def _full_reparse_document(
         for field in ("case_number", "case_title", "outcome", "motion_type"):
             if extracted.get(field):
                 extracted["extraction_methods"][field] = "split"
+        # ``case_type`` provenance: ``split`` when the LLM produced it,
+        # ``db_seed`` when the cases-row case_type filled in via doc_meta.
+        if extracted.get("case_type"):
+            extracted["extraction_methods"]["case_type"] = (
+                "split" if getattr(ruling, "case_type", None) else "db_seed"
+            )
         if doc_judge_name:
             extracted["extraction_methods"]["judge_name"] = "scraper"
         if doc_hearing_date:
@@ -2176,7 +2212,12 @@ def _reparse_document_multimodal(
             # incoming ``NULL`` preserves the existing non-null title
             # instead of erasing it.
             "case_title": cr.case_title,
-            "case_type": cr.case_type,
+            # Multimodal seed precedence mirrors the LLM-split path: prefer
+            # the per-ruling extractor output, then fall back to the cases-
+            # row seed surfaced via ``FETCH_DOCUMENTS_QUERY`` (#4263).  The
+            # downstream regex fallback chain in ``_apply_regex_fallbacks``
+            # adds a final tier when neither produced a value.
+            "case_type": cr.case_type or doc_meta.get("case_type"),
             "judge_name": cr.judge_name or doc_judge_name,
             "outcome": cr.outcome,
             "motion_type": cr.motion_type,
@@ -2472,6 +2513,7 @@ def reingest_batch(
             court_name,
             case_number,
             case_title,
+            case_type,
             ruling_hearing_date,
             stored_ruling_text,
             ruling_department,
@@ -2561,6 +2603,16 @@ def reingest_batch(
             "format": doc_format,
             "case_number": case_number,
             "case_title": case_title,
+            # ``case_type`` is read from the existing ``cases`` row so the
+            # plausibility guard in ``apply_post_extraction_guards`` sees the
+            # already-known case_type for re-ingested rulings.  Without this
+            # DB seed, reingest's ``_apply_regex_fallbacks`` is the only
+            # source for ``extracted["case_type"]``, and any case whose
+            # case_number prefix doesn't match (e.g. CC ``MSP*`` / ``N*``)
+            # falls into the civil ±14 day window — rejecting correctly-
+            # extracted probate hearing dates from multi-week master
+            # calendars (#4263, follow-up to #4256).
+            "case_type": case_type,
             "hearing_date": effective_doc_hearing,
             "court_id": str(court_id),
             "scraper_id": scraper_id,
