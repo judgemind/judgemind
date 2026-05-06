@@ -2,13 +2,14 @@
 # venv: scraper-framework
 # permanent: true
 """Short-unsubstantive ruling check — detects counties with many rulings
-that have a very short ruling_text and no extracted motion or outcome.
+that have a very short ruling_text and no extracted motion_type or outcome.
 
-A ruling with ``char_length(ruling_text) < 200`` AND ``motion IS NULL``
+A ruling with ``char_length(ruling_text) < 200`` AND ``motion_type IS NULL``
 AND ``outcome IS NULL`` is a candidate for a "short unsubstantive" ruling
 — content that slipped past the extraction pipeline without useful fields.
-This check counts those rulings per county over the last 7 days and fires
-an alert when any county exceeds the configured threshold.
+This check counts those rulings per county (joined via ``derived.courts``)
+over the last 7 days (by ``hearing_date``) and fires an alert when any
+county exceeds the configured threshold.
 
 See https://github.com/judgemind/judgemind/issues/2671 for context.
 
@@ -94,24 +95,28 @@ class CheckResult:
 # DB query
 # ---------------------------------------------------------------------------
 
-# NOTE: This query references columns that do not exist on `derived.rulings`:
-#   - `county` lives on `derived.courts` (joined via rulings.court_id)
-#   - the column is `motion_type`, not `motion`
-#   - the column is `hearing_date` or `posted_at`, not `ruling_date`
-# The script is broken and will fail at runtime. Tracked separately so the
-# new unqualified-column check (#4271) can ship without bundling unrelated
-# bug fixes. See follow-up filed at PR-merge time.
-# sql-check:ignore
+# Columns referenced:
+#   - `county` lives on `derived.courts`, joined via `r.court_id`.
+#   - `motion_type` is the canonical column on `derived.rulings`
+#     (not `motion`).
+#   - `hearing_date` is the canonical "issued at" column on
+#     `derived.rulings` (NOT NULL); `ruling_date` does not exist.
+# Fixed in #4278 — the prior query referenced `county`, `motion`, and
+# `ruling_date`, all of which do not exist on `derived.rulings`. The
+# unqualified-column-reference check (#4271) flagged this; the
+# `# sql-check:ignore` marker has been removed now that the columns are
+# correct.
 SHORT_UNSUBSTANTIVE_QUERY = """
-    SELECT county, COUNT(*) AS cnt
-    FROM derived.rulings
-    WHERE char_length(ruling_text) < 200
-      AND motion IS NULL
-      AND outcome IS NULL
-      AND ruling_date > NOW() - INTERVAL '7 days'
+    SELECT ct.county, COUNT(*) AS cnt
+    FROM derived.rulings r
+    JOIN derived.courts ct ON ct.id = r.court_id
+    WHERE char_length(r.ruling_text) < 200
+      AND r.motion_type IS NULL
+      AND r.outcome IS NULL
+      AND r.hearing_date > (NOW() - INTERVAL '7 days')::date
     {county_filter}
-    GROUP BY county
-    ORDER BY county
+    GROUP BY ct.county
+    ORDER BY ct.county
 """
 
 
@@ -123,7 +128,7 @@ def _fetch_county_counts(
     params: list[Any] = []
     county_filter = ""
     if county:
-        county_filter = "AND county = %s"
+        county_filter = "AND ct.county = %s"
         params.append(county)
 
     rows: list[CountyCount] = []

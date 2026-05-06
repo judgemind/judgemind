@@ -37,6 +37,7 @@ format_json = sur.format_json
 persist_metrics = sur.persist_metrics
 DEFAULT_THRESHOLD = sur.DEFAULT_THRESHOLD
 METRIC_NAME = sur.METRIC_NAME
+SHORT_UNSUBSTANTIVE_QUERY = sur.SHORT_UNSUBSTANTIVE_QUERY
 
 
 # ---------------------------------------------------------------------------
@@ -343,3 +344,75 @@ class TestCli:
             mock_connect.return_value.__exit__ = MagicMock(return_value=False)
             rc = sur.main(["--threshold", "5"])
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression — query references columns that actually exist on the schema
+# ---------------------------------------------------------------------------
+
+
+class TestQueryReferencesValidColumns:
+    """Regression for #4278 — guard against the script ever again referencing
+    columns that don't exist on `derived.rulings`.
+
+    The pre-#4278 query referenced `county`, `motion`, and `ruling_date`,
+    none of which exist on `derived.rulings` (the actual columns are
+    `motion_type` and `hearing_date` / `posted_at`, with `county` living on
+    the joined `derived.courts` table). The bug evaded the existing unit
+    tests because they mock `cursor.fetchall()` — the SQL is opaque to a
+    mock cursor. These tests inspect the SQL string directly so future
+    column-rename or column-removal regressions are caught at unit-test
+    time, not at the next hourly cron tick.
+    """
+
+    def test_uses_motion_type_not_motion(self) -> None:
+        """`motion` does not exist on `derived.rulings`; `motion_type` does."""
+        q = SHORT_UNSUBSTANTIVE_QUERY.lower()
+        assert "motion_type is null" in q, "Query must filter on motion_type, not motion (#4278)"
+        # Belt-and-suspenders: ensure we don't have a bare `motion IS NULL`.
+        assert " motion is null" not in q, (
+            "Query must not reference the non-existent `motion` column"
+        )
+
+    def test_uses_hearing_date_not_ruling_date(self) -> None:
+        """`ruling_date` does not exist on `derived.rulings`."""
+        q = SHORT_UNSUBSTANTIVE_QUERY.lower()
+        assert "ruling_date" not in q, (
+            "Query must not reference the non-existent `ruling_date` column "
+            "(#4278). Use `hearing_date` or `posted_at`."
+        )
+        # Confirm one of the valid time columns is present.
+        assert "hearing_date" in q or "posted_at" in q, (
+            "Query must filter on hearing_date or posted_at"
+        )
+
+    def test_joins_courts_for_county(self) -> None:
+        """`county` lives on `derived.courts`, joined via `rulings.court_id`."""
+        q = SHORT_UNSUBSTANTIVE_QUERY.lower()
+        assert "join derived.courts" in q, (
+            "Query must JOIN derived.courts to access `county` (#4278)"
+        )
+        # Aggregation must be on the qualified courts column, not a bare
+        # `county` that would be ambiguous (or non-existent on rulings).
+        assert "ct.county" in q, "Query must reference `county` qualified to the courts alias `ct`"
+
+    def test_county_filter_template_qualifies_county(self) -> None:
+        """The `--county` filter must qualify `county` to the courts alias.
+
+        The SQL uses a `{county_filter}` template placeholder; the runtime
+        substitution path in `_fetch_county_counts` adds the qualified clause.
+        Verify by exercising the actual code path with a county set.
+        """
+        conn = _mock_conn([("orange", 20)])
+        with patch.object(sur, "SHORT_UNSUBSTANTIVE_QUERY", SHORT_UNSUBSTANTIVE_QUERY):
+            check_short_unsubstantive_rulings(conn, threshold=5, county="Orange")
+
+        # The execute() call should have been issued with a fully formed
+        # SQL string that qualifies `county` to the courts alias.
+        executed_sql = conn.cursor.return_value.execute.call_args[0][0].lower()
+        assert "ct.county = %s" in executed_sql, (
+            "County filter must qualify `county` to the courts alias `ct` (#4278)"
+        )
+        # And the parameter must be bound.
+        executed_params = conn.cursor.return_value.execute.call_args[0][1]
+        assert executed_params == ("Orange",)
