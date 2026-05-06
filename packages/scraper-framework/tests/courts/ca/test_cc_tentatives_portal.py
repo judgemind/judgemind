@@ -12,7 +12,9 @@ Fixtures in tests/fixtures/cc_portal/:
 
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -26,12 +28,14 @@ from courts.ca.cc_tentatives_portal import (
     LISTING_URL,
     CCTentativesPortalScraper,
     _cc_dept_from_filename,
+    _coerce_hearing_date,
     _is_test_entry,
     _parse_detail_page,
     _parse_judge_dropdown,
     _parse_listing_table,
 )
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
+from framework import CapturedDocument, ContentFormat
 
 pytestmark = pytest.mark.regression
 
@@ -285,8 +289,20 @@ def test_fetch_documents_filters_test_entries_and_emits_skip_log() -> None:
 
 
 @respx.mock
-def test_fetch_documents_downloads_pdf_and_keeps_detail_html() -> None:
-    """PDF should be raw_content; detail HTML should be in doc.extra['detail_html']."""
+def test_fetch_documents_archives_envelope_with_pdf_and_detail_html() -> None:
+    """raw_content is a JSON envelope (#4133); PDF and detail HTML round-trip through it.
+
+    Pre-#4133 ``raw_content`` was the raw PDF bytes and the detail HTML
+    lived only in ``doc.extra["detail_html"]`` — neither shape survived
+    reingest because reingest builds a fresh ``CapturedDocument``
+    carrying only ``raw_content``.  Post-#4133 the envelope holds both
+    artifacts plus the listing-row dict, so ``parse_document`` can
+    re-derive every field on the reingest path.
+
+    ``doc.extra["detail_html"]`` is preserved on the live path for
+    backwards compatibility with consumers that read it (currently only
+    these tests).
+    """
     # Use a form with only Reyes (id=245)
     reyes_only_form = (
         '<html><body><form><select name="field_judge_target_id">'
@@ -318,12 +334,21 @@ def test_fetch_documents_downloads_pdf_and_keeps_detail_html() -> None:
     assert len(docs) == 1
     doc = docs[0]
 
-    # PDF is the primary raw content
-    assert doc.raw_content == pdf_bytes
+    # raw_content is now the JSON envelope (TEXT format), not raw PDF bytes
+    assert doc.content_format == ContentFormat.TEXT
+    payload = json.loads(doc.raw_content)
+    assert isinstance(payload, dict)
+    assert "row" in payload and isinstance(payload["row"], dict)
+    assert payload["row"]["case_number"] == "L24-04564"
 
-    # Detail HTML is in extra
-    assert "detail_html" in doc.extra
+    # Both byte-streams round-trip through the envelope as base64.
+    assert base64.b64decode(payload["pdf_bytes_b64"]) == pdf_bytes
+    assert base64.b64decode(payload["detail_html_b64"]) == detail_html_bytes
+
+    # Backwards-compatible extras still populated on the live path.
     assert doc.extra["detail_html"] == detail_html_bytes
+    assert doc.extra["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+    assert doc.extra["slug"] == "l24-04564"
 
     # Both requests were made
     assert respx.calls.call_count >= 4  # form + listing + detail + pdf
@@ -459,3 +484,246 @@ def test_default_config_registered() -> None:
 
     ids = get_scraper_ids()
     assert "ca-cc-tentatives-portal" in ids
+
+
+# ---------------------------------------------------------------------------
+# 14. parse_document reingest-safety regression tests (#4133)
+# ---------------------------------------------------------------------------
+
+
+def _make_reingest_scraper() -> CCTentativesPortalScraper:
+    """Build a scraper instance suitable for parse_document-only tests."""
+    config = portal_default_config()
+    config = config.model_copy(update={"request_delay_seconds": 0.0})
+    return CCTentativesPortalScraper(config=config)
+
+
+def _build_envelope_bytes(
+    *,
+    detail_html: bytes,
+    pdf_bytes: bytes,
+    pdf_url: str = "https://contracosta.courts.ca.gov/system/files/general/16_012925.pdf",
+    case_number: str = "L24-04564",
+    case_title: str = "SCOTT FUGERE VS. THE COUNTY OF CONTRA COSTA",
+    motion_type: str = "CASE MANAGEMENT CONFERENCE",
+    case_type: str = "Civil",
+    slug: str = "l24-04564",
+    judge_id: str = "245",
+    judge_name_dropdown: str = "BENJAMIN REYES",
+    hearing_date_iso: str = "2025-01-29T16:31:00+00:00",
+) -> bytes:
+    """Build a JSON envelope mirroring what _fetch_single_ruling writes.
+
+    Used by the reingest regression tests below to exercise
+    ``parse_document`` without going through the live HTTP path.  The
+    ``hearing_date`` field is intentionally an ISO-8601 string (not a
+    ``datetime``) — that's what reingest sees after the envelope
+    round-trips through ``json.dumps(default=str)`` and S3.
+    """
+    envelope = {
+        "row": {
+            "slug": slug,
+            "detail_url": f"{BASE_URL}/tentative-ruling/{slug}",
+            "case_number": case_number,
+            "case_title": case_title,
+            "case_type": case_type,
+            "motion_type": motion_type,
+            "hearing_date": hearing_date_iso,
+        },
+        "detail_html_b64": base64.b64encode(detail_html).decode("ascii"),
+        "pdf_url": pdf_url,
+        "pdf_bytes_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "judge_id": judge_id,
+        "judge_name_dropdown": judge_name_dropdown,
+    }
+    return json.dumps(envelope).encode("utf-8")
+
+
+def _make_cap_doc(raw_content: bytes) -> CapturedDocument:
+    """Build a CapturedDocument the way reingest_from_s3._reparse_document does.
+
+    Mirrors the production shape: only ``raw_content`` and the
+    identifier fields are set; every parsed field is left at its
+    default (``None`` / ``[]`` / ``{}``).  The structured-field
+    population MUST come from ``parse_document`` reading
+    ``raw_content`` — exactly the contract this test suite enforces.
+    """
+    return CapturedDocument(
+        document_id="test-doc-id",
+        scraper_id="ca-cc-tentatives-portal",
+        state="CA",
+        county="Contra Costa",
+        court="Superior Court",
+        source_url="https://contracosta.courts.ca.gov/tentative-ruling/l24-04564",
+        capture_timestamp=datetime(2025, 1, 28, 12, 0, 0, tzinfo=UTC),
+        content_format=ContentFormat.TEXT,
+        raw_content=raw_content,
+        content_hash="deadbeef" * 8,
+    )
+
+
+def test_parse_document_reingest_populates_fields_from_envelope() -> None:
+    """Acceptance criterion #3 (#4133) — parse_document populates structured fields
+    from raw_content alone, with no live-capture state available.
+
+    Constructs a fresh ``CapturedDocument`` carrying only the JSON
+    envelope as ``raw_content`` (the exact shape reingest hands to
+    ``parse_document``) and asserts that every field that
+    ``_fetch_single_ruling`` populates on the live path is recovered.
+    This is the test that would have caught #3986 and would have
+    flagged this scraper in the audit if it had existed.
+    """
+    detail_html = _load_bytes("detail_l24-04564.html")
+    pdf_bytes = _load_bytes("sample.pdf")
+
+    raw = _build_envelope_bytes(detail_html=detail_html, pdf_bytes=pdf_bytes)
+    doc = _make_cap_doc(raw)
+    assert doc.case_number is None
+    assert doc.judge_name is None
+    assert doc.department is None
+    assert doc.ruling_text is None
+    assert doc.ruling_text_html is None
+
+    scraper = _make_reingest_scraper()
+    parsed = scraper.parse_document(doc)
+
+    # Listing-row-derived fields recovered from the envelope.
+    assert parsed.case_number == "L24-04564"
+    assert parsed.case_title is not None
+    assert "FUGERE" in parsed.case_title or "CONTRA COSTA" in parsed.case_title
+    assert parsed.motion_type == "CASE MANAGEMENT CONFERENCE"
+
+    # hearing_date round-trips through ISO-8601 and lands as a datetime.
+    assert isinstance(parsed.hearing_date, datetime)
+    assert parsed.hearing_date.year == 2025
+    assert parsed.hearing_date.month == 1
+    assert parsed.hearing_date.day == 29
+
+    # Detail-page-derived fields re-derived from the embedded HTML —
+    # ruling_text_html is the field that was permanently lost pre-#4133.
+    assert parsed.ruling_text is not None
+    assert "Before the Court are a demurrer" in parsed.ruling_text
+    assert parsed.ruling_text_html is not None
+    assert parsed.judge_name == "BENJAMIN REYES"
+
+    # PDF-URL-derived fields.
+    assert parsed.department == "16"
+    assert parsed.courthouse == "Martinez Courthouse"
+
+    # Extras keep the same shape as the live path.
+    assert parsed.extra["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+    assert parsed.extra["pdf_filename"] == "16_012925.pdf"
+    assert parsed.extra["slug"] == "l24-04564"
+    assert parsed.extra["judge_id"] == "245"
+
+
+def test_parse_document_reingest_pre_4133_pdf_bytes_returns_unchanged() -> None:
+    """Pre-#4133 captures archived raw PDF bytes (not a JSON envelope).
+
+    On the reingest path those archived docs hand ``parse_document`` raw
+    PDF bytes that fail JSON decode.  The method MUST tolerate this and
+    return the doc unchanged — reingest's ``_extract_text_from_content``
+    + DB-seeded fields handle the recovery for those legacy captures
+    (the symmetric merge in #4142 keeps the DB seeds intact).
+    """
+    pdf_bytes = _load_bytes("sample.pdf")
+    doc = _make_cap_doc(pdf_bytes)
+
+    scraper = _make_reingest_scraper()
+    parsed = scraper.parse_document(doc)
+
+    # All structured fields stay at their defaults — the merge in
+    # _reparse_document then falls back to DB seeds (#4142).
+    assert parsed.case_number is None
+    assert parsed.judge_name is None
+    assert parsed.department is None
+    assert parsed.ruling_text is None
+    assert parsed.ruling_text_html is None
+    # raw_content is preserved unchanged for downstream pdfplumber.
+    assert parsed.raw_content == pdf_bytes
+
+
+def test_parse_document_reingest_invalid_envelope_shape_returns_unchanged() -> None:
+    """A JSON-decodable but wrong-shaped envelope must not populate garbage fields."""
+    raw = json.dumps({"unrelated": "payload"}).encode("utf-8")
+    doc = _make_cap_doc(raw)
+
+    scraper = _make_reingest_scraper()
+    parsed = scraper.parse_document(doc)
+
+    assert parsed.case_number is None
+    assert parsed.judge_name is None
+    assert parsed.ruling_text is None
+    # raw_content is preserved.
+    assert parsed.raw_content == raw
+
+
+def test_parse_document_reingest_empty_raw_content_returns_unchanged() -> None:
+    """Empty raw_content (defensive case) must not crash."""
+    doc = _make_cap_doc(b"")
+    scraper = _make_reingest_scraper()
+    parsed = scraper.parse_document(doc)
+    assert parsed.case_number is None
+    assert parsed.ruling_text is None
+
+
+def test_parse_document_reingest_envelope_with_unknown_pdf_filename_skips_dept() -> None:
+    """An envelope whose pdf_url does not match the dept regex must not crash.
+
+    Reproduces the case where a non-standard PDF filename appears
+    (e.g. a one-off uploaded with a different naming convention).
+    The dept/courthouse fields stay None; everything else still
+    populates.
+    """
+    detail_html = _load_bytes("detail_l24-04564.html")
+    pdf_bytes = _load_bytes("sample.pdf")
+
+    raw = _build_envelope_bytes(
+        detail_html=detail_html,
+        pdf_bytes=pdf_bytes,
+        pdf_url="https://example.com/some-other-name.pdf",
+    )
+    doc = _make_cap_doc(raw)
+
+    scraper = _make_reingest_scraper()
+    parsed = scraper.parse_document(doc)
+
+    assert parsed.case_number == "L24-04564"
+    assert parsed.judge_name == "BENJAMIN REYES"
+    assert parsed.department is None
+    assert parsed.courthouse is None
+
+
+# ---------------------------------------------------------------------------
+# 15. _coerce_hearing_date — accepts datetime, ISO string, or None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_year", "expected_month", "expected_day"),
+    [
+        (datetime(2025, 1, 29, tzinfo=UTC), 2025, 1, 29),
+        ("2025-01-29T16:31:00+00:00", 2025, 1, 29),
+        ("2025-01-29 16:31:00+00:00", 2025, 1, 29),
+        ("2025-01-29T16:31:00", 2025, 1, 29),
+    ],
+)
+def test_coerce_hearing_date_round_trips(
+    value: datetime | str,
+    expected_year: int,
+    expected_month: int,
+    expected_day: int,
+) -> None:
+    coerced = _coerce_hearing_date(value)
+    assert coerced is not None
+    assert coerced.year == expected_year
+    assert coerced.month == expected_month
+    assert coerced.day == expected_day
+
+
+def test_coerce_hearing_date_none_returns_none() -> None:
+    assert _coerce_hearing_date(None) is None
+
+
+def test_coerce_hearing_date_garbage_string_returns_none() -> None:
+    assert _coerce_hearing_date("not a date") is None
