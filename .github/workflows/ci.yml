@@ -788,6 +788,17 @@ jobs:
       - name: Verify scripts stay within the bash 3.2 feature subset
         if: matrix.shard == 'python'
         run: scripts/check-bash-compat.sh
+      # Issue #4143: bash 5.x footgun where 'declare -a <name>'
+      # (without an inline =()) is later expanded as ${#<name>[@]}
+      # under set -u — works on macOS bash 3.2 but trips
+      # 'unbound variable' on Linux CI bash 5.x. Surfaced in #4119 /
+      # PR #4140 (the cloudwatch-alarm-docs check). Sibling guard to
+      # check-bash-compat.sh — that one covers bash-4+ syntax that
+      # doesn't exist on 3.2; this one covers a construct that exists
+      # on both but has different observable behavior under set -u.
+      - name: Verify scripts initialise indexed arrays before reading under nounset
+        if: matrix.shard == 'python'
+        run: scripts/check-bash-set-u-empty-array.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no
