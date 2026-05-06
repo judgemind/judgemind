@@ -25,9 +25,7 @@ import sys
 # intentionally omit `.claude/` and other roots here because issue bodies
 # rarely cite them as the locus of changes — the five chosen roots cover
 # the vast majority of "this lands at <path>" references.
-PATH_REGEX = re.compile(
-    r"(?:scripts/|packages/|docs/|infra/|\.github/)[^\s\]\)`\"',]+"
-)
+PATH_REGEX = re.compile(r"(?:scripts/|packages/|docs/|infra/|\.github/)[^\s\]\)`\"',]+")
 
 # Strip these trailing characters from a hit (sentence punctuation that
 # often follows an inline file reference but is not part of the path).
@@ -48,6 +46,16 @@ def extract_files(body: str) -> list[str]:
         # Skip glob-y entries (`scripts/tests/*.sh`) — the commits API
         # rejects globs and they would just produce 404s.
         if "*" in path or "?" in path:
+            continue
+        # Skip directory references (paths ending in `/`). These are
+        # container references — the issue body cites them as the area
+        # where work happens, not as specific files the issue creates
+        # or modifies. Counting them as candidates produced false-
+        # positive `shipped:` matches against any PR that touched ANY
+        # file under the directory, because the overlap helper's
+        # directory-prefix matcher legitimately fires on the prefix.
+        # See #4219 for the worked examples (issues #4208, #4213).
+        if path.endswith("/"):
             continue
         # Skip suspiciously short hits (<6 chars after the root prefix)
         # to suppress false positives like `docs/`. The shortest legit
