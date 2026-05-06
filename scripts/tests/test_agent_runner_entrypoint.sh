@@ -5865,18 +5865,17 @@ t58_out=$(
     _status=$(printf '%s' "$_transition" | cut -f3)
     log "operational_transition_shim_done" "action=$_action" "next=$_next" "status=$_status"
     case "$_action" in
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_next" "$_status"
             ;;
-        advance)
+        (advance)
             advance_phase "$_next"
             ;;
-        *)
+        (*)
             printf 'UNEXPECTED_ACTION %s\n' "$_action"
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # (1) subshell exited / produced output.
@@ -6018,25 +6017,24 @@ t59_out=$(
     _hint=$(printf '%s' "$_transition" | cut -f4)
     log "operational_transition_shim_done" "action=$_action" "next=$_next" "hint=$_hint"
     case "$_action" in
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_next" "$_status"
             ;;
-        advance)
+        (advance)
             advance_phase "$_next"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "operational_route_to_diagnoser" "hint=$_hint"
             agent_runner_reaped_failure \
                 "operational_failed" \
                 "operational_failed" \
                 "operational skill returned non-succeeded verdict"
             ;;
-        *)
+        (*)
             printf 'UNEXPECTED_ACTION %s\n' "$_action"
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # (1) subshell completed.
@@ -6353,22 +6351,22 @@ t3543a_out=$(
     _status=$(printf '%s' "$_transition" | cut -f3)
     _hint=$(printf '%s' "$_transition" | cut -f4)
     case "$_action" in
-        advance)
+        (advance)
             advance_phase "$_next"
             ;;
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_next" "$_status"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "push_and_pr_route_to_diagnoser" "hint=$_hint"
             case "$_hint" in
-                push_and_pr_no_unmerged_files)
+                (push_and_pr_no_unmerged_files)
                     agent_runner_reaped_failure \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr rebase failed with no unmerged files"
                     ;;
-                *)
+                (*)
                     log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
                     agent_runner_reaped_failure \
                         "diagnoser_route_unrecognized_hint" \
@@ -6377,7 +6375,7 @@ t3543a_out=$(
                     ;;
             esac
             ;;
-        *)
+        (*)
             log "push_and_pr_transition_unrecognized" "action=$_action"
             agent_runner_reaped_failure \
                 "push_and_pr_transition_unrecognized" \
@@ -6386,7 +6384,6 @@ t3543a_out=$(
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # T3543A (1): subshell completed.
@@ -6477,22 +6474,22 @@ t3543b_out=$(
     _status=$(printf '%s' "$_transition" | cut -f3)
     _hint=$(printf '%s' "$_transition" | cut -f4)
     case "$_action" in
-        advance)
+        (advance)
             advance_phase "$_next"
             ;;
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_next" "$_status"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "push_and_pr_route_to_diagnoser" "hint=$_hint"
             case "$_hint" in
-                push_and_pr_no_unmerged_files)
+                (push_and_pr_no_unmerged_files)
                     agent_runner_reaped_failure \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr rebase failed with no unmerged files"
                     ;;
-                *)
+                (*)
                     log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
                     agent_runner_reaped_failure \
                         "diagnoser_route_unrecognized_hint" \
@@ -6501,7 +6498,7 @@ t3543b_out=$(
                     ;;
             esac
             ;;
-        *)
+        (*)
             log "push_and_pr_transition_unrecognized" "action=$_action"
             agent_runner_reaped_failure \
                 "push_and_pr_transition_unrecognized" \
@@ -6510,7 +6507,6 @@ t3543b_out=$(
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # T3543B (1): subshell completed.
@@ -6617,7 +6613,6 @@ t3166a_out=$(
         exit 0
     fi
     echo "loop_continued"
-    2>&1
 ) 2>&1
 t3166a_rc=$?
 
@@ -6694,7 +6689,6 @@ t3166b_out=$(
         exit 0
     fi
     echo "loop_continued"
-    2>&1
 ) 2>&1
 t3166b_rc=$?
 
@@ -6813,22 +6807,22 @@ t3573a_out=$(
     _bs=$(printf '%s' "$_bt" | cut -f3)
     _bh=$(printf '%s' "$_bt" | cut -f4)
     case "$_ba" in
-        advance)
+        (advance)
             advance_phase "$_bn"
             ;;
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_bn" "$_bs"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
             case "$_bh" in
-                push_and_pr_no_unmerged_files)
+                (push_and_pr_no_unmerged_files)
                     agent_runner_reaped_failure \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr_no_unmerged_files" \
                         "ralph baseline rebase failed with no unmerged files (#3573)"
                     ;;
-                *)
+                (*)
                     log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
                     agent_runner_reaped_failure \
                         "diagnoser_route_unrecognized_hint" \
@@ -6837,7 +6831,7 @@ t3573a_out=$(
                     ;;
             esac
             ;;
-        *)
+        (*)
             log "ralph_baseline_transition_unrecognized" "action=$_ba"
             agent_runner_reaped_failure \
                 "ralph_baseline_transition_unrecognized" \
@@ -6846,7 +6840,6 @@ t3573a_out=$(
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # T3573A (1): subshell completed.
@@ -6930,22 +6923,22 @@ t3573b_out=$(
     _bs=$(printf '%s' "$_bt" | cut -f3)
     _bh=$(printf '%s' "$_bt" | cut -f4)
     case "$_ba" in
-        advance)
+        (advance)
             advance_phase "$_bn"
             ;;
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_bn" "$_bs"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
             case "$_bh" in
-                push_and_pr_no_unmerged_files)
+                (push_and_pr_no_unmerged_files)
                     agent_runner_reaped_failure \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr_no_unmerged_files" \
                         "ralph baseline rebase failed with no unmerged files (#3573)"
                     ;;
-                *)
+                (*)
                     log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
                     agent_runner_reaped_failure \
                         "diagnoser_route_unrecognized_hint" \
@@ -6954,7 +6947,7 @@ t3573b_out=$(
                     ;;
             esac
             ;;
-        *)
+        (*)
             log "ralph_baseline_transition_unrecognized" "action=$_ba"
             agent_runner_reaped_failure \
                 "ralph_baseline_transition_unrecognized" \
@@ -6963,7 +6956,6 @@ t3573b_out=$(
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # T3573B (1): subshell completed.
@@ -7746,22 +7738,22 @@ t3651d_out=$(
     _bs=$(printf '%s' "$_bt" | cut -f3)
     _bh=$(printf '%s' "$_bt" | cut -f4)
     case "$_ba" in
-        advance)
+        (advance)
             advance_phase "$_bn"
             ;;
-        advance_with_status)
+        (advance_with_status)
             advance_phase "$_bn" "$_bs"
             ;;
-        route_to_diagnoser)
+        (route_to_diagnoser)
             log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
             case "$_bh" in
-                push_and_pr_no_unmerged_files)
+                (push_and_pr_no_unmerged_files)
                     agent_runner_reaped_failure \
                         "push_and_pr_no_unmerged_files" \
                         "push_and_pr_no_unmerged_files" \
                         "ralph baseline rebase failed with no unmerged files (#3573)"
                     ;;
-                *)
+                (*)
                     log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
                     agent_runner_reaped_failure \
                         "diagnoser_route_unrecognized_hint" \
@@ -7770,7 +7762,7 @@ t3651d_out=$(
                     ;;
             esac
             ;;
-        *)
+        (*)
             log "ralph_baseline_transition_unrecognized" "action=$_ba"
             agent_runner_reaped_failure \
                 "ralph_baseline_transition_unrecognized" \
@@ -7779,7 +7771,6 @@ t3651d_out=$(
             ;;
     esac
     echo "subshell_done"
-    2>&1
 ) 2>&1
 
 # T3651D (1): subshell completed.
