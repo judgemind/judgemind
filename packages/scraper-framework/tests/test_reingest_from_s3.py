@@ -1317,6 +1317,176 @@ class TestReparseDocumentMultimodalMergeAsymmetry:
 
 
 # ---------------------------------------------------------------------------
+# _extract_doc_level_judge_department helper — direct unit tests (#4154)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDocLevelJudgeDepartment:
+    """Direct unit tests for the symmetric-merge helper (#4154).
+
+    The helper centralises the #4142 / #4145 / #4150 fixes — every reingest
+    call site (``_reparse_document``, ``_full_reparse_document``,
+    ``_reparse_document_multimodal``) now calls this helper instead of
+    inlining the merge logic.  These tests are belt-and-suspenders coverage
+    on top of the existing ``TestReparseDocumentMergeAsymmetry`` /
+    ``TestFullReparseDocumentMergeAsymmetry`` /
+    ``TestReparseDocumentMultimodalMergeAsymmetry`` classes that exercise
+    the helper through its three call sites.
+
+    Paths covered:
+      * Live-only no-op (``parsed.X`` is falsy → DB seed wins).
+      * Reingest-aware (``parsed.X`` populated → parsed wins).
+      * ``except Exception`` (parse_document raises → DB seed wins).
+      * No scraper class registered (``parsed=None`` and ``scraper_id``
+        not in ``_SCRAPER_REGISTRY`` → DB seed wins).
+      * Missing ``judge_name`` / ``department`` keys in ``doc_meta``
+        (``.get()`` returns ``None`` cleanly — no KeyError).
+    """
+
+    def _doc_meta(
+        self,
+        *,
+        judge_name: str | None = None,
+        department: str | None = None,
+    ) -> dict:
+        """Build a minimal doc_meta dict mirroring FETCH_DOCUMENTS_QUERY shape."""
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "San Francisco",
+            "court_name": "San Francisco Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "CGC-24-12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "judge_name": judge_name,
+            "department": department,
+        }
+
+    def _live_only_no_op_parsed(self) -> MagicMock:
+        """Build a parsed mock that mirrors a Live-only no-op parse_document."""
+        parsed = MagicMock()
+        parsed.judge_name = None
+        parsed.department = None
+        return parsed
+
+    def test_helper_with_pre_computed_parsed_no_op_falls_back_to_db_seed(self) -> None:
+        """``parsed`` provided with falsy fields → DB seed wins."""
+        result = reingest._extract_doc_level_judge_department(
+            self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            "any-scraper",
+            b"raw",
+            parsed=self._live_only_no_op_parsed(),
+        )
+        assert result == ("Hon. Jane Smith", "C-32")
+
+    def test_helper_with_pre_computed_parsed_populated_overrides_db_seed(self) -> None:
+        """``parsed.X`` populated → parsed wins over DB seed."""
+        parsed = self._live_only_no_op_parsed()
+        parsed.judge_name = "Hon. John Parsed"
+        parsed.department = "D-1"
+        result = reingest._extract_doc_level_judge_department(
+            self._doc_meta(judge_name="Hon. DB Seed", department="D-X"),
+            "any-scraper",
+            b"raw",
+            parsed=parsed,
+        )
+        assert result == ("Hon. John Parsed", "D-1")
+
+    def test_helper_no_scraper_class_falls_back_to_db_seed(self) -> None:
+        """``parsed=None`` + no scraper class registered → DB seed wins."""
+        # Critical: the scraper_id is not in _SCRAPER_REGISTRY.
+        reingest._SCRAPER_REGISTRY.pop("test-no-cls-helper", None)
+        result = reingest._extract_doc_level_judge_department(
+            self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            "test-no-cls-helper",
+            b"raw",
+        )
+        assert result == ("Hon. Jane Smith", "C-32")
+
+    def test_helper_parse_document_raises_falls_back_to_db_seed(self) -> None:
+        """``parse_document`` raises → except branch returns DB seed."""
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.side_effect = RuntimeError("scraper exploded")
+        reingest._SCRAPER_REGISTRY["test-helper-except"] = mock_scraper_cls
+        try:
+            result = reingest._extract_doc_level_judge_department(
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+                "test-helper-except",
+                b"raw",
+            )
+            assert result == ("Hon. Jane Smith", "C-32")
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-helper-except", None)
+
+    def test_helper_parse_document_returns_no_op_falls_back_to_db_seed(self) -> None:
+        """``parse_document`` succeeds with falsy fields → DB seed wins."""
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = self._live_only_no_op_parsed()
+        reingest._SCRAPER_REGISTRY["test-helper-no-op"] = mock_scraper_cls
+        try:
+            result = reingest._extract_doc_level_judge_department(
+                self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+                "test-helper-no-op",
+                b"raw",
+            )
+            assert result == ("Hon. Jane Smith", "C-32")
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-helper-no-op", None)
+
+    def test_helper_parse_document_returns_populated_overrides_db_seed(self) -> None:
+        """``parse_document`` returns populated fields → parsed wins."""
+        parsed = self._live_only_no_op_parsed()
+        parsed.judge_name = "Hon. John Parsed"
+        parsed.department = "D-1"
+        mock_scraper_cls = MagicMock()
+        mock_scraper_cls.return_value.parse_document.return_value = parsed
+        reingest._SCRAPER_REGISTRY["test-helper-populated"] = mock_scraper_cls
+        try:
+            result = reingest._extract_doc_level_judge_department(
+                self._doc_meta(judge_name="Hon. DB Seed", department="D-X"),
+                "test-helper-populated",
+                b"raw",
+            )
+            assert result == ("Hon. John Parsed", "D-1")
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-helper-populated", None)
+
+    def test_helper_doc_meta_missing_judge_and_department_keys_returns_none(self) -> None:
+        """``doc_meta.get("X")`` returns None when keys are absent — no KeyError."""
+        meta = self._doc_meta()
+        meta.pop("judge_name", None)
+        meta.pop("department", None)
+        # Test the no-scraper-cls path (simplest fall-through).
+        reingest._SCRAPER_REGISTRY.pop("test-helper-missing-keys", None)
+        result = reingest._extract_doc_level_judge_department(
+            meta,
+            "test-helper-missing-keys",
+            b"raw",
+        )
+        assert result == (None, None)
+
+    def test_helper_parsed_object_missing_attrs_returns_db_seed(self) -> None:
+        """``parsed`` without ``judge_name``/``department`` attrs → DB seed wins (defensive)."""
+
+        # Defensive: a future alternate parsed shape might not carry these
+        # attrs.  ``getattr(parsed, "X", None)`` returns None cleanly.
+        class BareParsed:
+            pass
+
+        result = reingest._extract_doc_level_judge_department(
+            self._doc_meta(judge_name="Hon. Jane Smith", department="C-32"),
+            "any-scraper",
+            b"raw",
+            parsed=BareParsed(),
+        )
+        assert result == ("Hon. Jane Smith", "C-32")
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — DB format='txt' regression (#4122)
 # ---------------------------------------------------------------------------
 
