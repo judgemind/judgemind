@@ -348,19 +348,35 @@ class TestTimeoutWrappersPresent:
         is unchanged — the value is still derived from a TIMEOUT_SECONDS
         env-driven constant — but the lookup happens via the per-phase
         table at function-call time.
+
+        #4125 — also accept the macOS-portable
+        ``$_timeout_cmd ${_timeout_cmd:+"$_phase_timeout"}`` form. The
+        leading ``$_timeout_cmd`` resolves to either ``timeout`` (Linux),
+        ``gtimeout`` (macOS + coreutils), or empty (fresh Mac). The
+        semantic intent is unchanged — when the command resolves
+        non-empty, the expansion still yields ``<cmd> "$_phase_timeout"
+        claude -p ...``. We anchor on the ``${_timeout_cmd:+...}``
+        construct because it is a unique fingerprint for the resolver
+        path that won't match any other line.
         """
         for lineno, line in self._run_claude_phase_lines():
             if line.strip().startswith("#"):
                 continue
             if "claude" in line and "-p" in line and "--output-format" in line:
-                # Accept either the legacy ``timeout "$<VAR>_TIMEOUT_SECONDS"``
-                # form OR the #3766 ``timeout "$_phase_timeout"`` form.
+                # Accept legacy ``timeout "$<VAR>_TIMEOUT_SECONDS"``,
+                # ``timeout "$_phase_timeout"`` (#3766), or the #4125
+                # macOS-portable resolver-driven form
+                # ``$_timeout_cmd ${_timeout_cmd:+"$_phase_timeout"}``.
                 assert re.search(
                     r'timeout\s+"\$\w*TIMEOUT_SECONDS"', line
-                ) or re.search(r'timeout\s+"\$_phase_timeout"', line), (
+                ) or re.search(r'timeout\s+"\$_phase_timeout"', line) or re.search(
+                    r'\$_timeout_cmd\s+\$\{_timeout_cmd:\+"\$_phase_timeout"\}',
+                    line,
+                ), (
                     f"L{lineno}: ``claude -p`` in run_claude_phase is not wrapped by "
-                    f'``timeout "$<VAR>_TIMEOUT_SECONDS"`` or ``timeout "$_phase_timeout"`` '
-                    f"(#3683, #3766). Line: {line!r}"
+                    f'``timeout "$<VAR>_TIMEOUT_SECONDS"``, ``timeout "$_phase_timeout"``, '
+                    f'or ``$_timeout_cmd ${{_timeout_cmd:+"$_phase_timeout"}}`` '
+                    f"(#3683, #3766, #4125). Line: {line!r}"
                 )
 
 
