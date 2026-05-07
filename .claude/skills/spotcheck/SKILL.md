@@ -128,6 +128,7 @@ For the bidirectional sample (rulings → originals, originals → rulings) the 
 | **Department** | Wrong format, year fragments, "(1982)" misextracted? |
 | **UNKNOWN case numbers** | `UNKNOWN-...` placeholder despite a real number in the PDF? |
 | **Truncation** | `ruling_text_length` looks too short for the page count? Multi-page analyses reduced to a few hundred chars is a truncation bug. |
+| **LLM carry-forward (multi-case docs)** | LLM violated rule 5b and copied the first entry's `outcome` / `motion_type` / `case_title` onto subsequent entries. Run `scripts/audit_llm_carry_forward.py` for the four-axis cross-county sweep — see Step 3 §LLM carry-forward audit. Any non-zero count for a county without a deterministic pre-LLM splitter is a candidate for filing a #3534 / #3649-shape follow-up. |
 
 For multi-page PDFs use `pages: "1-20"`, then `"21-40"` — the Read tool maxes at 20 pages per call.
 
@@ -162,6 +163,41 @@ Possible directions (pick what feels productive — don't try to do them all):
 - **Scheduled-skill cron health.** `dispatcher.scheduled_skills` rows — any with `enabled=true` but `last_triggered_at` stale (suggests cron walk skipped them)?
 
 This list is illustrative, not prescriptive. If your nose tells you to look at something else, look there.
+
+### LLM carry-forward audit (cross-county)
+
+`scripts/audit_llm_carry_forward.py` runs four carry-forward checks across every CA county at once. Use it any time the bidirectional sample turns up a hint of multi-case PDF mis-attribution, or as a periodic cross-county sweep.
+
+The four checks (per county):
+
+1. **outcome_continue** — definitive `outcome` (`granted` / `denied` / `granted_in_part` / `denied_in_part`) but `ruling_text` starts with continuance boilerplate (`continue` / `continued` / `the motion is continued` / `the court continues`). The AC #3 axis from #3649.
+2. **motion_type_contradiction** — `motion_type` mentions a known motion (e.g. `demurrer`, `summary judgment`, `motion to compel`) but the ruling_text contains no stem of that motion.
+3. **case_title_text_mismatch** — significant case_title party words don't appear in the ruling_text (mirror of `audit_oc_ruling_integrity.py` applied per-county).
+4. **all_same_case_title_cluster** — same `documents.s3_key` produced multiple rulings, all sharing identical `case_title` — strong indicator the LLM applied page-1's case to every entry.
+
+Run it via `scripts/ecs-run-task.sh` so it has the dev DSN. Use `timeout: 1200000`:
+
+```
+scripts/ecs-run-task.sh scripts/audit_llm_carry_forward.py
+```
+
+For a JSON dump with example ruling_id / s3_key values per non-zero check:
+
+```
+scripts/ecs-run-task.sh scripts/audit_llm_carry_forward.py -- --json
+```
+
+To audit a single county or restrict to a date window:
+
+```
+scripts/ecs-run-task.sh scripts/audit_llm_carry_forward.py -- --county Ventura --since 2026-01-01
+```
+
+**Interpreting results.** Counties with deterministic splitters wired into `packages/scraper-framework/src/ingestion/worker.py` (Riverside #3649, Fresno #3534, San Diego calendar #2447, LA HTML #2450) should produce near-zero counts on checks 1, 2, and 4. Non-zero in those counties = either the splitter regressed or there is an un-handled multi-case shape.
+
+Counties with custom LLM prompts but no splitter — San Bernardino, San Francisco, Santa Clara, Ventura, Contra Costa, plus Orange (multimodal) — are the prime candidates for the bug class. Non-zero counts there should produce a follow-up issue mirroring #3534 / #3649: add a `_split_rulings()` helper to the county scraper, wire a `_try_<county>_pdf_split()` into `worker.py`, regression-test against a multi-entry fixture, then re-ingest with `--bust-llm-cache` over the affected window.
+
+The script is permanent (`# permanent: true`) and exits 0 always — it's a discovery audit, not a CI gate. Findings live in stdout / JSON / follow-up issues.
 
 ### Tooling reference
 
