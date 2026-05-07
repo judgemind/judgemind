@@ -3234,6 +3234,43 @@ class TestRunReingest:
         assert "AND EXISTS" in filters_arg
         assert "r.outcome IS NULL" in filters_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_s3_key_list_filter_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``run_reingest(s3_key_list=...)`` plumbs the list through to
+        ``_build_filters`` and the resulting ``ANY(%s)`` clause + param show
+        up on the ``reingest_batch`` call."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        keys = [
+            "ca/santa_clara/superior_court/raw/aaa.pdf",
+            "ca/santa_clara/superior_court/raw/bbb.pdf",
+        ]
+        reingest.run_reingest(
+            "postgresql://test",
+            county="Santa Clara",
+            s3_key_list=keys,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        filter_params_arg = call_args[0][5]
+        assert "AND ct.county = %s" in filters_arg
+        assert "AND d.s3_key = ANY(%s)" in filters_arg
+        assert "Santa Clara" in filter_params_arg
+        assert keys in filter_params_arg
+
 
 # ---------------------------------------------------------------------------
 # _build_filters
@@ -3471,6 +3508,129 @@ class TestBuildFilters:
         assert "AND c.case_number LIKE %s" in clauses
         assert "r.department = ANY(%s)" in clauses
         assert params == ["Orange", pattern, depts]
+
+    def test_s3_key_list_adds_any_clause(self) -> None:
+        """A non-empty s3_key_list emits ``AND d.s3_key = ANY(%s)`` and
+        appends the list verbatim as the corresponding param."""
+        keys = [
+            "ca/santa_clara/superior_court/raw/aaa.pdf",
+            "ca/santa_clara/superior_court/raw/bbb.pdf",
+        ]
+        clauses, params = reingest._build_filters(None, None, None, s3_key_list=keys)
+        assert "AND d.s3_key = ANY(%s)" in clauses
+        assert params == [keys]
+
+    def test_s3_key_list_none_no_clause(self) -> None:
+        """Passing s3_key_list=None emits no clause."""
+        clauses, params = reingest._build_filters(None, None, None, s3_key_list=None)
+        assert "s3_key" not in clauses
+        assert params == []
+
+    def test_s3_key_list_empty_no_clause(self) -> None:
+        """Passing an empty s3_key_list emits no clause (degenerate input
+        guarded at the CLI layer, but the SQL builder must not emit
+        ``= ANY('{}'::text[])`` which matches no rows accidentally)."""
+        clauses, params = reingest._build_filters(None, None, None, s3_key_list=[])
+        assert "s3_key" not in clauses
+        assert params == []
+
+    def test_s3_key_list_with_county(self) -> None:
+        """Combined county + s3_key_list; both clauses present and params
+        ordered [county, key_list]."""
+        keys = ["ca/santa_clara/superior_court/raw/abc.pdf"]
+        clauses, params = reingest._build_filters("Santa Clara", None, None, s3_key_list=keys)
+        assert "AND ct.county = %s" in clauses
+        assert "AND d.s3_key = ANY(%s)" in clauses
+        assert params == ["Santa Clara", keys]
+
+
+# ---------------------------------------------------------------------------
+# _read_s3_key_list_file
+# ---------------------------------------------------------------------------
+
+
+class TestReadS3KeyListFile:
+    """Unit tests for the ``_read_s3_key_list_file`` helper."""
+
+    def test_reads_keys_one_per_line(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "keys.txt"  # type: ignore[operator]
+        path.write_text(
+            "ca/santa_clara/superior_court/raw/aaa.pdf\n"
+            "ca/santa_clara/superior_court/raw/bbb.pdf\n",
+            encoding="utf-8",
+        )
+        keys = reingest._read_s3_key_list_file(str(path))
+        assert keys == [
+            "ca/santa_clara/superior_court/raw/aaa.pdf",
+            "ca/santa_clara/superior_court/raw/bbb.pdf",
+        ]
+
+    def test_strips_whitespace_and_skips_blank_lines(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "keys.txt"  # type: ignore[operator]
+        path.write_text(
+            "\n  ca/foo.pdf  \n\n  ca/bar.pdf\n\n",
+            encoding="utf-8",
+        )
+        keys = reingest._read_s3_key_list_file(str(path))
+        assert keys == ["ca/foo.pdf", "ca/bar.pdf"]
+
+    def test_skips_comment_lines(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "keys.txt"  # type: ignore[operator]
+        path.write_text(
+            "# this list was extracted from #3659 spotcheck\n"
+            "ca/foo.pdf\n"
+            "  # indented comments are stripped too\n"
+            "ca/bar.pdf\n",
+            encoding="utf-8",
+        )
+        keys = reingest._read_s3_key_list_file(str(path))
+        assert keys == ["ca/foo.pdf", "ca/bar.pdf"]
+
+    def test_deduplicates_preserving_first_order(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "keys.txt"  # type: ignore[operator]
+        path.write_text(
+            "ca/foo.pdf\nca/bar.pdf\nca/foo.pdf\n",
+            encoding="utf-8",
+        )
+        keys = reingest._read_s3_key_list_file(str(path))
+        assert keys == ["ca/foo.pdf", "ca/bar.pdf"]
+
+    def test_empty_file_raises_value_error(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "empty.txt"  # type: ignore[operator]
+        path.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="empty"):
+            reingest._read_s3_key_list_file(str(path))
+
+    def test_only_comments_and_blanks_raises_value_error(self, tmp_path: object) -> None:
+        """An all-comments / all-blank file is the same defect class as an
+        empty file: silently matching every document is dangerous, so fail
+        loud."""
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "comments.txt"  # type: ignore[operator]
+        path.write_text(
+            "# only comments\n\n# and blanks\n   \n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="empty"):
+            reingest._read_s3_key_list_file(str(path))
+
+    def test_missing_file_raises_filenotfound(self, tmp_path: object) -> None:
+        from pathlib import Path as _Path
+
+        path: _Path = tmp_path / "does_not_exist.txt"  # type: ignore[operator]
+        with pytest.raises(FileNotFoundError):
+            reingest._read_s3_key_list_file(str(path))
 
 
 # ---------------------------------------------------------------------------
