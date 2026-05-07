@@ -152,6 +152,11 @@ Options:
                         Useful when the LLM prompt has been updated and the
                         existing cache entries store stale outputs keyed by
                         the old prompt hash.  See #2424.
+    --s3-key-list PATH  Path to a file listing S3 keys (one per line, blank
+                        lines and ``#`` comments ignored) to restrict the
+                        reingest to.  Surgical scope for hand-picked SHAs
+                        where county / date / regex filters all over- or
+                        under-match.  See #3659.
 """
 
 from __future__ import annotations
@@ -500,6 +505,7 @@ def _build_filters(
     case_number_like: str | None = None,
     filter_null_outcome: bool = False,
     department_in: list[str] | None = None,
+    s3_key_list: list[str] | None = None,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -539,7 +545,46 @@ def _build_filters(
             " WHERE r.document_id = d.id AND r.department = ANY(%s))"
         )
         params.append(department_in)
+    if s3_key_list:
+        # Surgical scoping: limit reingest to a hand-picked set of S3 keys.
+        # Useful for targeted backfills (e.g. #3659 — re-resolve a small set
+        # of pre-#3655 cached SC PDFs) where county-wide rescope would
+        # over-shoot 10-100x and broader date filters lack sub-day granularity.
+        clauses.append("AND d.s3_key = ANY(%s)")
+        params.append(list(s3_key_list))
     return " ".join(clauses), params
+
+
+def _read_s3_key_list_file(path: str) -> list[str]:
+    """Read a list of S3 keys from a file, one per line.
+
+    Blank lines and lines starting with ``#`` are skipped, leading/trailing
+    whitespace on each entry is stripped, and duplicates are de-duplicated
+    while preserving first-occurrence order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+    ValueError
+        If the file produces an empty key list (every line was blank or a
+        comment) — fail loud rather than silently match every document.
+    """
+    raw = Path(path).read_text(encoding="utf-8")
+    seen: set[str] = set()
+    keys: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped in seen:
+            continue
+        seen.add(stripped)
+        keys.append(stripped)
+    if not keys:
+        msg = f"--s3-key-list file is empty after stripping blanks/comments: {path}"
+        raise ValueError(msg)
+    return keys
 
 
 def _is_real_case_number(case_number: str | None) -> bool:
@@ -3742,6 +3787,7 @@ def run_reingest(
     filter_null_outcome: bool = False,
     bust_llm_cache: bool = False,
     department_in: list[str] | None = None,
+    s3_key_list: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -3759,6 +3805,14 @@ def run_reingest(
         When *True*, only re-ingest documents that have at least one ruling
         with a NULL outcome.  Useful for targeted reprocessing when only a
         subset of documents need outcome extraction.
+    s3_key_list:
+        Optional list of S3 keys (``ct.county``-relative or full prefix) to
+        restrict the reingest to.  When provided, the document query adds an
+        ``AND d.s3_key = ANY(%s)`` clause and only documents whose ``s3_key``
+        exactly matches one of these values are re-ingested.  Useful for
+        surgical backfills targeting a hand-picked set of SHAs (#3659) where
+        county-wide rescope would over-shoot and date filters lack sub-day
+        granularity.
     """
     filters, filter_params = _build_filters(
         county,
@@ -3770,6 +3824,7 @@ def run_reingest(
         case_number_like=case_number_like,
         filter_null_outcome=filter_null_outcome,
         department_in=department_in,
+        s3_key_list=s3_key_list,
     )
 
     s3_client = boto3.client("s3")
@@ -4235,6 +4290,23 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--s3-key-list",
+        type=str,
+        default=None,
+        dest="s3_key_list",
+        help=(
+            "Path to a file listing S3 keys (one per line) to restrict the "
+            "reingest to.  Blank lines and lines starting with '#' are "
+            "ignored.  Adds an AND d.s3_key = ANY(...) clause to the document "
+            "query.  Useful for surgical backfills against a hand-picked set "
+            "of SHAs — e.g. #3659 (re-resolve cross-references on the 13 SC "
+            "PDFs whose cached LLM payload predates #3655) — where county-wide "
+            "rescope would over-shoot 10-100x and --date-from/--date-to clamp "
+            "to whole days only.  Combine with --bust-llm-cache to force "
+            "fresh LLM extraction on those keys."
+        ),
+    )
+    parser.add_argument(
         "--force-retranscribe",
         action="store_true",
         help=(
@@ -4253,6 +4325,23 @@ def main() -> None:
 
     if args.resume and not args.checkpoint_file:
         parser.error("--resume requires --checkpoint-file to be specified.")
+
+    # Resolve --s3-key-list path → list of keys (or None when not provided).
+    # Loaded eagerly so a missing file or empty list fails fast, before any
+    # DB connect or S3 client setup.
+    s3_key_list_values: list[str] | None = None
+    if args.s3_key_list:
+        try:
+            s3_key_list_values = _read_s3_key_list_file(args.s3_key_list)
+        except FileNotFoundError:
+            parser.error(f"--s3-key-list file not found: {args.s3_key_list}")
+        except ValueError as err:
+            parser.error(str(err))
+        logger.info(
+            "Loaded --s3-key-list",
+            path=args.s3_key_list,
+            count=len(s3_key_list_values),
+        )
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -4309,6 +4398,7 @@ def main() -> None:
         filter_null_outcome=args.filter_null_outcome,
         bust_llm_cache=args.bust_llm_cache,
         department_in=args.department_in,
+        s3_key_list=s3_key_list_values,
     )
 
     logger.info(
