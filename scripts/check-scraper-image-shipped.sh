@@ -42,6 +42,15 @@
 #        /app/scripts/ in headers and fixtures)
 #      - docs/  (descriptive, not invocation sites)
 #      - tmp/   (worktree-local scratch)
+#      - .claude/ (operator-managed agent state — worktrees, hooks,
+#                  skills; never an invocation site for /app/scripts/.
+#                  Some dispatcher tests under
+#                  scripts/dispatcher/tests/ create synthetic agent
+#                  worktrees beneath .claude/worktrees/, and those
+#                  fixtures may contain test heredocs that reference
+#                  /app/scripts/<X>.{py,sh}; without this exclusion
+#                  the check trips on those leftover fixtures during
+#                  CI's scripts-tests shard. See #4300.)
 #      - .git/, .venv/, node_modules/ (vendored / generated)
 # 3. For each unique <name>.<ext> token found, asserts that
 #    packages/scraper-framework/Dockerfile contains a matching
@@ -142,6 +151,7 @@ HITS=$(
         --exclude-dir='.next' \
         --exclude-dir='docs' \
         --exclude-dir='tmp' \
+        --exclude-dir='.claude' \
         2>/dev/null \
     | grep -v -F "$REPO_ROOT/$DOCKERFILE_REL:" \
     | grep -v -F "$REPO_ROOT/$SELF_REL:" \

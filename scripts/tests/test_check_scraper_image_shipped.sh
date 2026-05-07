@@ -345,6 +345,21 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test 15b: References under .claude/ are excluded (#4300) ──────────
+# The dispatcher test suite creates synthetic agent worktrees under
+# .claude/worktrees/agent-<MagicMock id=...>/scripts/... when running
+# the scripts-tests pytest shard in CI. Those leftover fixtures may
+# contain test heredocs with literal `python /app/scripts/<X>.py`
+# strings, which would otherwise trip the check at the next CI step.
+# Reproduce the shape of that fixture and assert the check ignores it.
+reset_tmpdir
+synth_scraper_dockerfile  # no scripts COPY'd
+write_file "$TMPDIR_TEST/.claude/worktrees/agent-fake/scripts/tests/test_check_scraper_image_shipped.sh" \
+'#!/usr/bin/env bash
+# Synthetic leftover from dispatcher tests — must NOT trip the check.
+python /app/scripts/nonexistent.py --foo'
+assert_passes "References under .claude/ are excluded (#4300 regression)"
+
 # ─── Test 16: No self-match on ci.yml step name ────────────────────────
 # Per CLAUDE.md §Hygiene-check CI steps, every new string-forbidding
 # guard must not have a CI step name that itself contains a forbidden
