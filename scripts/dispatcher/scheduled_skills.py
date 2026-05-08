@@ -1,7 +1,7 @@
 """Generalized cron-like scheduler for periodic skill dispatch.
 
 Issue #3374. Provides a minimal 5-field cron parser and a
-``next_fire_time`` helper that answers the question "given a cron
+``should_fire_cron`` helper that answers the question "given a cron
 expression, an anchor time (``last_triggered_at`` or NULL), and now,
 should the daemon fire this skill on this tick?".
 
@@ -20,6 +20,17 @@ Design notes
   ``last_triggered_at = now()`` on fire so the next tick re-anchors.
 * On parse error: log + ``False`` (skip this row this tick). A bad
   cron expression should never break the supervisor loop.
+
+Algorithm (issue #4326)
+-----------------------
+``should_fire_cron`` is implemented in O(1) per call via
+:func:`previous_match` — a backward search from ``now`` that walks
+candidate days until it finds the most-recent datetime ≤ ``now`` matching
+the schedule. Because the search is bounded at 366 days (one full year +
+a leap-day cushion) it supports every cadence cron can express —
+hourly, daily, weekly, monthly, quarterly, yearly — with no per-cadence
+"walk cap" tuning. Issue #4317 replaced the old 24h cap with an 8-day
+cap to support weekly cron; #4326 collapses the cap entirely.
 """
 
 from __future__ import annotations
@@ -33,17 +44,12 @@ from datetime import datetime, timedelta
 #: matching standard cron "fire exactly once if missed" semantics.
 _NULL_ANCHOR_LOOKBACK = timedelta(hours=24)
 
-#: Maximum minutes the walk will scan from ``anchor + 1m`` toward ``now``.
-#: Set to 8 days = 11,520 minutes so a weekly cron whose anchor is its prior
-#: fire (≈7 days = 10,080 minutes back) still finds its next match (issue
-#: #4317).  Wider than the NULL-anchor lookback so weekly cron rows fire at
-#: their target minute even after their first fire stamps
-#: ``last_triggered_at``.  Still bounds the walk so a daemon offline for
-#: many days does not enumerate hundreds of thousands of minutes — an
-#: offline-for-9+-days daemon hits the cap and yields control without
-#: firing on this tick (it will fire on a later tick once the daemon is
-#: caught up to within the 8-day window).
-_WALK_CAP_MINUTES = 60 * 24 * 8  # 11,520 minutes = 8 days
+#: Maximum number of days :func:`previous_match` will walk backward from
+#: ``now`` before giving up. 366 covers every realistic cadence (yearly
+#: schedules included, with a leap-day cushion).  An expression that
+#: matches no minute in the past 366 days returns None — this is treated
+#: as "no past match in the working range" by callers.
+_MAX_LOOKBACK_DAYS = 366
 
 
 # Field bounds, matching the standard 5-field cron layout:
@@ -154,6 +160,82 @@ def matches(schedule: CronSchedule, when: datetime) -> bool:
     )
 
 
+def _day_matches(schedule: CronSchedule, when: datetime) -> bool:
+    """True if *when*'s month/day-of-month/day-of-week match *schedule*.
+
+    Used by :func:`previous_match` to skip whole days that cannot
+    contain any matching minute, so the inner hour/minute search only
+    runs on days the schedule could fire.
+    """
+    return (
+        when.month in schedule.months
+        and when.day in schedule.days_of_month
+        and ((when.weekday() + 1) % 7) in schedule.days_of_week
+    )
+
+
+def previous_match(now: datetime, schedule: CronSchedule) -> datetime | None:
+    """Return the most-recent datetime ≤ *now* that matches *schedule*.
+
+    Returns ``None`` if no matching minute exists in the preceding
+    :data:`_MAX_LOOKBACK_DAYS` (366 days). Comparison is at minute
+    resolution — seconds and microseconds on *now* are ignored when
+    comparing to the candidate slot.
+
+    The algorithm steps backward day-by-day (starting at ``now``'s
+    date). For each candidate day:
+
+    * If the day's month/day-of-month/day-of-week do not match the
+      schedule, skip the entire day (no minute on that day can match).
+    * Otherwise, look for the largest ``(hour, minute)`` slot on that
+      day that is allowed by the schedule and ≤ ``now`` (when the day
+      is ``now``'s date) or simply the largest allowed slot (when the
+      day is earlier than ``now``'s date).
+
+    O(1) per call: the day-loop is bounded by ``_MAX_LOOKBACK_DAYS``
+    and the hour/minute search inside each candidate day enumerates at
+    most 24 × 60 = 1440 slots in the worst case (and typically far
+    fewer because hours/minutes are usually small frozensets).
+    """
+    # Drop seconds/microseconds — cron is minute-resolution.
+    cursor = now.replace(second=0, microsecond=0)
+    # Pre-sort the allowed hours and minutes once so the inner search
+    # can do bounded backward iteration without re-sorting per day.
+    sorted_hours = sorted(schedule.hours, reverse=True)
+    sorted_minutes = sorted(schedule.minutes, reverse=True)
+    if not sorted_hours or not sorted_minutes:
+        return None
+
+    cutoff = cursor - timedelta(days=_MAX_LOOKBACK_DAYS)
+    # ``cursor.date()`` candidate first; then walk back day by day.
+    candidate_day = cursor
+    days_walked = 0
+    while candidate_day >= cutoff:
+        if _day_matches(schedule, candidate_day):
+            # Search for the largest matching (hour, minute) on this day
+            # that is ≤ cursor when candidate_day is cursor's date, or
+            # any matching slot otherwise.
+            same_day = (
+                candidate_day.year == cursor.year
+                and candidate_day.month == cursor.month
+                and candidate_day.day == cursor.day
+            )
+            for hour in sorted_hours:
+                if same_day and hour > cursor.hour:
+                    continue
+                for minute in sorted_minutes:
+                    # When the candidate hour equals cursor.hour, the
+                    # minute must be ≤ cursor.minute on the same day.
+                    if same_day and hour == cursor.hour and minute > cursor.minute:
+                        continue
+                    return candidate_day.replace(hour=hour, minute=minute)
+        candidate_day = candidate_day - timedelta(days=1)
+        days_walked += 1
+        if days_walked > _MAX_LOOKBACK_DAYS:
+            break
+    return None
+
+
 def should_fire_cron(
     expression: str,
     last_triggered_at: datetime | None,
@@ -162,50 +244,40 @@ def should_fire_cron(
     """Should a cron-triggered skill fire on the current supervisor tick?
 
     The supervisor tick fires every 2 minutes by default, so we cannot
-    rely on the tick lining up with a specific minute. Instead: scan
-    the minute-resolution range (``last_triggered_at`` exclusive, ``now``
-    inclusive) and return True if any minute in that range matches the
-    cron schedule.
+    rely on the tick lining up with a specific minute. Instead: locate
+    the most-recent past match (``previous_match``) and decide whether
+    it falls in the "should fire" window.
 
-    On first-ever fire (``last_triggered_at is None``) — including
-    rows that were manually reset to NULL — the anchor walks back a
-    full :data:`_NULL_ANCHOR_LOOKBACK` (24 hours) from ``now``.  This
-    ensures the most-recent past match within the last day is found
-    and fired exactly once on this tick, even if the cron's target
-    minute already passed today.
+    Semantics:
 
-    Bounds:
-      - The walk is capped at :data:`_WALK_CAP_MINUTES` (8 days =
-        11,520 minutes) so a daemon offline for very long does not
-        enumerate hundreds of thousands of minutes.  Hourly, daily,
-        and weekly crons all find their match within the cap; a
-        daemon offline for 9+ days hits the cap and skips firing on
-        this tick (it will fire on a later tick once the daemon is
-        caught up to within the 8-day window).
+    * ``last_triggered_at is None`` (first-ever fire / manually reset):
+      fire if the most-recent past match falls within the last
+      :data:`_NULL_ANCHOR_LOOKBACK` (24 hours). This matches standard
+      cron "fire exactly once if missed" semantics — a target minute
+      that already passed today is still picked up on the next tick.
+    * ``last_triggered_at`` is set: fire if the most-recent past match
+      is strictly after ``last_triggered_at``. This guarantees we
+      neither double-fire (the same matching minute) nor lose fires
+      across long gaps (an O(1) reach to the most-recent match supports
+      every cadence cron can express).
+    * Defensive: if ``last_triggered_at`` is in the future (clock skew
+      or restored DB snapshot), do not fire — treat as up-to-date.
+
+    Performance is O(1) regardless of cadence — issue #4326 replaced
+    the prior O(N) minute-walk + per-cadence cap with a bounded
+    backward search via :func:`previous_match`.
     """
     schedule = parse_cron(expression)
-    if last_triggered_at is None:
-        # Never fired (or manually reset) — walk back 24h so the
-        # most-recent past match is found and fired on this tick.
-        anchor = now - _NULL_ANCHOR_LOOKBACK
-    else:
-        anchor = last_triggered_at
     # Defensive: if last_triggered is in the future (clock skew or
     # restored DB snapshot), don't fire — treat as up-to-date.
-    if anchor >= now:
+    if last_triggered_at is not None and last_triggered_at >= now:
         return False
-    # Walk minute by minute from anchor+1 minute up to now (inclusive).
-    cursor = anchor.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    end = now.replace(second=0, microsecond=0)
-    iterations = 0
-    while cursor <= end:
-        if matches(schedule, cursor):
-            return True
-        cursor += timedelta(minutes=1)
-        iterations += 1
-        if iterations > _WALK_CAP_MINUTES:  # 8-day safety cap (issue #4317)
-            break
-    return False
+    prev = previous_match(now, schedule)
+    if prev is None:
+        return False
+    if last_triggered_at is None:
+        return prev >= now - _NULL_ANCHOR_LOOKBACK
+    return prev > last_triggered_at
 
 
 __all__ = [
@@ -213,5 +285,6 @@ __all__ = [
     "CronSchedule",
     "matches",
     "parse_cron",
+    "previous_match",
     "should_fire_cron",
 ]
