@@ -133,10 +133,18 @@ def _load_psycopg() -> Any:
     return psycopg
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use the same structlog configuration as scripts/reingest_from_s3.py so the
+# ``extra=`` fields passed to ``logger.info(...)`` calls surface in CloudWatch
+# Logs Insights output. ``stdlib_bridge=True`` routes stdlib
+# ``logging.getLogger(__name__)`` calls through structlog's ProcessorFormatter
+# + ExtraAdder, JSON-encoding the LogRecord plus its extras as one event per
+# line. Without this, the previous ``logging.basicConfig`` format string
+# (``"%(asctime)s %(levelname)-8s %(message)s"``) silently dropped every
+# ``extra=`` field — see #4368 for the post-deploy-verification incident on
+# #4360 that motivated the switch.
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 
