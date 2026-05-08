@@ -129,6 +129,33 @@ def _make_riverside_event(**overrides: object) -> dict:
     return base
 
 
+def _make_sf_event(**overrides: object) -> dict:
+    """Return a SF family-law PDF-like event payload (#4304)."""
+    base: dict = {
+        "document_id": "aaaaaaaa-0000-0000-0000-000000000006",
+        "scraper_id": "ca-sf-tentatives-family-law",
+        "state": "CA",
+        "county": "San Francisco",
+        "court": "Superior Court",
+        "source_url": "https://webapps.sftc.org/ufctr/403_Tentative_Rulings.pdf",
+        "content_format": "pdf",
+        "content_hash": "pqr678",
+        "s3_key": "ca/san_francisco/superior_court/raw/pqr678.pdf",
+        "s3_bucket": "judgemind-document-archive-dev",
+        "ruling_text": (
+            "SUPERIOR COURT OF CALIFORNIA\n"
+            "COUNTY OF SAN FRANCISCO\n"
+            "Case Number: FPT-25-378624\n"
+            "Department: 403\n"
+            "TENTATIVE RULING\n"
+        ),
+        "hearing_date": "2026-03-03",
+        "capture_timestamp": "2026-03-03T14:00:00",
+    }
+    base.update(overrides)
+    return base
+
+
 def _make_llm_event(**overrides: object) -> dict:
     """Return a generic event for LLM split path testing."""
     base: dict = {
@@ -211,6 +238,28 @@ def _make_fake_riverside_rulings() -> list:
             ruling_index=i + 1,
             case_number=f"CVPS230000{i}",
             ruling_text=f"Riverside ruling {i}\nTentative Ruling: Granted.",
+        )
+        for i in range(3)
+    ]
+
+
+def _make_fake_sf_rulings() -> list:
+    """Return 3 fake SF family-law SplitRuling objects for testing (#4304)."""
+    from courts.ca.sf_tentatives import SplitRuling
+
+    return [
+        SplitRuling(
+            ruling_index=i,
+            case_number=f"FDI-25-80000{i}",
+            ruling_text=(
+                f"SUPERIOR COURT OF CALIFORNIA\n"
+                f"COUNTY OF SAN FRANCISCO\n"
+                f"Case Number: FDI-25-80000{i}\n"
+                f"Department: 403\n"
+                f"TENTATIVE RULING\n"
+                f"SF ruling {i} body."
+            ),
+            department="403",
         )
         for i in range(3)
     ]
@@ -1091,6 +1140,202 @@ class TestNonExhaustionExceptionsReraise:
         event = _make_llm_event()
         with pytest.raises(ValueError, match="non-exhaustion error on split child"):
             worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
+# San Francisco family-law PDF splitter — _try_sf_pdf_split (#4304)
+# ---------------------------------------------------------------------------
+
+
+class TestSfPdfSplit:
+    """Verify the SF family-law PDF deterministic split path (#4304).
+
+    These tests pin the same contract as the Riverside splitter (#3649):
+
+    1. The county+format gate skips non-SF events and non-PDF SF events.
+    2. Empty splitter results (no entry headers) and single-entry results
+       fall through to the LLM path so per-field enrichment can fill
+       motion_type/outcome/case_title.
+    3. Multi-entry splitter results dispatch synthetic split events with
+       ``_split_processed=True`` and **no** ``_llm_extracted`` flag, so
+       per-field LLM enrichment runs against each entry individually
+       (eliminating the cross-entry carry-forward window that the
+       SAN_FRANCISCO_SYSTEM_PROMPT was failing to enforce on its own).
+    4. Non-exhaustion exceptions in the dispatch callable propagate; only
+       ``LlmEnrichmentExhaustedError`` is swallowed (with a CRITICAL log).
+    """
+
+    def test_sf_pdf_split_skips_non_sf_county(self) -> None:
+        """_try_sf_pdf_split returns False (skips) when county != San Francisco."""
+        from ingestion.worker import _try_sf_pdf_split
+
+        # Riverside event with SF-shaped text — must be skipped because county is wrong.
+        event = _make_riverside_event()
+        result = _try_sf_pdf_split(
+            event,
+            event["document_id"],
+            "SUPERIOR COURT OF CALIFORNIA\nCOUNTY OF SAN FRANCISCO\n"
+            "Case Number: FPT-25-378624\nTENTATIVE RULING\n",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_sf_pdf_split_skips_non_pdf_format(self) -> None:
+        """_try_sf_pdf_split returns False (skips) when content_format != pdf.
+
+        SF civil tentatives (``ca-sf-tentatives-civil``) are HTML and create
+        one CapturedDocument per ruling at capture time — they never funnel
+        through this path.  The gate is defense in depth.
+        """
+        from ingestion.worker import _try_sf_pdf_split
+
+        event = _make_sf_event(content_format="html")
+        result = _try_sf_pdf_split(
+            event,
+            event["document_id"],
+            "SUPERIOR COURT OF CALIFORNIA\nCOUNTY OF SAN FRANCISCO\n"
+            "Case Number: FPT-25-378624\nTENTATIVE RULING\n",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_sf_pdf_split_falls_through_for_no_entry_headers(self) -> None:
+        """_try_sf_pdf_split returns False when splitter finds no entry headers.
+
+        Lets the LLM path run for malformed PDFs / non-multi-case shapes.
+        """
+        from ingestion.worker import _try_sf_pdf_split
+
+        event = _make_sf_event()
+        with patch("courts.ca.sf_tentatives._split_rulings", return_value=[]):
+            result = _try_sf_pdf_split(
+                event,
+                event["document_id"],
+                "Some text without entry headers",
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_sf_pdf_split_falls_through_for_single_ruling_pdf(self) -> None:
+        """_try_sf_pdf_split returns False when splitter finds exactly 1 entry.
+
+        The deterministic regex extraction does not populate
+        motion_type/outcome/case_title.  Falling through to the LLM path
+        lets the per-field enrichment fill those fields — and there is no
+        carry-forward window with a single entry, so the LLM is safe.
+        """
+        from courts.ca.sf_tentatives import SplitRuling
+        from ingestion.worker import _try_sf_pdf_split
+
+        single_ruling = [
+            SplitRuling(
+                ruling_index=0,
+                case_number="FPT-25-378624",
+                ruling_text="Lone ruling text",
+                department="403",
+            )
+        ]
+        event = _make_sf_event()
+        with patch("courts.ca.sf_tentatives._split_rulings", return_value=single_ruling):
+            result = _try_sf_pdf_split(
+                event,
+                event["document_id"],
+                event["ruling_text"],
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_sf_pdf_split_dispatches_with_split_metadata(self) -> None:
+        """When the splitter finds multiple entries, each dispatched event carries
+        the synthetic split metadata that ``IngestionWorker.process_event`` uses
+        to short-circuit redundant LLM split attempts and route to per-field
+        enrichment (#4304).
+
+        This pins the dispatch contract: ``_split_processed=True`` (so
+        the worker's outer split-attempt path is skipped on the recursive
+        call), AND ``_llm_extracted`` is NOT set to True (so per-field LLM
+        enrichment STILL runs against each child's ruling_text individually,
+        eliminating the cross-entry carry-forward window).
+        """
+        from ingestion.worker import _try_sf_pdf_split
+
+        captured: list[dict] = []
+
+        def capture(event_data: dict) -> None:
+            captured.append(event_data)
+
+        fake_rulings = _make_fake_sf_rulings()
+        with patch("courts.ca.sf_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_sf_event()
+            result = _try_sf_pdf_split(event, event["document_id"], event["ruling_text"], capture)
+
+        assert result is True
+        assert len(captured) == 3
+        for idx, child in enumerate(captured):
+            assert child["_split_processed"] is True, (
+                f"child {idx} missing _split_processed — would re-trigger split path"
+            )
+            # Critical contract: _llm_extracted must NOT be True so per-field
+            # LLM enrichment runs for each child individually.  This is the
+            # behavioural lock that prevents cross-entry carry-forward.
+            assert not child.get("_llm_extracted", False), (
+                f"child {idx} has _llm_extracted=True — would skip per-field "
+                f"enrichment and lose motion_type/outcome/case_title"
+            )
+            assert child["_original_document_id"] == event["document_id"]
+            # Each child's document_id must be unique (split_ids salt by index).
+            assert child["document_id"] != event["document_id"]
+            # Each child carries its own ruling text and case_number.
+            assert child["case_number"] == fake_rulings[idx].case_number
+            assert child["ruling_text"] == fake_rulings[idx].ruling_text
+            # Each child carries its own department from the splitter.
+            assert child["department"] == fake_rulings[idx].department
+
+    def test_sf_pdf_split_reraises_non_exhaustion_exception(self) -> None:
+        """_try_sf_pdf_split re-raises ValueError on non-exhaustion exception (#4304)."""
+        fake_rulings = _make_fake_sf_rulings()  # must be >1 to pass single-ruling guard
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with patch("courts.ca.sf_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_sf_event()
+            from ingestion.worker import _try_sf_pdf_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_sf_pdf_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    def test_sf_pdf_split_all_child_exhaustion_logs_and_succeeds(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """SF PDF: all children exhausted → logged as critical, returns True (no re-raise)."""
+        import logging
+
+        fake_rulings = _make_fake_sf_rulings()
+
+        def always_exhausted(event_data: dict) -> None:
+            if event_data.get("_split_processed"):
+                raise LlmEnrichmentExhaustedError("all exhausted")
+
+        with (
+            patch("courts.ca.sf_tentatives._split_rulings", return_value=fake_rulings),
+            caplog.at_level(logging.CRITICAL, logger="ingestion.worker"),
+        ):
+            event = _make_sf_event()
+            from ingestion.worker import _try_sf_pdf_split
+
+            result = _try_sf_pdf_split(
+                event, event["document_id"], event["ruling_text"], always_exhausted
+            )
+
+        assert result is True
+        critical_msgs = [r for r in caplog.records if r.levelname == "CRITICAL"]
+        assert len(critical_msgs) == 3
+        for record in critical_msgs:
+            assert "per-child enrichment exhausted" in record.getMessage()
 
 
 # ---------------------------------------------------------------------------

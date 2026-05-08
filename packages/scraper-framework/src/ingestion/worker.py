@@ -677,6 +677,162 @@ def _try_riverside_pdf_split(
     return True
 
 
+def _try_sf_pdf_split(
+    event_data: dict[str, Any],
+    document_id: str,
+    ruling_text: str,
+    dispatch: Any,
+) -> bool:
+    """If *ruling_text* is a SF family-law multi-case PDF, deterministically
+    split it into per-case rulings and dispatch one synthetic split event
+    per case via *dispatch*.  Returns True if the split ran, False otherwise.
+
+    This path bypasses the framework LLM extractor — SF family-law
+    multi-case PDFs use a ``SUPERIOR COURT OF CALIFORNIA`` page header
+    per ruling that is cheap to parse with the regex-based
+    ``_split_rulings`` function in ``courts.ca.sf_tentatives``.  Sending
+    the whole PDF through the LLM previously produced cross-entry
+    contamination (#4304): the LLM violated rule 5b of its own prompt
+    and copied the first entry's ``case_title`` (and other LLM-extracted
+    fields) onto subsequent entries, producing the
+    ``all_same_case_title_cluster`` pattern flagged by the cross-county
+    audit (#4289).
+
+    Detection gate: only triggers when event is San Francisco county
+    **and** content format is ``"pdf"`` — avoids false-positive matches
+    against the SF civil HTML scraper (``ca-sf-tentatives-civil``),
+    which already produces one ``CapturedDocument`` per ruling at
+    capture time and never funnels through this path.
+
+    When ``_split_rulings`` returns ``[]`` (no entry headers — typical
+    of malformed PDFs or non-multi-case shapes) or a 1-element list
+    (single-ruling PDF), this function returns ``False`` so the
+    existing LLM path handles enrichment.  The deterministic regex
+    extraction does not populate ``motion_type``/``outcome``/
+    ``case_title`` — falling through to the framework ``LlmExtractor``
+    is what gives those fields per-entry enrichment without any
+    cross-entry carry-forward window (single-ruling PDFs have nothing
+    to carry forward).
+
+    Mirrors the SD/LA/Fresno/Riverside pattern (``_try_sd_calendar_split``
+    #2447, ``_try_la_html_split`` #2450, ``_try_fresno_pdf_split`` #3534,
+    ``_try_riverside_pdf_split`` #3649).
+    """
+    county = event_data.get("county") or ""
+    if county.upper() != "SAN FRANCISCO":
+        return False
+    if event_data.get("content_format") != "pdf":
+        return False
+
+    # Lazy import to avoid a circular dependency between the worker and
+    # the courts package at module load time.
+    from courts.ca.sf_tentatives import _split_rulings
+
+    split_rulings = _split_rulings(ruling_text)
+    if not split_rulings:
+        # No entry headers found — fall through to LLM.
+        logger.info(
+            "sf_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "no_entry_headers",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "sf_pdf_deterministic",
+            },
+        )
+        return False
+    if len(split_rulings) == 1:
+        # Single-ruling PDF — the deterministic regex extraction does not
+        # populate motion_type/outcome/case_title.  Fall through to the
+        # LLM path so framework extraction fills those fields.  There is
+        # no carry-forward window with a single entry, so the LLM is
+        # safe to use here.
+        logger.info(
+            "sf_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "single_ruling_pdf",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "sf_pdf_deterministic",
+            },
+        )
+        return False
+
+    logger.info(
+        "SF family-law PDF deterministic split dispatching %d ruling(s)",
+        len(split_rulings),
+        extra={
+            "document_id": document_id,
+            "ruling_count": len(split_rulings),
+            "scraper_id": event_data.get("scraper_id"),
+            "extraction_method": "sf_pdf_deterministic",
+        },
+    )
+
+    from .split_ids import make_split_document_id
+
+    # At this point len(split_rulings) > 1 — always generate split doc IDs.
+    for idx, sr in enumerate(split_rulings):
+        split_doc_id = make_split_document_id(document_id, idx)
+        hearing_date_value: str | None = None
+        if sr.hearing_date is not None:
+            hearing_date_value = (
+                sr.hearing_date.date().isoformat()
+                if isinstance(sr.hearing_date, datetime)
+                else str(sr.hearing_date)
+            )
+
+        # ``_split_processed=True`` short-circuits the worker's per-doc
+        # split-attempt path; ``_llm_extracted`` is intentionally LEFT
+        # FALSE so the synthetic event flows through the per-field LLM
+        # enrichment path (``_llm_enrich_fields``) and motion_type /
+        # outcome / case_title get populated for each entry individually.
+        # This matches the Riverside splitter's design (#3649) — the
+        # SF family-law caption block does not carry the structured
+        # ``Re:`` / ``Motion:`` / ``Tentative Ruling:`` headers Fresno
+        # PDFs do, so deterministic regex extraction of those fields
+        # would produce a high false-negative rate.  Each entry gets
+        # its own LLM call against only its own text, so cross-entry
+        # carry-forward is impossible.
+        split_event: dict[str, Any] = {
+            **event_data,
+            "document_id": split_doc_id,
+            "_original_document_id": document_id,
+            "_split_processed": True,
+            "_split_index": idx,
+            "_split_count": len(split_rulings),
+            "ruling_text": sr.ruling_text,
+            "ruling_text_html": None,
+            "case_number": sr.case_number or event_data.get("case_number"),
+            "case_title": sr.case_title or event_data.get("case_title"),
+            "department": sr.department or event_data.get("department"),
+            "motion_type": sr.motion_type or event_data.get("motion_type"),
+            "outcome": sr.outcome or event_data.get("outcome"),
+            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+        }
+        try:
+            dispatch(split_event)
+        except Exception as _exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                raise
+            logger.critical(
+                "per-child enrichment exhausted on SF PDF split — ruling permanently lost",
+                extra={
+                    "document_id": document_id,
+                    "_split_index": idx,
+                    "_split_count": len(split_rulings),
+                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "error": str(_exc),
+                },
+            )
+
+    return True
+
+
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
     "hearing_date",
@@ -3287,6 +3443,31 @@ class IngestionWorker:
         # entry LLM enrichment via ``_llm_enrich_fields`` (each entry
         # processed individually, so no cross-entry carry-forward window).
         if ruling_text and _try_riverside_pdf_split(
+            event_data, document_id, ruling_text, self.process_event
+        ):
+            return True
+
+        # ------------------------------------------------------------------
+        # San Francisco family-law multi-ruling PDF deterministic split (#4304)
+        # ------------------------------------------------------------------
+        # SF family-law tentative ruling PDFs (``ca-sf-tentatives-family-law``)
+        # bundle 5–15 rulings per file with a ``SUPERIOR COURT OF CALIFORNIA``
+        # page header per entry.  The LLM previously violated rule 5b of the
+        # SAN_FRANCISCO_SYSTEM_PROMPT and copied the first entry's
+        # ``case_title`` (and other LLM-extracted fields) onto subsequent
+        # entries, producing the ``all_same_case_title_cluster`` pattern
+        # flagged by the cross-county audit (#4289 — 14 SF clusters as of
+        # 2026-05-06).  The deterministic ``_split_rulings`` in
+        # ``sf_tentatives`` is county+format gated (San Francisco + pdf only)
+        # so it never fires for the SF civil HTML scraper or other counties.
+        # Single-ruling PDFs and entry-header-only interstitials
+        # (``_split_rulings`` returns ``[]`` or a 1-element list) fall
+        # through to the normal LLM path below.  Like the Riverside
+        # splitter, the SF splitter does NOT extract motion_type / outcome
+        # / case_title — those are left to per-entry LLM enrichment via
+        # ``_llm_enrich_fields`` (each entry processed individually, so no
+        # cross-entry carry-forward window).
+        if ruling_text and _try_sf_pdf_split(
             event_data, document_id, ruling_text, self.process_event
         ):
             return True
