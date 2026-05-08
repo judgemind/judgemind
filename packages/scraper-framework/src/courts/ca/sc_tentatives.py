@@ -435,6 +435,198 @@ def parse_case_title(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Multi-ruling PDF splitter (#4303)
+# ---------------------------------------------------------------------------
+#
+# Santa Clara multi-case PDFs use one of two formats:
+#
+#   A) "Line N" expanded format (most departments — e.g. dept 16):
+#        Each case starts on a line containing only ``Line N`` (case-
+#        insensitive), followed by ``Case Name:`` and ``Case No.:`` headers
+#        and the per-case ruling body.  Trailing ``Line N`` labels with no
+#        body (e.g. cases that were taken off-calendar after the calendar
+#        was published) appear at the end of the PDF — these are skipped
+#        because their entry body is empty.
+#
+#   B) Compact summary-table format (e.g. dept 6):
+#        A single ``LINE CASE NO. CASE TITLE TENTATIVE RULING`` header,
+#        then per-row entries on shared rows.  This format does NOT have
+#        per-case bare ``Line N`` boundaries, so the splitter falls through
+#        to the LLM path and the existing per-county prompt's anti-carry-
+#        forward rule (5b) is the only protection.
+#
+# The splitter targets format (A) — the dominant source of the
+# ``all_same_case_title_cluster`` signal in Santa Clara per the
+# cross-county audit (#4289 ran 2026-05-06).  21 distinct multi-case PDFs
+# all produced the same wrong ``case_title`` across rulings — exactly the
+# carry-forward fingerprint #3534 (Fresno) and #3649 (Riverside) fixed by
+# pre-LLM splitters.
+
+# Entry boundary: a bare ``Line N`` label on its own line, case-insensitive.
+# pdfplumber's text output puts each ``Line N`` on its own line in the
+# Santa Clara expanded format — the splitter anchors on this.
+# Negative lookahead for ``Line\s+\d+\s*$`` followed by another ``Line\s+\d+\s*$``
+# (a trailing index label) is unnecessary because we filter on body length
+# below.
+_SC_RULING_ENTRY_RE = re.compile(
+    r"^(?P<num>Line\s+\d{1,3})\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Within an entry, the structured per-case headers Santa Clara uses in the
+# expanded format.  These are deterministic enough to extract case_number
+# and case_title without involving the LLM.  Matching is case-insensitive.
+_SC_CASE_NO_HEADER_RE = re.compile(
+    r"^Case\s+No\.?:\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+_SC_CASE_NAME_HEADER_RE = re.compile(
+    r"^Case\s+Name:\s*(?P<case_title>[^\n]+)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Body sanity threshold: a real ruling has at least this many characters of
+# body text after the boundary.  Trailing index labels (``Line 10`` through
+# ``Line 15`` at the end of a calendar PDF) have only single-digit page-
+# footer noise after them — those are not rulings and must be skipped.
+# 80 chars is comfortably below the smallest real ruling body in the
+# fixtures (the smallest is ~430 chars for a "see Line N above" cross-
+# reference entry, which is still legitimate calendar content) and well
+# above the page-footer noise.
+_SC_MIN_ENTRY_BODY_LEN = 80
+
+
+class SplitRuling:
+    """A single ruling extracted from a multi-ruling Santa Clara PDF.
+
+    Mirrors ``courts.ca.riverside_tentatives.SplitRuling`` (#3649).  The
+    splitter populates ``case_number`` and ``case_title`` deterministically
+    from the per-entry ``Case No.:`` / ``Case Name:`` headers when present,
+    and leaves ``motion_type`` / ``outcome`` ``None`` so per-entry LLM
+    enrichment runs against only the entry's own text — eliminating the
+    cross-entry carry-forward window (#4303).
+    """
+
+    __slots__ = (
+        "ruling_index",
+        "case_number",
+        "ruling_text",
+        "case_title",
+        "motion_type",
+        "outcome",
+        "hearing_date",
+        "department",
+    )
+
+    def __init__(
+        self,
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None = None,
+        motion_type: str | None = None,
+        outcome: str | None = None,
+        hearing_date: Any = None,
+        department: str | None = None,
+    ) -> None:
+        self.ruling_index = ruling_index
+        self.case_number = case_number
+        self.ruling_text = ruling_text
+        self.case_title = case_title
+        self.motion_type = motion_type
+        self.outcome = outcome
+        self.hearing_date = hearing_date
+        self.department = department
+
+
+def _split_rulings(text: str) -> list[SplitRuling]:
+    """Split Santa Clara multi-ruling PDF text into per-entry ``SplitRuling`` objects.
+
+    The page-1 preamble (calendar header, judge info, courtroom rules,
+    appearance instructions) is excluded by anchoring on the first
+    ``^Line\\s+\\d+\\s*$`` boundary — anything before the first numbered
+    entry is dropped.
+
+    Returns an empty list if no numbered entries are found, which is the
+    expected outcome for compact summary-table PDFs (e.g. dept 6) and for
+    single-ruling PDFs that don't follow the expanded ``Line N`` format.
+    Single-element returns are also possible — the worker treats both
+    cases identically (fall through to the LLM path) because there is no
+    cross-entry carry-forward window with 0 or 1 entries.
+
+    Each returned ``SplitRuling`` has:
+
+      * ``ruling_index`` — the integer from the entry header (e.g. ``1``,
+        ``2``, ``3`` for a PDF with three rulings).
+      * ``case_number`` — extracted from the ``Case No.:`` header inside
+        the entry; ``None`` if the regex fails to match (the worker's
+        per-entry LLM enrichment will fill it in).
+      * ``case_title`` — extracted from the ``Case Name:`` header inside
+        the entry; ``None`` if absent (per-entry LLM enrichment falls back
+        to the existing case-title heuristics).
+      * ``ruling_text`` — the **verbatim** entry text from the boundary
+        through the next entry boundary (or the end of the document for
+        the last entry).  Includes the entry's own headers and body.
+
+    motion_type and outcome are left ``None`` on purpose — Santa Clara
+    PDFs do not carry structured motion-type / outcome labels in their
+    per-entry headers, so deterministic regex extraction would produce a
+    high false-negative rate.  Letting the framework ``LlmExtractor``
+    populate those fields via per-entry enrichment matches the Riverside
+    pattern (#3649) and preserves correctness on single-ruling PDFs.
+    """
+    matches = list(_SC_RULING_ENTRY_RE.finditer(text))
+    if not matches:
+        return []
+
+    rulings: list[SplitRuling] = []
+    for i, match in enumerate(matches):
+        # ``Line N`` -> integer.
+        num_str = match.group("num")
+        digits = re.search(r"\d+", num_str)
+        if not digits:
+            continue
+        try:
+            entry_num = int(digits.group(0))
+        except ValueError:
+            continue
+
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+
+        body = text[start:end].strip()
+        if len(body) < _SC_MIN_ENTRY_BODY_LEN:
+            # Trailing index label (e.g. dept 16 emits ``Line 10`` through
+            # ``Line 15`` as bare labels at the end of the PDF for cases
+            # that were dropped from the calendar after publication).
+            # Skip — there is no ruling here.
+            continue
+
+        # Extract structured headers when present.  These are case-
+        # insensitive and tolerant of the headers appearing anywhere in
+        # the body (the dept 16 format has them as the first two lines
+        # after ``Line N``; other departments may emit them later).
+        case_no_match = _SC_CASE_NO_HEADER_RE.search(body)
+        case_name_match = _SC_CASE_NAME_HEADER_RE.search(body)
+        case_number = case_no_match.group("case_number").upper() if case_no_match else None
+        case_title = (
+            " ".join(case_name_match.group("case_title").split()) if case_name_match else None
+        )
+
+        rulings.append(
+            SplitRuling(
+                ruling_index=entry_num,
+                case_number=case_number,
+                ruling_text=body,
+                case_title=case_title,
+            )
+        )
+
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Scraper
 # ---------------------------------------------------------------------------
 
