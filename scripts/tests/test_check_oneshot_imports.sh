@@ -18,25 +18,15 @@ CHECK_SCRIPT="$SCRIPT_DIR/check-oneshot-imports.sh"
 FAILURES=0
 TESTS=0
 
-# Cleanup any temp files on exit
-TEMP_FILES=()
-cleanup() {
-    # ``${TEMP_FILES[@]+...}`` guards empty-array iteration under
-    # bash 3.2 + set -u (see #4336) — without it, an early test
-    # failure that fires the EXIT trap before any
-    # create_temp_script call would crash the trap itself.
-    for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
-        rm -f "$f"
-    done
-}
-trap cleanup EXIT
+# Cleanup any temp files on exit via the shared helper (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 
 create_temp_script() {
     local name="$1"
     local content="$2"
     local path="$SCRIPT_DIR/$name"
     printf '%s\n' "$content" > "$path"
-    TEMP_FILES+=("$path")
+    register_temp_file "$path"
     echo "$path"
 }
 

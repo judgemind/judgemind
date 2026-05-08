@@ -25,23 +25,16 @@ TESTS=0
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-TEMP_DIRS=()
+# Cleanup of temp directories + PATH restore via the shared helper
+# (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 ORIG_PATH_SAVE=""
-
-cleanup() {
-    set +eu
-    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
-    # bash 3.2 + set -u (see #4336).
-    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
+restore_path() {
     if [[ -n "$ORIG_PATH_SAVE" ]]; then
         export PATH="$ORIG_PATH_SAVE"
     fi
 }
-trap cleanup EXIT
+register_cleanup_hook restore_path
 
 pass() {
     TESTS=$((TESTS + 1))
@@ -77,7 +70,7 @@ fi
 # ── Set up a mock gh CLI on PATH for the remaining tests ──────────────────
 
 MOCK_BIN_DIR=$(mktemp -d)
-TEMP_DIRS+=("$MOCK_BIN_DIR")
+register_temp_dir "$MOCK_BIN_DIR"
 ORIG_PATH_SAVE="$PATH"
 export PATH="$MOCK_BIN_DIR:$ORIG_PATH_SAVE"
 

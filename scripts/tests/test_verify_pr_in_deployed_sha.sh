@@ -29,21 +29,15 @@ TESTS=0
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-TEMP_DIRS=()
+# Cleanup of temp directories + PATH restore via the shared helper
+# (see #4343). PATH is captured here at module-load time and the
+# restore_path hook fires before the rm-phase of the trap.
+. "$REPO_ROOT/scripts/tests/_temp_cleanup_helpers.sh"
 ORIG_PATH_SAVE="$PATH"
-
-cleanup() {
-    set +eu
-    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
-    # bash 3.2 + set -u (see #4336).
-    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
+restore_path() {
     export PATH="$ORIG_PATH_SAVE"
 }
-trap cleanup EXIT
+register_cleanup_hook restore_path
 
 pass() {
     TESTS=$((TESTS + 1))
@@ -62,7 +56,7 @@ fail() {
 make_temp_dir() {
     local dir
     dir=$(mktemp -d)
-    TEMP_DIRS+=("$dir")
+    register_temp_dir "$dir"
     echo "$dir"
 }
 
