@@ -813,6 +813,39 @@ if [ -n "$changed_watch_files" ]; then
 fi
 
 # -------------------------------------------------------------------
+# CI guard umbrella — run every scripts/check-*.{sh,py} guard locally
+# -------------------------------------------------------------------
+# Mirrors the dozen+ ``scripts/check-*`` jobs in ``.github/workflows/ci.yml``
+# so a guard failure is caught locally before the network round-trip.
+# Self-maintaining: dropping a new ``scripts/check-foo.sh`` into the tree
+# makes it pick up automatically (no umbrella-script edit required).
+#
+# Bypass with ``SKIP_CI_GUARDS=1 git push`` for the rare case an operator
+# needs to push partial work knowing one guard will fail. The bypass is
+# noisy on stderr so it's hard to miss. CI will still run every guard.
+#
+# See issue #4332 (motivating retro: PR #4325 / sql-column-check) and
+# scripts/run-ci-guards.sh for the discovery rules and skip list.
+if [ -x scripts/run-ci-guards.sh ]; then
+    if [ "${SKIP_CI_GUARDS:-0}" = "1" ]; then
+        echo "" >&2
+        echo "WARNING: SKIP_CI_GUARDS=1 — bypassing scripts/run-ci-guards.sh." >&2
+        echo "         CI will still run every guard. Use only when you" >&2
+        echo "         intentionally want to push partial work knowing one" >&2
+        echo "         or more guards will fail." >&2
+    else
+        echo "pre-push: running CI guard umbrella (scripts/run-ci-guards.sh)..." >&2
+        if ! run_check "_" "scripts/run-ci-guards.sh" scripts/run-ci-guards.sh; then
+            echo "  One or more CI guards failed. See the failure list above." >&2
+            echo "  Bypass: SKIP_CI_GUARDS=1 git push (CI still runs every guard)." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+else
+    echo "  WARNING: scripts/run-ci-guards.sh not found or not executable — skipping" >&2
+fi
+
+# -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
 # -------------------------------------------------------------------
 # Git has no native post-push hook. We check here as the closest

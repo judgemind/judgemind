@@ -33,6 +33,8 @@
 #  13. Real TS change still fires lint    'checking TypeScript package' present (#2877 AC2)
 #  18. Non-ASCII tf description rejected  em-dash in description -> hook fails (#3923)
 #  19. Stale ci-passed.needs entry rejected  hook fails before actionlint (#4207)
+#  22. CI-guard umbrella fires + rejects     scripts/run-ci-guards.sh stub fail -> hook fails (#4332)
+#  23. SKIP_CI_GUARDS=1 bypasses umbrella    bypass var skips run-ci-guards.sh, prints WARNING (#4332)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -1049,6 +1051,96 @@ if echo "$hook_out" | grep -q "checking subprocess.run / urlopen timeouts"; then
     report_fail "docs-only push must NOT fire subprocess-timeouts gate (#4328 AC2)" "$hook_out"
 else
     report_pass "docs-only push skips subprocess-timeouts gate (#4328 AC2)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 22: CI-guard umbrella fires and rejects on stub failure (#4332)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds scripts/run-ci-guards.sh as a stub that fails, makes a trivial
+# change so the hook runs, and asserts the hook exits non-zero with the
+# expected FAILED message. This exercises the umbrella's wiring without
+# depending on the real ~70-guard run (which would explode the test
+# suite duration). The real umbrella's discovery + run logic is covered
+# by scripts/run-ci-guards.sh's own list-mode probe and the AC4
+# verification (drop-and-detect a check-zzz-probe.sh).
+echo "[scenario 22] CI-guard umbrella fires + rejects on stub failure (#4332)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-ci-guards-fail
+mkdir -p "$WORK/scripts"
+cat > "$WORK/scripts/run-ci-guards.sh" <<'STUB'
+#!/usr/bin/env bash
+# Stub umbrella: respect SKIP_CI_GUARDS, otherwise always fail loudly.
+if [ "${SKIP_CI_GUARDS:-0}" = "1" ]; then
+    echo "WARNING: SKIP_CI_GUARDS=1 — bypassing scripts/run-ci-guards.sh." >&2
+    exit 0
+fi
+echo "STUB: simulated guard failure" >&2
+exit 1
+STUB
+chmod +x "$WORK/scripts/run-ci-guards.sh"
+# Trivial top-level change so the hook actually runs (the umbrella step
+# is unconditional once `scripts/run-ci-guards.sh` is executable, but we
+# still want a non-empty diff so the hook proceeds past its early exit
+# branches).
+echo "scenario 22" >> "$WORK/README.md"
+git -C "$WORK" add scripts/run-ci-guards.sh README.md
+git -C "$WORK" commit --quiet -m "feat: stub failing run-ci-guards.sh"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-ci-guards-fail $feat_sha refs/heads/feature-ci-guards-fail $ZERO_SHA"
+
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to reject failing run-ci-guards.sh stub (#4332), exit was 0" "$hook_out"
+elif ! echo "$hook_out" | grep -q "running CI guard umbrella"; then
+    report_fail "expected pre-push to log 'running CI guard umbrella' (#4332)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: scripts/run-ci-guards.sh"; then
+    report_fail "expected 'FAILED: scripts/run-ci-guards.sh' in output (#4332)" "$hook_out"
+else
+    report_pass "hook rejects push when run-ci-guards.sh fails (#4332)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 23: SKIP_CI_GUARDS=1 bypasses the umbrella (#4332)
+# ───────────────────────────────────────────────────────────────────────
+# Same stub setup as scenario 22, but invoke the hook with SKIP_CI_GUARDS=1.
+# The umbrella block in pre-push must take the bypass branch — emitting a
+# WARNING line and skipping the run entirely. This means the FAILED line
+# from scenario 22 must NOT appear, and the hook's exit code is determined
+# by the rest of the checks (which all pass on this trivial diff).
+echo "[scenario 23] SKIP_CI_GUARDS=1 bypasses the umbrella (#4332)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-ci-guards-bypass
+mkdir -p "$WORK/scripts"
+cat > "$WORK/scripts/run-ci-guards.sh" <<'STUB'
+#!/usr/bin/env bash
+# Stub umbrella: respect SKIP_CI_GUARDS, otherwise always fail loudly.
+if [ "${SKIP_CI_GUARDS:-0}" = "1" ]; then
+    echo "WARNING: SKIP_CI_GUARDS=1 — bypassing scripts/run-ci-guards.sh." >&2
+    exit 0
+fi
+echo "STUB: simulated guard failure" >&2
+exit 1
+STUB
+chmod +x "$WORK/scripts/run-ci-guards.sh"
+echo "scenario 23" >> "$WORK/README.md"
+git -C "$WORK" add scripts/run-ci-guards.sh README.md
+git -C "$WORK" commit --quiet -m "feat: stub run-ci-guards.sh (bypass test)"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+# Run the hook with SKIP_CI_GUARDS=1 set in env. We cannot reuse run_hook
+# directly because it doesn't inject env vars; do it inline.
+hook_out="$(cd "$WORK" && SKIP_CI_GUARDS=1 echo "refs/heads/feature-ci-guards-bypass $feat_sha refs/heads/feature-ci-guards-bypass $ZERO_SHA" \
+    | SKIP_CI_GUARDS=1 "$HOOK" origin "$REMOTE" 2>&1)" \
+    && hook_rc=0 || hook_rc=$?
+
+if echo "$hook_out" | grep -q "FAILED: scripts/run-ci-guards.sh"; then
+    report_fail "SKIP_CI_GUARDS=1 must skip the umbrella, but FAILED appeared (#4332)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "SKIP_CI_GUARDS=1"; then
+    report_fail "expected SKIP_CI_GUARDS=1 bypass WARNING in output (#4332)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "bypassing scripts/run-ci-guards.sh"; then
+    report_fail "expected 'bypassing scripts/run-ci-guards.sh' WARNING in output (#4332)" "$hook_out"
+else
+    report_pass "SKIP_CI_GUARDS=1 bypasses the umbrella with WARNING (#4332)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

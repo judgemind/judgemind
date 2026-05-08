@@ -154,6 +154,27 @@ If lint fails: `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff for
 
 Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (unused imports, remove them), **UP017** (use `datetime.now(datetime.UTC)`). Format and lint are **separate commands** — run BOTH.
 
+### CI guard umbrella (`scripts/run-ci-guards.sh`)
+
+The pre-push hook also runs `scripts/run-ci-guards.sh`, an auto-discovery umbrella that mirrors the dozen+ `scripts/check-*` jobs in `.github/workflows/ci.yml`. Self-maintaining: dropping a new `scripts/check-foo.sh` into the tree makes it pick up automatically — no umbrella-script edit required.
+
+**Run manually before pushing:**
+```
+scripts/run-ci-guards.sh         # run every applicable guard
+scripts/run-ci-guards.sh --list  # show the discovered guard list without running
+```
+
+**Bypass for the rare case of intentionally pushing partial work:**
+```
+SKIP_CI_GUARDS=1 git push        # CI still runs every guard
+```
+
+The bypass emits a noisy stderr WARNING so it's hard to miss. Use only when one or more guards are known to fail and you are pushing partial work intentionally — otherwise fix the failure first.
+
+**Skip list.** Several guards are not amenable to running blind from the local tree (need an issue/PR-number argument, need network access for `gh pr list`, depend on `npm ci` of `packages/web/`, depend on Docker, or run in scheduled-cron contexts against the dev DB). The umbrella's built-in `SKIP_LIST` excludes them; see the comment at the top of `scripts/run-ci-guards.sh` for the full list and rationale. Per-file opt-out is also available via a `# ci-guards: skip` marker in the first 20 lines of the guard file.
+
+See #4332 for the motivating retro (PR #4325 hit a CI-only `sql-column-check` failure that would have surfaced locally with this umbrella).
+
 ### Test assertion hygiene (enforced in CI)
 
 Blind exception swallows inside test files hide bugs: if the call under test raises, the test silently passes on a never-executed code path (see #2443). CI enforces this via `scripts/check-test-except-pass.sh`, which forbids the following patterns inside any file under a `tests/` directory:

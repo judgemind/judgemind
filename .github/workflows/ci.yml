@@ -137,6 +137,8 @@ jobs:
             githooks:
               - '.githooks/**'
               - 'scripts/tests/test_pre_push.sh'
+              - 'scripts/tests/test_run_ci_guards.sh'
+              - 'scripts/run-ci-guards.sh'
               - '.github/workflows/ci.yml'
             dispatcher-terminals:
               - 'scripts/dispatcher/daemon.py'
