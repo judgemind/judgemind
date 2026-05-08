@@ -33,7 +33,9 @@ TESTS=0
 TEMP_DIRS=()
 cleanup() {
     set +e
-    for d in "${TEMP_DIRS[@]}"; do
+    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336).
+    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
         if [[ -n "$d" && -d "$d" ]]; then
             if git -C "$d" rev-parse --git-dir > /dev/null 2>&1; then
                 git -C "$d" worktree list --porcelain 2>/dev/null \

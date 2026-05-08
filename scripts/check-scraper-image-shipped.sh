@@ -202,10 +202,12 @@ FIRST_REF_LINES=()
 _already_seen() {
     local needle="$1"
     local existing
-    if [[ ${#SCRIPT_NAMES[@]} -eq 0 ]]; then
-        return 1
-    fi
-    for existing in "${SCRIPT_NAMES[@]}"; do
+    # ``${SCRIPT_NAMES[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336). Even though SCRIPT_NAMES=()
+    # was initialised above, an empty initialised array still
+    # trips ``unbound variable`` on bash 3.2 when expanded with
+    # ``"${arr[@]}"`` — verified probe in #4336.
+    for existing in ${SCRIPT_NAMES[@]+"${SCRIPT_NAMES[@]}"}; do
         if [[ "$existing" == "$needle" ]]; then
             return 0
         fi
@@ -232,10 +234,12 @@ while IFS= read -r line; do
     done <<< "$tokens"
 done <<< "$HITS"
 
-# Bash 3.2 + set -u: empty-array expansion is a fatal "unbound variable"
-# unless the array was assigned at least once. We assigned to SCRIPT_NAMES
-# above (even if no items were appended), so "${SCRIPT_NAMES[@]}" is safe
-# below — but a guard for the empty case is clearer.
+# Bash 3.2 + set -u: ``arr=()`` initialises the array empty, but
+# expanding ``"${arr[@]}"`` while it is still empty trips a fatal
+# ``unbound variable`` (verified probe in #4336 — assignment alone is
+# NOT enough; an actual element must land first, OR the iteration must
+# be guarded with ``${arr[@]+...}`` or a length check). We size-check
+# below so the early-exit path doesn't even attempt iteration.
 if [[ ${#SCRIPT_NAMES[@]} -eq 0 ]]; then
     echo "OK: no /app/scripts/<name>.{py,sh} references found outside the scraper Dockerfile"
     exit 0

@@ -36,7 +36,9 @@ ORIG_PATH_SAVE=""
 
 cleanup() {
     set +eu
-    for d in "${TEMP_DIRS[@]}"; do
+    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336).
+    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
         if [[ -n "$d" && -d "$d" ]]; then
             rm -rf "$d"
         fi

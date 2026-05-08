@@ -237,6 +237,205 @@ EOF
 assert_fails "Violations across multiple files are detected"
 reset_tmpdir
 
+# ─── Shape (B) tests — bare ``arr=()`` + iterate-empty footgun ───────────
+# These cover the bash 3.2 (macOS) inverse-direction skew: ``arr=()``
+# initialises the array empty, but ``for x in "${arr[@]}"`` while
+# still empty trips ``unbound variable`` on bash 3.2 even though the
+# size form ``${#arr[@]}`` is fine. Tracked as #4336.
+
+# ─── Test B1: Canonical shape — arr=() + for loop iterate empty ──────────
+# This is the verbatim shape from the issue body's `Verify:` line.
+write_file "bad_arr_init_iterate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+arr=()
+for x in "${arr[@]}"; do
+    echo "got: $x"
+done
+EOF
+assert_fails "arr=() + for x in \"\${arr[@]}\" iterate-empty triggers shape (B)"
+reset_tmpdir
+
+# ─── Test B2: ``[*]`` star expansion variant → fails ─────────────────────
+write_file "bad_arr_star_expand.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+items=()
+echo "${items[*]}"
+EOF
+assert_fails "items=() + \"\${items[*]}\" expansion triggers shape (B)"
+reset_tmpdir
+
+# ─── Test B3: Echo-then-iterate (no for loop) → fails ────────────────────
+# A bare expansion outside a for loop is the same root-cause class.
+write_file "bad_arr_bare_expand.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+xs=()
+echo "${xs[@]}"
+EOF
+assert_fails "xs=() + bare \"\${xs[@]}\" expansion triggers shape (B)"
+reset_tmpdir
+
+# ─── Test B4: Safe — arr=() + size-only read → passes ────────────────────
+# The size form ``${#arr[@]}`` is bash-3.2-safe on an empty initialised
+# array. Pass 3 must NOT flag size-only reads.
+write_file "good_arr_size_only.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+if [[ ${#arr[@]} -eq 0 ]]; then
+    echo "empty"
+fi
+EOF
+assert_passes "arr=() + size-only \${#arr[@]} read passes (size form is bash-3.2-safe)"
+reset_tmpdir
+
+# ─── Test B5: Safe — arr=() + append-then-iterate → passes ───────────────
+write_file "good_arr_append_then_iterate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+arr+=("x")
+arr+=("y")
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + append-then-iterate (canonical safe pattern) passes"
+reset_tmpdir
+
+# ─── Test B6: Safe — arr=() + reassign-with-content + iterate → passes ───
+write_file "good_arr_reassign_iterate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+arr=("a" "b" "c")
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + reassign-with-content + iterate passes"
+reset_tmpdir
+
+# ─── Test B7: Length-guard alone (without += or [@]+ guard) → fails ─────
+# A length guard ``if [ "${#arr[@]}" -gt 0 ]; then`` is the runtime
+# fix recommended by the check's report message — it makes the
+# iteration safe at run time. But the static check cannot reason
+# about ``if`` block scopes, and the AC's static criterion is "no
+# ``arr+=(...)`` or ``arr=(...)`` assignment intervenes" (see #4336
+# AC#1). So the static check still flags this shape; users should
+# either pre-populate the array, use the ``${arr[@]+...}``
+# parameter-expansion guard (Test B8), or accept that the iteration
+# is unreachable at run time anyway. This test documents the
+# limitation so future maintainers don't accidentally weaken the
+# check trying to recognise length guards.
+write_file "bad_arr_length_guard_only.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+if [ "${#arr[@]}" -gt 0 ]; then
+    for v in "${arr[@]}"; do
+        echo "$v"
+    done
+fi
+EOF
+assert_fails "arr=() + length-guard alone (no += / [@]+ guard) still flags (static-scan limitation)"
+reset_tmpdir
+
+# ─── Test B8: Safe — arr=() + ${arr[@]+...} guarded expansion → passes ──
+# The defensive parameter-expansion guard ``${arr[@]+"${arr[@]}"}``
+# is bash-3.2-safe even on an empty initialised array because the
+# leading ``[@]+...`` substitutes nothing when the array is empty.
+write_file "good_arr_param_guard.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+for v in ${arr[@]+"${arr[@]}"}; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + \${arr[@]+...} parameter-expansion guard passes"
+reset_tmpdir
+
+# ─── Test B9: Safe — arr=() without nounset → passes ─────────────────────
+# Without set -u, the iteration of an empty initialised array is a
+# no-op on every bash version.
+write_file "good_arr_no_nounset.sh" <<'EOF'
+#!/usr/bin/env bash
+arr=()
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + iterate-empty without set -u passes"
+reset_tmpdir
+
+# ─── Test B10: Safe — arr=("x") with content → passes (not bare-empty) ──
+# A non-empty initialiser is not the bare-empty shape this check
+# targets. The Pass 3 declaration regex requires whitespace-only
+# between the parens.
+write_file "good_arr_init_with_content.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=("x" "y")
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=(\"x\" \"y\") with content + iterate passes (not bare-empty)"
+reset_tmpdir
+
+# ─── Test B11: Lookalike names (foo_bar vs foo) → passes ─────────────────
+# Same anchoring rationale as the existing Test 12: a substring like
+# ``foo_bar=("a")`` must not count as an assignment to ``foo``.
+write_file "good_lookalike_b.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+foo=()
+foo_bar=("a" "b")
+echo "${#foo_bar[@]}"
+foo+=("x")
+echo "${foo[@]}"
+EOF
+assert_passes "Lookalike names (foo_bar) are not confused with the declared name (foo) for shape (B)"
+reset_tmpdir
+
+# ─── Test B12: Verbatim issue body Verify clause (sanity) ────────────────
+# AC#1 Verify line: drop a probe ``tmp/probe.sh`` containing
+# ``set -uo pipefail; arr=(); for x in "${arr[@]}"; do echo "$x"; done``
+# and run the check against ``tmp/``. Exits non-zero with the probe
+# filename + line number. Reproduce that flow here.
+TESTS=$((TESTS + 1))
+PROBE_DIR="$TMPDIR_TEST/probe_root"
+mkdir -p "$PROBE_DIR/scripts"
+cat > "$PROBE_DIR/scripts/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+arr=()
+for x in "${arr[@]}"; do
+    echo "$x"
+done
+EOF
+chmod +x "$PROBE_DIR/scripts/probe.sh"
+PROBE_OUT_FILE="$TMPDIR_TEST/probe_output.txt"
+"$CHECK_SCRIPT" "$PROBE_DIR" > "$PROBE_OUT_FILE" 2>&1 && probe_rc=0 || probe_rc=$?
+if [[ "$probe_rc" -eq 0 ]]; then
+    echo "FAIL: AC#1 Verify probe — expected check to exit non-zero, got 0"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -q "probe.sh" "$PROBE_OUT_FILE"; then
+    echo "FAIL: AC#1 Verify probe — output missing probe filename"
+    cat "$PROBE_OUT_FILE"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -qE "probe.sh:[0-9]+" "$PROBE_OUT_FILE"; then
+    echo "FAIL: AC#1 Verify probe — output missing line number"
+    cat "$PROBE_OUT_FILE"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: AC#1 Verify probe — check fails with probe filename + line number"
+fi
+rm -rf "$PROBE_DIR" "$PROBE_OUT_FILE"
+
 # ─── Test 15: Self-scan — real repo scripts/ tree → passes ─────────────
 TESTS=$((TESTS + 1))
 if "$CHECK_SCRIPT" "$REPO_ROOT" > /dev/null 2>&1; then
