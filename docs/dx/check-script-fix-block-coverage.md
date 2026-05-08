@@ -47,6 +47,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 9 | `scripts/check-brand-md-tokens.sh` | self-diagnosing (Fix block) | Emits canonical token list. |
 | 10 | `scripts/check-case-type-fallback-parity.sh` | wrapper (delegates to helper) | Wrapper for `check-case-type-fallback-parity.py`. |
 | 11 | `scripts/check-ci-job-skipped.sh` | wrapper (delegates to helper) | Wrapper for `check-ci-job-skipped.py`. |
+| 11a | `scripts/check-ci-guards-skip-list-coverage.sh` | self-diagnosing (Fix block) | Meta-check guarding `run-ci-guards.sh`'s SKIP_LIST: fails when a guard with `argparse required=True` / `add_mutually_exclusive_group(required=True)` / shell `${1:?}` is missing from SKIP_LIST AND has no `# ci-guards: skip` marker. Emits per-violation `Fix:` block with both options (Option A: literal SKIP_LIST entry to paste; Option B: `# ci-guards: skip` marker). Tracking: #4379 (parent: #4332). |
 | 12 | `scripts/check-ci-passed-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-ci-passed-coverage.py`. |
 | 13 | `scripts/check-cleanup-step-continue-on-error.sh` | self-diagnosing (Fix block) | Inline Python emits "Add `continue-on-error: true` at the step level". |
 | 14 | `scripts/check-cloudwatch-alarm-docs.sh` | self-diagnosing (actionable text) | "Add a row to the §'CloudWatch Alarms' table with prefix, module, source metric, ...". Could be upgraded to emit a literal markdown-row patch. |
@@ -130,7 +131,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 
 ## Summary
 
-- Total guards: 91 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50a `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367).
+- Total guards: 92 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50a `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379).
 - Already self-diagnosing (Fix block or actionable text) before #4346: 71.
 - Wrappers (delegate to helper): 18.
 - Operational health probes: 5.
