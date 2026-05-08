@@ -800,6 +800,20 @@ jobs:
       - name: Check no unbounded timeouts in dispatcher
         if: matrix.shard == 'python'
         run: scripts/check-no-unbounded-timeouts.py
+      # Issue #4381: every scripts/*.py file that derives a data-file
+      # path from ``Path(__file__).resolve().parent.parent`` and passes
+      # it to ``open()``/``read_text()``/``read_bytes()``/
+      # ``importlib.util.spec_from_file_location`` must have an
+      # at-import existence assertion or an in-scope existence probe.
+      # Catches the #4374 bug class — under
+      # scripts/ecs-run-task.sh the script lands at
+      # /tmp/_oneshot_script and parent.parent collapses to /, silently
+      # producing a wrong path. PR #4378 fixed that one site with a
+      # candidate-path fallback list; this AST-based check enforces the
+      # structural invariant going forward.
+      - name: Check no /tmp/_oneshot_script path-collapse bugs
+        if: matrix.shard == 'python'
+        run: scripts/check-no-tmp-oneshot-file-path-derivation.py
       # Issue #3158: every ``UPDATE dispatcher.agents`` /
       # ``SELECT ... FROM dispatcher.agents`` line in
       # ``scripts/dispatcher/daemon.py`` must either mention

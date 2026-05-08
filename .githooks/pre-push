@@ -720,6 +720,42 @@ if [ -n "$changed_dispatcher_py" ]; then
 fi
 
 # -------------------------------------------------------------------
+# tmp/_oneshot_script path-collapse scan for scripts/*.py (#4381)
+# -------------------------------------------------------------------
+# Mirrors the CI `Check no /tmp/_oneshot_script path-collapse bugs` step
+# (.github/workflows/ci.yml — see test
+# scripts/tests/test_check_no_tmp_oneshot_file_path_derivation.py::TestRealRepoTree::test_repo_scans_clean).
+# Catches the #4374 bug class — a script that derives a data-file path
+# from `Path(__file__).resolve().parent.parent` and passes it to
+# read_text/open/spec_from_file_location without an existence guard.
+# Under scripts/ecs-run-task.sh the script is uploaded to
+# /tmp/_oneshot_script and parent.parent collapses to /, silently
+# producing a wrong path. The check runs only when a top-level Python
+# file under scripts/ is in the push diff (cheap-skip pattern,
+# mirroring the unbounded-timeout gate above). The script is
+# sub-second; its own stderr emits the violation list plus a
+# copy-pasteable Fix: block, so we let stderr pass through.
+changed_scripts_py=$(echo "$changed_files" \
+    | grep -E '^scripts/[^/]+\.py$' || true)
+if [ -n "$changed_scripts_py" ]; then
+    echo "pre-push: checking for /tmp/_oneshot_script path-collapse bugs in scripts/..." >&2
+    if [ -x scripts/check-no-tmp-oneshot-file-path-derivation.py ]; then
+        if ! run_check "_" "scripts/check-no-tmp-oneshot-file-path-derivation.py" \
+                scripts/check-no-tmp-oneshot-file-path-derivation.py; then
+            echo "  A scripts/*.py file derives a data-file path from" >&2
+            echo "  Path(__file__).resolve().parent.parent and passes it to" >&2
+            echo "  an unsafe data-load API without an existence guard." >&2
+            echo "  See the file:line and Fix: block above. The script's full" >&2
+            echo "  rule table is in scripts/check-no-tmp-oneshot-file-path-derivation.py." >&2
+            echo "  Tracking: issue #4381." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-tmp-oneshot-file-path-derivation.py not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Dispatcher terminal-status consistency drift — run when daemon or
 # API/web dispatcher files change (#2870)
 # -------------------------------------------------------------------
