@@ -42,23 +42,8 @@ HELPER="$SCRIPT_DIR/dispatcher/progress.sh"
 FAILURES=0
 TESTS=0
 
-TEMP_DIRS=()
-TEMP_FILES=()
-# shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT`.
-cleanup() {
-    set +e
-    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
-    for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
-        if [[ -n "$f" && -e "$f" ]]; then
-            rm -f "$f"
-        fi
-    done
-}
-trap cleanup EXIT
+# Cleanup of temp dirs + files via the shared helper (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 
 pass() {
     TESTS=$((TESTS + 1))
@@ -81,7 +66,7 @@ fail() {
 make_psql_stub() {
     local tmp
     tmp=$(mktemp -d -t progress_test.XXXXXX)
-    TEMP_DIRS+=("$tmp")
+    register_temp_dir "$tmp"
     mkdir -p "$tmp/bin"
     cat > "$tmp/bin/psql" <<STUB
 #!/usr/bin/env bash
@@ -122,7 +107,7 @@ fi
 
 run_no_args() {
     local err rc
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     "$HELPER" 2>"$err"
     rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -141,7 +126,7 @@ run_no_args
 
 run_one_arg() {
     local err rc
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     "$HELPER" only-one-arg 2>"$err"
     rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -161,7 +146,7 @@ run_one_arg
 # Empty-string second arg should also be rejected (treated as missing).
 run_empty_milestone() {
     local err rc
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     "$HELPER" agent-1 "" 2>"$err"
     rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -182,7 +167,7 @@ run_empty_milestone
 
 run_no_db_url() {
     local err rc
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     # `env -u` removes DATABASE_URL even if the surrounding test env set one.
     env -u DATABASE_URL "$HELPER" agent-1 ralph "iter 3" 2>"$err"
     rc=$?
@@ -204,9 +189,9 @@ run_no_db_url
 
 run_no_psql() {
     local err rc bin_only
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     bin_only=$(mktemp -d -t progress_nopath.XXXXXX)
-    TEMP_DIRS+=("$bin_only")
+    register_temp_dir "$bin_only"
     # Symlink only the binaries the script (and its shebang) need:
     # `env` and `bash`. This guarantees `psql` is unfindable while the
     # script's `#!/usr/bin/env bash` shebang still resolves. Falls back
@@ -239,7 +224,7 @@ run_no_psql
 run_stubbed_success() {
     local stub_dir rc err
     stub_dir=$(make_psql_stub)
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     echo 0 > "$stub_dir/psql.exit_code"
 
     PATH="$stub_dir/bin:$PATH" DATABASE_URL="postgresql://stub@localhost:0/x" \
@@ -298,7 +283,7 @@ run_stubbed_success
 run_stubbed_db_error() {
     local stub_dir rc err
     stub_dir=$(make_psql_stub)
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     echo 2 > "$stub_dir/psql.exit_code"
 
     PATH="$stub_dir/bin:$PATH" DATABASE_URL="postgresql://stub@localhost:0/x" \
@@ -330,7 +315,7 @@ run_stubbed_db_error
 run_injection_safe() {
     local stub_dir rc err evil
     stub_dir=$(make_psql_stub)
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     echo 0 > "$stub_dir/psql.exit_code"
 
     evil="'; DROP TABLE dispatcher.agents; --"
@@ -391,7 +376,7 @@ run_injection_safe
 run_optional_detail() {
     local stub_dir rc err
     stub_dir=$(make_psql_stub)
-    err=$(mktemp -t progress_test_err.XXXXXX); TEMP_FILES+=("$err")
+    err=$(mktemp -t progress_test_err.XXXXXX); register_temp_file "$err"
     echo 0 > "$stub_dir/psql.exit_code"
 
     PATH="$stub_dir/bin:$PATH" DATABASE_URL="postgresql://stub@localhost:0/x" \

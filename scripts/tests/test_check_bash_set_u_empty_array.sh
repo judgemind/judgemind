@@ -25,11 +25,11 @@ CHECK_SCRIPT="$SCRIPT_DIR/check-bash-set-u-empty-array.sh"
 FAILURES=0
 TESTS=0
 
+# Cleanup of temp directories on exit via the shared helper (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
+
 TMPDIR_TEST="$(mktemp -d)"
-cleanup() {
-    rm -rf "$TMPDIR_TEST"
-}
-trap cleanup EXIT
+register_temp_dir "$TMPDIR_TEST"
 
 mkdir -p "$TMPDIR_TEST/scripts"
 

@@ -23,21 +23,13 @@ TESTS=0
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-TEMP_DIRS=()
-cleanup_temps() {
-    set +e
-    for d in "${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}"; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
-}
-trap cleanup_temps EXIT
+# Cleanup of temp directories on exit via the shared helper (see #4343).
+. "$REPO_ROOT/scripts/tests/_temp_cleanup_helpers.sh"
 
 make_temp_dir() {
     local dir
     dir=$(mktemp -d)
-    TEMP_DIRS+=("$dir")
+    register_temp_dir "$dir"
     echo "$dir"
 }
 

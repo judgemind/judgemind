@@ -27,21 +27,16 @@ WRAPPER="$SCRIPT_DIR/preflight-branch-fresh.sh"
 FAILURES=0
 TESTS=0
 
-TEMP_DIRS=()
+# Cleanup of temp directories + cd-restore via the shared helper
+# (see #4343). We register the cd hook BEFORE any register_temp_dir
+# call so the rm-phase finds itself outside any temp dir before
+# trying to rm-rf it.
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 ORIG_PWD=$(pwd)
-
-cleanup() {
-    set +eu
+restore_pwd() {
     cd "$ORIG_PWD" || true
-    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
-    # bash 3.2 + set -u (see #4336).
-    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
 }
-trap cleanup EXIT
+register_cleanup_hook restore_pwd
 
 pass() {
     TESTS=$((TESTS + 1))
@@ -72,7 +67,7 @@ fi
 make_test_repo_fresh() {
     local pair_dir
     pair_dir=$(mktemp -d)
-    TEMP_DIRS+=("$pair_dir")
+    register_temp_dir "$pair_dir"
 
     # Bootstrap the upstream.
     git init --quiet --initial-branch=main "$pair_dir/upstream"
@@ -112,7 +107,7 @@ make_test_repo_behind() {
     # as its origin.
     local push_clone
     push_clone=$(mktemp -d)
-    TEMP_DIRS+=("$push_clone")
+    register_temp_dir "$push_clone"
     git clone --quiet "$pair_dir/remote.git" "$push_clone/push" > /dev/null
     (
         cd "$push_clone/push"

@@ -30,19 +30,8 @@ TESTS=0
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-TEMP_DIRS=()
-
-cleanup() {
-    set +eu
-    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
-    # bash 3.2 + set -u (see #4336).
-    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
-        if [[ -n "$d" && -d "$d" ]]; then
-            rm -rf "$d"
-        fi
-    done
-}
-trap cleanup EXIT
+# Cleanup of temp directories on exit via the shared helper (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 
 pass() {
     TESTS=$((TESTS + 1))
@@ -66,7 +55,7 @@ fail() {
 make_stub_bin() {
     local bindir
     bindir=$(mktemp -d)
-    TEMP_DIRS+=("$bindir")
+    register_temp_dir "$bindir"
 
     cat > "$bindir/aws" <<'AWS_STUB'
 #!/usr/bin/env bash

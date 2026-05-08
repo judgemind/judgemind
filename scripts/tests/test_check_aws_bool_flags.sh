@@ -18,12 +18,11 @@ CHECK_SCRIPT="$SCRIPT_DIR/check-aws-bool-flags.sh"
 FAILURES=0
 TESTS=0
 
-# Use a temp directory so we don't pollute scripts/
+# Use a temp directory so we don't pollute scripts/. Cleanup via the
+# shared helper (see #4343).
+. "$SCRIPT_DIR/tests/_temp_cleanup_helpers.sh"
 TMPDIR_TEST=$(mktemp -d)
-cleanup() {
-    rm -rf "$TMPDIR_TEST"
-}
-trap cleanup EXIT
+register_temp_dir "$TMPDIR_TEST"
 
 create_test_script() {
     local name="$1"
