@@ -1,30 +1,40 @@
-"""Regression tests for the splitter alias mechanism (#4331).
+"""Regression tests for the splitter alias mechanism (#4331, #4386).
 
 The discovery loop in ``scripts/reingest_from_s3.py:_load_scraper_registry``
 walks every court module that exposes ``default_config()`` and registers its
-``_split_rulings`` / ``_llm_extract_rulings`` callables in the ``_SPLIT_REGISTRY``
-/ ``_LLM_SPLIT_REGISTRY`` dicts under the canonical ``scraper_id``.  These
-tests verify that any module exporting an additional ``_SPLIT_REGISTRY_ALIASES``
-list also registers the same callables under each alias scraper_id.
+scraper class plus its ``_split_rulings`` / ``_llm_extract_rulings`` callables
+in the ``_SCRAPER_REGISTRY`` / ``_SPLIT_REGISTRY`` / ``_LLM_SPLIT_REGISTRY``
+dicts under the canonical ``scraper_id``.  These tests verify that any module
+exporting an additional ``_SPLIT_REGISTRY_ALIASES`` list also registers the
+scraper class and the same callables under each alias scraper_id.
 
 Why aliases are needed.  ``scripts/rebuild_db.py`` reconstructs rows from S3
 by emitting a synthetic ``rebuild-{state}-{county}`` scraper_id (rather than
 the live ``ca-{abbrev}-...`` id).  Audit and drain scripts that key on
 ``documents.scraper_id`` look up ``_SPLIT_REGISTRY[scraper_id]`` directly —
 without an alias entry, every rebuild-path row silently no-ops because the
-canonical scraper_id never matches.  Issue #4331 documents the failure mode:
-21 SC ``all_same_case_title_cluster`` rows were stuck on the rebuild path
-because ``ca-sc-tentatives-civil`` was registered but ``rebuild-ca-santa_clara``
-was not.
+canonical scraper_id never matches.  Issue #4331 documents the failure mode
+for the split registries: 21 SC ``all_same_case_title_cluster`` rows were
+stuck on the rebuild path because ``ca-sc-tentatives-civil`` was registered
+but ``rebuild-ca-santa_clara`` was not.
+
+Issue #4386 extends the contract to ``_SCRAPER_REGISTRY``: when
+``_reparse_document`` looks up the scraper class for a rebuild-path row, the
+absence of an alias entry made it return ``None``, ``parse_document`` was
+never called, and ``extracted["ruling_text"]`` kept its raw HTML — which
+``check_no_html_in_ruling_text`` then rejected, skipping the DB write and the
+judge resolver chain (root-caused for LA dept-25 in
+``docs/investigations/la-dept-25-html-in-ruling-text-2026-05.md``).
 
 This test file enforces the contract that:
 
 1. Every module declaring ``_SPLIT_REGISTRY_ALIASES`` registers each alias.
-2. Each alias resolves to the SAME callable as the canonical scraper_id
-   (so the splitter behaviour is identical regardless of which id surfaces).
+2. Each alias resolves to the SAME callable / class as the canonical
+   scraper_id (so splitter and parse-document behaviour is identical
+   regardless of which id surfaces).
 3. Every county that has a splitter has a matching ``rebuild-ca-<county>``
-   alias — so a future scraper_id rename can't silently break splitter
-   resolution on rebuild rows.
+   alias — so a future scraper_id rename can't silently break splitter or
+   scraper-class resolution on rebuild rows.
 """
 
 from __future__ import annotations
@@ -149,6 +159,51 @@ class TestAliasesPlumbedIntoRegistry:
                     f"audit / drain on rebuild rows silently no-ops."
                 )
 
+    def test_every_alias_registers_scraper_class(self) -> None:
+        """Every alias must resolve to a registered scraper class (#4386).
+
+        This is the ``_SCRAPER_REGISTRY`` companion to the split-registry
+        checks above.  ``_reparse_document`` looks up the scraper class via
+        ``_SCRAPER_REGISTRY.get(scraper_id)``; if the rebuild-path alias is
+        missing, the lookup returns ``None``, ``parse_document`` is never
+        called, and ``extracted["ruling_text"]`` keeps the raw HTML page —
+        which ``check_no_html_in_ruling_text`` rejects, skipping the DB
+        write and the judge resolver chain (LA dept-25 reproducer in
+        ``docs/investigations/la-dept-25-html-in-ruling-text-2026-05.md``).
+        """
+        self._reload_registries()
+        for mod in _discover_modules_with_aliases():
+            canonical_ids = _canonical_scraper_ids(mod)
+            if not canonical_ids:
+                # Module declares aliases but exports no default_config —
+                # nothing to register a scraper class against.
+                continue
+            for canonical_id in canonical_ids:
+                canonical_cls = reingest._SCRAPER_REGISTRY.get(canonical_id)
+                assert canonical_cls is not None, (
+                    f"Canonical scraper_id {canonical_id!r} from "
+                    f"{mod.__name__} did not register a scraper class in "
+                    f"_SCRAPER_REGISTRY."
+                )
+            for alias in mod._SPLIT_REGISTRY_ALIASES:
+                alias_cls = reingest._SCRAPER_REGISTRY.get(alias)
+                assert alias_cls is not None, (
+                    f"Alias scraper_id {alias!r} declared by {mod.__name__} "
+                    f"did not register a scraper class in _SCRAPER_REGISTRY. "
+                    f"This is the #4386 failure mode — _reparse_document "
+                    f"will fall through and leave raw HTML in ruling_text."
+                )
+                # Sanity: the alias should map to one of the module's
+                # registered classes (it cannot map to the wrong module's
+                # class because aliases are scoped to a single module in
+                # _load_scraper_registry).
+                assert alias_cls in {reingest._SCRAPER_REGISTRY[cid] for cid in canonical_ids}, (
+                    f"Alias scraper_id {alias!r} declared by {mod.__name__} "
+                    f"resolves to {alias_cls!r}, which is not one of the "
+                    f"module's canonical classes "
+                    f"{[reingest._SCRAPER_REGISTRY[cid] for cid in canonical_ids]!r}."
+                )
+
     def test_every_alias_registers_llm_split_fn_when_canonical_does(self) -> None:
         """If a module's canonical scraper_id has an LLM splitter, every alias must too."""
         self._reload_registries()
@@ -197,6 +252,58 @@ class TestSantaClaraReproducerSatisfied:
         assert reingest._SPLIT_REGISTRY["rebuild-ca-santa_clara"] is sc_tentatives._split_rulings, (
             "rebuild-ca-santa_clara resolves to a function but not the SC "
             "splitter — alias plumbing crossed wires."
+        )
+
+
+class TestLosAngelesReproducerSatisfied:
+    """Direct regression for the #4386 reproducer (LA dept-25 HTML-in-ruling_text)."""
+
+    def test_rebuild_ca_los_angeles_resolves_to_la_scraper_class(self) -> None:
+        """``_SCRAPER_REGISTRY['rebuild-ca-los_angeles']`` must resolve to LA's class.
+
+        This is the literal failure mode from #4386: LA's dept-25
+        rebuild-path rows carried ``scraper_id='rebuild-ca-los_angeles'``,
+        ``_reparse_document`` looked up ``_SCRAPER_REGISTRY`` with that
+        key, got ``None``, and ``parse_document`` was never called — so
+        ``extracted["ruling_text"]`` kept its raw HTML, the deterministic
+        validator rejected it, and the DB write (and judge resolution)
+        was skipped.
+
+        Root-cause writeup:
+        ``docs/investigations/la-dept-25-html-in-ruling-text-2026-05.md``.
+        """
+        reingest._SCRAPER_REGISTRY.clear()
+        reingest._SPLIT_REGISTRY.clear()
+        reingest._LLM_SPLIT_REGISTRY.clear()
+        reingest._load_scraper_registry()
+
+        assert "rebuild-ca-los_angeles" in reingest._SCRAPER_REGISTRY, (
+            "rebuild-ca-los_angeles not registered in _SCRAPER_REGISTRY — "
+            "_reparse_document will return None for the scraper class, "
+            "parse_document will never be called, and ruling_text will "
+            "stay as raw HTML (#4386)."
+        )
+
+        from courts.ca import la_tentatives  # type: ignore[import-not-found]
+
+        # Both LA scrapers (civil + appellate) share this rebuild id.
+        # The discovery loop iterates ``_SCRAPER_CLASS_BY_ID`` in dict
+        # insertion order (civil then appellate), so the alias entry
+        # ends up pointing at the *last* registered class — appellate.
+        # Either is correct for satisfying the AC ("does NOT start with
+        # <html"): both expose ``parse_document`` and call into
+        # ``_split_rulings`` to narrow per-case.  We assert the alias
+        # resolves to one of the module's classes rather than pinning
+        # to a specific one — pinning would make the test brittle to
+        # an unrelated _SCRAPER_CLASS_BY_ID reorder.
+        alias_cls = reingest._SCRAPER_REGISTRY["rebuild-ca-los_angeles"]
+        assert alias_cls in (
+            la_tentatives.LATentativeRulingsScraper,
+            la_tentatives.LAAppellateTentativeRulingsScraper,
+        ), (
+            f"rebuild-ca-los_angeles resolves to {alias_cls!r}, which is "
+            f"not one of LA's registered scraper classes — alias plumbing "
+            f"crossed wires (#4386)."
         )
 
 
@@ -334,3 +441,38 @@ class TestAliasContractIsolated:
             "alias mechanism may have inadvertently broken canonical "
             "registration for modules without _SPLIT_REGISTRY_ALIASES."
         )
+
+    def test_alias_registers_in_scraper_registry(self) -> None:
+        """A module with _SPLIT_REGISTRY_ALIASES must also register its scraper class
+        under each alias in ``_SCRAPER_REGISTRY`` (#4386).
+
+        Mirrors ``test_alias_registers_in_split_registry`` for the
+        scraper-class registry.  Uses a real reload of the production
+        loader against a known-aliased module (sd_calendar) rather than a
+        synthetic ``types.ModuleType`` because ``_SCRAPER_REGISTRY``
+        registration depends on the discovery loop's ``default_config()``
+        + ``_SCRAPER_CLASS_BY_ID`` resolution path, which is harder to
+        fake than the bare ``getattr(_split_rulings)`` lookup.
+        """
+        reingest._SCRAPER_REGISTRY.clear()
+        reingest._SPLIT_REGISTRY.clear()
+        reingest._LLM_SPLIT_REGISTRY.clear()
+        reingest._load_scraper_registry()
+
+        # SD is the simplest end-to-end witness: one canonical
+        # scraper_id, one alias.
+        from courts.ca import sd_calendar  # type: ignore[import-not-found]
+
+        canonical_id = sd_calendar.default_config().scraper_id
+        canonical_cls = reingest._SCRAPER_REGISTRY.get(canonical_id)
+        assert canonical_cls is not None, (
+            f"sd_calendar canonical scraper_id {canonical_id!r} did not "
+            f"register a scraper class — discovery loop is broken."
+        )
+
+        for alias in sd_calendar._SPLIT_REGISTRY_ALIASES:
+            assert reingest._SCRAPER_REGISTRY.get(alias) is canonical_cls, (
+                f"sd_calendar alias {alias!r} did not register the same "
+                f"scraper class as the canonical id {canonical_id!r} — "
+                f"#4386 alias plumbing is wrong."
+            )

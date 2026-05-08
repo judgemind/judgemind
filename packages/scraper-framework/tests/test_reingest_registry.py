@@ -122,7 +122,10 @@ def _get_all_scraper_ids() -> dict[str, str]:
     """Return {scraper_id: module_path} for every known scraper module.
 
     Multi-scraper modules contribute one entry per ``default_config*``
-    factory (#2599).
+    factory (#2599).  Modules that export ``_SPLIT_REGISTRY_ALIASES`` also
+    contribute one entry per alias (#4386 — the rebuild-path scraper_id
+    must resolve to the same scraper class as the canonical id so
+    ``_reparse_document`` can call ``parse_document`` on rebuild rows).
     """
     result: dict[str, str] = {}
     seen_modules: set[str] = set()
@@ -134,6 +137,12 @@ def _get_all_scraper_ids() -> dict[str, str]:
         for factory in _discover_config_factories(mod):
             config = factory()
             result[config.scraper_id] = module_path
+        # Include _SPLIT_REGISTRY_ALIASES entries — these are registered
+        # in ``_SCRAPER_REGISTRY`` by the loader (#4386), so they must
+        # appear in the expected set or the coverage check below would
+        # flag them as "extra unknown ids".
+        for alias in getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or []:
+            result[alias] = module_path
     return result
 
 
@@ -156,12 +165,35 @@ class TestScraperRegistryNonEmpty:
         )
 
     def test_registry_has_all_known_scrapers(self) -> None:
-        """The registry must contain an entry for every discovered scraper module."""
+        """The registry must contain an entry for every discovered scraper module.
+
+        Counts both canonical scraper_ids (one per registered class) and
+        ``_SPLIT_REGISTRY_ALIASES`` entries (one per alias per multi-class
+        module — both LA classes share the same alias, so the alias adds
+        one entry total even though the module has two classes).
+        """
         reingest._SCRAPER_REGISTRY.clear()
         reingest._load_scraper_registry()
-        assert len(reingest._SCRAPER_REGISTRY) == len(_SCRAPER_MODULES), (
+        # Canonical entries: one per (module, class) tuple in _SCRAPER_MODULES.
+        canonical_count = len(_SCRAPER_MODULES)
+        # Alias entries: each module's _SPLIT_REGISTRY_ALIASES register the
+        # *same* alias key across all its classes, so the alias contributes
+        # only one entry per module per alias (the second class's
+        # ``_SCRAPER_REGISTRY[alias] = scraper_cls`` overwrites the first
+        # under the same key).
+        alias_count = 0
+        seen_modules: set[str] = set()
+        for module_path, _class_name in _SCRAPER_MODULES:
+            if module_path in seen_modules:
+                continue
+            seen_modules.add(module_path)
+            mod = _load_module(module_path)
+            alias_count += len(getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or [])
+        expected_count = canonical_count + alias_count
+        assert len(reingest._SCRAPER_REGISTRY) == expected_count, (
             f"Registry has {len(reingest._SCRAPER_REGISTRY)} entries but "
-            f"auto-discovery found {len(_SCRAPER_MODULES)} scraper modules"
+            f"auto-discovery found {canonical_count} scraper modules and "
+            f"{alias_count} alias entries (total expected {expected_count})"
         )
 
     def test_discovery_found_scrapers(self) -> None:
@@ -176,7 +208,15 @@ class TestRegistryKeysMatchDefaultConfig:
     """Every registered key must match a ``default_config*`` factory's scraper_id."""
 
     def test_all_keys_match_default_config_scraper_id(self) -> None:
-        """Each key must equal some ``default_config*()`` factory's scraper_id."""
+        """Each key must equal a ``default_config*()`` factory's scraper_id or a declared alias.
+
+        Aliases come from a module's ``_SPLIT_REGISTRY_ALIASES`` and resolve
+        the rebuild-path scraper_ids emitted by ``scripts/rebuild_db.py``
+        to the canonical scraper class (#4386).  An alias entry is valid
+        iff the alias appears in the same module's ``_SPLIT_REGISTRY_ALIASES``
+        as the registered class — guards against accidental cross-module
+        alias bleeding.
+        """
         reingest._SCRAPER_REGISTRY.clear()
         reingest._load_scraper_registry()
 
@@ -189,11 +229,14 @@ class TestRegistryKeysMatchDefaultConfig:
             # for single-scraper modules this is one id; for multi-scraper
             # modules (#2599) it's one per factory.
             factory_ids = {f().scraper_id for f in _discover_config_factories(mod)}
+            # Alias scraper_ids declared by this module (#4386).
+            alias_ids = set(getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or [])
 
-            assert registry_key in factory_ids, (
+            assert registry_key in (factory_ids | alias_ids), (
                 f"Registry key {registry_key!r} does not match any "
-                f"default_config*().scraper_id in {module_name} "
-                f"(module offers {sorted(factory_ids)})"
+                f"default_config*().scraper_id or _SPLIT_REGISTRY_ALIASES "
+                f"in {module_name} (module offers {sorted(factory_ids)}, "
+                f"aliases {sorted(alias_ids)})"
             )
 
 
