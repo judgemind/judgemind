@@ -206,6 +206,8 @@ from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # n
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
     insert_document_and_ruling,
+    _expand_single_word_judge_surname,
+    _looks_like_valid_judge_name,
     resolve_judge,
     resolve_judge_from_department,
     upsert_case,
@@ -3064,6 +3066,40 @@ def reingest_batch(
                                 judge_name=judge_name,
                                 county=doc_meta.get("county"),
                             )
+                    # LA County single-word JUDGE/DEPT surname expansion
+                    # (#4297).  Mirrors the worker's expansion path so
+                    # rebuilds produce consistent output.  Only fires for
+                    # LA + single-word surname + department-set + name
+                    # rejected by ``_looks_like_valid_judge_name``.
+                    if (
+                        judge_name
+                        and not _looks_like_valid_judge_name(judge_name)
+                        and len(judge_name.strip().split()) == 1
+                        and extracted.get("department")
+                        and doc_meta.get("state", "").upper() == "CA"
+                        and doc_meta.get("county") == "Los Angeles"
+                    ):
+                        hearing_dt_for_expand = extracted.get("hearing_date")
+                        expanded = _expand_single_word_judge_surname(
+                            conn,
+                            court_id_str,
+                            judge_name,
+                            extracted["department"],
+                            hearing_date=hearing_dt_for_expand,
+                        )
+                        if expanded:
+                            logger.info(
+                                "Expanded single-word JUDGE/DEPT surname (reingest)",
+                                department=extracted["department"],
+                                original_surname=judge_name,
+                                expanded_judge_name=expanded,
+                                county=doc_meta.get("county"),
+                            )
+                            judge_name = expanded
+                            extracted["extraction_methods"]["judge_name"] = (
+                                "single_word_surname_expansion"
+                            )
+
                     judge_id = None
                     if judge_name:
                         judge_id = resolve_judge(conn, judge_name, court_id_str)

@@ -1209,6 +1209,143 @@ def resolve_judge_from_department(
     return None
 
 
+def _expand_single_word_judge_surname(
+    conn: psycopg.Connection,
+    court_id: str,
+    surname: str,
+    department: str,
+    hearing_date: date | None = None,
+) -> str | None:
+    """Expand a single-word judge surname to a canonical full name (#4297).
+
+    Background
+    ----------
+    LA County tentative-ruling HTML uses a ``JUDGE/DEPT: <Surname>/<dept>``
+    form-layout header that genuinely carries only the surname (e.g.
+    ``Mkrtchyan/25``).  Without expansion, ``resolve_judge`` rejects the
+    single-word value via ``_looks_like_valid_judge_name`` and the ruling
+    stores ``judge_id = NULL`` (#4297 root cause).
+
+    Lookup chain
+    ------------
+    1. Reject if ``surname`` is not a single-word value (caller usually
+       gates on this, but defend in depth — return ``None``).
+    2. Query ``court_directory_snapshots`` for the hearing-date-effective
+       canonical name ``C(D, t)`` for ``department`` (mirrors
+       :func:`resolve_judge_from_department`).
+    3. If ``C(D, t)`` exists and its last word matches ``surname``
+       case-insensitively, return ``C(D, t)`` — the directory and the
+       document agree (happy path).
+    4. Otherwise, search ``judges`` for any judge at ``court_id`` whose
+       ``canonical_name`` ends in ``surname`` (last-word match,
+       case-insensitive).  Return the canonical name when exactly one
+       judge matches; return ``None`` for zero or multiple matches
+       (ambiguous — caller falls back to the existing rejection
+       behavior).
+    5. On any DB error, log and return ``None`` (best-effort, never
+       raise — the caller's ``resolve_judge`` path is the authority).
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        Database connection.
+    court_id : str
+        The court UUID (from the ``courts`` table).
+    surname : str
+        The single-word surname extracted by the scraper.
+    department : str
+        The department string (used to look up the directory snapshot).
+    hearing_date : date | None
+        The hearing date for historical snapshot selection.  When
+        ``None``, the most recent snapshot is used.
+
+    Returns
+    -------
+    str | None
+        The expanded canonical judge name, or ``None`` when no
+        unambiguous expansion is available.
+    """
+    # Step 1: defensive guard — surname must be a single-word value.
+    if not surname or not surname.strip():
+        return None
+    surname_clean = surname.strip()
+    if len(surname_clean.split()) != 1:
+        return None
+    surname_lower = surname_clean.lower()
+
+    try:
+        # Step 2: directory snapshot lookup for the department.
+        directory_canonical = resolve_judge_from_department(
+            conn, court_id, department, hearing_date=hearing_date
+        )
+
+        # Step 3: directory canonical exists and surname matches → happy path.
+        if directory_canonical:
+            directory_words = directory_canonical.strip().split()
+            if directory_words:
+                directory_last = directory_words[-1].lower()
+                if directory_last == surname_lower:
+                    logger.debug(
+                        "_expand_single_word_judge_surname: directory match for %r/%s -> %r",
+                        surname_clean,
+                        department,
+                        directory_canonical,
+                    )
+                    return directory_canonical
+
+        # Step 4: search judges by surname suffix at the same court.
+        # Use LOWER + suffix match so we don't depend on any particular
+        # canonical_name casing.  ``%% <surname>`` matches names with at
+        # least one preceding word (i.e. real first+last names, not bare
+        # single-word entries that may already exist).
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT canonical_name
+                FROM judges
+                WHERE court_id = %s::uuid
+                  AND LOWER(canonical_name) LIKE %s
+                """,
+                (court_id, f"% {surname_lower}"),
+            )
+            rows = cur.fetchall()
+
+        if len(rows) == 1:
+            expanded = rows[0][0]
+            logger.info(
+                "_expand_single_word_judge_surname: surname suffix match %r/%s -> %r",
+                surname_clean,
+                department,
+                expanded,
+            )
+            return expanded
+
+        if len(rows) > 1:
+            logger.debug(
+                "_expand_single_word_judge_surname: ambiguous surname %r/%s "
+                "(%d candidates) — preserving single-word",
+                surname_clean,
+                department,
+                len(rows),
+            )
+            return None
+
+        # Zero matches.
+        logger.debug(
+            "_expand_single_word_judge_surname: no judge match for surname %r/%s",
+            surname_clean,
+            department,
+        )
+        return None
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception(
+            "_expand_single_word_judge_surname: DB error for surname=%r dept=%s",
+            surname_clean,
+            department,
+        )
+        return None
+
+
 def _maybe_arbitrate(
     cur: psycopg.Cursor,
     judge_id: str,
