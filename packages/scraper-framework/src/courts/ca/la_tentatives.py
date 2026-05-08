@@ -2272,3 +2272,12 @@ _SCRAPER_CLASS_BY_ID: dict[str, type] = {
     "ca-la-tentatives-civil": LATentativeRulingsScraper,
     "ca-la-tentatives-appellate": LAAppellateTentativeRulingsScraper,
 }
+
+# Extra scraper_ids under which this module's ``_split_rulings`` /
+# ``_llm_extract_rulings`` should be registered.  Required so audit / drain
+# scripts that key on ``documents.scraper_id`` resolve the splitter on
+# rebuild-path rows (rows reconstructed from S3 by ``scripts/rebuild_db.py``,
+# which emits ``rebuild-ca-los_angeles`` instead of the live ``ca-la-...`` id).
+# Both civil and appellate share this rebuild id since they're produced from
+# the same county slug.  See #4331.
+_SPLIT_REGISTRY_ALIASES: list[str] = ["rebuild-ca-los_angeles"]

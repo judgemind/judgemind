@@ -405,6 +405,15 @@ class SFTentativeRulingsScraper(PdfLinkScraper):
         return doc
 
 
+# Extra scraper_ids under which this module's ``_split_rulings`` /
+# ``_llm_extract_rulings`` should be registered.  Required so audit / drain
+# scripts that key on ``documents.scraper_id`` resolve the splitter on
+# rebuild-path rows (rows reconstructed from S3 by ``scripts/rebuild_db.py``,
+# which emits ``rebuild-ca-san_francisco`` instead of the live ``ca-sf-...`` id).
+# See #4331.
+_SPLIT_REGISTRY_ALIASES: list[str] = ["rebuild-ca-san_francisco"]
+
+
 def default_config(s3_bucket: str = "") -> ScraperConfig:
     """Factory for the default SF Family Law scraper configuration."""
     from datetime import time as dtime

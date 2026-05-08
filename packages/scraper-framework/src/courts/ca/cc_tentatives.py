@@ -790,6 +790,15 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
         return doc
 
 
+# Extra scraper_ids under which this module's ``_split_rulings`` /
+# ``_llm_extract_rulings`` should be registered.  Required so audit / drain
+# scripts that key on ``documents.scraper_id`` resolve the splitter on
+# rebuild-path rows (rows reconstructed from S3 by ``scripts/rebuild_db.py``,
+# which emits ``rebuild-ca-contra_costa`` instead of the live ``ca-cc-...`` id).
+# See #4331.
+_SPLIT_REGISTRY_ALIASES: list[str] = ["rebuild-ca-contra_costa"]
+
+
 def default_config(s3_bucket: str = "") -> ScraperConfig:
     """Factory for the default Contra Costa scraper configuration."""
     from datetime import time as dtime

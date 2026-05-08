@@ -57,9 +57,19 @@ def _load_registries() -> tuple[dict, dict]:
 
 
 def _llm_scraper_ids() -> list[str]:
-    """Return the list of scraper_ids in ``_LLM_SPLIT_REGISTRY`` after load."""
-    _, llm = _load_registries()
-    return sorted(llm.keys())
+    """Return the list of canonical scraper_ids in ``_LLM_SPLIT_REGISTRY``.
+
+    Filters out alias entries — scraper_ids registered via a module's
+    ``_SPLIT_REGISTRY_ALIASES`` (e.g. ``rebuild-ca-<county>``, see #4331).
+    Aliases register the splitter callables but NOT a corresponding
+    ``_SCRAPER_REGISTRY`` class, because the rebuild path does not invoke
+    ``parse_document`` (audit / drain scripts only call the splitter
+    directly).  The pre-split guard test below operates on
+    ``parse_document`` source, so it must run only against canonical
+    scraper_ids that actually have a registered class.
+    """
+    scraper_registry, llm = _load_registries()
+    return sorted(sid for sid in llm if sid in scraper_registry)
 
 
 # Parametrize at collection time so each scraper gets its own test ID.
