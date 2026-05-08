@@ -1238,6 +1238,23 @@ jobs:
         run: scripts/check-placeholder-gates.sh
 
   # ---------------------------------------------------------------
+  # Repo-walk exclusion canonicalization guard (#4308): every
+  # check-*.sh that walks the repo with grep must source preflight.sh
+  # and consume the canonical REPO_WALK_EXCLUSIONS list rather than
+  # hand-rolling its own list. Prevents the next #4300-style outage
+  # where a check missed `.claude` and tripped on test fixtures.
+  # The step name below intentionally avoids quoting the forbidden
+  # token (per docs/agent/code-standards.md §Hygiene-check CI steps
+  # and #2541/#2542).
+  # ---------------------------------------------------------------
+  repo-walk-exclusions-canonical-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enforce canonical repo-walk exclusion list across check scripts
+        run: scripts/check-repo-walk-exclusions-canonical.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded color guard: enforce semantic design tokens in TSX
   # ---------------------------------------------------------------
   hardcoded-colors-check:
@@ -1909,7 +1926,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, split-ruling-propagation-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, terraform-ecs-entrypoint-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, case-type-fallback-parity-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, split-ruling-propagation-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, terraform-ecs-entrypoint-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, case-type-fallback-parity-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, repo-walk-exclusions-canonical-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

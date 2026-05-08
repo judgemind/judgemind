@@ -27,8 +27,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Pattern ─────────────────────────────────────────────────────────────
 # Match `aws ecs wait services-stable` with any internal whitespace run.
@@ -37,22 +41,9 @@ SCAN_DIR="${1:-$REPO_ROOT}"
 PATTERN='aws[[:space:]]+ecs[[:space:]]+wait[[:space:]]+services-stable'
 
 # ─── Directories to exclude from the scan ────────────────────────────────
-# Standard ignored directories (vendored dependencies, VCS metadata, build
-# output) plus local developer state (`.claude`, `.venv`).  These never
-# contain source-of-truth code we care about.
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".claude"
-    ".vite"
-    # Local developer scratch dir for agent workflows (not tracked; see
-    # CLAUDE.md §ALWAYS — Before Acting).  CI checkout has no tmp/, so
-    # excluding it only affects local runs and keeps behavior consistent.
-    "tmp"
-)
+# Repo-walk dir exclusions come from REPO_WALK_EXCLUSIONS in preflight.sh
+# (canonical list — single source of truth, see #4308). No per-check
+# extras needed here.
 
 # ─── Files that legitimately mention the pattern as context ──────────────
 # The check script and its test both have to spell the pattern literally.
@@ -68,10 +59,10 @@ EXCLUDE_FILES=(
     "scripts/tests/test_check_no_ecs_wait_services_stable.sh"
 )
 
-# ─── Build grep arguments ───────────────────────────────────────────────
+# ─── Build --exclude-dir arguments from the canonical list ──────────────
 
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

@@ -70,8 +70,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT/packages/api/src/graphql}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Pattern ─────────────────────────────────────────────────────────────
 # Match `instanceof` followed by one of the realm-fragile graphql-js
@@ -81,20 +85,10 @@ SCAN_DIR="${1:-$REPO_ROOT/packages/api/src/graphql}"
 # `GraphQLNonNull` without a `Type` suffix.
 PATTERN='instanceof[[:space:]]+GraphQL(ObjectType|InterfaceType|UnionType|List(Type)?|NonNull(Type)?)\b'
 
-# ─── Directories to exclude from the scan ────────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    "__pycache__"
-    "tmp"
-    ".next"
-    "dist"
-    "build"
-)
-
+# ─── Build --exclude-dir arguments from the canonical list ──────────────
+# (REPO_WALK_EXCLUSIONS lives in preflight.sh — single source of truth, #4308.)
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

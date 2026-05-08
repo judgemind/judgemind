@@ -299,6 +299,65 @@ preflight_rate_budget() {
 }
 
 # --------------------------------------------------------------------------
+# REPO_WALK_EXCLUSIONS — canonical list of directories that repo-walking
+#   hygiene checks must NEVER scan. Single source of truth for the
+#   `--exclude-dir=<X>` flags every `scripts/check-*.sh` script that runs
+#   `grep -rEn` over the repo needs to pass.
+#
+#   Why this exists (#4308 root cause): every new repo-walk hygiene check
+#   re-derived this list from scratch, and the lists drifted. The .claude/
+#   exclusion was missed in #4296 → caused #4300 (CI red on main for ~30
+#   minutes). The exclusion contract is repo-wide policy — duplicating
+#   literals across 10+ scripts guarantees the next miss.
+#
+#   Maintenance: add new entries here when a build output, vendored tree,
+#   or operator-managed scratch directory needs blanket exclusion. Do NOT
+#   remove an entry without auditing every consumer first.
+#
+#   Per-check augmentations (e.g. `tests`/`test` in check-llm-json-loads.sh,
+#   `docs` in check-placeholder-gates.sh, etc.) stay local to the script —
+#   they're domain-specific allowlists, not repo-wide policy.
+#
+#   Consumer pattern:
+#     # shellcheck source=./preflight.sh
+#     source "$SCRIPT_DIR/preflight.sh"
+#     EXTRA_EXCLUDE_DIRS=(tests test)         # optional per-check extras
+#     exclude_args=()
+#     for dir in "${REPO_WALK_EXCLUSIONS[@]}" \
+#                ${EXTRA_EXCLUDE_DIRS[@]+"${EXTRA_EXCLUDE_DIRS[@]}"}; do
+#         exclude_args+=("--exclude-dir=$dir")
+#     done
+#     grep -rEn "$PATTERN" "$REPO_ROOT" "${exclude_args[@]}"
+# --------------------------------------------------------------------------
+REPO_WALK_EXCLUSIONS=(
+    .git
+    .venv
+    node_modules
+    __pycache__
+    .next
+    .claude
+    .vite
+    tmp
+    dist
+    build
+)
+
+# --------------------------------------------------------------------------
+# repo_walk_exclude_args
+#   Print one `--exclude-dir=<X>` per line for every entry in
+#   REPO_WALK_EXCLUSIONS. Provided for callers that prefer a streaming
+#   interface to the array; the array form is the recommended pattern
+#   (see consumer block above) because it is bash-3.2 safe and lets each
+#   script append its own per-check extras inline.
+# --------------------------------------------------------------------------
+repo_walk_exclude_args() {
+    local dir
+    for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
+        printf -- '--exclude-dir=%s\n' "$dir"
+    done
+}
+
+# --------------------------------------------------------------------------
 # preflight_no_forbidden_syntax <command_string>
 #   Check a command string for forbidden shell patterns. Mirrors the checks
 #   in .claude/hooks/preflight-bash.sh but can be called from scripts.

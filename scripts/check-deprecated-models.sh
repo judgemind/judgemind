@@ -18,8 +18,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Deprecated model identifiers ───────────────────────────────────────
 # Add new entries as Anthropic deprecates models.  Each entry is a string
@@ -45,17 +49,9 @@ DEPRECATED_MODELS=(
 )
 
 # ─── Directories and files to exclude ────────────────────────────────────
-# These contain configuration, documentation, or test fixtures where
-# deprecated model names may appear legitimately.
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".claude"
-    ".vite"
-)
+# Repo-walk dir exclusions come from REPO_WALK_EXCLUSIONS in preflight.sh
+# (canonical list — single source of truth, see #4308). No per-check
+# extras needed here.
 
 # Files that legitimately reference deprecated models (this script itself,
 # its tests, documentation about the deprecation check).
@@ -75,9 +71,9 @@ done
 alternation=$(IFS='|'; echo "${escaped_models[*]}")
 PATTERN="(${alternation})"
 
-# Build --exclude-dir arguments
+# Build --exclude-dir arguments from the canonical list.
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 
