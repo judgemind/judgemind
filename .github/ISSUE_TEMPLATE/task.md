@@ -12,27 +12,33 @@ Why this task exists. Link to relevant specs, investigations, or parent tasks.
 
 Parent issue: (if applicable)
 
+## Observed symptoms
+
+<!-- Optional — fill in for bug-fix or investigation-style issues; otherwise delete this section and the next two (Suspected root cause, Hypothesis verification steps). -->
+
+Facts you measured. NULL rate is X%, this query returns Y, sample input `<S3 key>` produces `field=NULL` after parse.
+
+## Suspected root cause
+
+<!-- Optional — your best current theory of *why* the symptoms appear, framed as a hypothesis the agent should verify, NOT as a known-true premise. Delete this section if not applicable. -->
+
+Example: "I suspect `_cc_hearing_date_from_pdf`'s regex doesn't match the dept-38 PDF format."
+
+## Hypothesis verification steps
+
 <!--
-## Bug-fix framing (optional — use for bug-fix or investigation-style issues)
+Optional but high-leverage when a Suspected root cause is named above. List the cheap probes the agent should run BEFORE writing implementation code — the agent's `/task` §4c step runs this section verbatim before writing code.
 
-When filing an issue that names a specific function/regex/layer as broken, separate the three pieces explicitly so an agent doesn't lock onto a wrong-hypothesis path. See `docs/agent/issue-authoring.md` §Hypothesis vs. evidence and `.claude/skills/task/SKILL.md` §4c. Uncomment and fill in the three sections below if applicable.
+See `docs/agent/issue-authoring.md` §"Hypothesis vs. evidence" for the full framing rationale, and §"Verify stored state matches the symptom" for the storage-tier (S3 / `derived.*` / `staging.*`) probe variant.
 
-### Observed Symptoms
+Delete this section if there is no suspected root cause to verify — e.g. pure feature work or trivial typo fixes.
+-->
 
-Facts you measured. NULL rate is X%, this query returns Y, sample input <S3 key> produces `field=NULL` after parse.
-
-### Suspected root cause
-
-Your best current theory of *why* the symptoms appear, framed as a hypothesis the agent should verify — NOT as a known-true premise. Example: "I suspect `_cc_hearing_date_from_pdf`'s regex doesn't match the dept-38 PDF format."
-
-### Hypothesis verification steps
-
-Cheap probes the agent should run BEFORE writing implementation code. Example:
-1. Download `<S3 key>` to {worktree}/tmp/sample.pdf.
-2. Run `_cc_hearing_date_from_pdf` on it directly (write a 5-line probe to {worktree}/tmp/verify.py).
+Example:
+1. Download `<S3 key>` to `{worktree}/tmp/sample.pdf`.
+2. Run `_cc_hearing_date_from_pdf` on it directly (write a 5-line probe to `{worktree}/tmp/verify.py`).
 3. If it returns the expected date, the hypothesis is wrong — root-cause from the observed symptoms instead. Inspect `is_plausible_hearing_date` next.
 4. If it returns NULL, the hypothesis is confirmed — proceed with the prescribed fix.
--->
 
 ## Objective
 
