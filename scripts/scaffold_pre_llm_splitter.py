@@ -1367,6 +1367,7 @@ def _ruff_format_touched_files(paths: list[Path]) -> None:
             [str(venv_ruff), "format", *(str(p) for p in framework_paths)],
             check=False,
             capture_output=True,
+            timeout=30,  # local-only ruff format — never network-bound (#3213)
         )
     except (OSError, FileNotFoundError) as exc:
         print(
