@@ -201,6 +201,58 @@ It is less critical for:
 
 When in doubt, including the framing is cheap and saves ralph cycles when the hypothesis turns out to be wrong.
 
+### Verify stored state matches the symptom
+
+Bug-fix issues that mention "raw X stored in Y" / "skipped step Z" / "the data in <table/bucket> is wrong" need one extra cheap probe before filing: **query the storage tier the symptom claims is corrupt and confirm the stored bytes actually look the way the hypothesis predicts.** This is the storage-side mirror of the §"Hypothesis vs. evidence" framing — the hypothesis is about *the state at rest*, so verify the state at rest, not just the log line that talked about it.
+
+The trap this catches: a log line like `ruling_text starts with '<html' — raw HTML detected, transcription step was likely skipped` describes what some downstream code *saw* during a transient pipeline run, not what is actually stored in S3 / `derived.*`. The "skipped transcription" hypothesis assumes the log line is reporting the persistent state, but in fact it can be reporting the function's own normalization buffer or a fallback path the function constructed in memory. A 30-second SQL query against the storage tier disambiguates.
+
+**The probe is keyed to the schema tiers from CLAUDE.md (S3 source of truth → `derived.*` → `staging.*`).** Pick the tier the hypothesis points at:
+
+- **"Raw X is in S3"** — fetch the relevant key with `aws s3 cp s3://<bucket>/<key> -` (or via the boto3 helper used by the scraper) and inspect the bytes. If the issue says "S3 stores HTML when it should store plain text," confirm the S3 bytes actually start with `<html` before filing.
+- **"Field Y in `derived.*` is corrupt"** — run a `scripts/dev-db-query.sh` SELECT against the rows the issue identifies. If the issue says `ruling_text` is HTML, query `SELECT LEFT(ruling_text, 50) FROM derived.rulings WHERE ...` for a sample of the affected rows. If the stored value is clean plain text, the symptom is in a *transient* state somewhere upstream of the read path — the persistent storage is fine, and the bug is in whatever produced the misleading log line.
+- **"Transient pipeline row in `staging.*` shows X"** — `staging.*` rows are short-lived, so run the probe within the same window as the symptom or capture the row before it drains. The same `dev-db-query.sh` pattern applies.
+
+**Worked example — #4382 (the issue that motivated this section):** the filer observed reingest log lines stating `ruling_text starts with '<html' — raw HTML detected, transcription step was likely skipped` for 126 LA dept-25 rulings, and wrote the issue body around the suspected root cause "the transcription step was skipped when these documents were originally captured." A 30-second probe against `derived.rulings` for the affected rows would have falsified the hypothesis immediately:
+
+```
+scripts/dev-db-query.sh "SELECT id, LEFT(ruling_text, 50) AS head \
+  FROM derived.rulings \
+  WHERE court_id = 'ca-los-angeles' AND department = '25' AND judge_id IS NULL \
+  LIMIT 5;"
+```
+
+If `head` is clean plain text (not `<html...`), then `ruling_text` was stored correctly and transcription was *not* skipped at capture time. The validation failure surfaces only inside the reingest function's *transient* state — the symptom is in `scripts/reingest_from_s3.py`'s in-memory normalization buffer, not in the storage tier the issue body pointed at. The actual root cause turned out to be a missing alias registration in `scripts/reingest_from_s3.py` that caused the function to fall back to constructing an HTML buffer for these specific rows.
+
+The right framing — combining this storage-tier probe with the Observed / Suspected / Verification structure from §"Hypothesis vs. evidence" — would have been:
+
+```
+## Observed symptoms
+
+- 126 LA dept-25 rulings have `judge_id = NULL` and reingest logs report
+  `ruling_text starts with '<html' — raw HTML detected`.
+- Sample affected ids: ec17ae67-..., 94045693-..., c457225f-...
+
+## Suspected root cause (hypothesis)
+
+The transcription step was skipped at capture time, leaving raw HTML in
+`ruling_text` for these rows.
+
+## Hypothesis verification steps
+
+Before writing code:
+1. Query `derived.rulings.ruling_text` for the affected rows:
+   `SELECT LEFT(ruling_text, 50) FROM derived.rulings WHERE ... LIMIT 5;`
+2. If the stored value is clean plain text, the hypothesis is FALSIFIED —
+   the storage tier is fine, and the bug lives in whatever code path
+   produced the `<html` log line (likely a transient normalization
+   buffer in `scripts/reingest_from_s3.py`).
+3. If the stored value starts with `<html`, the hypothesis is confirmed —
+   investigate why transcription was skipped at capture time.
+```
+
+The storage-tier probe is the thing that distinguishes "the data at rest is wrong" from "a function's transient state is wrong" — two failure modes that produce identical-looking log lines but require completely different fixes. File the probe in the issue body as a `## Hypothesis verification steps` block; the agent's `/task` §4c step already runs explicit verification steps verbatim before writing code, so the cost shifts from agent (5 minutes per ralph cycle on a wrong-hypothesis path) to filer (30 seconds with a SQL client open).
+
 ### Cross-references
 
 - `docs/agent/investigation-patterns.md` §"Instrument before you guess" — the agent-side mirror. When the filer's hypothesis is missing or known-thin, the agent ships an instrumentation-only PR first to make the next failure self-diagnosing.
