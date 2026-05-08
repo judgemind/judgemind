@@ -844,6 +844,15 @@ class SCTentativeRulingsScraper(BaseScraper):
         return doc
 
 
+# Extra scraper_ids under which this module's ``_split_rulings`` /
+# ``_llm_extract_rulings`` should be registered.  Required so audit / drain
+# scripts that key on ``documents.scraper_id`` resolve the splitter on
+# rebuild-path rows (rows reconstructed from S3 by ``scripts/rebuild_db.py``,
+# which emits ``rebuild-ca-santa_clara`` instead of the live ``ca-sc-...`` id).
+# See #4331.
+_SPLIT_REGISTRY_ALIASES: list[str] = ["rebuild-ca-santa_clara"]
+
+
 def default_config(s3_bucket: str = "") -> ScraperConfig:
     """Create the default scraper configuration for Santa Clara County."""
     from datetime import time as dtime

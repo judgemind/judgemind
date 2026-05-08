@@ -363,6 +363,18 @@ def _load_scraper_registry() -> None:
 
             _SCRAPER_REGISTRY[scraper_id] = scraper_cls
 
+            # Module-level alias list: extra scraper_ids under which this
+            # module's ``_split_rulings`` / ``_llm_extract_rulings`` should
+            # also be registered.  Required so rebuild-path rows
+            # (``rebuild-{state}-{county}``, emitted by
+            # ``scripts/rebuild_db.py`` when reconstructing rows from S3)
+            # resolve to the same splitter as live-captured rows.  Without
+            # this, any audit or drain that keys on ``documents.scraper_id``
+            # silently no-ops on every rebuild row (#4331).  The list is
+            # optional — modules without aliases simply register under the
+            # canonical scraper_id only.
+            split_aliases: list[str] = getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or []
+
             # Register split function if the module exports one.
             # Convention: a module-level ``_split_rulings`` callable
             # indicates that the scraper produces multi-ruling documents
@@ -370,6 +382,8 @@ def _load_scraper_registry() -> None:
             split_fn = getattr(mod, "_split_rulings", None)
             if split_fn is not None and callable(split_fn):
                 _SPLIT_REGISTRY[scraper_id] = split_fn
+                for alias in split_aliases:
+                    _SPLIT_REGISTRY[alias] = split_fn
 
             # Register LLM-based split function if available.
             # Convention: a module-level ``_llm_extract_rulings`` callable
@@ -378,6 +392,8 @@ def _load_scraper_registry() -> None:
             llm_split_fn = getattr(mod, "_llm_extract_rulings", None)
             if llm_split_fn is not None and callable(llm_split_fn):
                 _LLM_SPLIT_REGISTRY[scraper_id] = llm_split_fn
+                for alias in split_aliases:
+                    _LLM_SPLIT_REGISTRY[alias] = llm_split_fn
 
 
 FETCH_DOCUMENTS_QUERY = """
