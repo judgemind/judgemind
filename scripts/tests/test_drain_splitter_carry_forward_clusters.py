@@ -33,9 +33,51 @@ import sys
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# ---------------------------------------------------------------------------
+# Pre-import mocking — the script imports ``framework.logging`` (which
+# transitively imports ``structlog``) at module level; neither is installed
+# in the lightweight CI ``scripts-tests (python)`` environment (it only
+# installs ``pytest pytest-xdist boto3 -e packages/judgemind-config``).
+# Mock both modules in ``sys.modules`` before importing the script under
+# test, mirroring ``test_backfill_split_supersede.py``. The mocks are
+# scoped: regression tests in ``TestLoggerExtraFieldsSurfaceInOutput`` use
+# ``pytest.importorskip("structlog")`` and reach for the real
+# ``configure_structlog`` so they only run when structlog is actually
+# available (developer laptop with the scraper-framework venv, or any CI
+# job that installs scraper-framework).
+# ---------------------------------------------------------------------------
+
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
+_mock_framework = MagicMock()
+_mock_framework_logging = MagicMock()
+
+_modules_to_mock = {
+    "structlog": _mock_structlog,
+    "framework": _mock_framework,
+    "framework.logging": _mock_framework_logging,
+}
+
+_saved_modules: dict[str, object] = {}
+for _mod_name, _mock_mod in _modules_to_mock.items():
+    if _mod_name in sys.modules:
+        _saved_modules[_mod_name] = sys.modules[_mod_name]
+    sys.modules[_mod_name] = _mock_mod  # type: ignore[assignment]
+
 import drain_splitter_carry_forward_clusters as _script  # noqa: E402
+
+# Restore sys.modules so the mock injection doesn't break other test files
+# (and so ``TestLoggerExtraFieldsSurfaceInOutput`` can re-import the real
+# ``framework.logging`` if it's available).
+for _mod_name in list(_modules_to_mock.keys()):
+    if _mod_name in _saved_modules:
+        sys.modules[_mod_name] = _saved_modules[_mod_name]
+    elif _mod_name in sys.modules:
+        del sys.modules[_mod_name]
 
 
 # ---------------------------------------------------------------------------
@@ -536,61 +578,112 @@ class TestLoggerExtraFieldsSurfaceInOutput:
     structlog's ``ProcessorFormatter`` + ``ExtraAdder`` so the extras
     are JSON-encoded into the output line.
 
-    These tests assert the fix at the layer the bug lives — they capture
-    the script-module logger's actual stderr output and assert the
-    ``extra=`` fields surface as JSON keys.
+    These tests assert the fix at the layer the bug lives — they call
+    the *real* ``configure_structlog`` (skipping when structlog isn't
+    available, e.g. in the lightweight CI ``scripts-tests (python)``
+    shard which mocks structlog at module import) and capture stdlib
+    logger output to verify the ``extra=`` fields surface as JSON keys.
     """
 
-    def _capture_logger_output(self, emit_fn) -> str:
-        """Attach a StringIO StreamHandler to the root logger (the same
-        place the structlog stdlib_bridge installed its formatter), invoke
-        ``emit_fn``, return the captured bytes.
+    @pytest.fixture
+    def configured_logger_and_capture(self):
+        """Yield ``(logger, capture_buffer)`` backed by a real
+        ``configure_structlog(json=True, stdlib_bridge=True)`` setup
+        whose bridge ``StreamHandler`` writes into ``capture_buffer``
+        instead of ``sys.stderr``.
 
-        We attach a *second* handler that uses the same formatter as the
-        existing root handler so the captured output is identical to what
-        ECS / CloudWatch sees, just redirected to a buffer instead of
-        stderr.
+        Skips when structlog or scraper-framework isn't importable
+        (the python CI shard for scripts-tests doesn't install them).
+        Restores the root logger's previous handler set after the test.
         """
-        root = logging.root
-        # Find the handler the structlog stdlib bridge installed at
-        # module-import time so we can clone its formatter.
+        # ``importorskip`` fails fast when real structlog isn't present
+        # AND unwraps the MagicMock that the module-import-time block
+        # above installed in ``sys.modules``.
+        pytest.importorskip("structlog")
+        scraper_src = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "packages",
+                "scraper-framework",
+                "src",
+            )
+        )
+        if not os.path.isdir(scraper_src):
+            pytest.skip(
+                "scraper-framework src not present — only runs on a "
+                "developer laptop or a CI job that installs it."
+            )
+        if scraper_src not in sys.path:
+            sys.path.insert(0, scraper_src)
+        # Drop the MagicMocks the module-import-time block installed so
+        # the real ``framework.logging`` imports cleanly here.
+        for _mod in ("framework", "framework.logging"):
+            cur = sys.modules.get(_mod)
+            if isinstance(cur, MagicMock):
+                del sys.modules[_mod]
+        try:
+            from framework.logging import configure_structlog
+        except ImportError:
+            pytest.skip("framework.logging not importable in this env.")
+
+        prev_handlers = list(logging.root.handlers)
+        prev_level = logging.root.level
+        configure_structlog(json=True, stdlib_bridge=True)
+        # ``configure_structlog(stdlib_bridge=True)`` installs a
+        # ``StreamHandler()`` (default stream=stderr) with a
+        # ``ProcessorFormatter`` on the root logger. Redirect that
+        # handler's stream into our buffer so we capture exactly the
+        # bytes CloudWatch would see.
         bridge_handler = next(
-            (h for h in root.handlers if h.formatter is not None),
+            (
+                h
+                for h in logging.root.handlers
+                if h.formatter is not None
+                and h.__class__.__module__ == "logging"
+                and isinstance(h, logging.StreamHandler)
+            ),
             None,
         )
         assert bridge_handler is not None, (
-            "Expected configure_structlog(stdlib_bridge=True) to have "
-            "installed a StreamHandler with a ProcessorFormatter on the "
-            "root logger when drain_splitter_carry_forward_clusters was "
-            "imported."
+            "Expected configure_structlog(stdlib_bridge=True) to "
+            "install a StreamHandler with a ProcessorFormatter on "
+            "the root logger."
         )
-
         buffer = io.StringIO()
-        capture_handler = logging.StreamHandler(buffer)
-        capture_handler.setFormatter(bridge_handler.formatter)
-        root.addHandler(capture_handler)
+        bridge_handler.setStream(buffer)
+        # Suppress propagation to pytest's caplog handler so the buffer
+        # contains only the bridge-formatted JSON line.
+        logger = logging.getLogger("test_drain_splitter_extras_4368")
+        prev_propagate = logger.propagate
+        logger.propagate = True  # bridge sits on root, so we DO want to propagate
         try:
-            emit_fn()
+            yield logger, buffer
         finally:
-            root.removeHandler(capture_handler)
-        return buffer.getvalue()
+            logger.propagate = prev_propagate
+            for handler in list(logging.root.handlers):
+                logging.root.removeHandler(handler)
+            for handler in prev_handlers:
+                logging.root.addHandler(handler)
+            logging.root.setLevel(prev_level)
 
-    def test_skipping_cluster_log_surfaces_s3_key_and_plan_status(self) -> None:
+    def test_skipping_cluster_log_surfaces_s3_key_and_plan_status(
+        self, configured_logger_and_capture
+    ) -> None:
         # Mirror the call site at line 659 — the post-deploy verification
         # path needs to be able to grep CloudWatch for the plan_status
         # field to count skip_no_split vs. skip_single_title vs. error.
-        def _emit() -> None:
-            _script.logger.info(
-                "Skipping cluster — splitter would not improve it",
-                extra={
-                    "s3_key": "ca/santa_clara/2026/05/09/example.pdf",
-                    "plan_status": "skip_no_split",
-                    "distinct_titles": 1,
-                },
-            )
-
-        output = self._capture_logger_output(_emit)
-        # The output must carry every field, not just the message text.
+        logger, buffer = configured_logger_and_capture
+        logger.info(
+            "Skipping cluster — splitter would not improve it",
+            extra={
+                "s3_key": "ca/santa_clara/2026/05/09/example.pdf",
+                "plan_status": "skip_no_split",
+                "distinct_titles": 1,
+            },
+        )
+        output = buffer.getvalue()
         assert "s3_key" in output, (
             "extra={'s3_key': ...} must surface in log output (#4368). "
             f"Captured output: {output!r}"
@@ -600,24 +693,25 @@ class TestLoggerExtraFieldsSurfaceInOutput:
         assert "ca/santa_clara/2026/05/09/example.pdf" in output
         assert "skip_no_split" in output
 
-    def test_drain_summary_log_surfaces_counter_fields(self) -> None:
+    def test_drain_summary_log_surfaces_counter_fields(
+        self, configured_logger_and_capture
+    ) -> None:
         # Mirror the call site at line 803 — the canonical "did the drain
         # actually drain anything" verification field is
         # ``clusters_drained``. Without it surfacing in CloudWatch, the
         # post-deploy verification has no choice but to run a local probe
         # against the in-repo fixture (which is what motivated #4368).
-        def _emit() -> None:
-            _script.logger.info(
-                "Drain summary",
-                extra={
-                    "clusters_found": 22,
-                    "clusters_drained": 15,
-                    "clusters_skipped": 7,
-                    "children_deleted_total": 38,
-                },
-            )
-
-        output = self._capture_logger_output(_emit)
+        logger, buffer = configured_logger_and_capture
+        logger.info(
+            "Drain summary",
+            extra={
+                "clusters_found": 22,
+                "clusters_drained": 15,
+                "clusters_skipped": 7,
+                "children_deleted_total": 38,
+            },
+        )
+        output = buffer.getvalue()
         assert "clusters_found" in output
         assert "clusters_drained" in output
         assert "clusters_skipped" in output
@@ -627,22 +721,17 @@ class TestLoggerExtraFieldsSurfaceInOutput:
         assert "15" in output
         assert "38" in output
 
-    def test_log_lines_are_parseable_json(self) -> None:
+    def test_log_lines_are_parseable_json(self, configured_logger_and_capture) -> None:
         # CloudWatch Logs Insights treats each line as JSON when the
         # message starts with ``{``. The structlog JSONRenderer emits
         # exactly one JSON object per log call.
-        def _emit() -> None:
-            _script.logger.info(
-                "Drain summary",
-                extra={"clusters_drained": 15},
-            )
-
-        output = self._capture_logger_output(_emit)
-        # Strip trailing newline and parse.
-        line = output.strip()
-        # Some test environments interleave handlers — pull the line
-        # that starts with ``{`` (the JSON one).
-        json_lines = [ln for ln in line.split("\n") if ln.startswith("{")]
+        logger, buffer = configured_logger_and_capture
+        logger.info(
+            "Drain summary",
+            extra={"clusters_drained": 15},
+        )
+        output = buffer.getvalue()
+        json_lines = [ln for ln in output.strip().split("\n") if ln.startswith("{")]
         assert json_lines, f"Expected at least one JSON-formatted line; got: {output!r}"
         parsed = json.loads(json_lines[-1])
         assert parsed.get("event") == "Drain summary"
