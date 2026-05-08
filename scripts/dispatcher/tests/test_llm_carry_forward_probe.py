@@ -22,8 +22,10 @@ from dispatcher.llm_carry_forward_probe import (  # noqa: E402
     DEFAULT_RIVERSIDE_LEGACY_CAP,
     Finding,
     _load_state,
+    _load_state_from_db,
     _percent_jump,
     _save_state,
+    _save_state_to_db,
     evaluate,
     extract_county_totals,
     render_summary_comment,
@@ -450,3 +452,359 @@ def test_evaluate_returns_finding_instances() -> None:
     summary = _summary({"Ventura": _county_bucket(outcome_continue=1)})
     findings = evaluate(summary, prior_totals=None)
     assert all(isinstance(f, Finding) for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# DB-backed state — issue #4318
+# ---------------------------------------------------------------------------
+#
+# The probe persists per-county totals to
+# ``dispatcher.scheduled_skills.last_run_state`` so a fresh ECS task can
+# read prior totals on the next fire (the local --state file is wiped
+# between fires). These tests use a fake psycopg module that records
+# every executed statement and lets us script the SELECT result.
+
+
+class _FakeCursor:
+    """Records execute() calls; replays a queued result on fetchone()."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, tuple]] = []
+        self._fetch_queue: list = []
+        self.rowcount = 0
+
+    def queue_fetchone(self, value) -> None:
+        """Queue the value the next fetchone() returns."""
+        self._fetch_queue.append(value)
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        if not self._fetch_queue:
+            return None
+        return self._fetch_queue.pop(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, cur: _FakeCursor) -> None:
+        self._cur = cur
+        self.committed = False
+        self.closed = False
+
+    def cursor(self) -> _FakeCursor:
+        return self._cur
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+class _FakePsycopg:
+    """Stand-in for the ``psycopg`` module imported lazily by the probe."""
+
+    def __init__(self, conn_factory) -> None:
+        self._conn_factory = conn_factory
+        self.connect_calls: list[str] = []
+
+    def connect(self, dsn: str) -> _FakeConn:
+        self.connect_calls.append(dsn)
+        return self._conn_factory()
+
+
+def _install_fake_psycopg(monkeypatch, fake) -> None:
+    """Make ``import psycopg`` inside the probe return ``fake``."""
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+
+
+# ---------------------------------------------------------------------------
+# _load_state_from_db
+# ---------------------------------------------------------------------------
+
+
+def test_load_state_from_db_returns_dict_when_row_present(monkeypatch) -> None:
+    """Happy path — DB row exists with a JSONB dict."""
+    cur = _FakeCursor()
+    cur.queue_fetchone(({"Ventura": {"motion_type_contradiction": 100}},))
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    result = _load_state_from_db("audit-llm-carry-forward", "postgres://test")
+    assert result == {"Ventura": {"motion_type_contradiction": 100}}
+    # Connected once with the supplied DSN.
+    assert fake.connect_calls == ["postgres://test"]
+    # Executed exactly one parameterised SELECT against scheduled_skills.
+    assert len(cur.executed) == 1
+    sql, params = cur.executed[0]
+    assert "SELECT last_run_state" in sql
+    assert "FROM dispatcher.scheduled_skills" in sql
+    assert "WHERE name = %s" in sql
+    assert params == ("audit-llm-carry-forward",)
+
+
+def test_load_state_from_db_returns_none_when_skill_name_empty() -> None:
+    """Empty skill_name short-circuits before opening a connection."""
+    assert _load_state_from_db("", "postgres://test") is None
+    assert _load_state_from_db(None, "postgres://test") is None
+
+
+def test_load_state_from_db_returns_none_when_dsn_empty() -> None:
+    """Empty dsn short-circuits before opening a connection."""
+    assert _load_state_from_db("audit-llm-carry-forward", "") is None
+
+
+def test_load_state_from_db_returns_none_when_row_missing(monkeypatch) -> None:
+    """Skill row does not exist (fetchone returns None)."""
+    cur = _FakeCursor()
+    cur.queue_fetchone(None)
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    assert _load_state_from_db("audit-llm-carry-forward", "postgres://test") is None
+
+
+def test_load_state_from_db_returns_none_when_value_null(monkeypatch) -> None:
+    """Skill row exists but last_run_state is NULL (first-ever run)."""
+    cur = _FakeCursor()
+    cur.queue_fetchone((None,))
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    assert _load_state_from_db("audit-llm-carry-forward", "postgres://test") is None
+
+
+def test_load_state_from_db_returns_none_when_value_not_dict(monkeypatch) -> None:
+    """Defensive: a row whose JSONB is not an object (e.g. a list) is ignored."""
+    cur = _FakeCursor()
+    cur.queue_fetchone((["not", "a", "dict"],))
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    assert _load_state_from_db("audit-llm-carry-forward", "postgres://test") is None
+
+
+def test_load_state_from_db_returns_none_when_psycopg_missing(monkeypatch) -> None:
+    """psycopg unavailable — the helper returns None instead of raising."""
+    # Make ``import psycopg`` fail.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    assert _load_state_from_db("audit-llm-carry-forward", "postgres://test") is None
+
+
+def test_load_state_from_db_returns_none_on_db_error(monkeypatch) -> None:
+    """A psycopg.connect error is logged and converted to None."""
+
+    class _BoomPsycopg:
+        def connect(self, dsn: str):
+            raise RuntimeError("connection refused")
+
+    _install_fake_psycopg(monkeypatch, _BoomPsycopg())
+    assert _load_state_from_db("audit-llm-carry-forward", "postgres://test") is None
+
+
+# ---------------------------------------------------------------------------
+# _save_state_to_db
+# ---------------------------------------------------------------------------
+
+
+def test_save_state_to_db_runs_update_and_commits(monkeypatch) -> None:
+    """Happy path — UPDATE runs against the scheduled_skills row + commit fires."""
+    cur = _FakeCursor()
+    cur.rowcount = 1  # 1 row updated
+    fake_conn = _FakeConn(cur)
+    fake = _FakePsycopg(lambda: fake_conn)
+    _install_fake_psycopg(monkeypatch, fake)
+
+    totals = {"Ventura": {"motion_type_contradiction": 100}}
+    ok = _save_state_to_db("audit-llm-carry-forward", "postgres://test", totals)
+    assert ok is True
+    assert fake_conn.committed is True
+    assert len(cur.executed) == 1
+    sql, params = cur.executed[0]
+    assert "UPDATE dispatcher.scheduled_skills" in sql
+    assert "SET last_run_state" in sql
+    assert "WHERE name = %s" in sql
+    # Payload is JSON-serialised + parameterised.
+    payload, name = params
+    assert name == "audit-llm-carry-forward"
+    assert json.loads(payload) == totals
+
+
+def test_save_state_to_db_returns_false_when_no_row(monkeypatch) -> None:
+    """UPDATE found no row — the row is missing for this skill name."""
+    cur = _FakeCursor()
+    cur.rowcount = 0
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    totals = {"Ventura": {"outcome_continue": 1}}
+    ok = _save_state_to_db("typo-skill-name", "postgres://test", totals)
+    assert ok is False
+
+
+def test_save_state_to_db_returns_false_when_skill_name_empty() -> None:
+    """Empty skill_name short-circuits."""
+    assert _save_state_to_db("", "postgres://test", {}) is False
+    assert _save_state_to_db(None, "postgres://test", {}) is False
+
+
+def test_save_state_to_db_returns_false_when_dsn_empty() -> None:
+    """Empty dsn short-circuits."""
+    assert _save_state_to_db("audit-llm-carry-forward", "", {}) is False
+
+
+def test_save_state_to_db_returns_false_when_psycopg_missing(monkeypatch) -> None:
+    """psycopg unavailable — the helper returns False instead of raising."""
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    assert _save_state_to_db("audit-llm-carry-forward", "postgres://test", {}) is False
+
+
+def test_save_state_to_db_returns_false_on_db_error(monkeypatch) -> None:
+    """A connect-time error is logged and the helper returns False."""
+
+    class _BoomPsycopg:
+        def connect(self, dsn: str):
+            raise RuntimeError("disk full")
+
+    _install_fake_psycopg(monkeypatch, _BoomPsycopg())
+    assert _save_state_to_db("audit-llm-carry-forward", "postgres://test", {}) is False
+
+
+# ---------------------------------------------------------------------------
+# DB-backed state — round-trip + integration with evaluate()
+# ---------------------------------------------------------------------------
+
+
+def test_db_state_roundtrip_drives_jump_detection_on_second_run(monkeypatch) -> None:
+    """Two consecutive probe-style runs: the second sees the first's totals
+    via the DB-backed state and produces a +30% jump finding.
+
+    Acceptance criterion 2 of issue #4318: after two consecutive scheduled
+    fires of /audit-llm-carry-forward, the second fire's findings include
+    at least one ``jump_*`` finding when synthetic data has a > 25% delta
+    on a noisy axis.
+    """
+    # Single shared "DB" — the same row persists between save and load.
+    storage: dict[str, dict] = {}
+
+    class _StorageCursor:
+        def __init__(self) -> None:
+            self.rowcount = 0
+            self._fetch_queue: list = []
+
+        def execute(self, sql: str, params: tuple = ()) -> None:
+            if "UPDATE" in sql:
+                payload_json, name = params
+                storage[name] = json.loads(payload_json)
+                self.rowcount = 1
+            elif "SELECT last_run_state" in sql:
+                (name,) = params
+                row_value = storage.get(name)
+                self._fetch_queue.append(
+                    (row_value,) if row_value is not None else (None,)
+                )
+
+        def fetchone(self):
+            if not self._fetch_queue:
+                return None
+            return self._fetch_queue.pop(0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _StorageConn:
+        def cursor(self) -> _StorageCursor:
+            return _StorageCursor()
+
+        def commit(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.close()
+            return False
+
+    class _StoragePsycopg:
+        def connect(self, dsn: str) -> _StorageConn:
+            return _StorageConn()
+
+    _install_fake_psycopg(monkeypatch, _StoragePsycopg())
+
+    skill = "audit-llm-carry-forward"
+    dsn = "postgres://test"
+
+    # --- Run 1: prior state is empty; persist totals=100 on the noisy axis.
+    summary_run1 = _summary({"Ventura": _county_bucket(motion_type_contradiction=100)})
+    prior_run1 = _load_state_from_db(skill, dsn)
+    assert prior_run1 is None  # first run sees no baseline
+
+    findings_run1 = evaluate(summary_run1, prior_totals=prior_run1)
+    # No jump finding on first run (no baseline).
+    assert all(not f.probe.startswith("jump_") for f in findings_run1)
+
+    saved = _save_state_to_db(skill, dsn, extract_county_totals(summary_run1))
+    assert saved is True
+    assert storage[skill]["Ventura"]["motion_type_contradiction"] == 100
+
+    # --- Run 2: load prior baseline + new totals=130 (+30% > +25% threshold).
+    summary_run2 = _summary({"Ventura": _county_bucket(motion_type_contradiction=130)})
+    prior_run2 = _load_state_from_db(skill, dsn)
+    assert prior_run2 is not None
+    assert prior_run2["Ventura"]["motion_type_contradiction"] == 100
+
+    findings_run2 = evaluate(summary_run2, prior_totals=prior_run2)
+    jump_findings = [f for f in findings_run2 if f.probe.startswith("jump_")]
+    assert len(jump_findings) == 1
+    assert jump_findings[0].probe == "jump_motion_type_contradiction"
+    assert jump_findings[0].details["prior_count"] == 100
+    assert jump_findings[0].details["current_count"] == 130
+
+
+def test_load_state_from_db_falls_back_to_file_when_db_returns_none(
+    monkeypatch, tmp_path
+) -> None:
+    """Acceptance criterion 3: missing DB state falls back to the local
+    --state file path (development fallback).
+
+    This test asserts the helper composition the probe uses in main():
+    ``prior = _load_state_from_db(...) or _load_state(--state)``.
+    Both layers missing => first-run mode (None).
+    """
+    # Make the DB-backed read return None (simulates the column not yet
+    # populated in dev or no row).
+    cur = _FakeCursor()
+    cur.queue_fetchone(None)
+    fake = _FakePsycopg(lambda: _FakeConn(cur))
+    _install_fake_psycopg(monkeypatch, fake)
+
+    state_path = tmp_path / "last_totals.json"
+    fallback_totals = {"Ventura": {"motion_type_contradiction": 50}}
+    _save_state(str(state_path), fallback_totals)
+
+    # Compose the same way main() does.
+    prior = _load_state_from_db("audit-llm-carry-forward", "postgres://test")
+    if prior is None:
+        prior = _load_state(str(state_path))
+    assert prior == fallback_totals

@@ -37,6 +37,34 @@ Usage::
 The ``--state`` path is read for prior totals (jump-detection) and rewritten
 on success. Missing state file => first-run mode (no jump-detection).
 
+State persistence (issue #4318)
+-------------------------------
+Each weekly fire is a fresh ECS task with an empty filesystem, so a
+local state file alone is permanently first-run mode and the noisy-axis
+jump check never fires. The probe primarily persists per-county totals
+to ``dispatcher.scheduled_skills.last_run_state`` (JSONB column added in
+migration 64). The DB row is keyed by ``--skill-name`` and the column
+shape is ``{county: {axis: count}}`` (the same shape as the
+``totals_by_county`` envelope field). The local ``--state`` path stays
+as a development fallback so anyone running the probe outside the ECS
+task — or against a database without migration 64 applied — still gets
+the same behaviour.
+
+Read order (first wins, both are best-effort):
+
+1. ``dispatcher.scheduled_skills.last_run_state`` for ``--skill-name``
+   when ``DATABASE_URL`` is set and the column exists.
+2. ``--state`` local file path.
+
+Write order (write to both when available so the local file stays a
+faithful copy of DB state for debugging):
+
+1. ``dispatcher.scheduled_skills.last_run_state``.
+2. ``--state`` local file path.
+
+Either layer missing => the other is still authoritative; missing both
+=> first-run mode.
+
 Exit codes:
     0   Probe completed; JSON written.
     1   DATABASE_URL missing, DB connection failed, audit error.
@@ -447,6 +475,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             f"{DEFAULT_NOISY_JUMP_FRACTION:.2f} == 25%%)."
         ),
     )
+    parser.add_argument(
+        "--skill-name",
+        default="audit-llm-carry-forward",
+        help=(
+            "Scheduled-skill name keying the persistent state row in "
+            "dispatcher.scheduled_skills.last_run_state (issue #4318). "
+            "Default: 'audit-llm-carry-forward'. Set to '' to disable "
+            "DB-backed state and use only the --state file path."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -475,6 +513,103 @@ def _save_state(path: str | None, totals: dict[str, dict[str, int]]) -> None:
         json.dump(totals, fh, indent=2, sort_keys=True)
 
 
+def _load_state_from_db(
+    skill_name: str | None,
+    dsn: str,
+) -> dict[str, dict[str, int]] | None:
+    """Best-effort load of prior per-county totals from the DB row.
+
+    Reads ``dispatcher.scheduled_skills.last_run_state`` for ``skill_name``
+    (issue #4318, migration 64). Returns ``None`` for any of:
+
+      * ``skill_name`` is empty.
+      * ``dsn`` is empty.
+      * psycopg cannot be imported (e.g. running outside the
+        scraper-framework venv in CI).
+      * The column does not exist (migration 64 not yet applied — the
+        probe falls back to the ``--state`` local file in that case).
+      * The skill row does not exist or its ``last_run_state`` is NULL.
+      * Any other DB error — the probe falls back to the local file.
+
+    Returning ``None`` means "no DB-backed baseline" — the caller layers
+    in the local file path next.
+    """
+    if not skill_name or not dsn:
+        return None
+    try:
+        import psycopg  # noqa: PLC0415 — lazy import; CI may lack psycopg
+    except ImportError:
+        return None
+    try:
+        with psycopg.connect(dsn) as conn:  # type: ignore[attr-defined]
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT last_run_state "
+                    "  FROM dispatcher.scheduled_skills "
+                    " WHERE name = %s",
+                    (skill_name,),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        sys.stderr.write(
+            f"llm_carry_forward_probe: DB state load failed "
+            f"(skill={skill_name!r}): {exc}\n"
+        )
+        return None
+    if not row:
+        return None
+    value = row[0]
+    if value is None:
+        return None
+    # psycopg returns JSONB as a Python dict already.
+    if not isinstance(value, dict):
+        return None
+    return value  # type: ignore[return-value]
+
+
+def _save_state_to_db(
+    skill_name: str | None,
+    dsn: str,
+    totals: dict[str, dict[str, int]],
+) -> bool:
+    """Best-effort save of current per-county totals to the DB row.
+
+    Writes to ``dispatcher.scheduled_skills.last_run_state`` for
+    ``skill_name`` (issue #4318, migration 64). Returns ``True`` on a
+    successful UPDATE that touched a row, ``False`` otherwise (no skill
+    row, missing column, psycopg unavailable, DB error, etc.).
+
+    The write is best-effort because the probe also writes to the local
+    ``--state`` file as a fallback. A False return is logged to stderr
+    but does not fail the run.
+    """
+    if not skill_name or not dsn:
+        return False
+    try:
+        import psycopg  # noqa: PLC0415 — lazy import; CI may lack psycopg
+    except ImportError:
+        return False
+    payload = json.dumps(totals, sort_keys=True)
+    try:
+        with psycopg.connect(dsn) as conn:  # type: ignore[attr-defined]
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.scheduled_skills "
+                    "   SET last_run_state = %s::jsonb "
+                    " WHERE name = %s",
+                    (payload, skill_name),
+                )
+                rowcount = cur.rowcount
+            conn.commit()
+    except Exception as exc:
+        sys.stderr.write(
+            f"llm_carry_forward_probe: DB state save failed "
+            f"(skill={skill_name!r}): {exc}\n"
+        )
+        return False
+    return bool(rowcount)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -501,7 +636,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"llm_carry_forward_probe: audit error: {exc}\n")
         return 1
 
-    prior = _load_state(args.state)
+    # Read state — DB-backed first (issue #4318), local file as fallback.
+    prior = _load_state_from_db(args.skill_name, dsn)
+    if prior is None:
+        prior = _load_state(args.state)
     findings = evaluate(
         summary,
         prior_totals=prior,
@@ -521,7 +659,10 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.output, "w", encoding="utf-8") as fh:
         json.dump(envelope, fh, indent=2, default=str)
 
-    # Persist for next run's jump-detection.
+    # Persist for next run's jump-detection. Write to DB first so the
+    # next ECS task (with an empty filesystem) can still read prior
+    # totals; mirror to the local file as a fallback (and for debugging).
+    _save_state_to_db(args.skill_name, dsn, envelope["totals_by_county"])
     _save_state(args.state, envelope["totals_by_county"])
     return 0
 
