@@ -25,6 +25,9 @@ These tests cover:
 
 from __future__ import annotations
 
+import io
+import json
+import logging
 import os
 import sys
 from typing import Any
@@ -508,3 +511,139 @@ class TestCLI:
         parser = _script._build_parser()
         args = parser.parse_args(["--county", "Santa Clara", "--limit", "5"])
         assert args.limit == 5
+
+
+# ---------------------------------------------------------------------------
+# Logger surfacing of ``extra=`` fields (#4368)
+# ---------------------------------------------------------------------------
+
+
+class TestLoggerExtraFieldsSurfaceInOutput:
+    """Regression for #4368.
+
+    The script previously called ``logging.basicConfig`` with the format
+    string ``"%(asctime)s %(levelname)-8s %(message)s"``. That format string
+    silently drops every ``extra=`` field passed to ``logger.info(...)``,
+    so CloudWatch Logs Insights output for ``Skipping cluster`` and
+    ``Drain summary`` lines was missing the very ``s3_key`` /
+    ``plan_status`` / ``clusters_drained`` fields a follow-up agent needs
+    to verify each post-deploy run.
+
+    The fix swaps ``logging.basicConfig`` for
+    ``configure_structlog(json=True, stdlib_bridge=True)`` (the same
+    pattern ``scripts/reingest_from_s3.py`` uses), which routes stdlib
+    ``logging.getLogger().info(..., extra={...})`` calls through
+    structlog's ``ProcessorFormatter`` + ``ExtraAdder`` so the extras
+    are JSON-encoded into the output line.
+
+    These tests assert the fix at the layer the bug lives — they capture
+    the script-module logger's actual stderr output and assert the
+    ``extra=`` fields surface as JSON keys.
+    """
+
+    def _capture_logger_output(self, emit_fn) -> str:
+        """Attach a StringIO StreamHandler to the root logger (the same
+        place the structlog stdlib_bridge installed its formatter), invoke
+        ``emit_fn``, return the captured bytes.
+
+        We attach a *second* handler that uses the same formatter as the
+        existing root handler so the captured output is identical to what
+        ECS / CloudWatch sees, just redirected to a buffer instead of
+        stderr.
+        """
+        root = logging.root
+        # Find the handler the structlog stdlib bridge installed at
+        # module-import time so we can clone its formatter.
+        bridge_handler = next(
+            (h for h in root.handlers if h.formatter is not None),
+            None,
+        )
+        assert bridge_handler is not None, (
+            "Expected configure_structlog(stdlib_bridge=True) to have "
+            "installed a StreamHandler with a ProcessorFormatter on the "
+            "root logger when drain_splitter_carry_forward_clusters was "
+            "imported."
+        )
+
+        buffer = io.StringIO()
+        capture_handler = logging.StreamHandler(buffer)
+        capture_handler.setFormatter(bridge_handler.formatter)
+        root.addHandler(capture_handler)
+        try:
+            emit_fn()
+        finally:
+            root.removeHandler(capture_handler)
+        return buffer.getvalue()
+
+    def test_skipping_cluster_log_surfaces_s3_key_and_plan_status(self) -> None:
+        # Mirror the call site at line 659 — the post-deploy verification
+        # path needs to be able to grep CloudWatch for the plan_status
+        # field to count skip_no_split vs. skip_single_title vs. error.
+        def _emit() -> None:
+            _script.logger.info(
+                "Skipping cluster — splitter would not improve it",
+                extra={
+                    "s3_key": "ca/santa_clara/2026/05/09/example.pdf",
+                    "plan_status": "skip_no_split",
+                    "distinct_titles": 1,
+                },
+            )
+
+        output = self._capture_logger_output(_emit)
+        # The output must carry every field, not just the message text.
+        assert "s3_key" in output, (
+            "extra={'s3_key': ...} must surface in log output (#4368). "
+            f"Captured output: {output!r}"
+        )
+        assert "plan_status" in output
+        assert "distinct_titles" in output
+        assert "ca/santa_clara/2026/05/09/example.pdf" in output
+        assert "skip_no_split" in output
+
+    def test_drain_summary_log_surfaces_counter_fields(self) -> None:
+        # Mirror the call site at line 803 — the canonical "did the drain
+        # actually drain anything" verification field is
+        # ``clusters_drained``. Without it surfacing in CloudWatch, the
+        # post-deploy verification has no choice but to run a local probe
+        # against the in-repo fixture (which is what motivated #4368).
+        def _emit() -> None:
+            _script.logger.info(
+                "Drain summary",
+                extra={
+                    "clusters_found": 22,
+                    "clusters_drained": 15,
+                    "clusters_skipped": 7,
+                    "children_deleted_total": 38,
+                },
+            )
+
+        output = self._capture_logger_output(_emit)
+        assert "clusters_found" in output
+        assert "clusters_drained" in output
+        assert "clusters_skipped" in output
+        assert "children_deleted_total" in output
+        # Numeric values must surface — JSON renders them unquoted.
+        assert "22" in output
+        assert "15" in output
+        assert "38" in output
+
+    def test_log_lines_are_parseable_json(self) -> None:
+        # CloudWatch Logs Insights treats each line as JSON when the
+        # message starts with ``{``. The structlog JSONRenderer emits
+        # exactly one JSON object per log call.
+        def _emit() -> None:
+            _script.logger.info(
+                "Drain summary",
+                extra={"clusters_drained": 15},
+            )
+
+        output = self._capture_logger_output(_emit)
+        # Strip trailing newline and parse.
+        line = output.strip()
+        # Some test environments interleave handlers — pull the line
+        # that starts with ``{`` (the JSON one).
+        json_lines = [ln for ln in line.split("\n") if ln.startswith("{")]
+        assert json_lines, f"Expected at least one JSON-formatted line; got: {output!r}"
+        parsed = json.loads(json_lines[-1])
+        assert parsed.get("event") == "Drain summary"
+        assert parsed.get("clusters_drained") == 15
