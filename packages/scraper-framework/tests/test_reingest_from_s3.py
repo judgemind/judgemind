@@ -4084,6 +4084,12 @@ class TestScraperRegistryAutoDiscovery:
         Multi-scraper modules (those exporting ``_SCRAPER_CLASS_BY_ID`` with
         multiple ``default_config_<suffix>`` factories) contribute one expected
         scraper_id per factory (#2599).
+
+        Modules exporting ``_SPLIT_REGISTRY_ALIASES`` also contribute one
+        expected entry per alias — these are the rebuild-path scraper_ids
+        emitted by ``scripts/rebuild_db.py`` and the loader registers them
+        under the canonical scraper class so ``_reparse_document`` can call
+        ``parse_document`` on rebuild rows (#4386).
         """
         import inspect
         import pkgutil
@@ -4121,6 +4127,10 @@ class TestScraperRegistryAutoDiscovery:
                     _name == "default_config" or _name.startswith("default_config_")
                 ) and obj.__module__ == mod.__name__:
                     expected_ids.add(obj().scraper_id)
+            # Include _SPLIT_REGISTRY_ALIASES entries — the loader registers
+            # the scraper class under each alias too (#4386).
+            for alias in getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or []:
+                expected_ids.add(alias)
 
         reingest._load_scraper_registry()
         assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
@@ -4352,11 +4362,18 @@ class TestReparsePdfDocuments:
             )
 
     def test_registry_keys_match_default_config_scraper_id(self) -> None:
-        """Each registry key should match a ``default_config*()`` factory's scraper_id.
+        """Each registry key should match a ``default_config*()`` factory's scraper_id
+        or one of the module's declared ``_SPLIT_REGISTRY_ALIASES``.
 
         Multi-scraper modules (#2599) expose multiple factories; walk them all
         and verify that every registered ``scraper_id`` is produced by some
         ``default_config*()`` factory in the class's module.
+
+        Aliases declared via ``_SPLIT_REGISTRY_ALIASES`` (#4386) are also
+        valid keys — the loader registers the canonical scraper class under
+        each alias so ``_reparse_document`` can call ``parse_document`` on
+        rebuild-path rows.  An alias key is valid iff the alias appears in
+        the registered class's module's ``_SPLIT_REGISTRY_ALIASES``.
         """
         import importlib
         import inspect
@@ -4370,9 +4387,11 @@ class TestReparsePdfDocuments:
                     _name == "default_config" or _name.startswith("default_config_")
                 ) and obj.__module__ == mod.__name__:
                     factory_ids.add(obj().scraper_id)
-            assert scraper_id in factory_ids, (
+            alias_ids: set[str] = set(getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or [])
+            assert scraper_id in (factory_ids | alias_ids), (
                 f"scraper_id {scraper_id!r} not produced by any default_config* "
-                f"factory in {mod.__name__}"
+                f"factory in {mod.__name__} (factories produce {sorted(factory_ids)}, "
+                f"aliases declare {sorted(alias_ids)})"
             )
 
     def test_idempotent_load(self) -> None:

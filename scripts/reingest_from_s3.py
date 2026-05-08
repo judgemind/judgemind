@@ -391,6 +391,20 @@ def _load_scraper_registry() -> None:
             # canonical scraper_id only.
             split_aliases: list[str] = getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or []
 
+            # Register the scraper class under each alias too.  Without
+            # this, ``_reparse_document`` (line ~1123) fails to resolve
+            # rebuild-path rows to a class, ``parse_document`` is never
+            # called, and ``extracted["ruling_text"]`` keeps the raw HTML
+            # — which ``check_no_html_in_ruling_text`` then rejects,
+            # skipping the DB write and the judge resolver chain.  The
+            # split / llm-split registries already honored aliases
+            # (below); aliasing the scraper-class registry closes the
+            # gap so future counties that define
+            # ``_SPLIT_REGISTRY_ALIASES`` get the same upgrade for free
+            # (#4386).
+            for alias in split_aliases:
+                _SCRAPER_REGISTRY[alias] = scraper_cls
+
             # Register split function if the module exports one.
             # Convention: a module-level ``_split_rulings`` callable
             # indicates that the scraper produces multi-ruling documents
@@ -1225,13 +1239,23 @@ def _reparse_document(
     # ------------------------------------------------------------------
     # San Diego direct narrowing (#2311, #2381)
     # ------------------------------------------------------------------
-    # San Diego calendar pages contain 30+ cases per HTML file.  When a
-    # document has no registered scraper class (e.g. scraper_id
-    # "rebuild-ca-san_diego" from rebuild_db.py), ``parse_document`` is
-    # never called and ``extracted["ruling_text"]`` remains the full raw
-    # HTML page (~50KB).  We narrow directly here so the stored
-    # ruling_text becomes the plain-text excerpt for the specific case,
-    # independent of whether LLM extraction runs below.
+    # San Diego calendar pages contain 30+ cases per HTML file.
+    # Historically, when a document had no registered scraper class
+    # (e.g. scraper_id "rebuild-ca-san_diego" from rebuild_db.py),
+    # ``parse_document`` was never called and ``extracted["ruling_text"]``
+    # remained the full raw HTML page (~50KB).
+    #
+    # As of #4386, ``_load_scraper_registry`` registers
+    # ``_SCRAPER_REGISTRY`` under each ``_SPLIT_REGISTRY_ALIASES`` entry
+    # too, so rebuild-path scraper_ids now resolve to the canonical
+    # scraper class and ``parse_document`` IS called.  This narrowing
+    # block is kept as belt-and-suspenders defense for any SD document
+    # whose scraper class still happens to be unregistered (e.g. a
+    # synthetic future scraper_id outside the alias list, or an
+    # initialization failure that left the registry partially loaded).
+    # We narrow directly here so the stored ruling_text becomes the
+    # plain-text excerpt for the specific case, independent of whether
+    # LLM extraction runs below.
     sd_case_num = extracted.get("case_number")
     if (
         sd_case_num
