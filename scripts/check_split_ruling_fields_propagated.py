@@ -445,6 +445,90 @@ def discover_reingest_propagation(
 
 
 # ---------------------------------------------------------------------------
+# Fix-block guidance: copy-pasteable patch for scope-table omissions
+# ---------------------------------------------------------------------------
+
+
+def _suggest_worker_fn_name(stem: str, worker_path: Path) -> tuple[str, bool]:
+    """Look for an existing ``_try_<county>[_<format>]_split`` function in
+    *worker_path* that matches the dataclass module *stem*.
+
+    The convention is ``_try_<county>_<format>_split`` where ``<county>`` is
+    typically the module stem with ``_tentatives`` stripped (e.g. stem
+    ``sc_tentatives`` → county ``sc``) and ``<format>`` is one of ``pdf`` /
+    ``html`` / ``calendar`` (or absent).  If a real match is found, return
+    ``(name, True)``; otherwise return a conventional placeholder
+    ``(_try_<county>_pdf_split, False)`` so the Fix block is still
+    copy-pasteable — the operator just edits the format if needed.
+    """
+    county = stem
+    if county.endswith("_tentatives"):
+        county = county[: -len("_tentatives")]
+
+    if not worker_path.is_file():
+        return (f"_try_{county}_pdf_split", False)
+
+    try:
+        tree = ast.parse(
+            worker_path.read_text(encoding="utf-8"), filename=str(worker_path)
+        )
+    except SyntaxError:
+        return (f"_try_{county}_pdf_split", False)
+
+    prefix = f"_try_{county}_"
+    suffix = "_split"
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name.startswith(prefix)
+            and node.name.endswith(suffix)
+        ):
+            return (node.name, True)
+    # No match — also try the bare ``_try_<county>_split`` shape (no format
+    # token) before falling back to the placeholder.
+    bare = f"_try_{county}_split"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == bare:
+            return (bare, True)
+
+    return (f"_try_{county}_pdf_split", False)
+
+
+def _suggest_scope_entry(dc: DataclassDef, worker_path: Path) -> str:
+    """Build a copy-pasteable Fix block for a ``*SplitRuling`` dataclass
+    that is missing from ``_DATACLASS_SCOPE``.
+
+    The block reproduces the exact dict-literal shape used in the live
+    scope table so the operator can paste it in without reformatting.
+    """
+    # The scope key matches what ``discover_dataclasses`` uses: bare class
+    # name, except for plain ``SplitRuling`` which is disambiguated by
+    # ``@<module-stem>`` suffix.
+    if dc.class_name == "SplitRuling":
+        scope_key = f"SplitRuling@{Path(dc.file_path).stem}"
+    else:
+        scope_key = dc.class_name
+
+    worker_fn, real = _suggest_worker_fn_name(Path(dc.file_path).stem, worker_path)
+    worker_comment = (
+        "" if real else "  # adjust if the worker hook has a different name"
+    )
+
+    lines = [
+        "",
+        "Fix: Add this entry to _DATACLASS_SCOPE in "
+        "scripts/check_split_ruling_fields_propagated.py:",
+        "",
+        f'    "{scope_key}": {{',
+        f'        "worker_fn": "{worker_fn}",{worker_comment}',
+        '        "reingest": True,',
+        "    },",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Cross-check
 # ---------------------------------------------------------------------------
 
@@ -647,8 +731,39 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if blocking:
+        # Index dataclasses by bare class name so we can look up file_path
+        # when emitting the Fix block for ``<class itself>`` (scope-table)
+        # violations.  The bare name is unique enough for the scope-omission
+        # case — when two SplitRuling classes share the bare name (Fresno
+        # + Riverside today), both must be registered in _DATACLASS_SCOPE,
+        # so two scope violations fire and each gets its own Fix block.
+        # We map class_name → list[DataclassDef] to handle that case.
+        dc_by_name: dict[str, list[DataclassDef]] = {}
+        for dc in dataclasses:
+            dc_by_name.setdefault(dc.class_name, []).append(dc)
+
         for v in blocking:
             print(v.render())
+            if v.target == "scope":
+                # Find the DataclassDef that produced this violation so the
+                # Fix block can name the source-file stem (needed for the
+                # ``SplitRuling@<stem>`` disambiguator) and probe worker.py
+                # for an existing ``_try_<county>_split`` function.
+                candidates = dc_by_name.get(v.dataclass_name, [])
+                # If multiple dataclasses share the bare name, emit one Fix
+                # block per — they are independently scope-violating.
+                # Otherwise the loop runs at most once.
+                emitted_keys: set[str] = set()
+                for dc in candidates:
+                    fix_block = _suggest_scope_entry(dc, worker_path)
+                    # Avoid duplicates if a single iteration of the outer
+                    # blocking loop encounters the same DataclassDef again
+                    # via a different violation.
+                    key = f"{dc.class_name}@{Path(dc.file_path).stem}"
+                    if key in emitted_keys:
+                        continue
+                    emitted_keys.add(key)
+                    print(fix_block, file=sys.stderr)
         print(
             f"\nFound {len(blocking)} *SplitRuling propagation gap(s).  "
             "Either propagate the field through the worker / reingest path, "
