@@ -972,6 +972,86 @@ YML
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 20: scripts/*.py with bare subprocess.run rejected (#4328)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds scripts/foo.py with a subprocess.run call that has no timeout=
+# kwarg and no **kwargs splat, copies the real check script into the
+# scratch repo (mirrors scenarios 5/18/19), and asserts the hook exits
+# non-zero with the expected FAILED message. Mirrors the CI step
+# "Verify every subprocess.run call in scripts has timeout= or **kwargs"
+# inside the scripts-tests (python) job.
+echo "[scenario 20] scripts/*.py with bare subprocess.run — hook rejects push (#4328)"
+init_workspace
+
+SUBP_TIMEOUTS_SH="$REPO_ROOT/scripts/check-subprocess-timeouts.sh"
+if [ ! -x "$SUBP_TIMEOUTS_SH" ]; then
+    report_skip "scripts/check-subprocess-timeouts.sh unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-bare-subprocess
+    mkdir -p "$WORK/scripts"
+    cp "$SUBP_TIMEOUTS_SH" "$WORK/scripts/check-subprocess-timeouts.sh"
+    chmod +x "$WORK/scripts/check-subprocess-timeouts.sh"
+    # Write a scripts/*.py file with a subprocess.run call that lacks a
+    # timeout= kwarg AND a **kwargs splat — exactly the shape #4328
+    # wires the hook to catch.
+    cat > "$WORK/scripts/foo.py" <<'PY'
+"""Test fixture for #4328 — bare subprocess.run with no timeout."""
+
+import subprocess
+
+
+def run_git_status() -> None:
+    """Run git status without a timeout — must be rejected by the hook."""
+    subprocess.run(["git", "status"], check=True)
+PY
+    git -C "$WORK" add scripts/foo.py scripts/check-subprocess-timeouts.sh
+    git -C "$WORK" commit --quiet -m "feat: add scripts/foo.py with bare subprocess.run"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-bare-subprocess $feat_sha refs/heads/feature-bare-subprocess $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject bare subprocess.run (#4328), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "FAILED: scripts/check-subprocess-timeouts.sh"; then
+        report_fail "expected 'FAILED: scripts/check-subprocess-timeouts.sh' in output (#4328)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "scripts/foo.py"; then
+        report_fail "expected hook output to name the violating file 'scripts/foo.py' (#4328)" "$hook_out"
+    else
+        report_pass "hook rejects push with bare subprocess.run in scripts/*.py (#4328)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 21: docs-only push does NOT fire subprocess-timeouts (#4328 AC2)
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches only docs/*.md must NOT invoke the
+# subprocess-timeouts check (per the AC: "no overhead on pure
+# docs/CI/Terraform pushes"). Verifies the hook's path filter is doing
+# its job. Asserts the hook does not emit the
+# "checking subprocess.run / urlopen timeouts" probe line.
+echo "[scenario 21] docs-only push — subprocess-timeouts gate must NOT fire (#4328 AC2)"
+init_workspace
+
+git -C "$WORK" checkout --quiet -b feature-docs-only
+mkdir -p "$WORK/docs"
+cat > "$WORK/docs/foo.md" <<'MD'
+# Sample doc
+
+This is a sample documentation file.
+MD
+git -C "$WORK" add docs/foo.md
+git -C "$WORK" commit --quiet -m "docs: add foo.md"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-docs-only $feat_sha refs/heads/feature-docs-only $ZERO_SHA"
+
+if echo "$hook_out" | grep -q "checking subprocess.run / urlopen timeouts"; then
+    report_fail "docs-only push must NOT fire subprocess-timeouts gate (#4328 AC2)" "$hook_out"
+else
+    report_pass "docs-only push skips subprocess-timeouts gate (#4328 AC2)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
