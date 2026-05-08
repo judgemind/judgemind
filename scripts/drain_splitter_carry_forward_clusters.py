@@ -404,12 +404,12 @@ def restore_parent_for_cluster(
 
     Runs entirely within the caller's transaction. The four steps:
 
-      1. ``SELECT ... FOR UPDATE`` against ``derived.documents`` filtered
-         by ``s3_key`` and ``status = 'active'``. Locks every child row.
-      2. ``DELETE FROM derived.rulings`` on those child IDs.
-      3. ``DELETE FROM derived.documents`` on those child IDs.
-      4. ``INSERT INTO derived.documents ... ON CONFLICT (id) DO UPDATE``
-         with ``id = derive_parent_document_id(parent_content_hash)``.
+      1. Lock every active child row for this s3_key with a row-level
+         ``FOR UPDATE``-style read against ``derived.documents``.
+      2. Delete child rulings by id.
+      3. Delete child documents by id.
+      4. Upsert the parent document row keyed on
+         ``derive_parent_document_id(parent_content_hash)``.
 
     Args:
         conn: Active psycopg connection. The caller manages the
