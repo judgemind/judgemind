@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
-# check-bash-set-u-empty-array.sh — Forbid the bash 5.x footgun where
-# ``declare -a <name>`` (without ``=()``) is later expanded as
-# ``${#<name>[@]}`` or ``"${<name>[@]}"`` under ``set -u``.
+# check-bash-set-u-empty-array.sh — Forbid two sibling bash + ``set -u``
+# empty-array footguns:
+#
+#   (A) ``declare -a <name>`` (without ``=()``) is later expanded as
+#       ``${#<name>[@]}`` or ``"${<name>[@]}"``. Trips on bash 5.x
+#       (Linux CI), passes on bash 3.2 (macOS).
+#
+#   (B) ``<name>=()`` is later iterated as ``"${<name>[@]}"`` /
+#       ``"${<name>[*]}"`` while still empty (no intervening
+#       ``<name>+=(...)`` or ``<name>=(...)``-with-content). Trips on
+#       bash 3.2 (macOS), passes on bash 5.x.
+#
+# Both are different declaration forms of the same root-cause class:
+# declared-but-empty indexed arrays read with ``[@]`` / ``[*]`` under
+# nounset, where bash 3.2 and bash 5.x disagree on what ``unbound``
+# means.
 #
 # Why this check exists
 # ---------------------
-# ``declare -a <name>`` declares an indexed array but does NOT assign
-# it. On bash 3.2 (macOS operator laptops), reading
+# Shape (A): ``declare -a <name>`` declares an indexed array but does
+# NOT assign it. On bash 3.2 (macOS operator laptops), reading
 # ``${#empty_declared_array[@]}`` returns 0 cleanly. On bash 5.x (Linux
 # CI runners) under ``set -u``, the same read trips ``unbound
 # variable``:
@@ -23,6 +36,20 @@
 # empty array, so the subsequent ``${#<name>[@]}`` read sees a
 # bound-but-empty array and returns 0 on every bash version.
 #
+# Shape (B): ``<name>=()`` initialises the array empty, but iterating
+# ``"${<name>[@]}"`` while it is *still* empty trips ``unbound
+# variable`` on bash 3.2 — the inverse-direction skew of shape (A).
+# The size read ``${#<name>[@]}`` itself is fine on bash 3.2, but the
+# ``[@]`` / ``[*]`` element-expansion form is not. Surfaced in #4332's
+# ``scripts/run-ci-guards.sh`` umbrella (worked around at lines 254 +
+# 280 with ``if [ "${#arr[@]}" -gt 0 ]`` length guards); tracked here
+# as #4336.
+#
+# The canonical fix for shape (B) is the same length-guard one-liner:
+# wrap iteration in ``if [ "${#<name>[@]}" -gt 0 ]; then`` so the
+# loop body is skipped when the array is empty. Pre-populating the
+# array with at least one assignment before reading also fixes it.
+#
 # Detection strategy
 # ------------------
 # This check is line-text-based (not AST-based) so it runs in a few
@@ -33,13 +60,12 @@
 #      anywhere in the file. If not, skip the file — no nounset, no
 #      bug.
 #
-#   2. Find every ``declare -a <name>`` (or ``typeset -a <name>``)
-#      that is NOT immediately followed by ``=`` — i.e. a bare declare
-#      without an inline assignment. Record the line number and the
-#      array name.
-#
-#   3. For each (name, declare_line) pair: scan the file from
-#      ``declare_line + 1`` to EOF looking for either:
+#   2. (Shape A) Find every ``declare -a <name>`` (or ``typeset -a
+#      <name>``) that is NOT immediately followed by ``=`` — i.e. a
+#      bare declare without an inline assignment. Record the line
+#      number and the array name. For each (name, declare_line) pair:
+#      scan the file from ``declare_line + 1`` to EOF looking for
+#      either:
 #        - an assignment ``<name>=(`` or ``<name>+=(`` (clears the bug
 #          — array is bound before any read), OR
 #        - a read ``${#<name>[@]}`` or ``"${<name>[@]}"`` or
@@ -47,10 +73,30 @@
 #      Whichever comes first determines the verdict: read-first → flag,
 #      assign-first → safe.
 #
+#   3. (Shape B) Find every bare-empty ``<name>=()`` declaration —
+#      i.e. an indexed-array initialiser where the parens are empty
+#      (whitespace-only between ``(`` and ``)``). Record the line
+#      number and the array name. For each (name, decl_line) pair:
+#      scan from ``decl_line + 1`` to EOF looking for either:
+#        - an assignment ``<name>=(`` or ``<name>+=(`` (the bug is
+#          cleared the moment any element appends or a fresh
+#          assignment lands), OR
+#        - an iteration-form read ``"${<name>[@]}"`` or
+#          ``"${<name>[*]}"`` (i.e. element expansion, NOT the size
+#          form ``${#<name>[@]}`` which is bash-3.2-safe — flags the
+#          bug).
+#      Same first-wins verdict logic.
+#
 # What it does NOT flag
 # ---------------------
 #   - ``declare -a <name>=()`` — the inline form is fine.
-#   - ``<name>=()`` — the no-declare form is fine.
+#   - ``<name>=()`` followed by ``<name>+=(...)`` BEFORE any iteration
+#     read — append-then-iterate is bash-3.2-safe because the array is
+#     no longer empty by the time iteration runs.
+#   - ``<name>=()`` whose only subsequent reads are size form
+#     ``${#<name>[@]}`` / ``${#<name>[*]}`` — bash 3.2 handles size
+#     reads of empty initialised arrays cleanly.
+#   - ``<name>=("a" "b")`` with content — not bare-empty, not flagged.
 #   - ``declare -a <name>`` followed by ``<name>+=(...)`` BEFORE any
 #     ``${#<name>[@]}`` read — append-then-read is bash 3.2 / 5.x
 #     compatible because ``+=`` on an undeclared array binds it.
@@ -74,10 +120,9 @@
 # Exit codes
 # ----------
 #   0 — No violations found.
-#   1 — One or more shell scripts have ``declare -a <name>`` followed
-#       by ``${#<name>[@]}`` (or ``"${<name>[@]}"``) under ``set -u``
-#       without an intervening assignment. The offending lines are
-#       printed with file:line:content plus the suggested fix.
+#   1 — One or more shell scripts trip shape (A) or shape (B). The
+#       offending lines are printed with file:line:content plus the
+#       suggested fix.
 
 set -euo pipefail
 
@@ -140,6 +185,16 @@ NOUNSET_REGEX='^[[:space:]]*set[[:space:]]+(-[a-zA-Z]*u[a-zA-Z]*([[:space:]]|$)|
 # NOT followed by ``=`` (i.e. bare declare). Captures <name> in
 # BASH_REMATCH[2].
 DECLARE_BARE_REGEX='^[[:space:]]*(declare|typeset)[[:space:]]+-[a-zA-Z]*a[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)([[:space:]]|$)'
+
+# Match a bare-empty array initialiser ``<name>=()`` — i.e. the parens
+# are empty (whitespace-only between ``(`` and ``)``). Captures <name>
+# in BASH_REMATCH[1]. Anchored at start-of-line (with optional
+# leading whitespace) so a substring like ``foo=()`` inside an
+# expression is not picked up. Excludes ``declare -a <name>=()`` /
+# ``local -a <name>=()`` / ``readonly <name>=()`` and friends — those
+# inline-assignment forms are not the bare-empty pattern this check
+# targets, and they also fall under shape (A)'s "inline OK" carve-out.
+EMPTY_INIT_REGEX='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=\([[:space:]]*\)[[:space:]]*$'
 
 for file in "${sh_files[@]}"; do
     # Skip allow-listed files.
@@ -256,17 +311,133 @@ for file in "${sh_files[@]}"; do
 
         decl_idx=$((decl_idx + 1))
     done
+
+    # Pass 3: find bare-empty ``<name>=()`` lines and check for an
+    # iteration-form read (``"${<name>[@]}"`` / ``"${<name>[*]}"``)
+    # that fires *before* any intervening ``<name>+=(...)`` or
+    # ``<name>=(...)``-with-content assignment. Same first-wins
+    # verdict logic as Pass 2 but with a different declaration
+    # matcher and a stricter read regex (size form ``${#<name>[@]}``
+    # is not flagged — it is bash-3.2-safe).
+    init_idx=0
+    while (( init_idx < nlines )); do
+        iline="${lines[$init_idx]}"
+
+        # Skip comments.
+        if [[ "$iline" =~ ^[[:space:]]*# ]]; then
+            init_idx=$((init_idx + 1))
+            continue
+        fi
+
+        if [[ "$iline" =~ $EMPTY_INIT_REGEX ]]; then
+            iname="${BASH_REMATCH[1]}"
+
+            # Build name-specific patterns. Same assignment regex as
+            # Pass 2 — ``<name>=(`` or ``<name>+=(`` clears the bug
+            # by binding the array with at least one (or about to be
+            # one) element.
+            #
+            # The read regex is *stricter* than Pass 2's: it matches
+            # the bare element-expansion forms ``${<name>[@]}`` and
+            # ``${<name>[*]}`` only — i.e. ``[@]`` or ``[*]``
+            # IMMEDIATELY followed by ``}``. It deliberately does
+            # NOT match the size form ``${#<name>[@]}`` (bash-3.2-
+            # safe on an empty initialised array; flagging it here
+            # would over-report).
+            #
+            # Anchoring rationale: same as Pass 2 — leading
+            # ``[^A-Za-z0-9_]`` (or start-of-line) before the name
+            # ensures a substring like ``foo_bar=`` does not match
+            # when the array is ``foo``.
+            #
+            # Guarded-form exemption: lines containing the defensive
+            # parameter-expansion guard ``${<name>[@]+"${<name>[@]}"}``
+            # (or the ``[*]`` variant) are exempted in the scan
+            # below before the read regex is applied. The leading
+            # ``[@]+...`` substitutes nothing when the array is
+            # unset OR empty — the canonical bash-3.2-safe idiom for
+            # "iterate this maybe-empty array under set -u" — and
+            # the inner ``${<name>[@]}`` only evaluates when the
+            # array is non-empty, so it is not a footgun. We detect
+            # the guarded form via a substring presence check
+            # (``[@]+`` or ``[*]+`` after ``${<name>``) and skip
+            # the line.
+            iassign_regex="(^|[^A-Za-z0-9_])${iname}\\+?=\\("
+            iread_regex="\\\$\\{${iname}\\[[@*]\\]\\}"
+            iguarded_regex="\\\$\\{${iname}\\[[@*]\\]\\+"
+
+            iscan_idx=$((init_idx + 1))
+            iverdict=""
+            iverdict_line=0
+            iverdict_content=""
+            while (( iscan_idx < nlines )); do
+                isline="${lines[$iscan_idx]}"
+
+                # Skip comments inside the scan.
+                if [[ "$isline" =~ ^[[:space:]]*# ]]; then
+                    iscan_idx=$((iscan_idx + 1))
+                    continue
+                fi
+
+                # Check assignment first — it is the safe outcome.
+                if [[ "$isline" =~ $iassign_regex ]]; then
+                    iverdict="assigned"
+                    break
+                fi
+
+                # Skip lines using the guarded ``${name[@]+...}``
+                # parameter-expansion idiom. The line is bash-3.2-
+                # safe even when the array is empty, so do not
+                # treat it as a flagged read. The scan continues
+                # past the guarded line — the array is still empty
+                # afterward, so a later unguarded iteration would
+                # still be flagged.
+                if [[ "$isline" =~ $iguarded_regex ]]; then
+                    iscan_idx=$((iscan_idx + 1))
+                    continue
+                fi
+
+                if [[ "$isline" =~ $iread_regex ]]; then
+                    iverdict="read"
+                    iverdict_line=$((iscan_idx + 1))
+                    iverdict_content="$isline"
+                    break
+                fi
+
+                iscan_idx=$((iscan_idx + 1))
+            done
+
+            if [[ "$iverdict" == "read" ]]; then
+                report_lines+=("  [$iname=() iterated empty under set -u (bash 3.2 footgun)]")
+                report_lines+=("    $file:$((init_idx + 1)): $iline")
+                report_lines+=("    $file:$iverdict_line: $iverdict_content")
+                report_lines+=("    fix: guard with 'if [ \"\${#$iname[@]}\" -gt 0 ]; then ... fi'")
+                report_lines+=("         or pre-populate '$iname' before iterating")
+                violations=$((violations + 1))
+            fi
+        fi
+
+        init_idx=$((init_idx + 1))
+    done
 done
 
 if (( violations > 0 )); then
-    echo "ERROR: bash 5.x set -u + declare -a empty-array footgun(s) detected in scripts/**/*.sh."
+    echo "ERROR: bash + set -u empty-array footgun(s) detected in scripts/**/*.sh."
     echo ""
-    echo "  'declare -a <name>' declares an indexed array but does NOT"
-    echo "  assign it. On bash 3.2 (macOS) reading \${#<name>[@]} returns"
-    echo "  0 cleanly; on bash 5.x (Linux CI) under 'set -u' the same"
-    echo "  read trips '<name>: unbound variable'. Fix: replace"
-    echo "  'declare -a <name>' with '<name>=()' so the variable is"
-    echo "  bound to an empty array at declaration time."
+    echo "  Shape (A) — 'declare -a <name>' declares an indexed array"
+    echo "  but does NOT assign it. On bash 3.2 (macOS) reading"
+    echo "  \${#<name>[@]} returns 0 cleanly; on bash 5.x (Linux CI)"
+    echo "  under 'set -u' the same read trips '<name>: unbound"
+    echo "  variable'. Fix: replace 'declare -a <name>' with"
+    echo "  '<name>=()' so the variable is bound to an empty array at"
+    echo "  declaration time."
+    echo ""
+    echo "  Shape (B) — '<name>=()' initialises the array empty, but"
+    echo "  iterating \"\${<name>[@]}\" / \"\${<name>[*]}\" while it is"
+    echo "  still empty trips 'unbound variable' on bash 3.2 (the"
+    echo "  inverse-direction skew of shape A). Fix: guard iteration"
+    echo "  with 'if [ \"\${#<name>[@]}\" -gt 0 ]; then ... fi', or"
+    echo "  pre-populate the array before iterating."
     echo ""
     for line in "${report_lines[@]}"; do
         echo "$line"
@@ -275,8 +446,8 @@ if (( violations > 0 )); then
     echo "  Total violations: $violations"
     echo ""
     echo "  See: scripts/check-bash-set-u-empty-array.sh header for the"
-    echo "  full rationale and #4143 / PR #4140 for the originating"
-    echo "  incident."
+    echo "  full rationale, #4143 / PR #4140 for shape (A), and"
+    echo "  #4332 / #4336 for shape (B)."
     exit 1
 fi
 

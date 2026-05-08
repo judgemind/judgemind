@@ -21,7 +21,11 @@ TESTS=0
 # Cleanup any temp files on exit
 TEMP_FILES=()
 cleanup() {
-    for f in "${TEMP_FILES[@]}"; do
+    # ``${TEMP_FILES[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336) — without it, an early test
+    # failure that fires the EXIT trap before any
+    # create_temp_script call would crash the trap itself.
+    for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
         rm -f "$f"
     done
 }

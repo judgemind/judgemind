@@ -32,7 +32,9 @@ TEMP_DIRS=()
 cleanup() {
     # Errors during cleanup must not cause a non-zero exit
     set +e
-    for d in "${TEMP_DIRS[@]}"; do
+    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336).
+    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
         if [[ -n "$d" && -d "$d" ]]; then
             # Remove worktrees before deleting (only if it's a git repo)
             if git -C "$d" rev-parse --git-dir > /dev/null 2>&1; then

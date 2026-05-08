@@ -26,7 +26,9 @@ ORIG_PATH_SAVE=""
 
 cleanup() {
     set +eu
-    for d in "${TEMP_DIRS[@]}"; do
+    # ``${TEMP_DIRS[@]+...}`` guards empty-array iteration under
+    # bash 3.2 + set -u (see #4336).
+    for d in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
         if [[ -n "$d" && -d "$d" ]]; then
             # Abort any in-progress rebases in worktrees
             if git -C "$d" rev-parse --git-dir > /dev/null 2>&1; then
