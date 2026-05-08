@@ -283,6 +283,37 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test 11a: Per-violation Fix block names actual var.* args (#4346) ──────
+# The Python helper now emits a stderr Fix block that quotes the actual
+# var.* arguments inside compact([...]) so the operator can paste the
+# patch without having to look back at the offending TF.
+cat > "$TMPDIR_TEST/fix_block_test.tf" << 'TFEOF'
+resource "aws_iam_role_policy" "fix_target" {
+  name = "fix-target"
+  role = "some-role"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = compact([var.alpha_arn, var.beta_arn])
+    }]
+  })
+}
+TFEOF
+TESTS=$((TESTS + 1))
+fix_output=$(python3 "$PYTHON_HELPER" "$TMPDIR_TEST/fix_block_test.tf" 2>&1 || true)
+if echo "$fix_output" | grep -q '^Fix for "fix_target":' \
+    && echo "$fix_output" | grep -q "compacted_fix_target = compact(\\[var.alpha_arn, var.beta_arn\\])" \
+    && echo "$fix_output" | grep -q "count = length(local.compacted_fix_target) > 0 ? 1 : 0"; then
+    echo "PASS: Test 11a — Fix block names actual var.* args + resource"
+else
+    echo "FAIL: Test 11a — Fix block missing actual var.* args"
+    echo "  Got:"
+    echo "$fix_output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+
 # ─── Test 12: No self-match on ci.yml step name ──────────────────────────────
 # shellcheck source=./_guard_self_match_helpers.sh
 source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"

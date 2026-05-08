@@ -230,6 +230,45 @@ create_test_file "scripts/tests/a_b.sh"
 assert_passes "Collision inside scripts/tests/ is NOT flagged (scripts/ is non-recursive)"
 reset_tmpdir
 
+# ─── Test 18a: Fix block emitted with .py canonical winner (#4346) ──────
+# A *.py collision should suggest keeping the underscore form per Python
+# convention. The Fix block's `git rm ...` path uses the absolute path
+# of the loser; we assert by basename + canonical-winner phrase only.
+create_test_file "packages/foo/src/sub/my-mod.py"
+create_test_file "packages/foo/src/sub/my_mod.py"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^Fix:" \
+    && echo "$output" | grep -q "Convention for \*\.py prefers 'my_mod.py'" \
+    && echo "$output" | grep -qE "git rm '.*/my-mod\.py'"; then
+    echo "PASS: Test 18a — .py Fix block names underscore form as canonical winner"
+else
+    echo "FAIL: Test 18a — .py Fix block missing or wrong canonical winner"
+    echo "  Got:"
+    echo "$output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
+# ─── Test 18b: Fix block emitted with .sh canonical winner (#4346) ──────
+# A *.sh collision should suggest keeping the hyphen form per shell-script
+# convention.
+create_test_file "scripts/foo-bar.sh"
+create_test_file "scripts/foo_bar.sh"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^Fix:" \
+    && echo "$output" | grep -q "Convention for \*\.sh prefers 'foo-bar.sh'" \
+    && echo "$output" | grep -qE "git rm '.*/foo_bar\.sh'"; then
+    echo "PASS: Test 18b — .sh Fix block names hyphen form as canonical winner"
+else
+    echo "FAIL: Test 18b — .sh Fix block missing or wrong canonical winner"
+    echo "  Got:"
+    echo "$output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
 # ─── Test 19: No self-match on ci.yml step name ─────────────────────────
 # The step name in .github/workflows/ci.yml that runs this guard must
 # not itself contain the literal `-` / `_` filename-ambiguity pattern

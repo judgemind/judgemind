@@ -221,14 +221,66 @@ if [[ -n "$all_collisions" ]]; then
     echo "  the wrong one (see #2751 / #2754).  Rename one, or delete" >&2
     echo "  the stale sibling." >&2
     echo "" >&2
+    # Per-pair Fix block (#4346). Pick a canonical winner from the
+    # file's extension: Python (.py), Terraform (.tf, .tfvars), and TOML
+    # (.toml) prefer underscores; shell (.sh, .bash), markdown (.md),
+    # YAML (.yml, .yaml), and JSON (.json) prefer hyphens. Emit a literal
+    # `git rm` recipe + a grep call to find downstream importers.
+    fix_blocks=""
     while IFS=$'\t' read -r dir a b; do
         [[ -z "$dir" ]] && continue
         COLLISION_COUNT=$((COLLISION_COUNT + 1))
         echo "    $dir/$a" >&2
         echo "    $dir/$b" >&2
         echo "" >&2
+
+        ext_a="${a##*.}"
+        # Identify the underscore form vs the hyphen form. The pair
+        # always differs only by '-' vs '_', so swapping all '_' to '-'
+        # in one yields the other.
+        underscore_form=""
+        hyphen_form=""
+        if [[ "$a" == *"_"* && "${a//_/-}" == "$b" ]]; then
+            underscore_form="$a"
+            hyphen_form="$b"
+        elif [[ "$b" == *"_"* && "${b//_/-}" == "$a" ]]; then
+            underscore_form="$b"
+            hyphen_form="$a"
+        fi
+
+        keep=""
+        drop=""
+        case "$ext_a" in
+            py|tf|tfvars|toml)
+                keep="$underscore_form"
+                drop="$hyphen_form"
+                ;;
+            sh|bash|md|yml|yaml|json)
+                keep="$hyphen_form"
+                drop="$underscore_form"
+                ;;
+            *)
+                # Unknown extension — leave the choice to the operator.
+                ;;
+        esac
+
+        fix_blocks+="  Fix for collision in '$dir':"$'\n'
+        if [[ -n "$keep" && -n "$drop" ]]; then
+            fix_blocks+="    Convention for *.$ext_a prefers '$keep'. To collapse:"$'\n'
+            fix_blocks+="      git rm '$dir/$drop'  # if confirmed-duplicate"$'\n'
+            fix_blocks+="    Then find any importers / callers of the dropped name:"$'\n'
+            fix_blocks+="      grep -rn '${drop%.*}' . --include='*.py' --include='*.sh' --include='*.tf'"$'\n'
+        else
+            fix_blocks+="    Pick a winner ('$a' or '$b') and run:"$'\n'
+            fix_blocks+="      git rm '$dir/<loser>'"$'\n'
+            fix_blocks+="    Then update every importer / caller of the deleted name."$'\n'
+        fi
+        fix_blocks+=$'\n'
     done <<< "$all_collisions"
     echo "  Found $COLLISION_COUNT collision pair(s)." >&2
+    echo "" >&2
+    echo "Fix:" >&2
+    printf '%s' "$fix_blocks" >&2
     exit 1
 fi
 

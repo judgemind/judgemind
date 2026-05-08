@@ -109,6 +109,53 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test 9: Naming-pattern violation emits Fix block (#4346) ────────
+setup_repo
+echo "CREATE TABLE foo (id INT);" > "$TMPDIR_TEST/packages/api/migrations/initial.sql"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^Fix for naming-pattern violation 'initial.sql':" \
+    && echo "$output" | grep -q "git mv 'initial.sql'"; then
+    echo "PASS: Test 9 — naming-pattern Fix block emitted"
+else
+    echo "FAIL: Test 9 — Fix block missing for naming-pattern violation"
+    echo "  Got: $output"
+    FAILURES=$((FAILURES + 1))
+fi
+
+# ─── Test 10: Duplicate-number violation emits Fix block (#4346) ─────
+setup_repo
+echo "-- a" > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+echo "-- b" > "$TMPDIR_TEST/packages/api/migrations/1_also-initial.sql"
+echo "-- c" > "$TMPDIR_TEST/packages/api/migrations/2_alter.sql"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^Fix for duplicate migration number 1:" \
+    && echo "$output" | grep -q "1_initial.sql" \
+    && echo "$output" | grep -q "1_also-initial.sql" \
+    && echo "$output" | grep -q "3_<topic>.sql"; then
+    echo "PASS: Test 10 — duplicate-number Fix block emitted with concrete files + next free slot"
+else
+    echo "FAIL: Test 10 — Fix block missing for duplicate-number violation"
+    echo "  Got: $output"
+    FAILURES=$((FAILURES + 1))
+fi
+
+# ─── Test 11: Gap violation emits Fix block (#4346) ──────────────────
+setup_repo
+echo "-- a" > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+echo "-- c" > "$TMPDIR_TEST/packages/api/migrations/3_third.sql"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^Fix for migration number gap" \
+    && echo "$output" | grep -q "3_third.sql"; then
+    echo "PASS: Test 11 — gap Fix block emitted with concrete renumber suggestion"
+else
+    echo "FAIL: Test 11 — Fix block missing for gap violation"
+    echo "  Got: $output"
+    FAILURES=$((FAILURES + 1))
+fi
+
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
