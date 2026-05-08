@@ -10807,8 +10807,8 @@ class TestLlmSplitRegistry:
 
         try:
             result = reingest._full_reparse_document(b"raw pdf", "test-llm-split", self._doc_meta())
-            # LLM split should have been called
-            mock_llm_split.assert_called_once_with("full pdf text")
+            # LLM split should have been called with pdf_bytes (#4360 contract).
+            mock_llm_split.assert_called_once_with("full pdf text", pdf_bytes=b"raw pdf")
             # Regex split should NOT have been called
             mock_regex_split.assert_not_called()
             # Ruling text should come from LLM (full analysis)
@@ -11417,10 +11417,10 @@ class TestLlmSplitExceptionFallback:
             result = reingest._full_reparse_document(
                 b"raw pdf", "test-llm-exception", self._doc_meta()
             )
-            # LLM was called but raised
-            mock_llm_split.assert_called_once_with("full pdf text")
-            # Regex fallback was called
-            mock_regex_split.assert_called_once_with("full pdf text")
+            # LLM was called but raised — must pass pdf_bytes (#4360 contract).
+            mock_llm_split.assert_called_once_with("full pdf text", pdf_bytes=b"raw pdf")
+            # Regex fallback was called — must also pass pdf_bytes.
+            mock_regex_split.assert_called_once_with("full pdf text", pdf_bytes=b"raw pdf")
             # Results come from regex
             assert len(result) == 2
             assert result[0]["ruling_text"] == "DENY MSJ."
@@ -11562,7 +11562,8 @@ class TestLlmOnlySplitRegistry:
 
         try:
             result = reingest._full_reparse_document(b"raw html", "test-llm-only", self._doc_meta())
-            mock_llm_split.assert_called_once_with("full html text")
+            # LLM split must receive pdf_bytes (#4360 contract).
+            mock_llm_split.assert_called_once_with("full html text", pdf_bytes=b"raw html")
             assert len(result) == 2
             assert result[0]["ruling_text"] == "First ruling text"
             assert result[1]["ruling_text"] == "Second ruling text"
@@ -13921,3 +13922,158 @@ class TestSplitChildGuardUntouched:
             "is_split_child_id guard signature changed — verify #4049 plumbing "
             "did not regress the DB-row multimodal mode."
         )
+
+
+class TestFullReparsePassesPdfBytesToSplitter:
+    """Regression coverage for #4360 — the ``_full_reparse_document`` split
+    paths MUST pass ``raw_content`` (the bytes already in scope) to both
+    ``split_fn`` and ``llm_split_fn`` so SC's bytes-aware format-B path
+    fires.  Without these bytes, SC dept-6 PDFs silently fall through to
+    the single-doc LLM reparse, leaving placeholder titles like
+    ``"Plaintiff v. FCA"`` on every entry (root-cause investigation
+    #4339; format-B parser shipped in #4348).
+    """
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Santa Clara",
+            "court_name": "Santa Clara Superior Court",
+            "source_url": "https://court.example.com/dept6.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": None,
+            "case_title": None,
+            "case_type": None,
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-santa-clara-tentatives-civil",
+            "s3_key": "ca/santa_clara/superior_court/raw/dept6.pdf",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_fn_receives_pdf_bytes_kwarg(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Bytes-only-aware ``split_fn`` returns multi-ruling output only when
+        invoked with ``pdf_bytes``.  This proves
+        ``_full_reparse_document`` threads ``raw_content`` through the
+        regex split path at the line that was previously
+        ``split_fn(text)`` (#4360).
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        captured: dict[str, Any] = {}
+
+        def fake_split(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]:
+            captured["text"] = text
+            captured["pdf_bytes"] = pdf_bytes
+            if pdf_bytes is None:
+                return []  # mimics SC format A on dept-6 (returns empty)
+            # Mimic SC format B: 10 distinct case rows from the summary table.
+            return [
+                SplitRuling(
+                    i,
+                    f"24CV-{i:04d}",
+                    f"Ruling text {i}",
+                    f"Case Title {i}",
+                    None,
+                    None,
+                    None,
+                )
+                for i in range(1, 11)
+            ]
+
+        scraper_id = "ca-santa-clara-tentatives-civil"
+        reingest._SPLIT_REGISTRY[scraper_id] = fake_split
+        reingest._LLM_SPLIT_REGISTRY.pop(scraper_id, None)
+        reingest._SCRAPER_REGISTRY.pop(scraper_id, None)
+        mock_extract.return_value = "fake dept-6 pdf text"
+
+        try:
+            raw = b"%PDF-1.4 ...mock bytes..."
+            result = reingest._full_reparse_document(
+                raw,
+                scraper_id,
+                self._doc_meta(),
+            )
+            # The split function received ``pdf_bytes`` matching ``raw``.
+            assert captured["pdf_bytes"] == raw, (
+                "_full_reparse_document must thread raw_content into "
+                "split_fn(text, pdf_bytes=...) per #4360"
+            )
+            # >= 10 rulings exited the split path — that proves the
+            # multi-ruling code path ran instead of the single-doc
+            # fallback.  AC #4 of #4360 asks for >= 10.
+            assert len(result) >= 10, f"expected >= 10 split rulings; got {len(result)}"
+        finally:
+            reingest._SPLIT_REGISTRY.pop(scraper_id, None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_fn_receives_pdf_bytes_kwarg(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """The LLM-split call site must also pass ``pdf_bytes``.  Pre-#4360
+        it was ``llm_split_fn(text)`` — the unified contract requires the
+        bytes for symmetry with regex splitters.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        captured: dict[str, Any] = {}
+
+        def fake_llm_split(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling] | None:
+            captured["text"] = text
+            captured["pdf_bytes"] = pdf_bytes
+            # Return a non-None result so the regex fallback isn't invoked
+            # — we only care that pdf_bytes was passed to the LLM splitter.
+            return [
+                SplitRuling(
+                    1,
+                    "24CV-0001",
+                    "Ruling text 1",
+                    "Case Title 1",
+                    None,
+                    None,
+                    None,
+                ),
+                SplitRuling(
+                    2,
+                    "24CV-0002",
+                    "Ruling text 2",
+                    "Case Title 2",
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+
+        scraper_id = "ca-santa-clara-tentatives-civil"
+        reingest._LLM_SPLIT_REGISTRY[scraper_id] = fake_llm_split
+        reingest._SPLIT_REGISTRY.pop(scraper_id, None)
+        reingest._SCRAPER_REGISTRY.pop(scraper_id, None)
+        mock_extract.return_value = "fake dept-6 pdf text"
+
+        try:
+            raw = b"%PDF-1.4 ...mock bytes..."
+            reingest._full_reparse_document(
+                raw,
+                scraper_id,
+                self._doc_meta(),
+            )
+            assert captured["pdf_bytes"] == raw, (
+                "_full_reparse_document must thread raw_content into "
+                "llm_split_fn(text, pdf_bytes=...) per #4360"
+            )
+        finally:
+            reingest._LLM_SPLIT_REGISTRY.pop(scraper_id, None)

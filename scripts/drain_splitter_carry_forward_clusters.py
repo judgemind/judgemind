@@ -249,7 +249,7 @@ def plan_cluster_drain(
     cluster: Cluster,
     *,
     pdf_bytes: bytes,
-    split_fn: Callable[[str], list[Any]] | None,
+    split_fn: Callable[..., list[Any]] | None,
     extract_text_fn: Callable[[bytes], str],
 ) -> ClusterPlan:
     """Run the registered splitter to validate that draining will help.
@@ -259,7 +259,9 @@ def plan_cluster_drain(
         pdf_bytes: Raw bytes of the parent PDF (already fetched from S3).
         split_fn: The registered ``_split_rulings`` callable for the
             cluster's ``scraper_id``, or ``None`` if no splitter is
-            registered (in which case draining is a no-op).
+            registered (in which case draining is a no-op).  Conforms to
+            the unified ``_SPLIT_REGISTRY`` contract introduced in #4360:
+            ``(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]``.
         extract_text_fn: Callable that turns PDF bytes into text. Tests
             stub this; production passes the same helper used by
             ``_full_reparse_document``.
@@ -271,7 +273,11 @@ def plan_cluster_drain(
         return ClusterPlan(status="skip_no_split", distinct_titles=0)
 
     text = extract_text_fn(pdf_bytes)
-    split_results = split_fn(text)
+    # Pass ``pdf_bytes`` to the registered splitter so bytes-aware paths
+    # (e.g. SC's format-B ``pdfplumber.extract_tables()``) can fire.
+    # Without this, dept-6 SC PDFs report ``skip_no_split`` because
+    # format A returns ``[]`` and format B can't run (#4360).
+    split_results = split_fn(text, pdf_bytes=pdf_bytes)
     if len(split_results) < 2:
         return ClusterPlan(status="skip_no_split", distinct_titles=len(split_results))
 
@@ -518,13 +524,17 @@ def restore_parent_for_cluster(
 # ---------------------------------------------------------------------------
 
 
-def resolve_split_fn(scraper_id: str) -> Callable[[str], list[Any]] | None:
+def resolve_split_fn(scraper_id: str) -> Callable[..., list[Any]] | None:
     """Return the registered ``_split_rulings`` callable for a scraper_id.
 
     Mirrors the lookup ``reingest_from_s3.py:1479`` does against its
     ``_SPLIT_REGISTRY``. We import that registry lazily so this module
     can be imported in a test environment without the scraper-framework
     venv (the test suite stubs this resolver out).
+
+    The returned callable conforms to the unified ``_SPLIT_REGISTRY``
+    contract (#4360): ``(text: str, pdf_bytes: bytes | None = None) ->
+    list[SplitRuling]``.
     """
     # Late import — reingest_from_s3 pulls in boto3, structlog, etc.,
     # which we don't want as test-time dependencies for the per-cluster
@@ -578,7 +588,7 @@ def run_drain(
     dsn: str,
     county: str | None,
     s3_fetcher: Callable[[str, str], bytes],
-    splitter_resolver: Callable[[str], Callable[[str], list[Any]] | None],
+    splitter_resolver: Callable[[str], Callable[..., list[Any]] | None],
     text_extractor: Callable[[bytes], str],
     dry_run: bool = False,
     limit: int | None = None,
