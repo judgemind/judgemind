@@ -152,8 +152,9 @@ class TestShouldFireCron:
         assert should_fire_cron("0 14 * * *", last, now) is False
 
     def test_offline_for_days_caps_at_24h(self) -> None:
-        # Daemon offline for 7 days — the walk caps at 24h, but a
-        # daily cron is guaranteed to find its match within that window.
+        # Daemon offline for 7 days — well within the 8-day walk cap
+        # (#4317), and a daily cron is guaranteed to find its match.
+        # (Test name retained for git history; the cap is 8 days now.)
         last = datetime(2026, 4, 18, 14, 0, tzinfo=UTC)
         now = datetime(2026, 4, 25, 14, 0, tzinfo=UTC)
         assert should_fire_cron("0 14 * * *", last, now) is True
@@ -193,3 +194,47 @@ class TestShouldFireCron:
         assert (
             should_fire_cron("0 12 * * *", last_after_first_fire, now_second) is False
         )
+
+    # ------------------------------------------------------------------
+    # Weekly cron 8-day cap (issue #4317)
+    #
+    # Before the fix the walk was capped at 24h (1440 minutes), which
+    # silently truncated weekly crons after their first fire — the next
+    # match is 7 days = 10,080 minutes past the anchor, well beyond 1440.
+    # Bumping the cap to 8 days = 11,520 minutes lets weekly crons land
+    # while still bounding an offline-for-9+-days daemon.
+    # ------------------------------------------------------------------
+
+    def test_weekly_cron_after_first_fire_fires_next_week(self) -> None:
+        """AC #1: weekly Sunday 06:00Z cron fires the following Sunday.
+
+        Anchor (last_triggered_at) is 2026-05-03 06:00Z (a Sunday); now
+        is 2026-05-10 06:01Z (the next Sunday, one minute past the
+        target). Before the 24h cap fix this returned False; with the
+        8-day cap it correctly returns True.
+        """
+        prev_sunday = datetime(2026, 5, 3, 6, 0, tzinfo=UTC)
+        this_sunday = datetime(2026, 5, 10, 6, 1, tzinfo=UTC)
+        assert should_fire_cron("0 6 * * 0", prev_sunday, this_sunday) is True
+
+    def test_weekly_cron_no_premature_fire_mid_week(self) -> None:
+        """A weekly Sunday 06:00Z cron must not fire mid-week.
+
+        Anchor 2026-05-03 06:00Z (Sunday), now 2026-05-07 06:00Z
+        (Thursday). No matching minute in that range → False. Guards
+        against a too-greedy cap that would let unrelated minutes match.
+        """
+        anchor = datetime(2026, 5, 3, 6, 0, tzinfo=UTC)
+        thursday = datetime(2026, 5, 7, 6, 0, tzinfo=UTC)
+        assert should_fire_cron("0 6 * * 0", anchor, thursday) is False
+
+    def test_offline_for_eight_days_caps(self) -> None:
+        """Daemon offline > cap: walk caps at 8 days, daily cron still found.
+
+        anchor 9 days back, now today 14:00Z, schedule daily 14:00 — the
+        walk caps at 8 days = 11,520 minutes which is still enough to
+        find a daily match within the window.
+        """
+        last = datetime(2026, 4, 16, 14, 0, tzinfo=UTC)
+        now = datetime(2026, 4, 25, 14, 0, tzinfo=UTC)
+        assert should_fire_cron("0 14 * * *", last, now) is True

@@ -30,10 +30,20 @@ from datetime import datetime, timedelta
 #: Lookback window used when ``last_triggered_at`` is NULL (first-ever fire or
 #: manually reset).  Walking 24 hours ensures that a cron whose exact minute
 #: already passed today is still found and fired once on the next daemon tick,
-#: matching standard cron "fire exactly once if missed" semantics.  24 hours
-#: also matches the existing 24h iteration-cap safety guard so the two
-#: constants stay in sync without an extra config knob.
+#: matching standard cron "fire exactly once if missed" semantics.
 _NULL_ANCHOR_LOOKBACK = timedelta(hours=24)
+
+#: Maximum minutes the walk will scan from ``anchor + 1m`` toward ``now``.
+#: Set to 8 days = 11,520 minutes so a weekly cron whose anchor is its prior
+#: fire (≈7 days = 10,080 minutes back) still finds its next match (issue
+#: #4317).  Wider than the NULL-anchor lookback so weekly cron rows fire at
+#: their target minute even after their first fire stamps
+#: ``last_triggered_at``.  Still bounds the walk so a daemon offline for
+#: many days does not enumerate hundreds of thousands of minutes — an
+#: offline-for-9+-days daemon hits the cap and yields control without
+#: firing on this tick (it will fire on a later tick once the daemon is
+#: caught up to within the 8-day window).
+_WALK_CAP_MINUTES = 60 * 24 * 8  # 11,520 minutes = 8 days
 
 
 # Field bounds, matching the standard 5-field cron layout:
@@ -162,15 +172,16 @@ def should_fire_cron(
     full :data:`_NULL_ANCHOR_LOOKBACK` (24 hours) from ``now``.  This
     ensures the most-recent past match within the last day is found
     and fired exactly once on this tick, even if the cron's target
-    minute already passed today.  The existing 24h iteration cap (see
-    below) bounds the walk identically, so no extra config knob is
-    needed.
+    minute already passed today.
 
     Bounds:
-      - The walk is capped at 24 hours so a daemon that was offline
-        for days does not enumerate hundreds of thousands of minutes.
-        A cron that fires at most daily is guaranteed to find its
-        match in 1440 iterations.
+      - The walk is capped at :data:`_WALK_CAP_MINUTES` (8 days =
+        11,520 minutes) so a daemon offline for very long does not
+        enumerate hundreds of thousands of minutes.  Hourly, daily,
+        and weekly crons all find their match within the cap; a
+        daemon offline for 9+ days hits the cap and skips firing on
+        this tick (it will fire on a later tick once the daemon is
+        caught up to within the 8-day window).
     """
     schedule = parse_cron(expression)
     if last_triggered_at is None:
@@ -192,7 +203,7 @@ def should_fire_cron(
             return True
         cursor += timedelta(minutes=1)
         iterations += 1
-        if iterations > 60 * 24:  # 24h safety cap
+        if iterations > _WALK_CAP_MINUTES:  # 8-day safety cap (issue #4317)
             break
     return False
 
