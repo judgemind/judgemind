@@ -522,7 +522,7 @@ class _FakePsycopg:
         self._conn_factory = conn_factory
         self.connect_calls: list[str] = []
 
-    def connect(self, dsn: str) -> _FakeConn:
+    def connect(self, dsn: str, **kwargs) -> _FakeConn:
         self.connect_calls.append(dsn)
         return self._conn_factory()
 
@@ -609,7 +609,7 @@ def test_load_state_from_db_returns_none_on_db_error(monkeypatch) -> None:
     """A psycopg.connect error is logged and converted to None."""
 
     class _BoomPsycopg:
-        def connect(self, dsn: str):
+        def connect(self, dsn: str, **kwargs):
             raise RuntimeError("connection refused")
 
     _install_fake_psycopg(monkeypatch, _BoomPsycopg())
@@ -677,7 +677,7 @@ def test_save_state_to_db_returns_false_on_db_error(monkeypatch) -> None:
     """A connect-time error is logged and the helper returns False."""
 
     class _BoomPsycopg:
-        def connect(self, dsn: str):
+        def connect(self, dsn: str, **kwargs):
             raise RuntimeError("disk full")
 
     _install_fake_psycopg(monkeypatch, _BoomPsycopg())
@@ -747,7 +747,7 @@ def test_db_state_roundtrip_drives_jump_detection_on_second_run(monkeypatch) -> 
             return False
 
     class _StoragePsycopg:
-        def connect(self, dsn: str) -> _StorageConn:
+        def connect(self, dsn: str, **kwargs) -> _StorageConn:
             return _StorageConn()
 
     _install_fake_psycopg(monkeypatch, _StoragePsycopg())

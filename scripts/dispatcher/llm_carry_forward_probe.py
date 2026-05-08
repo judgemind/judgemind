@@ -541,7 +541,11 @@ def _load_state_from_db(
     except ImportError:
         return None
     try:
-        with psycopg.connect(dsn) as conn:  # type: ignore[attr-defined]
+        with psycopg.connect(  # type: ignore[attr-defined]
+            dsn,
+            connect_timeout=10,
+            options="-c statement_timeout=30000",
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT last_run_state "
@@ -591,7 +595,11 @@ def _save_state_to_db(
         return False
     payload = json.dumps(totals, sort_keys=True)
     try:
-        with psycopg.connect(dsn) as conn:  # type: ignore[attr-defined]
+        with psycopg.connect(  # type: ignore[attr-defined]
+            dsn,
+            connect_timeout=10,
+            options="-c statement_timeout=30000",
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE dispatcher.scheduled_skills "
