@@ -155,13 +155,20 @@ class TestSaveSnapshot:
         result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
         assert result is True
-        directory._conn.commit.assert_called_once()
-        # Verify the INSERT was called
+        # Two commits expected: one for the snapshot insert, one for the
+        # seed-judges follow-up (#4370).  The seeder runs in its own
+        # transactional unit so a seed failure cannot roll back the
+        # snapshot insert that already committed.
+        assert directory._conn.commit.call_count == 2
+        # Verify the snapshot INSERT was issued.  The seeder adds further
+        # SELECTs against court_directory_snapshots and courts plus
+        # potential INSERT INTO judges; we only assert the snapshot path
+        # was exercised here.
         calls = cursor.execute.call_args_list
-        # First call is the dedup SELECT, second is the INSERT
-        assert len(calls) == 2
-        insert_sql = calls[1].args[0]
-        assert "INSERT INTO court_directory_snapshots" in insert_sql
+        snapshot_inserts = [
+            c for c in calls if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert len(snapshot_inserts) == 1
 
     def test_skips_db_insert_when_duplicate(self, directory: _StubDirectory) -> None:
         """When content_hash matches the latest snapshot, skip the DB insert."""
@@ -182,7 +189,8 @@ class TestSaveSnapshot:
         result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
         assert result is True
-        directory._conn.commit.assert_called_once()
+        # Two commits: snapshot insert + seed-judges follow-up (#4370).
+        assert directory._conn.commit.call_count == 2
 
     def test_mapping_stored_as_sorted_json(self, directory: _StubDirectory) -> None:
         """The mapping should be stored as sorted JSON for consistency."""
@@ -191,8 +199,16 @@ class TestSaveSnapshot:
 
         directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
-        calls = cursor.execute.call_args_list
-        insert_params = calls[1].args[1]
+        # Find the snapshot INSERT specifically — the seed step (#4370)
+        # adds further SELECTs and possibly judge INSERTs after, so we
+        # cannot rely on a fixed call index.
+        snapshot_inserts = [
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert len(snapshot_inserts) == 1
+        insert_params = snapshot_inserts[0].args[1]
         # The mapping JSON is the 4th parameter (index 3)
         stored_json = insert_params[3]
         assert stored_json == json.dumps(MAPPING, sort_keys=True)
@@ -220,8 +236,15 @@ class TestSaveSnapshot:
 
         expected_hash = sha256_hex(RAW_HTML)
         expected_key = f"directories/{COURT_ID}/{expected_hash}.html"
-        calls = cursor.execute.call_args_list
-        insert_params = calls[1].args[1]
+        # Find the snapshot INSERT specifically — the seed step (#4370)
+        # adds further calls after this one.
+        snapshot_inserts = [
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert len(snapshot_inserts) == 1
+        insert_params = snapshot_inserts[0].args[1]
         # s3_key is the 3rd parameter (index 2)
         assert insert_params[2] == expected_key
 
@@ -240,7 +263,8 @@ class TestSaveSnapshot:
 
         assert result is True
         s3_client.put_object.assert_not_called()  # skip upload
-        directory._conn.commit.assert_called_once()  # still insert into DB
+        # Two commits: snapshot insert + seed-judges follow-up (#4370).
+        assert directory._conn.commit.call_count == 2
 
     def test_clears_roster_cache_on_new_snapshot(self, directory: _StubDirectory) -> None:
         """Saving a new snapshot should clear the roster name cache."""
@@ -279,6 +303,70 @@ class TestSaveSnapshot:
 
         # Clean up
         clear_roster_cache()
+
+    def test_seeds_judges_from_snapshot_after_insert(self, directory: _StubDirectory) -> None:
+        """After a new snapshot is inserted, judges are seeded from the
+        same DB connection (#4370).
+
+        AC #3: "Helper wired into the daily court-directory snapshot
+        refresh — integration test that runs the snapshot writer,
+        asserts new judges are inserted on the same DB transaction."
+        """
+        from unittest.mock import patch
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None  # not a duplicate
+
+        with patch("ingestion.judge_seed.seed_judges_from_directory_snapshots") as mock_seed:
+            mock_seed.return_value = {
+                "courts": 1,
+                "candidates": 2,
+                "inserted": 2,
+                "skipped_existing": 0,
+                "skipped_invalid": 0,
+                "skipped_no_court": 0,
+            }
+
+            result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+            assert result is True
+            # The seeder must be called with the same DB connection the
+            # snapshot was just written on, scoped to the just-inserted
+            # court_id.
+            mock_seed.assert_called_once_with(directory._conn, only_court_id=COURT_ID)
+
+    def test_skips_seed_when_snapshot_is_duplicate(self, directory: _StubDirectory) -> None:
+        """When the snapshot is a duplicate (no new DB row), the seeder is
+        not called — there's no new mapping to seed from."""
+        from unittest.mock import patch
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        # _is_duplicate sees the same content_hash -> duplicate.
+        cursor.fetchone.return_value = (sha256_hex(RAW_HTML),)
+
+        with patch("ingestion.judge_seed.seed_judges_from_directory_snapshots") as mock_seed:
+            result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+            assert result is False
+            mock_seed.assert_not_called()
+
+    def test_seed_failure_does_not_break_save_snapshot(self, directory: _StubDirectory) -> None:
+        """A seed failure must not roll back the snapshot insert that
+        already committed.  Best-effort, defensive — we never want a
+        seed-side bug to lose the directory snapshot."""
+        from unittest.mock import patch
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None  # not a duplicate
+
+        with patch(
+            "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+            side_effect=RuntimeError("simulated seed failure"),
+        ):
+            # Must not raise — the snapshot insert already happened.
+            result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+            assert result is True
 
 
 # ---------------------------------------------------------------------------
