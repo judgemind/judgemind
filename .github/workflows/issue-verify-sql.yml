@@ -52,19 +52,25 @@ jobs:
           REPO: ${{ github.repository }}
           DIAGNOSTIC: ${{ steps.check.outputs.stderr }}
         run: |
-          {
-            echo "## SQL column validation failed"
-            echo
-            echo 'A \`Verify:\` line in this issue references a column that does not exist on the named table per \`packages/api/src/data-access/schema.sql\`.'
-            echo
-            echo '```'
-            printf '%s\n' "$DIAGNOSTIC"
-            echo '```'
-            echo
-            echo 'Fix: update the \`Verify:\` line to use real column names. See \`docs/agent/issue-authoring.md\` §"Verify lines on SQL queries" and the dispatcher schema in \`packages/api/src/data-access/schema.sql\`.'
-            echo
-            echo 'The \`agent/ready\` label has been removed; re-add it once the AC is corrected. (Tracking: #4358.)'
-          } > "$RUNNER_TEMP/comment.md"
+          # Build the comment header / footer in two parts so the
+          # diagnostic stderr lands inside a fenced code block. Using a
+          # single-quoted heredoc disables shell expansion of the
+          # literal markdown backticks (shellcheck SC2016 friendly).
+          cat > "$RUNNER_TEMP/comment.md" <<'HEADER_EOF'
+          ## SQL column validation failed
+
+          A `Verify:` line in this issue references a column that does not exist on the named table per `packages/api/src/data-access/schema.sql`.
+
+          ```
+          HEADER_EOF
+          printf '%s\n' "$DIAGNOSTIC" >> "$RUNNER_TEMP/comment.md"
+          cat >> "$RUNNER_TEMP/comment.md" <<'FOOTER_EOF'
+          ```
+
+          Fix: update the `Verify:` line to use real column names. See `docs/agent/issue-authoring.md` §"Verify lines on SQL queries" and the dispatcher schema in `packages/api/src/data-access/schema.sql`.
+
+          The `agent/ready` label has been removed; re-add it once the AC is corrected. (Tracking: #4358.)
+          FOOTER_EOF
 
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
             --body-file "$RUNNER_TEMP/comment.md"
