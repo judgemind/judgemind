@@ -2474,6 +2474,73 @@ class TestReingestBatchDBWrites:
         # hearing_date is None but ruling should still be inserted (#2215)
         assert call_kwargs["hearing_date"] is None
 
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch(
+        "reingest_from_s3._expand_single_word_judge_surname",
+        return_value="Karine Mkrtchyan",
+    )
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_la_single_word_surname_expanded_in_reingest(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_expand: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """Reingest mirror of the worker LA single-word JUDGE/DEPT expansion (#4297).
+
+        When the regex/extraction pipeline produces a single-word surname
+        (``Mkrtchyan``) for an LA dept-25 ruling, the reingest path must
+        call ``_expand_single_word_judge_surname`` and pass the expanded
+        canonical name to ``resolve_judge`` — mirroring the worker fix so
+        rebuilds produce consistent output.
+        """
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "Some LA dept-25 ruling text.",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Mkrtchyan",  # single-word surname from JUDGE/DEPT
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "25",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        # Expansion helper called with the single-word surname.
+        mock_expand.assert_called_once()
+        # positional args: (conn, court_id_str, surname, department); hearing_date kwarg
+        assert mock_expand.call_args[0][2] == "Mkrtchyan"
+        assert mock_expand.call_args[0][3] == "25"
+
+        # resolve_judge sees the EXPANDED canonical name.
+        mock_resolve_judge.assert_called_once()
+        assert mock_resolve_judge.call_args[0][1] == "Karine Mkrtchyan"
+
 
 # ---------------------------------------------------------------------------
 # reingest_batch tests — per-document commits

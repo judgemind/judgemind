@@ -58,6 +58,8 @@ from validation.issue_filer import file_validation_issue
 
 from .case_type_resolver import resolve_case_type
 from .db import (
+    _expand_single_word_judge_surname,
+    _looks_like_valid_judge_name,
     batch_upsert_parties,
     delete_stale_split_children,
     insert_document_and_ruling,
@@ -3393,6 +3395,43 @@ class IngestionWorker:
                         "case_title": effective_title,
                     },
                 )
+
+            # 2c. LA County single-word JUDGE/DEPT surname expansion (#4297).
+            #
+            # LA tentative-ruling HTML uses a ``JUDGE/DEPT: <Surname>/<dept>``
+            # form-layout header that genuinely carries only the surname.
+            # ``resolve_judge`` rejects single-word names via
+            # ``_looks_like_valid_judge_name`` (defensive guard against
+            # truncated/garbage entries), so without expansion the ruling
+            # stores ``judge_id = NULL``.  Expand via the directory snapshot
+            # / ``judges`` surname-suffix lookup chain before resolving.
+            if (
+                judge_name
+                and not _looks_like_valid_judge_name(judge_name)
+                and len(judge_name.strip().split()) == 1
+                and department
+                and state == "CA"
+                and county == "Los Angeles"
+            ):
+                expanded = _expand_single_word_judge_surname(
+                    conn,
+                    court_id,
+                    judge_name,
+                    department,
+                    hearing_date=hearing_dt,
+                )
+                if expanded:
+                    logger.info(
+                        "Expanded single-word JUDGE/DEPT surname",
+                        extra={
+                            "document_id": document_id,
+                            "department": department,
+                            "original_surname": judge_name,
+                            "expanded_judge_name": expanded,
+                        },
+                    )
+                    judge_name = expanded
+                    extraction_methods["judge_name"] = "single_word_surname_expansion"
 
             # 3. Resolve judge name to canonical judge record
             judge_id: str | None = None

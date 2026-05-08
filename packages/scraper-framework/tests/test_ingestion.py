@@ -2749,6 +2749,226 @@ def test_roster_dept_lookup_skipped_when_judge_already_set(
 
 
 # ---------------------------------------------------------------------------
+# LA single-word JUDGE/DEPT surname expansion (#4297)
+# ---------------------------------------------------------------------------
+
+
+@patch(
+    "ingestion.worker._expand_single_word_judge_surname",
+    return_value="Karine Mkrtchyan",
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-mkrtchyan")
+@patch("ingestion.worker.psycopg")
+def test_la_single_word_surname_expanded_before_resolve_judge(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_expand: MagicMock,
+) -> None:
+    """LA dept-25 single-word ``Mkrtchyan`` is expanded before resolve_judge (#4297).
+
+    Regression test for the JUDGE/DEPT form-layout bug: when
+    ``judge_name`` is a single-word surname that ``_looks_like_valid_judge_name``
+    rejects, the worker calls ``_expand_single_word_judge_surname`` to look
+    up the canonical full name from the directory snapshot / judges table
+    before calling ``resolve_judge``.  Without this expansion,
+    ``resolve_judge`` rejects the single-word value and the ruling stores
+    ``judge_id = NULL`` (#4297).
+    """
+    worker, _os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (DB write section)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Mkrtchyan",  # single-word surname from JUDGE/DEPT header
+        department="25",
+        state="CA",
+        county="Los Angeles",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    # The expansion helper should have been called with the single-word surname
+    mock_expand.assert_called_once()
+    expand_args = mock_expand.call_args
+    # positional args: (conn, court_id, surname, department); hearing_date is kwarg
+    assert expand_args[0][2] == "Mkrtchyan"
+    assert expand_args[0][3] == "25"
+
+    # resolve_judge should have been called with the EXPANDED canonical name,
+    # not the original single-word surname.
+    mock_resolve_judge.assert_called_once()
+    assert mock_resolve_judge.call_args[0][1] == "Karine Mkrtchyan"
+
+
+@patch(
+    "ingestion.worker._expand_single_word_judge_surname",
+    return_value=None,
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_la_single_word_surname_unexpanded_falls_through_to_resolve_judge(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_expand: MagicMock,
+) -> None:
+    """When expansion is ambiguous (returns None), resolve_judge sees the original surname.
+
+    The current ``resolve_judge`` will reject the single-word value and
+    return None, leaving ``judge_id = NULL``.  This test confirms the
+    expansion path does not silently swallow names — it explicitly returns
+    None and the worker hands the original to resolve_judge.
+    """
+    worker, _os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (DB write section)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Mkrtchyan",
+        department="25",
+        state="CA",
+        county="Los Angeles",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    mock_expand.assert_called_once()
+    # resolve_judge sees the original surname (which it will reject internally)
+    mock_resolve_judge.assert_called_once()
+    assert mock_resolve_judge.call_args[0][1] == "Mkrtchyan"
+
+
+@patch(
+    "ingestion.worker._expand_single_word_judge_surname",
+    return_value="Karine Mkrtchyan",
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_la_expansion_skipped_for_non_la_county(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_expand: MagicMock,
+) -> None:
+    """The expansion is gated to LA only — other counties do NOT call the helper."""
+    worker, _os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Mkrtchyan",
+        department="25",
+        state="CA",
+        county="San Diego",  # NOT Los Angeles
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    mock_expand.assert_not_called()
+
+
+@patch(
+    "ingestion.worker._expand_single_word_judge_surname",
+    return_value="Karine Mkrtchyan",
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_la_expansion_skipped_for_multi_word_judge_name(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_expand: MagicMock,
+) -> None:
+    """Multi-word judge names are NOT routed through the expansion helper.
+
+    The helper only addresses the single-word JUDGE/DEPT form-layout bug.
+    Multi-word names that fail ``_looks_like_valid_judge_name`` for other
+    reasons (truncated last word, no-vowel surname) are different bugs
+    and should not be silently re-resolved via this path.
+    """
+    worker, _os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Karine Mkrtchyan",  # multi-word, valid — short-circuits
+        department="25",
+        state="CA",
+        county="Los Angeles",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    # Expansion is gated to single-word inputs that fail validation.
+    mock_expand.assert_not_called()
+
+
+@patch(
+    "ingestion.worker._expand_single_word_judge_surname",
+    return_value="Karine Mkrtchyan",
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_la_expansion_skipped_when_department_missing(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_expand: MagicMock,
+) -> None:
+    """When department is missing, expansion cannot proceed (no directory key)."""
+    worker, _os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Mkrtchyan",
+        department=None,  # gate condition fails
+        state="CA",
+        county="Los Angeles",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    mock_expand.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # PDF binary preprocessing in process_event
 # ---------------------------------------------------------------------------
 
