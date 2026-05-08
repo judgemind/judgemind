@@ -703,6 +703,142 @@ else
     fail "canonical placeholder PR (empty body) still reports shipped (regression #4327, AC2)" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 18: PR merged BEFORE the issue was filed → exit 1 (#4353) ──────
+
+# Regression for #4353. Issue body cites scripts/foo.sh; a closed PR
+# *added* that file but `mergedAt` is 30 days before the issue's
+# `createdAt`. A PR that merged before the issue existed cannot have
+# shipped the issue's work — by definition. Pre-fix, file overlap on
+# the heavily-edited path was enough to clear the high-confidence
+# threshold and emit a `shipped:` line. Post-fix, the date-ordering
+# guard skips the candidate and the script reports not-shipped.
+#
+# Concrete case: issue #4353 (created 2026-05-08) hit a false positive
+# against PR #3268 (merged 2026-04-25) on `docs/agent/code-standards.md`
+# — flagged because the 1-file added overlap was the only signal the
+# script considered.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: add scripts/foo.sh", "createdAt": "2026-05-08T19:41:29Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Closes the widget loop (#3268)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-04-08T15:39:47Z", "number": 3268, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4353 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "exits 1 when candidate PR merged before the issue was filed (regression #4353)"
+else
+    fail "exits 1 when candidate PR merged before the issue was filed (regression #4353)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 19: missing createdAt → guard fails open, fall back to overlap ─
+
+# When the issue JSON lacks `createdAt` (e.g. an older mock or a gh CLI
+# version that doesn't expose the field for some reason), the date guard
+# must be a no-op so existing behavior is preserved. Same shape as
+# Test 18 but with `createdAt` omitted from the issue mock — the
+# candidate PR's `mergedAt` is irrelevant to the guard. Expect exit 0
+# (shipped) because the file-overlap threshold is cleared.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh.", "title": "dx: add scripts/foo.sh"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Closes the widget loop (#3268)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-04-08T15:39:47Z", "number": 3268, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4353 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* ]]; then
+    pass "guard fails open when issue createdAt is absent (regression #4353)"
+else
+    fail "guard fails open when issue createdAt is absent (regression #4353)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 20: PR merged AFTER the issue was filed → exit 0 (#4353) ───────
+
+# Sanity check — the date guard must NOT block legitimate post-issue
+# PRs. Issue created 2026-05-08; candidate PR merged 2026-05-09 (one
+# day after). File overlap clears the threshold; the date guard does
+# not fire. Expect exit 0 (shipped).
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh.", "title": "dx: add scripts/foo.sh", "createdAt": "2026-05-08T19:41:29Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Add foo (#4400)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-05-09T00:00:00Z", "number": 4400, "title": "feat: add foo"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4353 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"4400"* ]]; then
+    pass "PR merged AFTER issue createdAt is still a valid shipped match (#4353 sanity)"
+else
+    fail "PR merged AFTER issue createdAt is still a valid shipped match (#4353 sanity)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
