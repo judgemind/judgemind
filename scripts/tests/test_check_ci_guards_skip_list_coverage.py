@@ -131,6 +131,59 @@ def _write_optional_sh_guard(tmp_path: Path, name: str) -> Path:
     return path
 
 
+def _write_env_var_required_sh_guard(
+    tmp_path: Path, name: str, marker: bool = False
+) -> Path:
+    """Create a synthetic check-*.sh guard with ``${VAR:?...}`` strict env-var.
+
+    Mirrors the canonical "guard reads env var that must be set" shape
+    we want to catch — e.g. a hypothetical future ``check-pr-rev.sh``
+    that does ``REV="${PR_REV:?Usage: PR_REV=xyz scripts/...}"`` at the
+    top of the file. blind invocation (umbrella with no env) crashes
+    on the strict-required ``${PR_REV:?}`` and the umbrella reports the
+    crash even though the guard is fine when called from CI with the
+    right env. Issue #4384.
+    """
+
+    marker_line = "# ci-guards: skip\n" if marker else ""
+    body = (
+        "#!/usr/bin/env bash\n"
+        "# permanent: true\n"
+        f"{marker_line}"
+        'PR_TITLE="${PR_TITLE:?Usage: PR_TITLE=... scripts/synthetic.sh}"\n'
+        'echo "$PR_TITLE"\n'
+    )
+    path = tmp_path / name
+    path.write_text(body)
+    return path
+
+
+def _write_env_var_required_py_guard(
+    tmp_path: Path, name: str, marker: bool = False
+) -> Path:
+    """Create a synthetic check-*.py guard reading ``os.environ["VAR"]`` at module scope.
+
+    The ``os.environ[...]`` subscript raises ``KeyError`` at import
+    time when the env var is unset, which is exactly the failure mode
+    the umbrella's blind invocation triggers. Issue #4384.
+    """
+
+    marker_line = "# ci-guards: skip\n" if marker else ""
+    body = (
+        "#!/usr/bin/env python3\n"
+        "# venv: none\n"
+        "# permanent: true\n"
+        f"{marker_line}"
+        '"""Synthetic env-var-required guard."""\n'
+        "import os\n"
+        '_PR_REV = os.environ["CHECK_REV_TARGET_REV"]  # required, raises KeyError if unset\n'
+        'print(f"target rev = {_PR_REV}")\n'
+    )
+    path = tmp_path / name
+    path.write_text(body)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # parse_skip_list
 # ---------------------------------------------------------------------------
@@ -207,6 +260,404 @@ class TestRequiredArgDetection:
         path = tmp_path / "check-thing.rb"
         path.write_text("# pretend Ruby script\n")
         assert not check_ci_guards.is_argument_required(path)
+
+
+# ---------------------------------------------------------------------------
+# Env-var-required detection (#4384)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvVarRequiredDetection:
+    """Issue #4384: extend the meta-check to env-var-required guards.
+
+    Three categories: shell ``${VAR:?}`` at file scope, Python
+    ``os.environ["VAR"]`` at module scope, and the negative cases
+    (defaulted forms, function-scope-only matches) we explicitly do NOT
+    flag.
+    """
+
+    # --- Shell ${VAR:?} positive cases ---------------------------------
+
+    def test_shell_env_var_strict_flagged(self, tmp_path: Path) -> None:
+        path = _write_env_var_required_sh_guard(tmp_path, "check-env.sh")
+        assert check_ci_guards.is_argument_required(path)
+        assert check_ci_guards.required_kind(path) == "sh-env"
+
+    def test_shell_env_var_strict_no_message_flagged(self, tmp_path: Path) -> None:
+        # ``${PR_TITLE:?}`` (no error message) is also a strict-required
+        # env var.
+        body = (
+            "#!/usr/bin/env bash\n# permanent: true\n"
+            'TITLE="${PR_TITLE:?}"\necho "$TITLE"\n'
+        )
+        path = tmp_path / "check-bare-env.sh"
+        path.write_text(body)
+        assert check_ci_guards.is_argument_required(path)
+        assert check_ci_guards.required_kind(path) == "sh-env"
+
+    def test_shell_env_var_with_underscores_and_digits(self, tmp_path: Path) -> None:
+        # The env-var regex allows underscores and digits after the
+        # leading uppercase letter/underscore. ``API_KEY_2`` is a
+        # legitimate variable name.
+        body = (
+            "#!/usr/bin/env bash\n# permanent: true\n"
+            'KEY="${API_KEY_2:?missing API_KEY_2}"\necho "$KEY"\n'
+        )
+        path = tmp_path / "check-multi-env.sh"
+        path.write_text(body)
+        assert check_ci_guards.required_kind(path) == "sh-env"
+
+    # --- Shell ${VAR:?} negative cases ---------------------------------
+
+    def test_shell_env_var_defaulted_not_flagged(self, tmp_path: Path) -> None:
+        # ``${VAR:-default}`` is the defaulted form — the script supplies
+        # a fallback. This is the canonical pattern used by ``check-pr-title.sh``
+        # and ``check-cloudwatch-alarm-docs.sh`` today; flagging it would
+        # produce false positives across the existing tree.
+        body = (
+            "#!/usr/bin/env bash\n# permanent: true\n"
+            'TITLE="${PR_TITLE:-}"\necho "$TITLE"\n'
+        )
+        path = tmp_path / "check-defaulted-env.sh"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+        assert check_ci_guards.required_kind(path) is None
+
+    def test_shell_env_var_inside_function_not_flagged(self, tmp_path: Path) -> None:
+        # When ``${VAR:?}`` only appears inside a function body, the
+        # function's caller is responsible for supplying the value;
+        # blind invocation of the script (which doesn't call the
+        # function) is fine. Not flagged.
+        body = (
+            "#!/usr/bin/env bash\n"
+            "# permanent: true\n"
+            "validate_input() {\n"
+            '    local value="${VALIDATE_VAR:?missing}"\n'
+            '    echo "$value"\n'
+            "}\n"
+            'echo "no top-level required env var"\n'
+        )
+        path = tmp_path / "check-fn-only-env.sh"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_shell_function_keyword_form_not_flagged(self, tmp_path: Path) -> None:
+        # ``function name() { ... }`` form is also a function — same
+        # rule applies, the inner ``${VAR:?}`` doesn't count.
+        body = (
+            "#!/usr/bin/env bash\n"
+            "# permanent: true\n"
+            "function validate {\n"
+            '    local value="${VAR:?missing}"\n'
+            '    echo "$value"\n'
+            "}\n"
+            "validate\n"
+        )
+        path = tmp_path / "check-function-keyword.sh"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_shell_lowercase_var_not_flagged(self, tmp_path: Path) -> None:
+        # Lowercase variables (``${var:?}``) are conventionally local
+        # variables, not environment variables. Don't flag.
+        body = (
+            "#!/usr/bin/env bash\n# permanent: true\n"
+            'value="${var:?missing}"\necho "$value"\n'
+        )
+        path = tmp_path / "check-lc-var.sh"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_shell_positional_takes_precedence_over_env(self, tmp_path: Path) -> None:
+        # If a script has BOTH ``${1:?}`` AND ``${VAR:?}`` at file
+        # scope, ``required_kind`` returns ``sh-arg`` (the positional
+        # signal). The Fix-block wording still mentions both options.
+        body = (
+            "#!/usr/bin/env bash\n# permanent: true\n"
+            'ISSUE="${1:?Usage: ...}"\nKEY="${API_KEY:?missing}"\n'
+        )
+        path = tmp_path / "check-both.sh"
+        path.write_text(body)
+        assert check_ci_guards.required_kind(path) == "sh-arg"
+
+    # --- Python os.environ[VAR] positive cases -------------------------
+
+    def test_python_os_environ_subscript_flagged(self, tmp_path: Path) -> None:
+        path = _write_env_var_required_py_guard(tmp_path, "check-env.py")
+        assert check_ci_guards.is_argument_required(path)
+        assert check_ci_guards.required_kind(path) == "py-env"
+
+    def test_python_os_environ_inside_if_block_flagged(self, tmp_path: Path) -> None:
+        # Reads inside a top-level ``if`` block are still module-scope
+        # (they execute at import time). Flag.
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "import sys\n"
+            "if sys.platform == 'darwin':\n"
+            '    _KEY = os.environ["DARWIN_ONLY"]\n'
+        )
+        path = tmp_path / "check-if-block-env.py"
+        path.write_text(body)
+        assert check_ci_guards.required_kind(path) == "py-env"
+
+    # --- Python os.environ[VAR] negative cases -------------------------
+
+    def test_python_os_environ_get_not_flagged(self, tmp_path: Path) -> None:
+        # ``os.environ.get("VAR")`` returns ``None`` on miss — safe at
+        # module scope. Not flagged.
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            '_KEY = os.environ.get("OPTIONAL_KEY", "default")\n'
+            'print(f"{_KEY}")\n'
+        )
+        path = tmp_path / "check-get-default.py"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_python_os_environ_inside_function_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        # ``os.environ["VAR"]`` inside a function body executes only
+        # when the function is called — blind ``python3 script.py``
+        # doesn't call ``main()``, so this is safe. The umbrella's
+        # invocation pattern would still crash IF the file's body
+        # called ``main()`` directly, but the guard's function scope
+        # is the explicit boundary here.
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "def main() -> int:\n"
+            '    key = os.environ["RUNTIME_KEY"]\n'
+            "    return 0\n"
+            'if __name__ == "__main__":\n'
+            "    main()\n"
+        )
+        path = tmp_path / "check-fn-env.py"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_python_os_environ_inside_class_not_flagged(self, tmp_path: Path) -> None:
+        # Class bodies run at import time too, but a class attribute
+        # set from ``os.environ[...]`` is unusual enough that we treat
+        # it the same as a function body — the canonical pattern is
+        # module-scope ``_VAR = os.environ["X"]``. Class-scope reads
+        # are intentionally excluded to keep the heuristic simple.
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "class Config:\n"
+            '    KEY = os.environ["CONFIG_KEY"]\n'
+        )
+        path = tmp_path / "check-cls-env.py"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+    def test_python_required_arg_takes_precedence_over_env(
+        self, tmp_path: Path
+    ) -> None:
+        # If a script has BOTH argparse ``required=True`` AND
+        # ``os.environ["X"]`` at module scope, ``required_kind`` returns
+        # ``py-arg`` — the argparse signal is the dominant trigger
+        # because the umbrella's blind invocation would hit it first
+        # (argparse exits 2 before the os.environ read runs).
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import argparse\n"
+            "import os\n"
+            '_KEY = os.environ["MODULE_KEY"]\n'
+            "parser = argparse.ArgumentParser()\n"
+            'parser.add_argument("--issue", required=True)\n'
+        )
+        path = tmp_path / "check-both.py"
+        path.write_text(body)
+        assert check_ci_guards.required_kind(path) == "py-arg"
+
+    def test_python_syntax_error_not_flagged(self, tmp_path: Path) -> None:
+        # Unparseable Python returns False — a non-importable .py
+        # check is out of scope for blind-invocation crash detection.
+        body = "this is not valid python (\n"
+        path = tmp_path / "check-broken.py"
+        path.write_text(body)
+        assert not check_ci_guards.is_argument_required(path)
+
+
+# ---------------------------------------------------------------------------
+# AC #1 + #2 fixture: env-var-required guard NOT in SKIP_LIST -> exit 1
+# ---------------------------------------------------------------------------
+
+
+class TestEnvVarRequiredFixtureScenarios:
+    """AC #1: regression test seeds a synthetic env-var-required guard
+    not in SKIP_LIST and asserts the meta-check exits 1 with the guard
+    named.
+
+    AC #3: regression test asserts the Fix block names "env-var" or
+    "environment variable" when the violation is env-var-shaped.
+    """
+
+    def test_shell_env_var_missing_named_in_violations(self, tmp_path: Path) -> None:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_sh_guard(scripts_dir, "check-env-missing.sh")
+        umbrella = _write_umbrella(scripts_dir, [])
+        skip_list = check_ci_guards.parse_skip_list(umbrella)
+        violations = check_ci_guards.find_violations(scripts_dir, skip_list)
+        assert [p.name for p in violations] == ["check-env-missing.sh"]
+
+        with_kind = check_ci_guards.find_violations_with_kind(scripts_dir, skip_list)
+        assert with_kind == [(scripts_dir / "check-env-missing.sh", "sh-env")]
+
+    def test_shell_env_var_marker_rescues(self, tmp_path: Path) -> None:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_sh_guard(
+            scripts_dir, "check-env-marker.sh", marker=True
+        )
+        umbrella = _write_umbrella(scripts_dir, [])
+        skip_list = check_ci_guards.parse_skip_list(umbrella)
+        assert check_ci_guards.find_violations(scripts_dir, skip_list) == []
+
+    def test_shell_env_var_skip_list_rescues(self, tmp_path: Path) -> None:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_sh_guard(scripts_dir, "check-env-listed.sh")
+        umbrella = _write_umbrella(scripts_dir, ["check-env-listed.sh"])
+        skip_list = check_ci_guards.parse_skip_list(umbrella)
+        assert check_ci_guards.find_violations(scripts_dir, skip_list) == []
+
+    def test_python_env_var_missing_named_in_violations(self, tmp_path: Path) -> None:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_py_guard(scripts_dir, "check-env-missing.py")
+        umbrella = _write_umbrella(scripts_dir, [])
+        skip_list = check_ci_guards.parse_skip_list(umbrella)
+        violations = check_ci_guards.find_violations(scripts_dir, skip_list)
+        assert [p.name for p in violations] == ["check-env-missing.py"]
+
+        with_kind = check_ci_guards.find_violations_with_kind(scripts_dir, skip_list)
+        assert with_kind == [(scripts_dir / "check-env-missing.py", "py-env")]
+
+    def test_cli_exits_one_on_env_var_violation(self, tmp_path: Path) -> None:
+        # AC #1 (CLI shape): seed a synthetic env-var-required guard,
+        # run the CLI, assert exit 1 + guard named in stderr.
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_sh_guard(scripts_dir, "check-env-missing.sh")
+        _write_umbrella(scripts_dir, [])
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--scripts-dir",
+                str(scripts_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1, result.stderr
+        assert "check-env-missing.sh" in result.stderr
+
+    def test_cli_fix_block_names_env_var_for_shell_violation(
+        self, tmp_path: Path
+    ) -> None:
+        # AC #3: the Fix block (or surrounding stderr) names "env-var"
+        # or "environment variable" so operators know the failure mode
+        # was the new env-var-required category, not a missed argparse
+        # required flag.
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_sh_guard(scripts_dir, "check-env-missing.sh")
+        _write_umbrella(scripts_dir, [])
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--scripts-dir",
+                str(scripts_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        # Either "env-var" or "environment variable" appears somewhere
+        # in stderr (the per-violation tag and/or the Fix block).
+        stderr_lower = result.stderr.lower()
+        assert "env-var" in stderr_lower or "environment variable" in stderr_lower, (
+            "Expected stderr to name env-var / environment variable as the "
+            "failure mode for an env-var-shaped violation. Got:\n" + result.stderr
+        )
+
+    def test_cli_fix_block_names_env_var_for_python_violation(
+        self, tmp_path: Path
+    ) -> None:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_env_var_required_py_guard(scripts_dir, "check-env-missing.py")
+        _write_umbrella(scripts_dir, [])
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--scripts-dir",
+                str(scripts_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        stderr_lower = result.stderr.lower()
+        assert "env-var" in stderr_lower or "environment variable" in stderr_lower, (
+            "Expected stderr to name env-var / environment variable as the "
+            "failure mode for a Python os.environ[VAR] violation. Got:\n"
+            + result.stderr
+        )
+        # AC #3 specifically: the failure mode should be visibly distinct
+        # from the legacy "argument-required" wording — when only an
+        # env-var violation is present, the FAIL header should NOT say
+        # plain "argument-required".
+        first_line = result.stderr.splitlines()[0] if result.stderr.splitlines() else ""
+        assert (
+            "argument-required" not in first_line.lower()
+            or "env-var" in first_line.lower()
+        ), (
+            "FAIL header must distinguish env-var-only failures from "
+            "argument-required failures. Got first line: " + first_line
+        )
+
+    def test_cli_fix_block_argparse_only_does_not_say_env_var(
+        self, tmp_path: Path
+    ) -> None:
+        # Negative control: when the only violation is argparse
+        # ``required=True``, the FAIL header is the legacy
+        # "argument-required" wording — we shouldn't accidentally
+        # tag every failure as env-var-shaped.
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        _write_required_py_guard(scripts_dir, "check-arg-missing.py", marker=False)
+        _write_umbrella(scripts_dir, [])
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--scripts-dir",
+                str(scripts_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        first_line = result.stderr.splitlines()[0] if result.stderr.splitlines() else ""
+        assert "argument-required" in first_line.lower()
+        # No "env-var" or "environment variable" in the first FAIL line
+        # for an argparse-only violation. (The Fix block can still use
+        # the words generically — we only constrain the FAIL header.)
+        assert "env-var" not in first_line.lower()
 
 
 # ---------------------------------------------------------------------------
