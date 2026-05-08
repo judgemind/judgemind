@@ -838,37 +838,40 @@ def _try_sc_pdf_split(
     document_id: str,
     ruling_text: str,
     dispatch: Any,
+    raw_pdf_bytes: bytes | None = None,
 ) -> bool:
     """If *ruling_text* is a Santa Clara multi-ruling PDF, deterministically
     split it into per-case rulings and dispatch one synthetic split event per
     case via *dispatch*.  Returns True if the split ran, False otherwise.
 
     This path bypasses the framework LLM extractor — Santa Clara expanded-
-    format calendar PDFs use bare ``Line N`` boundaries (case-insensitive)
-    on their own line followed by ``Case Name:`` / ``Case No.:`` headers
-    that are cheap to parse with the regex-based ``_split_rulings``
-    function in ``courts.ca.sc_tentatives``.  Sending the whole PDF
-    through the LLM previously produced cross-entry contamination
-    (#4303): the LLM violated rule 5b of the Santa Clara extraction
-    prompt and copied the first entry's ``case_title`` /
-    ``motion_type`` onto subsequent entries.  The cross-county audit
-    (#4289 ran 2026-05-06) found 21 distinct multi-case Santa Clara
-    PDFs with the ``all_same_case_title_cluster`` fingerprint —
-    precisely the carry-forward signature #3534 / #3649 fixed for
-    Fresno / Riverside.
+    format calendar PDFs (format A — e.g. dept 16) use bare ``Line N``
+    boundaries on their own line followed by ``Case Name:`` /
+    ``Case No.:`` headers that are cheap to parse with the regex-based
+    ``_split_rulings`` function in ``courts.ca.sc_tentatives``.  Compact
+    summary-table PDFs (format B — e.g. dept 6) are parsed with
+    pdfplumber's structured ``extract_tables()`` API when *raw_pdf_bytes*
+    is supplied — see #4341.  Sending the whole PDF through the LLM
+    previously produced cross-entry contamination (#4303): the LLM
+    violated rule 5b of the Santa Clara extraction prompt and copied
+    the first entry's ``case_title`` / ``motion_type`` onto subsequent
+    entries.  The cross-county audit (#4289 ran 2026-05-06) found 21
+    distinct multi-case Santa Clara PDFs with the
+    ``all_same_case_title_cluster`` fingerprint — precisely the
+    carry-forward signature #3534 / #3649 fixed for Fresno / Riverside.
 
     Detection gate: only triggers when event is Santa Clara county
     **and** content format is ``"pdf"`` — avoids false-positive
     matches on other courts.
 
-    When ``_split_rulings`` returns ``[]`` (no ``Line N`` boundaries —
-    typical of compact summary-table PDFs like dept 6 and of single-
-    ruling PDFs) or a 1-element list, this function returns ``False``
-    so the existing LLM path handles enrichment.  The deterministic
-    regex extraction does not populate ``motion_type``/``outcome`` —
-    falling through to the framework ``LlmExtractor`` is what gives
-    those fields per-entry enrichment without any cross-entry carry-
-    forward window (single-ruling PDFs have nothing to carry forward).
+    When ``_split_rulings`` returns ``[]`` (no ``Line N`` boundaries
+    AND no parseable summary table — typical of single-ruling PDFs) or
+    a 1-element list, this function returns ``False`` so the existing
+    LLM path handles enrichment.  The deterministic extraction does not
+    populate ``motion_type``/``outcome`` — falling through to the
+    framework ``LlmExtractor`` is what gives those fields per-entry
+    enrichment without any cross-entry carry-forward window
+    (single-ruling PDFs have nothing to carry forward).
 
     Mirrors the SD/LA/Fresno/Riverside/SF pattern (``_try_sd_calendar_split``
     #2447, ``_try_la_html_split`` #2450, ``_try_fresno_pdf_split`` #3534,
@@ -884,7 +887,7 @@ def _try_sc_pdf_split(
     # the courts package at module load time.
     from courts.ca.sc_tentatives import _split_rulings
 
-    split_rulings = _split_rulings(ruling_text)
+    split_rulings = _split_rulings(ruling_text, pdf_bytes=raw_pdf_bytes)
     if not split_rulings:
         # No ``Line N`` boundaries found — fall through to LLM.
         logger.info(
@@ -2242,11 +2245,23 @@ class IngestionWorker:
             # is_pdf_binary() returns False, so raw_pdf_bytes stays None.
             # For MULTIMODAL counties, download the original PDF from S3 so
             # the multimodal path can send page images to the LLM.
+            #
+            # Santa Clara also needs the raw bytes for the format-B
+            # summary-table splitter (#4341).  The format-B parser uses
+            # pdfplumber's ``extract_tables()`` API on the original PDF —
+            # the flattened text doesn't preserve the column structure.
+            # Fetching here (rather than lazily inside the splitter)
+            # keeps S3 access in one place and avoids a second fetch
+            # later in the pipeline.
+            sc_county_match = (
+                content_format == "pdf"
+                and (event_data.get("county") or "").upper() == "SANTA CLARA"
+            )
             if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
                 # ``strategy.use_multimodal`` is True for ExtractionMethod.MULTIMODAL
                 # AND for unconfigured counties (the helper preserves the worker's
                 # pre-refactor default-multimodal behavior, #4081).
-                if strategy.use_multimodal:
+                if strategy.use_multimodal or sc_county_match:
                     raw_pdf_bytes = self._fetch_raw_pdf_from_s3(s3_key, s3_bucket, document_id)
 
         # ------------------------------------------------------------------
@@ -3647,7 +3662,11 @@ class IngestionWorker:
         # deterministically from the per-entry ``Case No.:`` /
         # ``Case Name:`` headers when present.
         if ruling_text and _try_sc_pdf_split(
-            event_data, document_id, ruling_text, self.process_event
+            event_data,
+            document_id,
+            ruling_text,
+            self.process_event,
+            raw_pdf_bytes=raw_pdf_bytes,
         ):
             return True
 

@@ -1122,22 +1122,199 @@ class TestSantaClaraPdfSplit:
         for idx in ruling_indices:
             assert idx < 10, f"trailing index label Line {idx} was not skipped"
 
-    def test_santa_clara_pdf_split_dept6_compact_table_falls_through(self) -> None:
-        """sc_dept6_tues.pdf uses the compact summary-table format (no per-
-        entry ``Line N`` boundaries on their own line).  The splitter
-        returns at most 1 entry, so the worker falls through to the LLM
-        path and the existing carry-forward protection (the LLM prompt's
-        rule 5b) is the only defense for this format.
+    def test_santa_clara_pdf_split_dept6_compact_table_text_only_falls_through(self) -> None:
+        """sc_dept6_tues.pdf uses the compact summary-table format (format B —
+        no per-entry ``Line N`` boundaries on their own line for short
+        rulings).  When ``_split_rulings`` is called with text only (no
+        ``pdf_bytes``), the format-A regex path returns at most 1 entry, so
+        the worker falls through to the LLM path.
 
-        This test pins the fall-through behavior so the splitter's
-        coverage gap is explicit.  A future PR can extend the splitter
-        to handle compact tables; until then, dept 6's residual carry-
-        forward risk is acknowledged here.
+        This pins the text-only fallback behavior.  When ``pdf_bytes`` is
+        supplied, the format-B path takes over and produces structured
+        rulings — see :meth:`test_santa_clara_pdf_split_dept6_summary_table_returns_ten_rulings`.
         """
         text = extract_pdf_text(_load_bytes("sc_dept6_tues.pdf"))
         rulings = _split_rulings(text)
-        # 0 or 1 entries — both trigger the worker's fall-through-to-LLM path.
+        # 0 or 1 entries — text-only fallback when format-B parser is not invoked.
         assert len(rulings) <= 1
+
+    def test_santa_clara_pdf_split_dept6_summary_table_returns_ten_rulings(self) -> None:
+        """sc_dept6_tues.pdf in format-B summary-table layout has 10 distinct
+        case rows.  When ``_split_rulings`` is called with ``pdf_bytes``,
+        the format-B parser uses pdfplumber's ``extract_tables()`` to read
+        the structured columns and returns one ``SplitRuling`` per case
+        row with ``case_number`` and ``case_title`` populated
+        deterministically (#4341, root-cause investigation #4339).
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        # The fixture has 10 distinct case rows in its summary table.
+        assert len(rulings) >= 10, (
+            f"format-B summary-table parser must emit >= 10 rulings; got {len(rulings)}"
+        )
+        for r in rulings:
+            assert r.case_number is not None, (
+                f"case_number is None at ruling_index {r.ruling_index}"
+            )
+            assert r.case_title is not None, f"case_title is None at ruling_index {r.ruling_index}"
+
+    def test_santa_clara_pdf_split_dept6_summary_table_titles(self) -> None:
+        """The format-B parser must extract the per-row case_title from the
+        summary table, not synthesize a generic carry-forward title.  The
+        fingerprint of the fix is that distinct case_numbers produce
+        distinct case_titles — exactly what the LLM-only path was failing
+        to do (#4339 documented 21 SC rulings sharing the hallucinated
+        title ``"Plaintiff v. FCA"``).
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        titles = [r.case_title for r in rulings]
+        # The summary table in this fixture (2026-03-03 dept-6 calendar)
+        # contains these 10 distinct case rows.  All must appear among the
+        # extracted titles (substring match — pdfplumber may collapse or
+        # spread whitespace differently from the printed text).
+        expected_substrings = [
+            "Huynh vs Redis Labs",
+            "Nicholas v. Compass",
+            "Ne Wang v. Daili Ren",
+            "Devin Shaffer",
+            "Discover Bank",
+            "Jessica Ebert",
+            "Pisamai Cuesta",
+            "Freelancer",
+            "Lee Casper v. Ford",
+            "Pahl & McCay",
+        ]
+        for needle in expected_substrings:
+            assert any(needle in (t or "") for t in titles), (
+                f"expected case_title containing {needle!r} not found in {titles!r}"
+            )
+        # And distinct case_numbers must produce distinct case_titles —
+        # the carry-forward fingerprint is identical case_titles across
+        # distinct case_numbers.
+        cn_to_title: dict[str, set[str]] = {}
+        for r in rulings:
+            assert r.case_number is not None
+            assert r.case_title is not None
+            cn_to_title.setdefault(r.case_number, set()).add(r.case_title)
+        # At least 10 distinct case_numbers with at least 10 distinct titles.
+        assert len(cn_to_title) >= 10
+        distinct_titles = {next(iter(ts)) for ts in cn_to_title.values()}
+        assert len(distinct_titles) >= 10, (
+            f"expected >= 10 distinct titles; got {len(distinct_titles)}: {distinct_titles!r}"
+        )
+
+    def test_santa_clara_pdf_split_dept6_summary_table_case_numbers(self) -> None:
+        """Each row's case_number must be extracted verbatim from the
+        ``CASE NO.`` column of the summary table.  Uppercase, no internal
+        whitespace.
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        case_numbers = {r.case_number for r in rulings}
+        # Ground truth from the fixture — every distinct case_number in
+        # the dept-6 summary table.
+        expected = {
+            "24CV443183",
+            "25CV460465",
+            "24CV448038",
+            "24CV441941",
+            "25CV458157",
+            "24CV442402",
+            "23CV428298",
+            "25CV468424",
+            "25CV474364",
+            "23CV419882",
+        }
+        missing = expected - case_numbers
+        assert not missing, f"expected case_numbers missing from format-B output: {missing!r}"
+
+    def test_santa_clara_pdf_split_dept6_summary_table_first_row(self) -> None:
+        """AC2: The fixture's first row resolves to ``case_number="24CV443183"``
+        and ``case_title="Huynh vs Redis Labs"`` (or close variant tolerating
+        ``"vs."``/``"vs"``/``"v."`` spelling).
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        # Find the ruling for case 24CV443183 (the first row in the summary).
+        match = next((r for r in rulings if r.case_number == "24CV443183"), None)
+        assert match is not None, (
+            "first summary-table row (case 24CV443183) is not in the format-B output"
+        )
+        assert match.case_title is not None
+        # Tolerant title check — "vs"/"vs."/"v." all acceptable.
+        normalized = match.case_title.lower()
+        assert "huynh" in normalized
+        assert "redis labs" in normalized
+
+    def test_santa_clara_pdf_split_dept6_summary_table_isolation(self) -> None:
+        """Each format-B ruling's text must contain only its own row's
+        content.  No cross-row contamination — that is the carry-forward
+        fingerprint #4339 documented.
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        by_cn = {r.case_number: r for r in rulings}
+        # Pick rows with clearly distinct parties.
+        r_huynh = by_cn["24CV443183"]
+        r_discover = by_cn["25CV458157"]
+        # The Pahl row exists in the table — assert its case_number landed
+        # so the test fails loudly if the case were to drop out.
+        assert "23CV419882" in by_cn
+        # Title isolation — each ruling's title must NOT contain another
+        # ruling's distinctive party tokens.
+        assert "Huynh" not in (r_discover.case_title or "")
+        assert "Discover" not in (r_huynh.case_title or "")
+        assert "Pahl" not in (r_huynh.case_title or "")
+        assert "Pahl" not in (r_discover.case_title or "")
+
+    def test_santa_clara_pdf_split_dept6_summary_table_no_pdf_bytes_falls_back(self) -> None:
+        """When ``pdf_bytes`` is None (text-only call), the format-B parser
+        must NOT run — the splitter falls back to format-A regex (which
+        returns 0-1 entries for this PDF).  This is the backward-compat
+        contract for callers that haven't been updated yet.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept6_tues.pdf"))
+        # Explicit pdf_bytes=None is the same as omitting the param.
+        rulings_none = _split_rulings(text, pdf_bytes=None)
+        rulings_omitted = _split_rulings(text)
+        assert len(rulings_none) <= 1
+        assert len(rulings_omitted) <= 1
+        # And the two calls return the same thing.
+        assert len(rulings_none) == len(rulings_omitted)
+
+    def test_santa_clara_pdf_split_dept6_summary_table_does_not_extract_motion_or_outcome(
+        self,
+    ) -> None:
+        """Same contract as format-A: the splitter populates only
+        case_number / case_title / ruling_text and leaves motion_type /
+        outcome as ``None`` for per-entry LLM enrichment.
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        assert len(rulings) > 0
+        for r in rulings:
+            assert r.motion_type is None
+            assert r.outcome is None
+
+    def test_santa_clara_pdf_split_dept16_format_a_unaffected_by_pdf_bytes(self) -> None:
+        """The format-A path (dept 16) must continue to work when ``pdf_bytes``
+        is passed — format-A short-circuits before format-B is consulted,
+        so the dept 16 result is identical with or without bytes.
+        """
+        pdf_bytes = _load_bytes("sc_dept16_wed.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings_text = _split_rulings(text)
+        rulings_with_bytes = _split_rulings(text, pdf_bytes=pdf_bytes)
+        # Same count, same case_numbers in the same order.
+        assert len(rulings_text) == len(rulings_with_bytes) == 9
+        assert [r.case_number for r in rulings_text] == [r.case_number for r in rulings_with_bytes]
 
     def test_santa_clara_pdf_split_dept1_summary_table_falls_through(self) -> None:
         """sc_dept1_tues.pdf uses ``LINE 1 CASENO TITLE ...`` on a single
@@ -1260,3 +1437,186 @@ class TestSantaClaraPdfSplit:
             assert hasattr(r, "outcome")
             assert hasattr(r, "hearing_date")
             assert hasattr(r, "department")
+
+
+# ---------------------------------------------------------------------------
+# Format-B helper coverage (#4341)
+# ---------------------------------------------------------------------------
+#
+# The format-B path has several defensive branches that the dept-6 fixture
+# cannot exercise on its own (e.g., header-row mismatch, body-section
+# fallback, malformed PDF bytes).  These tests cover the helpers directly
+# so the diff-coverage gate is satisfied without needing an additional
+# binary fixture.
+
+
+class TestSantaClaraFormatBHelpers:
+    """Unit tests for format-B summary-table parser helpers (#4341)."""
+
+    def test_is_format_b_header_row_matches_canonical(self) -> None:
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        assert _is_format_b_header_row(["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"])
+        # Tolerate trailing None columns (pdfplumber pads to a fixed col count).
+        assert _is_format_b_header_row(
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING", None, None]
+        )
+
+    def test_is_format_b_header_row_tolerates_missing_period(self) -> None:
+        """pdfplumber may strip the trailing period from ``CASE NO.``"""
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        assert _is_format_b_header_row(["LINE", "CASE NO", "CASE TITLE", "TENTATIVE RULING"])
+
+    def test_is_format_b_header_row_case_insensitive(self) -> None:
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        assert _is_format_b_header_row(["line", "case no.", "case title", "tentative ruling"])
+
+    def test_is_format_b_header_row_too_short_returns_false(self) -> None:
+        """A row shorter than 4 cells cannot be the format-B header."""
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        assert not _is_format_b_header_row(["LINE", "CASE NO."])
+        assert not _is_format_b_header_row([])
+
+    def test_is_format_b_header_row_wrong_columns_returns_false(self) -> None:
+        """Non-matching columns return False."""
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        # First column wrong.
+        assert not _is_format_b_header_row(["FOO", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"])
+        # Second column wrong.
+        assert not _is_format_b_header_row(["LINE", "BAR", "CASE TITLE", "TENTATIVE RULING"])
+        # Tentative ruling column missing.
+        assert not _is_format_b_header_row(["LINE", "CASE NO.", "CASE TITLE", "BAZ"])
+
+    def test_is_format_b_header_row_normalizes_whitespace(self) -> None:
+        """``\\n`` and runs of whitespace inside cells are collapsed."""
+        from courts.ca.sc_tentatives import _is_format_b_header_row
+
+        assert _is_format_b_header_row(
+            ["  LINE  ", "CASE\nNO.", "CASE\nTITLE", "TENTATIVE  RULING"]
+        )
+
+    def test_normalize_table_cell_handles_none(self) -> None:
+        from courts.ca.sc_tentatives import _normalize_table_cell
+
+        assert _normalize_table_cell(None) == ""
+        assert _normalize_table_cell("") == ""
+        assert _normalize_table_cell("foo\nbar") == "foo bar"
+        assert _normalize_table_cell("  foo   bar  ") == "foo bar"
+
+    def test_format_a_body_section_finds_present_line(self) -> None:
+        """The helper returns the body when ``Line N`` is present and long
+        enough."""
+        from courts.ca.sc_tentatives import _format_a_body_section
+
+        body = "x" * 200  # well over _SC_MIN_ENTRY_BODY_LEN.
+        text = f"preamble\nLine 11\n{body}\nLine 12\nstub\n"
+        section = _format_a_body_section(text, 11)
+        assert section is not None
+        assert body in section
+
+    def test_format_a_body_section_returns_none_for_missing_line(self) -> None:
+        """Returns None when no ``Line N`` boundary exists for the
+        requested number — covers the "iterate-and-fall-through" branch."""
+        from courts.ca.sc_tentatives import _format_a_body_section
+
+        text = "Line 1\n" + ("x" * 200) + "\nLine 2\n" + ("y" * 200) + "\n"
+        # Line 99 is not in the text; loop should fall through.
+        assert _format_a_body_section(text, 99) is None
+
+    def test_format_a_body_section_returns_none_for_too_short(self) -> None:
+        """Returns None when the matched section is below the minimum body
+        length — covers the trailing-label-style branch."""
+        from courts.ca.sc_tentatives import _format_a_body_section
+
+        text = "Line 1\nshort.\nLine 2\nyyy\n"
+        assert _format_a_body_section(text, 1) is None
+
+    def test_format_a_body_section_handles_no_line_boundaries(self) -> None:
+        """No boundaries at all → return None (defensive)."""
+        from courts.ca.sc_tentatives import _format_a_body_section
+
+        assert _format_a_body_section("", 1) is None
+        assert _format_a_body_section("plain prose without boundaries", 1) is None
+
+    def test_format_b_returns_empty_on_corrupt_pdf_bytes(self) -> None:
+        """Corrupt PDF bytes raise inside pdfplumber — the format-B parser
+        catches the exception and returns ``[]`` so the caller falls
+        back to format A."""
+        from courts.ca.sc_tentatives import _split_rulings_format_b
+
+        corrupt = b"Not actually a PDF"
+        result = _split_rulings_format_b("LINE CASE NO. CASE TITLE TENTATIVE RULING", corrupt)
+        assert result == []
+
+    def test_format_b_returns_empty_when_no_matching_table(self) -> None:
+        """The dept 1 PDF has no format-B summary table — every page's
+        ``extract_tables()`` either returns no tables or tables whose
+        first row does not match the format-B header.  Calling the
+        format-B parser directly returns ``[]`` so the public
+        ``_split_rulings`` falls back to format A.
+        """
+        from courts.ca.sc_tentatives import _split_rulings_format_b
+
+        pdf_bytes = _load_bytes("sc_dept1_tues.pdf")
+        result = _split_rulings_format_b("", pdf_bytes)
+        assert result == []
+
+    def test_split_rulings_format_b_skipped_when_pdf_bytes_none(self) -> None:
+        """Even when the format-B header is in the text, the parser is not
+        invoked when ``pdf_bytes`` is None — backward-compat branch.
+        """
+        text_with_header = "LINE CASE NO. CASE TITLE TENTATIVE RULING\n"
+        rulings = _split_rulings(text_with_header, pdf_bytes=None)
+        # No format-A boundaries either, so we get an empty list.
+        assert rulings == []
+
+    def test_split_rulings_format_b_skipped_when_header_absent(self) -> None:
+        """When the format-B header is absent from the text, the parser is
+        not invoked even when ``pdf_bytes`` is supplied."""
+        # Text has no LINE CASE NO. CASE TITLE TENTATIVE RULING header.
+        text = "Some random PDF text without the format-B header"
+        rulings = _split_rulings(text, pdf_bytes=b"%PDF-1.4 dummy")
+        assert rulings == []
+
+    def test_format_b_cross_reference_expansion(self) -> None:
+        """When a summary-table cell contains ``See Line N below`` and the
+        flattened text has a corresponding ``Line N`` body section, the
+        body section is appended to the row's ruling_text.
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        # The Freelancer row (25CV468424) has a "See Line 11 below" cell
+        # AND the flattened text has a Line 11 body section — so the
+        # cross-reference should be expanded.
+        freelancer = next((r for r in rulings if r.case_number == "25CV468424"), None)
+        assert freelancer is not None
+        # The Line 11 body content should have been appended.
+        assert "FREELANCER" in (freelancer.ruling_text or "")
+        assert "MOTION TO DISMISS" in (freelancer.ruling_text or "")
+
+    def test_format_b_continuation_row_appends_title_and_ruling(self) -> None:
+        """Continuation rows where col-1 is empty contribute their CASE
+        TITLE and TENTATIVE RULING columns to the current case.
+
+        This is exercised by the dept-6 fixture (the Nicholas v. Compass
+        Group row spans 2 title lines and 4 ruling lines), but we add an
+        explicit assertion so a regression in that branch is caught
+        directly.
+        """
+        pdf_bytes = _load_bytes("sc_dept6_tues.pdf")
+        text = extract_pdf_text(pdf_bytes)
+        rulings = _split_rulings(text, pdf_bytes=pdf_bytes)
+        nicholas = next((r for r in rulings if r.case_number == "25CV460465"), None)
+        assert nicholas is not None
+        # Title spans 2 lines: "Nicholas v. Compass\nGroup, et. Al." — the
+        # continuation must have appended "Group, et. Al." to the title.
+        assert "Compass" in (nicholas.case_title or "")
+        assert "Group" in (nicholas.case_title or "")
+        # Ruling spans 4 lines starting "Defendant moves for a demurrer..."
+        assert "demurrer" in (nicholas.ruling_text or "").lower()
+        assert "GRANTED" in (nicholas.ruling_text or "")
