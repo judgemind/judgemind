@@ -88,6 +88,12 @@ COPY scripts/notify-telegram.sh /app/scripts/notify-telegram.sh
 # combined ~280 KB image-size impact is negligible.  See #4288.
 COPY scripts/reingest_from_s3.py /app/scripts/reingest_from_s3.py
 COPY scripts/rebuild_db.py /app/scripts/rebuild_db.py
+# drain_splitter_carry_forward_clusters.py: post-deploy verification
+# helper for splitter PRs.  Embedded alongside reingest_from_s3.py so it
+# can lazy-import the latter at /app/scripts/ to dispatch the
+# full-reparse + bust-llm-cache invocation that re-extracts per-entry
+# children from the freshly-restored parent doc rows.  See #4321.
+COPY scripts/drain_splitter_carry_forward_clusters.py /app/scripts/drain_splitter_carry_forward_clusters.py
 
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
