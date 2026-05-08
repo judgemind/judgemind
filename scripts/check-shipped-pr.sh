@@ -82,7 +82,7 @@ fi
 # ─── Fetch issue body ──────────────────────────────────────────────────────
 
 issue_json=""
-if ! issue_json=$("$GH_BIN" issue view "$issue_num" --repo "$REPO" --json body,title 2>/dev/null); then
+if ! issue_json=$("$GH_BIN" issue view "$issue_num" --repo "$REPO" --json body,title,createdAt 2>/dev/null); then
     echo "error: failed to fetch issue #${issue_num} from ${REPO} (exit 2)" >&2
     exit 2
 fi
@@ -96,6 +96,18 @@ if ! candidate_files=$(printf '%s' "$issue_json" | python3 \
     echo "error: failed to extract candidate file paths from issue #${issue_num} (exit 2)" >&2
     exit 2
 fi
+
+# Extract the issue's createdAt timestamp for the date-ordering guard
+# (#4353). The helper exits 0 unconditionally and emits an empty string
+# when the field is absent / null / malformed, so the guard fails open
+# (no date check applied) when the data is unavailable. The downstream
+# overlap helper uses CHECK_SHIPPED_ISSUE_CREATED_AT to skip candidate
+# PRs whose `mergedAt` precedes the issue's `createdAt` — a PR that
+# merged before the issue existed cannot have shipped its work.
+issue_created_at=""
+issue_created_at=$(printf '%s' "$issue_json" | python3 \
+    "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_extract_created_at.py" \
+    2>/dev/null) || issue_created_at=""
 
 if [[ -z "$candidate_files" ]]; then
     echo "not-shipped: no candidate file paths in issue #${issue_num} body (exit 1)"
@@ -192,9 +204,14 @@ for pr_num in "${prs_array[@]}"; do
 
     # Compute overlap and merged-on-main check via Python helper.
     # The helper applies the threshold (≥1 added overlap OR ≥2 total
-    # overlap) and emits a tab-separated line on match, empty on miss.
+    # overlap), the date-ordering guard (#4353 — a PR that merged
+    # before the issue existed cannot have shipped its work), and
+    # emits a tab-separated line on match, empty on miss.
     overlap_result=""
-    if ! overlap_result=$(printf '%s' "$pr_json" | CHECK_SHIPPED_CANDIDATE_FILES="$candidate_files_csv" python3 \
+    if ! overlap_result=$(printf '%s' "$pr_json" | \
+        CHECK_SHIPPED_CANDIDATE_FILES="$candidate_files_csv" \
+        CHECK_SHIPPED_ISSUE_CREATED_AT="$issue_created_at" \
+        python3 \
         "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_overlap.py" \
         2>/dev/null); then
         continue

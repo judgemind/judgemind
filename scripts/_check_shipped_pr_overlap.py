@@ -114,6 +114,20 @@ def main() -> int:
         # Merged onto a feature branch, not main.
         return 0
 
+    # Date-ordering guard (#4353). A PR that merged BEFORE the issue was
+    # filed cannot have shipped the issue's work — by definition. The
+    # check is a string comparison: GitHub timestamps are ISO-8601 UTC
+    # with a trailing `Z`, which is lexicographically sortable. When
+    # CHECK_SHIPPED_ISSUE_CREATED_AT is unset / empty (e.g. the caller
+    # could not extract it from the issue JSON), the guard is a no-op
+    # — preserving the pre-#4353 fail-open behavior so downstream tests
+    # whose mocks omit `createdAt` continue to work.
+    issue_created_at = os.environ.get("CHECK_SHIPPED_ISSUE_CREATED_AT", "")
+    if issue_created_at and merged_at < issue_created_at:
+        # PR merged before the issue existed — incidental file overlap,
+        # not a shipped match.
+        return 0
+
     candidate_csv = os.environ.get("CHECK_SHIPPED_CANDIDATE_FILES", "")
     candidates = [c for c in candidate_csv.split(",") if c]
     if not candidates:
