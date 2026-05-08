@@ -67,6 +67,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 29 | `scripts/check-hyphen-underscore-collision.sh` | self-diagnosing (Fix block) | **Upgraded #4346:** emits a `Fix:` block with concrete `git mv` rename suggestion picking a canonical winner per file extension (`.py`/`.tf` ⇒ underscore; `.sh`/`.md`/dirs ⇒ hyphen). Prior shape said only "Rename one, or delete the stale sibling". |
 | 30 | `scripts/check-ingestion-worker-task-def-fingerprint.sh` | self-diagnosing (Fix block) | Emits "Recovery:" with copy-paste `aws ecs describe-task-definition ...` + `update-service --force-new-deployment` recipe. |
 | 31 | `scripts/check-issue-author.sh` | decision flow (no violation list) | Returns trust verdict for callers. The fix (move untrusted issue to triage) is enacted by callers, not by this guard. |
+| 31a | `scripts/check-issue-verify-sql.py` | self-diagnosing (Fix block) | Validates SQL columns referenced in `Verify:` lines of an issue body against `packages/api/src/data-access/schema.sql`. Emits per-violation `column <schema.table.col> does not exist` plus a `Fix:` block pointing at `schema.sql` and `scripts/dev-db-query.sh`. Tracking: #4358. |
 | 32 | `scripts/check-llm-json-loads.sh` | self-diagnosing (Fix block) | Emits the `_safe_json_loads` / try-except replacement. |
 | 33 | `scripts/check-llm-paths-symmetry.sh` | self-diagnosing (actionable text) | Emits "the chunk-failure event MUST include document_id= so the log line is self-diagnosing". Could be upgraded to a literal-patch suggestion. |
 | 34 | `scripts/check-markdown-links.sh` | wrapper (delegates to helper) | Wrapper for `check-markdown-links.py`. |
@@ -123,7 +124,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 
 ## Summary
 
-- Total guards: 84.
+- Total guards: 85 (#31a `check-issue-verify-sql.py` added by #4358).
 - Already self-diagnosing (Fix block or actionable text) before #4346: 71.
 - Wrappers (delegate to helper): 18.
 - Operational health probes: 2.
