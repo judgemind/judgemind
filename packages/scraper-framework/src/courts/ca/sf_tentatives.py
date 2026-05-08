@@ -10,12 +10,12 @@ Link text format: filename only — e.g. "403 Tentative Rulings 3.03.2026.pdf"
   No judge name in link text; extracted from PDF text.
   Department extracted from filename (leading digits before space).
 
-PDF structure (pages 3+):
-  Header block per ruling:
-    Case Number: FPT-25-378624
-    Hearing Date: March 3, 2026
-    Department: 403
-    Presiding: BOBBY P. LUNA
+PDF structure (pages 3+, multi-case calendars):
+  Each entry begins with a ``SUPERIOR COURT OF CALIFORNIA`` page header
+  followed within ~10 lines by a multi-line caption block carrying
+  ``Case Number: FPT-25-378624``, ``Hearing Date: ...``, ``Department: ...``,
+  ``Presiding: BOBBY P. LUNA`` on adjacent lines (line numbers + ``)``
+  delimiters interleave the labels and values).
 
 Case number format: F + 2 uppercase letters + hyphen + 2-digit year + hyphen + 6 digits
   e.g. FPT-25-378624, FMS-20-387302, FDI-14-781786
@@ -23,6 +23,23 @@ Case number format: F + 2 uppercase letters + hyphen + 2-digit year + hyphen + 6
 Departments: 403, 404, 405, 405A, 406, 416, 425
 Calendar days: Tuesday and Thursday
 Previous rulings available for ~30 days, auto-deleted.
+
+Multi-case PDF splitting (#4304):
+  SF family-law PDFs commonly bundle 5–15 distinct rulings in one file.
+  Sending the whole PDF through the framework ``LlmExtractor`` lets the
+  LLM violate rule 5b of its own prompt and copy the first entry's
+  ``case_title`` (and other LLM-extracted fields) onto every subsequent
+  entry — producing the ``all_same_case_title_cluster`` pattern flagged
+  by the cross-county audit (#4289).  The ``_split_rulings`` helper
+  below splits a multi-case PDF into per-entry ``SplitRuling`` objects
+  using the ``SUPERIOR COURT OF CALIFORNIA`` page header as the entry
+  boundary; the ingestion worker hooks the splitter into per-document
+  dispatch via ``_try_sf_pdf_split`` in ``ingestion.worker`` so each
+  entry gets its own LLM enrichment pass.  This mirrors the Riverside
+  pattern (#3649) and Fresno pattern (#3534) — same fix family, same
+  shape.  Single-ruling PDFs (the splitter returns ``[]`` or a 1-element
+  list) fall through to the framework ``LlmExtractor`` path so the
+  existing per-field enrichment fills in motion_type and outcome.
 
 Investigation: #9
 Report: docs/investigations/sf-tentative-rulings-2026-03.md
@@ -56,6 +73,163 @@ _PRESIDING_RE = re.compile(
 
 # Case number format: F + 2 uppercase letters + hyphen + 2-digit year + hyphen + 6 digits
 _CASE_NUMBER_RE = re.compile(r"\bF[A-Z]{2}-\d{2}-\d{6}\b")
+
+# Multi-case entry boundary (#4304).  Each ruling in a multi-case SF
+# family-law PDF starts on its own page with the standard court header
+# ``SUPERIOR COURT OF CALIFORNIA``.  Anchored at start-of-line and
+# tolerating an optional leading line-number prefix (``"1 "``) inserted
+# by some PDF text extractors.  Page-1 / page-2 of a multi-case PDF carry
+# Tentative Ruling Instructions and Zoom-call boilerplate without this
+# header, so the regex naturally skips the preamble.
+_ENTRY_HEADER_RE = re.compile(
+    r"^\s*\d*\s*SUPERIOR\s+COURT\s+OF\s+CALIFORNIA\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Caption-block ``Case Number:`` extractor used by ``_split_rulings`` to
+# attach a deterministic case_number to each split entry.  Limited to the
+# F-prefix family-law shape so it does not match unrelated case-number-
+# like substrings inside the body (e.g. references to civil case numbers).
+_CASE_NUMBER_CAPTION_RE = re.compile(
+    r"Case\s+Number:\s*(F[A-Z]{2}-\d{2}-\d{6})",
+    re.IGNORECASE,
+)
+
+# Caption-block ``Department:`` extractor (3-digit dept, optional letter
+# suffix mirrors the link-text shape in ``_LINK_TEXT_RE``).
+_DEPARTMENT_CAPTION_RE = re.compile(
+    r"Department:\s*(?P<department>\d{3}[A-Z]?)",
+    re.IGNORECASE,
+)
+
+
+class SplitRuling:
+    """A single ruling extracted from a multi-ruling SF family-law PDF (#4304).
+
+    Mirrors ``courts.ca.riverside_tentatives.SplitRuling`` (#3649) and
+    ``courts.ca.fresno_tentatives.SplitRuling`` (#3534) so the deterministic
+    splitter dispatch in ``ingestion.worker._try_sf_pdf_split`` can produce
+    synthetic split events with the same shape as those counties.
+
+    Only ``case_number`` and ``ruling_text`` are populated by the splitter;
+    motion_type, case_title, and outcome are left to LLM enrichment because
+    the SF caption header wraps unpredictably (multi-line petitioner names,
+    ``)`` delimiters, line-number prefixes from the PDF text extractor) and
+    a deterministic regex extraction is not reliable enough to replace the
+    LLM.  The important property is that each entry's enrichment runs
+    *individually* so the LLM cannot carry-forward a previous entry's
+    fields onto the next one.
+    """
+
+    __slots__ = (
+        "ruling_index",
+        "case_number",
+        "ruling_text",
+        "case_title",
+        "motion_type",
+        "outcome",
+        "hearing_date",
+        "department",
+    )
+
+    def __init__(
+        self,
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None = None,
+        motion_type: str | None = None,
+        outcome: str | None = None,
+        hearing_date: datetime | None = None,
+        department: str | None = None,
+    ) -> None:
+        self.ruling_index = ruling_index
+        self.case_number = case_number
+        self.ruling_text = ruling_text
+        self.case_title = case_title
+        self.motion_type = motion_type
+        self.outcome = outcome
+        self.hearing_date = hearing_date
+        self.department = department
+
+
+def _split_rulings(text: str) -> list[SplitRuling]:
+    """Split SF family-law multi-ruling PDF text into per-entry ``SplitRuling`` objects.
+
+    The page-1 / page-2 preamble (Tentative Ruling Instructions, Zoom
+    call-in boilerplate, courthouse contact info) is excluded by anchoring
+    on ``SUPERIOR COURT OF CALIFORNIA`` page headers — the preamble pages
+    do not carry that header.  Entries without a ``Case Number:`` line in
+    their caption block (e.g. an interstitial blank page that happens to
+    carry the court header) are dropped to avoid synthesizing ghost
+    rulings.
+
+    Returns an empty list if no entry headers are found, which is the
+    expected outcome for very short single-page PDFs that don't follow
+    the multi-case calendar format.
+
+    Each returned ``SplitRuling`` has:
+
+      * ``ruling_index`` — the zero-based index of the entry within the
+        PDF (entry 0 is the first ruling, not the preamble).
+      * ``case_number`` — extracted via ``_CASE_NUMBER_CAPTION_RE`` from
+        the entry's caption block; ``None`` if the regex fails to match
+        (rare on well-formed SF PDFs but defensive).
+      * ``department`` — extracted via ``_DEPARTMENT_CAPTION_RE`` from
+        the entry's caption block; falls back to ``None`` if absent.
+      * ``ruling_text`` — the **verbatim** entry text from the boundary
+        through the next entry boundary (or the end of the document for
+        the last entry).  This includes the entry's own caption block
+        and tentative ruling body.  We keep it verbatim so downstream
+        LLM enrichment sees exactly the same content the LLM would have
+        seen if we'd sent the whole PDF — minus the cross-entry
+        contamination that causes the carry-forward bug.
+
+    motion_type, case_title, and outcome are left ``None`` on purpose —
+    the SF caption block doesn't have structured field labels for those
+    (the case title is reconstructed from a multi-line VS. block elsewhere
+    in this module via ``_sf_case_title_from_pdf_text`` for the
+    single-PDF parse path, but downstream LLM enrichment is what fills
+    those fields on the split path).  Letting the framework
+    ``LlmExtractor`` populate those fields via per-entry enrichment
+    matches the Riverside fall-through pattern (#3649) and preserves
+    the behaviour the LLM was already producing on single-ruling PDFs.
+    """
+    matches = list(_ENTRY_HEADER_RE.finditer(text))
+    if not matches:
+        return []
+
+    rulings: list[SplitRuling] = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+
+        body = text[start:end].strip()
+        if not body:
+            continue
+
+        # Real ruling entries always carry a Case Number line in the
+        # caption block.  Skip header-only / blank-page interstitials so
+        # we don't synthesize ghost rulings.
+        cn_match = _CASE_NUMBER_CAPTION_RE.search(body)
+        if not cn_match:
+            continue
+
+        case_number = cn_match.group(1).upper()
+
+        dept_match = _DEPARTMENT_CAPTION_RE.search(body)
+        department = dept_match.group("department") if dept_match else None
+
+        rulings.append(
+            SplitRuling(
+                ruling_index=len(rulings),
+                case_number=case_number,
+                ruling_text=body,
+                department=department,
+            )
+        )
+
+    return rulings
 
 
 # SF court caption format (multi-line, with line numbers and ")" delimiters):

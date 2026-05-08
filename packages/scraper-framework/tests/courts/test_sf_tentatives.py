@@ -10,6 +10,7 @@ for departments 405, 405A, 406, 425 per #2130):
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +24,12 @@ from courts.ca.sf_tentatives import (
     BASE_URL,
     INDEX_URL,
     SFTentativeRulingsScraper,
+    SplitRuling,
     _sf_case_title_from_pdf_text,
     _sf_courthouse,
     _sf_hearing_date_from_filename,
     _sf_judge_from_pdf_text,
+    _split_rulings,
 )
 from courts.ca.sf_tentatives import default_config as sf_default_config
 
@@ -591,3 +594,153 @@ def test_sf_default_config() -> None:
     assert config.county == "San Francisco"
     assert config.s3_bucket == "judgemind-document-archive-dev"
     assert len(config.schedule_windows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-case PDF splitter — _split_rulings (#4304)
+# ---------------------------------------------------------------------------
+
+
+def test_sf_split_rulings_returns_empty_for_empty_text() -> None:
+    """No entry headers → empty list (single-page or malformed PDFs)."""
+    assert _split_rulings("") == []
+
+
+def test_sf_split_rulings_returns_empty_for_no_entry_headers() -> None:
+    """Text without ``SUPERIOR COURT OF CALIFORNIA`` headers → empty list."""
+    text = (
+        "1 Important Information for Tentative Rulings and Hearings:\n"
+        "2 Please review and follow the Tentative Ruling Instructions...\n"
+    )
+    assert _split_rulings(text) == []
+
+
+def test_sf_split_rulings_skips_header_only_block_without_case_number() -> None:
+    """Header pages that don't carry a Case Number line are dropped (no ghost rulings)."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        "4 This is a header-only interstitial without any ruling content.\n"
+    )
+    assert _split_rulings(text) == []
+
+
+def test_sf_split_rulings_single_entry_returns_one_split() -> None:
+    """One entry header with one Case Number → one SplitRuling."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        ")\n"
+        "6 MICHAEL EDWARD GRAVES, ) Case Number: FPT-25-378624\n"
+        ")\n"
+        "7 Petitioner ) Hearing Date: March 3, 2026\n"
+        ")\n"
+        "8 VS. ) Department: 403\n"
+        ")\n"
+        "9 RANJIE LONG, ) Presiding: BOBBY P. LUNA\n"
+        ")\n"
+        "10 Respondent )\n"
+        "11 TENTATIVE RULING\n"
+        "12 The parties are ordered to appear.\n"
+    )
+    splits = _split_rulings(text)
+    assert len(splits) == 1
+    assert splits[0].case_number == "FPT-25-378624"
+    assert splits[0].department == "403"
+    assert splits[0].ruling_index == 0
+    # Splitter preserves verbatim entry text so downstream LLM enrichment
+    # sees the same content the LLM would have seen (minus cross-entry
+    # contamination).
+    assert "TENTATIVE RULING" in splits[0].ruling_text
+    assert "ordered to appear" in splits[0].ruling_text
+
+
+def test_sf_split_rulings_multi_case_dept403_fixture() -> None:
+    """AC#3 — multi-case fixture splits into N rulings with per-entry case_titles.
+
+    The dept-403 fixture PDF (sf_dept403_ruling.pdf, captured 2026-03-03)
+    contains 11 distinct rulings.  ``_split_rulings`` must produce 11
+    SplitRuling objects, each with a unique case_number and the entry's
+    ruling text isolated from siblings.
+    """
+    from courts.ca.pdf_link_scraper import _extract_pdf_text
+
+    text = _extract_pdf_text(_load_bytes("sf_dept403_ruling.pdf"))
+    splits = _split_rulings(text)
+    assert len(splits) == 11
+
+    # All splits must have unique case_numbers — the carry-forward bug
+    # this splitter is designed to prevent would produce duplicate
+    # case_titles.  Distinct case_numbers per entry is the structural
+    # invariant.
+    case_numbers = [s.case_number for s in splits]
+    assert len(set(case_numbers)) == 11
+    for cn in case_numbers:
+        assert cn is not None
+        # SF family-law case-number shape (#9): F + 2 letters + - + 2-digit year + - + 6 digits
+        assert re.match(r"^F[A-Z]{2}-\d{2}-\d{6}$", cn), f"unexpected case_number {cn!r}"
+
+    # All entries are dept 403 in this fixture.
+    for s in splits:
+        assert s.department == "403"
+
+    # Indexes are 0-based and contiguous.
+    assert [s.ruling_index for s in splits] == list(range(11))
+
+    # The first entry's ruling_text must contain the first case's text but
+    # NOT the second case's caption — that's the carry-forward boundary the
+    # splitter enforces.
+    first = splits[0]
+    assert first.case_number == "FPT-25-378624"
+    assert "FPT-25-378624" in first.ruling_text
+    assert "FPT-25-378672" not in first.ruling_text  # second entry's case_number
+
+    # The case_titles are populated by downstream LLM enrichment (per the
+    # splitter's design — see SplitRuling docstring).  Splitter leaves
+    # them at None, but per-entry texts are distinct, which is what
+    # gives the LLM a clean substrate to work from.
+    for s in splits:
+        assert s.case_title is None
+        assert s.motion_type is None
+        assert s.outcome is None
+
+
+def test_sf_split_rulings_returns_split_ruling_instances() -> None:
+    """The splitter returns SplitRuling objects (not dicts/tuples)."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        ")\n"
+        "6 SAMPLE PETITIONER ) Case Number: FDI-25-800001\n"
+        ")\n"
+        "7 Petitioner ) Department: 404\n"
+        ")\n"
+        "8 VS. ) Presiding: SOME JUDGE\n"
+        ")\n"
+        "9 SAMPLE RESPONDENT )\n"
+        "10 Respondent )\n"
+    )
+    splits = _split_rulings(text)
+    assert len(splits) == 1
+    assert isinstance(splits[0], SplitRuling)
+    assert splits[0].department == "404"
+
+
+def test_sf_split_rulings_lowercase_case_number_uppercased() -> None:
+    """Defensive — uppercase the extracted case_number (matches Riverside pattern)."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        ")\n"
+        "6 SAMPLE PETITIONER ) Case Number: fdi-25-800001\n"
+        ")\n"
+        "7 Petitioner ) Department: 404\n"
+        ")\n"
+    )
+    splits = _split_rulings(text)
+    assert len(splits) == 1
+    assert splits[0].case_number == "FDI-25-800001"
