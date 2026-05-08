@@ -35,13 +35,16 @@ sys.path.insert(0, _SCRIPTS_DIR)
 reingest = importlib.import_module("reingest_from_s3")
 
 # ---------------------------------------------------------------------------
-# Import the same extract helpers used by both code paths
+# Import the same extract helpers used by both code paths.
+#
+# After #4295 the case_type fallback chain is encoded in
+# ``ingestion.case_type_resolver.resolve_case_type`` and both worker.py
+# and ``_apply_regex_fallbacks`` call it.  The simulator below uses the
+# same resolver so its case_type output continues to mirror production.
 # ---------------------------------------------------------------------------
+from ingestion.case_type_resolver import resolve_case_type  # noqa: E402
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
-    extract_case_type_from_motion_type,
-    extract_case_type_from_number,
-    extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
 )
@@ -92,23 +95,20 @@ def _simulate_worker_fallbacks(
             extraction_methods.setdefault("case_number", "regex")
             case_number = extracted_cn
 
-    # Worker: case_type from case_number prefix
-    if case_type is None and case_number:
-        case_type = extract_case_type_from_number(case_number)
-        if case_type:
-            extraction_methods.setdefault("case_type", "regex")
-
-    # Worker: case_type from scraper_id
-    if case_type is None and scraper_id:
-        case_type = extract_case_type_from_scraper_id(scraper_id)
-        if case_type:
-            extraction_methods.setdefault("case_type", "scraper_id")
-
-    # Worker: case_type from motion_type
-    if case_type is None and motion_type:
-        case_type = extract_case_type_from_motion_type(motion_type)
-        if case_type:
-            extraction_methods.setdefault("case_type", "motion_type")
+    # Worker: full case_type fallback chain — delegated to the shared
+    # resolver since #4295 (number -> scraper_id -> motion_type ->
+    # case_title).  The simulator mirrors worker.py's call site so the
+    # parity assertion stays meaningful when the resolver evolves.
+    resolved_ct, resolved_method = resolve_case_type(
+        case_type=case_type,
+        case_number=case_number,
+        scraper_id=scraper_id or None,
+        motion_type=motion_type,
+        case_title=None,
+    )
+    if resolved_method is not None:
+        case_type = resolved_ct
+        extraction_methods.setdefault("case_type", resolved_method)
 
     return {
         "judge_name": judge_name,
