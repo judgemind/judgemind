@@ -96,6 +96,18 @@ psycopg: Any = None
 
 # Make the scraper-framework src importable when running standalone (not
 # via ``packages/scraper-framework/.venv/bin/python3``).
+#
+# Path resolution gotcha — see #4374. The ``Path(__file__).resolve().parent.parent``
+# anchor only points at the repo root on the developer-laptop layout
+# (``<repo>/scripts/drain_splitter_carry_forward_clusters.py``). When the
+# script is executed via ``scripts/ecs-run-task.sh``, it is uploaded to
+# ``/tmp/_oneshot_script`` and ``__file__`` resolves there, so
+# ``parent.parent`` collapses to ``/`` and ``_SCRAPER_SRC`` wrongly becomes
+# ``/packages/scraper-framework/src``. The ``_load_split_ids_module``
+# fallback list below covers every shipping layout (developer laptop, ECS
+# oneshot via ``/app/src``, image-baked under ``/app/packages/...``); this
+# variable is kept solely for the dev-laptop ``sys.path`` insertion below
+# and as the *first* candidate in that fallback list.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRAPER_SRC = _REPO_ROOT / "packages" / "scraper-framework" / "src"
 if str(_SCRAPER_SRC) not in sys.path:
@@ -112,6 +124,17 @@ if str(_SCRAPER_SRC) not in sys.path:
 _ECS_SCRIPTS_DIR = Path("/app/scripts")
 if _ECS_SCRIPTS_DIR.is_dir() and str(_ECS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_ECS_SCRIPTS_DIR))
+
+# In the in-image layout, the scraper-framework ``src/`` tree is copied to
+# ``/app/src/`` (Dockerfile line 34: ``COPY packages/scraper-framework/src/
+# ./src/`` after ``WORKDIR /app``). The pip install at line 35 also makes
+# the ``ingestion`` package importable from site-packages, but
+# ``_load_split_ids_module`` deliberately bypasses ``ingestion/__init__.py``
+# (which transitively imports ``ingestion.worker`` → psycopg, structlog),
+# so it needs a direct file-spec path to the module. The candidate-path
+# fallback list inside ``_load_split_ids_module`` includes ``/app/src/`` to
+# pick up split_ids.py from the in-image layout. See #4374.
+_ECS_APP_SRC = Path("/app/src")
 
 # Always include the directory the file lives in (for the developer-laptop
 # pytest path where __file__ is in scripts/) — Python normally adds this
@@ -366,6 +389,58 @@ _UPSERT_PARENT_SQL = """
 """
 
 
+def _split_ids_candidate_paths() -> list[Path]:
+    """Return the ordered list of candidate filesystem paths for
+    ``ingestion/split_ids.py``.
+
+    The first existing path is used by ``_load_split_ids_module``. The
+    list covers every shipping layout the script runs in:
+
+      1. ``_SCRAPER_SRC / ingestion / split_ids.py`` — the developer-laptop
+         + CI ``scripts-tests`` path. Resolves correctly when ``__file__``
+         lives in ``<repo>/scripts/`` so ``parent.parent`` is the repo root.
+      2. ``/app/src/ingestion/split_ids.py`` — the in-image path written by
+         the scraper-framework Dockerfile (``WORKDIR /app`` + ``COPY
+         packages/scraper-framework/src/ ./src/``). This is the path that
+         exists when the script runs via ``scripts/ecs-run-task.sh``,
+         because the oneshot uploads the script to ``/tmp/_oneshot_script``
+         where ``parent.parent`` collapses to ``/`` (#4374 root cause).
+      3. ``/app/packages/scraper-framework/src/ingestion/split_ids.py`` —
+         legacy / defense-in-depth path for any future image layout that
+         keeps the package directory under ``/app/packages/``. The current
+         Dockerfile flattens to ``/app/src/`` but a future build that
+         reverts to a per-package layout would land here.
+
+    Implemented as a function (not a module-level constant) so tests can
+    monkeypatch ``_SCRAPER_SRC`` to simulate the ECS-oneshot collapse and
+    exercise the fallback list. See #4374.
+    """
+    return [
+        _SCRAPER_SRC / "ingestion" / "split_ids.py",
+        _ECS_APP_SRC / "ingestion" / "split_ids.py",
+        Path("/app/packages/scraper-framework/src/ingestion/split_ids.py"),
+    ]
+
+
+def _resolve_split_ids_path() -> Path:
+    """Return the first existing candidate path from
+    ``_split_ids_candidate_paths``.
+
+    Raises ``RuntimeError`` listing every candidate that was tried if none
+    of them resolve to an existing file — this surfaces a self-diagnosing
+    error message instead of the original bare ``[Errno 2] No such file or
+    directory: '/packages/scraper-framework/src/ingestion/split_ids.py'``
+    that #4374 had to puzzle out from. See #4374.
+    """
+    candidates = _split_ids_candidate_paths()
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    tried = ", ".join(str(c) for c in candidates)
+    msg = f"Could not locate ingestion/split_ids.py in any known layout. Tried: {tried}"
+    raise RuntimeError(msg)
+
+
 def _load_split_ids_module() -> Any:
     """Load ``ingestion.split_ids`` directly from its file path.
 
@@ -376,6 +451,10 @@ def _load_split_ids_module() -> Any:
     file-spec API gives us the two pure-Python helpers we need
     (``derive_parent_document_id``, ``is_split_child_id``) without the
     transitive dependency cost.
+
+    The path lookup walks ``_split_ids_candidate_paths()`` and uses the
+    first existing file — see that function's docstring for why a
+    multi-layout fallback is required (#4374).
     """
     import importlib.util
 
@@ -383,7 +462,7 @@ def _load_split_ids_module() -> Any:
     if cached is not None:
         return cached
 
-    path = _SCRAPER_SRC / "ingestion" / "split_ids.py"
+    path = _resolve_split_ids_path()
     spec = importlib.util.spec_from_file_location("_drain_split_ids", str(path))
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         msg = f"Could not load split_ids module from {path}"
