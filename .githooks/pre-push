@@ -757,6 +757,40 @@ if [ -n "$changed_scripts_py" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Subprocess-timeouts check — run whenever scripts/**/*.py changes
+# (excluding any tests/ path)
+# -------------------------------------------------------------------
+# Mirrors the CI `Verify every subprocess.run call in scripts has
+# timeout= or **kwargs` step inside the `scripts-tests (python)` job
+# (.github/workflows/ci.yml). The check enforces the #3213 / #3309
+# invariant that every subprocess.run / urllib.request.urlopen call
+# under scripts/**/*.py carries a bounded timeout (or a **kwargs splat
+# that delegates to the caller). An unbounded network egress on the
+# MainThread of a long-lived process can wedge the daemon silently
+# forever — the prime hypothesis for the #3205 silent-wedge class.
+#
+# The check script itself walks scripts/**/*.py and is sub-second, so
+# we only need to invoke it when a scripts/**/*.py file is in the diff.
+# Excludes paths containing /tests/ since the check itself ignores them.
+# Catches the #4316 / PR #4324 retro case where an agent burned a full
+# CI round trip on a one-line `timeout=30` miss. See #4328.
+changed_scripts_py_recursive=$(echo "$changed_files" | grep -E '^scripts/.*\.py$' | grep -v '/tests/' || true)
+if [ -n "$changed_scripts_py_recursive" ]; then
+    echo "pre-push: checking subprocess.run / urlopen timeouts in scripts/**/*.py..." >&2
+    if [ -x scripts/check-subprocess-timeouts.sh ]; then
+        if ! run_check "_" "scripts/check-subprocess-timeouts.sh" scripts/check-subprocess-timeouts.sh; then
+            echo "  A subprocess.run or urllib.request.urlopen call site in" >&2
+            echo "  scripts/**/*.py is missing a timeout= kwarg or **kwargs splat." >&2
+            echo "  Add timeout=<seconds> to each flagged call. See issues #3213" >&2
+            echo "  (subprocess.run) and #3309 (urlopen) for background." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-subprocess-timeouts.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Rebase silent-drop guard — run whenever an appended-list file changes
 # -------------------------------------------------------------------
 # Detects markers in WATCH_FILES that would be silently dropped by
