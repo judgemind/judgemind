@@ -59,6 +59,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 21 | `scripts/check-dispatcher-terminals-consistent.sh` | self-diagnosing (Fix block) | Emits canonical terminal list. |
 | 22 | `scripts/check-duplicate-functions.sh` | wrapper (delegates to helper) | Wrapper for `check-duplicate-functions.py`. |
 | 23 | `scripts/check-duplicate-pr.sh` | decision flow (no violation list) | Returns 0/1/2 with a single status line for callers (`/task` skill). No code violation. |
+| 23a | `scripts/check-fix-block-coverage-complete.sh` | self-diagnosing (Fix block) | Inventory-coverage guard: fails when a runnable hygiene guard exists in the tree without a matching row here. Emits per-violation `Fix:` block naming the doc, the verdict vocabulary, and the letter-suffix-row pattern. Mirrors `run-ci-guards.sh --list` discovery so .py companions are covered by their .sh wrapper's row. Tracking: #4367. |
 | 24 | `scripts/check-git-gh-retries.sh` | self-diagnosing (Fix block) | Emits the `git_with_retry` / `gh_with_retry` wrapper pattern. |
 | 25 | `scripts/check-graphql-nullability-drift.sh` | wrapper (delegates to helper) | Wrapper for `check-graphql-nullability-drift.py`. |
 | 26 | `scripts/check-graphql-queries.sh` | self-diagnosing (Fix block) | Emits the `mock` / `__typename` add suggestion. |
@@ -87,6 +88,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 48 | `scripts/check-no-redos-pattern.sh` | self-diagnosing (Fix block) | Emits "Fix options" with three patterns + `# noqa: redos-pattern` suppression. |
 | 49 | `scripts/check-no-test-database-url-fallback.sh` | self-diagnosing (Fix block) | Emits required-shape example. |
 | 50 | `scripts/check-no-test-leaked-worktrees.sh` | self-diagnosing (Fix block) | Emits cleanup-pattern recipe. |
+| 50a | `scripts/check-no-unbounded-timeouts.py` | self-diagnosing (Fix block) | Validates IO call sites under `scripts/dispatcher/` carry bounded timeouts (boto3, psycopg, requests, urllib3). Emits per-violation `Fix: add the missing kwarg, or annotate the call with ...` block. No `.sh` wrapper — invoked directly via `python3 scripts/check-no-unbounded-timeouts.py` from CI and pre-push. Tracking: #3353 (root cause), #4364/#4365 (pre-push wiring). |
 | 51 | `scripts/check-nullable-column-reads.sh` | wrapper (delegates to helper) | Wrapper for `check-nullable-column-reads.py`. |
 | 52 | `scripts/check-oneshot-imports.sh` | self-diagnosing (Fix block) | Emits "Fix: inline the helper" guidance. |
 | 53 | `scripts/check-oneshot-repo-paths.sh` | self-diagnosing (Fix block) | Emits the `Path(__file__).resolve().parent.parent` replacement. |
@@ -99,10 +101,14 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 60 | `scripts/check-repo-walk-exclusions-canonical.sh` | self-diagnosing (Fix block) | Emits "Required shape:" with literal `source preflight.sh` + iteration block. |
 | 61 | `scripts/check-scraper-image-shipped.sh` | self-diagnosing (Fix block) | Emits "Did you push the image to ECR?" recipe. |
 | 62 | `scripts/check-scraper-registry.sh` | wrapper (delegates to helper) | Wrapper for `check-scraper-registry.py`. |
+| 62a | `scripts/check-scraper-zero-record-runner.py` | operational health probe | Scheduled-cron ECS runner for the zero-record streak detector — wraps `check-scraper-zero-record-streak.py` and manages GitHub-issue lifecycle (open/comment/close) on breach. Fix is to investigate the scraper that triggered the alert — no source-code patch literal applies. Wired by `.github/workflows/scraper-zero-record-check.yml`. Tracking: #2620 / #2666. |
+| 62b | `scripts/check-scraper-zero-record-streak.py` | operational health probe | Scheduled-cron data-quality probe — queries `telemetry.scraper_runs` for consecutive zero-record streaks per scraper. Fires when any active scraper has been silently outputting no data for N runs. Fix is to investigate the scraper, not patch the check. Wired by `.github/workflows/scraper-zero-record-check.yml`. Tracking: #2620 / #2666. |
 | 63 | `scripts/check-script-headers.sh` | wrapper (delegates to helper) | Wrapper for `check-script-headers.py` which emits the `# one-off: true` / `# permanent: true` add-this guidance. |
 | 64 | `scripts/check-shard-coverage.sh` | self-diagnosing (Fix block) | Emits the `--shard-of-N` invocation hint. |
 | 65 | `scripts/check-shipped-pr.sh` | decision flow (no violation list) | Returns shipped/not-shipped verdict for callers. No code violation. |
+| 65a | `scripts/check-short-unsubstantive-rulings.py` | operational health probe | Scheduled-cron data-quality probe — counts per-county rulings with `char_length(ruling_text) < 200 AND motion_type IS NULL AND outcome IS NULL` over the last 7 days. Fires when any county exceeds the configured threshold (signal that extraction is silently dropping useful fields). Fix is to investigate the extraction pipeline for that county; no source-code patch literal applies. Wired by `.github/workflows/short-unsubstantive-ruling-check.yml`. Tracking: #2671. |
 | 66 | `scripts/check-split-ruling-fields-propagated.sh` | wrapper (delegates to helper) | Wrapper for `check_split_ruling_fields_propagated.py` whose `_suggest_scope_entry()` emits the canonical Fix block (the reference upgrade from PR #4345). |
+| 66a | `scripts/check-sql-columns.py` | self-diagnosing (Fix block) | Validates qualified (`alias.column`) and unqualified column references in Python SQL string literals against `packages/api/src/data-access/schema.sql`. Emits per-violation `Fix: check the table's column definitions in schema.sql.` block. No `.sh` wrapper — invoked directly via `python3 scripts/check-sql-columns.py` from CI (`sql-column-check` job). Tracking: #1929 (qualified-drift), #4271 (unqualified-drift). |
 | 67 | `scripts/check-sql-conflicts.sh` | wrapper (delegates to helper) | Wrapper for `check-sql-conflicts.py`. |
 | 68 | `scripts/check-subprocess-timeouts.sh` | self-diagnosing (Fix block) | Emits `timeout=N` argument suggestion. |
 | 69 | `scripts/check-task-recovery.sh` | decision flow (no violation list) | Emits per-phase resume hints — that IS the fix-guidance, not a violation list. |
@@ -124,10 +130,10 @@ first read of the failing CI job names the fix, copy-pasteable.
 
 ## Summary
 
-- Total guards: 85 (#31a `check-issue-verify-sql.py` added by #4358).
+- Total guards: 91 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50a `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367).
 - Already self-diagnosing (Fix block or actionable text) before #4346: 71.
 - Wrappers (delegate to helper): 18.
-- Operational health probes: 2.
+- Operational health probes: 5.
 - Decision flows: 4.
 - **Upgraded by #4346: 5** (#6 `check-bash-compat.sh`, #29 `check-hyphen-underscore-collision.sh`, #35 `check-migration-files.sh`, #71 `check_tf_ecs_entrypoint.py`, #72 `check_tf_empty_resource.py`).
 - No future upgrade currently warranted: the remaining "actionable text" guards (#8, #14, #16, #33, #57) have human-readable guidance that's already concrete enough; upgrading them to literal-patch shape would add noise relative to the friction they cause.
@@ -137,10 +143,16 @@ first read of the failing CI job names the fix, copy-pasteable.
 This survey was authored manually for the #4346 audit (2026-05-08). Future
 contributors:
 
-- When you add a new `scripts/check-*.{sh,py}` guard: append a row.
+- When you add a new `scripts/check-*.{sh,py}` guard: append a row. To
+  minimise renumbering churn use a letter-suffix row number at the
+  alphabetical insertion point (e.g. `23a`, `50a`, `66a`) — the
+  `scripts/check-fix-block-coverage-complete.sh` CI guard (#23a) fails
+  the build if you forget.
 - When you upgrade a guard's error output: update the Verdict and Notes.
 - When you delete a guard: remove the row.
 
 The audit's `/audit` skill (§1.9) counts top-level scripts via marker
 headers; this doc is a per-guard health check the audit can cross-reference
-against the count.
+against the count. The `scripts/check-fix-block-coverage-complete.sh` guard
+(wired into CI as `fix-block-coverage-complete-check`) catches drift at PR
+time — see #4367.
