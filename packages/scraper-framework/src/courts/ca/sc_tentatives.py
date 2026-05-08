@@ -435,7 +435,7 @@ def parse_case_title(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-ruling PDF splitter (#4303)
+# Multi-ruling PDF splitter (#4303, format-B added in #4341)
 # ---------------------------------------------------------------------------
 #
 # Santa Clara multi-case PDFs use one of two formats:
@@ -451,16 +451,26 @@ def parse_case_title(text: str) -> str | None:
 #   B) Compact summary-table format (e.g. dept 6):
 #        A single ``LINE CASE NO. CASE TITLE TENTATIVE RULING`` header,
 #        then per-row entries on shared rows.  This format does NOT have
-#        per-case bare ``Line N`` boundaries, so the splitter falls through
-#        to the LLM path and the existing per-county prompt's anti-carry-
-#        forward rule (5b) is the only protection.
+#        per-case bare ``Line N`` boundaries on their own line for short
+#        rulings — pdfplumber's flat text output collapses the table
+#        columns and the format-A regex finds at most 1 entry.  Format B
+#        is parsed by ``_split_rulings_format_b`` using pdfplumber's
+#        ``extract_tables()`` API to read the structured columns
+#        directly: every row of the summary table whose CASE NO. column
+#        is non-empty becomes one SplitRuling, with ``case_number``,
+#        ``case_title``, and ``ruling_text`` (cell + continuation rows)
+#        populated deterministically from the table.  Format B requires
+#        the original PDF bytes — text-only callers fall back to format A
+#        for backward compatibility.  See #4341 (root cause #4339).
 #
-# The splitter targets format (A) — the dominant source of the
-# ``all_same_case_title_cluster`` signal in Santa Clara per the
-# cross-county audit (#4289 ran 2026-05-06).  21 distinct multi-case PDFs
-# all produced the same wrong ``case_title`` across rulings — exactly the
-# carry-forward fingerprint #3534 (Fresno) and #3649 (Riverside) fixed by
-# pre-LLM splitters.
+# The splitter handles both formats — format A is the dominant source of
+# the ``all_same_case_title_cluster`` signal in Santa Clara per the
+# cross-county audit (#4289 ran 2026-05-06; 21 distinct multi-case PDFs
+# all produced the same wrong ``case_title`` across rulings) and format
+# B drains the residual cluster of dept-6-style PDFs that the LLM-only
+# path was hallucinating generic titles for.  Same carry-forward
+# fingerprint #3534 (Fresno) and #3649 (Riverside) fixed by pre-LLM
+# splitters.
 
 # Entry boundary: a bare ``Line N`` label on its own line, case-insensitive.
 # pdfplumber's text output puts each ``Line N`` on its own line in the
@@ -540,41 +550,67 @@ class SplitRuling:
         self.department = department
 
 
-def _split_rulings(text: str) -> list[SplitRuling]:
-    """Split Santa Clara multi-ruling PDF text into per-entry ``SplitRuling`` objects.
+# Format-B summary-table header anchor (#4341).  pdfplumber's
+# ``extract_tables()`` produces the structured table when this header is
+# present on the page — see ``_split_rulings_format_b``.  The literal
+# header in the live PDFs is ``LINE CASE NO. CASE TITLE TENTATIVE RULING``.
+_SC_FORMAT_B_HEADER_RE = re.compile(
+    r"LINE\s+CASE\s+NO\.?\s+CASE\s+TITLE\s+TENTATIVE\s+RULING",
+    re.IGNORECASE,
+)
 
-    The page-1 preamble (calendar header, judge info, courtroom rules,
-    appearance instructions) is excluded by anchoring on the first
-    ``^Line\\s+\\d+\\s*$`` boundary — anything before the first numbered
-    entry is dropped.
+# Format-B per-row case number column.  pdfplumber may emit the case
+# number with internal whitespace (e.g. ``"24CV 443183"``) so we strip
+# whitespace before matching.  ``\d{2}(CV|PR)\d{6}`` is the canonical SC
+# case-number shape (see ``_CASE_NUMBER_RE``).
+_SC_FORMAT_B_CASE_NO_RE = re.compile(
+    r"^\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\s*$",
+    re.IGNORECASE,
+)
 
-    Returns an empty list if no numbered entries are found, which is the
-    expected outcome for compact summary-table PDFs (e.g. dept 6) and for
-    single-ruling PDFs that don't follow the expanded ``Line N`` format.
-    Single-element returns are also possible — the worker treats both
-    cases identically (fall through to the LLM path) because there is no
-    cross-entry carry-forward window with 0 or 1 entries.
+# Cross-reference inside a format-B summary-table cell:
+# ``See Line N below`` / ``see Line N above`` / ``See Line Item N below``.
+# When present, the format-B parser appends the corresponding format-A
+# ``Line N`` body section (when one exists in the same PDF) to the row's
+# ruling_text.  Only digits are captured.
+_SC_FORMAT_B_CROSSREF_RE = re.compile(
+    r"\bSee\s+Line(?:\s+Item)?\s+(?P<num>\d{1,3})\b",
+    re.IGNORECASE,
+)
 
-    Each returned ``SplitRuling`` has:
 
-      * ``ruling_index`` — the integer from the entry header (e.g. ``1``,
-        ``2``, ``3`` for a PDF with three rulings).
-      * ``case_number`` — extracted from the ``Case No.:`` header inside
-        the entry; ``None`` if the regex fails to match (the worker's
-        per-entry LLM enrichment will fill it in).
-      * ``case_title`` — extracted from the ``Case Name:`` header inside
-        the entry; ``None`` if absent (per-entry LLM enrichment falls back
-        to the existing case-title heuristics).
-      * ``ruling_text`` — the **verbatim** entry text from the boundary
-        through the next entry boundary (or the end of the document for
-        the last entry).  Includes the entry's own headers and body.
+def _normalize_table_cell(cell: str | None) -> str:
+    """Collapse newlines + multi-whitespace inside a single pdfplumber cell."""
+    if cell is None:
+        return ""
+    return " ".join(cell.replace("\n", " ").split())
 
-    motion_type and outcome are left ``None`` on purpose — Santa Clara
-    PDFs do not carry structured motion-type / outcome labels in their
-    per-entry headers, so deterministic regex extraction would produce a
-    high false-negative rate.  Letting the framework ``LlmExtractor``
-    populate those fields via per-entry enrichment matches the Riverside
-    pattern (#3649) and preserves correctness on single-ruling PDFs.
+
+def _is_format_b_header_row(row: list[str | None]) -> bool:
+    """Return True if a pdfplumber-extracted table row is the format-B header.
+
+    The first 4 cells must be (case-insensitive, leading-whitespace-tolerant)
+    ``"LINE"``, ``"CASE NO."``, ``"CASE TITLE"``, ``"TENTATIVE RULING"``.
+    Trailing cells (``None`` or empty) are ignored.
+    """
+    if len(row) < 4:
+        return False
+    expected = ("line", "case no.", "case title", "tentative ruling")
+    for col, want in zip(row[:4], expected, strict=False):
+        # Compare with normalized punctuation: pdfplumber may strip the
+        # trailing period from "CASE NO."  Tolerate either form.
+        normalized_loose = _normalize_table_cell(col).lower().rstrip(".")
+        if normalized_loose != want.rstrip("."):
+            return False
+    return True
+
+
+def _split_rulings_format_a(text: str) -> list[SplitRuling]:
+    """Format-A splitter — the original ``Line N`` boundary regex (#4303).
+
+    See module docstring §A for the exact pre-conditions.  Returns an
+    empty list when no ``Line N`` boundaries are present (typical of
+    compact summary-table PDFs and single-ruling PDFs).
     """
     matches = list(_SC_RULING_ENTRY_RE.finditer(text))
     if not matches:
@@ -624,6 +660,232 @@ def _split_rulings(text: str) -> list[SplitRuling]:
         )
 
     return rulings
+
+
+def _format_a_body_section(text: str, line_num: int) -> str | None:
+    """Find the ``Line N`` body section in ``text`` and return its content.
+
+    Used by the format-B parser to expand ``See Line N below`` cross-
+    references in summary-table cells.  Returns ``None`` if no such
+    section is present.
+
+    The section starts at the boundary ``^Line\\s+N\\s*$`` (case-
+    insensitive) and runs to the next ``^Line\\s+M\\s*$`` boundary or
+    the end of the document.  Returns the section body verbatim
+    (whitespace-stripped on both ends).
+    """
+    boundaries = [
+        (m.start(), m.end(), int(re.search(r"\d+", m.group("num")).group(0)))
+        for m in _SC_RULING_ENTRY_RE.finditer(text)
+        if re.search(r"\d+", m.group("num"))
+    ]
+    for i, (b_start, b_end, b_num) in enumerate(boundaries):
+        if b_num != line_num:
+            continue
+        section_start = b_end
+        section_end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
+        section = text[section_start:section_end].strip()
+        if len(section) < _SC_MIN_ENTRY_BODY_LEN:
+            return None
+        return section
+    return None
+
+
+def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
+    """Format-B splitter — pdfplumber ``extract_tables()`` on summary tables.
+
+    See module docstring §B for the exact pre-conditions.  Returns an
+    empty list when no format-B summary table is found (the caller
+    should fall back to format A).
+
+    The parser walks every page of the PDF, looking for a table whose
+    first row matches the format-B header
+    (``LINE | CASE NO. | CASE TITLE | TENTATIVE RULING``).  Within each
+    matching table:
+
+    * A "case row" is a row whose CASE NO. column normalizes to a
+      single ``\\d{2}(CV|PR)\\d{6}`` token.  Such a row starts a new
+      ``SplitRuling``.
+    * Continuation rows (where CASE NO. is empty / ``None``) append
+      their TENTATIVE RULING column to the current case's
+      ``ruling_text``.
+    * Cells containing ``See Line N below`` (or similar) cause the
+      format-A body section for ``Line N``, when present, to be
+      appended after the table cell — preserving the long-form ruling
+      content the summary table cross-references.
+
+    ``ruling_index`` is assigned 1..N in the order rows are seen; this
+    is independent of the printed ``LINE`` column (which can be
+    discontinuous in the live PDFs, e.g. ``;``, ``1,2``, ``3-5``).
+
+    Robustness: any ``Exception`` from pdfplumber (corrupt PDF,
+    encrypted PDF, unexpected layout) returns ``[]`` so the caller
+    can fall back to format A or the LLM path.  The worker logs the
+    fall-through.
+    """
+    import io
+
+    rulings: list[SplitRuling] = []
+    next_index = 1
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    if not table or not _is_format_b_header_row(table[0]):
+                        continue
+                    current: SplitRuling | None = None
+                    for row in table[1:]:
+                        if not row:
+                            continue
+                        # Case-no column (col 1).
+                        cn_raw = _normalize_table_cell(row[1] if len(row) > 1 else None)
+                        cn_normalized = cn_raw.replace(" ", "").upper()
+                        cn_match = _SC_FORMAT_B_CASE_NO_RE.match(cn_normalized)
+                        if cn_match:
+                            # New case row — flush the previous case (if any)
+                            # and start fresh.
+                            if current is not None:
+                                rulings.append(current)
+                            title = _normalize_table_cell(row[2] if len(row) > 2 else None)
+                            ruling_chunk = _normalize_table_cell(row[3] if len(row) > 3 else None)
+                            current = SplitRuling(
+                                ruling_index=next_index,
+                                case_number=cn_match.group("case_number").upper(),
+                                ruling_text=ruling_chunk,
+                                case_title=title or None,
+                            )
+                            next_index += 1
+                        elif current is not None:
+                            # Continuation row — append the TENTATIVE RULING
+                            # column to the current case's ruling_text and
+                            # the CASE TITLE column (if non-empty) to the
+                            # current case's title (the dept-6 layout wraps
+                            # long titles across multiple rows).
+                            cont_title = _normalize_table_cell(row[2] if len(row) > 2 else None)
+                            cont_ruling = _normalize_table_cell(row[3] if len(row) > 3 else None)
+                            if cont_title:
+                                current.case_title = (
+                                    f"{current.case_title} {cont_title}".strip()
+                                    if current.case_title
+                                    else cont_title
+                                )
+                            if cont_ruling:
+                                current.ruling_text = (
+                                    f"{current.ruling_text}\n{cont_ruling}"
+                                    if current.ruling_text
+                                    else cont_ruling
+                                )
+                    # Flush the last case in this table.
+                    if current is not None:
+                        rulings.append(current)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "format_b_table_parse_error",
+            error=str(exc),
+        )
+        return []
+
+    if not rulings:
+        return []
+
+    # Expand ``See Line N below`` cross-references — when a summary-table
+    # cell points at a format-A body section, append that section to the
+    # row's ruling_text so the per-entry LLM enrichment sees the full
+    # long-form ruling, not just the cross-reference.
+    for r in rulings:
+        if not r.ruling_text:
+            continue
+        for m in _SC_FORMAT_B_CROSSREF_RE.finditer(r.ruling_text):
+            try:
+                line_num = int(m.group("num"))
+            except ValueError:
+                continue
+            section = _format_a_body_section(text, line_num)
+            if section:
+                r.ruling_text = f"{r.ruling_text}\n\n{section}"
+
+    return rulings
+
+
+def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]:
+    """Split Santa Clara multi-ruling PDF text into per-entry ``SplitRuling`` objects.
+
+    Two parsing paths cover the two known SC layouts (see module docstring
+    §A and §B):
+
+    * **Format A** — ``Line N`` boundary regex on the flattened pdfplumber
+      text.  Always tried first; succeeds for dept 16 and other
+      departments that print per-case body sections with bare ``Line N``
+      headings.  When this path returns >= 2 entries, those are used
+      verbatim.
+    * **Format B** — pdfplumber ``extract_tables()`` on the original PDF
+      bytes.  Only attempted when format A returns < 2 entries AND the
+      flattened text contains the literal
+      ``LINE CASE NO. CASE TITLE TENTATIVE RULING`` header AND
+      ``pdf_bytes`` is supplied.  Each row of the summary table whose
+      CASE NO. column is non-empty becomes one ``SplitRuling``; the
+      TENTATIVE RULING column (plus continuation rows and any
+      cross-referenced format-A body sections) becomes ``ruling_text``.
+
+    Backward compat: callers that pass only ``text`` (the original
+    signature) still work — they get the format-A behavior, which is
+    correct for every layout that has per-case ``Line N`` boundaries
+    AND for any caller (e.g. the worker pre-#4341) that hasn't been
+    updated to thread PDF bytes through.
+
+    The page-1 preamble (calendar header, judge info, courtroom rules,
+    appearance instructions) is excluded by both paths — format A
+    anchors on the first ``^Line\\s+\\d+\\s*$`` boundary, format B
+    anchors on the table header row inside the structured-table output.
+
+    Returns an empty list if neither path can identify multi-ruling
+    structure, which is the expected outcome for genuinely single-
+    ruling PDFs.  Single-element returns are also possible; the worker
+    treats both cases identically (fall through to the LLM path)
+    because there is no cross-entry carry-forward window with 0 or 1
+    entries.
+
+    Each returned ``SplitRuling`` has:
+
+      * ``ruling_index`` — the integer from the entry header (format A)
+        or a 1..N positional counter assigned in row order
+        (format B).  Format A indices match the printed ``Line N``;
+        format B indices are positional because the printed ``LINE``
+        column in the summary table is non-contiguous (``;``, ``1,2``,
+        ``3-5``, etc.).
+      * ``case_number`` — extracted from the ``Case No.:`` header
+        (format A) or the CASE NO. column (format B); always uppercased
+        and whitespace-stripped.
+      * ``case_title`` — extracted from the ``Case Name:`` header
+        (format A) or the CASE TITLE column (format B); always
+        whitespace-normalized.
+      * ``ruling_text`` — the verbatim entry text (format A) or the
+        TENTATIVE RULING column plus continuation rows plus any
+        cross-referenced ``Line N`` body sections (format B).
+
+    motion_type and outcome are left ``None`` on purpose — Santa Clara
+    PDFs do not carry structured motion-type / outcome labels in their
+    per-entry headers, so deterministic regex extraction would produce a
+    high false-negative rate.  Letting the framework ``LlmExtractor``
+    populate those fields via per-entry enrichment matches the Riverside
+    pattern (#3649) and preserves correctness on single-ruling PDFs.
+    """
+    # Format A always runs first.  When it produces a usable multi-entry
+    # result, return it verbatim.
+    format_a = _split_rulings_format_a(text)
+    if len(format_a) >= 2:
+        return format_a
+
+    # Format B is conditional: needs the PDF bytes AND the literal
+    # summary-table header in the flattened text.  Otherwise we fall
+    # back to whatever format A produced (likely empty or single-entry).
+    if pdf_bytes is not None and _SC_FORMAT_B_HEADER_RE.search(text):
+        format_b = _split_rulings_format_b(text, pdf_bytes)
+        if len(format_b) >= 2:
+            return format_b
+
+    return format_a
 
 
 # ---------------------------------------------------------------------------
