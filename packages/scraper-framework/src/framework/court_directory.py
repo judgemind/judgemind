@@ -174,11 +174,33 @@ class CourtDirectory(abc.ABC):
 
         clear_roster_cache()
 
+        # Seed derived.judges from the just-inserted snapshot so that the
+        # single-word surname expansion helper (#4297) has multi-word
+        # canonical-name candidates to expand against.  Best-effort — a
+        # seed failure must not roll back the snapshot insert that
+        # already committed.  See #4370.
+        from ingestion.judge_seed import seed_judges_from_directory_snapshots
+
+        try:
+            seed_stats = seed_judges_from_directory_snapshots(self._conn, only_court_id=court_id)
+            self._conn.commit()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "Judge seed from snapshot failed — continuing",
+                court_id=court_id,
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            seed_stats = {"inserted": 0}
+
         logger.info(
             "Saved directory snapshot",
             court_id=court_id,
             departments=len(mapping),
             content_hash=content_hash[:12],
+            judges_seeded=seed_stats.get("inserted", 0),
         )
         return True
 

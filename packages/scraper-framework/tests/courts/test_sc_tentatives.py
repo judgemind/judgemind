@@ -733,13 +733,18 @@ class TestSantaClaraCourtDirectory:
 
         directory.fetch_and_snapshot(COURT_ID)
 
-        db.commit.assert_called_once()
+        # Two commits: snapshot insert + seed-judges follow-up (#4370).
+        assert db.commit.call_count == 2
         cursor = db.cursor.return_value.__enter__.return_value
         calls = cursor.execute.call_args_list
-        # First call: dedup SELECT, second call: INSERT
-        assert len(calls) == 2
-        insert_sql = calls[1].args[0]
-        assert "INSERT INTO court_directory_snapshots" in insert_sql
+        # The seeder issues additional SELECTs against
+        # court_directory_snapshots and courts (and possibly INSERTs into
+        # judges) after the snapshot insert, so we no longer assert a
+        # fixed call count — just the snapshot INSERT shape.
+        snapshot_inserts = [
+            c for c in calls if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert len(snapshot_inserts) == 1
 
     @respx.mock
     def test_fetch_and_snapshot_dedup_skips_insert(self) -> None:
