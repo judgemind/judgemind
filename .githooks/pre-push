@@ -685,6 +685,41 @@ if [ -n "$changed_dispatcher_deps" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Unbounded-timeout scan for scripts/dispatcher/ (#3356, #4364)
+# -------------------------------------------------------------------
+# Mirrors the CI `Check no unbounded timeouts in dispatcher` step
+# (.github/workflows/ci.yml — see test
+# scripts/tests/test_check_no_unbounded_timeouts.py::TestRealDispatcherTree::test_dispatcher_tree_scans_clean).
+# Catches the 2026-04-25 cascade class — a single boto3.client / psycopg.connect /
+# subprocess.run / requests.* call without a bounded timeout silently hangs
+# the entire daemon process. The check runs only when a Python file under
+# scripts/dispatcher/ is in the push diff (cheap-skip pattern, mirroring
+# the dispatcher-image-deps gate above). The script is sub-second; its
+# own output already names the offending file:line plus the
+# `# timeout-required: <reason>` opt-out hint, so we let stderr pass through.
+changed_dispatcher_py=$(echo "$changed_files" \
+    | grep -E '^scripts/dispatcher/.+\.py$' || true)
+if [ -n "$changed_dispatcher_py" ]; then
+    echo "pre-push: checking for unbounded timeouts in scripts/dispatcher/..." >&2
+    if [ -x scripts/check-no-unbounded-timeouts.py ]; then
+        if ! run_check "_" "scripts/check-no-unbounded-timeouts.py" \
+                scripts/check-no-unbounded-timeouts.py scripts/dispatcher/; then
+            echo "  An IO call site under scripts/dispatcher/ lacks a bounded timeout." >&2
+            echo "  See the file:line and opt-out hint above. The script's full rule" >&2
+            echo "  table is in scripts/check-no-unbounded-timeouts.py." >&2
+            echo "" >&2
+            echo "  Fix: add the missing kwarg (connect_timeout=, read_timeout=," >&2
+            echo "  options=...statement_timeout..., timeout=, etc.), OR annotate" >&2
+            echo "  the call with '# timeout-required: <reason>' on the same line." >&2
+            echo "  Tracking: issue #3356." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-unbounded-timeouts.py not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Dispatcher terminal-status consistency drift — run when daemon or
 # API/web dispatcher files change (#2870)
 # -------------------------------------------------------------------

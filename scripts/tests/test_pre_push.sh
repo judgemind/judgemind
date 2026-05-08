@@ -1144,6 +1144,161 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 24: scripts/dispatcher/*.py with unbounded psycopg.connect rejected (#4364)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds scripts/dispatcher/probe.py with a psycopg.connect call missing
+# both connect_timeout= and options=...statement_timeout..., copies the
+# real check script into the scratch repo (mirrors scenarios 18/19/20),
+# stubs scripts/run-ci-guards.sh to no-op so the umbrella doesn't muddy
+# the signal, and asserts the hook's by-name invocation:
+#   - exits non-zero
+#   - output names the violating file:line
+#   - output contains the `# timeout-required: <reason>` opt-out hint
+#   - output contains the FAILED line for the script
+echo "[scenario 24] dispatcher/*.py with unbounded psycopg.connect — hook rejects (#4364)"
+init_workspace
+
+UNBOUNDED_PY="$REPO_ROOT/scripts/check-no-unbounded-timeouts.py"
+if [ ! -x "$UNBOUNDED_PY" ]; then
+    report_skip "scripts/check-no-unbounded-timeouts.py unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-unbounded-psycopg
+    mkdir -p "$WORK/scripts/dispatcher" "$WORK/scripts"
+    cp "$UNBOUNDED_PY" "$WORK/scripts/check-no-unbounded-timeouts.py"
+    chmod +x "$WORK/scripts/check-no-unbounded-timeouts.py"
+    # Stub run-ci-guards.sh as a no-op so the umbrella's auto-discovery
+    # of check-no-unbounded-timeouts.py doesn't double-fire and confuse
+    # the assertions below — we want to prove the by-name path-gated
+    # invocation does the work, independent of the umbrella.
+    cat > "$WORK/scripts/run-ci-guards.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$WORK/scripts/run-ci-guards.sh"
+    # Seed an unbounded psycopg.connect — exact shape of the call that
+    # tripped CI in PR #4362 / issue #4318.
+    cat > "$WORK/scripts/dispatcher/probe.py" <<'PY'
+"""Test fixture for #4364 — unbounded psycopg.connect."""
+
+import psycopg
+
+
+def open_connection(dsn: str) -> object:
+    """Open a database connection — must be rejected by the hook."""
+    return psycopg.connect(dsn)
+PY
+    git -C "$WORK" add scripts/dispatcher/probe.py \
+        scripts/check-no-unbounded-timeouts.py \
+        scripts/run-ci-guards.sh
+    git -C "$WORK" commit --quiet -m "feat: add dispatcher probe with unbounded psycopg.connect"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-unbounded-psycopg $feat_sha refs/heads/feature-unbounded-psycopg $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject unbounded psycopg.connect (#4364), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "FAILED: scripts/check-no-unbounded-timeouts.py"; then
+        report_fail "expected 'FAILED: scripts/check-no-unbounded-timeouts.py' in output (#4364 AC1)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "scripts/dispatcher/probe.py"; then
+        report_fail "expected hook output to name violating file 'scripts/dispatcher/probe.py' (#4364 AC2)" "$hook_out"
+    elif ! echo "$hook_out" | grep -qE "psycopg\.connect.*missing"; then
+        report_fail "expected hook output to surface 'psycopg.connect ... missing' violation text (#4364 AC2)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "timeout-required"; then
+        report_fail "expected hook output to surface '# timeout-required:' opt-out hint (#4364 AC2)" "$hook_out"
+    else
+        report_pass "hook rejects push with unbounded psycopg.connect under scripts/dispatcher/ (#4364)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 25: docs-only push does NOT fire unbounded-timeouts gate (#4364 AC3)
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches only docs/*.md must NOT invoke the unbounded-
+# timeouts check by-name. Mirrors scenario 21 for the subprocess-timeouts
+# gate. Asserts the hook does not emit the
+# "checking for unbounded timeouts in scripts/dispatcher/" probe line.
+echo "[scenario 25] docs-only push — unbounded-timeouts gate must NOT fire (#4364 AC3)"
+init_workspace
+
+git -C "$WORK" checkout --quiet -b feature-docs-only-unbounded
+mkdir -p "$WORK/docs"
+cat > "$WORK/docs/timeouts-note.md" <<'MD'
+# Sample doc
+
+This is a sample documentation file.
+MD
+git -C "$WORK" add docs/timeouts-note.md
+git -C "$WORK" commit --quiet -m "docs: add timeouts note"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-docs-only-unbounded $feat_sha refs/heads/feature-docs-only-unbounded $ZERO_SHA"
+
+if echo "$hook_out" | grep -q "checking for unbounded timeouts in scripts/dispatcher/"; then
+    report_fail "docs-only push must NOT fire unbounded-timeouts gate (#4364 AC3)" "$hook_out"
+else
+    report_pass "docs-only push skips unbounded-timeouts gate (#4364 AC3)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 26: bounded dispatcher/*.py change passes the gate (#4364)
+# ───────────────────────────────────────────────────────────────────────
+# Regression guard for scenario 24: a dispatcher/*.py change with a
+# properly-bounded psycopg.connect (carries connect_timeout= AND options=
+# containing statement_timeout) must NOT trigger the new check. Without
+# this scenario the negative test could be satisfied by a check that
+# fails on every dispatcher .py change — we need the positive case to
+# pin down the actual contract.
+echo "[scenario 26] bounded dispatcher/*.py change passes unbounded-timeouts gate (#4364)"
+init_workspace
+
+if [ ! -x "$UNBOUNDED_PY" ]; then
+    report_skip "scripts/check-no-unbounded-timeouts.py unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-bounded-psycopg
+    mkdir -p "$WORK/scripts/dispatcher" "$WORK/scripts"
+    cp "$UNBOUNDED_PY" "$WORK/scripts/check-no-unbounded-timeouts.py"
+    chmod +x "$WORK/scripts/check-no-unbounded-timeouts.py"
+    cat > "$WORK/scripts/run-ci-guards.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$WORK/scripts/run-ci-guards.sh"
+    cat > "$WORK/scripts/dispatcher/probe.py" <<'PY'
+"""Test fixture for #4364 — bounded psycopg.connect."""
+
+import psycopg
+
+
+def open_connection(dsn: str) -> object:
+    """Open a database connection with bounded timeouts — must pass the hook."""
+    return psycopg.connect(
+        dsn,
+        connect_timeout=10,
+        options="-c statement_timeout=30000",
+    )
+PY
+    git -C "$WORK" add scripts/dispatcher/probe.py \
+        scripts/check-no-unbounded-timeouts.py \
+        scripts/run-ci-guards.sh
+    git -C "$WORK" commit --quiet -m "feat: add dispatcher probe with bounded psycopg.connect"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-bounded-psycopg $feat_sha refs/heads/feature-bounded-psycopg $ZERO_SHA"
+
+    # The hook may exit non-zero in the scratch workspace for unrelated
+    # reasons (e.g. ruff missing from the seeded test scaffold), so we
+    # only fail this scenario if the unbounded-timeouts check itself
+    # flagged.
+    if echo "$hook_out" | grep -q "FAILED: scripts/check-no-unbounded-timeouts.py"; then
+        report_fail "bounded psycopg.connect must NOT trigger unbounded-timeouts check (#4364)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "checking for unbounded timeouts in scripts/dispatcher/"; then
+        report_fail "expected hook to fire the gate on a dispatcher .py push (#4364 AC3)" "$hook_out"
+    else
+        report_pass "bounded dispatcher/*.py push fires gate but check passes (#4364)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
