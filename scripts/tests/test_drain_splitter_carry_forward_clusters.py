@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -496,6 +497,152 @@ class TestRestoreParentForCluster:
         split_ids = _script._load_split_ids_module()
         expected = split_ids.derive_parent_document_id("parent-real-hash")
         assert _script.compute_parent_doc_id("parent-real-hash") == expected
+
+
+# ---------------------------------------------------------------------------
+# split_ids path resolution (#4374)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitIdsPathResolution:
+    """Regression tests for #4374 — when the script runs via
+    ``scripts/ecs-run-task.sh``, ``__file__`` is ``/tmp/_oneshot_script``
+    so the original ``Path(__file__).resolve().parent.parent`` collapses to
+    ``/`` and ``_SCRAPER_SRC`` wrongly becomes
+    ``/packages/scraper-framework/src``. The previous implementation passed
+    that bogus path straight to ``importlib.util.spec_from_file_location``
+    and crashed every cluster's ``Restore transaction failed`` branch with
+    ``[Errno 2] No such file or directory:
+    '/packages/scraper-framework/src/ingestion/split_ids.py'``.
+
+    The fix is the candidate-path fallback list in
+    ``_split_ids_candidate_paths`` — try the dev-laptop path first, then
+    the in-image ``/app/src`` path that the scraper-framework Dockerfile
+    actually writes the source tree to.
+    """
+
+    def test_candidate_paths_include_ecs_layouts(self) -> None:
+        # The fallback list must cover the ECS oneshot layouts, otherwise
+        # #4374 is back. Specifically, ``/app/src`` is where the
+        # scraper-framework Dockerfile copies the package source (line 34:
+        # ``COPY packages/scraper-framework/src/ ./src/``).
+        candidates = _script._split_ids_candidate_paths()
+        candidate_strs = [str(c) for c in candidates]
+        # Dev-laptop path (still first — exercised by every other test in
+        # this file via the existing ``_load_split_ids_module`` call).
+        assert any(
+            "packages/scraper-framework/src/ingestion/split_ids.py" in c
+            for c in candidate_strs
+        )
+        # ECS in-image flattened layout — the actual fix for #4374.
+        assert "/app/src/ingestion/split_ids.py" in candidate_strs
+        # Defense-in-depth path for any future image layout that keeps the
+        # per-package directory.
+        assert (
+            "/app/packages/scraper-framework/src/ingestion/split_ids.py"
+            in candidate_strs
+        )
+
+    def test_resolve_picks_first_existing_candidate(self, tmp_path: Any) -> None:
+        # When multiple candidates exist, ``_resolve_split_ids_path`` picks
+        # the FIRST matching one (dev-laptop > ECS app-src > legacy app
+        # path). Simulate by monkeypatching the candidate list to a
+        # tmp-path that does exist.
+        candidate_a = tmp_path / "first" / "split_ids.py"
+        candidate_a.parent.mkdir(parents=True)
+        candidate_a.write_text("# fake")
+        candidate_b = tmp_path / "second" / "split_ids.py"
+        candidate_b.parent.mkdir(parents=True)
+        candidate_b.write_text("# also fake")
+        with patch.object(
+            _script,
+            "_split_ids_candidate_paths",
+            return_value=[candidate_a, candidate_b],
+        ):
+            assert _script._resolve_split_ids_path() == candidate_a
+
+    def test_resolve_falls_through_to_second_candidate_when_first_missing(
+        self, tmp_path: Any
+    ) -> None:
+        # The bug: when the first candidate (dev-laptop ``_SCRAPER_SRC``)
+        # collapses to ``/packages/...`` because ``__file__`` is
+        # ``/tmp/_oneshot_script``, that file does NOT exist, and the
+        # resolver MUST fall through to the next candidate (the
+        # ``/app/src`` in-image path) instead of crashing. This is exactly
+        # the path-resolution regression #4374 reports.
+        missing = tmp_path / "does-not-exist" / "split_ids.py"
+        present = tmp_path / "present" / "split_ids.py"
+        present.parent.mkdir(parents=True)
+        present.write_text("# real-enough")
+        with patch.object(
+            _script,
+            "_split_ids_candidate_paths",
+            return_value=[missing, present],
+        ):
+            assert _script._resolve_split_ids_path() == present
+
+    def test_resolve_raises_self_diagnosing_error_when_all_missing(
+        self, tmp_path: Any
+    ) -> None:
+        # If every candidate is missing — should never happen in practice
+        # but guards against a future Dockerfile change that drops every
+        # known layout — the error message lists every candidate that was
+        # tried, instead of the original bare ``[Errno 2]`` from inside
+        # ``importlib.util.spec_from_file_location``. This makes the
+        # failure self-diagnosing per
+        # ``feedback_instrument_before_guess_validated.md``.
+        missing_a = tmp_path / "a" / "split_ids.py"
+        missing_b = tmp_path / "b" / "split_ids.py"
+        with patch.object(
+            _script,
+            "_split_ids_candidate_paths",
+            return_value=[missing_a, missing_b],
+        ):
+            with pytest.raises(RuntimeError) as excinfo:
+                _script._resolve_split_ids_path()
+        msg = str(excinfo.value)
+        # The error must list every tried candidate so an operator can
+        # diagnose without re-reading the source.
+        assert str(missing_a) in msg
+        assert str(missing_b) in msg
+        assert "Could not locate" in msg
+
+    def test_load_succeeds_in_simulated_ecs_oneshot_layout(self, tmp_path: Any) -> None:
+        # Reproduce the #4374 failure mode end-to-end: when
+        # ``_SCRAPER_SRC`` would collapse to ``/packages/scraper-framework/src``
+        # (the exact path in the production error message), the loader
+        # MUST still find ``split_ids.py`` via the
+        # ``/app/src/ingestion/split_ids.py`` candidate. We simulate by:
+        #   1. Pointing ``_SCRAPER_SRC`` at a non-existent path
+        #      mirroring the ``__file__ = /tmp/_oneshot_script`` collapse.
+        #   2. Pointing the ``/app/src`` fallback at a tmp-path that
+        #      contains a real (minimal) ``split_ids.py``.
+        # Without the fix, this test fails because
+        # ``_load_split_ids_module`` would only ever try the bogus
+        # ``_SCRAPER_SRC`` path.
+        fake_oneshot_root = Path("/packages/scraper-framework/src")
+        # ``fake_oneshot_root / "ingestion" / "split_ids.py"`` won't exist
+        # on any real filesystem (root is not writable here, by design).
+        ecs_app_src = tmp_path / "app-src"
+        (ecs_app_src / "ingestion").mkdir(parents=True)
+        # Minimal split_ids stand-in — the loader should be able to
+        # ``exec_module`` it without errors.
+        (ecs_app_src / "ingestion" / "split_ids.py").write_text(
+            "MARKER = 'loaded-from-ecs-app-src'\n"
+        )
+
+        # Reset the cached module so the next call re-runs path resolution.
+        _script._load_split_ids_module._cached = None  # type: ignore[attr-defined]
+        try:
+            with (
+                patch.object(_script, "_SCRAPER_SRC", fake_oneshot_root),
+                patch.object(_script, "_ECS_APP_SRC", ecs_app_src),
+            ):
+                module = _script._load_split_ids_module()
+            assert module.MARKER == "loaded-from-ecs-app-src"
+        finally:
+            # Restore the cache so subsequent tests don't see our stub.
+            _script._load_split_ids_module._cached = None  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
