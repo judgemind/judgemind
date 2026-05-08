@@ -75,6 +75,38 @@ The `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories under `script
 - Write clear docstrings/comments for non-obvious logic.
 - **When removing or renaming module-level exports** (functions, classes, constants), grep for all import sites across the entire codebase (`src/` and `tests/`) before committing. Update or remove every import — not just the test file matching the modified module. Broken imports in unrelated test files will not surface until CI runs the full suite, and may not surface at all if the tests are skipped or filtered.
 
+## Per-county pre-LLM splitters — use the scaffolder
+
+When adding a multi-case ruling splitter for a new county (the pattern shipped in #2447 / #2450 / #3534 / #3649 / #4304 / #4303), use the scaffolder instead of copy-pasting from a prior PR:
+
+```
+scripts/scaffold_pre_llm_splitter.py --county "<County Name>" --format pdf
+```
+
+The scaffolder generates:
+
+1. `packages/scraper-framework/src/courts/ca/<slug>_tentatives.py` — the `SplitRuling` dataclass + `_split_rulings` skeleton with placeholder regex.
+2. `packages/scraper-framework/src/ingestion/worker.py` — the `_try_<slug>_<format>_split` function and dispatch wiring in `_llm_split_document`.
+3. `packages/scraper-framework/tests/courts/test_<slug>_tentatives.py` — placeholder unit tests.
+4. `packages/scraper-framework/tests/test_ingestion_worker.py` — `_make_<slug>_event` + `_make_fake_<slug>_rulings` fixtures and the dispatch contract test class (seven canonical cases — gate negatives, fall-through, dispatch contract, exhaustion handling).
+5. `scripts/check_split_ruling_fields_propagated.py` — the `_DATACLASS_SCOPE` entry so the propagation guard accepts the new dataclass.
+
+The contributor still has to fill in the county-specific regex (entry boundary + case_number shape) and replace the `xfail` placeholder test with a real fixture-driven test once a representative document is captured. The structural code (worker function, gate, dispatch contract, fake_rulings helper, scope entry, seven canonical dispatch tests) is generated correctly by construction.
+
+Use `--dry-run` to preview the diff without writing. The scaffolder is idempotent — re-running on a county that already has a registered splitter is a no-op.
+
+If the county module already exists (because the scraper for that county already lives in `<slug>_tentatives.py`), the scaffolder appends the `SplitRuling` + `_split_rulings` block instead of overwriting. Same shape for the per-county test file.
+
+After scaffolding, run the standard pre-PR checks from `packages/scraper-framework/`:
+
+```
+.venv/bin/ruff check src tests
+.venv/bin/ruff format --check src tests
+.venv/bin/pytest tests/ -k '<slug>'
+```
+
+And from the repo root: `scripts/check-split-ruling-fields-propagated.sh`. Tracking issue: #4316.
+
 ## S3 write discipline
 
 Rules that apply to every script or service that writes or copies objects under the `raw/` prefix in S3:
