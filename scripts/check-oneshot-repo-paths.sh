@@ -77,6 +77,7 @@ LOCAL_ONLY=(
 VALIDATED=(
     "data-quality-check.py"  # --baselines-base64 / --baselines-json CLI args bypass file path (#1225)
     "check-scraper-zero-record-runner.py"  # Runs in dedicated ECS task (EventBridge, not ecs-run-task.sh); scripts/ dir is baked into the Docker image (#2677)
+    "drain_splitter_carry_forward_clusters.py"  # _SCRAPER_SRC path is no-op in ECS (scraper-framework is installed in /app venv); /app/scripts is baked into the image (#4321)
 )
 
 # ─── Helper: is the file in a skip list? ──────────────────────────────────────
