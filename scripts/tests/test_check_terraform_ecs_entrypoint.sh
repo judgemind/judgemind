@@ -241,6 +241,38 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# Test 12a: Per-violation Fix block names actual interpreter + container (#4346)
+# The Python helper now emits a stderr Fix block that quotes the actual
+# interpreter and container_name detected so the patch is copy-pasteable.
+cat > "$TMPDIR_TEST/fix_block_test.tf" << 'TFEOF'
+resource "aws_ecs_task_definition" "fix_target" {
+  family       = "judgemind-fix-target"
+  cpu          = 256
+  memory       = 512
+  network_mode = "awsvpc"
+  container_definitions = jsonencode([
+    {
+      name      = "fix-target-container"
+      image     = "fake/img:latest"
+      command   = ["python3", "scripts/foo.py"]
+      essential = true
+    }
+  ])
+}
+TFEOF
+TESTS=$((TESTS + 1))
+fix_output=$(python3 "$PYTHON_HELPER" "$TMPDIR_TEST/fix_block_test.tf" 2>&1 || true)
+if echo "$fix_output" | grep -q '^Fix for resource "fix_target" container "fix-target-container":' \
+    && echo "$fix_output" | grep -q 'entryPoint = \["python3"\]' \
+    && echo "$fix_output" | grep -q 'name       = "fix-target-container"'; then
+    echo "PASS: Test 12a — Fix block names actual interpreter + container + resource"
+else
+    echo "FAIL: Test 12a — Fix block missing actual interpreter or container name"
+    echo "  Got:"
+    echo "$fix_output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+
 # Test 13: No self-match on ci.yml step name (per docs/agent/code-standards.md
 # § Hygiene-check CI steps -- the forbidden-string check must not match its
 # own ci.yml step name).

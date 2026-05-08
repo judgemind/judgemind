@@ -311,6 +311,49 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test 23a: Per-construct Fix block emitted (#4346) ─────────────────
+# When a violation fires, the report must include a "Fix:" header and a
+# per-construct rewrite suggestion that names the actual construct.
+write_file "bad_mapfile_for_fix.sh" <<'EOF'
+#!/usr/bin/env bash
+mapfile -t lines < <(echo "a")
+EOF
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "^  Fix:" \
+    && echo "$output" | grep -q "\\[mapfile (bash 4+ builtin)\\]" \
+    && echo "$output" | grep -q "while IFS= read -r line"; then
+    echo "PASS: Test 23a — Fix block names the construct + emits per-construct rewrite"
+else
+    echo "FAIL: Test 23a — Fix block missing or malformed"
+    echo "  Got:"
+    echo "$output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
+# ─── Test 23b: Fix block only shows constructs that fired (#4346) ──────
+# Two violations of different constructs should both appear; constructs
+# that did not fire should not.
+write_file "bad_two.sh" <<'EOF'
+#!/usr/bin/env bash
+declare -A m=([a]=1)
+echo "${x,,}"
+EOF
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "\\[declare -A (associative array, bash 4+)\\]" \
+    && echo "$output" | grep -q "\\[\${var,,} / \${var,} (lowercase expansion, bash 4+)\\]" \
+    && ! echo "$output" | grep -q "\\[mapfile (bash 4+ builtin)\\]"; then
+    echo "PASS: Test 23b — Fix block only emits rewrites for constructs that fired"
+else
+    echo "FAIL: Test 23b — Fix block emitted unexpected or missing constructs"
+    echo "  Got:"
+    echo "$output" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
 # ─── Test 23: No self-match on ci.yml step name ─────────────────────────
 # The step name in .github/workflows/ci.yml that runs this guard must
 # not itself contain a forbidden token. If it did, the guard would

@@ -160,6 +160,24 @@ PATTERN_LABELS=(
     "|& (stderr pipe shorthand, bash 4+)"
 )
 
+# Per-construct rewrite suggestions (#4346). Each entry mirrors
+# PATTERN_LABELS by index. Bash 3.2 has no associative arrays — see
+# PATTERN_LABELS comment — so we use a parallel indexed array.
+PATTERN_FIXES=(
+    "Use: while IFS= read -r line; do arr+=(\"\$line\"); done < <(cmd)"
+    "Use: while IFS= read -r line; do arr+=(\"\$line\"); done < <(cmd)"
+    "Use parallel indexed arrays (KEYS=(...) + VALS=(...)) or namespaced vars."
+    "Use parallel indexed arrays (KEYS=(...) + VALS=(...)) or namespaced vars."
+    "Use plain VAR=value at global scope, or write to stdout and VAR=\$(fn) at the caller."
+    "Pass the value by expansion, not by name. Or use 'eval' with strict quoting."
+    "Pass the value by expansion, not by name. Or use 'eval' with strict quoting."
+    "Pass the value by expansion, not by name. Or use 'eval' with strict quoting."
+    "Use: lower=\$(echo \"\$var\" | tr '[:upper:]' '[:lower:]')"
+    "Use: upper=\$(echo \"\$var\" | tr '[:lower:]' '[:upper:]')"
+    "Split into separate 'if' arms or repeat the case body across patterns."
+    "Use '2>&1 |' instead — works on bash 3.2+ and is more explicit."
+)
+
 # Leading word boundary: start-of-line or whitespace or ``;``/``&``/
 # ``(``. This keeps ``my_mapfile_wrapper`` and ``foo.readarray`` from
 # tripping the check while catching ``mapfile -t`` at the start of a
@@ -286,6 +304,22 @@ if (( violations > 0 )); then
     done
     echo ""
     echo "  Total violations: $violations"
+    echo ""
+    # Per-construct Fix block (#4346). Show the rewrite for every
+    # distinct label that appeared in the report. We deduplicate via a
+    # simple "have we already shown this label?" check.
+    echo "  Fix:"
+    fix_idx=0
+    while (( fix_idx < ${#PATTERN_LABELS[@]} )); do
+        fix_label="${PATTERN_LABELS[$fix_idx]}"
+        fix_text="${PATTERN_FIXES[$fix_idx]}"
+        # Did this label appear in the report?
+        if printf '%s\n' "${report_lines[@]}" | grep -qF "[$fix_label]"; then
+            echo "    [$fix_label]"
+            echo "      $fix_text"
+        fi
+        fix_idx=$((fix_idx + 1))
+    done
     echo ""
     echo "  If a construct must appear as explanatory context (e.g."
     echo "  \"we avoid mapfile because ...\"), put it in a comment line"

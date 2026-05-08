@@ -101,7 +101,7 @@ TASK_DEF_HEADER_RE = re.compile(
 )
 
 # Regex to find the start of jsonencode([ -- the container_definitions encoder
-JSONENCODE_START_RE = re.compile(r'\bcontainer_definitions\s*=\s*jsonencode\(')
+JSONENCODE_START_RE = re.compile(r"\bcontainer_definitions\s*=\s*jsonencode\(")
 
 
 def _extract_balanced_list(text: str, start: int) -> tuple[str, int] | None:
@@ -245,9 +245,7 @@ def _parse_container_block(
     return line_number, container_name, first_arg, command_list, entrypoint_list
 
 
-def check_file(
-    tf_path: str, allowlist: set[str]
-) -> list[tuple[int, str, str, str]]:
+def check_file(tf_path: str, allowlist: set[str]) -> list[tuple[int, str, str, str]]:
     """Return a list of (line_number, resource_name, container_name, interpreter) violations."""
     text = Path(tf_path).read_text(encoding="utf-8")
 
@@ -313,9 +311,7 @@ def check_file(
         body_start_line = text[:body_offset_in_file].count("\n") + 1
 
         for record in _scan_containers(body_text, body_start_line):
-            line_no, container_name, first_arg, _command_list, entrypoint_list = (
-                record
-            )
+            line_no, container_name, first_arg, _command_list, entrypoint_list = record
             if first_arg is None:
                 continue
             if first_arg not in INTERPRETERS:
@@ -345,13 +341,44 @@ def check_file(
                     in_allowlist = True
                     break
             if not in_allowlist:
-                violations.append(
-                    (line_no, resource_name, container_name, first_arg)
-                )
+                violations.append((line_no, resource_name, container_name, first_arg))
 
         pos = block_end + 1
 
     return violations
+
+
+def _suggest_fix(resource_name: str, container_name: str, interpreter: str) -> str:
+    """Build a copy-pasteable Fix block for a missing entryPoint override
+    on an ECS task definition (#4346).
+
+    Names the actual resource, container, and interpreter detected so the
+    operator can paste the patch verbatim.
+    """
+    lines = [
+        "",
+        f'Fix for resource "{resource_name}" container "{container_name}":',
+        "  Add an explicit entryPoint to the container definition so the",
+        f'  Dockerfile ENTRYPOINT does not double-wrap "{interpreter}":',
+        "",
+        "    container_definitions = jsonencode([",
+        "      {",
+        f'        name       = "{container_name}"',
+        '        image      = "..."',
+        f'        entryPoint = ["{interpreter}"]',
+        '        command    = ["scripts/<your-script>.py", "..."]',
+        "      }",
+        "    ])",
+        "",
+        "  Allowlist (only when the Dockerfile ENTRYPOINT is an argv-passthrough",
+        '  shim — e.g. dispatcher-v3\'s ["/bin/sh", "-c", "exec \\"$@\\"", "--"]):',
+        "    Append to scripts/check-terraform-ecs-entrypoint-allowlist.txt:",
+        f"      <path>:{resource_name}:{container_name}  # issue #NNNN",
+        "",
+        "  See issue #4270.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -371,6 +398,9 @@ def main() -> int:
             f'container "{container_name}" command starts with interpreter '
             f'"{interpreter}" without entryPoint override'
         )
+        # Per-violation Fix block (#4346) — names the actual resource,
+        # container, and detected interpreter so the patch is copy-pasteable.
+        print(_suggest_fix(resource_name, container_name, interpreter), file=sys.stderr)
 
     return 1 if violations else 0
 

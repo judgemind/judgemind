@@ -50,8 +50,9 @@ def load_allowlist(allowlist_path: str | None) -> set[str]:
 
 def check_file(
     tf_path: str, allowlist: set[str]
-) -> list[tuple[int, str, str]]:
-    """Return a list of (line_number, resource_type, resource_name) violations.
+) -> list[tuple[int, str, str, list[str]]]:
+    """Return a list of (line_number, resource_type, resource_name, var_names)
+    violations.
 
     A violation is a resource block that:
       - Contains a `Resource = compact([...])` (at any depth within the block)
@@ -59,27 +60,27 @@ def check_file(
         (with optional trailing comma), AND
       - Does NOT have a top-level `count =` or `for_each =` at depth 1
         (directly inside the resource block, not nested further).
+
+    The fourth element of each tuple is the list of `var.<identifier>` names
+    found inside the `compact([...])` call. The Fix block uses these to
+    emit a literal patch that names the actual variables (#4346).
     """
     text = Path(tf_path).read_text(encoding="utf-8")
     lines = text.splitlines()
 
     # Pattern to match the opening of a resource block:
     #   resource "aws_iam_role_policy" "name" {
-    resource_header_re = re.compile(
-        r'^resource\s+"([^"]+)"\s+"([^"]+)"\s*\{'
-    )
+    resource_header_re = re.compile(r'^resource\s+"([^"]+)"\s+"([^"]+)"\s*\{')
 
     # Pattern for top-level count / for_each (at depth 1 inside resource block)
-    count_re = re.compile(r'^\s*count\s*=')
-    for_each_re = re.compile(r'^\s*for_each\s*=')
+    count_re = re.compile(r"^\s*count\s*=")
+    for_each_re = re.compile(r"^\s*for_each\s*=")
 
     # Pattern: Resource = compact([  — the start of the problematic pattern
     # We scan for this at any depth within the resource block.
-    resource_compact_start_re = re.compile(
-        r'\bResource\s*=\s*compact\(\['
-    )
+    resource_compact_start_re = re.compile(r"\bResource\s*=\s*compact\(\[")
 
-    violations: list[tuple[int, str, str]] = []
+    violations: list[tuple[int, str, str, list[str]]] = []
 
     i = 0
     while i < len(lines):
@@ -133,7 +134,7 @@ def check_file(
                     compact_resource_lineno = i + 1  # 1-based
                     # Collect from the [ after compact(
                     bracket_pos = ln.index("[", mc.start())
-                    compact_args_text = ln[bracket_pos + 1:]
+                    compact_args_text = ln[bracket_pos + 1 :]
                     collecting_compact = True
                     compact_bracket_depth = 1
                     # Check if compact() closes on the same line
@@ -173,12 +174,17 @@ def check_file(
             arg_tokens = [t.strip() for t in args_raw.split(",") if t.strip()]
 
             # Every token must be var.<identifier>
-            var_only_re = re.compile(r'^var\.[a-zA-Z_][a-zA-Z0-9_]*$')
+            var_only_re = re.compile(r"^var\.[a-zA-Z_][a-zA-Z0-9_]*$")
             all_var = all(var_only_re.match(tok) for tok in arg_tokens)
 
             if all_var and arg_tokens and not has_count_guard:
                 violations.append(
-                    (compact_resource_lineno, resource_type, resource_name)
+                    (
+                        compact_resource_lineno,
+                        resource_type,
+                        resource_name,
+                        list(arg_tokens),
+                    )
                 )
 
     # Filter against allowlist
@@ -187,8 +193,8 @@ def check_file(
     # We match if the entry path equals the absolute path or is a suffix of it
     # (preceded by a path separator).
     tf_path_str = str(tf_path)
-    filtered: list[tuple[int, str, str]] = []
-    for lineno, rtype, rname in violations:
+    filtered: list[tuple[int, str, str, list[str]]] = []
+    for lineno, rtype, rname, var_names in violations:
         in_allowlist = False
         for entry in allowlist:
             parts = entry.split(":")
@@ -204,9 +210,46 @@ def check_file(
                 in_allowlist = True
                 break
         if not in_allowlist:
-            filtered.append((lineno, rtype, rname))
+            filtered.append((lineno, rtype, rname, var_names))
 
     return filtered
+
+
+def _suggest_fix(rname: str, var_names: list[str]) -> str:
+    """Build a copy-pasteable Fix block for an unguarded compact([var.*])
+    Resource list (#4346).
+
+    The block names the actual variables found inside `compact()` so the
+    operator can paste it verbatim. ``var.foo_arn`` / ``var.bar_arn`` →
+    a ``locals { compacted_<rname> = compact([var.foo_arn, var.bar_arn]) }``
+    block plus a ``count = length(local.compacted_<rname>) > 0 ? 1 : 0``
+    guard on the resource.
+    """
+    local_name = f"compacted_{rname}"
+    var_list = ", ".join(var_names)
+    lines = [
+        "",
+        f'Fix for "{rname}":',
+        "  Add a `count = length(...) > 0 ? 1 : 0` guard so the resource",
+        "  is suppressed when every input variable is empty:",
+        "",
+        "    locals {",
+        f"      {local_name} = compact([{var_list}])",
+        "    }",
+        "",
+        f'    resource "..." "{rname}" {{',
+        f"      count = length(local.{local_name}) > 0 ? 1 : 0",
+        "      ...",
+        f"      Resource = local.{local_name}",
+        "    }",
+        "",
+        "  See issue #2739 for the bug class and #2740 for the fix pattern.",
+        "  To temporarily waive while a fix is pending, add a line to:",
+        "    scripts/check-terraform-empty-resource-allowlist.txt",
+        f"  Format: <path>:<resource_type>:{rname}  # issue #NNNN",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -220,11 +263,14 @@ def main() -> int:
     allowlist = load_allowlist(allowlist_path)
     violations = check_file(tf_path, allowlist)
 
-    for lineno, rtype, rname in violations:
+    for lineno, rtype, rname, var_names in violations:
         print(
-            f"{tf_path}:{lineno}: {rtype} \"{rname}\" "
+            f'{tf_path}:{lineno}: {rtype} "{rname}" '
             f"missing count guard for compact([var.*]) Resource list"
         )
+        # Per-violation Fix block (#4346) — names the actual var.* args
+        # so the operator can paste the patch verbatim.
+        print(_suggest_fix(rname, var_names), file=sys.stderr)
 
     return 1 if violations else 0
 
