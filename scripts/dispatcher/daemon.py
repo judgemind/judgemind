@@ -68,6 +68,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -917,6 +918,38 @@ WORKTREE_PARENT_DIR = Path(".claude/worktrees")
 #: the lifetime of the dispatcher is negligible and the short form
 #: keeps path lengths sane.
 AGENT_SHORT_ID_HEX_CHARS = 8
+
+
+#: Regex that matches a *safe* short_id — only filename-safe ASCII
+#: characters (alphanumeric + underscore + hyphen). Used by the
+#: defense-in-depth guard in
+#: :meth:`DispatcherDaemon._compute_worktree_path` to reject leaked
+#: ``str(MagicMock())`` inputs that would otherwise produce
+#: ``agent-<MagicMo``-shaped directories on disk (issue #4307).
+#:
+#: Real production short_ids are 8 lowercase hex chars
+#: (``uuid.uuid4().hex[:AGENT_SHORT_ID_HEX_CHARS]``); test fixtures
+#: use deterministic strings like ``"aabbccdd"`` or
+#: ``"agentuui"`` — both pass this regex. Mock reprs
+#: (``"<MagicMock id='4503599627368'>"`` truncated to ``"<MagicMo"``)
+#: contain ``<`` and fail the regex.
+_SAFE_SHORT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_valid_short_id(short_id: str) -> bool:
+    """Return True iff ``short_id`` is a filename-safe ASCII slug.
+
+    This is intentionally permissive about content (production hex,
+    test-fixture deterministic strings) but strict about *shape* —
+    any character outside ``[A-Za-z0-9_-]`` is rejected. The leak
+    shape we are guarding against (``str(MagicMock())`` truncated
+    to ``"<MagicMo"``) contains ``<`` and is therefore rejected.
+    See issue #4307.
+    """
+    if not short_id:
+        return False
+    return bool(_SAFE_SHORT_ID_RE.match(short_id))
+
 
 #: Default absolute path for the daemon's baseline git clone inside the
 #: Fargate container. When ``DISPATCHER_BASELINE_REPO_ROOT`` is set in
@@ -5991,7 +6024,36 @@ class DispatcherDaemon:
         sibling ``worktrees/`` directory next to the baseline clone
         (``/var/lib/dispatcher/worktrees/agent-<short_id>``). When unset,
         fall back to the legacy ``<cwd>/.claude/worktrees/`` convention.
+
+        ``short_id`` MUST be a real ``str``. A non-``str`` (typically a
+        ``MagicMock`` leaked from a test fixture) would otherwise be
+        ``f"agent-{short_id}"``-formatted into the path string as
+        ``<MagicMock id='...'>`` — see issue #4307 for the historical
+        leak shape that landed real directories at
+        ``<repo_root>/.claude/worktrees/agent-<MagicMock id=...>/``
+        on the GitHub-hosted runner. The early ``TypeError`` here +
+        the matching guard in :meth:`_create_worktree` ensures the
+        bug class can never reach the filesystem.
         """
+        if not isinstance(short_id, str):
+            raise TypeError(
+                f"short_id must be a str, got {type(short_id).__name__!r} "
+                f"({short_id!r}) — see issue #4307 for the leak shape this "
+                f"guard prevents."
+            )
+        # Defense-in-depth (#4307): a str-typed short_id can still be the
+        # ``str()`` of a leaked ``MagicMock`` (the production path runs
+        # ``agent_id = str(row[0])`` on the cursor return — a row of
+        # MagicMock would produce ``"<MagicMock id='...'>"``). Reject
+        # anything that doesn't look like the documented short_id shape
+        # (hex characters from ``uuid.uuid4().replace("-", "")[:8]``).
+        if not _is_valid_short_id(short_id):
+            raise ValueError(
+                f"short_id {short_id!r} does not match the expected "
+                f"hex-only shape (8+ chars from a uuid). This usually "
+                f"means a test passed a synthetic agent_id (e.g. "
+                f"``str(MagicMock())``) — see issue #4307."
+            )
         baseline = self._cfg.baseline_repo_root
         if baseline is not None:
             return baseline.parent / "worktrees" / f"agent-{short_id}"
@@ -6948,7 +7010,18 @@ class DispatcherDaemon:
         In the legacy local-dev / unit-test mode (``baseline_repo_root``
         unset), runs ``git -C <cwd> worktree add`` against
         ``.claude/worktrees/`` as before.
+
+        ``agent_id`` MUST be a real ``str``. See
+        :meth:`_compute_worktree_path` for the rationale — issue #4307
+        documents the historical leak shape where a ``MagicMock`` agent
+        id ended up interpolated into ``agent-<MagicMock id='...'>``
+        directory names on disk.
         """
+        if not isinstance(agent_id, str):
+            raise TypeError(
+                f"agent_id must be a str, got {type(agent_id).__name__!r} "
+                f"({agent_id!r}) — see issue #4307."
+            )
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         git_parent = self._git_parent_root()
         worktree_path = self._compute_worktree_path(short_id)

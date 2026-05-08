@@ -663,6 +663,16 @@ jobs:
       - name: Test dispatcher daemon skeleton
         if: matrix.shard == 'python'
         run: pytest scripts/dispatcher/tests/ -v --tb=short -n auto -m "not integration"
+      # Issue #4307: defense-in-depth guard against the dispatcher pytest
+      # suite leaking synthetic agent worktrees under
+      # <repo_root>/.claude/worktrees/agent-*. The dispatcher conftest's
+      # session-scoped autouse fixture is the primary catch; this CI step
+      # is the wider net for any code path that bypasses pytest fixtures
+      # (e.g. a pre-existing leftover from a flaky earlier shard, a
+      # subprocess-launched test that escapes the fixture context).
+      - name: Verify dispatcher tests did not leak synthetic agent worktrees
+        if: matrix.shard == 'python'
+        run: scripts/check-no-test-leaked-worktrees.sh
       # Dispatcher v3 task-runner tests (scripts/dispatcher_v3/tests/).
       # Separate invocation because these live in their own package dir
       # (scripts/dispatcher_v3/tests/) rather than under scripts/tests/.
