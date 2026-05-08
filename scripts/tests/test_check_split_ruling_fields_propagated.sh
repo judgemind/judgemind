@@ -375,6 +375,145 @@ else
 fi
 rm -f "$live_scan_output"
 
+# ─── Test 12: Fix block emitted for missing _DATACLASS_SCOPE entry ───────
+# When a new ``*SplitRuling`` is missing from _DATACLASS_SCOPE, the check's
+# error output must include a copy-pasteable Fix block under a ``Fix:``
+# heading.  Issue #4322.
+write_dataclass xyz_tentatives XYZSplitRuling ruling_index case_number
+write_worker _try_la_html_split case_number ruling_text
+write_reingest case_number ruling_text
+TESTS=$((TESTS + 1))
+last_combined=$(mktemp)
+set +e
+python3 "$PY_SCRIPT" \
+    --scraper-framework "$TMPDIR_TEST/src" \
+    --reingest "$TMPDIR_TEST/reingest.py" \
+    --quiet-whitelisted \
+    > "$last_combined" 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 1 ]] \
+    && grep -q "^Fix:" "$last_combined" \
+    && grep -q '"XYZSplitRuling"' "$last_combined" \
+    && grep -q '"reingest": True' "$last_combined"; then
+    echo "PASS: Test 12 — Fix block emitted with literal scope-entry patch"
+else
+    echo "FAIL: Test 12 — output missing Fix block / patch literal"
+    echo "  rc: $rc"
+    echo "  combined: $(cat "$last_combined")"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$last_combined"
+reset_tmpdir
+
+# ─── Test 13: Fix block disambiguates SplitRuling by module stem ─────────
+# A plain ``SplitRuling`` class (Fresno/Riverside/SF/SC convention) gets
+# its scope key suggested as ``SplitRuling@<module-stem>`` so the operator
+# can paste it directly into the disambiguated table.  Issue #4322.
+courts_dir="$TMPDIR_TEST/src/courts/ca"
+mkdir -p "$courts_dir"
+cat > "$courts_dir/abc_tentatives.py" <<'PYEOF'
+class SplitRuling:
+    __slots__ = (
+        "ruling_index",
+        "case_number",
+        "ruling_text",
+    )
+    def __init__(self, ruling_index, case_number, ruling_text):
+        self.ruling_index = ruling_index
+        self.case_number = case_number
+        self.ruling_text = ruling_text
+PYEOF
+write_worker _try_la_html_split case_number ruling_text
+write_reingest case_number ruling_text
+TESTS=$((TESTS + 1))
+last_combined=$(mktemp)
+set +e
+python3 "$PY_SCRIPT" \
+    --scraper-framework "$TMPDIR_TEST/src" \
+    --reingest "$TMPDIR_TEST/reingest.py" \
+    --quiet-whitelisted \
+    > "$last_combined" 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 1 ]] \
+    && grep -q '"SplitRuling@abc_tentatives"' "$last_combined"; then
+    echo "PASS: Test 13 — Fix block uses SplitRuling@<stem> for disambiguated key"
+else
+    echo "FAIL: Test 13 — Fix block did not name SplitRuling@abc_tentatives"
+    echo "  rc: $rc"
+    echo "  combined: $(cat "$last_combined")"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$last_combined"
+reset_tmpdir
+
+# ─── Test 14: Fix block uses real worker fn name when one exists ─────────
+# When ``_try_<county>_<format>_split`` exists in worker.py, the Fix
+# block's ``"worker_fn"`` field uses the real name (no placeholder /
+# adjust-comment).  Issue #4322 AC #2.
+write_dataclass xyz_tentatives XYZSplitRuling ruling_index case_number
+# Worker has a real _try_xyz_pdf_split function — the Fix block should
+# pick it up and omit the "adjust if the worker hook has a different name"
+# comment.
+write_worker _try_xyz_pdf_split case_number
+write_reingest case_number
+TESTS=$((TESTS + 1))
+last_combined=$(mktemp)
+set +e
+python3 "$PY_SCRIPT" \
+    --scraper-framework "$TMPDIR_TEST/src" \
+    --worker "$TMPDIR_TEST/src/ingestion/worker.py" \
+    --reingest "$TMPDIR_TEST/reingest.py" \
+    --quiet-whitelisted \
+    > "$last_combined" 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 1 ]] \
+    && grep -q '"_try_xyz_pdf_split"' "$last_combined" \
+    && ! grep -q "adjust if the worker hook" "$last_combined"; then
+    echo "PASS: Test 14 — Fix block uses real worker fn name (no placeholder comment)"
+else
+    echo "FAIL: Test 14 — Fix block did not pick up real _try_xyz_pdf_split"
+    echo "  rc: $rc"
+    echo "  combined: $(cat "$last_combined")"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$last_combined"
+reset_tmpdir
+
+# ─── Test 15: Fix block falls back to placeholder when no worker fn ──────
+# When no ``_try_<county>_*_split`` function exists in worker.py, the Fix
+# block uses the conventional ``_try_<county>_pdf_split`` placeholder and
+# includes the "adjust if the worker hook has a different name" comment.
+# Issue #4322 AC #2 (negative).
+write_dataclass xyz_tentatives XYZSplitRuling ruling_index case_number
+write_worker _try_la_html_split case_number ruling_text
+write_reingest case_number ruling_text
+TESTS=$((TESTS + 1))
+last_combined=$(mktemp)
+set +e
+python3 "$PY_SCRIPT" \
+    --scraper-framework "$TMPDIR_TEST/src" \
+    --worker "$TMPDIR_TEST/src/ingestion/worker.py" \
+    --reingest "$TMPDIR_TEST/reingest.py" \
+    --quiet-whitelisted \
+    > "$last_combined" 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 1 ]] \
+    && grep -q '"_try_xyz_pdf_split"' "$last_combined" \
+    && grep -q "adjust if the worker hook" "$last_combined"; then
+    echo "PASS: Test 15 — Fix block uses placeholder + adjust-comment when no worker fn matches"
+else
+    echo "FAIL: Test 15 — Fix block missing placeholder _try_xyz_pdf_split + adjust-comment"
+    echo "  rc: $rc"
+    echo "  combined: $(cat "$last_combined")"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$last_combined"
+reset_tmpdir
+
 # ─── Self-match guard — N/A ──────────────────────────────────────────────
 # The peer ``check-no-*.sh`` self-match helper is for guards that grep
 # arbitrary text and might match their own ci.yml step name.  This
