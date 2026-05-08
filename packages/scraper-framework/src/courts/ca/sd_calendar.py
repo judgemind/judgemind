@@ -727,7 +727,7 @@ def is_sd_calendar_html(text: str | None) -> bool:
     return "CIVIL CALENDAR For" in head
 
 
-def _split_rulings(text: str) -> list[SDSplitRuling]:
+def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SDSplitRuling]:
     """Split a SD calendar HTML page into per-case rulings.
 
     Registered in :data:`scripts.reingest_from_s3._SPLIT_REGISTRY` under
@@ -744,7 +744,14 @@ def _split_rulings(text: str) -> list[SDSplitRuling]:
     Each returned ruling has a *focused* ``ruling_text`` built from that
     case's calendar row only — NEVER the full HTML.  This is what prevents
     50000-char raw-HTML dumps and cross-case contamination.
+
+    The ``pdf_bytes`` parameter is part of the unified ``_SPLIT_REGISTRY``
+    contract introduced in #4360 (so SC's format-B path can receive raw
+    bytes from registry callers). SD's splitter operates on HTML text and
+    ignores ``pdf_bytes`` — the parameter exists purely for signature
+    symmetry across registered splitters.
     """
+    del pdf_bytes  # HTML-only splitter; bytes ignored (contract symmetry)
     if not is_sd_calendar_html(text):
         return []
 

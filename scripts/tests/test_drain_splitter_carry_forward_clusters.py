@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -221,6 +222,121 @@ class TestPlanClusterDrain:
             extract_text_fn=lambda b: "text",
         )
         assert plan.status == "skip_no_split"
+
+    def test_format_b_splitter_receives_pdf_bytes_kwarg(self) -> None:
+        """Regression test for #4360.
+
+        ``plan_cluster_drain`` MUST pass ``pdf_bytes`` to the registered
+        splitter so SC's bytes-aware format-B path can fire.  Pre-#4360
+        the call site was ``split_fn(text)`` and SC dept-6 PDFs reported
+        ``skip_no_split`` because format A returns ``[]`` and format B
+        couldn't run without bytes.
+
+        We stub a splitter that mimics SC's format-B behaviour: returns
+        ``[]`` when invoked with text only, returns >= 2 distinct-title
+        rulings when invoked with ``pdf_bytes``.  This proves the
+        plan_cluster_drain call site threads bytes through.
+        """
+        captured: dict[str, Any] = {}
+
+        def fake_split(text: str, pdf_bytes: bytes | None = None) -> list[Any]:
+            captured["text"] = text
+            captured["pdf_bytes"] = pdf_bytes
+            if pdf_bytes is None:
+                return []
+            sr_a = MagicMock()
+            sr_a.case_title = "Huynh vs Redis Labs"
+            sr_b = MagicMock()
+            sr_b.case_title = "Lee Casper v. Ford"
+            return [sr_a, sr_b]
+
+        cluster = _script.Cluster(
+            county="Santa Clara",
+            s3_key="ca/santa_clara/raw/dept6.pdf",
+            s3_bucket="abc-bucket",
+            scraper_id="ca-santa-clara-tentatives-civil",
+            case_title="Plaintiff v. FCA",
+            ruling_count=10,
+        )
+        plan = _script.plan_cluster_drain(
+            cluster,
+            pdf_bytes=b"%PDF-1.4 ...",
+            split_fn=fake_split,
+            extract_text_fn=lambda b: "fake dept-6 text",
+        )
+        # The bytes were threaded — splitter saw pdf_bytes != None and
+        # returned the multi-ruling result, so the plan is ready.
+        assert captured["pdf_bytes"] == b"%PDF-1.4 ..."
+        assert plan.status == "ready"
+        assert plan.distinct_titles == 2
+
+    def test_format_b_real_fixture_through_plan_cluster_drain(self) -> None:
+        """End-to-end regression test for #4360 using the real SC dept-6
+        fixture.  Wires ``plan_cluster_drain`` to the actual SC
+        ``_split_rulings`` callable and an extract_text_fn backed by
+        ``pdfplumber`` (via the scraper-framework helper) — proves the
+        format-B path returns >= 10 distinct titles when bytes flow
+        through.
+
+        Skipped when the scraper-framework venv isn't on ``sys.path`` —
+        this test runs from the scraper-framework venv during CI's
+        per-package pytest stage (it imports SC's ``_split_rulings`` and
+        ``extract_pdf_text`` helpers from the package source tree).
+        """
+        import pathlib
+
+        try:
+            from courts.ca.sc_tentatives import (  # type: ignore[import-not-found]
+                _split_rulings,
+                extract_pdf_text,
+            )
+        except ImportError:
+            import pytest
+
+            pytest.skip(
+                "scraper-framework imports not available; "
+                "test runs from packages/scraper-framework/.venv"
+            )
+
+        fixture_path = (
+            pathlib.Path(__file__).parent.parent.parent
+            / "packages"
+            / "scraper-framework"
+            / "tests"
+            / "fixtures"
+            / "sc_dept6_tues.pdf"
+        )
+        if not fixture_path.exists():
+            import pytest
+
+            pytest.skip(f"SC dept-6 fixture not found at {fixture_path}")
+
+        pdf_bytes = fixture_path.read_bytes()
+
+        cluster = _script.Cluster(
+            county="Santa Clara",
+            s3_key="ca/santa_clara/superior_court/raw/dept6_tues.pdf",
+            s3_bucket="abc-bucket",
+            scraper_id="ca-santa-clara-tentatives-civil",
+            case_title="Plaintiff v. FCA",
+            ruling_count=10,
+        )
+
+        plan = _script.plan_cluster_drain(
+            cluster,
+            pdf_bytes=pdf_bytes,
+            split_fn=_split_rulings,
+            extract_text_fn=extract_pdf_text,
+        )
+        # The dept-6 summary table holds 10 distinct case rows.  Without
+        # the #4360 fix the plan was ``skip_no_split`` (format A returns
+        # 0 entries, format B can't run without bytes).
+        assert plan.status == "ready", (
+            f"expected status='ready' from real SC dept-6 fixture; got {plan.status}"
+        )
+        assert plan.distinct_titles >= 10, (
+            f"expected >= 10 distinct titles; got {plan.distinct_titles}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -251,7 +251,9 @@ class CCSplitRuling:
     parties: list[dict[str, str]] = dataclass_field(default_factory=list)
 
 
-def _llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
+def _llm_extract_rulings(
+    pdf_text: str, pdf_bytes: bytes | None = None
+) -> list[CCSplitRuling] | None:
     """Extract rulings from CC department PDF text using an LLM.
 
     Sends pdfplumber-extracted text to the LLM with the Contra Costa system
@@ -265,7 +267,13 @@ def _llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
     The name is deliberately ``_llm_extract_rulings`` (no ``_cc_`` prefix)
     so that ``scripts/reingest_from_s3.py`` discovers it via the
     ``_LLM_SPLIT_REGISTRY`` attribute-name scan (#2469).
+
+    The ``pdf_bytes`` parameter is part of the unified ``_LLM_SPLIT_REGISTRY``
+    contract introduced in #4360 (so SC's format-B bytes-based path can
+    receive raw bytes from registry callers). CC's LLM extractor operates
+    on text only and ignores ``pdf_bytes``.
     """
+    del pdf_bytes  # text-only LLM extractor; bytes ignored (contract symmetry)
     from ingestion.llm_providers import call_llm
 
     if not pdf_text or not pdf_text.strip():

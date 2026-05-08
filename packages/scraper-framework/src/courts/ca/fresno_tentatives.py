@@ -420,7 +420,7 @@ def _normalize_outcome(raw: str) -> str:
     return raw.strip()
 
 
-def _split_rulings(text: str) -> list[SplitRuling]:
+def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]:
     """Split PDF text containing multiple numbered rulings into SplitRuling objects.
 
     Fresno PDFs use numbered entries like:
@@ -434,7 +434,15 @@ def _split_rulings(text: str) -> list[SplitRuling]:
         To sustain ...
 
     Returns an empty list if no numbered entries are found.
+
+    The ``pdf_bytes`` parameter is part of the unified ``_SPLIT_REGISTRY``
+    contract ``(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]``
+    introduced in #4360 so SC's ``pdfplumber.extract_tables()``-based
+    format-B path can receive raw bytes from registry callers.  Fresno's
+    splitter is text-only and ignores ``pdf_bytes`` — the parameter exists
+    purely for signature symmetry across registered splitters.
     """
+    del pdf_bytes  # text-only splitter; bytes ignored (contract symmetry)
     matches = list(_RULING_ENTRY_RE.finditer(text))
     if not matches:
         return []

@@ -245,19 +245,33 @@ logger = structlog.get_logger()
 _SCRAPER_REGISTRY: dict[str, type] = {}
 
 # Registry mapping scraper_id to a callable that splits raw PDF/document
-# content into multiple extracted-field dicts.  Only populated for scrapers
-# that produce multi-ruling documents (e.g. Riverside).  The callable
-# signature is:  (raw_content: bytes, doc_meta: dict) -> list[dict]
-# Each dict in the returned list has the same shape as _reparse_document()'s
-# return value plus a "ruling_index" key.
+# content into per-ruling SplitRuling-style records.  Only populated for
+# scrapers that produce multi-ruling documents (e.g. Riverside, SC).
+#
+# Unified registry contract (#4360):
+#   (text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]
+#
+# Every callable accepts the document text plus optionally the raw PDF
+# bytes.  The bytes argument exists for splitters that need a layout
+# engine (e.g. SC dept-6 format B uses ``pdfplumber.extract_tables()`` on
+# the original bytes).  Text-only splitters accept ``pdf_bytes`` for
+# signature symmetry and ignore it.  Callers (``_full_reparse_document``,
+# ``drain_splitter_carry_forward_clusters.plan_cluster_drain``) MUST
+# pass ``pdf_bytes`` so bytes-aware splitters can fire.
 _SPLIT_REGISTRY: dict[str, Any] = {}
 
 # Registry mapping scraper_id to an LLM-based split function.  These are
 # preferred over the regex-based _SPLIT_REGISTRY entries in full-reparse
 # mode because they use LLM prompts to extract ruling_text (which may have
-# been improved, e.g. #1948/#1959).  The callable signature is:
-#   (text: str) -> list[SplitRuling] | None
+# been improved, e.g. #1948/#1959).
+#
+# Unified registry contract (#4360):
+#   (text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling] | None
+#
 # Returns None on LLM failure, in which case the regex fallback is used.
+# Like ``_SPLIT_REGISTRY``, every callable accepts the optional
+# ``pdf_bytes`` for signature symmetry; today's CA LLM splitters operate
+# on text only and ignore the bytes.
 _LLM_SPLIT_REGISTRY: dict[str, Any] = {}
 
 
@@ -1535,9 +1549,16 @@ def _full_reparse_document(
     # see #1948/#1959).  Falls back to regex-based split on LLM failure.
     # Note: some scrapers (e.g. LA) only have an LLM splitter without a
     # regex fallback — previously these were skipped entirely (#2007).
+    # Unified _SPLIT_REGISTRY / _LLM_SPLIT_REGISTRY contract (#4360):
+    #   (text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]
+    # ``raw_content`` is the bytes already fetched from S3 at the top of
+    # this function — pass it through so bytes-aware splitters (e.g. SC's
+    # format-B pdfplumber.extract_tables() path) can fire.  Without these
+    # bytes, SC dept-6 PDFs silently fall through to the single-doc LLM
+    # reparse, leaving placeholder titles in place.
     if llm_split_fn is not None:
         try:
-            split_results = llm_split_fn(text)
+            split_results = llm_split_fn(text, pdf_bytes=raw_content)
         except Exception:
             logger.warning(
                 "LLM split raised exception, falling back to regex",
@@ -1553,7 +1574,7 @@ def _full_reparse_document(
                     document_id=doc_meta["document_id"],
                     scraper_id=scraper_id,
                 )
-                split_results = split_fn(text)
+                split_results = split_fn(text, pdf_bytes=raw_content)
             else:
                 logger.warning(
                     "LLM split failed and no regex fallback available",
@@ -1562,7 +1583,7 @@ def _full_reparse_document(
                 )
                 split_results = []
     else:
-        split_results = split_fn(text)
+        split_results = split_fn(text, pdf_bytes=raw_content)
 
     if len(split_results) <= 1:
         # Single ruling or no rulings — fall back to standard reparse

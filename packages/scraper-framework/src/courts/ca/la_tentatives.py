@@ -560,7 +560,9 @@ def _rebuild_reversed_title_from_parties(
     return None
 
 
-def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
+def _llm_extract_rulings(
+    ruling_html: str, pdf_bytes: bytes | None = None
+) -> list[LASplitRuling] | None:
     """Extract rulings from LA department HTML using an LLM.
 
     Preprocesses the HTML to plain text, sends it to the LLM with a
@@ -570,7 +572,13 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
     Returns a list of ``LASplitRuling`` objects on success, or ``None``
     if the LLM call fails or the response cannot be parsed.  The caller
     should fall back to ``_split_cases_html()`` when ``None`` is returned.
+
+    The ``pdf_bytes`` parameter is part of the unified ``_LLM_SPLIT_REGISTRY``
+    contract introduced in #4360 (so SC's format-B bytes-based path can
+    receive raw bytes from registry callers). LA's LLM extractor operates
+    on HTML text only and ignores ``pdf_bytes``.
     """
+    del pdf_bytes  # text-only LLM extractor; bytes ignored (contract symmetry)
     from ingestion.llm_extract import preprocess_html
     from ingestion.llm_providers import call_llm
 
@@ -844,7 +852,7 @@ def _extract_judge_name_from_case_section(
     return None
 
 
-def _split_rulings(text: str) -> list[LASplitRuling]:
+def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[LASplitRuling]:
     """Split an LA department page into per-case rulings using regex + HTML parsing.
 
     This is the non-LLM splitting path registered in ``_SPLIT_REGISTRY`` for
@@ -862,7 +870,14 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
     fallback (#4282).
 
     Returns an empty list if no case sections are found.
+
+    The ``pdf_bytes`` parameter is part of the unified ``_SPLIT_REGISTRY``
+    contract introduced in #4360 (so SC's format-B path can receive raw
+    bytes from registry callers). LA's splitter operates on HTML text and
+    ignores ``pdf_bytes`` — the parameter exists purely for signature
+    symmetry across registered splitters.
     """
+    del pdf_bytes  # HTML-only splitter; bytes ignored (contract symmetry)
     case_htmls = _split_cases_html(text)
     if not case_htmls:
         return []

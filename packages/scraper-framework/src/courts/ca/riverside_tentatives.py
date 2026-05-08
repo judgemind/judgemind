@@ -276,7 +276,7 @@ def _extract_case_number_from_header(header: str) -> str | None:
     return m.group(0).upper() if m else None
 
 
-def _split_rulings(text: str) -> list[SplitRuling]:
+def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]:
     """Split Riverside multi-ruling PDF text into per-entry ``SplitRuling`` objects.
 
     The page-1 preamble (Zoom call-in instructions, court reporter notice,
@@ -310,7 +310,14 @@ def _split_rulings(text: str) -> list[SplitRuling]:
     those fields via per-entry enrichment matches the Fresno fall-
     through path (#3599, AC4 of #3534) and preserves the behaviour the
     LLM was already producing on single-ruling PDFs.
+
+    The ``pdf_bytes`` parameter is part of the unified ``_SPLIT_REGISTRY``
+    contract introduced in #4360 (so SC's format-B path can receive raw
+    bytes from registry callers). Riverside's splitter is text-only and
+    ignores ``pdf_bytes`` — the parameter exists purely for signature
+    symmetry across registered splitters.
     """
+    del pdf_bytes  # text-only splitter; bytes ignored (contract symmetry)
     matches = list(_RULING_ENTRY_RE.finditer(text))
     if not matches:
         return []
