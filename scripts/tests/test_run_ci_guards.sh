@@ -28,6 +28,9 @@
 #   8.  Non-executable .py runs anyway (CI-canonical state for #4332 retro)
 #   9.  Non-executable .sh is skipped with reason
 #  10.  SKIP_CI_GUARDS=1 emits WARNING and exits 0 without running guards
+#  11.  Built-in skip list (check-issue-verify-sql.py) — exits 0, listed
+#       as SKIP (#4372 regression — script requires --issue/--body-file
+#       and exits 2 with usage error when invoked blind).
 #
 # Run:
 #   scripts/tests/test_run_ci_guards.sh
@@ -315,6 +318,55 @@ elif echo "$out_buf" | grep -q "this must never run"; then
     report_fail "SKIP_CI_GUARDS=1 invoked the guard despite bypass" "$out_buf"
 else
     report_pass "SKIP_CI_GUARDS=1 bypasses with WARNING and exits 0"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 11: built-in skip list — check-issue-verify-sql.py skipped
+#               (#4372 regression — script requires --issue or --body-file
+#               and exits 2 with usage error when invoked blind, which
+#               masked real failures in every run-ci-guards.sh run since
+#               check-issue-verify-sql.py shipped in #4358).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 11] built-in skip list — check-issue-verify-sql.py skipped (#4372)"
+synth_scripts="$(seed_synthetic_scripts s11)"
+# Seed a passing guard plus a check-issue-verify-sql.py stub that mimics
+# the real script's argparse failure shape. The built-in skip list must
+# keep it from running — if it ran, it would exit 2 and surface as a
+# failed guard.
+cat > "$synth_scripts/check-pass.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$synth_scripts/check-pass.sh"
+cat > "$synth_scripts/check-issue-verify-sql.py" <<'PY'
+import sys
+print(
+    "usage: check-issue-verify-sql.py [-h] (--issue ISSUE | --body-file BODY_FILE)",
+    file=sys.stderr,
+)
+print(
+    "check-issue-verify-sql.py: error: one of the arguments --issue --body-file is required",
+    file=sys.stderr,
+)
+sys.exit(2)
+PY
+# Intentionally do NOT chmod +x — .py guards are invoked via python3 by
+# the umbrella, so the +x bit is irrelevant. The skip-list match must
+# fire before the umbrella attempts to execute the file at all.
+run_synth "$synth_scripts" --list
+if [ "$rc_buf" -ne 0 ]; then
+    report_fail "expected --list to exit 0, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "SKIP check-issue-verify-sql.py (built-in skip)"; then
+    report_fail "expected 'SKIP check-issue-verify-sql.py (built-in skip)' (#4372)" "$out_buf"
+else
+    report_pass "built-in skip list excludes check-issue-verify-sql.py (#4372)"
+fi
+# And verify the skip actually prevents execution: a full run should pass.
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 0 ]; then
+    report_fail "check-issue-verify-sql.py ran despite skip-list (rc=$rc_buf, #4372)" "$out_buf"
+else
+    report_pass "check-issue-verify-sql.py not invoked during full run (#4372)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

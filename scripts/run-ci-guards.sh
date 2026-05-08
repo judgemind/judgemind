@@ -43,6 +43,10 @@
 #   * check-blocked-issues.sh      — scans live GitHub issues
 #   * check-task-recovery.sh       — needs a worktree path argument
 #   * check-pr-title.sh            — needs a PR number / title input
+#   * check-issue-verify-sql.py    — needs ``--issue N`` or ``--body-file
+#                                    PATH``; blind invocation exits 2 with
+#                                    "one of the arguments --issue
+#                                    --body-file is required" (#4372)
 #   * check-graphql-queries.sh     — requires ``packages/web`` npm install
 #   * check-migration-number-collision.{sh,py}
 #                                  — requires ``gh pr list`` for cross-PR
@@ -119,6 +123,10 @@ SKIP_LIST=(
     "check-blocked-issues.sh"
     "check-task-recovery.sh"
     "check-pr-title.sh"
+    # check-issue-verify-sql.py needs --issue N or --body-file PATH;
+    # blind invocation exits 2 with "one of the arguments --issue
+    # --body-file is required" (#4372).
+    "check-issue-verify-sql.py"
     "check-graphql-queries.sh"
     "check-migration-number-collision.sh"
     "check-migration-number-collision.py"
