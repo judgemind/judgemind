@@ -29,12 +29,16 @@ import sys
 
 import psycopg
 
+from framework.logging import configure_structlog
 from ingestion.extract import dedupe_repeated_title, strip_trailing_case_number
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use ``configure_structlog`` so any ``extra=`` fields passed to logger calls
+# surface in CloudWatch Logs Insights output. ``stdlib_bridge=True`` routes
+# stdlib ``logging.getLogger(__name__)`` calls through structlog's
+# ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its
+# extras as one event per line. The previous ``logging.basicConfig`` format
+# string silently dropped every ``extra=`` field — see #4368 / #4373.
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

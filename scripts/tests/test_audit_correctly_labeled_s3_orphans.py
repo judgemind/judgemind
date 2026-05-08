@@ -10,8 +10,12 @@ Covers:
 - --json output schema is stable
 - fetch_db_s3_keys issues correct LIKE query
 
-The script imports boto3 and psycopg at module level; we mock them before
-importing to support CI environments without those packages installed.
+The script imports boto3, psycopg, structlog, and framework.logging at module
+level; we mock them before importing to support the CI scripts-tests (python)
+environment which only installs ``pytest pytest-xdist boto3 -e
+packages/judgemind-config``. Mirrors the post-#4368 pattern used in
+``test_drain_splitter_carry_forward_clusters.py`` /
+``test_backfill_split_supersede.py``. Migrated as part of #4373.
 """
 
 from __future__ import annotations
@@ -27,17 +31,28 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Pre-import mocking — inject boto3 + psycopg mocks before the script loads.
+# Pre-import mocking — inject boto3, psycopg, structlog, and framework.logging
+# mocks before the script loads. The script's top-level
+# ``from framework.logging import configure_structlog`` would otherwise raise
+# ModuleNotFoundError in the lightweight CI scripts-tests (python) shard
+# (which only installs pytest, pytest-xdist, boto3, judgemind-config). See #4373.
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 _mock_boto3 = MagicMock()
 _mock_psycopg = MagicMock()
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
+_mock_framework = MagicMock()
+_mock_framework_logging = MagicMock()
 
 _modules_to_mock = {
     "boto3": _mock_boto3,
     "psycopg": _mock_psycopg,
+    "structlog": _mock_structlog,
+    "framework": _mock_framework,
+    "framework.logging": _mock_framework_logging,
 }
 
 _saved_modules: dict[str, object] = {}

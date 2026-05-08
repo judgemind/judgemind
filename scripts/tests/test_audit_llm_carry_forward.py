@@ -7,7 +7,11 @@ Covers the four carry-forward check primitives:
 - case_title_text_mismatch (no case_title party word in ruling_text)
 
 The script imports ``psycopg`` lazily inside ``run_audit``, so tests can
-import the module without a live DB connection.
+import the module without a live DB connection. The script also imports
+``framework.logging`` (which transitively imports ``structlog``) at module
+level since the #4373 migration; we pre-mock both in ``sys.modules`` so the
+lightweight CI scripts-tests (python) shard import works (it only installs
+pytest, pytest-xdist, boto3, judgemind-config).
 
 Cluster check 4 (all_same_case_title_cluster) is SQL-only and tested via
 ``run_audit`` integration tests using a mock psycopg connection.
@@ -19,9 +23,41 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+# ---------------------------------------------------------------------------
+# Pre-import mocking — inject structlog and framework.logging mocks before
+# the script loads. The script's top-level
+# ``from framework.logging import configure_structlog`` would otherwise raise
+# ModuleNotFoundError in the lightweight CI scripts-tests (python) shard.
+# See #4373.
+# ---------------------------------------------------------------------------
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
+_mock_framework = MagicMock()
+_mock_framework_logging = MagicMock()
+
+_modules_to_mock = {
+    "structlog": _mock_structlog,
+    "framework": _mock_framework,
+    "framework.logging": _mock_framework_logging,
+}
+
+_saved_modules: dict[str, object] = {}
+for _mod_name, _mock_mod in _modules_to_mock.items():
+    if _mod_name in sys.modules:
+        _saved_modules[_mod_name] = sys.modules[_mod_name]
+    sys.modules[_mod_name] = _mock_mod
+
 import audit_llm_carry_forward as _script  # noqa: E402
+
+# Restore sys.modules to avoid polluting other test files.
+for _mod_name in list(_modules_to_mock.keys()):
+    if _mod_name in _saved_modules:
+        sys.modules[_mod_name] = _saved_modules[_mod_name]
+    elif _mod_name in sys.modules:
+        del sys.modules[_mod_name]
 
 _check_outcome_continue = _script._check_outcome_continue
 _check_motion_type_contradiction = _script._check_motion_type_contradiction
