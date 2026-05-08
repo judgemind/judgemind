@@ -35,12 +35,16 @@ import sys
 
 import boto3
 
+from framework.logging import configure_structlog
 from framework.s3_integrity import S3MislabelError, verify_key_matches_bytes
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use ``configure_structlog`` so any ``extra=`` fields passed to logger calls
+# surface in CloudWatch Logs Insights output. ``stdlib_bridge=True`` routes
+# stdlib ``logging.getLogger(__name__)`` calls through structlog's
+# ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its
+# extras as one event per line. The previous ``logging.basicConfig`` format
+# string silently dropped every ``extra=`` field — see #4368 / #4373.
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "judgemind-document-archive-dev")

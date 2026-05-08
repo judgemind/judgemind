@@ -28,10 +28,15 @@ import sys
 
 import psycopg
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use ``configure_structlog`` so any ``extra=`` fields passed to logger calls
+# surface in CloudWatch Logs Insights output. ``stdlib_bridge=True`` routes
+# stdlib ``logging.getLogger(__name__)`` calls through structlog's
+# ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its
+# extras as one event per line. The previous ``logging.basicConfig`` format
+# string silently dropped every ``extra=`` field — see #4368 / #4373.
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 _JUDGE_UUID = "bafa63e4-6a93-4d97-b00e-92e446857c7c"
