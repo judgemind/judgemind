@@ -166,8 +166,27 @@ for pr_num in "${prs_array[@]}"; do
     [[ -z "$pr_num" ]] && continue
     pr_json=""
     if ! pr_json=$("$GH_BIN" pr view "$pr_num" --repo "$REPO" \
-        --json number,title,mergedAt,baseRefName,files \
+        --json number,title,body,mergedAt,baseRefName,files \
         2>/dev/null); then
+        continue
+    fi
+
+    # Closes-keyword filter (#4327). If the PR body contains a closing
+    # keyword (`Closes #N` / `Fixes #N` / `Resolves #N`, case-insensitive,
+    # all 9 GitHub verb forms) that names ONLY issues other than the one
+    # we're checking, skip this candidate — the PR shipped a different
+    # issue's work, and the file overlap is incidental (e.g. a previous
+    # PR introduced the file the current issue is about to extend).
+    # Canonical placeholder-titled WIP PRs have empty bodies and so do
+    # NOT trip this filter — exit 1 from the helper means "keep". The
+    # helper exits 0 only when EVERY closing-keyword reference points
+    # at a different issue. See #4327 for the worked example
+    # (issue #4317 vs PR #3426).
+    closes_other_exit=0
+    printf '%s' "$pr_json" | CHECK_SHIPPED_ISSUE_NUM="$issue_num" python3 \
+        "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_closes_other.py" \
+        2>/dev/null || closes_other_exit=$?
+    if [[ "$closes_other_exit" -eq 0 ]]; then
         continue
     fi
 

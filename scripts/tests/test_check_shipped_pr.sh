@@ -529,6 +529,178 @@ else
     fail "extracts EVERY (#N) token from multi-token headline (regression #4214)" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 14: PR body has `Closes #N` for a DIFFERENT issue → exit 1 ─────
+
+# Regression for #4327. Issue body cites scripts/foo.sh; a closed PR
+# touched that file but its body says `Closes #999` — i.e. it shipped a
+# DIFFERENT issue's work. The closes-other-issue filter must drop this
+# candidate even though file overlap clears the high-confidence
+# threshold (1 added overlap). Pre-fix: shipped: PR #1234.
+# Post-fix: not-shipped (the only candidate was filtered out).
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: extend scripts/foo.sh"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Closes the unrelated bug (#1234)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "## Summary\n\nFixed unrelated bug.\n\nCloses #999\n", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-04-15T00:00:00Z", "number": 1234, "title": "fix: unrelated bug (#999)"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "exits 1 when candidate PR's body Closes a different issue (regression #4327)"
+else
+    fail "exits 1 when candidate PR's body Closes a different issue (regression #4327)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 15: PR body has `Fixes #N` for a DIFFERENT issue → exit 1 ──────
+
+# Same shape as Test 14 but uses `Fixes` (lowercase, different verb).
+# All 9 GitHub closing-keyword verbs (close/closes/closed/fix/fixes/
+# fixed/resolve/resolves/resolved) are recognized case-insensitively.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh.", "title": "dx: foo"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "fix unrelated (#5555)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "fixes #888", "files": [{"path": "scripts/foo.sh", "additions": 50, "deletions": 0}], "mergedAt": "2026-04-15T00:00:00Z", "number": 5555, "title": "fix: unrelated"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "exits 1 when candidate PR's body Fixes a different issue (lowercase, regression #4327)"
+else
+    fail "exits 1 when candidate PR's body Fixes a different issue (lowercase)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 16: PR body has `Closes #N` for the SAME issue → exit 0 ────────
+
+# A PR whose body says `Closes #<this-issue>` is the legitimate happy-
+# path PR — it explicitly closes the issue we're checking. Keep it as
+# a candidate (exit 0). The duplicate-PR check is the right gate for
+# the "same issue, different open PR" case, not this one.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh.", "title": "dx: foo"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "feat: foo (#7777)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "## Summary\n\nAdded foo.\n\nCloses #2831", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-04-15T00:00:00Z", "number": 7777, "title": "feat: foo"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"7777"* ]]; then
+    pass "exits 0 when candidate PR's body Closes the SAME issue we're checking (regression #4327)"
+else
+    fail "exits 0 when candidate PR's body Closes the SAME issue we're checking" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 17: canonical placeholder PR (empty body) still ships → exit 0 ─
+
+# The canonical case from #2831 ↔ PR #3229: PR title is `WIP: ralph
+# output` (placeholder), body is empty (no `Closes #N` keyword fired
+# the auto-close). The closes-other-issue filter must NOT drop this —
+# an empty body has no closing-keyword references at all, so the
+# filter exits 1 (keep) and the candidate proceeds to file-overlap
+# check. This guards against accidentally over-filtering the very
+# zombie shape the script was built to catch.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh.", "title": "dx: foo"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "WIP: ralph output (#3229)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0}], "mergedAt": "2026-04-24T00:00:00Z", "number": 3229, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3229"* ]]; then
+    pass "canonical placeholder PR (empty body) still reports shipped (regression #4327, AC2)"
+else
+    fail "canonical placeholder PR (empty body) still reports shipped (regression #4327, AC2)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
