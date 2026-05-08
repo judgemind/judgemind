@@ -207,7 +207,7 @@ See **`docs/agent/code-standards.md`** for the full reference. Highlights:
 - **Pre-PR (MANDATORY, `.githooks/pre-push` enforces):** from each touched package, run `ruff check`, `ruff format --check`, and `pytest` (Python) or `lint`/`typecheck`/`test` + `build` for `packages/web/` (TS). Diff coverage ≥ 90%; package floor ratchet in `coverage-baselines.json`.
 - **Docs / Markdown:** run `scripts/check-markdown-links.sh` when any `.md` file changes.
 - **CI workflow edits:** run `scripts/check-ci-job-skipped.sh` when `.github/workflows/ci.yml` changes.
-- **Hygiene-check CI steps:** when wiring a `scripts/check-no-*.sh` / `check-forbidden-*.sh` / `check-deprecated-*.sh` guard into CI, do not quote the forbidden string in the step's `name:` field. See `docs/agent/code-standards.md` §Hygiene-check CI steps.
+- **Hygiene-check CI steps:** when wiring a `scripts/check-no-*.sh` / `check-forbidden-*.sh` / `check-deprecated-*.sh` guard into CI, do not quote the forbidden string in the step's `name:` field. See `docs/agent/code-standards.md` §Hygiene-check CI steps. New guards must also emit a copy-pasteable `Fix:` block per the Fix-block contract — see the §Hygiene-check guards: Fix-block contract sub-section and `docs/dx/check-script-fix-block-coverage.md`.
 
 ### Subagent Responsibilities
 
