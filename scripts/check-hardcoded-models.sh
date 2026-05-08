@@ -28,8 +28,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Model identifier patterns ────────────────────────────────────────
 # Match current and future Claude model IDs.  These patterns match
@@ -41,15 +45,9 @@ SCAN_DIR="${1:-$REPO_ROOT}"
 PATTERN='claude-(haiku|sonnet|opus)-[0-9][a-zA-Z0-9._-]*'
 
 # ─── Directories to exclude from scanning ─────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".claude"
-    ".vite"
-)
+# Repo-walk dir exclusions come from REPO_WALK_EXCLUSIONS in preflight.sh
+# (canonical list — single source of truth, see #4308). No per-check
+# extras needed here.
 
 # ─── Files to exclude (relative to repo root) ─────────────────────────
 # The source-of-truth file, this script, its tests, and the deprecated
@@ -69,9 +67,9 @@ EXCLUDE_PATH_PATTERNS=(
     "scripts/eval/*"
 )
 
-# ─── Build grep arguments ─────────────────────────────────────────────
+# ─── Build --exclude-dir arguments from the canonical list ─────────────
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

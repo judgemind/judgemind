@@ -31,8 +31,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Suspect patterns ─────────────────────────────────────────────────
 # Pattern 1: json.loads(...text<word-boundary>)
@@ -46,18 +50,12 @@ SCAN_DIR="${1:-$REPO_ROOT}"
 #   Allows leading/trailing whitespace for formatting tolerance.
 PATTERN='json\.loads\([^)]*\.text\b|json\.loads\(\s*raw_text\s*[,)]'
 
-# ─── Directories and files to exclude ─────────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".claude"
-    ".vite"
-    "tests"
-    "test"
-)
+# ─── Per-check extras on top of REPO_WALK_EXCLUSIONS ──────────────────
+# ``tests`` and ``test`` directories are excluded because LLM response
+# fixtures and assertions in tests legitimately call ``json.loads`` on
+# fake LLM-shaped strings; the production-source-only scope keeps the
+# guard signal clean. Repo-wide dir exclusions come from preflight.sh.
+EXTRA_EXCLUDE_DIRS=(tests test)
 
 # Allowlist — files where json.loads on .text or raw_text is legitimate
 # (non-LLM source).  Keep this list small and justified.  New entries
@@ -77,8 +75,10 @@ EXCLUDE_FILES=(
 )
 
 # ─── Build grep arguments ─────────────────────────────────────────────
+# Canonical list (REPO_WALK_EXCLUSIONS in preflight.sh, #4308) plus the
+# per-check extras above.
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}" ${EXTRA_EXCLUDE_DIRS[@]+"${EXTRA_EXCLUDE_DIRS[@]}"}; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

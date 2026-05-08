@@ -25,8 +25,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT/packages/api/tests}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Pattern ─────────────────────────────────────────────────────────────
 # Fixed-string match for the exact literal `process.env.OPENSEARCH_URL`.
@@ -35,19 +39,10 @@ SCAN_DIR="${1:-$REPO_ROOT/packages/api/tests}"
 # matching `process.env.TEST_OPENSEARCH_URL` or any other superset variant.
 PATTERN='process.env.OPENSEARCH_URL'
 
-# ─── Directories to exclude from the scan ────────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    "__pycache__"
-    "tmp"
-)
-
-# ─── Build grep arguments ─────────────────────────────────────────────────
-
+# ─── Build --exclude-dir arguments from the canonical list ───────────────
+# (REPO_WALK_EXCLUSIONS lives in preflight.sh — single source of truth, #4308.)
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

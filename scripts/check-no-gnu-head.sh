@@ -25,24 +25,17 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT/scripts/tests}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Pattern ─────────────────────────────────────────────────────────────
 # Match `head` followed by optional whitespace, `-n`, optional whitespace,
 # and a negative number (dash + digit).  This is the GNU-only form.
 PATTERN='head[[:space:]]+-n[[:space:]]+-[0-9]'
-
-# ─── Directories to exclude from the scan ────────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".vite"
-    "tmp"
-)
 
 # ─── Files that legitimately mention the pattern as context ──────────────
 # The check script and its test must spell the pattern literally.
@@ -51,10 +44,10 @@ EXCLUDE_FILES=(
     "scripts/tests/test_check_no_gnu_head.sh"
 )
 
-# ─── Build grep arguments ───────────────────────────────────────────────
-
+# ─── Build --exclude-dir arguments from the canonical list ──────────────
+# (REPO_WALK_EXCLUSIONS lives in preflight.sh — single source of truth, #4308.)
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

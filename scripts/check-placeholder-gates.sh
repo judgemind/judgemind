@@ -29,20 +29,17 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
 
-# ─── Directories to exclude from scanning ─────────────────────────────
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".claude"
-    ".vite"
-    "docs"
-)
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
+
+# ─── Per-check extras on top of REPO_WALK_EXCLUSIONS ──────────────────
+# `docs/` is excluded because design docs and incident write-ups
+# routinely paraphrase the placeholder patterns this check looks for.
+EXTRA_EXCLUDE_DIRS=(docs)
 
 # ─── Files to exclude (relative to repo root) ─────────────────────────
 EXCLUDE_FILES=(
@@ -59,8 +56,10 @@ EXCLUDE_PATH_PATTERNS=(
 )
 
 # ─── Build grep exclude arguments ────────────────────────────────────
+# Canonical list (REPO_WALK_EXCLUSIONS in preflight.sh, #4308) plus the
+# per-check extras above.
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}" ${EXTRA_EXCLUDE_DIRS[@]+"${EXTRA_EXCLUDE_DIRS[@]}"}; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

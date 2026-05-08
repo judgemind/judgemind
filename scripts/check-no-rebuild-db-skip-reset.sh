@@ -26,8 +26,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCAN_DIR="${1:-$REPO_ROOT}"
+
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
 
 # ─── Pattern ─────────────────────────────────────────────────────────────
 # Match `rebuild_db.py` followed (somewhere on the same line) by
@@ -39,18 +43,9 @@ SCAN_DIR="${1:-$REPO_ROOT}"
 PATTERN='rebuild_db\.py.*--skip-reset'
 
 # ─── Directories to exclude from the scan ────────────────────────────────
-# Standard ignored directories (vendored deps, VCS metadata, build output)
-# plus local developer state.
-EXCLUDE_DIRS=(
-    ".git"
-    ".venv"
-    "node_modules"
-    ".next"
-    "__pycache__"
-    ".vite"
-    # Local developer scratch dir (not tracked).
-    "tmp"
-)
+# Repo-walk dir exclusions come from REPO_WALK_EXCLUSIONS in preflight.sh
+# (canonical list — single source of truth, see #4308). No per-check
+# extras needed here.
 
 # ─── Files that legitimately mention the pattern as context ──────────────
 # The check script and its test must spell the pattern literally.  Past
@@ -61,10 +56,10 @@ EXCLUDE_FILES=(
     "scripts/tests/test_check_no_rebuild_db_skip_reset.sh"
 )
 
-# ─── Build grep arguments ───────────────────────────────────────────────
+# ─── Build --exclude-dir arguments from the canonical list ──────────────
 
 exclude_args=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
+for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
 

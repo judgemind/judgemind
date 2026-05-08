@@ -88,6 +88,9 @@ DOCKERFILE_REL="packages/scraper-framework/Dockerfile"
 SELF_REL="scripts/check-scraper-image-shipped.sh"
 TEST_REL="scripts/tests/test_check_scraper_image_shipped.sh"
 
+# shellcheck source=./preflight.sh
+source "$SCRIPT_DIR/preflight.sh"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo-root)
@@ -130,6 +133,15 @@ fi
 # and /app/scripts/X.shell.
 PATTERN='/app/scripts/[A-Za-z_][A-Za-z0-9_-]*\.(py|sh)([^A-Za-z0-9_]|$)'
 
+# Build --exclude-dir args from the canonical REPO_WALK_EXCLUSIONS list
+# (preflight.sh — single source of truth, #4308) plus the per-check
+# extras below. ``docs/`` is descriptive prose, never an invocation site.
+EXTRA_EXCLUDE_DIRS=(docs)
+exclude_args=()
+for dir in "${REPO_WALK_EXCLUSIONS[@]}" ${EXTRA_EXCLUDE_DIRS[@]+"${EXTRA_EXCLUDE_DIRS[@]}"}; do
+    exclude_args+=("--exclude-dir=$dir")
+done
+
 # Compute hits. Allow grep to exit 1 (no match) without tripping the
 # whole script (we have set -uo pipefail, no -e, so this is fine).
 HITS=$(
@@ -142,16 +154,7 @@ HITS=$(
         --include='*.json' \
         --include='*.md' \
         --include='*.txt' \
-        --exclude-dir='.git' \
-        --exclude-dir='.venv' \
-        --exclude-dir='node_modules' \
-        --exclude-dir='__pycache__' \
-        --exclude-dir='dist' \
-        --exclude-dir='build' \
-        --exclude-dir='.next' \
-        --exclude-dir='docs' \
-        --exclude-dir='tmp' \
-        --exclude-dir='.claude' \
+        "${exclude_args[@]}" \
         2>/dev/null \
     | grep -v -F "$REPO_ROOT/$DOCKERFILE_REL:" \
     | grep -v -F "$REPO_ROOT/$SELF_REL:" \
