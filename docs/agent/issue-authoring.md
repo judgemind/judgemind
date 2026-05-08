@@ -51,6 +51,20 @@ Use one of these three approved forms instead, in preference order:
    ```
    The `{worktree}/tmp/` directory is the approved location for agent temp files (not `/tmp/`).
 
+### Verify lines on SQL queries
+
+If a `Verify:` line is a SQL query against a Judgemind schema (`derived.*`, `dispatcher.*`, `staging.*`, `telemetry.*`, `public.*`), the column names MUST match `packages/api/src/data-access/schema.sql`. Run the query against `scripts/dev-db-query.sh` (or grep `schema.sql` for the table) before filing the issue to confirm it parses — regardless of result count. A `Verify:` line that errors out on column-not-found is worse than no `Verify:` line at all, because it makes an agent picking up the issue debug whether the implementation is wrong or the AC is wrong before they can begin.
+
+```
+# Cheap pre-file check — does this query parse?
+scripts/dev-db-query.sh "SELECT name, trigger_kind, trigger_value, enabled FROM dispatcher.scheduled_skills LIMIT 1"
+
+# Or grep schema.sql to confirm the columns exist:
+grep -n "scheduled_skills" packages/api/src/data-access/schema.sql
+```
+
+Concrete failure mode this rule prevents: #4309's first AC `Verify:` line read `SELECT name, schedule, enabled, last_triggered_at FROM dispatcher.scheduled_skills WHERE name = 'audit-llm-carry-forward'`. The `schedule` column does not exist on `dispatcher.scheduled_skills` — the actual columns are `trigger_kind` + `trigger_value` (migration 48). The agent picking up #4309 had to debug whether the implementation or the AC was at fault before progressing. A thirty-second pre-file check against `schema.sql` would have caught the mismatch immediately. See #4319.
+
 ### Cleanup AC queries — anchor on document status
 
 When writing an AC that counts/filters `derived.rulings`, `derived.cases`, `derived.judges`, `derived.attorneys`, `derived.parties`, or any other row whose source-of-truth is a `derived.documents` row, always join `derived.documents` and filter `d.status = 'active'`. Supersede chains (post-#3722 multimodal-fix and similar reingest events) routinely leave rows with the OLD case_number / OLD case_title / null judge_id behind under `status = 'superseded'`, and a naive count picks up that noise as if it were live regression. The cleanup AC then looks unmet long after the fix has actually landed and re-extracted everything.
