@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 61 migrations.
+-- Generated from 64 migrations.
 
 
 
@@ -764,7 +764,8 @@ CREATE TABLE dispatcher.scheduled_skills (
     enabled boolean DEFAULT true NOT NULL,
     last_triggered_at timestamp with time zone,
     last_triggered_agent_id uuid,
-    notes text
+    notes text,
+    last_run_state jsonb
 );
 
 
@@ -787,6 +788,9 @@ COMMENT ON COLUMN dispatcher.scheduled_skills.last_triggered_at IS 'Timestamp of
 
 
 COMMENT ON COLUMN dispatcher.scheduled_skills.last_triggered_agent_id IS 'agent_id of the dispatcher.agents row spawned by the last fire. FK ON DELETE SET NULL so a rare agents cleanup doesn''t cascade.';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.last_run_state IS 'Skill-private state carried forward across runs. Type is JSONB so each scheduled skill can encode whatever shape it needs. NULL means no baseline — the skill treats it as first-run mode. The daemon does not read or write this column; only the skill itself does. For audit-llm-carry-forward (#4309/#4318) the value is {county: {axis: count}} for noisy-axis jump-detection across ECS task restarts. Issue #4318.';
 
 
 CREATE TABLE dispatcher.terminal_outcomes (

@@ -24,7 +24,15 @@ Create the output directory:
 mkdir -p tmp/llm-carry-forward
 ```
 
-The state file `tmp/llm-carry-forward/last_totals.json` is written by the probe at the end of each successful run. It is intentionally NOT committed — every fresh ECS task starts without a baseline, which means the first ECS-launched run is silent on noisy-axis jump checks. That is acceptable: fixed-threshold axes (`outcome_continue`, `all_same_case_title_cluster`) fire on every run, and the noisy axes calibrate themselves on the second-and-later runs once a long-lived state location lands. State persistence is a follow-up (see Step 5 retrospective).
+### State persistence (issue #4318)
+
+The probe persists per-county totals in two places, in priority order:
+
+1. **`dispatcher.scheduled_skills.last_run_state`** (primary, JSONB column added in migration 64). Survives ECS task restarts so the second-and-later fires see the prior week's totals and the noisy-axis +25% jump checks (`motion_type_contradiction`, `case_title_text_mismatch`) actually fire.
+
+2. **`tmp/llm-carry-forward/last_totals.json`** (development fallback). Local file path written on every successful run so the local file stays a faithful copy of DB state for debugging. Used as the fallback read source when the DB-backed state is unavailable (psycopg missing, migration 64 not applied, DB error). Not committed.
+
+On the very first run after migration 64 lands the DB row's `last_run_state` is NULL — the probe treats NULL the same as a missing local file (first-run mode, noisy-axis jump checks silent). From the second fire onward, the noisy-axis checks fire whenever a county's count jumps > 25% over the prior fire.
 
 ---
 
@@ -41,7 +49,7 @@ The script reads `DATABASE_URL` from the environment (injected by the ECS task d
 ```json
 {
   "summary": { ... full run_audit output ... },
-  "totals_by_county": {"County": {"axis": count, ...}},
+  "totals_by_county": {"County": {"axis": count}},
   "findings": [
     {
       "probe": "outcome_continue",
@@ -56,6 +64,8 @@ The script reads `DATABASE_URL` from the environment (injected by the ECS task d
   "comment_markdown": "## Weekly LLM carry-forward audit\n..."
 }
 ```
+
+The probe also reads `dispatcher.scheduled_skills.last_run_state` for the `audit-llm-carry-forward` skill before the audit (jump-detection baseline) and writes the new totals back to that column on success. The `--state` local file path is written too as a development fallback. Override the skill name only for testing — pass `--skill-name=''` to disable the DB-backed state and use only the local file.
 
 On DB error the script exits non-zero — let the failure propagate so the scheduler records the run as failed.
 
