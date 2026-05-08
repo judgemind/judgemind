@@ -105,8 +105,9 @@ _INTERNAL_FIELDS: frozenset[str] = frozenset({"ruling_index"})
 _DATACLASS_SCOPE: dict[str, dict[str, object]] = {
     "LASplitRuling": {"worker_fn": "_try_la_html_split", "reingest": True},
     "SDSplitRuling": {"worker_fn": "_try_sd_calendar_split", "reingest": True},
-    # Fresno + Riverside + SF all name their dataclass plain ``SplitRuling`` —
-    # we disambiguate by source-file path during dataclass discovery.
+    # Fresno + Riverside + SF + Santa Clara all name their dataclass plain
+    # ``SplitRuling`` — we disambiguate by source-file path during dataclass
+    # discovery.
     "SplitRuling@fresno_tentatives": {
         "worker_fn": "_try_fresno_pdf_split",
         "reingest": True,
@@ -117,6 +118,10 @@ _DATACLASS_SCOPE: dict[str, dict[str, object]] = {
     },
     "SplitRuling@sf_tentatives": {
         "worker_fn": "_try_sf_pdf_split",
+        "reingest": True,
+    },
+    "SplitRuling@sc_tentatives": {
+        "worker_fn": "_try_sc_pdf_split",
         "reingest": True,
     },
     # CC has no worker dispatcher today — its split path runs only via the
