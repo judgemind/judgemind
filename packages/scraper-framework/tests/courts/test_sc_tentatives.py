@@ -27,6 +27,8 @@ from courts.ca.sc_tentatives import (
     LANDING_URL,
     SantaClaraCourtDirectory,
     SCTentativeRulingsScraper,
+    SplitRuling,
+    _split_rulings,
     extract_departments,
     extract_pdf_links_from_dept_page,
     extract_pdf_text,
@@ -977,3 +979,284 @@ class TestDateAwareDirectoryLookup:
         result = scraper.parse_document(doc)
         assert result.judge_name == "Live Judge"
         scraper._court_directory.get_mapping_for_date.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — Santa Clara multi-case PDF deterministic splitter (#4303)
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the carry-forward bug documented in #4303.  The
+# Riverside splitter (#3649) eliminated this same class of bug for Riverside
+# PDFs by splitting before LLM enrichment so each entry's enrichment runs
+# against only its own text.  These tests pin the Santa Clara splitter to
+# the same contract: each ``Line N``-bounded entry is a separate
+# SplitRuling, the page-1 preamble is dropped, trailing index-only labels
+# (``Line 10``..``Line 15`` at the end of the calendar) are skipped, and
+# compact summary-table PDFs and single-ruling PDFs return ``[]`` or a
+# 1-element list so the worker falls through to the LLM path.
+
+
+class TestSantaClaraPdfSplit:
+    """Unit tests for _split_rulings against real Santa Clara fixture PDFs."""
+
+    def test_santa_clara_pdf_split_dept16_returns_nine_rulings(self) -> None:
+        """sc_dept16_wed.pdf has 9 valid expanded-format entries (Lines 1-9)
+        plus 6 trailing index labels (Lines 10-15) without bodies — the
+        splitter must return 9 rulings and skip the trailing labels.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        assert len(rulings) == 9
+        # Indices match the PDF's printed numbering 1..9.
+        assert [r.ruling_index for r in rulings] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    def test_santa_clara_pdf_split_dept16_case_numbers_match_pdf(self) -> None:
+        """Each split must carry the case_number from its own ``Case No.:``
+        header.  Ground truth is from the fixture PDF's per-entry headers."""
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        case_numbers = [r.case_number for r in rulings]
+        # Ground truth from the fixture (verified via probe).  Lines 3+4
+        # share a case (consolidated motions on Ford Motor Company suit),
+        # Lines 6+7 share a case (joined motion + cross-reference) — these
+        # duplicates are CORRECT, not carry-forward leakage.
+        assert case_numbers == [
+            "24CV448974",  # Line 1: Wells Fargo v. Bagdriwicz
+            "24CV445397",  # Line 2: Kwong v. Yang
+            "24CV447738",  # Line 3: Jara Jurado v. Ford
+            "24CV447738",  # Line 4: Jara Jurado v. Ford (consolidated)
+            "25CV464528",  # Line 5: Vora v. Sunnyvale Gardens
+            "24CV439631",  # Line 6: Ben Abdallah v. Fackler
+            "24CV439631",  # Line 7: Ben Abdallah v. Fackler (joined)
+            "23CV413738",  # Line 8: Emerging Growth Staffing v. DFO
+            "25CV456254",  # Line 9: Hogan v. Moore
+        ]
+
+    def test_santa_clara_pdf_split_dept16_case_titles_per_entry(self) -> None:
+        """Each split must carry its own ``case_title`` — the carry-forward
+        fingerprint is identical case_titles across distinct case_numbers,
+        so this test is the primary regression for #4303.
+
+        Lines 1, 2, 3, 5, 6, 8, 9 all have distinct case_numbers, so their
+        case_titles must all be distinct from each other.  Lines 3+4 and
+        6+7 share case_numbers and SHOULD share titles (legitimate
+        consolidation, not carry-forward).
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        # Build {case_number: case_title} mapping; every distinct
+        # case_number must have exactly one distinct case_title.
+        cn_to_title: dict[str, set[str]] = {}
+        for r in rulings:
+            assert r.case_number is not None
+            assert r.case_title is not None
+            cn_to_title.setdefault(r.case_number, set()).add(r.case_title)
+        for case_number, titles in cn_to_title.items():
+            assert len(titles) == 1, (
+                f"case_number {case_number} has {len(titles)} distinct titles: {titles}"
+            )
+        # And distinct case_numbers should mostly have distinct titles —
+        # the 7 distinct case_numbers in dept16 must produce 7 distinct
+        # titles (no leakage across cases).
+        distinct_titles = {next(iter(ts)) for ts in cn_to_title.values()}
+        assert len(distinct_titles) == len(cn_to_title), (
+            "Distinct case_numbers must produce distinct case_titles "
+            f"(got {len(distinct_titles)} titles for {len(cn_to_title)} case_numbers)"
+        )
+
+    def test_santa_clara_pdf_split_dept16_entry_text_isolation(self) -> None:
+        """Entry N's ruling_text must contain only its own header + body —
+        no cross-entry contamination from other entries' headers/bodies.
+
+        This is the core invariant the splitter must guarantee: the LLM
+        that runs against ``ruling_text`` should never see another
+        entry's text, which is what enables it to violate the anti-
+        carry-forward rule (5b in the per-county system prompt).
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        # Pick three entries with clearly distinct parties for cross-
+        # entry leakage assertions:
+        #   Line 1: Wells Fargo / Bagdriwicz   (24CV448974)
+        #   Line 2: Kwong / Yang               (24CV445397)
+        #   Line 8: Emerging Growth / DFO      (23CV413738)
+        by_idx = {r.ruling_index: r for r in rulings}
+        r1, r2, r8 = by_idx[1], by_idx[2], by_idx[8]
+        assert "Wells Fargo" in r1.ruling_text
+        assert "Bagdriwicz" in r1.ruling_text
+        assert "Kwong" not in r1.ruling_text
+        assert "Emerging Growth" not in r1.ruling_text
+        assert "Kwong" in r2.ruling_text
+        assert "Yang" in r2.ruling_text
+        assert "Wells Fargo" not in r2.ruling_text
+        assert "Emerging Growth" in r8.ruling_text
+        assert "DFO" in r8.ruling_text
+        assert "Wells Fargo" not in r8.ruling_text
+        assert "Kwong" not in r8.ruling_text
+
+    def test_santa_clara_pdf_split_dept16_preamble_is_dropped(self) -> None:
+        """Page-1 boilerplate (UDC video instructions, courtroom rules,
+        scheduling notice) must NOT appear in any per-entry ruling_text.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        for r in rulings:
+            # Page-1 preamble markers from the dept 16 fixture.
+            assert "Unicorn Digital Courtroom" not in r.ruling_text, (
+                f"Entry {r.ruling_index} contains preamble UDC text"
+            )
+            assert "phone-only appearances" not in r.ruling_text.lower(), (
+                f"Entry {r.ruling_index} contains preamble phone-only text"
+            )
+
+    def test_santa_clara_pdf_split_dept16_skips_trailing_index_labels(self) -> None:
+        """Trailing ``Line 10``..``Line 15`` labels at the end of the
+        dept 16 fixture have no body — they are calendar lines that were
+        cleared after publication.  The splitter must skip them rather
+        than emitting empty SplitRuling objects.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        # No ruling indexed 10 or above — those are trailing labels.
+        ruling_indices = [r.ruling_index for r in rulings]
+        for idx in ruling_indices:
+            assert idx < 10, f"trailing index label Line {idx} was not skipped"
+
+    def test_santa_clara_pdf_split_dept6_compact_table_falls_through(self) -> None:
+        """sc_dept6_tues.pdf uses the compact summary-table format (no per-
+        entry ``Line N`` boundaries on their own line).  The splitter
+        returns at most 1 entry, so the worker falls through to the LLM
+        path and the existing carry-forward protection (the LLM prompt's
+        rule 5b) is the only defense for this format.
+
+        This test pins the fall-through behavior so the splitter's
+        coverage gap is explicit.  A future PR can extend the splitter
+        to handle compact tables; until then, dept 6's residual carry-
+        forward risk is acknowledged here.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept6_tues.pdf"))
+        rulings = _split_rulings(text)
+        # 0 or 1 entries — both trigger the worker's fall-through-to-LLM path.
+        assert len(rulings) <= 1
+
+    def test_santa_clara_pdf_split_dept1_summary_table_falls_through(self) -> None:
+        """sc_dept1_tues.pdf uses ``LINE 1 CASENO TITLE ...`` on a single
+        line (summary-table format) plus a single ``Calendar Line # 3 - 4``
+        body section — neither matches the bare ``Line N`` boundary
+        pattern.  The splitter returns ``[]`` so the worker falls through.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept1_tues.pdf"))
+        rulings = _split_rulings(text)
+        assert rulings == []
+
+    def test_santa_clara_pdf_split_empty_text_returns_empty(self) -> None:
+        """Empty text returns an empty list (defensive)."""
+        assert _split_rulings("") == []
+
+    def test_santa_clara_pdf_split_no_line_boundaries_returns_empty(self) -> None:
+        """Text without any ``Line N`` boundaries returns empty (defensive)."""
+        text = "Some random text without any line N boundaries"
+        assert _split_rulings(text) == []
+
+    def test_santa_clara_pdf_split_skips_too_short_entries(self) -> None:
+        """Entries whose body is shorter than the threshold are skipped.
+
+        This is the same defense that lets the dept 16 splitter ignore
+        the trailing ``Line 10``..``Line 15`` labels — those have only
+        a few chars of page-footer noise after them and must not be
+        emitted as empty SplitRuling objects.
+        """
+        text = (
+            "Line 1\n"
+            "Short stub.\n"
+            "Line 2\n"
+            "Case Name: Foo v. Bar\n"
+            "Case No.: 25CV111111\n"
+            "Plaintiff Foo moves for summary judgment.  The motion is granted "
+            "based on the undisputed evidence and applicable law.  This is a "
+            "long-enough body to clear the minimum-entry threshold and be "
+            "emitted as a real SplitRuling.\n"
+        )
+        rulings = _split_rulings(text)
+        # Entry 1 is below the threshold; only entry 2 survives.
+        assert len(rulings) == 1
+        assert rulings[0].ruling_index == 2
+        assert rulings[0].case_number == "25CV111111"
+        assert rulings[0].case_title == "Foo v. Bar"
+
+    def test_santa_clara_pdf_split_two_digit_entry_numbers(self) -> None:
+        """Entry indices can be 1-3 digits (defensive — Santa Clara
+        calendars sometimes run >9 entries, e.g. dept 16's calendar
+        labels Line 10..15 even when only 9 are ruled on).
+        """
+        body = (
+            "Case Name: Foo v. Bar\n"
+            "Case No.: 25CV111111\n"
+            "The motion is granted based on the undisputed evidence and "
+            "applicable law.  This body is long enough to clear the "
+            "minimum-entry threshold.\n"
+        )
+        body_alpha = body.replace("Foo v. Bar", "Alpha v. Beta").replace("25CV111111", "25CV222222")
+        body_gamma = body.replace("Foo v. Bar", "Gamma v. Delta").replace(
+            "25CV111111", "25CV333333"
+        )
+        text = f"Line 9\n{body}\nLine 10\n{body_alpha}\nLine 11\n{body_gamma}\n"
+        rulings = _split_rulings(text)
+        assert [r.ruling_index for r in rulings] == [9, 10, 11]
+        assert [r.case_number for r in rulings] == [
+            "25CV111111",
+            "25CV222222",
+            "25CV333333",
+        ]
+
+    def test_santa_clara_pdf_split_handles_missing_case_no_header(self) -> None:
+        """Entries without a structured ``Case No.:`` header must still be
+        emitted (case_number=None) so the worker's per-entry LLM
+        enrichment can fill it in.  This defends against future
+        Santa Clara format variants that drop the header.
+        """
+        text = (
+            "Line 1\n"
+            "Plaintiff Foo moves for summary judgment.  The motion is granted "
+            "based on the undisputed evidence and applicable law.  This body "
+            "has no Case No. header.\n"
+        )
+        rulings = _split_rulings(text)
+        assert len(rulings) == 1
+        assert rulings[0].case_number is None
+        assert rulings[0].case_title is None
+        assert "summary judgment" in rulings[0].ruling_text
+
+    def test_santa_clara_pdf_split_does_not_extract_motion_or_outcome(self) -> None:
+        """The Santa Clara splitter intentionally leaves motion_type and
+        outcome as ``None`` — those are populated by per-entry LLM
+        enrichment via ``_llm_enrich_fields``.
+
+        This is the same behavioural choice as the Riverside splitter
+        (#3649): per-entry LLM enrichment runs against only the entry's
+        own text, so the LLM can never carry-forward motion_type /
+        outcome from one entry onto another.
+        """
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        assert len(rulings) > 0
+        for r in rulings:
+            assert r.motion_type is None, "splitter must not populate motion_type"
+            assert r.outcome is None, "splitter must not populate outcome"
+
+    def test_santa_clara_pdf_split_returns_split_ruling_instances(self) -> None:
+        """Splitter must return ``SplitRuling`` instances so the worker's
+        ``_try_sc_pdf_split`` dispatcher can read the typed attributes."""
+        text = extract_pdf_text(_load_bytes("sc_dept16_wed.pdf"))
+        rulings = _split_rulings(text)
+        for r in rulings:
+            assert isinstance(r, SplitRuling)
+            # Required attributes per SplitRuling.__slots__.
+            assert hasattr(r, "ruling_index")
+            assert hasattr(r, "case_number")
+            assert hasattr(r, "ruling_text")
+            assert hasattr(r, "case_title")
+            assert hasattr(r, "motion_type")
+            assert hasattr(r, "outcome")
+            assert hasattr(r, "hearing_date")
+            assert hasattr(r, "department")

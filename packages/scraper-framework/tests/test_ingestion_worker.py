@@ -265,6 +265,53 @@ def _make_fake_sf_rulings() -> list:
     ]
 
 
+def _make_sc_event(**overrides: object) -> dict:
+    """Return a Santa Clara PDF-like event payload (#4303)."""
+    base: dict = {
+        "document_id": "aaaaaaaa-0000-0000-0000-000000000007",
+        "scraper_id": "ca-sc-tentatives-civil",
+        "state": "CA",
+        "county": "Santa Clara",
+        "court": "Superior Court",
+        "source_url": "https://santaclara.courts.ca.gov/tentativerulings/7",
+        "content_format": "pdf",
+        "content_hash": "stu678",
+        "s3_key": "ca/santa_clara/superior_court/raw/stu678.pdf",
+        "s3_bucket": "judgemind-document-archive-dev",
+        "ruling_text": (
+            "Line 1\n"
+            "Case Name: Foo v. Bar\n"
+            "Case No.: 25CV111111\n"
+            "The motion is GRANTED.  Body text long enough to clear the "
+            "minimum-entry threshold.\n"
+            "Line 2\n"
+            "Case Name: Alpha v. Beta\n"
+            "Case No.: 25CV222222\n"
+            "The demurrer is overruled.  Body text long enough to clear "
+            "the minimum-entry threshold.\n"
+        ),
+        "hearing_date": "2026-03-04",
+        "capture_timestamp": "2026-03-03T23:00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_fake_sc_rulings() -> list:
+    """Return 3 fake Santa Clara SplitRuling objects for testing (#4303)."""
+    from courts.ca.sc_tentatives import SplitRuling
+
+    return [
+        SplitRuling(
+            ruling_index=i + 1,
+            case_number=f"25CV{i:06d}",
+            case_title=f"Plaintiff{i} v. Defendant{i}",
+            ruling_text=f"Santa Clara ruling {i}\nThe motion is granted.",
+        )
+        for i in range(3)
+    ]
+
+
 def _make_fake_extracted_rulings() -> list[ExtractedRuling]:
     """Return 3 fake ExtractedRuling objects for LLM split path testing.
 
@@ -1140,6 +1187,145 @@ class TestNonExhaustionExceptionsReraise:
         event = _make_llm_event()
         with pytest.raises(ValueError, match="non-exhaustion error on split child"):
             worker.process_event(event)
+
+    def test_santa_clara_pdf_reraises_non_exhaustion_exception(self) -> None:
+        """_try_sc_pdf_split re-raises ValueError on non-exhaustion exception (#4303)."""
+        fake_rulings = _make_fake_sc_rulings()  # >1 to pass single-ruling guard
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with patch("courts.ca.sc_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_sc_event()
+            from ingestion.worker import _try_sc_pdf_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_sc_pdf_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    def test_santa_clara_pdf_split_skips_non_sc_county(self) -> None:
+        """_try_sc_pdf_split returns False (skips) when county != Santa Clara (#4303)."""
+        from ingestion.worker import _try_sc_pdf_split
+
+        # Riverside event with SC-like text — must be skipped because county is wrong.
+        event = _make_riverside_event()
+        result = _try_sc_pdf_split(
+            event,
+            event["document_id"],
+            "Line 1\nCase No.: 25CV111111\nThe motion is granted.",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_santa_clara_pdf_split_skips_non_pdf_format(self) -> None:
+        """_try_sc_pdf_split returns False (skips) when content_format != pdf (#4303)."""
+        from ingestion.worker import _try_sc_pdf_split
+
+        # SC event with html format — must be skipped (gate is pdf-only).
+        event = _make_sc_event(content_format="html")
+        result = _try_sc_pdf_split(
+            event,
+            event["document_id"],
+            "Line 1\nCase No.: 25CV111111\nThe motion is granted.",
+            lambda _e: None,
+        )
+        assert result is False
+
+    def test_santa_clara_pdf_split_falls_through_for_no_numbered_entries(self) -> None:
+        """_try_sc_pdf_split returns False when splitter finds no numbered entries.
+
+        This is the compact-summary-table path (e.g. dept 6) — the LLM
+        path runs normally so the existing prompt's anti-carry-forward
+        rule remains the only protection until a future PR extends the
+        splitter to compact tables.
+        """
+        from ingestion.worker import _try_sc_pdf_split
+
+        event = _make_sc_event()
+        with patch("courts.ca.sc_tentatives._split_rulings", return_value=[]):
+            result = _try_sc_pdf_split(
+                event,
+                event["document_id"],
+                "Some compact summary table without Line N markers",
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_santa_clara_pdf_split_falls_through_for_single_ruling_pdf(self) -> None:
+        """_try_sc_pdf_split returns False when splitter finds exactly 1 entry.
+
+        The deterministic regex extraction does not populate
+        motion_type/outcome.  Falling through to the LLM path lets the
+        per-field enrichment fill those fields — there is no carry-
+        forward window with a single entry (matches Riverside #3649).
+        """
+        from courts.ca.sc_tentatives import SplitRuling
+        from ingestion.worker import _try_sc_pdf_split
+
+        single_ruling = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="25CV111111",
+                case_title="Foo v. Bar",
+                ruling_text="Lone ruling text",
+            )
+        ]
+        event = _make_sc_event()
+        with patch("courts.ca.sc_tentatives._split_rulings", return_value=single_ruling):
+            result = _try_sc_pdf_split(
+                event,
+                event["document_id"],
+                event["ruling_text"],
+                lambda _e: None,
+            )
+        assert result is False
+
+    def test_santa_clara_pdf_split_dispatches_with_split_metadata(self) -> None:
+        """When the splitter finds multiple entries, each dispatched event carries
+        the synthetic split metadata that ``IngestionWorker.process_event`` uses
+        to short-circuit redundant LLM split attempts and route to per-field
+        enrichment (#4303 — mirrors #3649 contract).
+
+        This test pins the dispatch contract: ``_split_processed=True`` (so
+        the worker's outer split-attempt path is skipped on the recursive
+        call), AND ``_llm_extracted`` is NOT set to True (so per-field LLM
+        enrichment STILL runs against each child's ruling_text individually,
+        eliminating the cross-entry carry-forward window).
+        """
+        from ingestion.worker import _try_sc_pdf_split
+
+        captured: list[dict] = []
+
+        def capture(event_data: dict) -> None:
+            captured.append(event_data)
+
+        fake_rulings = _make_fake_sc_rulings()
+        with patch("courts.ca.sc_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_sc_event()
+            result = _try_sc_pdf_split(event, event["document_id"], event["ruling_text"], capture)
+
+        assert result is True
+        assert len(captured) == 3
+        for idx, child in enumerate(captured):
+            assert child["_split_processed"] is True, (
+                f"child {idx} missing _split_processed — would re-trigger split path"
+            )
+            # Critical contract: _llm_extracted must NOT be True so per-field
+            # LLM enrichment runs for each child individually.  Mirrors the
+            # Riverside splitter's behavior — the SC splitter does not
+            # populate motion_type/outcome deterministically.
+            assert not child.get("_llm_extracted", False), (
+                f"child {idx} has _llm_extracted=True — would skip per-field "
+                f"enrichment and lose motion_type/outcome"
+            )
+            assert child["_original_document_id"] == event["document_id"]
+            # Each child's document_id must be unique (split_ids salt by index).
+            assert child["document_id"] != event["document_id"]
+            # Each child carries its own ruling text, case_number, and case_title.
+            assert child["case_number"] == fake_rulings[idx].case_number
+            assert child["case_title"] == fake_rulings[idx].case_title
+            assert child["ruling_text"] == fake_rulings[idx].ruling_text
 
 
 # ---------------------------------------------------------------------------
