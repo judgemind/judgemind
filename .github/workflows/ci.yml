@@ -707,6 +707,18 @@ jobs:
       - name: Check CI rollup-classifier vocabulary is centralized
         if: matrix.shard == 'python'
         run: scripts/check-no-ci-classifier-duplication.sh
+      # Issue #4429: forbid the absolute-package import shape
+      # (`from scripts.dispatcher import ...` /
+      # `import scripts.dispatcher`) inside scripts/dispatcher/tests/.
+      # Hit by #4417 / PR #4425 — pytest collection without an explicit
+      # rootdir resolves the absolute path locally but raises
+      # ModuleNotFoundError("scripts") when CI runs pytest from the
+      # repo root. The peer-test sibling-import pattern
+      # (parents[2] sys.path push + `from dispatcher import X`) works
+      # in both contexts.
+      - name: Check dispatcher tests use sibling-import pattern
+        if: matrix.shard == 'python'
+        run: scripts/check-dispatcher-test-imports.sh
       # Issue #4267: detect the silent-miscompile pattern where a
       # piped python3 invocation also has a heredoc — bash gives the
       # heredoc precedence as stdin, so json.load(sys.stdin) parses
