@@ -46,15 +46,18 @@
 #   - On error / malformed input: empty stdout and exit 2.
 #
 # Algorithm:
-#   1. Parse the issue body for ``Found by:.*retrospective on #(\d+)``.
-#      Each captured number is a *lineage parent*. Multiple matches in
-#      the same body are deduplicated.
+#   1. Parse the issue body for any recognized lineage idiom (#4519):
+#      ``Found by: retrospective on #N``, ``Found while shipping #N``,
+#      ``Same lesson as #N``, or ``Adjacent to #N`` (all
+#      case-insensitive). Each captured number is a *lineage parent*.
+#      Multiple matches in the same body are deduplicated and ordered by
+#      first-occurrence position across all idioms.
 #   2. For each lineage parent, list closed issues whose body references
-#      ``retrospective on #<parent>`` via
-#      ``gh search issues "in:body retrospective on #<parent> repo:<repo>
-#       state:closed" --json number,body``.
-#      Drop the current issue itself from the result set (an issue
-#      naming itself as a sibling is the same issue).
+#      the parent via any of the same lineage idioms. The probe issues
+#      one ``gh search issues`` call per phrase and unions the results
+#      client-side (``gh search`` OR semantics on quoted phrases are not
+#      reliable across the GraphQL backend). Drop the current issue
+#      itself and the parent itself from the result set.
 #   3. For each sibling, fetch its merging PR via
 #      ``gh issue view <sibling> --json closedByPullRequestsReferences``.
 #      Pre-#3994 placeholder-titled PRs that lack ``Closes #N`` keywords
@@ -98,10 +101,12 @@
 #   - Two retrospective siblings against the same parent that describe
 #     genuinely different lessons → no backtick-token overlap → exit 1.
 #     This is the precision case from the issue's AC2.
-#   - The current issue has no ``Found by: retrospective on #N`` line
-#     in its body → the lineage probe extracts zero parents and exits 1
-#     unconditionally. Issues without retrospective lineage fall through
-#     to the path-overlap channel as before.
+#   - The current issue has no recognized lineage idiom in its body
+#     (none of ``Found by: retrospective on #N``, ``Found while shipping
+#     #N``, ``Same lesson as #N``, or ``Adjacent to #N``) → the lineage
+#     probe extracts zero parents and exits 1 unconditionally. Issues
+#     without retrospective lineage fall through to the path-overlap
+#     channel as before.
 #   - The lineage parent's siblings are all still open (no merging PRs)
 #     → no candidate PRs → exit 1. This is by design — the channel only
 #     fires when a sibling has DEMONSTRABLY shipped (closed by a merged
@@ -131,28 +136,78 @@ import sys
 
 # ─── Lineage parent extraction ─────────────────────────────────────────────
 
-# Match ``Found by: retrospective on #N`` (case-insensitive). The colon
-# is optional; the "retrospective on" phrase is the load-bearing signal.
-# Variations observed in the corpus:
-#   - ``Found by: retrospective on #4304.``           (canonical)
-#   - ``Found by retrospective on #4304``             (no colon)
-#   - ``found by: retrospective on #4304``            (lowercase)
-LINEAGE_PARENT_RE = re.compile(
-    r"Found\s+by:?\s+retrospective\s+on\s+#(\d+)",
-    re.IGNORECASE,
+# Lineage idioms (#4519). Each regex captures a parent issue number from
+# a body phrase that signals "this issue was filed because of work on #N."
+# All matchers are case-insensitive.
+#
+# Canonical idiom:
+#   - ``Found by: retrospective on #N`` (canonical, established by #4515)
+#   - ``Found by retrospective on #N``  (no colon)
+#   - ``found by: retrospective on #N`` (lowercase)
+#
+# Additional idioms (#4519) — same lineage signal, different phrasings
+# observed in the corpus:
+#   - ``Found while shipping #N``  (e.g. issue #4322 cites #4303 this way)
+#   - ``Same lesson as #N``        (explicit cross-reference)
+#   - ``Adjacent to #N``           (sibling-issue link)
+#
+# All four share the same precision-defense — the gating signal is
+# "this issue cites another issue as its lineage source," and the
+# downstream identifier-overlap check still applies. Adding more
+# matchers expands recall without inflating false-positive rate.
+LINEAGE_PARENT_RES: tuple[re.Pattern[str], ...] = (
+    # Canonical "Found by: retrospective on #N" form.
+    re.compile(
+        r"Found\s+by:?\s+retrospective\s+on\s+#(\d+)",
+        re.IGNORECASE,
+    ),
+    # "Found while shipping #N" — same idiom, different phrasing.
+    re.compile(
+        r"Found\s+while\s+shipping\s+#(\d+)",
+        re.IGNORECASE,
+    ),
+    # "Same lesson as #N" — explicit cross-reference.
+    re.compile(
+        r"Same\s+lesson\s+as\s+#(\d+)",
+        re.IGNORECASE,
+    ),
+    # "Adjacent to #N" — sibling-issue link.
+    re.compile(
+        r"Adjacent\s+to\s+#(\d+)",
+        re.IGNORECASE,
+    ),
 )
+
+# Backwards-compatibility alias — older call sites and tests may import
+# the original singular name. It points at the canonical retrospective-on
+# matcher so existing references keep their current semantics.
+LINEAGE_PARENT_RE = LINEAGE_PARENT_RES[0]
 
 
 def extract_lineage_parents(body: str) -> list[int]:
     """Return the deduplicated list of lineage parent issue numbers.
 
-    Order is preserved by first-occurrence so the caller can prefer
-    earlier mentions when multiple parents are cited (rare).
+    Walks every recognized lineage idiom (canonical
+    ``Found by: retrospective on #N`` plus the #4519 variants:
+    ``Found while shipping #N``, ``Same lesson as #N``, ``Adjacent to #N``)
+    and unions the captured parent numbers.
+
+    Order is preserved by first-occurrence in the body so the caller can
+    prefer earlier mentions when multiple parents are cited (rare). When
+    a body uses two different idioms to cite the same parent, only the
+    first-seen occurrence is kept.
     """
     seen: set[int] = set()
     out: list[int] = []
-    for m in LINEAGE_PARENT_RE.finditer(body):
-        n = int(m.group(1))
+    # Walk every match across all idioms in body order. We can't iterate
+    # them per-pattern and concatenate because that would lose body-order
+    # — we have to scan once and pick up matches from any pattern.
+    matches: list[tuple[int, int]] = []
+    for pattern in LINEAGE_PARENT_RES:
+        for m in pattern.finditer(body):
+            matches.append((m.start(), int(m.group(1))))
+    matches.sort(key=lambda x: x[0])
+    for _, n in matches:
         if n not in seen:
             seen.add(n)
             out.append(n)
@@ -241,16 +296,40 @@ def _run_gh(args: list[str], *, timeout_sec: int = 30) -> tuple[int, str]:
         return 124, ""
 
 
+# Search phrases that signal "this closed issue is a sibling
+# retrospective citing the same parent" (#4519). Each entry is a phrase
+# template — ``{parent}`` is substituted with the parent issue number.
+# The phrases mirror the ``LINEAGE_PARENT_RES`` matchers above so any
+# idiom recognized by the body parser is also discoverable via search.
+#
+# Why a tuple of phrases instead of one OR'd query: ``gh search
+# issues "..."`` interprets the entire string as a single query token
+# and the OR semantics on quoted phrases are not reliable across the
+# GraphQL backend. Multiple search calls + client-side union is the
+# straightforward, testable shape.
+LINEAGE_SEARCH_PHRASES: tuple[str, ...] = (
+    "retrospective on #{parent}",
+    "Found while shipping #{parent}",
+    "Same lesson as #{parent}",
+    "Adjacent to #{parent}",
+)
+
+
 def find_sibling_retrospectives(
     parent: int, *, repo: str, current_issue: int
 ) -> list[int]:
-    """Find closed issues whose body references ``retrospective on #<parent>``.
+    """Find closed issues whose body references ``<parent>`` via lineage idioms.
+
+    Searches for all four lineage idioms (#4519):
+    ``retrospective on #N``, ``Found while shipping #N``,
+    ``Same lesson as #N``, and ``Adjacent to #N``. Unions the results
+    in search-result order (the canonical retrospective-on phrase
+    runs first, matching prior precedence; subsequent phrases append
+    only their non-duplicate hits).
 
     Excludes ``current_issue`` AND ``parent`` from the result (the parent
     issue's body sometimes also matches the literal string when a
-    follow-up retrospective comment references back to itself). Returns
-    a list of issue numbers. Order is search-result order (most-recently-
-    updated first by default with ``gh search issues``).
+    follow-up retrospective comment references back to itself).
 
     Why the search query uses CLI flags instead of inline ``repo:`` /
     ``state:`` qualifiers: ``gh search issues "..."`` interprets the
@@ -260,49 +339,58 @@ def find_sibling_retrospectives(
     (``--repo``, ``--state``). Wrapping the whole thing in one quoted
     string returns ``Invalid search query`` from gh's GraphQL backend.
     """
-    # Use ``gh search issues`` with a literal-string match in the body.
-    # The query string is the literal phrase to search for; --repo,
-    # --state are passed as separate flags (gh-cli requirement — see
-    # docstring above).
-    query = f'"retrospective on #{parent}"'
-    rc, out = _run_gh(
-        [
-            "search",
-            "issues",
-            query,
-            "--repo",
-            repo,
-            "--state",
-            "closed",
-            "--json",
-            "number",
-            "--limit",
-            "20",
-        ],
-    )
-    if rc != 0 or not out.strip():
-        return []
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        return []
     siblings: list[int] = []
-    for entry in data:
-        if not isinstance(entry, dict):
+    seen: set[int] = set()
+    for phrase_template in LINEAGE_SEARCH_PHRASES:
+        # Use ``gh search issues`` with a literal-string match in the body.
+        # The query string is the literal phrase to search for; --repo,
+        # --state are passed as separate flags (gh-cli requirement — see
+        # docstring above).
+        phrase = phrase_template.format(parent=parent)
+        query = f'"{phrase}"'
+        rc, out = _run_gh(
+            [
+                "search",
+                "issues",
+                query,
+                "--repo",
+                repo,
+                "--state",
+                "closed",
+                "--json",
+                "number",
+                "--limit",
+                "20",
+            ],
+        )
+        if rc != 0 or not out.strip():
+            # One phrase failing (rate limit, transient API error) does
+            # not abort the whole probe — keep walking the remaining
+            # phrases. The probe is best-effort by design.
             continue
-        n = entry.get("number")
-        if not isinstance(n, int):
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
             continue
-        if n == current_issue:
-            continue
-        if n == parent:
-            # The parent itself can match the search when its own body
-            # references the lineage phrase (rare but observed when the
-            # parent retrospective summary mentions follow-up issues
-            # filed against it). Drop it — the parent is the lineage
-            # SOURCE, not a sibling.
-            continue
-        siblings.append(n)
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            n = entry.get("number")
+            if not isinstance(n, int):
+                continue
+            if n == current_issue:
+                continue
+            if n == parent:
+                # The parent itself can match the search when its own
+                # body references the lineage phrase (rare but observed
+                # when the parent retrospective summary mentions
+                # follow-up issues filed against it). Drop it — the
+                # parent is the lineage SOURCE, not a sibling.
+                continue
+            if n in seen:
+                continue
+            seen.add(n)
+            siblings.append(n)
     return siblings
 
 
