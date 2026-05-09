@@ -850,6 +850,59 @@ if [ -n "$changed_scripts_py" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Structlog-pattern guards — run whenever scripts/*.py changes
+# -------------------------------------------------------------------
+# Mirrors the CI `Check top-level scripts use configure_structlog for
+# logger setup` step (.github/workflows/ci.yml line 785) and the peer
+# `Check no basicConfig + extra= without configure_structlog` step
+# (line 1731). Both guards enforce the #4368 invariant that top-level
+# scripts/*.py use the canonical structlog pattern instead of the
+# stdlib logging.basicConfig idiom — which silently drops every
+# `extra=` field passed to logger.<level>(...) calls in CloudWatch.
+#
+# Catches the #4441 retro case: PR #4436 added a new
+# scripts/cleanup_mislabeled_s3_2661.py that copied the legacy
+# basicConfig block from a sibling archived script. The pre-push hook
+# ran filename-separator and one-off-marker checks (both passed) and
+# the push succeeded — CI failed 3:28 into the run on the basicConfig
+# guard. Wiring these path-gated guards directly into pre-push closes
+# the loop: same scope as the existing scripts/*.py header check, and
+# both check scripts are sub-second.
+#
+# Re-uses the $changed_scripts_py path filter from the script-headers
+# block above — top-level scripts/*.py only, no recursion.
+if [ -n "$changed_scripts_py" ]; then
+    echo "pre-push: checking scripts/*.py use configure_structlog (no logging.basicConfig)..." >&2
+    if [ -x scripts/check-no-logging-basicconfig.sh ]; then
+        if ! run_check "_" "scripts/check-no-logging-basicconfig.sh" scripts/check-no-logging-basicconfig.sh; then
+            echo "  A top-level scripts/*.py file uses the forbidden" >&2
+            echo "  logging.basicConfig() pattern. The format-string-only" >&2
+            echo "  logger silently drops every extra= field passed to" >&2
+            echo "  logger calls (extras disappear in CloudWatch Logs" >&2
+            echo "  Insights) — see #4368/#4373/#4400 for background." >&2
+            echo "  Replace with configure_structlog(json=True, stdlib_bridge=True)." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-logging-basicconfig.sh not found or not executable — skipping" >&2
+    fi
+
+    echo "pre-push: checking scripts/*.py for basicConfig + extra= co-occurrence..." >&2
+    if [ -x scripts/check-no-basicconfig-with-extra.sh ]; then
+        if ! run_check "_" "scripts/check-no-basicconfig-with-extra.sh" scripts/check-no-basicconfig-with-extra.sh; then
+            echo "  A top-level scripts/*.py file calls logging.basicConfig()" >&2
+            echo "  AND passes extra={...} to a logger call without" >&2
+            echo "  configure_structlog(). The combination silently drops" >&2
+            echo "  every extra= field in CloudWatch — see #4368/#4376." >&2
+            echo "  Replace with configure_structlog(json=True, stdlib_bridge=True)." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-basicconfig-with-extra.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Subprocess-timeouts check — run whenever scripts/**/*.py changes
 # (excluding any tests/ path)
 # -------------------------------------------------------------------

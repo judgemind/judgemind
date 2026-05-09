@@ -35,6 +35,9 @@
 #  19. Stale ci-passed.needs entry rejected  hook fails before actionlint (#4207)
 #  22. CI-guard umbrella fires + rejects     scripts/run-ci-guards.sh stub fail -> hook fails (#4332)
 #  23. SKIP_CI_GUARDS=1 bypasses umbrella    bypass var skips run-ci-guards.sh, prints WARNING (#4332)
+#  27. scripts/*.py basicConfig rejected     bare logging.basicConfig in scripts/*.py -> hook fails (#4441)
+#  28. scripts/*.py basicConfig+extra= rejected  basicConfig + extra= without configure_structlog -> hook fails (#4441)
+#  29. docs-only push skips basicConfig gates  path filter — no overhead on pure docs pushes (#4441 AC2)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -1296,6 +1299,156 @@ PY
     else
         report_pass "bounded dispatcher/*.py push fires gate but check passes (#4364)"
     fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 27: scripts/*.py with logging.basicConfig rejected (#4441)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds scripts/foo.py with a forbidden logging.basicConfig call (no
+# allowlist marker), copies the real check script into the scratch repo
+# (mirrors scenarios 5/18/19/20), and asserts the hook exits non-zero
+# with the expected FAILED message. Mirrors the CI step
+# "Check top-level scripts use configure_structlog for logger setup"
+# in .github/workflows/ci.yml. Closes the #4436 retro: PR #4436 added a
+# scripts/cleanup_mislabeled_s3_2661.py with the legacy basicConfig
+# block, push succeeded, CI failed 3:28 in. Wiring the guard into
+# pre-push catches the bug class locally before the round trip.
+echo "[scenario 27] scripts/*.py with logging.basicConfig — hook rejects push (#4441)"
+init_workspace
+
+BASICCFG_SH="$REPO_ROOT/scripts/check-no-logging-basicconfig.sh"
+if [ ! -x "$BASICCFG_SH" ]; then
+    report_skip "scripts/check-no-logging-basicconfig.sh unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-bare-basicconfig
+    mkdir -p "$WORK/scripts"
+    cp "$BASICCFG_SH" "$WORK/scripts/check-no-logging-basicconfig.sh"
+    chmod +x "$WORK/scripts/check-no-logging-basicconfig.sh"
+    # The check script sources scripts/preflight.sh — copy it too so the
+    # source line resolves cleanly inside the scratch repo.
+    if [ -f "$REPO_ROOT/scripts/preflight.sh" ]; then
+        cp "$REPO_ROOT/scripts/preflight.sh" "$WORK/scripts/preflight.sh"
+    fi
+    # Write a scripts/*.py file with the forbidden basicConfig pattern
+    # at line start — exactly the shape #4441 wires the hook to catch.
+    cat > "$WORK/scripts/foo.py" <<'PY'
+"""Test fixture for #4441 — bare logging.basicConfig."""
+
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger(__name__)
+PY
+    git -C "$WORK" add scripts/foo.py scripts/check-no-logging-basicconfig.sh
+    [ -f "$WORK/scripts/preflight.sh" ] && git -C "$WORK" add scripts/preflight.sh
+    git -C "$WORK" commit --quiet -m "feat: add scripts/foo.py with logging.basicConfig"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-bare-basicconfig $feat_sha refs/heads/feature-bare-basicconfig $ZERO_SHA"
+
+    # The check's full violation list (including the file:line) goes to
+    # /tmp/prepush-_-scripts_check-no-logging-basicconfig.sh.log via
+    # run_check; the hook's stderr only shows the last 20 lines of that
+    # log, which on this guard is the multi-line "Fix:" suggestion block
+    # (the violation list is pushed above the tail). Read the log
+    # directly for the filename assertion.
+    log_file="/tmp/prepush-_-scripts_check-no-logging-basicconfig.sh.log"
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject logging.basicConfig (#4441), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "FAILED: scripts/check-no-logging-basicconfig.sh"; then
+        report_fail "expected 'FAILED: scripts/check-no-logging-basicconfig.sh' in output (#4441)" "$hook_out"
+    elif [ ! -f "$log_file" ] || ! grep -q "scripts/foo.py" "$log_file"; then
+        report_fail "expected violation log to name 'scripts/foo.py' (#4441)" "$hook_out"
+    else
+        report_pass "hook rejects push with logging.basicConfig in scripts/*.py (#4441)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 28: scripts/*.py with basicConfig + extra= rejected (#4441)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds scripts/bar.py with logging.basicConfig AND a logger.info(...,
+# extra={...}) call without configure_structlog — the AST-checked
+# anti-pattern (#4376). Asserts the hook exits non-zero with the
+# expected FAILED message from the peer guard. Mirrors the CI step
+# "Check no basicConfig + extra= without configure_structlog" in
+# .github/workflows/ci.yml.
+echo "[scenario 28] scripts/*.py basicConfig + extra= — hook rejects push (#4441)"
+init_workspace
+
+BASICCFG_EXTRA_SH="$REPO_ROOT/scripts/check-no-basicconfig-with-extra.sh"
+BASICCFG_EXTRA_PY="$REPO_ROOT/scripts/check_no_basicconfig_with_extra.py"
+if [ ! -x "$BASICCFG_EXTRA_SH" ] || [ ! -f "$BASICCFG_EXTRA_PY" ]; then
+    report_skip "scripts/check-no-basicconfig-with-extra.{sh,py} unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-basicconfig-extra
+    mkdir -p "$WORK/scripts"
+    cp "$BASICCFG_EXTRA_SH" "$WORK/scripts/check-no-basicconfig-with-extra.sh"
+    cp "$BASICCFG_EXTRA_PY" "$WORK/scripts/check_no_basicconfig_with_extra.py"
+    chmod +x "$WORK/scripts/check-no-basicconfig-with-extra.sh"
+    # Write a scripts/*.py file that calls basicConfig AND passes extra=
+    # to a logger call without configure_structlog — the bug class.
+    cat > "$WORK/scripts/bar.py" <<'PY'
+"""Test fixture for #4441 — basicConfig + extra= without configure_structlog."""
+
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def emit() -> None:
+    """Log with extras — the format string drops them silently."""
+    logger.info("starting", extra={"document_id": "abc123"})
+PY
+    git -C "$WORK" add scripts/bar.py \
+        scripts/check-no-basicconfig-with-extra.sh \
+        scripts/check_no_basicconfig_with_extra.py
+    git -C "$WORK" commit --quiet -m "feat: add scripts/bar.py with basicConfig + extra="
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-basicconfig-extra $feat_sha refs/heads/feature-basicconfig-extra $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject basicConfig + extra= (#4441), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "FAILED: scripts/check-no-basicconfig-with-extra.sh"; then
+        report_fail "expected 'FAILED: scripts/check-no-basicconfig-with-extra.sh' in output (#4441)" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "scripts/bar.py"; then
+        report_fail "expected hook output to name the violating file 'scripts/bar.py' (#4441)" "$hook_out"
+    else
+        report_pass "hook rejects push with basicConfig + extra= in scripts/*.py (#4441)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 29: docs-only push does NOT fire basicConfig gates (#4441 AC2)
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches only docs/*.md must NOT invoke either of the
+# basicConfig guards (per the AC: "no overhead on pushes that don't
+# touch top-level scripts"). Verifies the hook's path filter is doing
+# its job. Asserts the hook does not emit either probe line.
+echo "[scenario 29] docs-only push — basicConfig gates must NOT fire (#4441 AC2)"
+init_workspace
+
+git -C "$WORK" checkout --quiet -b feature-docs-only-basicconfig
+mkdir -p "$WORK/docs"
+cat > "$WORK/docs/bar.md" <<'MD'
+# Sample doc
+
+This is another sample documentation file for the #4441 path-filter test.
+MD
+git -C "$WORK" add docs/bar.md
+git -C "$WORK" commit --quiet -m "docs: add bar.md"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-docs-only-basicconfig $feat_sha refs/heads/feature-docs-only-basicconfig $ZERO_SHA"
+
+if echo "$hook_out" | grep -q "checking scripts/\*\.py use configure_structlog"; then
+    report_fail "docs-only push must NOT fire logging.basicConfig gate (#4441 AC2)" "$hook_out"
+elif echo "$hook_out" | grep -q "checking scripts/\*\.py for basicConfig + extra="; then
+    report_fail "docs-only push must NOT fire basicConfig+extra gate (#4441 AC2)" "$hook_out"
+else
+    report_pass "docs-only push skips both basicConfig gates (#4441 AC2)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
