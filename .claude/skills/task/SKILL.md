@@ -352,6 +352,41 @@ Read the JSON summary from stdout (the `shipped_pr` field names the merged PR; `
 
 The verify-and-close path should be the common case when this check fires — pre-#3994 placeholder-title PRs almost always landed everything the AC asked for, the only thing missing is the issue closure.
 
+#### 4a.3 — Plan-blocked recommendation check (zombie-recommendation pivot, MANDATORY when 4a.2 returned exit 1)
+
+**Why this runs after 4a.2:** When `/task-v2-plan` returns `go=false` with an explicit "operator should close this issue" recommendation, the dispatcher posts the standard plan-blocked comment carrying the `<!-- dispatcher-plan-blocked -->` sentinel and removes `agent/ready`. The recommendation is correct, but the issue can drift back into `agent/ready` later (manual operator re-add, or auto-restore from `unblock-dependents.sh` if a sibling closes). Without this check, the next agent runs ralph (or the §4a.2 verify-and-close fallback) from scratch and re-derives the same recommendation — wasting the verify-and-close cycle each time it recurs. Issue #4438 is the canonical example: the plan agent recommended close on 2026-04-23, the issue sat unactioned, an agent re-claimed it 11 days later. The full failure mode is documented in #4438; this check is the agent-side fix.
+
+Run the check as a single tool call (only after `check-shipped-pr.sh` returned exit 1):
+
+```
+{worktree}/scripts/check-issue-plan-blocked.sh <N>
+```
+
+Exit codes:
+
+- **Exit 1 (`clear:` line on stdout) — no actionable plan-blocked marker.** Continue to Step 4b. This is the common case. The script emits `clear:no-comments` when the issue has no human/operator comments at all, `clear:no-marker` when comments exist but none carry the dispatcher-plan-blocked sentinel, and `clear:superseded` when a plan-blocked comment exists but a *later* human comment came in after it. The "superseded" branch is intentional: a human commenting after the marker has already moved the issue forward (re-scoped, asked a question, or just acknowledged), and suppressing /task in that case would block legitimate follow-up work.
+- **Exit 0 (`plan-blocked:<recommendation>` line on stdout) — the latest non-bot comment carries the dispatcher-plan-blocked sentinel.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, malformed JSON).** Fail-open: continue to Step 4b.
+
+##### 4a.3.1 — Verify-and-close pivot (only runs on exit 0)
+
+The recommendation token (`operator-triage` for daemon-posted comments per #4438; bare/empty for pre-#4438 comments) is informational — the action is the same in either case. The plan-phase agent has already done the "what should happen here" analysis; this pivot's job is to either confirm-and-close OR explicitly hand back to the operator without re-running ralph.
+
+1. **Run the §4a.2.1 mechanical-verify pass.** Walk the issue body, extract each concrete `Verify:` command (e.g. `Verify: pytest -k test_x`, `Verify: scripts/foo.sh exits 0`, `Verify: grep -n <pattern> <file>`), and run each one. Skip free-form prose verifies. This pass is the same as §4a.2.1 step 1 — just driven by a different upstream signal (a recommendation marker, not a shipped-PR detection). The plan-phase agent recommended close because they believed the work was already done; running the AC's verify commands either confirms that or surfaces the residual.
+2. **All-green path:** if every mechanical `Verify:` command exits clean, the recommendation stands. Post a verification-evidence comment quoting the verify commands + their output + naming the plan-blocked recommendation, close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
+
+   ```
+   {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/verification_evidence.txt
+   gh issue close <N> --repo judgemind/judgemind --reason completed
+   {worktree}/scripts/unblock-dependents.sh <N>
+   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+   ```
+
+   The verification-evidence comment must explicitly cite the plan-blocked recommendation comment (link or quote a fragment) so the audit trail is clear: "the plan-phase agent on $DATE recommended close, today's mechanical verify pass confirmed, closing." This is the canonical zombie-recommendation flow and should be the common case when this check fires.
+3. **Any-failure path:** if any mechanical `Verify:` command fails (or the issue has no mechanical verifies and a human-judgment residual remains), post a comment naming the plan-blocked recommendation + the failed verify line, leave the issue open, and **stop without falling through to Step 4b.** Re-attach `agent/ready` only if the failure indicates a follow-up an agent can pick up; if the residual genuinely needs a human, leave the label off and remove `status/in-progress` so the issue surfaces for operator review without re-entering the queue. The point of this check is to AVOID re-running ralph on a human-decision-required issue — falling through to Step 4b would defeat the purpose. The comment should make explicit that the agent ran `check-issue-plan-blocked.sh`, found a recommendation marker, ran the mechanical verifies, and at least one is still unmet — so an operator can decide.
+
+The verify-and-close path should be the common case when this check fires — the plan-phase agent's "operator should close" recommendation is almost always correct (they ran a full plan analysis to derive it), the only thing missing is the close.
+
 ---
 
 ### Step 4b — Verify gap is real (current state probe)

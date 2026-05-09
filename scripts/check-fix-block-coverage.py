@@ -383,6 +383,7 @@ def _has_decision_flow_exit_codes(content: str) -> bool:
       * ``DONE:`` / ``RESUME:`` / ``UNKNOWN:`` (task-recovery check)
       * ``duplicate:`` / ``ok:`` (duplicate-PR check)
       * ``shipped:`` / ``not-shipped:`` (shipped-PR check)
+      * ``plan-blocked:`` / ``clear:`` (issue-plan-blocked check, #4438)
 
     Decision-flow guards are characterised by emitting one of these
     tokens as the leading content of an ``echo`` / ``print`` line —
@@ -406,6 +407,8 @@ def _has_decision_flow_exit_codes(content: str) -> bool:
         "ok:",
         "shipped:",
         "not-shipped:",
+        "plan-blocked:",
+        "clear:",
     )
 
     # Find emit lines (echo / print) and inspect their first quoted

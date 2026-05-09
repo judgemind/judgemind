@@ -2849,6 +2849,27 @@ class TestPlanBlockedHandler:
         # Short id is first 8 chars of the UUID with dashes removed.
         assert "`aabbccdd`" in body
 
+    def test_render_plan_blocked_comment_includes_recommendation_footer(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #4438 stretch AC: machine-readable footer on the last non-empty line.
+
+        ``/task`` Step 4a.3 and ``scripts/check-issue-plan-blocked.sh``
+        pattern-match this footer to detect that an operator-triage
+        recommendation is in flight, without parsing the prose. The
+        footer must be the last non-empty line so consumers can find it
+        with a tail-style scan.
+        """
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+        body = d._render_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            "block reason text",
+        )
+        assert daemon.PLAN_BLOCKED_RECOMMENDATION_FOOTER in body
+        # Last non-empty line is the footer (a trailing newline is fine).
+        non_empty = [line for line in body.splitlines() if line.strip()]
+        assert non_empty[-1] == daemon.PLAN_BLOCKED_RECOMMENDATION_FOOTER
+
     def test_post_plan_blocked_comment_skips_when_sentinel_already_present(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
