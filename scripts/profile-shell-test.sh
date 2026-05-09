@@ -213,24 +213,51 @@ _PROFILE_STATE="__STATE_PATH__"
 : > "$_PROFILE_STATE"
 
 _section_now_ms() {
+    # Both branches are run with || true so a flaky python or date never
+    # leaks a non-zero rc up to the caller — see #4383 for why this
+    # matters when the wrapped test exits with `set -e` in force.
     if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import time; print(int(time.time()*1000))'
+        python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || true
     else
         # Fallback: second precision. Multiplied by 1000 for unit consistency.
-        printf '%s000\n' "$(date +%s)"
+        printf '%s000\n' "$(date +%s 2>/dev/null || echo 0)" 2>/dev/null || true
     fi
 }
 
+# _section_record / _section_close: the rc-no-leak contract (#4383)
+# ────────────────────────────────────────────────────────────────
+# Both functions are called from injected hooks inside the wrapped
+# test. The wrapped test may have `set -e` in force at the moment the
+# EXIT trap fires (e.g. test_agent_runner_entrypoint.sh's last
+# `set -e` toggle is at line 10275, before its `exit 0` at line 10295).
+# Under bash's `set -e` semantics, ANY non-zero command rc inside the
+# trap exits the shell with that rc — overriding the wrapped test's
+# real exit code. That manifested as #4383: profiler reported rc=2
+# even though the wrapped test's 474/474 sub-tests all passed.
+#
+# These functions therefore disable `set -e` for the duration of their
+# bodies and restore the caller's flags on return, AND `|| true` every
+# interior command that could plausibly flake (sed, printf, : >,
+# python3 via _section_now_ms). They unconditionally `return 0` at end.
+# The fixture-side regression test at scripts/tests/test_profile_shell_test.sh
+# Test T_issue4383 proves this contract holds when the wrapped script
+# has `set -e` enabled and the trap chain hits a deliberately-flaky
+# section boundary.
 _section_record() {
+    # Save and disable errexit; restore on return.
+    local _saved_e=""
+    case $- in *e*) _saved_e="-e" ;; esac
+    set +e
+
     local _label="$1"
     local _now
-    _now=$(_section_now_ms)
+    _now=$(_section_now_ms 2>/dev/null) || true
     # Close prior section (if any).
     if [[ -s "$_PROFILE_STATE" ]]; then
         local _t0 _prev_label
-        _t0=$(sed -n '1p' "$_PROFILE_STATE")
-        _prev_label=$(sed -n '2p' "$_PROFILE_STATE")
-        if [[ -n "$_t0" && -n "$_prev_label" ]]; then
+        _t0=$(sed -n '1p' "$_PROFILE_STATE" 2>/dev/null) || true
+        _prev_label=$(sed -n '2p' "$_PROFILE_STATE" 2>/dev/null) || true
+        if [[ -n "${_t0:-}" && -n "${_prev_label:-}" && -n "${_now:-}" ]]; then
             local _elapsed_ms=$(( _now - _t0 ))
             # Format as <int>.<3-digit-ms> seconds, bash 3.2 friendly.
             local _secs=$(( _elapsed_ms / 1000 ))
@@ -241,21 +268,30 @@ _section_record() {
             elif [[ $_frac -lt 100 ]]; then _frac_pad="0$_frac"
             else                            _frac_pad="$_frac"
             fi
-            printf '%d.%s\t%s\n' "$_secs" "$_frac_pad" "$_prev_label" >> "$_PROFILE_TSV"
+            printf '%d.%s\t%s\n' "$_secs" "$_frac_pad" "$_prev_label" >> "$_PROFILE_TSV" 2>/dev/null || true
         fi
     fi
     # Open new section.
-    printf '%s\n%s\n' "$_now" "$_label" > "$_PROFILE_STATE"
+    printf '%s\n%s\n' "${_now:-0}" "$_label" > "$_PROFILE_STATE" 2>/dev/null || true
+
+    # Restore errexit if the caller had it.
+    [[ -n "$_saved_e" ]] && set -e
+    return 0
 }
 
 _section_close() {
+    # Save and disable errexit; restore on return.
+    local _saved_e=""
+    case $- in *e*) _saved_e="-e" ;; esac
+    set +e
+
     local _now
-    _now=$(_section_now_ms)
+    _now=$(_section_now_ms 2>/dev/null) || true
     if [[ -s "$_PROFILE_STATE" ]]; then
         local _t0 _prev_label
-        _t0=$(sed -n '1p' "$_PROFILE_STATE")
-        _prev_label=$(sed -n '2p' "$_PROFILE_STATE")
-        if [[ -n "$_t0" && -n "$_prev_label" ]]; then
+        _t0=$(sed -n '1p' "$_PROFILE_STATE" 2>/dev/null) || true
+        _prev_label=$(sed -n '2p' "$_PROFILE_STATE" 2>/dev/null) || true
+        if [[ -n "${_t0:-}" && -n "${_prev_label:-}" && -n "${_now:-}" ]]; then
             local _elapsed_ms=$(( _now - _t0 ))
             local _secs=$(( _elapsed_ms / 1000 ))
             local _frac=$(( _elapsed_ms % 1000 ))
@@ -264,10 +300,14 @@ _section_close() {
             elif [[ $_frac -lt 100 ]]; then _frac_pad="0$_frac"
             else                            _frac_pad="$_frac"
             fi
-            printf '%d.%s\t%s\n' "$_secs" "$_frac_pad" "$_prev_label" >> "$_PROFILE_TSV"
+            printf '%d.%s\t%s\n' "$_secs" "$_frac_pad" "$_prev_label" >> "$_PROFILE_TSV" 2>/dev/null || true
         fi
-        : > "$_PROFILE_STATE"
+        : > "$_PROFILE_STATE" 2>/dev/null || true
     fi
+
+    # Restore errexit if the caller had it.
+    [[ -n "$_saved_e" ]] && set -e
+    return 0
 }
 
 # Install an EXIT trap so the final section closes even when the test
@@ -446,6 +486,14 @@ else
     echo "Sections recorded: 0 (no sections matched pattern: $SECTION_PATTERN)"
 fi
 echo "----- end -----"
-echo "profile-shell-test: tsv=$TSV_PATH" >&2
+# Structured one-line stderr beacon (#4383) so callers can distinguish
+# "wrapped test exited rc=N" from "profiler died with rc=N" when the
+# stderr is captured. The order is fixed (wrapped_exit, sections, tsv)
+# so simple grep/awk extraction works.
+SECTION_COUNT_FOR_BEACON=0
+if [[ -s "$TSV_PATH" ]]; then
+    SECTION_COUNT_FOR_BEACON=$(wc -l < "$TSV_PATH" 2>/dev/null | tr -d ' ' || echo 0)
+fi
+echo "profile-shell-test: wrapped_exit=$EXIT_CODE sections=$SECTION_COUNT_FOR_BEACON tsv=$TSV_PATH" >&2
 
 exit "$EXIT_CODE"
