@@ -337,6 +337,65 @@ class TestCleanCaseTitle:
 
 
 # ---------------------------------------------------------------------------
+# SDCalendarScraper._build_urls — default day_numbers and URL enumeration
+# ---------------------------------------------------------------------------
+
+
+class TestBuildUrls:
+    """Tests for ``SDCalendarScraper._build_urls()`` — default day_numbers
+    and the (URL, division) enumeration.
+
+    The default ``day_numbers=[1, 2, 3, 4, 5]`` is the structural fix from
+    #4539: prior to that the default was ``[2]`` (one day per run), which
+    caused ``ca-sd-calendar`` to return 0 records on Mon/Sat/Sun and a
+    handful on Tue/Wed/Thu — only Friday's calendar carried the motion
+    hearings. Fetching all 5 days means the latest Friday calendar (the
+    high-yield page) is always in scope regardless of which weekday the
+    run executes. See #4531 for the originating silent-outage alert.
+    """
+
+    def test_default_day_numbers_covers_full_mon_fri_window(self) -> None:
+        """The ``__init__`` default fetches all 5 weekday calendar pages."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+        assert scraper._day_numbers == [1, 2, 3, 4, 5]
+
+    def test_default_build_urls_emits_20_urls(self) -> None:
+        """4 divisions × 5 days = 20 (URL, division) pairs by default."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+        urls = scraper._build_urls()
+        assert len(urls) == 20
+
+    def test_default_build_urls_covers_all_days_per_division(self) -> None:
+        """Every (Central, North, East, South) division emits days 1-5."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+        urls = scraper._build_urls()
+        # Group URLs by division and assert each has all 5 day numbers.
+        by_division: dict[str, set[int]] = {}
+        for url, division in urls:
+            # The day digit is the last char before ``.html``.
+            day = int(url.rsplit(".", 1)[0][-1])
+            by_division.setdefault(division, set()).add(day)
+        assert by_division == {
+            "Central": {1, 2, 3, 4, 5},
+            "North County": {1, 2, 3, 4, 5},
+            "East County": {1, 2, 3, 4, 5},
+            "South County": {1, 2, 3, 4, 5},
+        }
+
+    def test_explicit_day_numbers_override_default(self) -> None:
+        """Passing ``day_numbers=`` to the constructor overrides the default."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config, day_numbers=[3])
+        assert scraper._day_numbers == [3]
+        urls = scraper._build_urls()
+        assert len(urls) == 4  # 4 divisions × 1 day
+        assert all(url.endswith("3.html") for url, _ in urls)
+
+
+# ---------------------------------------------------------------------------
 # SDCalendarScraper — integration test with respx
 # ---------------------------------------------------------------------------
 

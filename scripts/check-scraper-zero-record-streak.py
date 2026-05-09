@@ -112,17 +112,6 @@ EXCLUSIONS: set[str] = {
     # Governor appointments scraper runs quarterly-ish; most runs legitimately
     # return zero records. Exclude until dedicated health signal is wired.
     "ca-governor-appointments",
-    # San Diego civil calendar scrapes only ``day_numbers=[2]`` per run, and
-    # the source court schedules motion hearings predominantly on Fridays —
-    # Mon/Sat/Sun runs land on calendar pages that legitimately have zero
-    # motion-typed events. Verified against 21 days of
-    # ``telemetry.scraper_runs`` (2026-04-19 → 2026-05-09): Mon=0-1,
-    # Tue=0-1, Wed=0-4, Thu=1-16, Fri=269-277, Sat=0-3, Sun=0. The streak
-    # alert fires structurally on this scraper several times per week. The
-    # root-cause fix (fetch all 5 weekday pages so Friday's high-yield
-    # calendar is always in scope) is tracked in #4539; remove this entry
-    # once that ships. Originating alert: #4531.
-    "ca-sd-calendar",
 }
 
 # Scrapers that run more than once per day ("frequent"). All others are
