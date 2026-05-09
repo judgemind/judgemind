@@ -162,6 +162,21 @@ issue_created_at=$(printf '%s' "$issue_json" | python3 \
     "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_extract_created_at.py" \
     2>/dev/null) || issue_created_at=""
 
+# Classify the issue for audit/investigation/refactor keywords (#4223).
+# Emits "audit" when the title or body contains any of:
+#   audit, investigate, investigation, refactor, refactoring, migrate,
+#   migration, extend, extension, tighten, harden, additional.
+# The downstream overlap helper uses CHECK_SHIPPED_AUDIT_CLASS to apply
+# a stricter threshold (≥2 target-context overlaps AND every overlap
+# is ADDED) on these issues, dropping the residual FP class where a
+# prior unrelated PR touched a file the issue cites as the *subject of
+# further work*. Empty stdout (non-audit) is a no-op — the existing
+# threshold (≥1 added OR ≥2 total) applies as before.
+issue_class=""
+issue_class=$(printf '%s' "$issue_json" | python3 \
+    "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_classify_issue.py" \
+    2>/dev/null) || issue_class=""
+
 if [[ -z "$candidate_files" ]]; then
     echo "not-shipped: no candidate file paths in issue #${issue_num} body (exit 1)"
     exit 1
@@ -274,6 +289,7 @@ for pr_num in "${prs_array[@]}"; do
         CHECK_SHIPPED_CANDIDATE_FILES="$candidate_files_csv" \
         CHECK_SHIPPED_TARGET_FILES="$target_files_csv" \
         CHECK_SHIPPED_ISSUE_CREATED_AT="$issue_created_at" \
+        CHECK_SHIPPED_AUDIT_CLASS="$issue_class" \
         python3 \
         "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_overlap.py" \
         2>/dev/null); then
