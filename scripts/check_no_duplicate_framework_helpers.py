@@ -16,7 +16,10 @@ copies in ``cleanup_mislabeled_s3_2661.py`` and
 ``packages/scraper-framework/src/framework/s3_keys.py``. ECS oneshot
 scripts can import them via the standard ``from framework.s3_keys
 import ...`` path because the helpers are bundled into the
-ingestion-worker / scraper-framework Docker image.
+ingestion-worker / scraper-framework Docker image. Both scripts were
+archived to ``scripts/archive/`` in #4565 after their runtime applies
+landed; the post-#4447 import shape is preserved verbatim in the
+archived copies.
 
 Days later PR #4453 shipped ``scripts/create_missing_twins_4446.py``
 that re-duplicated the helpers — the agent read the *pre-#4447*
@@ -24,9 +27,9 @@ docstring of ``repoint_mislabeled_documents_4439.py`` (which still
 carried the legacy NOTE about the duplication being deliberate) and
 faithfully copied the duplication. The post-#4447 version of the
 repoint script imports cleanly from ``framework.s3_keys``. Issue #4455
-tracks the migration of ``create_missing_twins_4446.py``; this guard
-prevents the next agent who clones one of those scripts from
-inheriting the same duplication.
+tracked the migration of ``create_missing_twins_4446.py`` (archived
+at ``scripts/archive/`` in #4565); this guard prevents the next agent
+who clones one of those scripts from inheriting the same duplication.
 
 What is flagged
 ---------------
