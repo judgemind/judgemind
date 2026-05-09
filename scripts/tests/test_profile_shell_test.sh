@@ -121,9 +121,23 @@ sleep 0.50
 exit 0
 ')
 tsv1="$TMPDIR_TEST/fixture1.tsv"
-out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>/dev/null)
+# #4528: capture stderr (do NOT discard) so a future flake records the
+# profiler's diagnostic output alongside the wrapped fixture's stdout.
+# Without this capture the only signal on rc mismatch is "expected 0,
+# actual N" with no context — exactly the #4383 failure mode this issue
+# is generalising. The dump fires only on the rc assertion failing.
+err1="$TMPDIR_TEST/fixture1.err"
+out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
 exit1=$?
 assert_eq "basic fixture exits 0" "$exit1" "0"
+if [[ "$exit1" != "0" ]]; then
+    echo "  ── #4528 stderr dump (basic fixture) ──"
+    echo "  profiler stderr (last 50 lines):"
+    tail -n 50 "$err1" 2>/dev/null | sed 's/^/    /'
+    echo "  fixture stdout (last 50 lines):"
+    printf '%s\n' "$out1" | tail -n 50 | sed 's/^/    /'
+    echo "  ── end #4528 dump ──"
+fi
 sections1=$(wc -l < "$tsv1" | tr -d ' ')
 assert_eq "basic fixture records 3 sections" "$sections1" "3"
 assert_contains "basic fixture summary names section 3" "$out1" "Test 3: gamma"
@@ -202,9 +216,19 @@ echo hello
 exit 0
 ')
 tsv5="$TMPDIR_TEST/fixture5.tsv"
-out5=$("$PROFILER" --tsv "$tsv5" "$fixture5" 2>/dev/null)
+# #4528: capture stderr (see same pattern at fixture1 above).
+err5="$TMPDIR_TEST/fixture5.err"
+out5=$("$PROFILER" --tsv "$tsv5" "$fixture5" 2>"$err5")
 exit5=$?
 assert_eq "no-section fixture exits 0" "$exit5" "0"
+if [[ "$exit5" != "0" ]]; then
+    echo "  ── #4528 stderr dump (no-section fixture) ──"
+    echo "  profiler stderr (last 50 lines):"
+    tail -n 50 "$err5" 2>/dev/null | sed 's/^/    /'
+    echo "  fixture stdout (last 50 lines):"
+    printf '%s\n' "$out5" | tail -n 50 | sed 's/^/    /'
+    echo "  ── end #4528 dump ──"
+fi
 sections5=$(wc -l < "$tsv5" 2>/dev/null | tr -d ' ' || echo 0)
 assert_eq "no-section fixture records 0 sections" "$sections5" "0"
 assert_contains "no-section fixture reports 0 sections" "$out5" "Sections recorded: 0"
@@ -227,10 +251,26 @@ else
 fi
 
 # ─── Test 8: --top N controls number of rows printed ─────────────────────
-out6=$("$PROFILER" --tsv "$TMPDIR_TEST/top1.tsv" --top 1 "$fixture1" 2>/dev/null)
+# #4528: capture stderr — Test 8 doesn't capture rc directly, but its
+# `top_rows` derived value is computed from out6's stdout. If the
+# profiler dies silently, top_rows is 0 and the assertion fires with
+# "expected 1, actual 0" and no context. Same flake-hider class as the
+# fixture1/fixture5 sites above.
+err6="$TMPDIR_TEST/top1.err"
+out6=$("$PROFILER" --tsv "$TMPDIR_TEST/top1.tsv" --top 1 "$fixture1" 2>"$err6")
+exit6=$?
 # Count rows after "Top 1 longest sections:" header. Stop at "----- end -----".
 top_rows=$(printf '%s' "$out6" | awk '/^Top 1 longest sections:/{flag=1; next} /^----- end -----/{flag=0} flag' | wc -l | tr -d ' ')
 assert_eq "--top 1 prints 1 row" "$top_rows" "1"
+if [[ "$top_rows" != "1" ]]; then
+    echo "  ── #4528 stderr dump (--top 1) ──"
+    echo "  profiler exit: $exit6"
+    echo "  profiler stderr (last 50 lines):"
+    tail -n 50 "$err6" 2>/dev/null | sed 's/^/    /'
+    echo "  fixture stdout (last 50 lines):"
+    printf '%s\n' "$out6" | tail -n 50 | sed 's/^/    /'
+    echo "  ── end #4528 dump ──"
+fi
 
 # ─── Test 9: Bash 3.2 compatibility check ────────────────────────────────
 TESTS=$((TESTS + 1))
@@ -401,6 +441,71 @@ tsv_t4383="$TMPDIR_TEST/fixture_t4383.tsv"
 PATH="$fixture_t4383_dir/bin-stub:$PATH" "$PROFILER" --tsv "$tsv_t4383" "$fixture_t4383" >/dev/null 2>&1
 rc_t4383=$?
 assert_eq "profiler does not leak trap rc=2 when wrapped test exits 0 under set -e" "$rc_t4383" "0"
+
+# ─── Test T_issue4528: stderr-dump-on-assertion-failure contract ───────────
+# Issue #4528: The fixture1 / fixture5 / Test 8 sites in this file used
+# to discard the profiler's stderr to /dev/null. When a CI-only flake
+# fired (the canonical example was the rc=2 leak fixed in #4383), the
+# only signal was "expected: 0 / actual: 2" with no diagnostic context.
+# This PR captures stderr to a file and dumps it on assertion failure.
+# This regression test proves the dump fires by stubbing the profiler
+# with a wrapper that writes a known marker to stderr and exits non-
+# zero, then runs *only* the fixture1 block from this file under that
+# stub PATH. Expectation: the captured shell-test output contains the
+# stderr marker, proving the dump path executed.
+fixture_t4528_dir="$TMPDIR_TEST/t4528"
+mkdir -p "$fixture_t4528_dir/bin-stub"
+# Stub profile-shell-test.sh that always writes a known stderr marker
+# and exits 7 (a value that won't collide with any real profiler rc).
+cat > "$fixture_t4528_dir/bin-stub/profile-shell-test.sh" <<'PROFILER_STUB_EOF'
+#!/usr/bin/env bash
+echo "T_issue4528_STDERR_MARKER: deliberate stub failure" >&2
+exit 7
+PROFILER_STUB_EOF
+chmod +x "$fixture_t4528_dir/bin-stub/profile-shell-test.sh"
+
+# Inline mini-test that mirrors the fixture1 capture-and-dump pattern.
+# Runs in a subshell so its FAILURES are captured into a file rather
+# than leaked into the parent test's tally.
+t4528_out="$TMPDIR_TEST/t4528_capture.txt"
+(
+    set +e
+    PROFILER="$fixture_t4528_dir/bin-stub/profile-shell-test.sh"
+    err1="$TMPDIR_TEST/t4528_fixture1.err"
+    # Note: do NOT use `|| true` here — it would mask the rc and make
+    # exit1 always 0, defeating the regression test. The mirror in
+    # fixture1/fixture5 above also does not use `|| true`; the parent
+    # shell's `set -uo pipefail` (no `-e`) lets the assignment proceed
+    # even when the command exits non-zero.
+    out1=$("$PROFILER" --tsv /dev/null --top 5 /dev/null 2>"$err1")
+    exit1=$?
+    if [[ "$exit1" != "0" ]]; then
+        echo "  ── #4528 stderr dump (basic fixture) ──"
+        echo "  profiler stderr (last 50 lines):"
+        tail -n 50 "$err1" 2>/dev/null | sed 's/^/    /'
+        echo "  fixture stdout (last 50 lines):"
+        printf '%s\n' "$out1" | tail -n 50 | sed 's/^/    /'
+        echo "  ── end #4528 dump ──"
+    fi
+) > "$t4528_out" 2>&1
+
+t4528_captured=$(cat "$t4528_out")
+assert_contains "stderr dump fires on assertion failure (#4528)" \
+    "$t4528_captured" "T_issue4528_STDERR_MARKER"
+assert_contains "stderr dump emits #4528 dump banner" \
+    "$t4528_captured" "── #4528 stderr dump (basic fixture) ──"
+
+# Source-level grep regression: confirm the three patched sites still
+# carry the err* capture file + the dump block. If a future refactor
+# accidentally reverts to `2>/dev/null`, this fires immediately.
+self_path="${BASH_SOURCE[0]}"
+self_body=$(cat "$self_path")
+assert_contains "fixture1 site captures stderr to err1 (#4528)" \
+    "$self_body" 'err1="$TMPDIR_TEST/fixture1.err"'
+assert_contains "fixture5 site captures stderr to err5 (#4528)" \
+    "$self_body" 'err5="$TMPDIR_TEST/fixture5.err"'
+assert_contains "Test 8 site captures stderr to err6 (#4528)" \
+    "$self_body" 'err6="$TMPDIR_TEST/top1.err"'
 
 # ─── Summary ─────────────────────────────────────────────────────────────
 echo ""
