@@ -625,9 +625,27 @@ def _format_fix_block(violations: list[tuple[Path, str]]) -> str:
     lines.append("  Use Option B for ad-hoc guards that depend on uncommon context")
     lines.append("  (Docker, npm-install, packages/web/ deps, etc.).")
     lines.append("")
+    lines.append("  Option C — rename without the `check-` prefix. For ECS-oneshot")
+    lines.append("  data-check scripts (those with `# venv:` + `# permanent: true`")
+    lines.append("  headers that are invoked by scripts/ecs-run-task.sh with a")
+    lines.append("  required argument like --date YYYY-MM-DD, NOT code-quality CI")
+    lines.append("  guards). The canonical rename drops the `check-` prefix")
+    lines.append("  entirely:")
+    lines.append("")
+    for path, _kind in violations:
+        stripped = path.name
+        if stripped.startswith("check-"):
+            stripped = stripped[len("check-") :]
+        lines.append(f"      {path.name}  →  {stripped}")
+    lines.append("")
+    lines.append("  See docs/agent/code-standards.md §\"Naming convention: don't")
+    lines.append('  name ECS-oneshot data-check scripts scripts/check-*.{sh,py}"')
+    lines.append("  for the full rationale (#4558).")
+    lines.append("")
     lines.append("Reference: scripts/run-ci-guards.sh §SKIP_LIST entries (lines 37-66)")
-    lines.append("for the decision rubric. Tracking: #4384 (env-var extension), #4379")
-    lines.append("(parent meta-check), #4332 (motivating retro).")
+    lines.append("for the decision rubric. Tracking: #4558 (Option C / naming")
+    lines.append("convention), #4384 (env-var extension), #4379 (parent meta-check),")
+    lines.append("#4332 (motivating retro).")
     return "\n".join(lines)
 
 

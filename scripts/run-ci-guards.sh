@@ -423,18 +423,44 @@ if [ "$failures" -gt 0 ]; then
     if [ "${#requires_arg_failures[@]}" -gt 0 ]; then
         echo "" >&2
         echo "Fix: the guard(s) below appear to require an argument that the" >&2
-        echo "umbrella cannot supply blind. Add each one to SKIP_LIST in" >&2
-        echo "scripts/run-ci-guards.sh (alphabetical order), and add a row" >&2
-        echo "in docs/dx/check-script-fix-block-coverage.md naming the" >&2
-        echo "verdict (typically \"decision flow (no violation list)\")." >&2
+        echo "umbrella cannot supply blind. Pick the option that matches" >&2
+        echo "what the guard does:" >&2
         echo "" >&2
-        echo "  SKIP_LIST=(" >&2
-        echo "      \"check-issue-author.sh\"" >&2
-        echo "      ..." >&2
+        echo "  Option A — Add to SKIP_LIST. For genuine code-quality CI" >&2
+        echo "  guards (lives in scripts/ permanently, runs blind in CI with" >&2
+        echo "  the right args). Add each one to SKIP_LIST in" >&2
+        echo "  scripts/run-ci-guards.sh (alphabetical order), and add a row" >&2
+        echo "  in docs/dx/check-script-fix-block-coverage.md naming the" >&2
+        echo "  verdict (typically \"decision flow (no violation list)\")." >&2
+        echo "" >&2
+        echo "    SKIP_LIST=(" >&2
+        echo "        \"check-issue-author.sh\"" >&2
+        echo "        ..." >&2
         for fname in "${requires_arg_failures[@]}"; do
-            echo "      \"$fname\"   # <-- insert here, alphabetical order" >&2
+            echo "        \"$fname\"   # <-- insert here, alphabetical order" >&2
         done
-        echo "  )" >&2
+        echo "    )" >&2
+        echo "" >&2
+        echo "  Option B — Add the per-file opt-out marker. Add this line as" >&2
+        echo "  a top-level comment in the first 20 lines of each guard:" >&2
+        echo "" >&2
+        echo "      # ci-guards: skip" >&2
+        echo "" >&2
+        echo "  Option C — rename without the \`check-\` prefix. For" >&2
+        echo "  ECS-oneshot data-check scripts (those with \`# venv:\` +" >&2
+        echo "  \`# permanent: true\` headers that are invoked by" >&2
+        echo "  scripts/ecs-run-task.sh with a required argument like" >&2
+        echo "  --date YYYY-MM-DD, NOT code-quality CI guards). The" >&2
+        echo "  canonical rename drops the \`check-\` prefix entirely:" >&2
+        echo "" >&2
+        for fname in "${requires_arg_failures[@]}"; do
+            stripped="${fname#check-}"
+            echo "      $fname  →  $stripped" >&2
+        done
+        echo "" >&2
+        echo "  See docs/agent/code-standards.md §\"Naming convention: don't" >&2
+        echo "  name ECS-oneshot data-check scripts scripts/check-*.{sh,py}\"" >&2
+        echo "  for the full rationale (#4558)." >&2
         echo "" >&2
         echo "If the guard is genuinely runnable blind from the local tree" >&2
         echo "and the failure is a real violation, ignore this hint and fix" >&2

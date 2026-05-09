@@ -191,6 +191,16 @@ if [ -n "$missing" ]; then
         echo "To minimise renumbering churn, use letter-suffix row numbers (e.g. \`50a\`)" >&2
         echo "for the alphabetical insertion point — see the existing \`31a\` row for" >&2
         echo "\`check-issue-verify-sql.py\`." >&2
+        echo "" >&2
+        echo "Alternative — rename without the \`check-\` prefix. If the missing guard" >&2
+        echo "is an ECS-oneshot data-check script (\`# venv:\` + \`# permanent: true\`" >&2
+        echo "headers, invoked by scripts/ecs-run-task.sh with a required argument" >&2
+        echo "like --date YYYY-MM-DD), it doesn't belong in the check-* namespace at" >&2
+        echo "all. Rename without the \`check-\` prefix (e.g. \`check-foo-data.py\` →" >&2
+        echo "\`foo_data.py\` or \`audit_foo_data.py\`); inventory coverage and the" >&2
+        echo "umbrella runner stop applying. See docs/agent/code-standards.md" >&2
+        echo "§\"Naming convention: don't name ECS-oneshot data-check scripts" >&2
+        echo "scripts/check-*.{sh,py}\" for the full rationale (#4558)." >&2
     fi
     echo "" >&2
     echo "Note: the \`# ci-guards: skip\` opt-out marker only suppresses umbrella" >&2
