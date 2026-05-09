@@ -20,8 +20,6 @@ the docker-compose dev environment specifically).
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import textwrap
 import uuid
@@ -29,111 +27,26 @@ from pathlib import Path
 
 import pytest
 
+from tests._dispatcher_test_bootstrap import (
+    DOCKER_POSTGRES_SKIP_REASON,
+    bootstrap_dispatcher_test_db,
+    docker_postgres_admin_dsn,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _ENTRYPOINT_SH = _REPO_ROOT / "scripts" / "dispatcher" / "agent-runner-entrypoint.sh"
 
-
-def _docker_postgres_dsn() -> str | None:
-    """Return a DSN if the docker-compose postgres is reachable, else None."""
-    if shutil.which("psql") is None:
-        return None
-    dsn = os.environ.get(
-        "TEST_DSN",
-        "postgres://judgemind:localdev@localhost:5432/judgemind",
-    )
-    try:
-        r = subprocess.run(
-            ["psql", "-X", dsn, "-At", "-c", "SELECT 1"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    if r.returncode != 0 or r.stdout.strip() != "1":
-        return None
-    return dsn
-
-
-_DSN = _docker_postgres_dsn()
+# #4424 — schema bootstrap is now centralised in
+# ``scripts/tests/_dispatcher_test_bootstrap.py`` (one source of truth for
+# the union of ``dispatcher.*`` tables every persist-* test family member
+# touches).
+_DSN = docker_postgres_admin_dsn()
 pytestmark = pytest.mark.skipif(
     _DSN is None,
-    reason="local docker postgres not reachable; behavioural test skipped "
-    "(schema-parity test in test_phase_outputs_insert_shape.py still runs)",
+    reason=DOCKER_POSTGRES_SKIP_REASON,
 )
 
 _TEST_DB_NAME = "judgemind_test_persist_phase_transition"
-
-
-def _bootstrap_test_database(admin_dsn: str) -> str:
-    """Create a dedicated test database and return its DSN.
-
-    Idempotent — re-runs of the test reuse the same database.  Both
-    ``dispatcher.phase_outputs`` and ``dispatcher.phase_transitions`` are
-    created in their minimal forms (no FK constraints, no extra indexes beyond
-    what the bash function needs).
-    """
-    create = subprocess.run(
-        [
-            "psql",
-            "-X",
-            admin_dsn,
-            "-At",
-            "-c",
-            f"SELECT 1 FROM pg_database WHERE datname='{_TEST_DB_NAME}';",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if create.returncode != 0:
-        raise AssertionError(f"db existence probe failed: {create.stderr}")
-    if create.stdout.strip() != "1":
-        cr = subprocess.run(
-            [
-                "psql",
-                "-X",
-                admin_dsn,
-                "-c",
-                f'CREATE DATABASE "{_TEST_DB_NAME}";',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if cr.returncode != 0 and "already exists" not in cr.stderr:
-            raise AssertionError(f"create db failed: {cr.stderr}")
-
-    test_dsn = admin_dsn.rsplit("/", 1)[0] + f"/{_TEST_DB_NAME}"
-
-    schema_sql = textwrap.dedent("""
-        CREATE SCHEMA IF NOT EXISTS dispatcher;
-        CREATE TABLE IF NOT EXISTS dispatcher.phase_outputs (
-            agent_id    uuid    NOT NULL,
-            phase       text    NOT NULL,
-            attempt     int     NOT NULL DEFAULT 1,
-            output_json jsonb   NOT NULL,
-            ts          timestamptz NOT NULL DEFAULT now()
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_phase_outputs_pt_agent_phase_attempt
-            ON dispatcher.phase_outputs (agent_id, phase, attempt);
-        CREATE TABLE IF NOT EXISTS dispatcher.phase_transitions (
-            transition_id   bigserial   PRIMARY KEY,
-            agent_id        uuid        NOT NULL,
-            phase           text        NOT NULL,
-            ts              timestamptz NOT NULL DEFAULT now()
-        );
-    """)
-    r = subprocess.run(
-        ["psql", "-X", test_dsn, "-v", "ON_ERROR_STOP=1", "-c", schema_sql],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert r.returncode == 0, f"schema setup failed: {r.stderr}"
-    return test_dsn
-
 
 _TEST_DSN: str | None = None
 
@@ -145,7 +58,7 @@ def _get_test_dsn() -> str | None:
         return _TEST_DSN
     if _DSN is None:
         return None
-    _TEST_DSN = _bootstrap_test_database(_DSN)
+    _TEST_DSN = bootstrap_dispatcher_test_db(_DSN, _TEST_DB_NAME)
     return _TEST_DSN
 
 
@@ -275,7 +188,9 @@ def test_second_call_different_phase_adds_second_row() -> None:
     rc1, _, stderr1 = _invoke_persist(test_dsn, agent_id, "plan", '{"go": true}')
     assert rc1 == 0, f"first call failed rc={rc1}\n{stderr1}"
 
-    rc2, _, stderr2 = _invoke_persist(test_dsn, agent_id, "ralph", '{"verdict": "SHIP"}')
+    rc2, _, stderr2 = _invoke_persist(
+        test_dsn, agent_id, "ralph", '{"verdict": "SHIP"}'
+    )
     assert rc2 == 0, f"second call failed rc={rc2}\n{stderr2}"
 
     count = _count_phase_transitions(test_dsn, agent_id)

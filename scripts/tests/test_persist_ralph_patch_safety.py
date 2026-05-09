@@ -25,8 +25,6 @@ and is gated on the docker-compose stack being up).
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import textwrap
 import uuid
@@ -34,116 +32,33 @@ from pathlib import Path
 
 import pytest
 
+from tests._dispatcher_test_bootstrap import (
+    DOCKER_POSTGRES_SKIP_REASON,
+    bootstrap_dispatcher_test_db,
+    docker_postgres_admin_dsn,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _ENTRYPOINT_SH = _REPO_ROOT / "scripts" / "dispatcher" / "agent-runner-entrypoint.sh"
 
-
-def _docker_postgres_dsn() -> str | None:
-    """Return a DSN if the docker-compose postgres is reachable, else None."""
-    if shutil.which("psql") is None:
-        return None
-    dsn = os.environ.get(
-        "TEST_DSN",
-        "postgres://judgemind:localdev@localhost:5432/judgemind",
-    )
-    try:
-        r = subprocess.run(
-            ["psql", "-X", dsn, "-At", "-c", "SELECT 1"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    if r.returncode != 0 or r.stdout.strip() != "1":
-        return None
-    return dsn
-
-
-_DSN = _docker_postgres_dsn()
+# #4424 — schema bootstrap is now centralised in
+# ``scripts/tests/_dispatcher_test_bootstrap.py`` (one source of truth for
+# the union of ``dispatcher.*`` tables every persist-* test family member
+# touches).
+_DSN = docker_postgres_admin_dsn()
 pytestmark = pytest.mark.skipif(
     _DSN is None,
-    reason="local docker postgres not reachable; behavioural test skipped "
-    "(schema-parity test in test_phase_outputs_insert_shape.py still runs)",
+    reason=DOCKER_POSTGRES_SKIP_REASON,
 )
 
-# Test schema name — deliberately separate from ``dispatcher`` so the test
-# never collides with the operational schema that may be loaded in the same
-# docker postgres (it has FKs and constraints we can't easily seed). The bash
-# function under test executes ``INSERT INTO dispatcher.ralph_patches ...`` with
-# that schema name hard-coded, so we point it at a dedicated test database
-# where we own the ``dispatcher`` schema entirely.
+# Test database name — deliberately separate from ``dispatcher`` inside
+# the docker-compose admin DB so the test never collides with the
+# operational schema that may also be loaded there (it has FKs and
+# constraints we can't easily seed). The bash function under test
+# executes ``INSERT INTO dispatcher.ralph_patches ...`` with that schema
+# name hard-coded, so we point it at a dedicated test database where we
+# own the ``dispatcher`` schema entirely.
 _TEST_DB_NAME = "judgemind_test_persist_ralph_patch"
-
-
-def _bootstrap_test_database(admin_dsn: str) -> str:
-    """Create a dedicated test database and return its DSN.
-
-    Idempotent — re-runs of the test reuse the same database.
-    """
-    probe = subprocess.run(
-        [
-            "psql",
-            "-X",
-            admin_dsn,
-            "-At",
-            "-c",
-            f"SELECT 1 FROM pg_database WHERE datname='{_TEST_DB_NAME}';",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if probe.returncode != 0:
-        raise AssertionError(f"db existence probe failed: {probe.stderr}")
-    if probe.stdout.strip() != "1":
-        cr = subprocess.run(
-            [
-                "psql",
-                "-X",
-                admin_dsn,
-                "-c",
-                f'CREATE DATABASE "{_TEST_DB_NAME}";',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if cr.returncode != 0 and "already exists" not in cr.stderr:
-            raise AssertionError(f"create db failed: {cr.stderr}")
-
-    test_dsn = admin_dsn.rsplit("/", 1)[0] + f"/{_TEST_DB_NAME}"
-
-    # Minimal schema mirroring production columns. No FKs — agents table is
-    # referenced by the UPDATE in ralph_head_watcher_persist; we create a stub
-    # with the same column shape so the UPDATE is a no-op (WHERE clause never
-    # matches a real agent_id, which is fine — we only need the INSERT to work).
-    schema_sql = textwrap.dedent("""
-        CREATE SCHEMA IF NOT EXISTS dispatcher;
-        CREATE TABLE IF NOT EXISTS dispatcher.ralph_patches (
-            patch_id       UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-            agent_id       UUID        NOT NULL,
-            issue_number   INT         NOT NULL,
-            patch_content  TEXT        NOT NULL,
-            commit_sha     TEXT,
-            iteration_n    INT,
-            verdict        TEXT,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        CREATE TABLE IF NOT EXISTS dispatcher.agents (
-            agent_id                    UUID PRIMARY KEY,
-            ralph_iterations_observed   INT NOT NULL DEFAULT 0
-        );
-    """)
-    r = subprocess.run(
-        ["psql", "-X", test_dsn, "-v", "ON_ERROR_STOP=1", "-c", schema_sql],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert r.returncode == 0, f"schema setup failed: {r.stderr}"
-    return test_dsn
-
 
 _TEST_DSN: str | None = None
 
@@ -155,7 +70,7 @@ def _get_test_dsn() -> str | None:
         return _TEST_DSN
     if _DSN is None:
         return None
-    _TEST_DSN = _bootstrap_test_database(_DSN)
+    _TEST_DSN = bootstrap_dispatcher_test_db(_DSN, _TEST_DB_NAME)
     return _TEST_DSN
 
 
