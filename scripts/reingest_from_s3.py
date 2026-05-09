@@ -277,6 +277,22 @@ _SPLIT_REGISTRY: dict[str, Any] = {}
 _LLM_SPLIT_REGISTRY: dict[str, Any] = {}
 
 
+def _register_with_aliases(
+    registry: dict, scraper_id: str, value: Any, aliases: list[str]
+) -> None:
+    """Register ``value`` in ``registry`` under canonical scraper_id + every alias.
+
+    Centralizes the "register under canonical id + every alias" pattern so a
+    future 4th registry can't repeat the #4331 / #4386 pattern of forgetting to
+    honor ``_SPLIT_REGISTRY_ALIASES``.  Adding a new registry tomorrow becomes
+    a one-line ``_register_with_aliases(...)`` call — structurally impossible
+    to miss the alias loop (#4398).
+    """
+    registry[scraper_id] = value
+    for alias in aliases:
+        registry[alias] = value
+
+
 def _load_scraper_registry() -> None:
     """Lazily populate the scraper registry by auto-discovering court modules.
 
@@ -377,33 +393,27 @@ def _load_scraper_registry() -> None:
             if scraper_cls is None:
                 continue
 
-            _SCRAPER_REGISTRY[scraper_id] = scraper_cls
-
             # Module-level alias list: extra scraper_ids under which this
-            # module's ``_split_rulings`` / ``_llm_extract_rulings`` should
-            # also be registered.  Required so rebuild-path rows
-            # (``rebuild-{state}-{county}``, emitted by
+            # module's scraper class, ``_split_rulings``, and
+            # ``_llm_extract_rulings`` should also be registered.  Required
+            # so rebuild-path rows (``rebuild-{state}-{county}``, emitted by
             # ``scripts/rebuild_db.py`` when reconstructing rows from S3)
-            # resolve to the same splitter as live-captured rows.  Without
-            # this, any audit or drain that keys on ``documents.scraper_id``
-            # silently no-ops on every rebuild row (#4331).  The list is
-            # optional — modules without aliases simply register under the
-            # canonical scraper_id only.
+            # resolve to the same scraper class / splitter as live-captured
+            # rows.  Without this, any audit or drain that keys on
+            # ``documents.scraper_id`` silently no-ops on every rebuild row
+            # (#4331), and ``_reparse_document`` fails to resolve rebuild
+            # rows to a class so the raw HTML survives ``check_no_html_in_
+            # ruling_text`` rejection (#4386).  The list is optional —
+            # modules without aliases simply register under the canonical
+            # scraper_id only.  The ``_register_with_aliases`` helper
+            # centralizes the "register under canonical + every alias"
+            # pattern so a future 4th registry can't repeat the #4331 /
+            # #4386 forget-aliases pattern (#4398).
             split_aliases: list[str] = getattr(mod, "_SPLIT_REGISTRY_ALIASES", []) or []
 
-            # Register the scraper class under each alias too.  Without
-            # this, ``_reparse_document`` (line ~1123) fails to resolve
-            # rebuild-path rows to a class, ``parse_document`` is never
-            # called, and ``extracted["ruling_text"]`` keeps the raw HTML
-            # — which ``check_no_html_in_ruling_text`` then rejects,
-            # skipping the DB write and the judge resolver chain.  The
-            # split / llm-split registries already honored aliases
-            # (below); aliasing the scraper-class registry closes the
-            # gap so future counties that define
-            # ``_SPLIT_REGISTRY_ALIASES`` get the same upgrade for free
-            # (#4386).
-            for alias in split_aliases:
-                _SCRAPER_REGISTRY[alias] = scraper_cls
+            _register_with_aliases(
+                _SCRAPER_REGISTRY, scraper_id, scraper_cls, split_aliases
+            )
 
             # Register split function if the module exports one.
             # Convention: a module-level ``_split_rulings`` callable
@@ -411,9 +421,9 @@ def _load_scraper_registry() -> None:
             # that need splitting during full reparse.
             split_fn = getattr(mod, "_split_rulings", None)
             if split_fn is not None and callable(split_fn):
-                _SPLIT_REGISTRY[scraper_id] = split_fn
-                for alias in split_aliases:
-                    _SPLIT_REGISTRY[alias] = split_fn
+                _register_with_aliases(
+                    _SPLIT_REGISTRY, scraper_id, split_fn, split_aliases
+                )
 
             # Register LLM-based split function if available.
             # Convention: a module-level ``_llm_extract_rulings`` callable
@@ -421,9 +431,9 @@ def _load_scraper_registry() -> None:
             # produces higher-quality ruling_text than regex splitting.
             llm_split_fn = getattr(mod, "_llm_extract_rulings", None)
             if llm_split_fn is not None and callable(llm_split_fn):
-                _LLM_SPLIT_REGISTRY[scraper_id] = llm_split_fn
-                for alias in split_aliases:
-                    _LLM_SPLIT_REGISTRY[alias] = llm_split_fn
+                _register_with_aliases(
+                    _LLM_SPLIT_REGISTRY, scraper_id, llm_split_fn, split_aliases
+                )
 
 
 FETCH_DOCUMENTS_QUERY = """
