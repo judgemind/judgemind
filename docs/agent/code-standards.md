@@ -56,6 +56,25 @@ The `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories under `script
 
 **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 
+#### Cross-script helper sharing
+
+Reaffirming the rule above: ECS oneshot scripts uploaded by `scripts/ecs-run-task.sh` cannot import from peer `scripts/*.py` files, because only the requested script (not the rest of `scripts/`) is uploaded at run time. Verbatim copy-paste between successive scripts is **not** the answer when the same helper is reaching for its third caller — the codebase has a sanctioned escape hatch.
+
+**Escape hatch — land pure helpers under `packages/scraper-framework/src/framework/`.** Helpers WITH NO scraper-framework dependencies (i.e. they don't import from `framework.storage`, `framework.enrichment`, `framework.llm_extractor`, etc., and don't transitively pull anything that does) belong in a small standalone module under `packages/scraper-framework/src/framework/<name>.py` and are imported via `from framework.<name> import …`. The `framework` package is on `sys.path` for every ECS oneshot via the `# venv: scraper-framework` header, so the import works in both local and ECS-task contexts without any single-file-upload concerns.
+
+Worked examples:
+
+- `from framework.logging import configure_structlog` — the canonical structured-logging entry point used by `scripts/drain_splitter_carry_forward_clusters.py` (PR #4368) and the 13 other top-level scripts migrated in PR #4373. This is the long-standing precedent for cross-script sharing and is mandatory for any top-level script that emits `extra=` log fields (see §Logger configuration below).
+- `from framework.s3_keys import parse_flat_hash_key, is_mislabel, head_object_metadata_hash, build_twin_key, KEY_PATTERN` — the four flat-hash key helpers extracted in #4447 (PR #4450). Today's consumers are `scripts/cleanup_mislabeled_s3_2661.py` and `scripts/repoint_mislabeled_documents_4439.py`; the foreseeable third caller is `scripts/create_missing_twins_4446.py` (CopyObject-twins follow-up #4446). `framework.s3_keys` is the explicit landing zone for parsing/validation helpers operating on the `raw/<county>/<format>/<filename_hash>.<ext>` flat-hash key shape.
+
+**When NOT to extract.** The bar for promoting a helper from a `scripts/*.py` file into `framework.*` is real — don't do it for everything. Skip the extraction when:
+
+- The helper has domain-specific behaviour that belongs in a scraper, ingestion stage, or enrichment module rather than a generic helper. Reach for `packages/scraper-framework/src/courts/`, `…/ingestion/`, or `…/enrichment/` instead.
+- The helper has circular framework dependencies — i.e. it imports from `framework.storage`, `framework.s3_integrity`, etc., which would create a `framework` ↔ `framework` cycle. In that case the helper has effectively become part of the framework already; restructure the existing module rather than adding a new top-level one.
+- "This is the only script that will ever need this." A single caller is just a script; two callers is a coincidence; three callers is a pattern. The four #4447 helpers passed the bar because (a) they have no scraper-framework deps, (b) two scripts already exhibited the duplication, and (c) the CopyObject-twins follow-up #4446 was a foreseeable third caller. Without that triangulation, leave it inline — premature `framework.*` extraction adds API-surface that is hard to delete later.
+
+When you do extract, keep the new `framework/<name>.py` module narrow (one concept per module — see how `framework.s3_keys` covers only flat-hash key shape, while `framework.logging` covers only logging configuration), add unit tests under `packages/scraper-framework/tests/`, and update the two-or-more existing consumers in the same PR so the duplication doesn't sit in the tree as a known-broken hedge.
+
 #### Logger configuration
 
 Top-level `scripts/*.py` scripts that emit logger calls with `extra=` kwargs MUST configure logging via `configure_structlog`, not `logging.basicConfig`. The basicConfig idiom — `logging.basicConfig(format="%(asctime)s %(levelname)-8s %(message)s")` — silently drops every `extra=` field from the LogRecord because the format string only references `%(asctime)s`, `%(levelname)s`, and `%(message)s`. Issue #4368 documented the production incident: a backfill script's `extra=` fields disappeared from CloudWatch Logs Insights, and the post-deploy verification that depended on those fields silently passed.
