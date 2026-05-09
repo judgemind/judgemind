@@ -159,11 +159,14 @@ if (( violations > 0 )); then
     echo "  Sites missing a ROUTING (#N) comment in the ${ROUTING_WINDOW_LINES}"
     echo "  lines above the call:"
     echo ""
-    for line in "${missing[@]}"; do
-        # Show the offending line in context for fast triage.
-        snippet="$(sed -n "${line}p" "$TARGET_FILE")"
-        echo "    $TARGET_FILE:${line}: ${snippet}"
-    done
+    # Length-guard the iteration — see #4479.
+    if [ "${#missing[@]}" -gt 0 ]; then
+        for line in "${missing[@]}"; do
+            # Show the offending line in context for fast triage.
+            snippet="$(sed -n "${line}p" "$TARGET_FILE")"
+            echo "    $TARGET_FILE:${line}: ${snippet}"
+        done
+    fi
     echo ""
     echo "  Fix: add a comment above the call such as"
     echo ""

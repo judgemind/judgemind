@@ -73,6 +73,15 @@ if [[ "$SCAN_DIR" == "$REPO_ROOT" ]]; then
 else
     scan_targets+=("$SCAN_DIR")
 fi
+# Defensive: each ``scan_targets+=`` above runs in exactly one
+# branch of the if/else, so the array is always populated at
+# runtime — but the #4479 static check treats branch-conditional
+# ``+=`` as non-binding. Catch the pathological case (no
+# packages/*/src/ exists yet on a fresh clone) explicitly.
+if [ "${#scan_targets[@]}" -eq 0 ]; then
+    echo "check-placeholder-gates: no scan targets resolved — nothing to check."
+    exit 0
+fi
 
 # ─── Helper: check if a grep output line should be skipped ───────────
 should_skip() {

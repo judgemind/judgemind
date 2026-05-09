@@ -71,6 +71,16 @@ while IFS= read -r -d '' f; do
     fi
 done < <(find "$REPO_ROOT/infra/terraform" -name "main.tf" -print0 2>/dev/null)
 
+# Defensive: ``TF_FILES+=`` only fires inside the ``if ! "$skip"``
+# arm of the while-read loop, so the static check #4479 treats the
+# array as potentially empty. In practice the find expression
+# always returns at least one main.tf in a non-fresh checkout, but
+# bail cleanly on the pathological case.
+if [ "${#TF_FILES[@]}" -eq 0 ]; then
+    echo "check-terraform-ecs-entrypoint: no main.tf files under infra/terraform — nothing to check."
+    exit 0
+fi
+
 if [[ "$LIST_MODE" == true ]]; then
     for f in "${TF_FILES[@]}"; do
         echo "$f"

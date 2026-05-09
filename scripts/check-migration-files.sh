@@ -106,9 +106,17 @@ for num in "${sorted_numbers[@]}"; do
             "Fix for duplicate migration number $num:"
             "  Two files claim sequence number $num:"
         )
-        for c in "${colliding[@]}"; do
-            fix_blocks+=("    - $c")
-        done
+        # Length-guard: ``colliding`` was just populated above by
+        # the inner ``for f in migration_files`` filter loop. In
+        # practice the duplicate-num condition guarantees at least
+        # one match (we got here because two files share the same
+        # number), but the #4479 static check treats branch-
+        # conditional ``+=`` as non-binding.
+        if [ "${#colliding[@]}" -gt 0 ]; then
+            for c in "${colliding[@]}"; do
+                fix_blocks+=("    - $c")
+            done
+        fi
         fix_blocks+=(
             "  Keep the older one (whichever was merged to main first) at"
             "  '$num' and rename the newer to '${next_free}_<topic>.sql':"
@@ -162,10 +170,17 @@ for num in "${sorted_numbers[@]}"; do
 done
 
 if [[ $errors -gt 0 ]]; then
-    # Emit the accumulated Fix blocks.
-    for line in "${fix_blocks[@]}"; do
-        echo "$line"
-    done
+    # Emit the accumulated Fix blocks. Length-guard the iteration —
+    # bash 3.2 trips on ``"${fix_blocks[@]}"`` when arr=() and the
+    # ``+=`` only ran inside conditional branches that produced
+    # error-counter increments without populating ``fix_blocks``
+    # (defensive: in practice ``errors > 0`` implies fix_blocks is
+    # populated, but the static check #4479 can't prove that).
+    if [ "${#fix_blocks[@]}" -gt 0 ]; then
+        for line in "${fix_blocks[@]}"; do
+            echo "$line"
+        done
+    fi
     echo ""
     echo "Migration file validation: $errors error(s) found."
     exit 1

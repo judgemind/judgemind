@@ -238,9 +238,15 @@ if (( violations_total > 0 )); then
     echo ""
     echo "  Violations:"
     echo ""
-    for vline in "${violation_lines[@]}"; do
-        echo "    $vline"
-    done
+    # Length-guard the iteration — see #4479. ``violation_lines+=``
+    # only runs inside conditional branches, so the static check
+    # treats the array as potentially empty even though
+    # ``violations_total > 0`` guarantees at least one entry.
+    if [ "${#violation_lines[@]}" -gt 0 ]; then
+        for vline in "${violation_lines[@]}"; do
+            echo "    $vline"
+        done
+    fi
     echo ""
     echo "  Fix: add timeout=<seconds> to each call. Choose a value appropriate"
     echo "  to the operation (e.g. timeout=30 for local git ops, timeout=120 for"
