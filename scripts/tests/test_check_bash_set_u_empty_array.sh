@@ -600,6 +600,178 @@ else
     rm -f "$FIXTURE_OUT_FILE"
 fi
 
+# ─── Tests F1-F6 (#4492): --fix mode ─────────────────────────────────────
+# The --fix flag wraps shape (B) violations in a length-guard
+# (``if [ "${#<name>[@]}" -gt 0 ]; then ... fi``). Same shape as
+# ruff's --fix mode.
+
+# ─── Test F1: --fix --dry-run prints patch, does NOT modify file ─────────
+TESTS=$((TESTS + 1))
+F1_DIR="$TMPDIR_TEST/f1_root"
+mkdir -p "$F1_DIR/scripts"
+cat > "$F1_DIR/scripts/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+arr=()
+for x in "${arr[@]}"; do
+    echo "$x"
+done
+EOF
+chmod +x "$F1_DIR/scripts/probe.sh"
+F1_BEFORE_HASH="$(shasum "$F1_DIR/scripts/probe.sh" | awk '{print $1}')"
+F1_OUT="$TMPDIR_TEST/f1_out.txt"
+"$CHECK_SCRIPT" --fix --dry-run "$F1_DIR" > "$F1_OUT" 2>&1 && f1_rc=0 || f1_rc=$?
+F1_AFTER_HASH="$(shasum "$F1_DIR/scripts/probe.sh" | awk '{print $1}')"
+if [[ "$f1_rc" -ne 1 ]]; then
+    echo "FAIL: F1 --fix --dry-run — expected exit 1 (violations outstanding), got $f1_rc"
+    FAILURES=$((FAILURES + 1))
+elif [[ "$F1_BEFORE_HASH" != "$F1_AFTER_HASH" ]]; then
+    echo "FAIL: F1 --fix --dry-run — file was modified despite --dry-run"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -qE '\+if \[ "\$\{#arr\[@\]\}" -gt 0 \]; then' "$F1_OUT"; then
+    echo "FAIL: F1 --fix --dry-run — patch did not show added 'if' guard line"
+    cat "$F1_OUT"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -qE '^\+fi$' "$F1_OUT"; then
+    echo "FAIL: F1 --fix --dry-run — patch did not show added 'fi' closer"
+    cat "$F1_OUT"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: F1 --fix --dry-run prints unified diff with added if/fi wrapper, file unchanged, exit 1"
+fi
+rm -rf "$F1_DIR" "$F1_OUT"
+
+# ─── Test F2: --fix applies the wrap and exits 0 ────────────────────────
+TESTS=$((TESTS + 1))
+F2_DIR="$TMPDIR_TEST/f2_root"
+mkdir -p "$F2_DIR/scripts"
+cat > "$F2_DIR/scripts/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+arr=()
+for x in "${arr[@]}"; do
+    echo "$x"
+done
+EOF
+chmod +x "$F2_DIR/scripts/probe.sh"
+F2_OUT="$TMPDIR_TEST/f2_out.txt"
+"$CHECK_SCRIPT" --fix "$F2_DIR" > "$F2_OUT" 2>&1 && f2_rc=0 || f2_rc=$?
+if [[ "$f2_rc" -ne 0 ]]; then
+    echo "FAIL: F2 --fix — expected exit 0 after fixing all violations, got $f2_rc"
+    cat "$F2_OUT"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -qE 'if \[ "\$\{#arr\[@\]\}" -gt 0 \]; then' "$F2_DIR/scripts/probe.sh"; then
+    echo "FAIL: F2 --fix — file does not contain the inserted 'if' guard"
+    cat "$F2_DIR/scripts/probe.sh"
+    FAILURES=$((FAILURES + 1))
+elif ! "$CHECK_SCRIPT" "$F2_DIR" > /dev/null 2>&1; then
+    echo "FAIL: F2 --fix — file still trips the check after the wrap"
+    cat "$F2_DIR/scripts/probe.sh"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: F2 --fix applies the wrap, file passes the default check afterward, exit 0"
+fi
+rm -rf "$F2_DIR" "$F2_OUT"
+
+# ─── Test F3: --fix wrap preserves the body's original indentation ──────
+# AC#1 Verify line: "with preserved indentation". The wrapped body
+# keeps its original indentation; only the if/fi lines are added at
+# the iteration line's indentation level.
+TESTS=$((TESTS + 1))
+F3_DIR="$TMPDIR_TEST/f3_root"
+mkdir -p "$F3_DIR/scripts"
+cat > "$F3_DIR/scripts/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+LABELS=()
+    for label in "${LABELS[@]}"; do
+        echo "$label"
+    done
+EOF
+chmod +x "$F3_DIR/scripts/probe.sh"
+"$CHECK_SCRIPT" --fix "$F3_DIR" > /dev/null 2>&1 || true
+# The 'if' line should have the same 4-space leading indentation as
+# the original 'for' line, and 'fi' likewise.
+F3_FILE="$F3_DIR/scripts/probe.sh"
+if grep -qE '^    if \[ "\$\{#LABELS\[@\]\}" -gt 0 \]; then$' "$F3_FILE" && \
+   grep -qE '^    fi$' "$F3_FILE" && \
+   grep -qE '^    for label in "\$\{LABELS\[@\]\}"; do$' "$F3_FILE" && \
+   grep -qE '^        echo "\$label"$' "$F3_FILE"; then
+    echo "PASS: F3 --fix preserves the body's original indentation; if/fi added at iter-line indent"
+else
+    echo "FAIL: F3 --fix indentation preservation broken"
+    cat "$F3_FILE"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$F3_DIR"
+
+# ─── Test F4: --fix on single-line read (no for-loop body) ──────────────
+# A bare ``echo "${arr[@]}"`` outside a for loop is also flagged. The
+# --fix wrap should target just that single line.
+TESTS=$((TESTS + 1))
+F4_DIR="$TMPDIR_TEST/f4_root"
+mkdir -p "$F4_DIR/scripts"
+cat > "$F4_DIR/scripts/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+xs=()
+echo "${xs[@]}"
+EOF
+chmod +x "$F4_DIR/scripts/probe.sh"
+F4_OUT="$TMPDIR_TEST/f4_out.txt"
+"$CHECK_SCRIPT" --fix "$F4_DIR" > "$F4_OUT" 2>&1 && f4_rc=0 || f4_rc=$?
+if [[ "$f4_rc" -ne 0 ]]; then
+    echo "FAIL: F4 --fix single-line read — expected exit 0, got $f4_rc"
+    cat "$F4_OUT"
+    FAILURES=$((FAILURES + 1))
+elif ! "$CHECK_SCRIPT" "$F4_DIR" > /dev/null 2>&1; then
+    echo "FAIL: F4 --fix single-line read — file still trips the check"
+    cat "$F4_DIR/scripts/probe.sh"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: F4 --fix wraps a single-line iteration read"
+fi
+rm -rf "$F4_DIR" "$F4_OUT"
+
+# ─── Test F5: --dry-run without --fix → exit 2 (usage error) ───────────
+TESTS=$((TESTS + 1))
+F5_OUT="$TMPDIR_TEST/f5_out.txt"
+"$CHECK_SCRIPT" --dry-run "$TMPDIR_TEST" > "$F5_OUT" 2>&1 && f5_rc=0 || f5_rc=$?
+if [[ "$f5_rc" -eq 2 ]]; then
+    echo "PASS: F5 --dry-run without --fix exits 2 (usage error)"
+else
+    echo "FAIL: F5 --dry-run without --fix — expected exit 2, got $f5_rc"
+    cat "$F5_OUT"
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$F5_OUT"
+
+# ─── Test F6: --fix on the AC#1 fixture matches the expected wrap ──────
+# Reproduce AC#1 verbatim against a copy of the repo fixture: the
+# diff shows the added if/fi wrapper around the line-33 iteration,
+# and the post-fix file passes the default check.
+TESTS=$((TESTS + 1))
+F6_DIR="$TMPDIR_TEST/f6_root"
+mkdir -p "$F6_DIR/scripts"
+cp "$REPO_ROOT/tests/fixtures/conditional_array_assign/scripts/conditional_array_assign.sh" \
+    "$F6_DIR/scripts/conditional_array_assign.sh"
+F6_OUT="$TMPDIR_TEST/f6_out.txt"
+"$CHECK_SCRIPT" --fix "$F6_DIR" > "$F6_OUT" 2>&1 && f6_rc=0 || f6_rc=$?
+if [[ "$f6_rc" -ne 0 ]]; then
+    echo "FAIL: F6 --fix on conditional_array_assign fixture — expected exit 0, got $f6_rc"
+    cat "$F6_OUT"
+    FAILURES=$((FAILURES + 1))
+elif ! grep -qE '^if \[ "\$\{#LABELS\[@\]\}" -gt 0 \]; then$' "$F6_DIR/scripts/conditional_array_assign.sh"; then
+    echo "FAIL: F6 --fix — wrap was not applied to fixture"
+    FAILURES=$((FAILURES + 1))
+elif ! "$CHECK_SCRIPT" "$F6_DIR" > /dev/null 2>&1; then
+    echo "FAIL: F6 --fix — fixture still trips the check after wrap"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: F6 --fix on conditional_array_assign fixture wraps line-33 iteration; post-fix check passes"
+fi
+rm -rf "$F6_DIR" "$F6_OUT"
+
 # ─── Test 15: Self-scan — real repo scripts/ tree → passes ─────────────
 TESTS=$((TESTS + 1))
 if "$CHECK_SCRIPT" "$REPO_ROOT" > /dev/null 2>&1; then
