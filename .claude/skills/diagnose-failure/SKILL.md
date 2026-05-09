@@ -270,7 +270,7 @@ You can use the full toolset of a `/task` agent or the operator's dispatcher ses
 - **Edit / Write / Read / Glob / Grep** — full filesystem access. Edit files in the failed agent's worktree (when present), write helpers to `{worktree}/tmp/diagnoser/`, read PR diffs, etc. Note: the v3 diagnoser runs in its own ECS task; it does not have the failed agent's worktree on disk by default. Use `git fetch origin pull/<PR>/head:adopt-<PR>` to materialize the agent's branch when you need to inspect or patch it.
 - **Agent (sub-skill invocation)** — call `/ralph`, `/tdd`, `/audit`, etc. when judgment requires. Sub-skills run with their own normal contracts.
 - **MCP servers** — `github`, `awslabs_cloudwatch-mcp-server`, `awslabs_ecs-mcp-server`, `plugin:telegram` (read/notify only — see Telegram Integration in `CLAUDE.md`).
-- **gh / git / aws CLI** — full operator-tier authority. You may commit and push to the failed agent's branch, file new issues, edit issue/PR bodies, add/remove labels, post comments, close issues. AWS reads (CloudWatch logs, ECS describe-tasks) plus same writes the launcher already has on the dev account.
+- **gh / git / aws CLI** — full operator-tier authority. You may commit and push to the failed agent's branch, file new issues, edit issue/PR bodies, add/remove labels, post comments (via `scripts/gh-comment-with-retry.sh` for `--body-file` posts so the 504-after-success failure mode #4478 is handled transparently), close issues. AWS reads (CloudWatch logs, ECS describe-tasks) plus same writes the launcher already has on the dev account.
 
 ---
 
@@ -304,7 +304,7 @@ remote: refusing to allow a Personal Access Token to create or update workflow `
 
 Three prior fleet decisions all blocked-on the same PAT issue (#4012). The current agent's failure is an instance of the same root cause.
 
-**Action.** Append `Blocked by #4012` to issue #3297, add `status/blocked`, post the explanatory comment.
+**Action.** Append `Blocked by #4012` to issue #3297, add `status/blocked`, post the explanatory comment via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478):
 
 ```
 gh issue view 3297 --repo judgemind/judgemind --json body --jq .body > {worktree}/tmp/diagnoser/orig_body.md
@@ -312,7 +312,7 @@ gh issue view 3297 --repo judgemind/judgemind --json body --jq .body > {worktree
 python3 {worktree}/tmp/diagnoser/append_blocked_by.py 4012 < {worktree}/tmp/diagnoser/orig_body.md > {worktree}/tmp/diagnoser/new_body.md
 gh issue edit 3297 --repo judgemind/judgemind --body-file {worktree}/tmp/diagnoser/new_body.md
 gh issue edit 3297 --repo judgemind/judgemind --add-label status/blocked --remove-label agent/ready
-gh issue comment 3297 --repo judgemind/judgemind --body-file {worktree}/tmp/diagnoser/block_comment.md
+{worktree}/scripts/gh-comment-with-retry.sh 3297 --body-file {worktree}/tmp/diagnoser/block_comment.md
 python3 {worktree}/tmp/diagnoser/write_outcome.py "$AGENT_ID" "\"remote: refusing to allow a Personal Access Token to create or update workflow\" — same PAT-scope cascade as #4012. Blocked-on #4012; will auto-unblock when that PR merges."
 ```
 
@@ -330,6 +330,8 @@ gh issue comment 3601 --repo judgemind/judgemind --body "AC #1 referenced 'trans
 gh issue edit 3601 --repo judgemind/judgemind --add-label agent/ready
 python3 {worktree}/tmp/diagnoser/write_outcome.py "$AGENT_ID" "\"AC#1 unmet: field 'transcribed_text' does not exist on Document\" — the field was renamed to transcription_html in #3204. Reissued the AC and re-added agent/ready."
 ```
+
+(Note: the `gh issue comment ... --body "..."` line above passes a short inline body, not `--body-file`, so the 504-after-success wrapper isn't needed here. The wrapper is required for `--body-file` posts; short inline bodies are unaffected by the failure mode.)
 
 ### Example 4 — duplicate-PR consolidation (#3725)
 
@@ -376,7 +378,7 @@ WHERE agent_id = $AGENT_ID;
 
 ```
 gh issue edit 3700 --repo judgemind/judgemind --add-label status/needs-human,priority/p1
-gh issue comment 3700 --repo judgemind/judgemind --body-file {worktree}/tmp/diagnoser/escalation.md
+{worktree}/scripts/gh-comment-with-retry.sh 3700 --body-file {worktree}/tmp/diagnoser/escalation.md
 python3 {worktree}/tmp/diagnoser/write_outcome.py "$AGENT_ID" "silent_hang at ralph_iter_3 — task-runner stopped emitting log events for 31 min during reviewer subagent. Third silent-hang at the same milestone on this issue. Marked needs_review; transcript ends mid-Bash call to 'gh run watch'."
 ```
 

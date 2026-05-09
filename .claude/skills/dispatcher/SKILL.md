@@ -290,9 +290,9 @@ A previous agent attempted this issue and made progress before exiting.
 - If no implementation started: "No implementation progress was made. Start fresh."
 ```
 
-Post the comment:
+Post the comment via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478, so a flaky GitHub response doesn't surface as a duplicate context comment on the next agent's pickup):
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file tmp/failed_agent_context_<issue>.txt
+scripts/gh-comment-with-retry.sh <N> --body-file tmp/failed_agent_context_<issue>.txt
 ```
 
 **Determining the failure mode:**
@@ -969,7 +969,7 @@ When a `529 overloaded_error`, Anthropic/Claude-side rate-limit error, or equiva
 
 1. **Retry once with ~30s backoff.** Sleep roughly 30 seconds and reattempt the exact same operation (spawn agent, merge PR, post comment, apply terraform — whatever was overloaded). One retry is enough to ride out a transient spike; a second retry just burns API budget without improving success rate.
 2. **If the retry also fails, defer the task.** "Defer" means:
-   - Post a short comment on the affected issue: `"529 during dispatch at <ISO-8601>; deferring — retry on next dispatcher run."` Write the comment to `{worktree}/tmp/defer_comment.txt` first, then post with `gh issue comment --body-file`.
+   - Post a short comment on the affected issue: `"529 during dispatch at <ISO-8601>; deferring — retry on next dispatcher run."` Write the comment to `{worktree}/tmp/defer_comment.txt` first, then post via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478).
    - Continue processing remaining slots in the main loop. **Do not stall the whole queue** over one overloaded task.
    - If the deferred task was an agent spawn that never started, leave the issue assigned to whoever it was assigned to (the next dispatcher cycle will re-fetch and retry). If it was a PR merge, leave the PR open — the next merge pass will pick it up again.
 

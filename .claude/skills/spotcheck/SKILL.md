@@ -25,7 +25,7 @@ The original court documents are authoritative. They are the source of truth —
 5. **File issues for structural findings.** When the fix shape is non-trivial or requires a maintainer decision, file an `agent/ready` issue with root-cause-first analysis (file:line evidence, the structural fix shape, why a surface patch wouldn't work) so the dispatcher can pick it up.
 6. **No `priority/p0`.** Reserved for humans.
 
-> **MCP vs `gh`:** `mcp__github__list_issues` and `mcp__github__search_issues` for reads (full typed objects, no `--json` enumeration). `gh issue create --body-file` and `gh issue comment --body-file` for writes — the MCP write path is currently auth-blocked. See `docs/agent/github-api-access.md`.
+> **MCP vs `gh`:** `mcp__github__list_issues` and `mcp__github__search_issues` for reads (full typed objects, no `--json` enumeration). `gh issue create --body-file` and `scripts/gh-comment-with-retry.sh` (the wrapper around `gh issue comment --body-file` that handles the 504-after-success failure mode #4478) for writes — the MCP write path is currently auth-blocked. See `docs/agent/github-api-access.md`.
 
 > **MCP vs `aws` CLI:** `scripts/ecs-run-task.sh` for the oneshot Fargate launch (handles network config, log streaming, exit-code propagation — not MCP-replaceable). `aws s3 cp` for downloading the spotcheck JSON and PDF artifacts. `mcp__awslabs_ecs-mcp-server__*` and `mcp__awslabs_cloudwatch-mcp-server__*` for ad-hoc cluster + logs reads. See `docs/agent/aws-api-access.md`.
 
@@ -300,10 +300,10 @@ If the new issue is blocked by another open issue, run `scripts/block-issue.sh <
 
 ### 4c — Comment on existing issue (for new evidence)
 
-When state-awareness in Step 1 matched the finding to an existing open issue, post a comment with the new sample:
+When state-awareness in Step 1 matched the finding to an existing open issue, post a comment with the new sample. Use the `scripts/gh-comment-with-retry.sh` wrapper so the 504-after-success failure mode (#4478) doesn't surface as a duplicate comment or false-failure:
 
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/spotcheck/comment_N.txt
+{worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/spotcheck/comment_N.txt
 ```
 
 Comment body should add value — a fresh date, a county not previously seen, a counter-example that disambiguates, a hypothesis the issue body didn't consider. "+1, still broken" is not a comment worth posting.
