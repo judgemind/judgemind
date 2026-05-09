@@ -16,31 +16,49 @@
 #
 # Algorithm:
 #   1. Fetch the issue body via `gh issue view`.
-#   2. Extract candidate file paths from the body using a fixed regex
-#      that covers the four conventional repo roots
-#      (scripts/, packages/, docs/, infra/) plus `.github/`. Each path
-#      is classified as either *target-context* (narrative / Proposal /
-#      AC text — load-bearing change targets) or *search-context*
-#      (cited only inside Verify: / grep / pytest / aws / curl / rg
-#      invocations or fenced shell-output blocks — search arguments,
-#      not change targets). #4340.
-#   3. For each unique file path, query the commits API on `main` to find
-#      commits that touched it (`gh api /repos/.../commits?path=<file>`),
-#      and parse the squash-merge PR number from each commit headline
-#      (the trailing `(#N)` token).
-#   4. For each candidate PR, fetch its merge metadata and changed files
-#      via `gh pr view --json mergedAt,baseRefName,files`. Drop the
-#      candidate if `mergedAt` is null or `baseRefName != main`.
-#   5. Compute overlap of the candidate PR's changed files vs the
-#      candidate paths. Apply the high-confidence threshold AGAINST THE
-#      TARGET-CONTEXT SUBSET ONLY — search-context overlaps don't trip
-#      a shipped match by themselves (#4340). Threshold: ≥1 added
-#      target-context overlap OR ≥2 total target-context overlaps. The
-#      "added" classification uses changeType:"ADDED" (or status:
-#      "added" from the raw GitHub REST API), falling back to a
-#      deletions==0 heuristic when neither authoritative signal is
-#      present.
-#   6. On match: print a `shipped:` line and a JSON summary to stdout,
+#   2. **Verify-clause content probe (#4472).** Before falling through to
+#      the path-overlap channel, run the AC's literal Verify: clauses
+#      against the worktree via _check_shipped_pr_verify_probe.py. The
+#      probe supports three shapes — `grep <pattern> <path>` (read-only,
+#      executed verbatim), `pytest -k <test>` (rewritten to
+#      --collect-only for safety), and `./scripts/<probe>.sh` (NOT
+#      executed; checks file existence + git log). On match, the probe
+#      resolves the introducing PR via `git log -S` and emits a
+#      `shipped:` line, short-circuiting the path-overlap pipeline.
+#      This catches the canonical pre-#3994 zombie shape where the AC
+#      pins a content invariant (frozenset name, magic string, test
+#      name) and the actual PR uses a different filename than the
+#      issue body's prose — issue #2828 ↔ PR #3215 is the worked
+#      example.
+#   3. **Fallback — path-overlap channel.** When step 2 returns no
+#      match, fall through to the original heuristic:
+#        a. Extract candidate file paths from the body using a fixed
+#           regex that covers the four conventional repo roots
+#           (scripts/, packages/, docs/, infra/) plus `.github/`. Each
+#           path is classified as either *target-context* (narrative /
+#           Proposal / AC text — load-bearing change targets) or
+#           *search-context* (cited only inside Verify: / grep / pytest
+#           / aws / curl / rg invocations or fenced shell-output blocks
+#           — search arguments, not change targets). #4340.
+#        b. For each unique file path, query the commits API on `main`
+#           to find commits that touched it
+#           (`gh api /repos/.../commits?path=<file>`), and parse the
+#           squash-merge PR number from each commit headline (the
+#           trailing `(#N)` token).
+#        c. For each candidate PR, fetch its merge metadata and changed
+#           files via `gh pr view --json mergedAt,baseRefName,files`.
+#           Drop the candidate if `mergedAt` is null or
+#           `baseRefName != main`.
+#        d. Compute overlap of the candidate PR's changed files vs the
+#           candidate paths. Apply the high-confidence threshold
+#           AGAINST THE TARGET-CONTEXT SUBSET ONLY — search-context
+#           overlaps don't trip a shipped match by themselves (#4340).
+#           Threshold: ≥1 added target-context overlap OR ≥2 total
+#           target-context overlaps. The "added" classification uses
+#           changeType:"ADDED" (or status: "added" from the raw GitHub
+#           REST API), falling back to a deletions==0 heuristic when
+#           neither authoritative signal is present.
+#   4. On match: print a `shipped:` line and a JSON summary to stdout,
 #      exit 0. On no match: print a `not-shipped:` line, exit 1. On
 #      error: print an `error:` line to stderr, exit 2.
 #
@@ -96,6 +114,67 @@ issue_json=""
 if ! issue_json=$("$GH_BIN" issue view "$issue_num" --repo "$REPO" --json body,title,createdAt 2>/dev/null); then
     echo "error: failed to fetch issue #${issue_num} from ${REPO} (exit 2)" >&2
     exit 2
+fi
+
+# ─── Verify-clause content probe (#4472) ──────────────────────────────────
+#
+# Before the path-overlap channel, run the AC's literal `Verify:` clauses
+# against the worktree. This catches the canonical pre-#3994 zombie shape
+# where the AC pins a content invariant (frozenset name, magic string,
+# test name) and the actual PR used a different filename than the issue
+# body's prose. Concrete case: issue #2828 ↔ PR #3215 — the AC's
+# `grep "ALLOWED_CLAUDE_FLAGS" scripts/dispatcher/tests/` matches in
+# origin/main today, even though the issue's body cited
+# `scripts/dispatcher/tests/test_daemon_phase3a.py` as a guess (the PR
+# landed at `test_daemon_phase_argv_allowlist.py`).
+#
+# Exit codes from the helper:
+#   0 — match. Stdout: ``shipped:<pr-number>\t<canonical-clause>``.
+#   1 — no match. Stdout empty. Caller falls through to path-overlap.
+#   2 — error / malformed input. Stdout empty. Caller falls through too.
+#
+# The helper is opt-out via env var so callers can suppress the new
+# channel when running against a shallow / non-git fixture (some unit
+# tests with bash mocks cannot satisfy the `git rev-parse --show-toplevel`
+# precondition; setting CHECK_SHIPPED_VERIFY_DISABLE=1 bypasses the
+# probe entirely while leaving the path-overlap channel intact).
+verify_probe_disabled="${CHECK_SHIPPED_VERIFY_DISABLE:-}"
+if [[ -z "$verify_probe_disabled" ]]; then
+    verify_probe_out=""
+    verify_probe_exit=0
+    verify_probe_out=$(printf '%s' "$issue_json" | python3 \
+        "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_verify_probe.py" \
+        2>/dev/null) || verify_probe_exit=$?
+    if [[ "$verify_probe_exit" -eq 0 && "$verify_probe_out" == shipped:* ]]; then
+        # Parse `shipped:<pr>\t<clause>` — split on the first tab.
+        verify_probe_pr="${verify_probe_out%%$'\t'*}"
+        verify_probe_pr="${verify_probe_pr#shipped:}"
+        verify_probe_clause=""
+        if [[ "$verify_probe_out" == *$'\t'* ]]; then
+            verify_probe_clause="${verify_probe_out#*$'\t'}"
+        fi
+        if [[ "$verify_probe_pr" =~ ^[0-9]+$ ]]; then
+            # Emit a `shipped:` line in the same shape the path-overlap
+            # channel uses, plus a minimal JSON summary. Downstream
+            # consumers (.claude/skills/task/SKILL.md §4a.2.1) parse
+            # `shipped_pr` from the JSON, which is enough to drive the
+            # verify-and-close pivot.
+            summary_json=$(CHECK_SHIPPED_ISSUE="$issue_num" \
+                            CHECK_SHIPPED_PR="$verify_probe_pr" \
+                            CHECK_SHIPPED_OVERLAP_COUNT="0" \
+                            CHECK_SHIPPED_OVERLAP_FILES="" \
+                            CHECK_SHIPPED_ADDED_FILES="" \
+                            CHECK_SHIPPED_CANDIDATE_FILES="" \
+                            CHECK_SHIPPED_VERIFY_CLAUSE="$verify_probe_clause" \
+                            python3 "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_summary.py" \
+                            2>/dev/null) || summary_json=""
+            echo "shipped: PR #${verify_probe_pr} matches issue #${issue_num} via Verify-clause probe (${verify_probe_clause}) (exit 0)"
+            if [[ -n "$summary_json" ]]; then
+                echo "$summary_json"
+            fi
+            exit 0
+        fi
+    fi
 fi
 
 # Extract candidate file paths from the issue body via Python (so the regex

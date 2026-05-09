@@ -53,6 +53,15 @@ MOCK_BIN_DIR=$(mktemp -d)
 register_temp_dir "$MOCK_BIN_DIR"
 export PATH="$MOCK_BIN_DIR:$ORIG_PATH_SAVE"
 
+# Disable the Verify-clause content probe (#4472) for the path-overlap
+# integration tests below. The verify-channel runs the AC's literal
+# Verify clauses against the actual worktree (grep, pytest --collect-only,
+# git log -S), which the bash mocks here cannot influence — the worktree
+# content is real and the mocks only intercept gh. Tests in this file
+# specifically exercise the path-overlap channel; the verify-channel has
+# its own dedicated unit tests in test_check_shipped_pr_verify_probe.py.
+export CHECK_SHIPPED_VERIFY_DISABLE=1
+
 # Path to the mock gh script that test cases overwrite.
 MOCK_GH="$MOCK_BIN_DIR/gh"
 
@@ -1262,6 +1271,121 @@ if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3319"* ]
 else
     fail "audit-class mixed ADDED+MODIFIED clears threshold (regression #4501)" "exit=$exit_code output=$output"
 fi
+
+# ─── Test 30: Verify-clause content probe matches #2828 ↔ PR #3215 (#4472) ─
+
+# AC1 of #4472: extending check-shipped-pr.sh with a content-channel
+# probe that runs the AC's literal Verify clause against origin/main
+# must catch the canonical case from issue #2828. Issue body cites
+# `scripts/dispatcher/tests/test_daemon_phase3a.py` as a *guess* at the
+# new test file's path — the actual PR (#3215) landed at
+# `test_daemon_phase_argv_allowlist.py`. Path-overlap returns zero hits
+# because the issue's path guess and the PR's actual filename don't
+# match. The AC's literal Verify line —
+#   `grep "ALLOWED_CLAUDE_FLAGS" scripts/dispatcher/tests/`
+# — matches in origin/main today, and `git log -S 'ALLOWED_CLAUDE_FLAGS'`
+# resolves the introducing commit's PR as #3215.
+#
+# This test runs WITHOUT the CHECK_SHIPPED_VERIFY_DISABLE opt-out so the
+# verify-channel actually executes. It runs grep + git log against the
+# real worktree (the worktree this test executes from) — both are
+# read-only, so no side effects. The mock gh is only used to feed the
+# issue body to the wrapper.
+unset CHECK_SHIPPED_VERIFY_DISABLE
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            # Issue #2828 body — abbreviated to the AC bullet that
+            # carries the load-bearing Verify clause.
+            cat << 'JSON'
+{"body": "## Acceptance criteria\n\n- [ ] Unit test asserts all flags in the phase-subprocess argv are in an explicit allowlist.\n  **Verify:** `grep \"ALLOWED_CLAUDE_FLAGS\" scripts/dispatcher/tests/` returns a match.\n- [ ] Allowlist contains -p, --max-turns, --model.\n", "title": "test(dispatcher): lock claude -p argv flags to an allowlist", "createdAt": "2026-04-19T15:49:13Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api|pr)
+        # The verify-channel short-circuits before the wrapper reaches
+        # the path-overlap section; these handlers should not be called.
+        # Return empty / error to avoid masking a regression in the
+        # short-circuit path.
+        exit 1
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2828 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3215"* && "$output" == *"Verify-clause probe"* ]]; then
+    pass "verify-channel probe resolves #2828 ↔ PR #3215 via grep clause (regression #4472, AC1)"
+else
+    fail "verify-channel probe resolves #2828 ↔ PR #3215 via grep clause (regression #4472, AC1)" "exit=$exit_code output=$output"
+fi
+
+# Re-disable for any remaining tests (defensive — this is the last test
+# before the summary, but make the env state explicit for future
+# extensions).
+export CHECK_SHIPPED_VERIFY_DISABLE=1
+
+# ─── Test 31: Verify-channel falls through when no Verify clause (#4472) ──
+
+# AC5 of #4472: an issue body with NO literal `Verify:` clause must NOT
+# be affected by the new probe — the wrapper falls through to the path-
+# overlap channel as before. Locks in that the probe is purely additive:
+# issues that the path-overlap channel already classifies correctly
+# (exit 0 / shipped or exit 1 / not-shipped) keep classifying the same
+# way. This guards against the failure mode where a poorly-targeted
+# verify probe over-fires on incidental text.
+#
+# We re-use the high-confidence shipped fixture from Test 3 — issue
+# body cites `scripts/foo.sh`, no Verify line at all, mock PR #3229
+# added the file. Expectation: shipped (via path-overlap), with the
+# verify-channel exiting 1 (no match) on a body that has no Verify
+# clauses to probe.
+unset CHECK_SHIPPED_VERIFY_DISABLE
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            # Body has NO `Verify:` clauses — verify-channel must miss.
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: add scripts/foo.sh"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Closes the widget loop (#3229)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-04-24T15:39:47Z", "number": 3229, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+# Path-overlap channel must fire (note: NOT the verify-channel — the
+# `Verify-clause probe` substring must NOT appear).
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3229"* && "$output" != *"Verify-clause probe"* ]]; then
+    pass "no-Verify-clause issue still resolves via path-overlap channel (regression #4472, AC5)"
+else
+    fail "no-Verify-clause issue still resolves via path-overlap channel (regression #4472, AC5)" "exit=$exit_code output=$output"
+fi
+
+export CHECK_SHIPPED_VERIFY_DISABLE=1
 
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
