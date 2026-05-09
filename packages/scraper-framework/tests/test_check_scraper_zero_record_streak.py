@@ -322,15 +322,20 @@ class TestModuleExclusions:
         """Quarterly cadence — most runs legitimately return zero."""
         assert "ca-governor-appointments" in zrs.EXCLUSIONS
 
-    def test_excludes_ca_sd_calendar_pending_4539(self) -> None:
-        """ca-sd-calendar is excluded as the structural day_numbers=[2] fix
-        in #4539 is pending. The entry MUST be removed once #4539 ships
-        (the day_numbers default flips to ``[1, 2, 3, 4, 5]`` and the
-        Friday-clustered motion calendar is captured on every run day).
-        See #4531 for the originating alert.
+    def test_does_not_exclude_ca_sd_calendar_after_4539(self) -> None:
+        """ca-sd-calendar must NOT be in EXCLUSIONS now that #4539 has
+        shipped. The structural fix flipped the ``day_numbers`` default
+        from ``[2]`` to ``[1, 2, 3, 4, 5]`` so the Friday-clustered
+        motion calendar is captured on every run day, restoring the
+        silent-outage guard for this scraper. Re-adding ``ca-sd-calendar``
+        to EXCLUSIONS without a fresh tracked root-cause follow-up is
+        the failure mode this test guards against. See #4531 for the
+        originating alert and #4539 for the structural fix.
         """
-        assert "ca-sd-calendar" in zrs.EXCLUSIONS, (
-            "ca-sd-calendar must remain in EXCLUSIONS until #4539 ships"
+        assert "ca-sd-calendar" not in zrs.EXCLUSIONS, (
+            "ca-sd-calendar must NOT be in EXCLUSIONS after #4539 — the "
+            "structural day_numbers fix shipped and the silent-outage "
+            "guard must remain active for this scraper"
         )
 
 

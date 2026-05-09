@@ -494,8 +494,16 @@ class SDCalendarScraper(BaseScraper):
         **kwargs: Any,
     ) -> None:
         super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
-        # Which day numbers (1-5) to fetch.  Default: [2] (tomorrow).
-        self._day_numbers = day_numbers or [2]
+        # Which day numbers (1-5) to fetch.  Default: ``[1, 2, 3, 4, 5]`` —
+        # the full Mon-Fri rolling window. The San Diego calendar publishes
+        # ``f_svcal{1-5}.html`` etc. as a 5-business-day window where motion
+        # hearings cluster heavily on Fridays. Fetching only one day (the
+        # prior ``[2]`` default) meant Mon/Sat/Sun runs returned 0 records
+        # — the structural fix in #4539 captures the full window so the
+        # latest Friday calendar (the high-yield page) is always in scope
+        # regardless of which weekday the run executes. See #4531 for the
+        # originating silent-outage alert.
+        self._day_numbers = day_numbers or [1, 2, 3, 4, 5]
 
     def _build_urls(self) -> list[tuple[str, str]]:
         """Build (url, division_name) pairs for all divisions and day numbers."""
