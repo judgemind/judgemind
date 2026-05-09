@@ -134,6 +134,11 @@ SKIP_LIST=(
     "check-scraper-zero-record-runner.py"
     "check-scraper-zero-record-streak.py"
     "check-short-unsubstantive-rulings.py"
+    # check-fix-block-coverage.py needs one of --check / --regenerate /
+    # --print as a required mutually-exclusive argument; blind invocation
+    # exits 2 with "one of the arguments --check --regenerate --print is
+    # required". The CI step runs it explicitly as `--check`.
+    "check-fix-block-coverage.py"
 )
 
 # is_in_skip_list <basename> -> 0 if skipped, 1 otherwise

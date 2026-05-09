@@ -2202,6 +2202,22 @@ jobs:
         run: scripts/check-fix-block-coverage-complete.sh
 
   # ---------------------------------------------------------------
+  # Fix-block coverage verdict guard: every row in
+  # docs/dx/check-script-fix-block-coverage.md must carry a Verdict
+  # column matching the classifier output of
+  # scripts/check-fix-block-coverage.py --check. This is the orthogonal
+  # invariant to the row-presence check above (#4367 / #23a) — presence
+  # is necessary but not sufficient; the verdict has to track reality.
+  # See #4349.
+  # ---------------------------------------------------------------
+  dx-fix-block-coverage-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify inventory verdicts match classifier output
+        run: python3 scripts/check-fix-block-coverage.py --check
+
+  # ---------------------------------------------------------------
   # CI-guards SKIP_LIST coverage: every argument-required hygiene guard
   # under scripts/check-*.{sh,py} must be in run-ci-guards.sh's SKIP_LIST
   # or carry a `# ci-guards: skip` marker. Without this, the umbrella
@@ -2311,6 +2327,7 @@ jobs:
       - removed-exports-check
       - vitest-environment-deps-check
       - fix-block-coverage-complete-check
+      - dx-fix-block-coverage-check
       - ci-guards-skip-list-coverage-check
     if: always()
     runs-on: ubuntu-latest
