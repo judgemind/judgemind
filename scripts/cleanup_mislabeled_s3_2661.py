@@ -30,13 +30,21 @@ This script does **two passes**:
    the mislabels via ``s3.delete_objects`` (1000/batch).
 
 Usage:
+    # --dry-run is read-only -- runs under the default scraper role.
     scripts/ecs-run-task.sh scripts/cleanup_mislabeled_s3_2661.py -- --dry-run
-    scripts/ecs-run-task.sh scripts/cleanup_mislabeled_s3_2661.py -- --apply
-    scripts/ecs-run-task.sh scripts/cleanup_mislabeled_s3_2661.py -- --apply --county santa_clara
+
+    # --apply requires s3:DeleteObject -- pass --role to assume the
+    # narrow cleanup role (judgemind-s3-cleanup-dev, see #4440).
+    scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev \\
+        scripts/cleanup_mislabeled_s3_2661.py -- --apply
+    scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev \\
+        scripts/cleanup_mislabeled_s3_2661.py -- --apply --county santa_clara
 
 Options:
     --dry-run   List mislabels grouped by county; do not delete (default).
     --apply     Run DB safety check and, if it passes, delete the mislabels.
+                Requires the judgemind-s3-cleanup-dev IAM role -- the
+                default scraper role does NOT grant s3:DeleteObject.
     --county    Restrict to a single county (e.g. santa_clara, orange).
     --state     State prefix to scan (default: ca).
     --bucket    S3 bucket to scan (default: $S3_BUCKET or judgemind-document-archive-dev).

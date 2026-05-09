@@ -70,6 +70,17 @@ module "iam_agent" {
   scraper_role_arn            = module.iam_scraper.role_arn
 }
 
+# Narrow IAM role for one-off raw-prefix S3 cleanup scripts (#4440).
+# Used via `scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev` for
+# scripts/cleanup_mislabeled_s3_2661.py (#2661) and similar future
+# `ca/{county}/{court}/raw/*` cleanup classes. Dev-only by design.
+module "iam_s3_cleanup" {
+  source = "../../modules/iam_s3_cleanup"
+
+  environment                 = "dev"
+  document_archive_bucket_arn = module.document_archive.bucket_arn
+}
+
 module "database" {
   source = "../../modules/database"
 
@@ -761,6 +772,11 @@ output "scraper_role_arn" {
 output "agent_role_arn" {
   description = "Dev agent IAM role ARN -- copy into ~/.aws/config as role_arn for the judgemind-agent profile"
   value       = module.iam_agent.role_arn
+}
+
+output "s3_cleanup_role_arn" {
+  description = "Dev s3-cleanup IAM role ARN -- pass to scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev for raw-prefix cleanup scripts (#4440)"
+  value       = module.iam_s3_cleanup.role_arn
 }
 
 output "scraper_instance_profile_arn" {
