@@ -58,6 +58,26 @@ def main() -> int:
     if verify_clause:
         summary["verify_clause"] = verify_clause
 
+    # Retrospective-lineage channel (#4515). When the wrapper resolved
+    # the match via _check_shipped_pr_lineage_probe.py rather than the
+    # path-overlap channel, the sibling retrospective issue and the
+    # comma-separated identifier overlap that fired are passed through
+    # these env vars so the JSON summary can name them. Empty strings
+    # → no lineage-channel match → fields are omitted (preserves the
+    # pre-#4515 JSON shape for path-overlap-driven and verify-driven
+    # matches that downstream consumers already parse).
+    lineage_sibling = os.environ.get("CHECK_SHIPPED_LINEAGE_SIBLING", "")
+    if lineage_sibling:
+        try:
+            summary["lineage_sibling"] = int(lineage_sibling)
+        except ValueError:
+            summary["lineage_sibling"] = lineage_sibling
+    lineage_identifiers_csv = os.environ.get("CHECK_SHIPPED_LINEAGE_IDENTIFIERS", "")
+    if lineage_identifiers_csv:
+        summary["lineage_identifiers"] = [
+            tok for tok in lineage_identifiers_csv.split(",") if tok
+        ]
+
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

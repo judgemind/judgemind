@@ -62,6 +62,16 @@ export PATH="$MOCK_BIN_DIR:$ORIG_PATH_SAVE"
 # its own dedicated unit tests in test_check_shipped_pr_verify_probe.py.
 export CHECK_SHIPPED_VERIFY_DISABLE=1
 
+# Disable the retrospective-lineage probe (#4515) for the path-overlap
+# integration tests. None of the fixture issue bodies below contain a
+# ``Found by: retrospective on #N`` line, so the probe would extract
+# zero parents and return None without making gh calls — but the
+# explicit opt-out keeps the integration tests insulated from any
+# future changes to the lineage-probe trigger conditions. The lineage
+# channel has its own dedicated unit tests in
+# test_check_shipped_pr_lineage_probe.py.
+export CHECK_SHIPPED_LINEAGE_DISABLE=1
+
 # Path to the mock gh script that test cases overwrite.
 MOCK_GH="$MOCK_BIN_DIR/gh"
 
@@ -1386,6 +1396,205 @@ else
 fi
 
 export CHECK_SHIPPED_VERIFY_DISABLE=1
+
+# ─── Test 32: lineage probe matches #4315 ↔ PR #4345 (#4515) ──────────────
+
+# Regression for #4515 (this test). Issue body has
+# ``Found by: retrospective on #4304.`` and mentions ``_DATACLASS_SCOPE``
+# in backticks. The mock gh:
+#   - search issues → returns sibling #4322
+#   - issue view 4322 --json closedByPullRequestsReferences → PR #4345
+#   - pr view 4345 --json body,mergedAt,baseRefName → eligible, body
+#     mentions ``_DATACLASS_SCOPE``
+# Expected: shipped match via lineage probe, PR #4345 named, output
+# contains "lineage probe" and the sibling number.
+#
+# This test runs the lineage channel without the verify channel
+# disabled — but the issue body has no Verify: lines, so the verify
+# channel falls through.
+unset CHECK_SHIPPED_VERIFY_DISABLE
+unset CHECK_SHIPPED_LINEAGE_DISABLE
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            # The wrapper's first call (in step 1 of the algorithm)
+            # fetches body,title,createdAt for the issue under check.
+            # The lineage probe's call later (in find_closing_pr) fetches
+            # the SIBLING'S closedByPullRequestsReferences. We dispatch
+            # by --json field signature to disambiguate.
+            for arg in "$@"; do
+                if [[ "$arg" == "closedByPullRequestsReferences" ]]; then
+                    cat << 'JSON'
+{"closedByPullRequestsReferences": [{"number": 4345, "state": "MERGED"}]}
+JSON
+                    exit 0
+                fi
+            done
+            cat << 'JSON'
+{"body": "## Description\n\nWhen a new `*SplitRuling` dataclass is missing from `_DATACLASS_SCOPE`, emit a paste-ready hint.\n\nFound by: retrospective on #4304.", "title": "fix(dx): paste-ready hint for SplitRuling propagation", "createdAt": "2026-05-08T16:18:34Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    search)
+        if [[ "${2:-}" == "issues" ]]; then
+            # Single sibling — issue #4322 — found in retrospective lineage.
+            echo '[{"number": 4322}]'
+            exit 0
+        fi
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "## Summary\n\nMake `_DATACLASS_SCOPE` self-diagnosing for new `*SplitRuling` dataclasses.\n\nCloses #4322", "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4315 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"4345"* && "$output" == *"lineage probe"* && "$output" == *"4322"* ]]; then
+    pass "lineage probe resolves #4315 ↔ PR #4345 via sibling #4322 (regression #4515 AC1)"
+else
+    fail "lineage probe resolves #4315 ↔ PR #4345 via sibling #4322 (regression #4515 AC1)" "exit=$exit_code output=$output"
+fi
+
+# Verify the JSON summary names the lineage sibling and identifiers.
+if [[ "$output" == *'"lineage_sibling": 4322'* ]]; then
+    pass "JSON summary names the lineage sibling (#4515 AC1)"
+else
+    fail "JSON summary names the lineage sibling (#4515 AC1)" "got: $output"
+fi
+
+if [[ "$output" == *'"lineage_identifiers"'* ]]; then
+    pass "JSON summary includes lineage_identifiers (#4515 AC1)"
+else
+    fail "JSON summary includes lineage_identifiers (#4515 AC1)" "got: $output"
+fi
+
+# ─── Test 33: lineage probe — sibling describes different lesson (#4515 AC2) ─
+
+# Precision case. Issue has retrospective lineage AND a sibling has
+# shipped, BUT the sibling's PR body shares NO backtick-wrapped
+# identifiers with the current issue. The lineage channel must NOT
+# fire — fall through to path-overlap.
+#
+# Mock the issue body with ``_DATACLASS_SCOPE`` and the PR body with
+# ``_REGEX_VALIDATOR`` (different lesson, no overlap). The path-overlap
+# channel will also miss because the issue body has no candidate file
+# paths matching the PR's diff (we don't return a `gh api commits`
+# response for the issue's path).
+unset CHECK_SHIPPED_VERIFY_DISABLE
+unset CHECK_SHIPPED_LINEAGE_DISABLE
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            for arg in "$@"; do
+                if [[ "$arg" == "closedByPullRequestsReferences" ]]; then
+                    cat << 'JSON'
+{"closedByPullRequestsReferences": [{"number": 4400, "state": "MERGED"}]}
+JSON
+                    exit 0
+                fi
+            done
+            cat << 'JSON'
+{"body": "Update `_DATACLASS_SCOPE` to include the new entry.\n\nFound by: retrospective on #4304.", "title": "fix(dx): dataclass scope hint", "createdAt": "2026-05-08T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    search)
+        if [[ "${2:-}" == "issues" ]]; then
+            # Sibling found, but it ships a different lesson.
+            echo '[{"number": 4399}]'
+            exit 0
+        fi
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Tighten the `_REGEX_VALIDATOR` for trailing whitespace.\n\nCloses #4399", "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        # No commits touched the issue's candidate paths — empty.
+        exit 0
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4515 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "lineage probe does NOT fire when sibling describes a different lesson (#4515 AC2)"
+else
+    fail "lineage probe does NOT fire when sibling describes a different lesson (#4515 AC2)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 34: lineage probe — no retrospective lineage (#4515 AC3) ────────
+
+# Regression for AC3: an issue body without a ``Found by: retrospective
+# on #N`` line must NOT activate the lineage probe — the probe extracts
+# zero parents and returns empty. The wrapper falls through to the
+# path-overlap channel as before. Locks in that the lineage channel is
+# purely additive.
+#
+# We re-use the high-confidence shipped fixture from Test 3 — issue
+# body has no Found-by line, mock PR #3229 added the file. Expectation:
+# shipped via path-overlap (no "lineage probe" string in output).
+unset CHECK_SHIPPED_VERIFY_DISABLE
+unset CHECK_SHIPPED_LINEAGE_DISABLE
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: add scripts/foo.sh"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "Closes the widget loop (#3229)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-04-24T15:39:47Z", "number": 3229, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3229"* && "$output" != *"lineage probe"* ]]; then
+    pass "no-retrospective-lineage issue still resolves via path-overlap channel (#4515 AC3)"
+else
+    fail "no-retrospective-lineage issue still resolves via path-overlap channel (#4515 AC3)" "exit=$exit_code output=$output"
+fi
+
+export CHECK_SHIPPED_VERIFY_DISABLE=1
+export CHECK_SHIPPED_LINEAGE_DISABLE=1
 
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"

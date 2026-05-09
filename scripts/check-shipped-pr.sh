@@ -30,8 +30,21 @@
 #      name) and the actual PR uses a different filename than the
 #      issue body's prose — issue #2828 ↔ PR #3215 is the worked
 #      example.
-#   3. **Fallback — path-overlap channel.** When step 2 returns no
-#      match, fall through to the original heuristic:
+#   3. **Retrospective-lineage probe (#4515).** When step 2 returns no
+#      match, run the lineage probe via _check_shipped_pr_lineage_probe.
+#      py. The probe extracts ``Found by: retrospective on #N`` parent
+#      references from the issue body, finds sibling retrospective
+#      issues against each parent, identifies the merged PR that closed
+#      each sibling, and checks identifier overlap (backtick-wrapped
+#      tokens) between the current-issue body and the candidate PR's
+#      body. On match, emits a `shipped:` line citing the lineage PR,
+#      short-circuiting the path-overlap pipeline. This catches the
+#      canonical retrospective-duplicate shape where two issues filed
+#      from the same parent retrospective describe the same lesson, one
+#      already merged — issue #4315 ↔ PR #4345 (via sibling #4322) is
+#      the worked example.
+#   4. **Fallback — path-overlap channel.** When steps 2 and 3 return
+#      no match, fall through to the original heuristic:
 #        a. Extract candidate file paths from the body using a fixed
 #           regex that covers the four conventional repo roots
 #           (scripts/, packages/, docs/, infra/) plus `.github/`. Each
@@ -58,7 +71,7 @@
 #           changeType:"ADDED" (or status: "added" from the raw GitHub
 #           REST API), falling back to a deletions==0 heuristic when
 #           neither authoritative signal is present.
-#   4. On match: print a `shipped:` line and a JSON summary to stdout,
+#   5. On match: print a `shipped:` line and a JSON summary to stdout,
 #      exit 0. On no match: print a `not-shipped:` line, exit 1. On
 #      error: print an `error:` line to stderr, exit 2.
 #
@@ -169,6 +182,73 @@ if [[ -z "$verify_probe_disabled" ]]; then
                             python3 "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_summary.py" \
                             2>/dev/null) || summary_json=""
             echo "shipped: PR #${verify_probe_pr} matches issue #${issue_num} via Verify-clause probe (${verify_probe_clause}) (exit 0)"
+            if [[ -n "$summary_json" ]]; then
+                echo "$summary_json"
+            fi
+            exit 0
+        fi
+    fi
+fi
+
+# ─── Retrospective-lineage probe (#4515) ──────────────────────────────────
+#
+# Before the path-overlap channel, run the retrospective-lineage probe.
+# The probe extracts ``Found by: retrospective on #N`` parent references
+# from the issue body, finds sibling retrospective issues against each
+# parent, identifies the merged PR that closed each sibling, and checks
+# identifier overlap (backtick-wrapped tokens) between the current-issue
+# body and the candidate PR's body.
+#
+# Concrete worked example: issue #4315 ↔ PR #4345 ↔ sibling #4322.
+#   - #4315 body has ``Found by: retrospective on #4304.``
+#   - sibling #4322 closed by PR #4345 (``Closes #4322``)
+#   - identifier overlap between #4315 body and PR #4345 body
+#   - → emit ``shipped: PR #4345 matches issue #4315 via lineage probe``
+#
+# Exit codes from the helper:
+#   0 — match. Stdout: ``shipped:<pr>\t<sibling>\t<identifiers>``.
+#   1 — no match. Stdout empty. Caller falls through to path-overlap.
+#   2 — error / malformed input. Stdout empty. Caller falls through too.
+#
+# Opt-out via env var (mirrors the verify-probe knob). Tests that mock
+# only path-overlap responses set CHECK_SHIPPED_LINEAGE_DISABLE=1 to
+# avoid the additional gh search/issue/pr calls the probe would make.
+lineage_probe_disabled="${CHECK_SHIPPED_LINEAGE_DISABLE:-}"
+if [[ -z "$lineage_probe_disabled" ]]; then
+    lineage_probe_out=""
+    lineage_probe_exit=0
+    lineage_probe_out=$(printf '%s' "$issue_json" | \
+        CHECK_SHIPPED_LINEAGE_REPO="$REPO" \
+        CHECK_SHIPPED_LINEAGE_GH_BIN="$GH_BIN" \
+        CHECK_SHIPPED_LINEAGE_ISSUE="$issue_num" \
+        python3 \
+        "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_lineage_probe.py" \
+        2>/dev/null) || lineage_probe_exit=$?
+    if [[ "$lineage_probe_exit" -eq 0 && "$lineage_probe_out" == shipped:* ]]; then
+        # Parse `shipped:<pr>\t<sibling>\t<identifiers>` — split on tabs.
+        # The wrapper does NOT use IFS=$'\t' read because that consumes
+        # an outer subshell; manual ${var%%\t*} splits keep the parsing
+        # in this shell so a malformed line cannot wedge the wrapper.
+        rest="${lineage_probe_out#shipped:}"
+        lineage_probe_pr="${rest%%$'\t'*}"
+        rest2="${rest#*$'\t'}"
+        lineage_probe_sibling="${rest2%%$'\t'*}"
+        lineage_probe_identifiers=""
+        if [[ "$rest2" == *$'\t'* ]]; then
+            lineage_probe_identifiers="${rest2#*$'\t'}"
+        fi
+        if [[ "$lineage_probe_pr" =~ ^[0-9]+$ ]]; then
+            summary_json=$(CHECK_SHIPPED_ISSUE="$issue_num" \
+                            CHECK_SHIPPED_PR="$lineage_probe_pr" \
+                            CHECK_SHIPPED_OVERLAP_COUNT="0" \
+                            CHECK_SHIPPED_OVERLAP_FILES="" \
+                            CHECK_SHIPPED_ADDED_FILES="" \
+                            CHECK_SHIPPED_CANDIDATE_FILES="" \
+                            CHECK_SHIPPED_LINEAGE_SIBLING="$lineage_probe_sibling" \
+                            CHECK_SHIPPED_LINEAGE_IDENTIFIERS="$lineage_probe_identifiers" \
+                            python3 "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_summary.py" \
+                            2>/dev/null) || summary_json=""
+            echo "shipped: PR #${lineage_probe_pr} matches issue #${issue_num} via lineage probe (sibling retrospective #${lineage_probe_sibling}) (exit 0)"
             if [[ -n "$summary_json" ]]; then
                 echo "$summary_json"
             fi
