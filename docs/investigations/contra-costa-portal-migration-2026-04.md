@@ -208,11 +208,27 @@ No existing docstring is immediately contradicted today (the retired site still 
 Filed as sub-tasks of #2601. Each is independently pickup-able.
 
 - **[follow-up 1 — Phase 1 scraper]** Implement `cc_tentatives_portal.py` scraper targeting `/tentative-rulings` with per-judge enumeration. Details in the filed issue.
-- **[follow-up 2 — Phase 2 dual-run]** Add dual-run orchestration: both `ca-cc-tentatives` and `ca-cc-tentatives-portal` run in parallel, with a daily diff report.
+- **[follow-up 2 — Phase 2 dual-run]** Add dual-run orchestration: both `ca-cc-tentatives` and `ca-cc-tentatives-portal` run in parallel, with a daily diff report. **(Shipped, see "Phase 2 status" below.)**
 - **[follow-up 3 — Phase 3 cutover]** Retire the `retired.cc-courts.org` scraper once new portal has full coverage. Keep behind an env flag for rollback.
 - **[follow-up 4 — Department reassignment data migration]** Update `derived.courts` to reflect the announced dept reassignments; rebuild affected docs.
 - **[follow-up 5 — Fixture capture]** Capture fresh fixtures from the new portal (listing page, detail page, PDF) for regression tests.
 - **[follow-up 6 — Monitor the retired site]** Add a lightweight check that alerts if `retired.cc-courts.org` starts returning redirects to the new portal or 404s on the index page — an early sunset signal.
+
+---
+
+## Phase 2 status — dual-run wiring landed (2026-05-08)
+
+**Issue:** [#2610](https://github.com/judgemind/judgemind/issues/2610) — CC Dual-Run Diff: wire up daily diff job comparing both CC scrapers.
+
+Phase 2 dual-run validation is wired up. The following landed:
+
+- **`packages/scraper-framework/src/framework/dual_run_diff.py`** — pure logic module (`Capture`, `DiffRow`, `compute_per_department_diff`, `format_summary`). No DB imports; fully unit-tested.
+- **`scripts/check-cc-dual-run-diff.py`** — ECS oneshot script (`# venv: scraper-framework`, `# permanent: true`). Queries `derived.documents` for both `ca-cc-tentatives` and `ca-cc-tentatives-portal`, computes per-department diff, writes one row to `telemetry.data_quality_metrics` (`metric_name='cc_dual_run_diff'`, `county='contra_costa'`). Exits 0 if healthy, 1 if any `missing_portal` dept, 2 if `DATABASE_URL` not set.
+- **`packages/scraper-framework/tests/test_dual_run_diff.py`** — 21 unit tests covering AC#2 (per-dept diff), AC#3 (missing_portal flag), AC#4 (new_portal_coverage flag), date filtering, case-level set differences, and `format_summary`.
+- **`packages/scraper-framework/tests/test_check_cc_dual_run_diff.py`** — 8 integration tests covering CLI argparse, JSON output shape, exit-code semantics (0/1/2), and DB write verification.
+- **`.github/workflows/cc-dual-run-diff.yml`** — daily scheduled GitHub Action that runs the check on ECS, files an `agent/ready` issue on a missing-portal breach (deduped via the `cc-dual-run-alert` label), updates an existing alert issue if still in breach, auto-closes it when healthy again, and emits a Telegram heartbeat on transitions.
+
+Both scrapers (`ca-cc-tentatives` and `ca-cc-tentatives-portal`) are registered in `packages/scraper-framework/src/framework/runner.py` and run on the twice-daily production schedule (`poll_interval_seconds=43200` in each scraper's `ScraperConfig`). AC#5 (telemetry channel) is satisfied via the `telemetry.data_quality_metrics` row plus the dashboard / GitHub-issue alert path described above — no new channel is invented.
 
 ---
 
