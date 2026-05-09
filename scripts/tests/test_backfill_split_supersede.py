@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, patch
 # scripts-tests environment.
 # ---------------------------------------------------------------------------
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "archive"))
 
 _mock_psycopg = MagicMock()
 _mock_structlog = MagicMock()
