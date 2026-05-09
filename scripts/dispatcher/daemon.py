@@ -2140,7 +2140,7 @@ STUCK_TIMEOUT_ALERT_WINDOW_SECONDS = 600
 #: with full toolset (Bash/Edit/Write/Agent/MCP/git/gh/aws), which can
 #: take materially longer than the pre-#3366 read-only reasoning. The
 #: timeout is bumped to 90 minutes to accommodate sub-skill
-#: invocations (``/task-v2-fix-conflict``, ``/tdd``, ``/ralph``) and
+#: invocations (``/task-v2-fix-conflict``, ``/ralph``) and
 #: real diagnostic work (commit a fix, file a prerequisite).
 #:
 #: Issue #3376: with the async fire-and-forget spawn, this is
