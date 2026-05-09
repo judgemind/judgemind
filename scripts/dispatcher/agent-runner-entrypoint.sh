@@ -725,6 +725,23 @@ import sys
 from pathlib import Path
 
 
+# Locate scripts/dispatcher/ on sys.path so the shim can import the
+# canonical CI-classifier helper from phase_transitions.py — single
+# source of truth across the daemon (subprocess) and entrypoint
+# (Fargate) paths.  In the deployed agent-runner image the dispatcher
+# directory lives at /app/scripts/dispatcher/ (see
+# Dockerfile.dispatcher-agent-runner). In tests we fall back to the
+# repo's ``scripts/dispatcher`` directory relative to ``REPO_ROOT``.
+# #4417: pre-refactor the shim spelled out its own ``failure_conclusions``
+# set; shared helper eliminates the divergence vector.
+for _candidate in (
+    Path("/app/scripts/dispatcher"),
+    Path(os.environ.get("REPO_ROOT", "")) / "scripts" / "dispatcher",
+):
+    if _candidate.is_dir() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+
+
 # Cap on failing jobs embedded in fix-ci input — mirrors the daemon's
 # ``FIX_CI_MAX_FAILING_JOBS`` constant. Keeps the payload bounded when
 # a PR has dozens of red checks (e.g. matrix explosions).
@@ -1129,39 +1146,22 @@ def _fetch_pr_diff(repo: str, pr_number: int) -> str:
 
 
 def _extract_failing_jobs(pr_status: dict) -> list[dict]:
-    """Mirror DispatcherDaemon._extract_failing_jobs (pre-log-tail).
+    """Delegate to phase_transitions.extract_failing_jobs (#4417).
 
-    Returns up to ``FIX_CI_MAX_FAILING_JOBS`` entries.
-
-    ``CANCELLED`` is intentionally excluded (#4414) — it is
-    non-blocking per the canonical merge gate and not a failure to
-    fix. Matches ``DispatcherDaemon._extract_failing_jobs``.
+    Returns up to ``FIX_CI_MAX_FAILING_JOBS`` entries. The canonical
+    failure-conclusion vocabulary lives in
+    ``phase_transitions._CI_FAILURE_CONCLUSIONS`` so the daemon
+    (subprocess path) and the Fargate agent-runner (this shim)
+    classify identically. ``CANCELLED`` is intentionally excluded
+    (#4414).
     """
-    failure_conclusions = {
-        "FAILURE",
-        "TIMED_OUT",
-        "ACTION_REQUIRED",
-        "STARTUP_FAILURE",
-    }
-    rollup = pr_status.get("statusCheckRollup") or []
-    failing: list[dict] = []
-    for check in rollup:
-        if not isinstance(check, dict):
-            continue
-        conclusion = str(check.get("conclusion") or "").upper()
-        status = str(check.get("status") or "").upper()
-        if status == "COMPLETED" and conclusion in failure_conclusions:
-            failing.append(
-                {
-                    "name": check.get("name") or check.get("context") or "",
-                    "conclusion": conclusion,
-                    "databaseId": check.get("databaseId"),
-                    "detailsUrl": check.get("detailsUrl"),
-                }
-            )
-        if len(failing) >= FIX_CI_MAX_FAILING_JOBS:
-            break
-    return failing
+    # Late import — keeps the shim importable in environments where
+    # ``scripts/dispatcher/`` is not on sys.path (the sys.path push
+    # at module top runs unconditionally, but defensive import here
+    # makes test fixtures simpler too).
+    from phase_transitions import extract_failing_jobs
+
+    return extract_failing_jobs(pr_status, max_jobs=FIX_CI_MAX_FAILING_JOBS)
 
 
 def _fetch_job_log_tail(repo: str, job_database_id) -> str:
@@ -4307,71 +4307,25 @@ read_pr_number() {
 classify_pr_rollup() {
     # $1 = path to ``gh pr view --json ... ,statusCheckRollup,mergeable,
     # mergeStateStatus`` stdout. Prints one of: green / red / pending /
-    # error. Mirrors ``_ci_rollup_state`` in phase_transitions.py so
-    # the ECS path uses the same merge gate as subprocess mode.
+    # error. Delegates to scripts/dispatcher/ci_classifier_cli.py — the
+    # canonical Python implementation lives in
+    # phase_transitions._ci_rollup_state and is shared with the daemon
+    # (subprocess path) and worker-status.sh (operator dashboard) so
+    # all four pre-#4417 sites resolve to the same classification.
     #
-    # statusCheckRollup is a heterogeneous list:
-    #   * CheckRun entries have ``.status`` + ``.conclusion`` (GitHub
-    #     Actions, container-based check runs).
-    #   * StatusContext entries have ``.state`` only (commit-status API,
-    #     third-party integrations like Vercel).
-    #
-    # We branch on ``.__typename`` so Vercel-style StatusContext entries
-    # classify correctly. Before #3200 the jq program only looked at
-    # ``.status`` + ``.conclusion`` and fell through to "pending" for
-    # any StatusContext entry — so every PR that exposed a Vercel
-    # status stayed pending forever and every ECS agent timed out.
+    # The entrypoint already invokes python3 for transition + phase-input
+    # shims (see _setup_transition_shim / _setup_phase_input_shim above),
+    # so the dependency surface is unchanged. Pre-#4417 a 60-line jq
+    # program lived here — it diverged from the Python rule on STALE
+    # handling and required parallel fixes for #4407 / #4414. The
+    # CLI eliminates that divergence vector.
     _status_file="$1"
     if [[ ! -s "$_status_file" ]]; then
         printf 'error'
         return 0
     fi
-    # Classify via a jq program rather than parsing in bash — keeps the
-    # logic declarative and bash-3.2 friendly.
-    _state=$(jq -r '
-        def classify:
-            (.statusCheckRollup // []) as $rollup
-            | ($rollup | map(select(type == "object"))) as $checks
-            | ([$checks[]
-                | (.__typename // "" | ascii_upcase) as $tn
-                | if $tn == "STATUSCONTEXT" then
-                      # Commit-status API entries (Vercel, etc.): only
-                      # ``.state`` is populated. State vocabulary:
-                      # EXPECTED / PENDING / SUCCESS / FAILURE / ERROR.
-                      (.state // "" | ascii_upcase) as $cs
-                      | if ($cs == "FAILURE" or $cs == "ERROR") then "red"
-                        elif ($cs == "SUCCESS" or $cs == "NEUTRAL") then "ok"
-                        else "pending" end
-                  else
-                      # CheckRun (default) — the pre-#3200 code path.
-                      # CANCELLED is non-blocking (#4414): typical Vercel
-                      # ``concurrency: cancel-in-progress`` cancels surface
-                      # here when a newer push supersedes a deploy. Treat
-                      # as skip-equivalent ("ok"), matching
-                      # phase_transitions._CI_CANCELLED_CONCLUSIONS and
-                      # scripts/wait-for-ci.sh (#4407).
-                      (.status // "" | ascii_upcase) as $st
-                      | (.conclusion // "" | ascii_upcase) as $co
-                      | if $st == "COMPLETED" then
-                            if ($co == "FAILURE" or $co == "TIMED_OUT"
-                                or $co == "ACTION_REQUIRED"
-                                or $co == "STARTUP_FAILURE") then "red"
-                            elif ($co == "SUCCESS" or $co == "SKIPPED"
-                                  or $co == "NEUTRAL" or $co == "STALE"
-                                  or $co == "CANCELLED") then "ok"
-                            else "red" end
-                        else "pending" end
-                  end]) as $outcomes
-            | if ($outcomes | index("red")) then "red"
-              elif ($outcomes | index("pending")) then "pending"
-              else
-                (.mergeable // "" | ascii_upcase) as $m
-                | (.mergeStateStatus // "" | ascii_upcase) as $ms
-                | if ($m == "MERGEABLE" and $ms == "CLEAN") then "green"
-                  else "pending" end
-              end;
-        classify
-    ' "$_status_file" 2>/dev/null || printf 'error')
+    _classifier_py="$(dirname "${BASH_SOURCE[0]}")/ci_classifier_cli.py"
+    _state=$(python3 "$_classifier_py" < "$_status_file" 2>/dev/null || printf 'error')
     if [[ -z "$_state" ]]; then
         printf 'error'
     else

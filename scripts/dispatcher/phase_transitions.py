@@ -1287,7 +1287,16 @@ _CI_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
 _CI_CANCELLED_CONCLUSIONS: frozenset[str] = frozenset({"CANCELLED"})
 
 #: Check-run conclusions that count as green.
-_CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
+#:
+#: ``STALE`` is included alongside ``SUCCESS`` / ``SKIPPED`` / ``NEUTRAL``
+#: so the canonical Python classifier matches the agent-runner's pre-#4417
+#: jq program and ``scripts/worker-status.sh``'s awk regex (neither of
+#: which treated ``STALE`` as a failure). #4417 unified all four sites
+#: on this single source of truth — diverging on ``STALE`` would have
+#: regressed the entrypoint + worker-status callers.
+_CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset(
+    {"SUCCESS", "SKIPPED", "NEUTRAL", "STALE"}
+)
 
 #: StatusContext (commit-status API, e.g. Vercel) states that count as red.
 _CI_STATUSCONTEXT_FAILURE_STATES: frozenset[str] = frozenset({"FAILURE", "ERROR"})
@@ -1389,6 +1398,62 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     if mergeable != "MERGEABLE" or merge_state != "CLEAN":
         return "pending"
     return "green"
+
+
+def extract_failing_jobs(
+    pr_status: Mapping[str, Any] | None,
+    *,
+    max_jobs: int | None = None,
+) -> list[dict[str, Any]]:
+    """Pull failing check-run entries out of a ``gh pr view`` rollup.
+
+    Single source of truth for "what counts as a failing job to feed
+    into ``/task-v2-fix-ci``" — used by both
+    :class:`DispatcherDaemon._extract_failing_jobs` (subprocess path)
+    and the Fargate ``agent-runner-entrypoint.sh`` Python helper
+    (``_extract_failing_jobs``).  Pre-#4417 each site spelled the
+    ``failure_conclusions`` set out independently; the duplication
+    bit twice on the ``CANCELLED``-handling rule (#4407 ↔ #4414) and
+    once more on the broader rollup classifier (#4417).
+
+    Returns a list of ``{name, conclusion, databaseId, detailsUrl}``
+    dicts.  ``CANCELLED`` is intentionally excluded (#4414) — it is
+    non-blocking per :data:`_CI_CANCELLED_CONCLUSIONS` and not a
+    failure to fix.
+
+    Parameters
+    ----------
+    pr_status:
+        ``gh pr view --json statusCheckRollup,...`` payload.
+    max_jobs:
+        Optional cap on the number of returned entries.  ``None``
+        (default) returns every failing job; daemon and entrypoint
+        callers both pass ``FIX_CI_MAX_FAILING_JOBS`` to bound the
+        payload size handed to ``/task-v2-fix-ci``.
+    """
+    if not pr_status:
+        return []
+    rollup = pr_status.get("statusCheckRollup") or []
+    if not isinstance(rollup, list):
+        return []
+    failing: list[dict[str, Any]] = []
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        conclusion = str(check.get("conclusion") or "").upper()
+        status = str(check.get("status") or "").upper()
+        if status == "COMPLETED" and conclusion in _CI_FAILURE_CONCLUSIONS:
+            failing.append(
+                {
+                    "name": check.get("name") or check.get("context") or "",
+                    "conclusion": conclusion,
+                    "databaseId": check.get("databaseId"),
+                    "detailsUrl": check.get("detailsUrl"),
+                }
+            )
+        if max_jobs is not None and len(failing) >= max_jobs:
+            break
+    return failing
 
 
 # ---------------------------------------------------------------------------
@@ -1602,4 +1667,6 @@ __all__ = [
     "is_terminal_phase",
     "is_terminal_status",
     "is_known_phase",
+    # CI-rollup classifier (single source of truth — #4417)
+    "extract_failing_jobs",
 ]
