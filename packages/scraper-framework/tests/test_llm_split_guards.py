@@ -57,16 +57,21 @@ def _load_registries() -> tuple[dict, dict]:
 
 
 def _llm_scraper_ids() -> list[str]:
-    """Return the list of canonical scraper_ids in ``_LLM_SPLIT_REGISTRY``.
+    """Return the list of scraper_ids in ``_LLM_SPLIT_REGISTRY`` that have a class.
 
-    Filters out alias entries — scraper_ids registered via a module's
-    ``_SPLIT_REGISTRY_ALIASES`` (e.g. ``rebuild-ca-<county>``, see #4331).
-    Aliases register the splitter callables but NOT a corresponding
-    ``_SCRAPER_REGISTRY`` class, because the rebuild path does not invoke
-    ``parse_document`` (audit / drain scripts only call the splitter
-    directly).  The pre-split guard test below operates on
-    ``parse_document`` source, so it must run only against canonical
-    scraper_ids that actually have a registered class.
+    Post-#4386 (PR #4394 / #4401), aliases registered via a module's
+    ``_SPLIT_REGISTRY_ALIASES`` (e.g. ``rebuild-ca-<county>``) ARE in
+    ``_SCRAPER_REGISTRY`` — the registry-loader runs every registration
+    through ``_register_with_aliases`` so canonical and alias keys land in
+    all three registries together.  This filter is still load-bearing for
+    a different reason: an alias may have an ``_LLM_SPLIT_REGISTRY`` entry
+    that resolves to one of the module's classes via the alias entry,
+    while the pre-split guard test below operates on ``parse_document``
+    source — so we want every yielded scraper_id to be one we can pull a
+    class for and ``inspect.getsource`` on without hitting None.
+
+    See ``docs/investigations/rebuild-pattern-scraper-id-audit-2026-05.md``
+    §4 for the post-#4386 docstring update rationale.
     """
     scraper_registry, llm = _load_registries()
     return sorted(sid for sid in llm if sid in scraper_registry)
