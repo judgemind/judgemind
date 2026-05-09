@@ -104,50 +104,54 @@ MOCKGH
 
 write_mock_gh '{"comments":[]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test3.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 1 && "$output" == *"clear:"* && "$output" == *"no-comments"* ]]; then
     pass "exits 1 with clear:no-comments when issue has no comments"
 else
-    fail "exits 1 with clear:no-comments when issue has no comments" "exit=$exit_code output='$output'"
+    fail "exits 1 with clear:no-comments when issue has no comments" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 4: exit 1 ("clear:no-marker") when comments lack the sentinel ─────
 
 write_mock_gh '{"comments":[{"author":{"login":"drewthaler"},"createdAt":"2026-05-01T00:00:00Z","body":"some other comment"}]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test4.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 1 && "$output" == *"clear:"* && "$output" == *"no-marker"* ]]; then
     pass "exits 1 with clear:no-marker when sentinel absent"
 else
-    fail "exits 1 with clear:no-marker when sentinel absent" "exit=$exit_code output='$output'"
+    fail "exits 1 with clear:no-marker when sentinel absent" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 5: exit 0 when latest non-bot comment carries the sentinel ────────
 
 write_mock_gh '{"comments":[{"author":{"login":"drewthaler"},"createdAt":"2026-04-23T00:00:00Z","body":"<!-- dispatcher-plan-blocked -->\nplan returned go=false\n<!-- dispatcher-plan-blocked-recommendation: operator-triage -->"}]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test5.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 0 && "$output" == *"plan-blocked:"* ]]; then
     pass "exits 0 with plan-blocked: line when sentinel present on latest comment"
 else
-    fail "exits 0 with plan-blocked: line when sentinel present on latest comment" "exit=$exit_code output='$output'"
+    fail "exits 0 with plan-blocked: line when sentinel present on latest comment" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 if [[ "$output" == *"operator-triage"* ]]; then
     pass "extracts recommendation token from footer"
 else
-    fail "extracts recommendation token from footer" "output='$output'"
+    fail "extracts recommendation token from footer" "output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 6: exit 1 ("clear:superseded") when a later human comment follows ─
 
 write_mock_gh '{"comments":[{"author":{"login":"drewthaler"},"createdAt":"2026-04-23T00:00:00Z","body":"<!-- dispatcher-plan-blocked -->\nplan reason"},{"author":{"login":"drewthaler"},"createdAt":"2026-04-24T00:00:00Z","body":"acknowledged, will re-scope"}]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test6.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 1 && "$output" == *"clear:"* && "$output" == *"superseded"* ]]; then
     pass "exits 1 with clear:superseded when later human comment follows the marker"
 else
-    fail "exits 1 with clear:superseded when later human comment follows the marker" "exit=$exit_code output='$output'"
+    fail "exits 1 with clear:superseded when later human comment follows the marker" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 7: bot comments are filtered out of the latest-comment pick ──────
@@ -156,11 +160,12 @@ fi
 # bot comment is filtered.
 write_mock_gh '{"comments":[{"author":{"login":"drewthaler"},"createdAt":"2026-04-23T00:00:00Z","body":"<!-- dispatcher-plan-blocked -->\nplan reason"},{"author":{"login":"github-actions[bot]"},"createdAt":"2026-04-24T00:00:00Z","body":"automated noise"}]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test7.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 0 && "$output" == *"plan-blocked:"* ]]; then
     pass "filters github-actions[bot] when picking the latest non-bot comment"
 else
-    fail "filters github-actions[bot] when picking the latest non-bot comment" "exit=$exit_code output='$output'"
+    fail "filters github-actions[bot] when picking the latest non-bot comment" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 8: empty/missing recommendation footer (pre-#4438 comments) ───────
@@ -169,22 +174,24 @@ fi
 # recommendation field is empty / "(unspecified)".
 write_mock_gh '{"comments":[{"author":{"login":"drewthaler"},"createdAt":"2026-04-23T00:00:00Z","body":"<!-- dispatcher-plan-blocked -->\nlegacy comment without footer"}]}'
 exit_code=0
-output=$("$WRAPPER" 1 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test8.err"
+output=$("$WRAPPER" 1 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 0 && "$output" == *"plan-blocked:"* ]]; then
     pass "exits 0 even when comment lacks the recommendation footer (pre-#4438)"
 else
-    fail "exits 0 even when comment lacks the recommendation footer (pre-#4438)" "exit=$exit_code output='$output'"
+    fail "exits 0 even when comment lacks the recommendation footer (pre-#4438)" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 9: strips a leading '#' from the issue argument ───────────────────
 
 write_mock_gh '{"comments":[]}'
 exit_code=0
-output=$("$WRAPPER" "#42" 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test9.err"
+output=$("$WRAPPER" "#42" 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 1 && "$output" == *"clear:"* ]]; then
     pass "strips leading '#' from the issue argument"
 else
-    fail "strips leading '#' from the issue argument" "exit=$exit_code output='$output'"
+    fail "strips leading '#' from the issue argument" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 10: exit 2 when gh CLI fails (API error) ──────────────────────────
