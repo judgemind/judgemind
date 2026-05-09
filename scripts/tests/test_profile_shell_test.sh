@@ -37,6 +37,12 @@ cleanup() {
 trap cleanup EXIT
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
+# Source the shared assert harness extracted in #4540. Provides pass /
+# fail / assert_eq / assert_ge / assert_contains plus the optional
+# ``--err-file FILE`` flag that dumps FILE's last 50 lines on
+# assertion mismatch. Replaces three inline assert helper definitions
+# that previously lived here (pre-#4540).
+. "$SCRIPT_DIR/tests/_test-helpers.sh"
 
 # Make a fixture .sh file under the temp dir; chmod +x so the wrapper can
 # run it. Returns the absolute path.
@@ -47,51 +53,6 @@ make_fixture() {
     printf '%s\n' "$content" > "$path"
     chmod +x "$path"
     echo "$path"
-}
-
-assert_eq() {
-    local desc="$1"
-    local actual="$2"
-    local expected="$3"
-    TESTS=$((TESTS + 1))
-    if [[ "$actual" = "$expected" ]]; then
-        echo "PASS: $desc"
-    else
-        echo "FAIL: $desc"
-        echo "  expected: $expected"
-        echo "  actual:   $actual"
-        FAILURES=$((FAILURES + 1))
-    fi
-}
-
-assert_ge() {
-    local desc="$1"
-    local actual="$2"
-    local floor="$3"
-    TESTS=$((TESTS + 1))
-    if [[ "$actual" -ge "$floor" ]]; then
-        echo "PASS: $desc (got $actual, floor $floor)"
-    else
-        echo "FAIL: $desc"
-        echo "  expected ≥ $floor"
-        echo "  actual:    $actual"
-        FAILURES=$((FAILURES + 1))
-    fi
-}
-
-assert_contains() {
-    local desc="$1"
-    local haystack="$2"
-    local needle="$3"
-    TESTS=$((TESTS + 1))
-    if printf '%s' "$haystack" | grep -qF -- "$needle"; then
-        echo "PASS: $desc"
-    else
-        echo "FAIL: $desc"
-        echo "  expected to contain: $needle"
-        echo "  haystack: $haystack"
-        FAILURES=$((FAILURES + 1))
-    fi
 }
 
 # ─── Test 1: Three-section fixture; preserves exit code 0 ────────────────
@@ -121,23 +82,16 @@ sleep 0.50
 exit 0
 ')
 tsv1="$TMPDIR_TEST/fixture1.tsv"
-# #4528: capture stderr (do NOT discard) so a future flake records the
-# profiler's diagnostic output alongside the wrapped fixture's stdout.
-# Without this capture the only signal on rc mismatch is "expected 0,
-# actual N" with no context — exactly the #4383 failure mode this issue
-# is generalising. The dump fires only on the rc assertion failing.
+# #4528 / #4540: capture stderr (do NOT discard) so a future flake
+# records the profiler's diagnostic output alongside the wrapped
+# fixture's stdout. Without this capture the only signal on rc
+# mismatch is "expected 0, actual N" with no context — exactly the
+# #4383 failure mode this issue is generalising. The dump fires only
+# on the rc assertion failing, via the shared helper's --err-file.
 err1="$TMPDIR_TEST/fixture1.err"
 out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
 exit1=$?
-assert_eq "basic fixture exits 0" "$exit1" "0"
-if [[ "$exit1" != "0" ]]; then
-    echo "  ── #4528 stderr dump (basic fixture) ──"
-    echo "  profiler stderr (last 50 lines):"
-    tail -n 50 "$err1" 2>/dev/null | sed 's/^/    /'
-    echo "  fixture stdout (last 50 lines):"
-    printf '%s\n' "$out1" | tail -n 50 | sed 's/^/    /'
-    echo "  ── end #4528 dump ──"
-fi
+assert_eq "basic fixture exits 0" "$exit1" "0" --err-file "$err1"
 sections1=$(wc -l < "$tsv1" | tr -d ' ')
 assert_eq "basic fixture records 3 sections" "$sections1" "3"
 assert_contains "basic fixture summary names section 3" "$out1" "Test 3: gamma"
@@ -216,19 +170,12 @@ echo hello
 exit 0
 ')
 tsv5="$TMPDIR_TEST/fixture5.tsv"
-# #4528: capture stderr (see same pattern at fixture1 above).
+# #4528 / #4540: capture stderr (see same pattern at fixture1 above).
+# Dump-on-mismatch handled by the shared helper's --err-file flag.
 err5="$TMPDIR_TEST/fixture5.err"
 out5=$("$PROFILER" --tsv "$tsv5" "$fixture5" 2>"$err5")
 exit5=$?
-assert_eq "no-section fixture exits 0" "$exit5" "0"
-if [[ "$exit5" != "0" ]]; then
-    echo "  ── #4528 stderr dump (no-section fixture) ──"
-    echo "  profiler stderr (last 50 lines):"
-    tail -n 50 "$err5" 2>/dev/null | sed 's/^/    /'
-    echo "  fixture stdout (last 50 lines):"
-    printf '%s\n' "$out5" | tail -n 50 | sed 's/^/    /'
-    echo "  ── end #4528 dump ──"
-fi
+assert_eq "no-section fixture exits 0" "$exit5" "0" --err-file "$err5"
 sections5=$(wc -l < "$tsv5" 2>/dev/null | tr -d ' ' || echo 0)
 assert_eq "no-section fixture records 0 sections" "$sections5" "0"
 assert_contains "no-section fixture reports 0 sections" "$out5" "Sections recorded: 0"
@@ -251,26 +198,18 @@ else
 fi
 
 # ─── Test 8: --top N controls number of rows printed ─────────────────────
-# #4528: capture stderr — Test 8 doesn't capture rc directly, but its
-# `top_rows` derived value is computed from out6's stdout. If the
-# profiler dies silently, top_rows is 0 and the assertion fires with
-# "expected 1, actual 0" and no context. Same flake-hider class as the
-# fixture1/fixture5 sites above.
+# #4528 / #4540: capture stderr — Test 8 doesn't capture rc directly,
+# but its `top_rows` derived value is computed from out6's stdout. If
+# the profiler dies silently, top_rows is 0 and the assertion fires
+# with "expected 1, actual 0" and no context. Same flake-hider class
+# as the fixture1/fixture5 sites above. Dump-on-mismatch handled by
+# the shared helper's --err-file flag.
 err6="$TMPDIR_TEST/top1.err"
 out6=$("$PROFILER" --tsv "$TMPDIR_TEST/top1.tsv" --top 1 "$fixture1" 2>"$err6")
 exit6=$?
 # Count rows after "Top 1 longest sections:" header. Stop at "----- end -----".
 top_rows=$(printf '%s' "$out6" | awk '/^Top 1 longest sections:/{flag=1; next} /^----- end -----/{flag=0} flag' | wc -l | tr -d ' ')
-assert_eq "--top 1 prints 1 row" "$top_rows" "1"
-if [[ "$top_rows" != "1" ]]; then
-    echo "  ── #4528 stderr dump (--top 1) ──"
-    echo "  profiler exit: $exit6"
-    echo "  profiler stderr (last 50 lines):"
-    tail -n 50 "$err6" 2>/dev/null | sed 's/^/    /'
-    echo "  fixture stdout (last 50 lines):"
-    printf '%s\n' "$out6" | tail -n 50 | sed 's/^/    /'
-    echo "  ── end #4528 dump ──"
-fi
+assert_eq "--top 1 prints 1 row" "$top_rows" "1" --err-file "$err6"
 
 # ─── Test 9: Bash 3.2 compatibility check ────────────────────────────────
 TESTS=$((TESTS + 1))

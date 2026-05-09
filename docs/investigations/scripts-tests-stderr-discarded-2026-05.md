@@ -239,3 +239,91 @@ Three reasons:
   worth it."
 
 (Filed as part of this task's retro — issue TBD when this PR opens.)
+
+## Update — 2026-05-08: helper-driven 1-line recipe is now available (#4540)
+
+The recommended follow-up landed as `scripts/tests/_test-helpers.sh`
+in PR for #4540. The helper provides `pass`, `fail`, `assert_eq`,
+`assert_ge`, `assert_contains` with optional `--err-file FILE`
+support — on assertion mismatch, the helper dumps FILE's last 50
+lines bracketed with the `── #4540 stderr dump ──` banner. Pass-path
+calls are silent on `--err-file`, mirroring the dump-on-mismatch
+contract this audit established.
+
+### The new 1-line recipe
+
+```bash
+# Source the shared harness once at the top of the test:
+. "$SCRIPT_DIR/tests/_test-helpers.sh"
+
+# Then at each site, the canonical 6-line block:
+err1="$TMPDIR_TEST/cmd.err"
+out1=$("$WRAPPER" 1 2>"$err1") || exit_code=$?
+assert_eq "exit code matches" "$exit_code" "1"
+if [[ "$exit_code" != "1" ]]; then
+    echo "  ── #4528 stderr dump ──"
+    tail -n 50 "$err1" 2>/dev/null | sed 's/^/    /'
+    echo "  ── end #4528 dump ──"
+fi
+
+# ... collapses to 4 lines (or 3 with the existing rc capture):
+err1="$TMPDIR_TEST/cmd.err"
+out1=$("$WRAPPER" 1 2>"$err1") || exit_code=$?
+assert_eq "exit code matches" "$exit_code" "1" --err-file "$err1"
+```
+
+The conditional dump block disappears entirely; the helper handles
+it.
+
+### Worked example migrations from this audit's harm class
+
+The three patched sites in `scripts/tests/test_profile_shell_test.sh`
+were all migrated to the helper-driven form as part of #4540.
+Compare before-and-after:
+
+**Site 1 — fixture1 (basic fixture):**
+
+```bash
+# Before (#4528 inline form):
+err1="$TMPDIR_TEST/fixture1.err"
+out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
+exit1=$?
+assert_eq "basic fixture exits 0" "$exit1" "0"
+if [[ "$exit1" != "0" ]]; then
+    echo "  ── #4528 stderr dump (basic fixture) ──"
+    echo "  profiler stderr (last 50 lines):"
+    tail -n 50 "$err1" 2>/dev/null | sed 's/^/    /'
+    echo "  fixture stdout (last 50 lines):"
+    printf '%s\n' "$out1" | tail -n 50 | sed 's/^/    /'
+    echo "  ── end #4528 dump ──"
+fi
+
+# After (#4540 helper-driven form):
+err1="$TMPDIR_TEST/fixture1.err"
+out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
+exit1=$?
+assert_eq "basic fixture exits 0" "$exit1" "0" --err-file "$err1"
+```
+
+**Site 2 — fixture5 (no-section fixture):** Same shape — the
+6-line conditional dump block is replaced by a single `--err-file`
+argument on the `assert_eq` call.
+
+**Site 3 — Test 8 (--top 1 stdout-derived metric):** Same shape, but
+the assertion is on a derived metric (`top_rows`) rather than the rc
+directly. The helper's `--err-file` still surfaces the profiler's
+stderr on mismatch — matching the harm class this audit identified.
+
+### Cost/benefit math now flips for the long tail
+
+The audit's "Sites considered and intentionally NOT patched" section
+(~60+ already-debuggable sites whose `fail` messages already include
+`output`) argued patching each was high-churn for marginal benefit
+under the inline 6-line recipe. With the helper-driven 1-line form,
+each site is one extra arg on the existing `assert_*` call (or one
+`fail "..." "$(tail -n 50 "$err_file")"` for the hand-rolled `fail`
+sites). A follow-up `type/dx` issue can audit those sites for
+opportunistic migration as they're touched for other reasons; a
+wholesale sweep is still not worth it (the `fail` message + stdout
+remain a sufficient signal in most cases), but the upgrade is now
+mechanical.
