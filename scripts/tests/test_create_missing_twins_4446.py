@@ -2,9 +2,13 @@
 
 Tests cover:
 - parse_flat_hash_key for valid, malformed, edge-case keys
+  (re-exported from ``framework.s3_keys`` after #4447 / #4455)
 - is_mislabel for matching/mismatching/missing-metadata cases
+  (re-exported from ``framework.s3_keys`` after #4447 / #4455)
 - build_twin_key for valid + non-parseable inputs
+  (re-exported from ``framework.s3_keys`` after #4447 / #4455)
 - head_object_metadata_hash with mocked S3 client (200, 404, missing field)
+  (re-exported from ``framework.s3_keys`` after #4447 / #4455)
 - verify_twin: valid, missing, invalid twin
 - enumerate_mislabel_pairs end-to-end with mocked paginator + HEAD
   (records valid/missing/invalid twin states)
@@ -21,10 +25,19 @@ may not be installed in the CI ``scripts-tests`` environment. We use
 #4430) to inject MagicMocks into sys.modules around the import — the
 helper restores sys.modules on exit so other tests in the same pytest run
 don't see the leaked mocks (#4426).
+
+After #4455, the small pure helpers (``parse_flat_hash_key``,
+``is_mislabel``, ``head_object_metadata_hash``, ``build_twin_key``,
+``KEY_PATTERN``) live in ``framework.s3_keys``. We load that real module
+via ``importlib`` from its source path inside the mock_sys_modules block
+so the script imports the genuine implementation rather than a MagicMock
+attribute. Mirrors the recipe in
+``test_repoint_mislabeled_documents_4439.py`` (#4447).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -58,6 +71,30 @@ _mock_structlog = MagicMock()
 _mock_structlog.get_logger.return_value = MagicMock()
 
 
+def _load_real_s3_keys() -> object:
+    """Load ``framework.s3_keys`` from source so the script-under-test
+    imports the real helpers, not a MagicMock attribute. Pure Python over
+    ``re`` and ``botocore.exceptions.ClientError``; invoked INSIDE the
+    ``mock_sys_modules`` block so s3_keys' import of ``ClientError``
+    resolves to ``_FakeClientError`` — keeping the ``except ClientError``
+    branch reachable from tests that raise ``_FakeClientError``."""
+    s3_keys_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "packages",
+        "scraper-framework",
+        "src",
+        "framework",
+        "s3_keys.py",
+    )
+    spec = importlib.util.spec_from_file_location("framework.s3_keys", s3_keys_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 with mock_sys_modules(
     {
         "boto3": MagicMock(),
@@ -66,8 +103,19 @@ with mock_sys_modules(
         "structlog": _mock_structlog,
         "framework": MagicMock(),
         "framework.logging": MagicMock(),
+        # Placeholder — replaced below with the real loaded module so the
+        # ``mock_sys_modules`` restore path cleans it up on exit.
+        "framework.s3_keys": MagicMock(),
     }
 ):
+    # Replace the placeholder with the genuine ``framework.s3_keys`` module
+    # loaded via importlib. The load happens INSIDE the mock context so the
+    # ``from botocore.exceptions import ClientError`` inside s3_keys.py
+    # resolves to ``_FakeClientError`` — keeping the ``except ClientError``
+    # branch reachable from tests that raise ``_FakeClientError``.
+    import sys as _sys
+
+    _sys.modules["framework.s3_keys"] = _load_real_s3_keys()
     import create_missing_twins_4446  # noqa: E402
 
 parse_flat_hash_key = create_missing_twins_4446.parse_flat_hash_key
