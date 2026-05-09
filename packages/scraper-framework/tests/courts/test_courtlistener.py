@@ -1250,12 +1250,17 @@ class TestJurisdictionMapping:
             ("ca1", "Federal", "Federal"),
             ("cadc", "Federal", "Federal"),
             ("cafc", "Federal", "Federal"),
+            # Federal military appellate courts (#4471)
+            ("nmcca", "Federal", "Federal"),
             # State high courts
             ("tex", "Texas", "Statewide"),
             ("ny", "New York", "Statewide"),
             ("fla", "Florida", "Statewide"),
             ("cal", "California", "Statewide"),
             ("ga", "Georgia", "Statewide"),
+            ("hi", "Hawaii", "Statewide"),
+            # Hawaii alternate short-id surfaced in production logs (#4471)
+            ("haw", "Hawaii", "Statewide"),
             # State appellate courts
             ("texapp1", "Texas", "Statewide"),
             ("texapp14", "Texas", "Statewide"),
@@ -1267,6 +1272,20 @@ class TestJurisdictionMapping:
             ("fladistctapp1", "Florida", "Statewide"),
             ("gactapp", "Georgia", "Statewide"),
             ("ohioctapp1", "Ohio", "Statewide"),
+            # Appellate parent-records and alternates surfaced in production
+            # logs after the #4466 URL-parsing fix (#4471)
+            ("calctapp", "California", "Statewide"),
+            ("ohioctapp", "Ohio", "Statewide"),
+            ("illappct", "Illinois", "Statewide"),
+            ("lactapp", "Louisiana", "Statewide"),
+            ("texapp", "Texas", "Statewide"),
+            ("txctapp11", "Texas", "Statewide"),
+            ("hawapp", "Hawaii", "Statewide"),
+            # Specialty state trial court (#4471)
+            ("ncbizct", "North Carolina", "Statewide"),
+            # US Territory supreme courts (#4471)
+            ("prsupreme", "Puerto Rico", "Statewide"),
+            ("virginislands", "Virgin Islands", "Statewide"),
         ],
     )
     def test_mapping_table_entries(
@@ -1287,6 +1306,46 @@ class TestJurisdictionMapping:
     def test_unknown_court_id_not_in_mapping(self) -> None:
         """A sentinel unknown court_id is absent from the mapping table."""
         assert "zzunknownsentinel" not in _CL_COURT_ID_TO_JURISDICTION
+
+    def test_court_id_to_jurisdiction_includes_required_courts_4471(self) -> None:
+        """Regression: #4471 — the 11 distinct unmapped court_ids surfaced in the
+        post-#4466 CourtListener scraper run (CloudWatch query against
+        /ecs/judgemind-scraper-dev, 2026-05-08 → 2026-05-09) MUST all be
+        covered by _CL_COURT_ID_TO_JURISDICTION so they no longer fall
+        through to ("Unknown", "Unknown").
+
+        The IDs and their authoritative CourtListener jurisdictions
+        (verified against /api/rest/v4/courts/<id>/?format=json):
+
+        * calctapp     — California Court of Appeal (parent record)
+        * illappct     — Appellate Court of Illinois (parent record)
+        * hawapp       — Hawaii Intermediate Court of Appeals
+        * txctapp11    — Texas Court of Appeals 11th District (Eastland; alternate of texapp11)
+        * haw          — Hawaii Supreme Court (alternate of "hi")
+        * ohioctapp    — Ohio Court of Appeals (parent record)
+        * prsupreme    — Supreme Court of Puerto Rico
+        * virginislands — Supreme Court of the Virgin Islands
+        * nmcca        — Navy-Marine Corps Court of Criminal Appeals (federal military)
+        * lactapp      — Louisiana Court of Appeal (parent record)
+        * ncbizct      — North Carolina Business Court (specialty trial court)
+        """
+        required_4471_ids = {
+            "calctapp",
+            "illappct",
+            "hawapp",
+            "txctapp11",
+            "haw",
+            "ohioctapp",
+            "prsupreme",
+            "virginislands",
+            "nmcca",
+            "lactapp",
+            "ncbizct",
+        }
+        missing = required_4471_ids - set(_CL_COURT_ID_TO_JURISDICTION)
+        assert not missing, (
+            f"#4471 regression — these CourtListener court_ids must remain mapped: {missing}"
+        )
 
     @pytest.mark.parametrize(
         "court_url,expected_state,expected_county",

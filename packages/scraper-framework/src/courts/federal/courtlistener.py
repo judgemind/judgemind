@@ -757,8 +757,14 @@ def _parse_date(date_str: str | None) -> datetime | None:
 
 #: Maps CourtListener short court IDs to (state, county) tuples.
 #:
-#: Federal courts map to ("Federal", "Federal").
+#: Federal courts (including federal military appellate courts like nmcca)
+#: map to ("Federal", "Federal").
 #: State high courts and appellate courts map to ("<State>", "Statewide").
+#: For appellate-court systems with both a parent record (e.g. "calctapp",
+#: "ohioctapp", "illappct") and per-district records (e.g. "calctapp1"-"6"),
+#: both are mapped explicitly to the same tuple.
+#: US territory supreme courts (prsupreme, virginislands) map to
+#: ("<Territory name>", "Statewide") — the territory is treated as the state.
 #: On a miss, the scraper defaults to ("Unknown", "Unknown") and logs a warning.
 #:
 #: Source: https://www.courtlistener.com/api/rest/v4/courts/?format=json
@@ -882,6 +888,8 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "bap10": ("Federal", "Federal"),
     "bapme": ("Federal", "Federal"),
     "bapma": ("Federal", "Federal"),
+    # Federal military appellate courts
+    "nmcca": ("Federal", "Federal"),  # Navy-Marine Corps Court of Criminal Appeals
     # -----------------------------------------------------------------------
     # State high courts (supreme courts)
     # -----------------------------------------------------------------------
@@ -923,6 +931,8 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "wva": ("West Virginia", "Statewide"),
     "idaho": ("Idaho", "Statewide"),
     "hi": ("Hawaii", "Statewide"),
+    # CourtListener also serves the Hawaii Supreme Court under the "haw" short-id
+    "haw": ("Hawaii", "Statewide"),
     "me": ("Maine", "Statewide"),
     "nh": ("New Hampshire", "Statewide"),
     "ri": ("Rhode Island", "Statewide"),
@@ -936,7 +946,10 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     # -----------------------------------------------------------------------
     # State appellate courts
     # -----------------------------------------------------------------------
-    # Texas Courts of Appeals (14 districts)
+    # Texas Courts of Appeals (parent + 14 districts)
+    "texapp": ("Texas", "Statewide"),  # parent record (Court of Appeals of Texas)
+    # Alternate short-id for the 11th District (Eastland), seen alongside texapp11
+    "txctapp11": ("Texas", "Statewide"),
     "texapp1": ("Texas", "Statewide"),
     "texapp2": ("Texas", "Statewide"),
     "texapp3": ("Texas", "Statewide"),
@@ -971,7 +984,8 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "fladistctapp6": ("Florida", "Statewide"),
     # Georgia Court of Appeals
     "gactapp": ("Georgia", "Statewide"),
-    # Ohio Courts of Appeals (12 districts)
+    # Ohio Courts of Appeals (parent + 12 districts)
+    "ohioctapp": ("Ohio", "Statewide"),  # parent record
     "ohioctapp1": ("Ohio", "Statewide"),
     "ohioctapp2": ("Ohio", "Statewide"),
     "ohioctapp3": ("Ohio", "Statewide"),
@@ -984,14 +998,16 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "ohioctapp10": ("Ohio", "Statewide"),
     "ohioctapp11": ("Ohio", "Statewide"),
     "ohioctapp12": ("Ohio", "Statewide"),
-    # California Courts of Appeal
+    # California Courts of Appeal (parent + 6 districts)
+    "calctapp": ("California", "Statewide"),  # parent record
     "calctapp1": ("California", "Statewide"),
     "calctapp2": ("California", "Statewide"),
     "calctapp3": ("California", "Statewide"),
     "calctapp4": ("California", "Statewide"),
     "calctapp5": ("California", "Statewide"),
     "calctapp6": ("California", "Statewide"),
-    # Illinois Appellate Courts
+    # Illinois Appellate Courts (parent + 5 districts)
+    "illappct": ("Illinois", "Statewide"),  # parent record
     "illappct1": ("Illinois", "Statewide"),
     "illappct2": ("Illinois", "Statewide"),
     "illappct3": ("Illinois", "Statewide"),
@@ -1004,6 +1020,10 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "michctapp": ("Michigan", "Statewide"),
     # North Carolina Court of Appeals
     "ncctapp": ("North Carolina", "Statewide"),
+    # North Carolina Business Court (specialty trial court)
+    "ncbizct": ("North Carolina", "Statewide"),
+    # Hawaii Intermediate Court of Appeals
+    "hawapp": ("Hawaii", "Statewide"),
     # New Jersey Appellate Division
     "njsuperctappdiv": ("New Jersey", "Statewide"),
     # Virginia Court of Appeals
@@ -1039,7 +1059,8 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     # Alabama Court of Civil Appeals / Court of Criminal Appeals
     "alacivapp": ("Alabama", "Statewide"),
     "alacrimapp": ("Alabama", "Statewide"),
-    # Louisiana Courts of Appeal
+    # Louisiana Courts of Appeal (parent + 5 districts; CL uses two short-id schemes)
+    "lactapp": ("Louisiana", "Statewide"),  # parent record
     "laapp1": ("Louisiana", "Statewide"),
     "laapp2": ("Louisiana", "Statewide"),
     "laapp3": ("Louisiana", "Statewide"),
@@ -1076,6 +1097,13 @@ _CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
     "montag": ("Montana", "Statewide"),
     # DC Court of Appeals (local, not federal circuit)
     "dc": ("District of Columbia", "Statewide"),
+    # -----------------------------------------------------------------------
+    # US Territories — Supreme courts
+    # -----------------------------------------------------------------------
+    # Treat the territory itself as the "state" — Puerto Rico and Virgin
+    # Islands have their own legal systems separate from any US state.
+    "prsupreme": ("Puerto Rico", "Statewide"),
+    "virginislands": ("Virgin Islands", "Statewide"),
 }
 
 
