@@ -171,12 +171,37 @@ _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 # We stop at the first "/" that precedes a short dept token (letters + digits,
 # typically <=8 chars), so "O'Connor/25" and "Van Der Berg/F46" both match
 # cleanly without swallowing unrelated trailing text.
+#
+# Used by BOTH LA extraction surfaces (#4283 docstring clarification):
+#
+#   - ``_extract_ruling_fields`` (line ~1875) — the live single-doc parse
+#     path used by ``ca-la-tentatives-civil`` captures.  Strategy 1 there
+#     calls ``_JUDGE_DEPT_RE.search(full_text)`` directly and assigns to
+#     ``CapturedDocument.judge_name``.
+#   - ``_extract_judge_name_from_case_section`` (line ~805) — the helper
+#     called by ``_split_rulings`` (line ~855) on the rebuild / reingest
+#     path (``scripts/rebuild_db.py``, ``scripts/reingest_from_s3.py``,
+#     and any ``is_la_html``-routed worker dispatch).  Mirrors the
+#     ``_extract_ruling_fields`` strategy so ``LASplitRuling.judge_name``
+#     receives the same surname when only the JUDGE/DEPT header is
+#     present (#4282).
+#
+# Pre-#4282 ``_split_rulings`` did NOT use this regex — that surface
+# split is what caused the misleading rebuild-only "fix" attempt in
+# #3732 and motivated the docstring clarification in #4283.  Both
+# surfaces are now wired through this regex.
 _JUDGE_DEPT_RE = re.compile(
     r"JUDGE\s*/\s*DEPT\s*:\s*"
     r"(?P<name>[A-Za-z][A-Za-z\-\'\. ]*?)"
     r"\s*/\s*[A-Za-z0-9]{1,8}\b",
     re.IGNORECASE,
 )
+# Surface-cross-reference (#4283 verify target): this regex is consumed by
+# both ``_extract_ruling_fields`` (the live single-doc parse path used by
+# ``ca-la-tentatives-civil`` captures and ``_extract_metadata`` callers) AND
+# ``_extract_judge_name_from_case_section``, the helper invoked by
+# ``_split_rulings`` (the rebuild / reingest path).  See the block comment
+# above for the full rationale.
 
 # Case title extraction from party caption block.
 # The party section text typically looks like:
@@ -328,7 +353,25 @@ _OUTCOME_MAP: dict[str | None, str | None] = {
 
 @dataclass
 class LASplitRuling:
-    """A single ruling extracted from a multi-case LA department page via LLM."""
+    """A single ruling extracted from a multi-case LA department page.
+
+    Built by :func:`_split_rulings` (the deterministic, non-LLM split
+    path registered in ``_SPLIT_REGISTRY``) and by the LLM splitter
+    when ``ENABLE_LA_LLM_EXTRACTION`` is set.  Both producers populate
+    the same fields with identical semantics; the docstring originally
+    said "via LLM" only because the LLM splitter shipped first (#4283
+    clarification).
+
+    The ``judge_name`` field carries the in-document presiding judge
+    extracted from the per-case HTML (#4282).  Pre-#4282 ``_split_rulings``
+    did NOT carry a judge_name field at all — the rebuild / reingest path
+    fell through to the worker's dept-to-judge directory fallback for
+    every ruling, which was the root cause of the LA dept-25 judge
+    misattribution traced in #3732 and the docstring drift documented
+    in #4283.  Callers downstream (``worker.py``, ``reingest_from_s3.py``)
+    now prefer this value over the directory fallback when non-None so
+    day-of-bench attributions match the document text.
+    """
 
     ruling_index: int
     case_number: str | None
@@ -343,9 +386,11 @@ class LASplitRuling:
     # In-document judge name extracted from the per-case HTML (#4282).  Captures
     # both the "JUDGE/DEPT: <Surname>/<dept>" form-layout header (Dept-25
     # Mkrtchyan pattern, #2578) and the "<Name> Judge of the Superior Court"
-    # signature line.  When non-None, downstream worker / reingest paths must
-    # prefer this value over the dept-to-judge directory fallback so day-of-
-    # bench judge attributions match the document text.
+    # signature line via :func:`_extract_judge_name_from_case_section`, which
+    # mirrors strategies 1-2 of :func:`_extract_ruling_fields` (the live
+    # single-doc parse surface).  When non-None, downstream worker / reingest
+    # paths must prefer this value over the dept-to-judge directory fallback
+    # so day-of-bench judge attributions match the document text.
     judge_name: str | None = None
 
 
@@ -855,9 +900,16 @@ def _extract_judge_name_from_case_section(
 def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[LASplitRuling]:
     """Split an LA department page into per-case rulings using regex + HTML parsing.
 
-    This is the non-LLM splitting path registered in ``_SPLIT_REGISTRY`` for
-    use by ``reingest_from_s3._full_reparse_document()``.  It provides a
-    reliable fallback when the LLM splitter is unavailable or fails.
+    Surface counterpart to :func:`_extract_ruling_fields` (the live
+    single-doc parse path).  This is the rebuild / reingest path: it is
+    the non-LLM splitting path registered in ``_SPLIT_REGISTRY`` for use
+    by ``reingest_from_s3._full_reparse_document()`` and by
+    ``rebuild_db.py``'s ``rebuild-ca-los_angeles`` synthetic event flow
+    (routed through ``is_la_html``).  Both surfaces must produce
+    equivalent judge_name attribution for the same HTML — see the
+    "Surface split" section below for the gap in pre-#4282 behavior
+    (the root cause of #3732's LA dept-25 misattribution and the
+    docstring drift fixed in #4283).
 
     The ``text`` parameter is the raw HTML content (for HTML documents,
     ``_extract_text_from_content()`` returns the decoded HTML string).
@@ -868,6 +920,21 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[LASplitRul
     downstream worker / reingest paths can attribute the ruling to the
     day-of-bench judge instead of the directory's primary-assignment
     fallback (#4282).
+
+    Surface split with ``_extract_ruling_fields`` (#4283 clarification):
+    LA has two parallel extraction surfaces that must produce equivalent
+    judge attribution for the same HTML.  The live single-doc parse path
+    (``_extract_ruling_fields``, line ~1875) extracts judge_name inline
+    via strategies 1-3 (``_JUDGE_DEPT_RE`` form-layout header,
+    ``_JUDGE_DIV_RE`` signature line, ``ingestion.extract`` cross-court
+    fallback).  This rebuild / reingest path delegates strategies 1-2 to
+    :func:`_extract_judge_name_from_case_section` (line ~805), which
+    mirrors ``_extract_ruling_fields`` exactly.  Strategy 3 (the broader
+    cross-court regex fallback) is intentionally deferred to the worker /
+    reingest layer so this helper stays free of cross-package imports.
+    Pre-#4282 this function did NOT extract judge_name at all — every
+    ruling fell through to the worker's dept-to-judge directory fallback,
+    which was the root cause of #3732's LA dept-25 judge misattribution.
 
     Returns an empty list if no case sections are found.
 
