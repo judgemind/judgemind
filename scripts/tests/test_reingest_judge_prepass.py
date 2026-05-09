@@ -90,14 +90,23 @@ for _mod_name, _mock_mod in _modules_to_mock.items():
 
 import reingest_from_s3 as reingest  # noqa: E402
 
-# NOTE: mocked modules are intentionally LEFT IN PLACE in sys.modules for
-# the lifetime of this test session.  Restoring would let pytest later
-# resolve a real ``ingestion.db`` import (e.g. via ``unittest.mock.patch``
-# string-target resolution), which would crash because the lightweight
-# scripts-tests environment has no ``psycopg`` / ``framework`` /
-# ``ingestion`` installed.  The pre-pass module under test is fully
-# importable with the mocks in place; the trade-off is the standard one
-# for ``scripts/tests/`` modules with heavyweight import trees.
+# Restore sys.modules so the mock injection doesn't pollute other test files
+# collected in the same pytest run (#4426).  ``reingest_from_s3``'s own module
+# globals already captured the mock references at the ``import reingest_from_s3``
+# above, so the tests still see mocks via ``reingest.<attr>`` and
+# ``@patch("reingest_from_s3.<attr>")`` targets — those are bound in the
+# script's namespace, not via ``sys.modules`` lookups.  Leaving the mocks in
+# ``sys.modules`` for the rest of the session breaks any later test that
+# imports the real ``structlog`` / ``framework.logging`` (e.g.
+# ``test_drain_splitter_carry_forward_clusters.py::TestLoggerExtraFieldsSurfaceInOutput``,
+# which calls ``isinstance(..., structlog.stdlib.ProcessorFormatter)`` against
+# the real ``framework.logging`` and crashes when ``structlog`` is a
+# ``MagicMock``).
+for _mod_name in list(_modules_to_mock.keys()):
+    if _mod_name in _saved_modules:
+        sys.modules[_mod_name] = _saved_modules[_mod_name]
+    elif _mod_name in sys.modules:
+        del sys.modules[_mod_name]
 
 
 # ---------------------------------------------------------------------------
