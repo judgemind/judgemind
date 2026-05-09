@@ -105,12 +105,20 @@ while read -r worker_num branch worker_path; do
         ci_json=$(gh pr view "$pr_number" --repo judgemind/judgemind \
             --json statusCheckRollup 2>/dev/null || echo "{}")
 
-        # Determine overall CI status from individual check conclusions
+        # Determine overall CI status from individual check conclusions.
+        # CANCELLED is intentionally NOT counted as failure (#4414):
+        # typical Vercel ``concurrency: cancel-in-progress`` cancels
+        # surface there when a newer push supersedes a deploy, and the
+        # canonical merge gate documented in
+        # docs/agent/code-standards.md §"Interpreting mergeStateStatus"
+        # treats them as non-blocking. Matches
+        # phase_transitions._CI_CANCELLED_CONCLUSIONS and
+        # scripts/wait-for-ci.sh (#4407).
         ci_status=$(echo "$ci_json" | awk '
             BEGIN { has_checks = 0; has_pending = 0; has_failure = 0 }
             /"conclusion"/ || /"status"/ {
                 has_checks = 1
-                if (/"FAILURE"/ || /"ERROR"/ || /"TIMED_OUT"/ || /"CANCELLED"/) has_failure = 1
+                if (/"FAILURE"/ || /"ERROR"/ || /"TIMED_OUT"/) has_failure = 1
                 if (/"PENDING"/ || /"IN_PROGRESS"/ || /"QUEUED"/) has_pending = 1
             }
             END {
