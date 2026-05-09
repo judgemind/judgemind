@@ -1725,6 +1725,58 @@ _TRAILING_CONNECTOR_RE = re.compile(
 # Examples: "Steinman v", "Doe vs", "Aoyagi vs.", "Serrato Vs"
 _BARE_VS_SUFFIX_RE = re.compile(r"(?:^|\s)[Vv][Ss]?\.?\s*$")
 
+# Federal pro se "v. Judge X" defendant pattern (#4536).
+#
+# Federal pro se civil-rights / habeas / appellate cases (42 U.S.C. § 1983,
+# § 2254, etc.) frequently caption the case as ``<plaintiff> v. (Circuit |
+# Magistrate | Hon. )?Judge <Name>`` — i.e. the judge IS the named defendant,
+# not a procedural-context reference.  The #3615 widening of
+# _IMPLAUSIBLE_FRAGMENTS_RE adds a generic ``\bJudge\s+[A-Z][\w'\-]*`` clause
+# that correctly catches body-text contamination ("Judge Smith's Report"),
+# but produces a 100% false-positive rate on this federal pro se subset.
+#
+# The shape we mask out is the entire judge-defendant phrase that begins with
+# ``v.`` and (optionally) extends through ``; <next-judge>`` continuations.
+# Matched spans are replaced with a placeholder before running the
+# _IMPLAUSIBLE_FRAGMENTS_RE check so a legitimate caption isn't rejected for
+# naming a judge as a defendant.  See is_plausible_case_title() for the call
+# site.
+#
+# Acceptance criteria (issue #4536) called out these shapes:
+#   - "X v. Judge Y"
+#   - "X v. Circuit Judge Y"
+#   - "X v. Hon. Judge Y"
+#   - "X v. Magistrate Judge Y"
+#   - "X v. Judge Y, Former Chief Judge Z"   (comma continuation)
+#   - "X v. Judge Y; Judge Z; Judge W"        (semicolon continuation)
+#
+# Honorific-prefix order is constrained: ``(Hon\.\s+)?(Circuit\s+|Magistrate\s+)?``
+# matches ``Hon. Judge X``, ``Hon. Circuit Judge X``, ``Hon. Magistrate Judge X``,
+# and ``Circuit Judge X`` / ``Magistrate Judge X``.  The continuation half adds
+# an optional ``Former (Chief |Senior )?`` rank prefix.
+# Sub-patterns:
+#   _JUDGE_RANK matches the honorific + rank prefix + "Judge <Name>"
+#     where <Name> is 1-3 capitalized words (covers single surnames like
+#     "Sjostrom" through "Mary Beth Smith" / "Dominique Ross"; supports
+#     compound/apostrophe/hyphen via [\w'\-]).  Cap at 3 to avoid overrunning
+#     into trailing prose like "Judge Sjostrom of the Second Judicial Circuit
+#     Court" — at 4+ words the pattern would consume the prose.
+#   The leading "v.\s+" anchors the first instance to the defendant position,
+#     so we don't mask body-text "Judge X" contamination.
+#   The continuation half allows ", " / "; " delimited additional judge
+#     defendants, optionally prefixed with "Former (Chief|Senior) " ranks.
+#   The trailing ",?" tolerates truncated-mid-list captions like Gill where
+#     a 120-char cut leaves a dangling comma.
+_JUDGE_NAME = r"[A-Z][\w'\-]*(?:\s+[A-Z][\w'\-]*){0,2}"
+_JUDGE_RANK = r"(?:Hon\.\s+)?(?:Circuit\s+|Magistrate\s+)?Judge\s+" + _JUDGE_NAME
+_FEDERAL_PRO_SE_VS_JUDGE_RE = re.compile(
+    r"\bv\.\s+"
+    + _JUDGE_RANK
+    + r"(?:[,;]\s+(?:Former\s+(?:Chief|Senior)\s+)?"
+    + _JUDGE_RANK
+    + r")*,?"
+)
+
 
 def strip_trailing_connectors(title: str) -> str:
     """Strip trailing English connector words from a case title.
@@ -1805,8 +1857,20 @@ def is_plausible_case_title(title: str) -> bool:
     if _IN_THE_NOT_MATTER_RE.match(stripped):
         return False
 
+    # Federal pro se "v. Judge X" exception (#4536): when the title names a
+    # judge as the defendant (post-"v." position), mask the judge-defendant
+    # span so the procedural-context "Judge X" clause inside
+    # _IMPLAUSIBLE_FRAGMENTS_RE doesn't reject the legitimate caption.  The
+    # contamination shape (#3615) places "Judge X" AFTER a complete party
+    # name, never directly after "v.", so this mask preserves rejection of
+    # real contamination.
+    stripped_for_check = _FEDERAL_PRO_SE_VS_JUDGE_RE.sub(
+        "v. <judge-defendant>",
+        stripped,
+    )
+
     # Reject titles containing ruling/procedural fragments
-    if _IMPLAUSIBLE_FRAGMENTS_RE.search(stripped):
+    if _IMPLAUSIBLE_FRAGMENTS_RE.search(stripped_for_check):
         return False
 
     # Reject titles containing multiple case numbers — strong indicator

@@ -3604,6 +3604,85 @@ class TestProceduralVocabularyFragments:
         assert is_plausible_case_title("In re Marriage of Garcia") is True
 
 
+class TestFederalProSeJudgeDefendant:
+    """Issue #4536 — federal pro se civil-rights / habeas / appellate cases
+    legitimately caption the case as ``<plaintiff> v. (Circuit | Magistrate
+    | Hon. )?Judge <Name>`` where the judge IS the named defendant.
+
+    The #3615 widening's ``\\bJudge\\s+[A-Z][\\w'\\-]*`` clause inside
+    _IMPLAUSIBLE_FRAGMENTS_RE produces a false positive on this shape.
+    The fix masks the ``v.`` + judge-defendant span before running the
+    implausibility check so legitimate captions are accepted.
+    """
+
+    # --- The 3 confirmed false positives on dev (issue #4536 table) ---
+
+    def test_federal_pro_se_judge_defendant_is_plausible_walker(self) -> None:
+        """Walker case: 'X v. Circuit Judge Y of the Second Judicial Circuit Court'."""
+        title = "Torrey D. Walker v. Circuit Judge Sjostrom of the Second Judicial Circuit Court"
+        assert is_plausible_case_title(title) is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_gill(self) -> None:
+        """Gill case: 'X v. Judge Y, Former Chief Judge Z,' (mid-list truncation)."""
+        title = "Yolanda S. Gill v. Judge Dominique Ross, Former Chief Judge Cheryl Ingram,"
+        assert is_plausible_case_title(title) is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_holtzclaw(self) -> None:
+        """Holtzclaw case: 'X v. Judge Y; Judge Z; <non-judge>; ...' semicolon list."""
+        title = "Weldon Eugene Holtzclaw, Jr. v. Judge Stokes; Judge Stone; Wendy Moses;"
+        assert is_plausible_case_title(title) is True
+
+    # --- Additional shapes called out in the issue acceptance criteria ---
+
+    def test_federal_pro_se_judge_defendant_is_plausible_hon_judge(self) -> None:
+        """'X v. Hon. Judge Y' — Hon. honorific prefix is allowed."""
+        title = "Doe v. Hon. Judge Sotomayor"
+        assert is_plausible_case_title(title) is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_magistrate_judge(self) -> None:
+        """'X v. Magistrate Judge Y' — Magistrate rank prefix is allowed."""
+        title = "Doe v. Magistrate Judge Smith"
+        assert is_plausible_case_title(title) is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_compound_name(self) -> None:
+        """Compound surnames ('Smith-Jones', 'O'Brien', 'd'Arcy') still match."""
+        assert is_plausible_case_title("Doe v. Judge Smith-Jones") is True
+        assert is_plausible_case_title("Doe v. Judge O'Brien") is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_two_part_name(self) -> None:
+        """Two-word judge names are accepted ('Dominique Ross', 'Mary Beth')."""
+        assert is_plausible_case_title("Doe v. Judge Mary Beth") is True
+
+    def test_federal_pro_se_judge_defendant_is_plausible_three_part_name(self) -> None:
+        """Three-word judge names are accepted ('John Quincy Adams')."""
+        assert is_plausible_case_title("Doe v. Judge John Quincy Adams") is True
+
+    # --- Regression: the #3615 contamination shape MUST still be rejected ---
+
+    def test_judge_smith_report_contamination_still_rejected(self) -> None:
+        """The original #3615 shape 'X v. Y Judge Smith's Report' is still
+        rejected — 'Judge Smith' here is body text following a complete
+        defendant name, not the defendant itself.
+        """
+        title = "Balt USA, LLC v. Treadstone Medical Judge Smith's Report"
+        assert is_plausible_case_title(title) is False
+
+    def test_judge_smith_report_contamination_still_rejected_with_pro_se_lookalike(
+        self,
+    ) -> None:
+        """Even if a contamination caption begins 'v. <entity> Judge X', it
+        is still rejected because the judge phrase doesn't *immediately*
+        follow 'v.' — the entity name 'Treadstone' sits between.
+        """
+        title = "Acme v. Widget Judge d'Arcy's report on the motion"
+        assert is_plausible_case_title(title) is False
+
+    def test_judge_named_after_non_v_separator_still_rejected(self) -> None:
+        """'X Judge Smith ruled ...' (no 'v.' anchor) is still rejected."""
+        title = "Smith Industries Judge Smith ruled on the motion"
+        assert is_plausible_case_title(title) is False
+
+
 class TestProceduralVocabularyTerminators:
     """Issue #3615 — widened _TITLE_TERMINATOR_RE causes clean_case_title()
     to find the boundary in contaminated titles and return clean party names."""
