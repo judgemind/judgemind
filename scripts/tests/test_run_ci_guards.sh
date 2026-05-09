@@ -460,6 +460,42 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 15: requires-argument hint includes Option C — rename without
+#               `check-` prefix (#4558). The naming-convention overload
+#               between code-quality CI guards and ECS-oneshot data-check
+#               scripts named `check-*` must surface as one of the listed
+#               remediation options in the umbrella's failure summary.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 15] requires-argument hint includes Option C rename (#4558)"
+synth_scripts="$(seed_synthetic_scripts s15)"
+cat > "$synth_scripts/check-foo-data.py" <<'PY'
+import sys
+print(
+    "usage: check-foo-data.py [-h] --date DATE",
+    file=sys.stderr,
+)
+print(
+    "check-foo-data.py: error: the following arguments are required: --date",
+    file=sys.stderr,
+)
+sys.exit(2)
+PY
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with failing argparse guard, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "Option C"; then
+    report_fail "expected Option C header in Fix block (#4558)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "rename without the.*check-.*prefix"; then
+    report_fail "expected 'rename without check- prefix' phrase in Fix block (#4558)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "check-foo-data.py  →  foo-data.py"; then
+    report_fail "expected post-rename suggestion 'check-foo-data.py → foo-data.py' (#4558)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "code-standards.md"; then
+    report_fail "expected code-standards.md cross-reference (#4558)" "$out_buf"
+else
+    report_pass "requires-argument hint includes Option C rename remediation (#4558)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""

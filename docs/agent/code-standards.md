@@ -219,6 +219,24 @@ The bypass emits a noisy stderr WARNING so it's hard to miss. Use only when one 
 
 See #4332 for the motivating retro (PR #4325 hit a CI-only `sql-column-check` failure that would have surfaced locally with this umbrella).
 
+#### Naming convention: don't name ECS-oneshot data-check scripts `scripts/check-*.{sh,py}`
+
+The `scripts/check-*.{sh,py}` glob is the umbrella's auto-discovery namespace for **code-quality CI guards** — guards that run blind on the local tree, take no arguments, and fail loudly when the tree contains a forbidden pattern. ECS-oneshot data-check scripts (those with `# venv: scraper-framework` + `# permanent: true` headers, invoked by `scripts/ecs-run-task.sh` from a scheduled GitHub Actions workflow with required `--date YYYY-MM-DD`-style arguments) collide with this glob whenever they are named `check-*`. Three cascading pre-push failures result:
+
+1. `scripts/check-ci-guards-skip-list-coverage.sh` (#11a) flags the script for missing-from-`SKIP_LIST` coverage, because its `--date` argument is `required=True` (or its `${1:?}` first positional is strict-required). The remediation is then to add a `SKIP_LIST` entry or a `# ci-guards: skip` marker.
+2. `scripts/check-fix-block-coverage-complete.sh` (#23a) flags the script for missing-from-inventory coverage, because every executable `scripts/check-*.{sh,py}` in the tree must carry a row in `docs/dx/check-script-fix-block-coverage.md`.
+3. `scripts/run-ci-guards.sh` itself blindly invokes the script with no args during pre-push, exits 2 because the required argument is absent, and surfaces that exit 2 as a guard failure.
+
+**Use a descriptive verb-less name instead.** ECS-oneshot data-check scripts are not CI guards and should not appear in the `check-*` namespace at all. The canonical fix is to rename without the `check-` prefix:
+
+- `scripts/cc-dual-run-diff.py` (not `scripts/check-cc-dual-run-diff.py`) — the rename that came out of #2610 / #4558.
+- `scripts/audit_correctly_labeled_s3_orphans.py` — uses the verb `audit_` which signals the intent more accurately than `check_` and dodges the glob entirely.
+- `scripts/scraper_zero_record_streak.py` would be the canonical rename for `scripts/check-scraper-zero-record-streak.py` (and its two siblings) the next time they are touched. The current `check-` names are grandfathered into `SKIP_LIST` for historical reasons; new ECS-oneshot data-check scripts should not perpetuate the pattern.
+
+**The `SKIP_LIST` route is the fallback, not the recommended path.** When you absolutely must name an ECS-oneshot data-check script `check-*` (e.g. you are extending an existing series of `check-foo-*` data scripts and renaming would break runtime / dashboards / incident-response muscle memory), add a `SKIP_LIST` entry plus an inventory row plus a `# ci-guards: skip` marker, all in the same PR. But: when the rename is cheap, prefer the rename — every avoided `SKIP_LIST` entry is one less landmine for the next agent who touches `run-ci-guards.sh`.
+
+Tracking: #4558 (this rule), #2610 (the rename that surfaced the naming overload).
+
 ### Test assertion hygiene (enforced in CI)
 
 Blind exception swallows inside test files hide bugs: if the call under test raises, the test silently passes on a never-executed code path (see #2443). CI enforces this via `scripts/check-test-except-pass.sh`, which forbids the following patterns inside any file under a `tests/` directory:

@@ -867,6 +867,40 @@ class TestCli:
         # The marker hint must include the literal opt-out comment.
         assert "# ci-guards: skip" in result.stderr
 
+    def test_cli_fix_block_includes_rename_option_c(self, tmp_path: Path) -> None:
+        """Fix block surfaces Option C — rename without `check-` prefix (#4558).
+
+        ECS-oneshot data-check scripts that need required arguments collide
+        with the umbrella's `scripts/check-*.{sh,py}` auto-discovery
+        namespace. The canonical fix is to rename without the `check-`
+        prefix; the Fix block must list this as one of the remediation
+        options so the operator doesn't reach for SKIP_LIST as the only
+        option.
+        """
+
+        scripts_dir = self._build_failing_tree(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--scripts-dir",
+                str(scripts_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        # Option C header.
+        assert "Option C" in result.stderr
+        # The literal phrase the AC's verify line searches for.
+        assert "rename without the `check-` prefix" in result.stderr
+        # The post-rename suggestion — drops the `check-` prefix entirely.
+        assert "check-missing.py  →  missing.py" in result.stderr
+        # Doc cross-reference + tracking issue.
+        assert "code-standards.md" in result.stderr
+        assert "#4558" in result.stderr
+
     def test_cli_exit_two_on_missing_umbrella(self, tmp_path: Path) -> None:
         scripts_dir = tmp_path / "scripts"
         scripts_dir.mkdir()

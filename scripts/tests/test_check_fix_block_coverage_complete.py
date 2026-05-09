@@ -283,6 +283,42 @@ def test_format_fix_block_sums_n_missing_in_total(
     assert "Total guards: 14" in block
 
 
+def test_format_fix_block_includes_rename_alternative(
+    sample_rows: list[InventoryRow],
+) -> None:
+    """Fix block names the rename-without-`check-` prefix alternative (#4558).
+
+    The naming-convention overload — ECS-oneshot data-check scripts named
+    `scripts/check-*` getting flagged by the umbrella's auto-discovery —
+    must surface as one of the listed remediation options. The alternative
+    points at ``docs/agent/code-standards.md`` for the full rationale.
+    """
+
+    result = compute_insertion("check-foo-data.py", sample_rows)
+    block = format_fix_block("check-foo-data.py", result, total_guards=12, n_missing=1)
+
+    # The literal phrase the AC's verify line searches for.
+    assert "rename without the `check-` prefix" in block
+    # The post-rename suggestion — drops the `check-` prefix entirely.
+    assert "`scripts/foo-data.py`" in block
+    # Doc cross-reference + tracking issue.
+    assert "code-standards.md" in block
+    assert "#4558" in block
+
+
+def test_format_fix_block_rename_alternative_handles_underscore_prefix(
+    sample_rows: list[InventoryRow],
+) -> None:
+    """Rename alternative drops the `check_` prefix for underscore-named guards (#4558)."""
+
+    result = compute_insertion("check_foo_data.py", sample_rows)
+    block = format_fix_block("check_foo_data.py", result, total_guards=12, n_missing=1)
+
+    assert "rename without the `check-` prefix" in block
+    # `check_foo_data.py` → `foo_data.py` (underscore prefix stripped).
+    assert "`scripts/foo_data.py`" in block
+
+
 # ─── Live inventory smoke test ────────────────────────────────────────────
 
 

@@ -282,6 +282,82 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test 6: ECS-oneshot rename hint surfaces as an alternative (#4558) ──
+# Issue #4558 acceptance criterion: a fresh `scripts/check-foo-data.py`
+# ECS oneshot must trigger an error message that includes the literal
+# "rename without `check-` prefix" phrase as one of the listed fix
+# options. The per-guard Fix-block formatter is the canonical surface for
+# this hint; this test exercises the full wrapper → helper invocation
+# path so a regression that drops the hint surfaces locally before CI.
+
+reset_tmpdir
+mkdir -p "$TMPDIR_TEST/scripts"
+write_synth_inventory "$TMPDIR_TEST/inventory.md"
+for name in \
+    check-ci-job-skipped.sh \
+    check-ci-guards-skip-list-coverage.sh \
+    check-ci-passed-coverage.sh \
+    check-duplicate-pr.sh \
+    check-fix-block-coverage-complete.sh \
+    check-git-gh-retries.sh \
+    check-no-api-github-fetch.sh \
+    check-no-duplicate-stubs.sh \
+    check-workflow-paths-filter-coverage.sh; do
+    write_synth_guard "$TMPDIR_TEST/scripts" "$name"
+done
+for name in \
+    check_no_basicconfig_with_extra.py \
+    check_no_redos_pattern.py \
+    check_tf_empty_resource.py; do
+    cat > "$TMPDIR_TEST/scripts/$name" <<'EOF'
+#!/usr/bin/env python3
+EOF
+done
+
+# The ECS-oneshot fixture: a Python check-* script that the umbrella
+# would pick up via `scripts/check-*.py` glob.
+cat > "$TMPDIR_TEST/scripts/check-foo-data.py" <<'EOF'
+#!/usr/bin/env python3
+# venv: scraper-framework
+# permanent: true
+import argparse
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--date", required=True)
+    p.parse_args()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+
+TESTS=$((TESTS + 1))
+last_stderr=$(mktemp)
+set +e
+SCRIPTS_DIR_OVERRIDE="$TMPDIR_TEST/scripts" \
+    DOC_OVERRIDE="$TMPDIR_TEST/inventory.md" \
+    "$WRAPPER" 2> "$last_stderr"
+rc=$?
+set -e
+
+if [[ $rc -eq 1 ]] \
+    && grep -q "rename without the .check-. prefix" "$last_stderr" \
+    && grep -q '`scripts/foo-data.py`' "$last_stderr" \
+    && grep -q "code-standards.md" "$last_stderr" \
+    && grep -q "#4558" "$last_stderr"; then
+    echo "PASS: Test 6 — ECS-oneshot rename hint surfaces as alternative remediation (#4558)"
+else
+    echo "FAIL: Test 6 — Fix block missing rename-without-check-prefix hint (#4558)"
+    echo "  rc: $rc"
+    echo "  stderr:"
+    cat "$last_stderr" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$last_stderr"
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"

@@ -242,6 +242,19 @@ def format_fix_block(
 
     template_line = f"| {template_rownum} | `scripts/{new_basename}` | <verdict> | <one-line note> |"
 
+    # Compute the rename-without-`check-`-prefix suggestion for the
+    # alternative remediation hint (#4558). The hint applies when the
+    # missing guard is actually an ECS-oneshot data-check script (`# venv:`
+    # + `# permanent: true` headers, invoked via scripts/ecs-run-task.sh
+    # with a required argument like --date YYYY-MM-DD) rather than a true
+    # code-quality CI guard. Rename drops the `check-`/`check_` prefix.
+    if new_basename.startswith("check-"):
+        renamed = new_basename[len("check-") :]
+    elif new_basename.startswith("check_"):
+        renamed = new_basename[len("check_") :]
+    else:
+        renamed = new_basename
+
     return (
         f"Fix for `scripts/{new_basename}`:\n"
         f"  {location_line}\n"
@@ -250,6 +263,13 @@ def format_fix_block(
         f"  Update the Summary section's count: Total guards: {new_total}\n"
         f"  Verdict options: self-diagnosing (Fix block), self-diagnosing (actionable text),\n"
         f"  wrapper (delegates to helper), operational health probe, decision flow, NEEDS UPGRADE.\n"
+        f"  Alternative — rename without the `check-` prefix. If `{new_basename}` is\n"
+        f"  an ECS-oneshot data-check script (`# venv:` + `# permanent: true` headers,\n"
+        f"  invoked by scripts/ecs-run-task.sh with a required argument like\n"
+        f"  --date YYYY-MM-DD) rather than a code-quality CI guard, rename to e.g.\n"
+        f"  `scripts/{renamed}` so it falls outside the umbrella's auto-discovery\n"
+        f"  namespace. See docs/agent/code-standards.md §\"Naming convention: don't\n"
+        f'  name ECS-oneshot data-check scripts scripts/check-*.{{sh,py}}" (#4558).\n'
     )
 
 
