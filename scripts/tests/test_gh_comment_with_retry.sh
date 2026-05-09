@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # test_gh_comment_with_retry.sh — Tests for scripts/gh-comment-with-retry.sh.
 #
-# Covers the four code paths called out in issue #4478:
+# Covers the code paths from #4478 and #4503, plus the PR-comment
+# generalization from #4484:
 #   A — Success path: gh exits 0, helper prints URL and exits 0.
 #   B — 504 + matching last-comment: helper exits 0 with "504 swallowed" log.
 #   C — 504 + non-matching last-comment: helper exits non-zero (real failure).
+#   C2 — 504 + no comment by current user: helper exits non-zero.
 #   D — Other non-zero exit (auth fail / rate limit / etc.): pass-through.
 #   E — Usage / argument validation paths.
+#   F — GraphQL rate-limit exhaustion → REST fallback (#4503).
+#   P — PR-comment shape via --pr flag (#4484): success, 504-recovery,
+#       GraphQL-rate-limit REST fallback, and auth passthrough — exact
+#       parity with the issue-comment paths above.
 #
 # All tests run against a PATH-mocked ``gh`` binary — no network. Uses the
 # same temp-cleanup helper pattern as test_block_issue.sh and friends
@@ -60,7 +66,7 @@ fi
 
 # ── Set up a mock gh CLI on PATH ──────────────────────────────────────────
 #
-# The mock supports three command shapes the wrapper exercises:
+# The mock supports four command shapes the wrapper exercises:
 #
 #   1. ``gh issue comment <N> --repo <repo> --body-file <path>``
 #      Behavior controlled by ``MOCK_COMMENT_MODE`` env var:
@@ -69,13 +75,21 @@ fi
 #        - "auth"     : exit 4, print "authentication required" on stderr
 #                       (other-failure passthrough path).
 #
-#   2. ``gh api /user --jq .login``
+#   2. ``gh pr comment <N> --repo <repo> --body-file <path>`` (#4484)
+#      Same MOCK_COMMENT_MODE switch as `gh issue comment`. Branding the
+#      stdout URL with ``/pull/<N>`` lets the tests assert the wrapper
+#      drove the PR shape rather than the issue shape.
+#
+#   3. ``gh api /user --jq .login``
 #      Always prints ``MOCK_GH_USER`` (default: "test-user") and exits 0.
 #
-#   3. ``gh api /repos/<owner>/<repo>/issues/<N>/comments?...``
+#   4. ``gh api /repos/<owner>/<repo>/issues/<N>/comments?...``
 #      Prints the JSON staged in ``MOCK_COMMENTS_FILE`` and exits 0. If
 #      ``MOCK_COMMENTS_FILE`` is unset or the file is missing, prints
-#      ``[]`` (empty list) and exits 0.
+#      ``[]`` (empty list) and exits 0. PR top-level comments resolve to
+#      this same endpoint at the API layer (#4484), so the GET-comments
+#      mock and the REST POST mock both serve the PR-comment paths
+#      unchanged.
 
 MOCK_BIN_DIR=$(mktemp -d)
 register_temp_dir "$MOCK_BIN_DIR"
@@ -89,12 +103,22 @@ if [[ -n "${MOCK_INVOCATIONS:-}" ]]; then
     echo "$@" >> "$MOCK_INVOCATIONS"
 fi
 
-# ── gh issue comment <N> --repo <repo> --body-file <path> ──────────────────
-if [[ "${1:-}" == "issue" && "${2:-}" == "comment" ]]; then
+# ── gh issue comment <N> ... | gh pr comment <N> ... ──────────────────────
+# Both call shapes share the same flag set and the same logical recovery
+# paths; the PR shape stamps "/pull/" into the success URL so tests can
+# assert the wrapper drove the right subcommand.
+if [[ "${1:-}" == "issue" && "${2:-}" == "comment" ]] \
+        || [[ "${1:-}" == "pr" && "${2:-}" == "comment" ]]; then
+    target_kind="$1"   # "issue" or "pr"
+    if [[ "$target_kind" == "pr" ]]; then
+        url_path="pull"
+    else
+        url_path="issues"
+    fi
     mode="${MOCK_COMMENT_MODE:-success}"
     case "$mode" in
         success)
-            echo "https://github.com/judgemind/judgemind/issues/${3:-0}#issuecomment-99999"
+            echo "https://github.com/judgemind/judgemind/${url_path}/${3:-0}#issuecomment-99999"
             exit 0
             ;;
         504)
@@ -604,6 +628,241 @@ if [[ "$rest_post_calls" == "0" ]]; then
 else
     fail "F.3: auth-fail makes no REST POST calls" \
         "found $rest_post_calls REST POST calls"
+fi
+
+# ── Test P — --pr flag drives `gh pr comment` (#4484) ─────────────────────
+#
+# Acceptance criteria (issue #4484): test coverage parity with the
+# issue-comment path — at minimum success + 504+matching + 504+non-
+# matching + GraphQL-rate-limit + other-non-zero. The PR-comment shape
+# uses the SAME REST endpoint internally, so the recovery paths are the
+# same; we just need to confirm the wrapper drove the right gh
+# subcommand (asserted via `^pr comment ` invocation prefix and the
+# `/pull/<N>` URL path the mock stamps for the PR shape).
+
+# P.1 — Success path under --pr.
+BODY_FILE_P1=$(mktemp)
+register_temp_file "$BODY_FILE_P1"
+echo "test body P.1 — PR success path" > "$BODY_FILE_P1"
+
+INVOCATIONS_P1="$MOCK_BIN_DIR/invocations_p1.txt"
+: > "$INVOCATIONS_P1"
+
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_P1" \
+    MOCK_COMMENT_MODE=success \
+    "$WRAPPER" --pr 200 --body-file "$BODY_FILE_P1" 2>/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "P.1: --pr success path exits 0"
+else
+    fail "P.1: --pr success path exits 0" "expected 0, got $exit_code"
+fi
+
+if grep -qE "^pr comment 200\b" "$INVOCATIONS_P1"; then
+    pass "P.1: --pr drove 'gh pr comment 200' (not 'gh issue comment')"
+else
+    fail "P.1: --pr drove 'gh pr comment 200' (not 'gh issue comment')" \
+        "invocations: $(cat "$INVOCATIONS_P1")"
+fi
+
+if [[ "$stdout_output" == *"https://github.com/judgemind/judgemind/pull/200"* ]]; then
+    pass "P.1: stdout includes the PR URL (mock stamp /pull/<N>)"
+else
+    fail "P.1: stdout includes the PR URL (mock stamp /pull/<N>)" "got: $stdout_output"
+fi
+
+# P.1b — Default (no --pr) still drives `gh issue comment` — backwards-compat guard.
+BODY_FILE_P1B=$(mktemp)
+register_temp_file "$BODY_FILE_P1B"
+echo "test body P.1b — backwards-compat guard" > "$BODY_FILE_P1B"
+
+INVOCATIONS_P1B="$MOCK_BIN_DIR/invocations_p1b.txt"
+: > "$INVOCATIONS_P1B"
+
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_P1B" \
+    MOCK_COMMENT_MODE=success \
+    "$WRAPPER" 200 --body-file "$BODY_FILE_P1B" >/dev/null 2>&1 || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]] && grep -qE "^issue comment 200\b" "$INVOCATIONS_P1B"; then
+    pass "P.1b: default (no --pr) still drives 'gh issue comment' (backwards-compat)"
+else
+    fail "P.1b: default (no --pr) still drives 'gh issue comment' (backwards-compat)" \
+        "exit=$exit_code, invocations: $(cat "$INVOCATIONS_P1B")"
+fi
+
+# P.2 — 504 + matching last-comment under --pr exits 0.
+BODY_FILE_P2=$(mktemp)
+register_temp_file "$BODY_FILE_P2"
+cat > "$BODY_FILE_P2" << 'BODY_P2_EOF'
+## PR comment — 504-after-success recovery test
+This body's SHA-256 must match the last comment by test-user on the
+mock PR. The wrapper should detect 504-after-success and exit 0.
+BODY_P2_EOF
+
+COMMENTS_P2=$(mktemp)
+register_temp_file "$COMMENTS_P2"
+python3 - "$BODY_FILE_P2" "$COMMENTS_P2" << 'PY_STAGE_P2'
+import json
+import sys
+body = open(sys.argv[1]).read()
+comments = [
+    {
+        "html_url": "https://github.com/judgemind/judgemind/pull/200#issuecomment-99",
+        "user": {"login": "test-user"},
+        "body": body,
+        "created_at": "2026-05-08T01:00:00Z",
+    },
+]
+with open(sys.argv[2], "w") as fh:
+    json.dump(comments, fh)
+PY_STAGE_P2
+
+INVOCATIONS_P2="$MOCK_BIN_DIR/invocations_p2.txt"
+: > "$INVOCATIONS_P2"
+
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_P2" \
+    MOCK_COMMENT_MODE=504 \
+    MOCK_GH_USER="test-user" \
+    MOCK_COMMENTS_FILE="$COMMENTS_P2" \
+    "$WRAPPER" --pr 200 --body-file "$BODY_FILE_P2" 2>/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "P.2: --pr 504 + matching last-comment exits 0"
+else
+    fail "P.2: --pr 504 + matching last-comment exits 0" "expected 0, got $exit_code"
+fi
+
+if [[ "$stdout_output" == *"504 swallowed"* ]]; then
+    pass "P.2: --pr stdout names '504 swallowed' on the recovery path"
+else
+    fail "P.2: --pr stdout names '504 swallowed' on the recovery path" "got: $stdout_output"
+fi
+
+if [[ "$stdout_output" == *"https://github.com/judgemind/judgemind/pull/200#issuecomment-99"* ]]; then
+    pass "P.2: --pr stdout includes the matched PR comment URL"
+else
+    fail "P.2: --pr stdout includes the matched PR comment URL" "got: $stdout_output"
+fi
+
+# Confirm the wrapper invoked `gh pr comment` first (not `gh issue comment`).
+if grep -qE "^pr comment 200\b" "$INVOCATIONS_P2"; then
+    pass "P.2: --pr drove 'gh pr comment' before recovery"
+else
+    fail "P.2: --pr drove 'gh pr comment' before recovery" \
+        "invocations: $(cat "$INVOCATIONS_P2")"
+fi
+
+# P.3 — 504 + non-matching last-comment under --pr exits non-zero.
+BODY_FILE_P3=$(mktemp)
+register_temp_file "$BODY_FILE_P3"
+echo "intended body for P.3 — should NOT match staged comment" > "$BODY_FILE_P3"
+
+COMMENTS_P3=$(mktemp)
+register_temp_file "$COMMENTS_P3"
+cat > "$COMMENTS_P3" << 'COMMENTS_P3_EOF'
+[
+  {
+    "html_url": "https://github.com/judgemind/judgemind/pull/200#issuecomment-50",
+    "user": {"login": "test-user"},
+    "body": "an OLDER unrelated comment we posted earlier",
+    "created_at": "2026-05-08T00:00:00Z"
+  }
+]
+COMMENTS_P3_EOF
+
+exit_code=0
+err_output=$(
+    MOCK_COMMENT_MODE=504 \
+    MOCK_GH_USER="test-user" \
+    MOCK_COMMENTS_FILE="$COMMENTS_P3" \
+    "$WRAPPER" --pr 200 --body-file "$BODY_FILE_P3" 2>&1 >/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -ne 0 ]]; then
+    pass "P.3: --pr 504 + non-matching last-comment exits non-zero"
+else
+    fail "P.3: --pr 504 + non-matching last-comment exits non-zero" \
+        "expected non-zero, got $exit_code"
+fi
+
+if [[ "$err_output" == *"does not match body-file content"* ]]; then
+    pass "P.3: --pr stderr names the SHA mismatch"
+else
+    fail "P.3: --pr stderr names the SHA mismatch" "got: $err_output"
+fi
+
+# P.4 — Auth failure under --pr passes through original exit code.
+BODY_FILE_P4=$(mktemp)
+register_temp_file "$BODY_FILE_P4"
+echo "test body P.4" > "$BODY_FILE_P4"
+
+INVOCATIONS_P4="$MOCK_BIN_DIR/invocations_p4.txt"
+: > "$INVOCATIONS_P4"
+
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_P4" \
+    MOCK_COMMENT_MODE=auth \
+    "$WRAPPER" --pr 200 --body-file "$BODY_FILE_P4" 2>&1 >/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -eq 4 ]]; then
+    pass "P.4: --pr auth-fail passes through original exit code (4)"
+else
+    fail "P.4: --pr auth-fail passes through original exit code (4)" \
+        "expected 4, got $exit_code"
+fi
+
+if [[ "$err_output" == *"authentication required"* ]]; then
+    pass "P.4: --pr auth-fail stderr is passed through"
+else
+    fail "P.4: --pr auth-fail stderr is passed through" "got: $err_output"
+fi
+
+# P.5 — GraphQL rate-limit exhaustion under --pr → REST fallback success.
+BODY_FILE_P5=$(mktemp)
+register_temp_file "$BODY_FILE_P5"
+echo "test body P.5 — GraphQL exhausted on PR comment, REST should rescue" > "$BODY_FILE_P5"
+
+INVOCATIONS_P5="$MOCK_BIN_DIR/invocations_p5.txt"
+: > "$INVOCATIONS_P5"
+
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_P5" \
+    MOCK_COMMENT_MODE=graphql_rate_limit \
+    MOCK_REST_POST_MODE=success \
+    "$WRAPPER" --pr 200 --body-file "$BODY_FILE_P5" 2>/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "P.5: --pr GraphQL rate-limit + REST success exits 0"
+else
+    fail "P.5: --pr GraphQL rate-limit + REST success exits 0" \
+        "expected 0, got $exit_code"
+fi
+
+if [[ "$stdout_output" == *"REST fallback"* ]]; then
+    pass "P.5: --pr stdout names 'REST fallback' on the recovery path"
+else
+    fail "P.5: --pr stdout names 'REST fallback' on the recovery path" "got: $stdout_output"
+fi
+
+# Confirm the REST fallback hit /repos/.../issues/200/comments — PR
+# top-level comments resolve to the same endpoint as issue comments
+# (#4484), which is the structural reason the same wrapper covers both.
+if grep -qE "^api -X POST /repos/.*/issues/200/comments( |$)" "$INVOCATIONS_P5"; then
+    pass "P.5: --pr REST fallback hits /repos/.../issues/200/comments (shared endpoint)"
+else
+    fail "P.5: --pr REST fallback hits /repos/.../issues/200/comments (shared endpoint)" \
+        "invocations: $(cat "$INVOCATIONS_P5")"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

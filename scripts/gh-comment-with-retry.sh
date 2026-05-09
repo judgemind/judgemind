@@ -1,62 +1,75 @@
 #!/usr/bin/env bash
 # permanent: true
-# gh-comment-with-retry.sh — Post a `gh issue comment` and tolerate two
-# distinct flaky failure modes (504-after-success + GraphQL-quota
-# exhaustion).
+# gh-comment-with-retry.sh — Post a `gh issue comment` or `gh pr comment`
+# and tolerate two distinct flaky failure modes (504-after-success +
+# GraphQL-quota exhaustion).
 #
 # Why this helper exists
 # ----------------------
-# `gh issue comment <N> --body-file <file>` has two flaky failure modes
-# that the bare `gh` call does not handle:
+# `gh issue comment <N> --body-file <file>` and `gh pr comment <N>
+# --body-file <file>` share two flaky failure modes that the bare `gh`
+# call does not handle. PR top-level comments are issue-comments under
+# the hood — both posts target the same `/repos/.../issues/<N>/comments`
+# REST endpoint via GitHub's GraphQL API, so the same flaky modes and
+# the same recovery recipes apply to both call shapes:
 #
-#   1. **504-after-success (#4478):** the request periodically returns a
-#      `504 Gateway Timeout` (with a multi-KB HTML "Unicorn!" error page
-#      in stderr) **after the comment has already posted**. A naive
-#      retry creates a duplicate; treating it as a hard failure
+#   1. **504-after-success (#4478 / #4484):** the request periodically
+#      returns a `504 Gateway Timeout` (with a multi-KB HTML "Unicorn!"
+#      error page in stderr) **after the comment has already posted**.
+#      A naive retry creates a duplicate; treating it as a hard failure
 #      misleads the agent about pipeline state. Recipe: re-fetch the
-#      issue's recent comments, treat already-posted-with-matching-body
-#      as success.
+#      issue/PR's recent comments, treat already-posted-with-matching-
+#      body as success.
 #
-#   2. **GraphQL-quota-exhausted (#4503):** `gh issue comment` posts
-#      the comment via GitHub's GraphQL API, which has a separate
-#      5,000-req/hr quota from the REST core API. Long agent sessions
-#      (dispatcher, multi-PR /task runs) regularly exhaust GraphQL —
-#      consumed by `gh pr view`, `gh pr merge`, `gh issue view --json`,
-#      etc. — while the REST core quota stays healthy. Recipe: fall
-#      back to `gh api -X POST /repos/<owner>/<repo>/issues/<N>/comments
-#      -F body=@<file>`. The REST endpoint is the same logical
-#      operation and `-F body=@<file>` accepts the body the same way
-#      `--body-file` does.
+#   2. **GraphQL-quota-exhausted (#4503 / #4484):** `gh issue comment`
+#      and `gh pr comment` post via GitHub's GraphQL API, which has a
+#      separate 5,000-req/hr quota from the REST core API. Long agent
+#      sessions (dispatcher, multi-PR /task runs) regularly exhaust
+#      GraphQL — consumed by `gh pr view`, `gh pr merge`, `gh issue
+#      view --json`, etc. — while the REST core quota stays healthy.
+#      Recipe: fall back to `gh api -X POST /repos/<owner>/<repo>/
+#      issues/<N>/comments -F body=@<file>`. The REST endpoint is the
+#      same logical operation for both shapes (PR comments are
+#      issue-comments at the API layer) and `-F body=@<file>` accepts
+#      the body the same way `--body-file` does.
 #
 # Both failure modes share the same shape — the API can accept the
 # request, the wrapper just needs the right fallback path. See
 # `.claude/skills/task/SKILL.md` §A.7 for the `gh pr merge` 5xx
 # analogue (#4231).
 #
-# Tracking: issues #4478 (504-after-success) and #4503 (GraphQL-quota
-# REST fallback).
+# Tracking: issues #4478 (504-after-success), #4503 (GraphQL-quota
+# REST fallback), and #4484 (PR-comment generalization).
 #
 # Usage
 # -----
 #   scripts/gh-comment-with-retry.sh <issue-N> --body-file <path>
-#   scripts/gh-comment-with-retry.sh <issue-N> --body-file <path> --repo <owner/name>
+#   scripts/gh-comment-with-retry.sh <pr-N> --pr --body-file <path>
+#   scripts/gh-comment-with-retry.sh <N> [--pr] --body-file <path> --repo <owner/name>
 #   scripts/gh-comment-with-retry.sh --help
+#
+# Default target is an issue comment. Pass `--pr` to post on a pull
+# request instead — the wrapper invokes `gh pr comment` and otherwise
+# behaves identically (same 504-recovery + GraphQL-rate-limit REST
+# fallback semantics, same exit codes).
 #
 # Behavior
 # --------
-#   1. Calls ``gh issue comment <N> --repo <repo> --body-file <path>``.
+#   1. Calls ``gh issue comment <N> --repo <repo> --body-file <path>``
+#      (or ``gh pr comment <N> ...`` when --pr is set).
 #   2. On exit 0: prints the returned comment URL to stdout, exits 0.
 #   3. On non-zero exit AND the captured stderr matches
 #      ``GraphQL: API rate limit already exceeded`` (#4503):
 #      - Falls back to ``gh api -X POST /repos/<owner>/<repo>/issues/<N>/comments
-#        -F body=@<path>``.
+#        -F body=@<path>`` (same endpoint for both issue and PR
+#        comments — PR comments are issue-comments at the API layer).
 #      - On REST success: prints "comment posted (REST fallback): <url>"
 #        and exits 0.
 #      - On REST failure: prints both stderrs (gh + REST, truncated to
 #        5 KB each) and exits non-zero with the REST exit code.
 #   4. On non-zero exit AND the captured stderr matches
 #      ``504 Gateway Timeout`` or ``<title>Unicorn!`` (#4478):
-#      - Re-fetches the issue's recent comments via
+#      - Re-fetches the issue/PR's recent comments via
 #        ``gh api /repos/<repo>/issues/<N>/comments?per_page=100&sort=created&direction=desc``.
 #      - Filters to comments by the current ``gh`` user
 #        (``gh api /user --jq .login``).
@@ -90,15 +103,18 @@
 #
 # Integration
 # -----------
-# Replaces direct ``gh issue comment ... --body-file ...`` calls in
+# Replaces direct ``gh issue comment ... --body-file ...`` and
+# ``gh pr comment ... --body-file ...`` calls in
 # ``.claude/skills/task/SKILL.md`` (Steps 2, A.2b, A.8 Step 3 — claim
 # comment, process summary, verification evidence) and the
 # documentation in ``.claude/skills/task-v2-summary/SKILL.md`` (process
 # summary post — daemon side already retries via
 # ``_gh_issue_comment``; the helper is the bash-path equivalent).
 #
-# Out of scope: ``gh pr comment`` calls share the same bug class but
-# are rarer; a follow-up issue can pick those up.
+# PR-comment generalization (#4484): the helper added a ``--pr`` flag
+# so a single command surface covers both shapes; the same 504 +
+# GraphQL-rate-limit recovery paths apply unchanged because PR
+# top-level comments resolve to the same REST endpoint.
 
 set -euo pipefail
 
@@ -108,25 +124,39 @@ set -euo pipefail
 
 print_help() {
     cat << 'EOF'
-gh-comment-with-retry.sh — post `gh issue comment` with 504-swallow recovery.
+gh-comment-with-retry.sh — post `gh issue comment` or `gh pr comment`
+with 504-swallow recovery and GraphQL-quota REST fallback.
 
 Usage:
   scripts/gh-comment-with-retry.sh <issue-N> --body-file <path>
-  scripts/gh-comment-with-retry.sh <issue-N> --body-file <path> --repo <owner/name>
+  scripts/gh-comment-with-retry.sh <pr-N>    --pr --body-file <path>
+  scripts/gh-comment-with-retry.sh <N> [--pr] --body-file <path> --repo <owner/name>
   scripts/gh-comment-with-retry.sh --help | -h
 
+Forms:
+  Issue comment (default): `gh issue comment <N> --body-file <path>`
+  PR comment   (--pr):     `gh pr comment <N> --body-file <path>`
+
+Both forms target the same `/repos/.../issues/<N>/comments` REST
+endpoint at the API layer (PR top-level comments are issue-comments
+under the hood), so the recovery paths are identical and the only
+behavioral difference is the underlying gh subcommand.
+
 Arguments:
-  <issue-N>            Issue number to comment on (digits, optional leading '#').
+  <N>                  Issue or PR number (digits, optional leading '#').
+  --pr                 Post a PR comment via `gh pr comment`. Default
+                       is an issue comment (`gh issue comment`).
   --body-file <path>   Path to the comment body file.
   --repo <owner/name>  Repository (default: judgemind/judgemind).
   -h, --help           Show this help and exit.
 
 Exit codes:
-  0  — Comment posted successfully (including 504-after-success).
+  0  — Comment posted successfully (including 504-after-success and
+       GraphQL-rate-limit REST fallback).
   1  — Real failure (auth, rate limit, real server failure, etc.).
   2  — Usage error (missing args, body-file not found).
 
-See header comment for behavior details. Tracking: #4478.
+See header comment for behavior details. Tracking: #4478, #4503, #4484.
 EOF
 }
 
@@ -138,12 +168,21 @@ fi
 ISSUE=""
 BODY_FILE=""
 REPO="judgemind/judgemind"
+# IS_PR controls which gh subcommand we drive: `gh pr comment` when "1",
+# `gh issue comment` (the default) when "0". The recovery paths and the
+# REST fallback URL are identical for both because PR top-level comments
+# are issue-comments at the API layer (#4484).
+IS_PR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             print_help
             exit 0
+            ;;
+        --pr)
+            IS_PR=1
+            shift
             ;;
         --body-file)
             if [[ $# -lt 2 ]]; then
@@ -184,13 +223,13 @@ done
 # ---------------------------------------------------------------------------
 
 if [[ -z "$ISSUE" ]]; then
-    echo "ERROR: missing <issue-N> argument." >&2
+    echo "ERROR: missing <N> argument (issue or PR number)." >&2
     print_help >&2
     exit 2
 fi
 
 if ! [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: <issue-N> must be a positive integer, got '$ISSUE'." >&2
+    echo "ERROR: <N> must be a positive integer, got '$ISSUE'." >&2
     exit 2
 fi
 
@@ -216,8 +255,19 @@ STDOUT_FILE=$(mktemp)
 # shellcheck disable=SC2064  # cleanup paths are fixed at trap-install time.
 trap "rm -f '$STDERR_FILE' '$STDOUT_FILE'" EXIT
 
+# Route the underlying gh subcommand based on --pr. Both shapes accept
+# the same `<N> --repo <owner/name> --body-file <path>` flag set; the
+# only difference is the verb. Recovery paths downstream are identical
+# because PR top-level comments resolve to the same REST endpoint as
+# issue comments (#4484).
+if [[ "$IS_PR" -eq 1 ]]; then
+    GH_TARGET_CMD=("gh" "pr" "comment")
+else
+    GH_TARGET_CMD=("gh" "issue" "comment")
+fi
+
 set +e
-gh issue comment "$ISSUE" --repo "$REPO" --body-file "$BODY_FILE" \
+"${GH_TARGET_CMD[@]}" "$ISSUE" --repo "$REPO" --body-file "$BODY_FILE" \
     > "$STDOUT_FILE" 2> "$STDERR_FILE"
 GH_EXIT=$?
 set -e
