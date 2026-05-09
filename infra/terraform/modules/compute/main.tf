@@ -948,6 +948,47 @@ resource "aws_cloudwatch_metric_alarm" "ingestion_worker_idle" {
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
 }
 
+# ─── Case-Title Unrecoverable Telemetry ─────────────────────────────────────
+# CloudWatch metric filter that increments on every `case_title.unrecoverable`
+# warning emitted from `apply_case_title_cleanup()` in
+# packages/scraper-framework/src/ingestion/worker.py. The warning fires when
+# the LLM-extracted case_title fails plausibility AND deterministic cleanup
+# cannot produce a plausible replacement — the fallback is to persist NULL
+# rather than visible motion-description / procedural-text contamination.
+#
+# Source of the literal log line:
+#   packages/scraper-framework/src/ingestion/worker.py:1161
+#       logger.warning("case_title.unrecoverable", extra={...})
+#
+# The pattern is a literal-substring match (the worker uses stdlib `logging`,
+# not structlog JSON, so the `extra={...}` keys including `telemetry_event`
+# do NOT appear in the rendered log message — only the message string does).
+# The dot in "case_title.unrecoverable" makes the prefix unambiguous and
+# avoids future `case_title_unrecoverable_*` collisions.
+#
+# This metric measures (a) how frequently the NULL fallback fires (= rate of
+# contaminated extractions reaching the cleanup layer that the regex widening
+# doesn't catch) and (b) whether that rate trends down over time as the regex
+# vocabulary improves, or holds steady (argues for an enrichment-layer LLM
+# round-trip fix rather than more regex patches).
+#
+# See: #3615 (origin of the unrecoverable warning), #4076 (this metric).
+
+resource "aws_cloudwatch_log_metric_filter" "case_title_unrecoverable" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-case-title-unrecoverable-${var.environment}"
+  pattern        = "\"case_title.unrecoverable\""
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name          = "CaseTitleUnrecoverable"
+    namespace     = "Judgemind/Ingestion"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
 # ─── Scraper Redis Emit Failure Alerts ───────────────────────────────────────
 # CloudWatch alarm that fires when scrapers fail to emit `document.captured`
 # events to the Redis Streams event bus. This is the upstream signal that
