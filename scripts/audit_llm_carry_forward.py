@@ -27,9 +27,20 @@ This script runs four carry-forward checks per CA county:
    ("v. plaintiff_name") do not appear in ``ruling_text``. Same shape as
    ``audit_oc_ruling_integrity.py`` but applied per-county.
 
-4. **all_same_case_title_cluster** — same ``documents.s3_key`` has multiple
-   rulings, all sharing identical ``case_title``. Strong indicator the LLM
-   applied page-1 case to every entry.
+4. **all_same_case_title_cluster** — multiple rulings within the same
+   county sharing identical ``case_title``, where the cluster output
+   reports both the distinct ``s3_key`` count and the distinct
+   ``content_hash`` count. Strong indicator the LLM applied page-1 case
+   to every entry.
+
+   Per-cluster output exposes ``distinct_blobs`` (count of unique
+   ``derived.documents.content_hash`` values spanning the cluster),
+   ``distinct_keys`` (count of unique ``s3_key`` values), and an
+   ``examples`` array deduplicated to one row per content_hash (#4344).
+   When ``keys > blobs`` the inflation factor is the
+   ``mislabeled-s3-writes-2026-04`` shape — one underlying PDF blob
+   stored under N different S3 keys; ``keys == blobs`` is a real
+   N-blob multi-PDF cluster.
 
 Counties with deterministic splitters wired in
 ``ingestion/worker.py`` (Riverside, Fresno, San Diego, LA) should produce
@@ -323,21 +334,36 @@ _RULING_QUERY = """
       {since_filter}
 """
 
-# Cluster query for check 4 — same s3_key (one source document) with
-# multiple rulings, all sharing identical case_title.
+# Cluster query for check 4 — multiple rulings sharing identical case_title
+# inside the same county.
 #
-# Single-case PDFs naturally have one (s3_key, case_title) tuple. Multi-case
-# PDFs split correctly produce multiple distinct case_titles per s3_key. The
+# Single-case PDFs naturally have one ruling per case_title. Multi-case PDFs
+# split correctly produce multiple distinct case_titles per source PDF. The
 # bug shape is multi-case PDFs that produced N>=2 rulings, all with the
 # SAME case_title — i.e. the LLM applied page 1's case to every entry.
+#
+# Why we group by ``case_title`` (not ``(s3_key, case_title)``): the
+# ``mislabeled-s3-writes-2026-04`` bug stores the same underlying PDF blob
+# under up to 15 different ``s3_key`` values (#4344). The pre-#4344 query
+# grouped by ``s3_key`` and inflated cluster counts 15× — investigators
+# reading the audit saw "21 SC clusters" when the underlying structural
+# defect was one PDF with 12 cases. Grouping by ``case_title`` and
+# aggregating ``distinct_blobs`` (count of distinct ``content_hash`` values
+# spanning the cluster) makes the inflation factor visible at audit time:
+# ``count: 30 (15 keys → 1 blob)`` vs ``count: 30 (15 keys → 15 blobs)``
+# tell completely different stories.
+#
+# We aggregate ``s3_key`` / ``content_hash`` / ``scraper_id`` as arrays so
+# the Python side can dedupe ``examples`` to one row per content_hash.
 
 _CLUSTER_QUERY = """
     SELECT
-        ct.county          AS county,
-        d.s3_key           AS s3_key,
-        d.scraper_id       AS scraper_id,
-        c.case_title       AS case_title,
-        COUNT(*)           AS ruling_count
+        ct.county                       AS county,
+        c.case_title                    AS case_title,
+        COUNT(*)                        AS ruling_count,
+        ARRAY_AGG(DISTINCT d.s3_key)        AS s3_keys,
+        ARRAY_AGG(DISTINCT d.content_hash)  AS content_hashes,
+        ARRAY_AGG(DISTINCT d.scraper_id)    AS scraper_ids
     FROM derived.rulings r
     JOIN derived.cases     c  ON c.id = r.case_id
     JOIN derived.courts    ct ON ct.id = r.court_id
@@ -347,7 +373,7 @@ _CLUSTER_QUERY = """
       {since_filter}
       AND c.case_title IS NOT NULL
       AND c.case_title <> ''
-    GROUP BY ct.county, d.s3_key, d.scraper_id, c.case_title
+    GROUP BY ct.county, c.case_title
     HAVING COUNT(*) >= 2
        AND COUNT(DISTINCT r.id) = COUNT(*)
 """
@@ -365,6 +391,50 @@ def _build_filters(county: str | None, since: str | None) -> tuple[str, str, lis
         since_filter = "AND r.posted_at >= %s"
         params.append(since)
     return county_filter, since_filter, params
+
+
+def _build_cluster_example(
+    *,
+    case_title: str | None,
+    ruling_count: int,
+    s3_keys: list[str],
+    content_hashes: list[str],
+    scraper_ids: list[str],
+) -> dict[str, Any]:
+    """Build a single cluster ``examples`` row with content-hash dedup.
+
+    Definition of done from #4344:
+
+    1. Each cluster output row exposes ``distinct_blobs`` (count of unique
+       content_hashes among the cluster's documents).
+    2. ``examples`` is capped to one row per content_hash so investigators
+       don't waste time downloading 15 copies of the same PDF.
+
+    The returned dict is one cluster row's worth of structured output —
+    callers cap the number of cluster rows separately via
+    ``limit_examples``.
+    """
+    distinct_blobs = len(content_hashes)
+    distinct_keys = len(s3_keys)
+    primary_content_hash = content_hashes[0] if content_hashes else None
+    primary_s3_key = s3_keys[0] if s3_keys else None
+    primary_scraper_id = scraper_ids[0] if scraper_ids else None
+
+    return {
+        "case_title": case_title,
+        "ruling_count": ruling_count,
+        "distinct_blobs": distinct_blobs,
+        "distinct_keys": distinct_keys,
+        # ``content_hash`` and ``s3_key`` keep their pre-#4344 names for
+        # downstream consumers; the ``s3_keys``/``content_hashes`` arrays
+        # carry the full set of distinct values when keys outnumber blobs.
+        "content_hash": primary_content_hash,
+        "s3_key": primary_s3_key,
+        "scraper_id": primary_scraper_id,
+        "s3_keys": list(s3_keys),
+        "content_hashes": list(content_hashes),
+        "scraper_ids": list(scraper_ids),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -472,16 +542,26 @@ def run_audit(
                             }
                         )
 
-            # Check 4 — same-s3_key + same-case_title clusters
+            # Check 4 — same case_title across rulings (content-hash aware)
+            #
+            # Each row covers one (county, case_title) pair, with
+            # array-aggregated s3_keys, content_hashes, and scraper_ids
+            # spanning the cluster (#4344). We expose ``distinct_blobs`` /
+            # ``distinct_keys`` so investigators can tell "real N-ruling
+            # cluster" from "1-blob cluster amplified by S3 mislabeling."
             cur.execute(cluster_sql, params)
             for row in cur.fetchall():
                 (
                     county_name,
-                    s3_key,
-                    scraper_id,
                     case_title,
                     ruling_count,
+                    s3_keys_raw,
+                    content_hashes_raw,
+                    scraper_ids_raw,
                 ) = row
+                s3_keys = [k for k in (s3_keys_raw or []) if k]
+                content_hashes = [h for h in (content_hashes_raw or []) if h]
+                scraper_ids = [s for s in (scraper_ids_raw or []) if s]
                 bucket = _bucket(county_name)
                 bucket["all_same_case_title_cluster"]["count"] += 1
                 if (
@@ -489,12 +569,13 @@ def run_audit(
                     < limit_examples
                 ):
                     bucket["all_same_case_title_cluster"]["examples"].append(
-                        {
-                            "s3_key": s3_key,
-                            "case_title": case_title,
-                            "ruling_count": ruling_count,
-                            "scraper_id": scraper_id,
-                        }
+                        _build_cluster_example(
+                            case_title=case_title,
+                            ruling_count=ruling_count,
+                            s3_keys=s3_keys,
+                            content_hashes=content_hashes,
+                            scraper_ids=scraper_ids,
+                        )
                     )
 
     # Compose final summary
@@ -600,7 +681,58 @@ def render_text_report(summary: dict[str, Any]) -> str:
             "Re-run with --json to inspect example ruling_id / s3_key / "
             "scraper_id values for each non-zero check."
         )
+
+    # Per-cluster keys-vs-blobs detail (#4344). Surfacing the inflation
+    # factor at audit time (``count: 30 (15 keys → 1 blob)``) lets
+    # investigators tell "real 30-ruling cluster" from "1-blob cluster
+    # amplified by S3 mislabeling" without out-of-band ``aws s3api
+    # head-object`` calls per cluster.
+    cluster_lines = _render_cluster_detail(summary)
+    if cluster_lines:
+        lines.append("")
+        lines.extend(cluster_lines)
     return "\n".join(lines)
+
+
+def _render_cluster_detail(summary: dict[str, Any]) -> list[str]:
+    """Return per-cluster ``count: N (K keys → B blobs)`` detail lines.
+
+    Empty list when no county has cluster examples to render.
+    """
+    out: list[str] = []
+    counties = summary.get("counties", {}) or {}
+    has_any = False
+    for county_name in sorted(counties):
+        county_bucket = counties[county_name]
+        cluster = county_bucket.get("all_same_case_title_cluster", {})
+        examples = cluster.get("examples") or []
+        if not examples:
+            continue
+        if not has_any:
+            out.append("Cluster details (all_same_case_title_cluster):")
+            has_any = True
+        out.append(f"  {county_name}:")
+        for ex in examples:
+            out.append(f"    - {_format_cluster_example(ex)}")
+    return out
+
+
+def _format_cluster_example(example: dict[str, Any]) -> str:
+    """Render one cluster example as ``count: N (K keys → B blobs) — title``.
+
+    The ``K keys → B blobs`` shape is what makes the
+    ``mislabeled-s3-writes-2026-04`` inflation visible at audit time
+    (#4344). When ``keys == blobs`` the cluster has no S3-mislabeling
+    inflation; when ``keys > blobs`` the inflation factor is exactly
+    ``keys / blobs``.
+    """
+    count = int(example.get("ruling_count", 0))
+    keys = int(example.get("distinct_keys", 0))
+    blobs = int(example.get("distinct_blobs", 0))
+    title = example.get("case_title") or "<untitled>"
+    keys_word = "key" if keys == 1 else "keys"
+    blobs_word = "blob" if blobs == 1 else "blobs"
+    return f"count: {count} ({keys} {keys_word} → {blobs} {blobs_word}) — {title}"
 
 
 # ---------------------------------------------------------------------------

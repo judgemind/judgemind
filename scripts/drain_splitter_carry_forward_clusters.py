@@ -22,9 +22,13 @@ restore parent doc rows so the new splitter can re-run.
 
 This script does that work generically:
 
-  1. Identifies clusters using the same query shape as the audit's
-     ``_CLUSTER_QUERY``: ``(d.s3_key, c.case_title)`` tuples with
-     ruling_count >= 2 and exactly one distinct case_title.
+  1. Identifies clusters using a ``(d.s3_key, c.case_title)`` GROUP BY:
+     tuples with ruling_count >= 2 and exactly one distinct case_title.
+     Drain operates per S3 blob, so its grouping is per-s3_key — different
+     from the audit's per-``case_title`` aggregate that exposes
+     ``distinct_blobs`` (#4344). The drain's HAVING clause still matches
+     the audit's check 4: ``COUNT(*) >= 2`` and ``COUNT(DISTINCT r.id) =
+     COUNT(*)``.
   2. For each cluster, in a single transaction with ``SELECT ... FOR
      UPDATE`` row locks:
        a. Fetches the parent PDF from S3 using the cluster's ``s3_key`` /
@@ -175,9 +179,12 @@ logger = logging.getLogger(__name__)
 # Cluster discovery
 # ---------------------------------------------------------------------------
 
-# Same shape as ``audit_llm_carry_forward.py`` ``_CLUSTER_QUERY`` but adds
-# ``s3_bucket`` (needed to fetch the PDF) and ``ORDER BY`` for deterministic
-# iteration. The HAVING clauses match the audit's check 4 exactly.
+# Per-(s3_key, case_title) cluster query — drain operates on one S3 blob
+# at a time so it groups by ``s3_key`` (not the audit's content-hash-aware
+# ``case_title`` grain — see #4344). The HAVING clauses still match the
+# audit's check 4: ``COUNT(*) >= 2`` rulings, all distinct ruling IDs.
+# Adds ``s3_bucket`` (needed to fetch the PDF) and ``ORDER BY`` for
+# deterministic iteration.
 _CLUSTER_QUERY = """
     SELECT
         ct.county          AS county,
