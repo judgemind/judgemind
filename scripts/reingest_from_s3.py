@@ -157,6 +157,15 @@ Options:
                         reingest to.  Surgical scope for hand-picked SHAs
                         where county / date / regex filters all over- or
                         under-match.  See #3659.
+    --skip-judge-prepass
+                        Disable the one-shot judge pre-pass that walks the
+                        FETCH cursor up front to seed full-name judges into
+                        ``derived.judges`` before the main per-doc loop
+                        runs.  Default: pre-pass runs.  Reserved for
+                        emergency rollback when the pre-pass itself
+                        misbehaves; in normal operation it closes the
+                        chronological resolver-race class.  See #4408
+                        (parent #4397).
 """
 
 from __future__ import annotations
@@ -2455,6 +2464,288 @@ def _supersede_document(
     )
 
 
+def _seed_judges_from_cursor(
+    conn: psycopg.Connection,
+    s3_client: object,
+    cursor: tuple[datetime, str],
+    filters: str,
+    filter_params: list,
+    *,
+    batch_size: int,
+    limit: int | None,
+    parse_timeout: float,
+    concurrency: int,
+) -> dict[str, int]:
+    """Walk the FETCH cursor once and seed judges from full-name documents (#4408).
+
+    This is the judge pre-pass that closes the chronological-resolver-race
+    class surfaced by #4397.  When LA per-case docs carrying only a surname
+    via ``JUDGE/DEPT: <Surname>/<dept>`` sort earlier in the
+    ``(captured_at, id)`` cursor than the boilerplate doc carrying the full
+    ``JUDGE <FIRST> <LAST>`` string, the per-case docs would commit
+    ``judge_id = NULL`` until the boilerplate doc later auto-created the
+    judge in ``derived.judges``.  A second reingest pass would close the
+    NULL gap, but that's a workaround, not a fix.
+
+    The pre-pass walks the same FETCH cursor once before the main per-doc
+    write loop.  For every doc with valid raw S3 content, it runs
+    ``extract_judge_name`` against the document text and, when a *full*
+    name (≥2 words, passing ``_looks_like_valid_judge_name``) is found,
+    calls ``resolve_judge`` to upsert the judge into ``derived.judges``.
+    The Step 4 auto-create path at ``ingestion.db.resolve_judge`` is
+    idempotent via ``ON CONFLICT (canonical_name, court_id)``, so seeding
+    the same judge twice is a no-op.
+
+    After the pre-pass, the main per-doc loop's
+    ``_expand_single_word_judge_surname`` Step 4 lookup
+    (``packages/scraper-framework/src/ingestion/db.py``) finds the judge
+    via the suffix-LIKE match regardless of which doc the cursor processes
+    first.  Single-word surnames now resolve on the first reingest
+    invocation.
+
+    Operational notes:
+      * Skipped under ``dry_run=True`` (caller's responsibility — the helper
+        always commits).
+      * Skipped under ``--skip-judge-prepass`` (caller's responsibility).
+      * Operates on RAW S3 content + ``_extract_text_from_content`` regex,
+        so it works for ``full_reparse``, ``multimodal``, and the default
+        path equally — ``extract_judge_name`` is regex-only and incurs no
+        LLM cost.
+      * S3 content is re-fetched by the main pass.  For a typical
+        100–200 doc dept-scoped reingest the pre-pass overhead is <30 s
+        per #4408 estimate.
+
+    Parameters
+    ----------
+    conn:
+        Open psycopg connection.  Pre-pass commits after each page.
+    s3_client:
+        boto3 S3 client (mockable in tests).
+    cursor:
+        Starting ``(captured_at, document_id)`` keyset cursor.  Typically
+        the cursor min — the pre-pass walks from the beginning of the
+        scoped slice.
+    filters, filter_params:
+        Same SQL ``filters`` clause and parameter list ``run_reingest``
+        builds for the main pass.  The pre-pass walks the identical
+        document slice.
+    batch_size:
+        Page size for the keyset walk.  The same value the main pass uses
+        is fine (S3 fetch is parallelised within each page).
+    limit:
+        Optional total-document cap.  When set, the pre-pass stops after
+        scanning at most ``limit`` documents.
+    parse_timeout:
+        Per-document text-extraction timeout (seconds).  Forwarded to
+        ``_extract_text_from_content``.
+    concurrency:
+        Thread pool size for parallel S3 fetches.
+
+    Returns
+    -------
+    dict[str, int]
+        ``{"docs_scanned": N, "judges_seeded": M}`` — N is the number of
+        documents the pre-pass observed (after split-child / no-S3-key
+        skips), M is the number of ``resolve_judge`` calls that returned
+        a judge_id (i.e. successfully upserted).  Both counters are
+        cumulative across all pages walked.
+    """
+    docs_scanned = 0
+    judges_seeded = 0
+    judges_skipped_invalid = 0
+    page = 0
+    page_cursor = cursor
+
+    while True:
+        page += 1
+        effective_size = batch_size
+        if limit is not None:
+            remaining = limit - docs_scanned
+            if remaining <= 0:
+                break
+            effective_size = min(batch_size, remaining)
+
+        params = filter_params + [page_cursor[0], page_cursor[1], effective_size]
+        with conn.cursor() as cur:
+            cur.execute(
+                FETCH_DOCUMENTS_QUERY.format(filters=filters),
+                params,
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            break
+
+        # Defense in depth: even though the SQL ``LIMIT %s`` should cap
+        # at ``effective_size``, trim the in-memory list to ``limit``
+        # when set so we never overshoot the operator's cap.
+        if limit is not None and len(rows) > (limit - docs_scanned):
+            rows = rows[: limit - docs_scanned]
+
+        # Parallel-fetch S3 content for the page.  Skip rows that would
+        # not contribute (no s3_key/s3_bucket, split children).
+        s3_results: dict[int, bytes] = {}
+        scan_targets: list[tuple[int, dict]] = []
+        for idx, row in enumerate(rows):
+            (
+                doc_id,
+                _case_id,
+                court_id,
+                s3_key,
+                s3_bucket,
+                content_hash,
+                _source_url,
+                _scraper_id,
+                captured_at,
+                _hearing_date,
+                doc_format,
+                _state,
+                _county,
+                _court_name,
+                _case_number,
+                _case_title,
+                _case_type,
+                _ruling_hearing_date,
+                _stored_ruling_text,
+                _ruling_department,
+                _ruling_judge_name,
+            ) = row
+            doc_id_str = str(doc_id)
+            page_cursor = (captured_at, doc_id_str)
+
+            # Skip split-child documents: mirrors the guard in
+            # ``reingest_batch`` (#1919, #2367, #2416).  Split children
+            # share their parent's S3 object; processing them here would
+            # double-count text the parent already covers.
+            if is_split_child_id(doc_id_str, content_hash):
+                continue
+
+            if not s3_key or not s3_bucket:
+                continue
+
+            scan_targets.append(
+                (
+                    idx,
+                    {
+                        "document_id": doc_id_str,
+                        "court_id": str(court_id),
+                        "format": doc_format,
+                        "s3_key": s3_key,
+                        "s3_bucket": s3_bucket,
+                    },
+                )
+            )
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {}
+            for idx, meta in scan_targets:
+                future = pool.submit(
+                    _fetch_s3_content,
+                    s3_client,
+                    meta["s3_bucket"],
+                    meta["s3_key"],
+                )
+                futures[future] = idx
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    s3_results[idx] = future.result()
+                except Exception:
+                    # Best-effort: missing-S3-content just skips the doc
+                    # for the pre-pass.  The main pass logs and accounts
+                    # for it on its own re-fetch.
+                    logger.debug(
+                        "judge prepass: S3 fetch failed",
+                        document_id=str(rows[idx][0]),
+                        exc_info=True,
+                    )
+
+        # Extract text + judge name + seed.
+        for idx, meta in scan_targets:
+            raw_content = s3_results.get(idx)
+            if raw_content is None:
+                continue
+
+            docs_scanned += 1
+
+            try:
+                text = _extract_text_from_content(
+                    raw_content,
+                    meta["format"],
+                    pdf_timeout=parse_timeout,
+                )
+            except Exception:
+                logger.debug(
+                    "judge prepass: text extraction failed",
+                    document_id=meta["document_id"],
+                    exc_info=True,
+                )
+                continue
+
+            judge_name = extract_judge_name(text)
+            if not judge_name:
+                continue
+
+            # Only seed FULL names — single-word surnames would just be
+            # rejected by ``resolve_judge``'s ``_looks_like_valid_judge_name``
+            # guard (which requires ≥2 words).  Calling resolve_judge with
+            # a bare surname produces no DB write and only adds log noise.
+            if not _looks_like_valid_judge_name(judge_name):
+                judges_skipped_invalid += 1
+                continue
+
+            try:
+                judge_id = resolve_judge(conn, judge_name, meta["court_id"])
+            except Exception:
+                logger.warning(
+                    "judge prepass: resolve_judge failed",
+                    document_id=meta["document_id"],
+                    judge_name=judge_name,
+                    exc_info=True,
+                )
+                continue
+
+            if judge_id:
+                judges_seeded += 1
+                logger.debug(
+                    "judge prepass: seeded judge",
+                    document_id=meta["document_id"],
+                    judge_name=judge_name,
+                    judge_id=judge_id,
+                )
+
+        # Commit after each page so partial pre-pass progress survives a
+        # crash mid-prepass.  Only commit if the page actually produced
+        # writes — committing an empty page generates a redundant TX
+        # round-trip and breaks tests that assert "no batch-level commit"
+        # via mocking ``reingest_batch`` directly.
+        page_committed = False
+        if scan_targets:
+            conn.commit()
+            page_committed = True
+
+        logger.info(
+            "judge_prepass_page",
+            page=page,
+            page_size=len(rows),
+            scan_targets=len(scan_targets),
+            committed=page_committed,
+            cumulative_docs_scanned=docs_scanned,
+            cumulative_judges_seeded=judges_seeded,
+            cumulative_judges_skipped_invalid=judges_skipped_invalid,
+        )
+
+        if len(rows) < effective_size:
+            break
+
+    return {
+        "docs_scanned": docs_scanned,
+        "judges_seeded": judges_seeded,
+        "judges_skipped_invalid": judges_skipped_invalid,
+    }
+
+
 def reingest_batch(
     conn: psycopg.Connection,
     s3_client: object,
@@ -3875,6 +4166,7 @@ def run_reingest(
     bust_llm_cache: bool = False,
     department_in: list[str] | None = None,
     s3_key_list: list[str] | None = None,
+    skip_judge_prepass: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -3900,6 +4192,15 @@ def run_reingest(
         surgical backfills targeting a hand-picked set of SHAs (#3659) where
         county-wide rescope would over-shoot and date filters lack sub-day
         granularity.
+    skip_judge_prepass:
+        When *True*, skip the one-shot judge pre-pass that walks the FETCH
+        cursor up front and seeds full-name judges into ``derived.judges``
+        before the main per-doc loop runs (#4408).  Default ``False`` (the
+        pre-pass runs).  Reserved for emergency rollback when the pre-pass
+        itself misbehaves; in normal operation it closes the chronological
+        resolver-race class (#4397) and should always run.  Always implicitly
+        skipped under ``dry_run=True`` because the pre-pass writes real DB
+        rows.
     """
     filters, filter_params = _build_filters(
         county,
@@ -4020,7 +4321,45 @@ def run_reingest(
     # rows span batch boundaries.  See #1984.
     s3_dedup: set[tuple[str, str]] | None = set() if full_reparse else None
 
+    # ---------------------------------------------------------------------
+    # Judge pre-pass (#4408) — seed full-name judges before the per-doc
+    # loop so single-word JUDGE/DEPT surnames resolve on the first
+    # reingest invocation regardless of cursor ordering.  Closes the
+    # chronological-resolver-race class surfaced by #4397.
+    # ---------------------------------------------------------------------
+    prepass_stats: dict[str, int] | None = None
     with psycopg.connect(dsn) as conn:
+        if dry_run:
+            logger.info(
+                "judge_prepass_skipped",
+                reason="dry_run — pre-pass writes real judge rows",
+            )
+        elif skip_judge_prepass:
+            logger.warning(
+                "judge_prepass_skipped",
+                reason="--skip-judge-prepass flag set (emergency rollback)",
+            )
+        else:
+            prepass_t0 = time.monotonic()
+            prepass_stats = _seed_judges_from_cursor(
+                conn,
+                s3_client,
+                cursor,
+                filters,
+                filter_params,
+                batch_size=batch_size,
+                limit=limit,
+                parse_timeout=parse_timeout,
+                concurrency=concurrency,
+            )
+            logger.info(
+                "judge_prepass_complete",
+                docs_scanned=prepass_stats["docs_scanned"],
+                judges_seeded=prepass_stats["judges_seeded"],
+                judges_skipped_invalid=prepass_stats["judges_skipped_invalid"],
+                wall_time_seconds=round(time.monotonic() - prepass_t0, 2),
+            )
+
         while True:
             effective_batch = batch_size
             if limit is not None:
@@ -4170,6 +4509,8 @@ def run_reingest(
         result["quality_after"] = after_metrics
     if metrics_delta is not None:
         result["quality_delta"] = metrics_delta
+    if prepass_stats is not None:
+        result["judge_prepass"] = prepass_stats
     return result
 
 
@@ -4408,6 +4749,21 @@ def main() -> None:
             "without this flag — it only affects PDF documents."
         ),
     )
+    parser.add_argument(
+        "--skip-judge-prepass",
+        action="store_true",
+        dest="skip_judge_prepass",
+        help=(
+            "Skip the judge pre-pass that walks the FETCH cursor up front "
+            "and seeds full-name judges into derived.judges before the main "
+            "per-doc loop runs (#4408).  Default: pre-pass runs.  This flag "
+            "is reserved for emergency rollback when the pre-pass itself "
+            "misbehaves; in normal operation it closes the chronological "
+            "resolver-race class (#4397) and should always run.  Always "
+            "implicitly skipped under --dry-run because the pre-pass writes "
+            "real judge rows."
+        ),
+    )
     args = parser.parse_args()
 
     if args.resume and not args.checkpoint_file:
@@ -4486,6 +4842,7 @@ def main() -> None:
         bust_llm_cache=args.bust_llm_cache,
         department_in=args.department_in,
         s3_key_list=s3_key_list_values,
+        skip_judge_prepass=args.skip_judge_prepass,
     )
 
     logger.info(
