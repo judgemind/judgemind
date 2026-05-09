@@ -110,9 +110,24 @@ MOCK_AWS
 
 run_script() {
     # Args: <mock_bin> <args...>
+    #
+    # Defaults LIST_TASKS_POLL_TIMEOUT_SECS to 0 so flag-parsing / SSM-strip
+    # tests that aren't exercising polling behavior fail fast on the first
+    # list-tasks "None" response from the mock (~instant) instead of waiting
+    # the script's 60-second production default + 3-second retry loop. With
+    # =0, the deadline check on the first iteration fires immediately —
+    # 5 affected tests × ~60s each → ~5 min cut from the suite (#4497).
+    #
+    # Tests that need to exercise polling behavior (test_polls_until_task_appears,
+    # test_polls_then_gives_up_with_clear_error, test_exec_agent_probe_*)
+    # set LIST_TASKS_POLL_TIMEOUT_SECS / EXEC_AGENT_POLL_TIMEOUT_SECS on the
+    # command line and those values take precedence over these defaults via
+    # bash's standard env-var precedence.
     local mock_bin="$1"
     shift
-    PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "$@" 2>&1
+    LIST_TASKS_POLL_TIMEOUT_SECS="${LIST_TASKS_POLL_TIMEOUT_SECS:-0}" \
+        EXEC_AGENT_POLL_TIMEOUT_SECS="${EXEC_AGENT_POLL_TIMEOUT_SECS:-0}" \
+        PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "$@" 2>&1
 }
 
 # ── Tests ──────────────────────────────────────────────────────────────────
