@@ -106,6 +106,12 @@ module "cache" {
   # window. Production keeps the default (false) so surprise reboots don't
   # land during business hours. See #2573 (RDS) and #2581 (this extension).
   apply_immediately = true
+
+  # CloudWatch memory alarms — see #4475 / #4470. The compute module owns the
+  # SNS topic (judgemind-scraper-alerts-dev); we share it so cache alerts land
+  # in the same place as scraper alerts.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
 }
 
 module "compute" {
