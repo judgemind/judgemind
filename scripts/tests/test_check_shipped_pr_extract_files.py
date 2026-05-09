@@ -416,3 +416,147 @@ def test_line_range_suffix_does_not_strip_non_numeric(extract_module):
     body = "See packages/api/src/index.ts (the entry point)."
     out = extract_module.extract_files(body)
     assert out == ["packages/api/src/index.ts"]
+
+
+# ─── Existence-Verify classification (issue #4469) ────────────────────
+
+
+def test_existence_verify_is_committed_classifies_as_target(extract_module):
+    """``Verify: <path> is committed`` cites ``<path>`` as the change
+    target — the predicate is "this file must exist," not "this file
+    is a search argument." Pre-#4469 the bare ``Verify:`` token put
+    every cited path into search-context; post-fix the verb regex no
+    longer triggers on plain-prose Verify clauses.
+
+    Canonical case from issue #3310 — its third AC reads
+    ``Verify: scripts/iam-agent-phase-b-smoke.sh ... is committed.``
+    The cited script IS the load-bearing file the AC requires, not a
+    grep / pytest argument.
+    """
+    body = (
+        "## Acceptance criteria\n"
+        "\n"
+        "- [ ] A documented manual smoke test exists for the Phase-B write path.\n"
+        "  - Verify: `scripts/iam-agent-phase-b-smoke.sh` "
+        "(or equivalent in `infra/terraform/modules/iam_agent/tests/`) is committed.\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert "scripts/iam-agent-phase-b-smoke.sh" in target
+    assert "scripts/iam-agent-phase-b-smoke.sh" not in search
+
+
+def test_existence_verify_exists_or_created_classifies_as_target(extract_module):
+    """The existence-Verify pattern is shape-agnostic to the specific
+    predicate verb — ``is committed``, ``is created``, ``exists``,
+    ``must exist`` all behave the same. The classifier doesn't need to
+    enumerate predicate verbs; it just needs to NOT classify the line
+    as search-context when the line carries no shell-invocation verb.
+    """
+    body_a = "## AC\n  - Verify: `scripts/dispatcher/zombie_alert.py` exists.\n"
+    body_b = "## AC\n  - Verify: `docs/agent/new-runbook.md` is created.\n"
+    target_a, _ = extract_module.classify_files(body_a)
+    target_b, _ = extract_module.classify_files(body_b)
+    assert "scripts/dispatcher/zombie_alert.py" in target_a
+    assert "docs/agent/new-runbook.md" in target_b
+
+
+def test_verify_with_grep_invocation_stays_search(extract_module):
+    """Negative regression — the existence-Verify fix must not regress
+    the #4340 invariant. ``Verify: `grep -n widget <path>` `` cites
+    ``<path>`` as a grep argument; it stays search-context.
+    """
+    body = (
+        "## AC\n"
+        "  - Verify: `grep -n widget scripts/run-foo.sh packages/api/src/index.ts`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert "scripts/run-foo.sh" in search
+    assert "packages/api/src/index.ts" in search
+
+
+def test_verify_with_bash_invocation_stays_search(extract_module):
+    """Negative regression — ``Verify: `bash <path>` exits 0`` cites
+    ``<path>`` as the script being executed, not as a target the
+    issue creates. Classify as search-context.
+
+    The verb regex was extended in #4469 to include ``bash`` so this
+    case keeps its pre-#4469 search classification after the bare
+    ``Verify:`` trigger was dropped.
+    """
+    body = "## AC\n  - Verify: `bash scripts/tests/test_check_shipped_pr.sh` exits 0.\n"
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert "scripts/tests/test_check_shipped_pr.sh" in search
+
+
+def test_verify_with_python_invocation_stays_search(extract_module):
+    """Negative regression — ``Verify: `python3 <path>` `` and
+    ``Verify: `python <path>` `` cite the script being executed,
+    not a target the issue creates. Classify as search-context.
+
+    Locks in the ``python`` / ``python3`` verb additions from #4469.
+    """
+    body_a = (
+        "## AC\n  - Verify: `python3 scripts/check-something.py --dry-run` succeeds.\n"
+    )
+    body_b = "## AC\n  - Verify: `python scripts/dispatcher/audit.py` reports clean.\n"
+    target_a, search_a = extract_module.classify_files(body_a)
+    target_b, search_b = extract_module.classify_files(body_b)
+    assert "scripts/check-something.py" in search_a
+    assert "scripts/dispatcher/audit.py" in search_b
+
+
+def test_existence_verify_mixed_with_search_verify(extract_module):
+    """Two Verify clauses in the same body — one existence-shape, one
+    grep-shape — classify INDEPENDENTLY. The existence Verify's path
+    is target; the grep Verify's path is search.
+    """
+    body = (
+        "## AC\n"
+        "  - [ ] Smoke test exists.\n"
+        "  - Verify: `scripts/new-smoke-test.sh` is committed.\n"
+        "  - [ ] Hardcoded prefix is gone from caller.\n"
+        "  - Verify: `grep -n staging packages/api/src/legacy.py`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert "scripts/new-smoke-test.sh" in target
+    assert "packages/api/src/legacy.py" in search
+    assert "scripts/new-smoke-test.sh" not in search
+    assert "packages/api/src/legacy.py" not in target
+
+
+def test_existence_verify_three_repo_3310_layout(extract_module):
+    """End-to-end repro of the issue #3310 body shape — narrative cites
+    ``main.tf`` (with line ranges that strip per #4462) plus a fenced
+    HCL block citing the bare ``main.tf``, plus a Verify-existence
+    clause citing ``iam-agent-phase-b-smoke.sh``. All three target
+    paths classify correctly.
+
+    Locks in #4469's worked example: post-fix, target_overlap should
+    contain BOTH ``main.tf`` and ``iam-agent-phase-b-smoke.sh``.
+    """
+    body = (
+        "## Affected files\n"
+        "\n"
+        "- `infra/terraform/modules/iam_agent/main.tf:47-62` — first issue\n"
+        "- `infra/terraform/modules/iam_agent/main.tf:132-141` — second issue\n"
+        "\n"
+        "## Acceptance criteria\n"
+        "\n"
+        "- [ ] Policy is split.\n"
+        "  - Verify: `terraform plan -chdir=infra/terraform/environments/dev` "
+        "shows the new statement; `aws iam simulate-principal-policy "
+        "--policy-source-arn <arn> --action-names ecs:RegisterTaskDefinition` "
+        "returns `allowed`.\n"
+        "- [ ] A documented manual smoke test exists.\n"
+        "  - Verify: `scripts/iam-agent-phase-b-smoke.sh` "
+        "(or equivalent in `infra/terraform/modules/iam_agent/tests/`) is committed.\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert "infra/terraform/modules/iam_agent/main.tf" in target
+    assert "scripts/iam-agent-phase-b-smoke.sh" in target
+    # The aws / terraform plan Verify line cites
+    # ``infra/terraform/environments/dev`` — only on a search-context
+    # line — so it stays search.
+    assert "infra/terraform/environments/dev" in search
