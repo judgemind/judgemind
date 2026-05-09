@@ -318,19 +318,14 @@ EOF
 assert_passes "arr=() + reassign-with-content + iterate passes"
 reset_tmpdir
 
-# ─── Test B7: Length-guard alone (without += or [@]+ guard) → fails ─────
-# A length guard ``if [ "${#arr[@]}" -gt 0 ]; then`` is the runtime
-# fix recommended by the check's report message — it makes the
-# iteration safe at run time. But the static check cannot reason
-# about ``if`` block scopes, and the AC's static criterion is "no
-# ``arr+=(...)`` or ``arr=(...)`` assignment intervenes" (see #4336
-# AC#1). So the static check still flags this shape; users should
-# either pre-populate the array, use the ``${arr[@]+...}``
-# parameter-expansion guard (Test B8), or accept that the iteration
-# is unreachable at run time anyway. This test documents the
-# limitation so future maintainers don't accidentally weaken the
-# check trying to recognise length guards.
-write_file "bad_arr_length_guard_only.sh" <<'EOF'
+# ─── Test B7: Length-guard wrapping the iteration → passes ─────────────
+# The recommended runtime fix (``if [ "${#arr[@]}" -gt 0 ]; then
+# ... fi``) is now recognized by the static check (#4479). Reads of
+# ``arr`` inside the length-guard block are exempt: the iteration
+# only fires when the array is non-empty, so the bash 3.2 footgun
+# cannot trip. This is the canonical post-#4051 fix used in
+# ``scripts/block-on-new-issue.sh`` lines 169-175.
+write_file "good_arr_length_guard.sh" <<'EOF'
 #!/usr/bin/env bash
 set -u
 arr=()
@@ -340,7 +335,21 @@ if [ "${#arr[@]}" -gt 0 ]; then
     done
 fi
 EOF
-assert_fails "arr=() + length-guard alone (no += / [@]+ guard) still flags (static-scan limitation)"
+assert_passes "arr=() + length-guarded iteration ('if [ \"\${#arr[@]}\" -gt 0 ]') passes (#4479)"
+reset_tmpdir
+
+# ─── Test B7b: Length-guard with [[ ... ]] / -ne 0 form → passes ────────
+write_file "good_arr_length_guard_dbl.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+if [[ ${#arr[@]} -ne 0 ]]; then
+    for v in "${arr[@]}"; do
+        echo "$v"
+    done
+fi
+EOF
+assert_passes "arr=() + length-guarded iteration ('[[ -ne 0 ]]') passes (#4479)"
 reset_tmpdir
 
 # ─── Test B8: Safe — arr=() + ${arr[@]+...} guarded expansion → passes ──
@@ -435,6 +444,161 @@ else
     echo "PASS: AC#1 Verify probe — check fails with probe filename + line number"
 fi
 rm -rf "$PROBE_DIR" "$PROBE_OUT_FILE"
+
+# ─── Test C1 (#4479): Conditional ``+=`` inside ``case`` arm → fails ────
+# This is the canonical bug shape from #4051 / ``block-on-new-issue.sh``:
+# ``LABELS=()`` then ``LABELS+=("$2")`` inside a ``case`` arm of an
+# arg-parse loop, then unguarded ``for label in "${LABELS[@]}"; do``.
+# When the user supplies no ``--label`` flag, the conditional ``+=``
+# never runs, the array stays empty, and bash 3.2 trips ``unbound
+# variable`` on the iteration. The pre-#4479 linear scan stopped at
+# the first ``LABELS+=`` it saw and classified the array as "assigned"
+# regardless of nesting; the post-#4479 scan tracks branch depth and
+# treats ``+=`` inside ``if``/``case`` arms as conditional.
+write_file "bad_conditional_assign_case_arm.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+LABELS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --label)
+            LABELS+=("${2:-}")
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+# Unguarded iteration — the #4051 bug shape.
+for label in "${LABELS[@]}"; do
+    echo "$label"
+done
+EOF
+assert_fails "Conditional 'LABELS+=' inside case arm + unguarded for-loop iterate triggers (#4479)"
+reset_tmpdir
+
+# ─── Test C2 (#4479): Conditional ``+=`` inside ``if`` arm → fails ──────
+# Same root cause class but the conditional gate is an ``if`` rather
+# than a ``case`` arm.
+write_file "bad_conditional_assign_if_arm.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+if [[ "${1:-}" == "--add" ]]; then
+    arr+=("$2")
+fi
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_fails "Conditional 'arr+=' inside 'if' arm + unguarded iterate triggers (#4479)"
+reset_tmpdir
+
+# ─── Test C3 (#4479): Conditional ``+=`` inside ``case`` + length-guard → passes ──
+# Mirrors the post-#4051 fix in ``scripts/block-on-new-issue.sh``:
+# the conditional ``+=`` stays where it is, but the iteration is
+# wrapped in an explicit length-guard that the static check now
+# recognizes (B7 above).
+write_file "good_conditional_assign_with_length_guard.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+LABELS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --label)
+            LABELS+=("${2:-}")
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+if [ "${#LABELS[@]}" -gt 0 ]; then
+    for label in "${LABELS[@]}"; do
+        echo "$label"
+    done
+fi
+EOF
+assert_passes "Conditional 'LABELS+=' + length-guarded iteration passes (post-#4051 fix shape)"
+reset_tmpdir
+
+# ─── Test C4 (#4479): Loop-body ``+=`` is treated as binding → passes ───
+# The static check intentionally accepts the ``arr=(); while read line;
+# do arr+=("$line"); done; for x in "${arr[@]}"; do ...`` pattern as
+# binding, even though the loop body may iterate zero times if the
+# input stream is empty. Distinguishing "loop iterates >= 1 times"
+# from "loop iterates 0 times" needs runtime semantics; the check
+# only enforces "branch-conditional ``+=`` does not bind". The
+# zero-iteration case is a separate (lower-severity) bug class —
+# real codebases routinely use this idiom and the false-positive
+# rate would be too high to ship.
+write_file "good_loop_body_assign.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+while IFS= read -r line; do
+    arr+=("$line")
+done < /dev/null
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + loop-body 'arr+=' (no inner if/case) treated as binding"
+reset_tmpdir
+
+# ─── Test C5 (#4479): Early-exit-on-empty + iterate → passes ────────────
+# A closed ``if [[ ${#arr[@]} -eq 0 ]]; then ... exit ...; fi`` block
+# before the iteration marks the array as "guaranteed non-empty
+# after this point". The check short-circuits to "assigned" when the
+# closing ``fi`` is processed.
+write_file "good_early_exit_on_empty.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+arr=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && arr+=("$line")
+done < /dev/null
+if [[ ${#arr[@]} -eq 0 ]]; then
+    echo "no items"
+    exit 0
+fi
+for v in "${arr[@]}"; do
+    echo "$v"
+done
+EOF
+assert_passes "arr=() + early-exit-on-empty + iterate passes (#4479)"
+reset_tmpdir
+
+# ─── Test C6 (#4479): Verify-line probe — repo-style fixture path ──────
+# AC#1 of #4479 says: ``scripts/check-bash-set-u-empty-array.sh
+# tests/fixtures/conditional_array_assign/`` exits 1 with a violation
+# report naming the iteration line. This test reproduces that
+# verbatim by pointing the check at the repo's
+# ``tests/fixtures/conditional_array_assign/`` directory and
+# asserting exit 1 + the iteration line is named.
+TESTS=$((TESTS + 1))
+FIXTURE_DIR="$REPO_ROOT/tests/fixtures/conditional_array_assign"
+if [[ ! -d "$FIXTURE_DIR" ]]; then
+    echo "FAIL: AC#1 fixture directory missing: $FIXTURE_DIR"
+    FAILURES=$((FAILURES + 1))
+else
+    FIXTURE_OUT_FILE="$TMPDIR_TEST/fixture_output.txt"
+    "$CHECK_SCRIPT" "$FIXTURE_DIR" > "$FIXTURE_OUT_FILE" 2>&1 && fixture_rc=0 || fixture_rc=$?
+    if [[ "$fixture_rc" -eq 0 ]]; then
+        echo "FAIL: AC#1 fixture probe — expected check to exit non-zero, got 0"
+        cat "$FIXTURE_OUT_FILE"
+        FAILURES=$((FAILURES + 1))
+    elif ! grep -qE "for[[:space:]]+label[[:space:]]+in.*LABELS" "$FIXTURE_OUT_FILE"; then
+        echo "FAIL: AC#1 fixture probe — output does not name the iteration line"
+        cat "$FIXTURE_OUT_FILE"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "PASS: AC#1 fixture probe — tests/fixtures/conditional_array_assign/ flagged with iteration line"
+    fi
+    rm -f "$FIXTURE_OUT_FILE"
+fi
 
 # ─── Test 15: Self-scan — real repo scripts/ tree → passes ─────────────
 TESTS=$((TESTS + 1))

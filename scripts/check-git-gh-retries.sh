@@ -187,10 +187,13 @@ if (( violations > 0 )); then
     echo ""
     echo "  Sites missing an annotation:"
     echo ""
-    for line in "${missing[@]}"; do
-        snippet="$(sed -n "${line}p" "$TARGET_FILE")"
-        echo "    $TARGET_FILE:${line}: ${snippet}"
-    done
+    # Length-guard the iteration — see #4479.
+    if [ "${#missing[@]}" -gt 0 ]; then
+        for line in "${missing[@]}"; do
+            snippet="$(sed -n "${line}p" "$TARGET_FILE")"
+            echo "    $TARGET_FILE:${line}: ${snippet}"
+        done
+    fi
     echo ""
     echo "  Fix: add a comment above the call such as"
     echo ""

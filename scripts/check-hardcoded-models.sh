@@ -93,72 +93,81 @@ fi
 # ─── Scan the codebase ────────────────────────────────────────────────
 violations=0
 
-for target in "${scan_targets[@]}"; do
-    [[ -e "$target" ]] || continue
+# Defensive length-guard: each ``scan_targets+=`` above runs in
+# exactly one branch of the if/else, so the array is always
+# populated at runtime — but the #4479 static check treats branch-
+# conditional ``+=`` as non-binding. The guard makes the check
+# happy AND defends against the pathological case where neither
+# branch fired (e.g. SCAN_DIR is REPO_ROOT but no packages/*/src/
+# exists yet on a fresh clone before the first build).
+if [ "${#scan_targets[@]}" -gt 0 ]; then
+    for target in "${scan_targets[@]}"; do
+        [[ -e "$target" ]] || continue
 
-    matches=$(grep -rnE "$PATTERN" "$target" "${exclude_args[@]}" 2>/dev/null || true)
+        matches=$(grep -rnE "$PATTERN" "$target" "${exclude_args[@]}" 2>/dev/null || true)
 
-    [[ -z "$matches" ]] && continue
+        [[ -z "$matches" ]] && continue
 
-    while IFS= read -r line; do
-        # Check if this match is in an excluded file
-        skip=false
-        for excl in "${EXCLUDE_FILES[@]}"; do
-            if [[ "$line" == *"$excl"* ]]; then
-                skip=true
-                break
+        while IFS= read -r line; do
+            # Check if this match is in an excluded file
+            skip=false
+            for excl in "${EXCLUDE_FILES[@]}"; do
+                if [[ "$line" == *"$excl"* ]]; then
+                    skip=true
+                    break
+                fi
+            done
+            "$skip" && continue
+
+            # Check excluded path patterns (tests, eval)
+            for pat in "${EXCLUDE_PATH_PATTERNS[@]}"; do
+                # shellcheck disable=SC2254
+                case "$line" in
+                    *$pat*) skip=true; break ;;
+                esac
+            done
+            "$skip" && continue
+
+            # Skip comment lines:
+            #   Python/shell comments: lines where the match is after a #
+            #   SQL comments: lines containing --
+            #   Docstring examples: lines containing e.g. or ``
+            # Extract the file:lineno:content and check the content portion.
+            content="${line#*:}"   # strip filename
+            content="${content#*:}"  # strip line number
+            # Trim leading whitespace
+            trimmed="${content#"${content%%[![:space:]]*}"}"
+
+            # Skip lines that are pure comments
+            if [[ "$trimmed" == "#"* ]]; then
+                continue
             fi
-        done
-        "$skip" && continue
+            # Skip SQL comment lines
+            if [[ "$trimmed" == "--"* ]]; then
+                continue
+            fi
+            # Skip docstring-style documentation lines (contain `` or "e.g.")
+            if [[ "$content" == *'``'* ]] || [[ "$content" == *'e.g.'* ]]; then
+                continue
+            fi
 
-        # Check excluded path patterns (tests, eval)
-        for pat in "${EXCLUDE_PATH_PATTERNS[@]}"; do
-            # shellcheck disable=SC2254
-            case "$line" in
-                *$pat*) skip=true; break ;;
-            esac
-        done
-        "$skip" && continue
+            if [[ $violations -eq 0 ]]; then
+                echo "ERROR: Found hardcoded Claude model identifier(s) in the codebase."
+                echo ""
+                echo "  Model identifiers should be centralized in judgemind-config."
+                echo "  Import from judgemind_config instead of hardcoding the string:"
+                echo ""
+                echo "    from judgemind_config import DEFAULT_HAIKU_MODEL"
+                echo ""
+                echo "  Violations:"
+                echo ""
+            fi
 
-        # Skip comment lines:
-        #   Python/shell comments: lines where the match is after a #
-        #   SQL comments: lines containing --
-        #   Docstring examples: lines containing e.g. or ``
-        # Extract the file:lineno:content and check the content portion.
-        content="${line#*:}"   # strip filename
-        content="${content#*:}"  # strip line number
-        # Trim leading whitespace
-        trimmed="${content#"${content%%[![:space:]]*}"}"
-
-        # Skip lines that are pure comments
-        if [[ "$trimmed" == "#"* ]]; then
-            continue
-        fi
-        # Skip SQL comment lines
-        if [[ "$trimmed" == "--"* ]]; then
-            continue
-        fi
-        # Skip docstring-style documentation lines (contain `` or "e.g.")
-        if [[ "$content" == *'``'* ]] || [[ "$content" == *'e.g.'* ]]; then
-            continue
-        fi
-
-        if [[ $violations -eq 0 ]]; then
-            echo "ERROR: Found hardcoded Claude model identifier(s) in the codebase."
-            echo ""
-            echo "  Model identifiers should be centralized in judgemind-config."
-            echo "  Import from judgemind_config instead of hardcoding the string:"
-            echo ""
-            echo "    from judgemind_config import DEFAULT_HAIKU_MODEL"
-            echo ""
-            echo "  Violations:"
-            echo ""
-        fi
-
-        echo "    $line"
-        violations=$((violations + 1))
-    done <<< "$matches"
-done
+            echo "    $line"
+            violations=$((violations + 1))
+        done <<< "$matches"
+    done
+fi
 
 if [[ $violations -gt 0 ]]; then
     echo ""

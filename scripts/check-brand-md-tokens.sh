@@ -208,17 +208,22 @@ check_tuple_in_config() {
 
     IFS=':' read -r token subkey expected_val <<< "$tuple"
 
-    # Find matching tuple in config_tuples
+    # Find matching tuple in config_tuples. Length-guard: bash 3.2
+    # trips on ``"${config_tuples[@]}"`` when the array is empty
+    # (tailwind.config.ts restructured to drop the colors block).
+    # See #4479.
     local found_val=""
     local t
-    for t in "${config_tuples[@]}"; do
-        local ct cs cv
-        IFS=':' read -r ct cs cv <<< "$t"
-        if [[ "$ct" == "$token" && "$cs" == "$subkey" ]]; then
-            found_val="$cv"
-            break
-        fi
-    done
+    if [ "${#config_tuples[@]}" -gt 0 ]; then
+        for t in "${config_tuples[@]}"; do
+            local ct cs cv
+            IFS=':' read -r ct cs cv <<< "$t"
+            if [[ "$ct" == "$token" && "$cs" == "$subkey" ]]; then
+                found_val="$cv"
+                break
+            fi
+        done
+    fi
 
     if [[ -z "$found_val" ]]; then
         if [[ $violations -eq 0 ]]; then
@@ -240,16 +245,24 @@ check_tuple_in_config() {
     fi
 }
 
-# Check code-block tuples
-for tuple in "${brand_tuples[@]}"; do
-    check_tuple_in_config "$tuple" "Tailwind Token Mapping block"
-done
+# Check code-block tuples. Length-guard the iteration: bash 3.2
+# trips ``unbound variable`` on ``"${arr[@]}"`` when arr=() and no
+# elements ever got appended (e.g. BRAND.md restructured to drop
+# the §Tailwind Token Mapping block). See #4479 for the static
+# check that catches this shape.
+if [ "${#brand_tuples[@]}" -gt 0 ]; then
+    for tuple in "${brand_tuples[@]}"; do
+        check_tuple_in_config "$tuple" "Tailwind Token Mapping block"
+    done
+fi
 
 # Check Accent table tuples (may overlap with code block — that's fine,
 # the cross-check is the point)
-for tuple in "${accent_tuples[@]}"; do
-    check_tuple_in_config "$tuple" "Accent table"
-done
+if [ "${#accent_tuples[@]}" -gt 0 ]; then
+    for tuple in "${accent_tuples[@]}"; do
+        check_tuple_in_config "$tuple" "Accent table"
+    done
+fi
 
 if [[ $violations -gt 0 ]]; then
     echo ""

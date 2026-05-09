@@ -140,10 +140,16 @@ if (( violations > 0 )); then
     echo ""
     echo "  Sites missing coverage:"
     echo ""
-    for line in "${missing[@]}"; do
-        snippet="$(sed -n "${line}p" "$TARGET_FILE")"
-        echo "    $TARGET_FILE:${line}: ${snippet}"
-    done
+    # Length-guard the iteration — bash 3.2 trips on ``"${arr[@]}"``
+    # when arr=() and the conditional ``missing+=`` inside the
+    # earlier loop never fired (e.g. all SQL sites are covered, but
+    # ``violations`` was incremented by some other path). See #4479.
+    if [ "${#missing[@]}" -gt 0 ]; then
+        for line in "${missing[@]}"; do
+            snippet="$(sed -n "${line}p" "$TARGET_FILE")"
+            echo "    $TARGET_FILE:${line}: ${snippet}"
+        done
+    fi
     echo ""
     echo "  Fix: add an execution_mode branch, OR annotate the site:"
     echo ""

@@ -330,9 +330,14 @@ if [ "$failures" -gt 0 ]; then
     echo "" >&2
     echo "════════════════════════════════════════════════════════════════════" >&2
     echo "run-ci-guards: $failures of ${#runnable[@]} guard(s) failed:" >&2
-    for fname in "${failed_names[@]}"; do
-        echo "  - $fname" >&2
-    done
+    # Length-guard the iteration — see #4479. ``failures > 0``
+    # implies failed_names was populated, but the static check
+    # treats branch-conditional ``+=`` as non-binding.
+    if [ "${#failed_names[@]}" -gt 0 ]; then
+        for fname in "${failed_names[@]}"; do
+            echo "  - $fname" >&2
+        done
+    fi
     echo "" >&2
     echo "Fix the issues above and re-run.  These are the same guards CI" >&2
     echo "runs — catching them locally saves a full CI round trip." >&2
