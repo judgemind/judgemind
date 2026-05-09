@@ -217,7 +217,16 @@ def count_documents_for_county(conn: object, county: str) -> int:
 
     The SELECT joins ``derived.courts`` because ``derived.documents`` does not
     carry county directly — county lives on the joined courts row.
+
+    Callers pass the underscored CLI/S3-prefix slug (e.g. ``santa_clara``,
+    ``los_angeles``, ``contra_costa``); ``derived.courts.county`` stores the
+    human form (``'santa clara'``, ``'los angeles'``, ``'contra costa'``).
+    We normalize underscores to spaces before the case-insensitive compare so
+    multi-word counties match — without this, the COUNT silently degenerates
+    to 0 and the pre/post invariant becomes ``0 == 0`` regardless of what
+    the UPDATE did (the bug from #4566 / observed in #2661 apply).
     """
+    canonical = county.replace("_", " ")
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -226,7 +235,7 @@ def count_documents_for_county(conn: object, county: str) -> int:
             JOIN derived.courts c ON d.court_id = c.id
             WHERE LOWER(c.county) = LOWER(%s)
             """,
-            (county,),
+            (canonical,),
         )
         row = cur.fetchone()
     return int(row[0]) if row else 0

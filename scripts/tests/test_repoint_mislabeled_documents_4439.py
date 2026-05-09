@@ -474,6 +474,7 @@ class TestCountDocumentsForCounty:
         cur = MagicMock()
         conn.cursor.return_value.__enter__.return_value = cur
         cur.fetchone.return_value = (1174,)
+        # Spaced form passes through unchanged (no underscores to replace).
         result = count_documents_for_county(conn, "Santa Clara")
         assert result == 1174
         cur.execute.assert_called_once()
@@ -487,8 +488,60 @@ class TestCountDocumentsForCounty:
         cur = MagicMock()
         conn.cursor.return_value.__enter__.return_value = cur
         cur.fetchone.return_value = None
-        result = count_documents_for_county(conn, "Orange")
+        result = count_documents_for_county(conn, "orange")
         assert result == 0
+
+    # ------------------------------------------------------------------
+    # Regression: #4566 — multi-word counties degenerated to COUNT(*) = 0
+    # ------------------------------------------------------------------
+    #
+    # Before the fix, the CLI passed ``santa_clara`` (underscore) but
+    # ``derived.courts.county`` stores ``'santa clara'`` (space), so the
+    # ``LOWER(c.county) = LOWER('santa_clara')`` predicate never matched
+    # and the row-count invariant silently degenerated to ``0 == 0``.
+    # The fix normalizes underscores to spaces before binding the param.
+
+    def test_underscored_multi_word_county_normalized_to_spaced(self) -> None:
+        """``--county santa_clara`` must bind ``'santa clara'`` to the SQL,
+        which is what ``derived.courts.county`` actually stores."""
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        cur.fetchone.return_value = (1174,)
+        result = count_documents_for_county(conn, "santa_clara")
+        assert result == 1174
+        sql, params = cur.execute.call_args.args
+        # Underscores must be replaced with spaces in the bound param.
+        assert params == ("santa clara",)
+
+    @pytest.mark.parametrize(
+        ("input_county", "expected_param"),
+        [
+            # All five multi-word counties from #2661 / #4566.
+            ("santa_clara", "santa clara"),
+            ("los_angeles", "los angeles"),
+            ("contra_costa", "contra costa"),
+            ("san_bernardino", "san bernardino"),
+            ("san_francisco", "san francisco"),
+            # Single-word counties pass through unchanged.
+            ("orange", "orange"),
+            ("riverside", "riverside"),
+            ("fresno", "fresno"),
+            ("ventura", "ventura"),
+            # Triple-underscore (defense-in-depth).
+            ("a_b_c", "a b c"),
+        ],
+    )
+    def test_county_param_normalization(
+        self, input_county: str, expected_param: str
+    ) -> None:
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        cur.fetchone.return_value = (42,)
+        count_documents_for_county(conn, input_county)
+        _, params = cur.execute.call_args.args
+        assert params == (expected_param,)
 
 
 # ---------------------------------------------------------------------------
