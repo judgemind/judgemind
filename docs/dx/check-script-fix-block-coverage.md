@@ -124,6 +124,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 76 | `scripts/check-transition-dispatch-vocabulary.sh` | self-diagnosing (Fix block) | Emits the canonical-vocabulary list. |
 | 77 | `scripts/check-vitest-environment-deps.sh` | self-diagnosing (Fix block) | Emits the `npm install` invocation. |
 | 78 | `scripts/check-workflow-paths-filter-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-workflow-paths-filter-coverage.py`. |
+| 78b | `scripts/check_fix_block_coverage_complete.py` | self-diagnosing (Fix block) | Per-guard Fix-block formatter for `check-fix-block-coverage-complete.sh` (#23a). Parses the inventory in this file, computes the alphabetical insertion point + letter-suffix row number for each missing guard, and emits a copy-pasteable row template plus the new `Total guards: N` count. Invoked from the wrapper when the diff produces a non-empty missing list. Tracking: #4405 (this guard), #4376 (parent retro). |
 | 78a | `scripts/check_no_basicconfig_with_extra.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:logging.basicConfig + extra= at line(s) ...` per violating file; wrapper sh adds the `Fix:` block naming the canonical `configure_structlog(json=True, stdlib_bridge=True)` replacement. Tracking: #4376. |
 | 79 | `scripts/check_no_redos_pattern.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:<pattern>` per violation; wrapper sh adds the Fix-options block. |
 | 80 | `scripts/check_parse_document_reingest_safety.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:<label>` per violation; wrapper sh adds the required-marker block. |
@@ -134,7 +135,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 
 ## Summary
 
-- Total guards: 95 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381; #37a `check-no-basicconfig-with-extra.sh` + #78a `check_no_basicconfig_with_extra.py` added by #4376).
+- Total guards: 96 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381; #37a `check-no-basicconfig-with-extra.sh` + #78a `check_no_basicconfig_with_extra.py` added by #4376; #78b `check_fix_block_coverage_complete.py` added by #4405).
 - Already self-diagnosing (Fix block or actionable text) before #4346: 71.
 - Wrappers (delegate to helper): 18.
 - Operational health probes: 5.

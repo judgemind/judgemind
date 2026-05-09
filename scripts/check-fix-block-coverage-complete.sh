@@ -52,8 +52,12 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPTS_DIR="$REPO_ROOT/scripts"
-DOC="$REPO_ROOT/docs/dx/check-script-fix-block-coverage.md"
+# Test-override hooks (issue #4405). Production paths are derived from
+# $REPO_ROOT; tests in scripts/tests/ point these at a synthesized
+# directory + inventory so the per-guard Fix-block contract can be
+# exercised end-to-end without touching the real tree. Unset in CI.
+SCRIPTS_DIR="${SCRIPTS_DIR_OVERRIDE:-$REPO_ROOT/scripts}"
+DOC="${DOC_OVERRIDE:-$REPO_ROOT/docs/dx/check-script-fix-block-coverage.md}"
 
 if [ ! -d "$SCRIPTS_DIR" ]; then
     echo "ERROR: scripts/ dir not found: $SCRIPTS_DIR" >&2
@@ -160,17 +164,34 @@ if [ -n "$missing" ]; then
     echo "" >&2
     echo "Inventory: docs/dx/check-script-fix-block-coverage.md" >&2
     echo "" >&2
-    echo "Fix: add a row to the survey table for each missing guard. Use the" >&2
-    echo "verdict vocabulary already in the doc:" >&2
-    echo "" >&2
-    echo "  | <N> | \`scripts/<guard>\` | <verdict> | <one-line note describing what the Fix block contains> |" >&2
-    echo "" >&2
-    echo "Verdict options: self-diagnosing (Fix block), self-diagnosing (actionable text)," >&2
-    echo "wrapper (delegates to helper), operational health probe, decision flow, NEEDS UPGRADE." >&2
-    echo "" >&2
-    echo "To minimise renumbering churn, use letter-suffix row numbers (e.g. \`50a\`)" >&2
-    echo "for the alphabetical insertion point — see the existing \`31a\` row for" >&2
-    echo "\`check-issue-verify-sql.py\`." >&2
+    # Per-guard Fix blocks (issue #4405) — name the exact letter-suffix
+    # row number, a copy-pasteable row template with <guard> already
+    # filled in, and the new "Total guards: N" count. Implemented in
+    # scripts/check_fix_block_coverage_complete.py for testability.
+    missing_args=()
+    while IFS= read -r name; do
+        [ -n "$name" ] && missing_args+=("$name")
+    done <<< "$missing"
+    if ! python3 "$REPO_ROOT/scripts/check_fix_block_coverage_complete.py" \
+            --doc "$DOC" \
+            "${missing_args[@]}"; then
+        # Helper failed — fall through to the generic Fix block so CI
+        # operators still get actionable guidance even if the per-guard
+        # formatter regresses.
+        echo "(Per-guard Fix-block formatter exited non-zero — falling back to generic Fix block.)" >&2
+        echo "" >&2
+        echo "Fix: add a row to the survey table for each missing guard. Use the" >&2
+        echo "verdict vocabulary already in the doc:" >&2
+        echo "" >&2
+        echo "  | <N> | \`scripts/<guard>\` | <verdict> | <one-line note describing what the Fix block contains> |" >&2
+        echo "" >&2
+        echo "Verdict options: self-diagnosing (Fix block), self-diagnosing (actionable text)," >&2
+        echo "wrapper (delegates to helper), operational health probe, decision flow, NEEDS UPGRADE." >&2
+        echo "" >&2
+        echo "To minimise renumbering churn, use letter-suffix row numbers (e.g. \`50a\`)" >&2
+        echo "for the alphabetical insertion point — see the existing \`31a\` row for" >&2
+        echo "\`check-issue-verify-sql.py\`." >&2
+    fi
     echo "" >&2
     echo "Note: the \`# ci-guards: skip\` opt-out marker only suppresses umbrella" >&2
     echo "execution; it does NOT exempt a guard from the inventory. Even guards" >&2
