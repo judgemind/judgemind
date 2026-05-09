@@ -229,19 +229,27 @@ def test_audit_class_two_added_overlaps_clears_threshold(helper, monkeypatch, ca
     assert out.startswith("2\t"), f"expected count=2 line, got: {out!r}"
 
 
-def test_audit_class_two_overlaps_one_modified_dropped(helper, monkeypatch, capsys):
-    """#4223: an audit-class issue with 2 overlaps where ANY is modified is dropped.
+def test_audit_class_mixed_added_modified(helper, monkeypatch, capsys):
+    """#4501: an audit-class issue with mixed ADDED+MODIFIED overlaps clears the threshold.
 
-    The "all-ADDED" half of the tightened rule. Even though total ≥2,
-    a single MODIFIED overlap is enough to drop the match — audit
-    issues need a creation-style signal across the board.
+    The #4501 escape hatch on the #4223 audit-class tightening. Pre-#4501,
+    the tightened rule required EVERY target-context overlap to be ADDED,
+    which over-penalized audit issues that prescribed BOTH (a) a
+    modification to an existing file AND (b) creation of a new file.
+    PR #3319 ↔ #3310 is exactly this shape — `main.tf` modified +
+    `iam-agent-phase-b-smoke.sh` added. The refined rule (≥1 target-
+    context overlap is ADDED, ≥2 total) re-opens this legitimate match.
+
+    Mirrors the #3310 ↔ #3319 fixture shape: one MODIFIED file
+    (`infra/terraform/.../main.tf`) and one ADDED file
+    (`scripts/iam-agent-phase-b-smoke.sh`).
     """
     pr_json = {
         "mergedAt": "2026-04-24T00:00:00Z",
         "baseRefName": "main",
         "files": _pr_files(
-            ("scripts/foo.sh", 100, 0, "ADDED"),
-            ("scripts/bar.sh", 5, 5, "MODIFIED"),
+            ("infra/terraform/modules/iam-agent/main.tf", 12, 4, "MODIFIED"),
+            ("scripts/iam-agent-phase-b-smoke.sh", 80, 0, "ADDED"),
         ),
     }
     rc, out = _run_main(
@@ -249,23 +257,30 @@ def test_audit_class_two_overlaps_one_modified_dropped(helper, monkeypatch, caps
         monkeypatch,
         capsys,
         pr_json,
-        candidate_files="scripts/foo.sh,scripts/bar.sh",
-        target_files="scripts/foo.sh,scripts/bar.sh",
+        candidate_files=(
+            "infra/terraform/modules/iam-agent/main.tf,"
+            "scripts/iam-agent-phase-b-smoke.sh"
+        ),
+        target_files=(
+            "infra/terraform/modules/iam-agent/main.tf,"
+            "scripts/iam-agent-phase-b-smoke.sh"
+        ),
         audit_class="audit",
     )
     assert rc == 0
-    assert out == "", (
-        f"expected empty output (audit-class mixed-modified dropped), got: {out!r}"
+    assert out.startswith("2\t"), (
+        f"expected count=2 line (audit-class mixed clears threshold), got: {out!r}"
     )
 
 
 def test_audit_class_two_modified_overlaps_dropped(helper, monkeypatch, capsys):
-    """#4223: an audit-class issue with 2 MODIFIED overlaps is dropped.
+    """#4223 (refined #4501): an audit-class issue with all-MODIFIED overlaps is dropped.
 
     The most common FP shape for audit issues that cite multiple files
     in a directory — a prior refactor PR touched both. Pre-#4223 the
-    ≥2 total branch fires; post-#4223 with audit-class, all-ADDED is
-    required → drops.
+    ≥2 total branch fires; post-#4223 with audit-class, ≥1 ADDED is
+    required (#4501 refinement of the original "all-ADDED" rule) → with
+    no ADDED overlaps in the PR's diff, the match still drops.
     """
     pr_json = {
         "mergedAt": "2026-04-24T00:00:00Z",

@@ -183,25 +183,44 @@ def main() -> int:
     if len(target_added_overlap) < 1 and len(target_overlap) < 2:
         return 0
 
-    # Audit-class tightening (#4223). When the issue is classified as
-    # audit / investigation / refactor / migrate / extend / tighten /
-    # harden / additional (see `_check_shipped_pr_classify_issue.py`),
-    # apply a stricter threshold: the candidate PR must have ADDED
-    # ALL of the target-context overlap files. This drops the canonical
-    # FP class for this issue type — investigation issues that name a
-    # specific file as the *subject of further work*, where some prior
-    # unrelated PR happened to create or modify that same file.
+    # Audit-class tightening (#4223, refined #4501). When the issue is
+    # classified as audit / investigation / refactor / migrate / extend /
+    # tighten / harden / additional (see
+    # `_check_shipped_pr_classify_issue.py`), apply a stricter threshold:
+    # the candidate PR must show a creation-style signal on the
+    # target-context overlap. This drops the canonical FP class for this
+    # issue type — investigation issues that name a specific file as the
+    # *subject of further work*, where some prior unrelated PR happened
+    # to create or modify that same file.
     #
     # Rationale: an audit/investigation issue is by intent asking for
     # MORE work on an existing file. The work is legitimately distinct
     # from anything a prior PR shipped on the same file — even if that
-    # prior PR added the file in the first place. The strict rule
-    # "every target-context overlap must be ADDED" effectively requires
-    # the candidate PR to be the file's creation commit AND for the
-    # match to be at-least 2 target-context paths (#4353's date guard
-    # handles the case where a creation commit predates the issue).
+    # prior PR added the file in the first place. The strict rule needs
+    # at-least 2 target-context paths (#4353's date guard handles the
+    # case where a creation commit predates the issue) AND a creation-
+    # style signal.
     #
-    # Tradeoffs (issue #4223 §Proposal option 1):
+    # Refinement (#4501) — mixed ADDED+MODIFIED escape hatch.
+    # The pre-#4501 rule required EVERY target-context overlap to be
+    # ADDED, which over-penalized a sub-class the tightening should not
+    # block: audit issues that prescribe BOTH (a) modifications to an
+    # existing file AND (b) creation of a new file. PR #3319 ↔ #3310 is
+    # exactly this shape — the issue prescribed a `main.tf` policy fix
+    # AND a new smoke-test script, and the PR shipped both. With the
+    # pre-#4501 strict rule, the modified `main.tf` overlap dropped the
+    # legitimate match because not every overlap was ADDED.
+    #
+    # The refined rule: when ≥1 target-context overlap is ADDED, the
+    # audit issue's intent is provably broader than "more work on an
+    # existing file" — the candidate PR demonstrably created at least
+    # one of the target files the issue prescribed, which is a strong
+    # creation-style signal even when other overlaps are modifications.
+    # Allow the match in that case. Drop only when EVERY target-context
+    # overlap is a modification (the canonical FP — issue cites multiple
+    # files in a directory, one prior PR refactored them).
+    #
+    # Tradeoffs (issue #4501 §Proposal option A, refining #4223 option 1):
     #   - false-negative cost is LOW — audit issues that ARE shipped
     #     get re-investigated cheaply (the worst case is one extra
     #     /task cycle, not a wrong-fix-merged regression).
@@ -209,27 +228,30 @@ def main() -> int:
     #     auto-closes legitimate `agent/ready` audit issues whenever
     #     any prior PR touched the same file, which is structurally
     #     guaranteed to happen on a healthy codebase.
+    #   - the refinement preserves both bounds. The all-modifications
+    #     drop still catches the canonical FP. The ≥1-added relaxation
+    #     re-opens legitimate matches like #3310 ↔ #3319 where the
+    #     issue's intent encompasses both modification and creation.
     #
     # When CHECK_SHIPPED_AUDIT_CLASS is unset / empty / "0", this guard
     # is a no-op — preserving pre-#4223 behavior so downstream tests
     # whose mocks omit the new env var continue to work.
     audit_class = os.environ.get("CHECK_SHIPPED_AUDIT_CLASS", "")
     if audit_class and audit_class != "0":
-        target_added_set = set(target_added_overlap)
-        # Tightened rule (per #4223 proposal option 1):
+        # Tightened rule (per #4223 option 1, refined per #4501 option A):
         #
         #   total target-context overlap ≥ 2  AND
-        #   EVERY target-context overlap is ADDED
+        #   ≥1 target-context overlap is ADDED
         #
         # The "≥2" half drops single-file overlaps regardless of class
         # (the most common FP shape — issue cites one file, one prior
-        # PR touched it). The "all-ADDED" half drops 2+ overlaps where
-        # any are modifications (the second-most-common FP — issue
-        # cites multiple files in a directory, one prior PR refactored
-        # them).
+        # PR touched it). The "≥1 ADDED" half drops 2+ overlaps where
+        # NONE are added (the second-most-common FP — issue cites
+        # multiple files in a directory, one prior PR refactored them
+        # without creating any new file).
         if len(target_overlap) < 2:
             return 0
-        if any(p not in target_added_set for p in target_overlap):
+        if not target_added_overlap:
             return 0
 
     # Output format: <count>\t<comma-separated-overlap>\t<comma-separated-added>

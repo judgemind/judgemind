@@ -1212,6 +1212,57 @@ else
     fail "non-audit issue retains pre-#4223 single-ADDED threshold (regression #4223 sanity)" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 29: audit-class mixed ADDED+MODIFIED → exit 0 (#4501) ────────────
+
+# Regression for #4501. Issue body cites BOTH a modification target
+# (`infra/terraform/.../main.tf`) AND a creation target
+# (`scripts/iam-agent-phase-b-smoke.sh`); a closed PR shipped both.
+# Pre-#4501 the audit-class strict rule "every target overlap is ADDED"
+# dropped this match because main.tf is modified, not added. Post-#4501
+# the refined rule "≥1 target overlap is ADDED" allows it — when the
+# candidate PR demonstrably created at least one of the target files
+# the issue prescribed, the issue's intent is provably broader than
+# "more work on an existing file."
+#
+# Concrete shape: issue #3310 (audit-class via `/audit` skill mention
+# in the body) ↔ PR #3319 (modified main.tf + added smoke-test script).
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "## Found by\n\n`/audit` skill scan of dispatcher IAM policies.\n\n## Description\n\nThe iam-agent module's main.tf has an over-broad policy. Tighten infra/terraform/modules/iam-agent/main.tf and add a smoke-test.\n\n## Acceptance criteria\n\n- [ ] scripts/iam-agent-phase-b-smoke.sh is committed and exits 0.\n  - Verify: scripts/iam-agent-phase-b-smoke.sh is committed.\n", "title": "fix(iam): tighten agent IAM policy and add smoke-test", "createdAt": "2026-04-20T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "fix(iam): tighten agent IAM policy and add smoke-test (#3319)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            # PR shipped both files: main.tf MODIFIED, smoke-test ADDED.
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "infra/terraform/modules/iam-agent/main.tf", "additions": 12, "deletions": 4, "changeType": "MODIFIED"}, {"path": "scripts/iam-agent-phase-b-smoke.sh", "additions": 80, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-04-25T00:00:00Z", "number": 3319, "title": "fix(iam): tighten agent IAM policy and add smoke-test"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 3310 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3319"* ]]; then
+    pass "audit-class mixed ADDED+MODIFIED clears threshold (regression #4501)"
+else
+    fail "audit-class mixed ADDED+MODIFIED clears threshold (regression #4501)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
