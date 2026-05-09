@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
 # permanent: true
+# allow-duplicate-framework-helpers: #4456 — this script's local
+# ``KEY_PATTERN`` deliberately accepts variable-length hex hashes
+# (the broad pre-#4447 content-addressed shape used to enumerate every
+# raw object during a full rebuild). ``framework.s3_keys.KEY_PATTERN``
+# is the stricter flat-hash hex64-only shape used by the cleanup /
+# repoint / create-twin scripts. Both regexes coexist intentionally
+# (see ``framework.s3_keys`` module docstring §"Note: the existing
+# framework.s3_integrity.KEY_PATTERN regex matches content-addressed
+# keys generally..."); a future refactor could move ``rebuild_db``'s
+# regex into the framework as a third named pattern, but until that
+# decision is made the local definition is preserved.
 """Rebuild the entire database from S3 archived content.
 #
 # Lists S3 objects (or local cache), derives courts from key prefixes,
