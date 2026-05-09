@@ -79,8 +79,12 @@ class TestRegistry:
     def test_courtlistener_is_registered(self) -> None:
         spec = get_spec("federal-courtlistener-opinions")
         assert spec is not None
-        # Per #4247: docket.court is the canonical jurisdiction signal.
-        assert "docket.court" in spec.field_paths
+        # Per #4310: docket.court_id is the canonical bare short-id.  docket.court
+        # is a URL with a ?format=json query string and was previously the
+        # registered field, but parsing it produced "?format=json" as the court
+        # id (#4310).  docket.court_id is the bare short-id directly and avoids
+        # URL parsing entirely.
+        assert "docket.court_id" in spec.field_paths
 
     def test_sf_civil_is_registered(self) -> None:
         spec = get_spec("ca-sf-civil-tentatives")
@@ -280,14 +284,16 @@ class TestAuditOneScraper:
         assert skip["reason"] == "no_sample_keys"
 
     def test_drift_when_field_empty_in_all_samples(self) -> None:
-        """The motivating bug class: docket.court empty in 10/10 samples."""
+        """The motivating bug class (#4247 / #4310): docket.court_id empty
+        in 10/10 samples.  Now keyed on docket.court_id (the bare short-id)
+        rather than docket.court (the URL form) -- see #4310."""
         keys = [f"federal/dc/dc_district/raw/{'a' * 63}{i:x}.txt" for i in range(10)]
-        # Simulates the #4247 scenario: cluster present, docket missing court.
+        # Simulates the #4310 scenario: docket present but court_id empty.
         envelopes = {
             k: {
                 "cluster": {"id": i, "case_name": "X v. Y"},
                 "opinion": {"id": i, "plain_text": "text"},
-                "docket": {"id": i, "court": ""},  # empty -- the bug!
+                "docket": {"id": i, "court_id": ""},  # empty -- the bug!
             }
             for i, k in enumerate(keys)
         }
@@ -312,7 +318,7 @@ class TestAuditOneScraper:
         assert skip is None
         assert len(results) == 1
         assert results[0].scraper_id == "federal-courtlistener-opinions"
-        assert results[0].field_path == "docket.court"
+        assert results[0].field_path == "docket.court_id"
         assert results[0].populated == 0
         assert results[0].sampled == 10
         assert results[0].drifted is True
@@ -320,14 +326,14 @@ class TestAuditOneScraper:
     def test_healthy_when_field_populated_in_at_least_one(self) -> None:
         """1/N populated is enough to clear -- the audit's floor is 'at least one'."""
         keys = [f"federal/dc/dc_district/raw/{'a' * 63}{i:x}.txt" for i in range(10)]
-        # Only one sample has docket.court populated; the audit clears.
+        # Only one sample has docket.court_id populated; the audit clears.
         envelopes = {}
         for i, k in enumerate(keys):
-            court = "ca9" if i == 0 else ""
+            court_id = "ca9" if i == 0 else ""
             envelopes[k] = {
                 "cluster": {},
                 "opinion": {},
-                "docket": {"court": court},
+                "docket": {"court_id": court_id},
             }
         conn = _make_conn(
             {"federal-courtlistener-opinions": 100},
@@ -358,7 +364,7 @@ class TestAuditOneScraper:
         keys = ["k1", "k2", "k3"]
         envelopes = {
             "k1": b"not json at all",  # parse fail
-            "k2": {"docket": {"court": "ca9"}},  # OK
+            "k2": {"docket": {"court_id": "ca9"}},  # OK
             "k3": b"[1, 2, 3]",  # JSON but not a dict
         }
         conn = _make_conn(
@@ -454,11 +460,11 @@ class TestRunAudit:
 
 class TestSyntheticDriftResult:
     def test_synthetic_is_unhealthy(self) -> None:
-        """The synthetic scenario simulates the #4247 bug class."""
+        """The synthetic scenario simulates the #4247 / #4310 bug class."""
         result = synthetic_drift_result()
         assert result.healthy is False
         assert result.drift_count == 1
-        assert result.field_results[0].field_path == "docket.court"
+        assert result.field_results[0].field_path == "docket.court_id"
         assert result.field_results[0].drifted is True
 
 
@@ -472,7 +478,7 @@ class TestBuildIssueBody:
         result = synthetic_drift_result()
         body = build_issue_body(result)
         assert "federal-courtlistener-opinions" in body
-        assert "docket.court" in body
+        assert "docket.court_id" in body
         # Markdown table delimiter present.
         assert "| Scraper |" in body
 
@@ -503,7 +509,7 @@ class TestMainDryRun:
         assert out.exists()
         text = out.read_text()
         assert "Scraper Field-Mapping Drift Alert" in text
-        assert "docket.court" in text
+        assert "docket.court_id" in text
 
     def test_dry_run_returns_1_when_unhealthy(self) -> None:
         rc = _script.main(["--dry-run"])

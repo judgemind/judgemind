@@ -145,11 +145,15 @@ REGISTRY: tuple[ScraperFieldSpec, ...] = (
     ScraperFieldSpec(
         scraper_id="federal-courtlistener-opinions",
         envelope_format="json",
-        field_paths=("docket.court",),
+        field_paths=("docket.court_id",),
         rationale=(
-            "docket.court is the canonical jurisdiction signal after "
-            "#4247.  cluster.court (the previous source-of-truth) is "
-            "empty in every CourtListener API response we capture."
+            "docket.court_id is the canonical bare short-id (e.g. "
+            "'dcd', 'scotus', 'texapp1') after #4247 / #4310. "
+            "cluster.court / cluster.court_id are empty in every "
+            "CourtListener API response we capture; docket.court is a "
+            "URL with a ?format=json query string and previously parsed "
+            "to '?format=json' (#4310).  docket.court_id is the bare "
+            "short-id directly and avoids URL parsing entirely."
         ),
     ),
     ScraperFieldSpec(
@@ -475,7 +479,7 @@ def synthetic_drift_result() -> AuditResult:
     assert spec is not None, "registry must contain courtlistener"
     drifted = FieldResult(
         scraper_id=spec.scraper_id,
-        field_path="docket.court",
+        field_path="docket.court_id",
         populated=0,
         sampled=10,
         sample_keys=[
