@@ -125,6 +125,16 @@ jobs:
       - name: dispatcher-v3-sessions-bucket policy-shape check
         run: bash infra/terraform/modules/dispatcher-v3-sessions-bucket/tests/policy-checks/check.sh
 
+      # Policy-shape regression test for iam_s3_cleanup (#4440). Static
+      # analysis of the rendered HCL -- no AWS credentials needed.
+      # Asserts #4440 scope-exclusion invariants: dev-only environment
+      # validation, ecs-tasks-only trust policy, no cross-account
+      # principal, ARNs reference ca/*/*/raw/* only (never derived/,
+      # processed/, transcripts/, staging/, spotcheck/, or bucket root),
+      # no s3:PutObject, ListBucket gated by s3:prefix condition.
+      - name: iam_s3_cleanup policy-shape check
+        run: bash infra/terraform/modules/iam_s3_cleanup/tests/policy-checks/check.sh
+
       # Check-block fixture test for dispatcher-v3-scheduled-skills (#3890).
       # Verifies the module's two `check` blocks fire at plan time when
       # the input config violates them: a task-def-arn / family mismatch
