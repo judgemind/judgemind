@@ -112,7 +112,18 @@ def parse_job_names(lines: list[str]) -> list[str]:
 
 
 def parse_ci_passed_needs(lines: list[str]) -> list[str]:
-    """Return the list of job names in ci-passed.needs:."""
+    """Return the list of job names in ci-passed.needs:.
+
+    Accepts both YAML forms:
+
+    1. Inline flow:   ``needs: [a, b, c]`` — one ~3-KB line.
+    2. Block list:    ``needs:`` on its own line, followed by one ``- name``
+       per line at deeper indentation.
+
+    The block form is the canonical shape per #4444 — adjacent guard-adding
+    PRs no longer conflict on the entire array because each insertion lands
+    on its own line.
+    """
     # Find the ci-passed: job header.
     ci_passed_line: int | None = None
     for i, line in enumerate(lines):
@@ -122,14 +133,64 @@ def parse_ci_passed_needs(lines: list[str]) -> list[str]:
     if ci_passed_line is None:
         raise ValueError("Could not find 'ci-passed:' job in ci.yml")
 
-    # Look for `needs: [...]` within the next ~5 lines of the job body.
-    needs_re = re.compile(r"^\s+needs:\s*\[(.+)\]")
+    # Pass 1: inline flow form `needs: [a, b, c]` — first match within ~5
+    # lines of the job body. Preserves the original behaviour for any
+    # workflow that still uses the inline form.
+    inline_needs_re = re.compile(r"^\s+needs:\s*\[(.+)\]")
     for line in lines[ci_passed_line + 1 : ci_passed_line + 10]:
-        m = needs_re.match(line)
+        m = inline_needs_re.match(line)
         if m:
             raw = m.group(1)
-            return [name.strip() for name in raw.split(",")]
-    raise ValueError("Could not find 'needs: [...]' in ci-passed job body")
+            return [name.strip() for name in raw.split(",") if name.strip()]
+
+    # Pass 2: block list form. Header is `needs:` on its own line (no `[`),
+    # followed by `- name` lines at deeper indentation. The block ends at
+    # the first line whose indentation is shallower than the first list item
+    # (typically the next sibling key like `if:` or `runs-on:`).
+    block_header_re = re.compile(r"^(\s+)needs:\s*$")
+    list_item_re = re.compile(r"^(\s+)-\s+([A-Za-z0-9_\-]+)\s*$")
+
+    for header_idx in range(ci_passed_line + 1, min(ci_passed_line + 10, len(lines))):
+        header_match = block_header_re.match(lines[header_idx])
+        if not header_match:
+            continue
+        header_indent = len(header_match.group(1))
+
+        items: list[str] = []
+        list_indent: int | None = None
+        for line in lines[header_idx + 1 :]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            item_match = list_item_re.match(line)
+            if item_match:
+                item_indent = len(item_match.group(1))
+                # Items must be indented deeper than the `needs:` header.
+                if item_indent <= header_indent:
+                    break
+                if list_indent is None:
+                    list_indent = item_indent
+                # Stop if indentation jumps back to a sibling-or-shallower
+                # level (next key in the job body).
+                if item_indent < list_indent:
+                    break
+                items.append(item_match.group(2))
+                continue
+            # Non-list, non-blank line at sibling-or-shallower indent ends
+            # the list (e.g. `if: always()` after the needs block).
+            leading_ws = len(line) - len(line.lstrip(" "))
+            if leading_ws <= header_indent:
+                break
+
+        if items:
+            return items
+        raise ValueError(
+            "Found 'needs:' block header but no list items in ci-passed job body"
+        )
+
+    raise ValueError(
+        "Could not find 'needs: [...]' or 'needs:\\n      - ...' in ci-passed job body"
+    )
 
 
 def main() -> int:
