@@ -24,36 +24,20 @@ import pytest
 
 # ---------------------------------------------------------------------------
 # Pre-import mocking — the script imports boto3 and psycopg at module level,
-# which may not be installed in the CI scripts-tests environment.
+# which may not be installed in the CI scripts-tests environment. Save/replay
+# envelope is centralised in ``scripts/tests/_mock_helpers.py`` (#4430). The
+# script's module-level boto3/psycopg bindings remain bound to the mocks
+# captured at import time, so tests in this file continue to work correctly
+# even after ``mock_sys_modules`` restores ``sys.modules`` on exit.
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "archive"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-_mock_boto3 = MagicMock()
-_mock_psycopg = MagicMock()
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
-_modules_to_mock = {
-    "boto3": _mock_boto3,
-    "psycopg": _mock_psycopg,
-}
-
-_saved_modules: dict[str, object] = {}
-for mod_name, mock_mod in _modules_to_mock.items():
-    if mod_name in sys.modules:
-        _saved_modules[mod_name] = sys.modules[mod_name]
-    sys.modules[mod_name] = mock_mod
-
-import cleanup_legacy_date_partitioned_s3  # noqa: E402
-
-# Restore sys.modules so the mock injection doesn't break other test files
-# that use @patch("boto3.client") (e.g. test_api_error_check.py). The cleanup
-# script's module-level boto3/psycopg bindings remain as mocks (captured at
-# import time), so tests in this file continue to work correctly.
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(["boto3", "psycopg"]):
+    import cleanup_legacy_date_partitioned_s3  # noqa: E402
 
 DATE_PARTITIONED_RE = cleanup_legacy_date_partitioned_s3.DATE_PARTITIONED_RE
 list_date_partitioned_keys = (

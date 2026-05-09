@@ -62,54 +62,113 @@ must mock that package in `sys.modules` **before** importing the script.
 Importing at module level without mocking will raise `ModuleNotFoundError` in
 CI even if it works locally (where those packages are installed).
 
-### Pattern
+**Use the `mock_sys_modules` context manager from `_mock_helpers.py`** —
+it installs the mocks before the import and restores `sys.modules` after,
+so a single forgotten restore can't leak `MagicMock` entries into unrelated
+tests collected later in the same pytest run (#4426). The helper is the
+canonical pattern as of #4430.
+
+### Pattern (mock_sys_modules — current)
 
 ```python
+import os
 import sys
 from unittest.mock import MagicMock
 
-# 1. Create mock modules BEFORE importing the script under test.
-mock_psycopg = MagicMock()
-mock_structlog = MagicMock()
-mock_structlog.get_logger.return_value = MagicMock()
+# Add scripts/ to sys.path so the script-under-test imports cleanly, and
+# scripts/tests/ to sys.path so the helper module is reachable as
+# ``tests._mock_helpers``.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# 2. Inject them into sys.modules.
-sys.modules["psycopg"] = mock_psycopg
-sys.modules["structlog"] = mock_structlog
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
-# For packages with sub-modules, mock the full dotted path:
-mock_ingestion = MagicMock()
-sys.modules["ingestion"] = mock_ingestion
-sys.modules["ingestion.llm_providers"] = MagicMock()
-sys.modules["ingestion.ruling_formatter"] = MagicMock()
+# When the script-under-test calls e.g. ``structlog.get_logger`` at module
+# load (typical for ``framework.logging.configure_structlog``), pre-seed
+# the attribute on a caller-built mock and pass the mapping form. Modules
+# that need no attribute setup can be passed bare via the iterable form
+# (``mock_sys_modules(["boto3", "psycopg"])``) — each name then gets a
+# fresh ``MagicMock``.
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
 
-# 3. Now import the script — it picks up the mocks.
-import my_script  # noqa: E402
+with mock_sys_modules(
+    {
+        "psycopg": MagicMock(),
+        "structlog": _mock_structlog,
+        "framework": MagicMock(),
+        "framework.logging": MagicMock(),
+        # Sub-modules need separate entries — ``from ingestion.ruling_formatter
+        # import X`` requires ``sys.modules["ingestion.ruling_formatter"]`` to
+        # be a mock too, not just ``sys.modules["ingestion"]``.
+        "ingestion": MagicMock(),
+        "ingestion.ruling_formatter": MagicMock(),
+    }
+):
+    import my_script as _script  # noqa: E402
 ```
 
 ### Key details
 
 - **Order matters.** The `sys.modules` entries must exist before the script's
-  `import` statements execute. Do this at module level in the test file, not
-  inside a test function or fixture.
-- **Sub-modules need separate entries.** `from ingestion.ruling_formatter import X`
-  requires both `sys.modules["ingestion"]` and
-  `sys.modules["ingestion.ruling_formatter"]` to be set.
-- **Restore if needed.** If you want to be defensive, save any pre-existing
-  `sys.modules` entries and restore them in a teardown. See
-  `test_backfill_ruling_html.py` for an example of this pattern.
+  `import` statements execute, which is why the import lives inside the
+  `with` block. Do not move the import outside the context manager.
+- **Sub-modules need separate entries.** `from ingestion.ruling_formatter
+  import X` requires both `sys.modules["ingestion"]` and
+  `sys.modules["ingestion.ruling_formatter"]` to be set — pass each as a
+  separate key in the mapping.
+- **Restoration is automatic.** `mock_sys_modules.__exit__` restores
+  pre-existing `sys.modules` entries and deletes entries that did not exist
+  before the `with` block — even if the import raises. This is the
+  invariant pinned by `test_scripts_tests_isolation.py` (#4426).
+- **The script's module-level bindings still see the mock.** When the
+  script does `from framework.logging import configure_structlog`, the
+  symbol `configure_structlog` is bound in the script's namespace at
+  import time — which happens inside the `with` block, so it captures
+  the mock. Restoring `sys.modules` after the import does NOT rebind the
+  script's already-imported globals.
 - **Use `patch.dict(sys.modules, ...)` for function-level mocking.** When the
   script uses lazy imports inside functions (not at module level), you can mock
   per-test with `patch.dict`. See `test_dev_db_query_runner.py`'s
   `TestRunQuery` class for this approach.
 
+### Legacy pattern (manual save/restore — superseded)
+
+Pre-#4430 test files maintained their own save/replay boilerplate around
+the import:
+
+```python
+_modules_to_mock = {"structlog": MagicMock(), ...}
+_saved_modules: dict[str, object] = {}
+for _mod_name, _mock_mod in _modules_to_mock.items():
+    if _mod_name in sys.modules:
+        _saved_modules[_mod_name] = sys.modules[_mod_name]
+    sys.modules[_mod_name] = _mock_mod
+
+import my_script  # noqa: E402
+
+for _mod_name in list(_modules_to_mock.keys()):
+    if _mod_name in _saved_modules:
+        sys.modules[_mod_name] = _saved_modules[_mod_name]
+    elif _mod_name in sys.modules:
+        del sys.modules[_mod_name]
+```
+
+This pattern still works correctly when written as shown above, but a
+single forgotten restore loop pollutes `sys.modules` for every later
+test (#4426). New test files should use `mock_sys_modules` instead — it
+collapses the ~15 lines above to a single `with` block and makes the
+restore unforgeable.
+
 ## Examples
 
-- **`test_backfill_ruling_html.py`** — Module-level `sys.modules` mocking for
-  psycopg, anthropic, structlog, and ingestion sub-modules. The script imports
-  all of these at the top level.
+- **`test_audit_correctly_labeled_s3_orphans.py`** — Module-level
+  `mock_sys_modules` for boto3, psycopg, structlog, and framework
+  sub-modules. The script imports all of these at the top level.
 - **`test_dev_db_query_runner.py`** — Function-level `patch.dict(sys.modules, ...)`
   for psycopg, because the script uses a lazy import inside `run_query()`.
+- **`test_mock_helpers.py`** — Unit tests for the `mock_sys_modules`
+  helper itself; shows the iterable-of-names form, the mapping form, the
+  restore-on-exception path, and the nested-usage path.
 
 ## Test durations baseline
 

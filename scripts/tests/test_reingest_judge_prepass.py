@@ -30,83 +30,63 @@ from unittest.mock import MagicMock, patch
 # Pre-import mocking — the script imports psycopg, structlog, framework,
 # and ingestion at module level, none of which are installed in the
 # lightweight CI scripts-tests environment.  Mock them in sys.modules
-# before importing the script under test.
+# before importing the script under test.  Save/replay envelope is
+# centralised in ``scripts/tests/_mock_helpers.py`` (#4430): the
+# context-manager exit path restores ``sys.modules`` even if the import
+# raises, which is the invariant ``test_scripts_tests_isolation.py``
+# pins (#4426).  ``reingest_from_s3``'s own module globals capture the
+# mock references at import time, so tests still see mocks via
+# ``reingest.<attr>`` and ``@patch("reingest_from_s3.<attr>")`` targets
+# — those are bound in the script's namespace, not via ``sys.modules``
+# lookups.
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-def _make_mock_module() -> MagicMock:
-    """Return a MagicMock that resolves arbitrary attribute access."""
-    return MagicMock()
-
-
-_modules_to_mock = {
-    "psycopg": _make_mock_module(),
-    "structlog": _make_mock_module(),
-    "framework": _make_mock_module(),
-    "framework.extraction_config": _make_mock_module(),
-    "framework.llm_enrichment": _make_mock_module(),
-    "framework.llm_extractor": _make_mock_module(),
-    "framework.llm_schema": _make_mock_module(),
-    "framework.logging": _make_mock_module(),
-    "framework.models": _make_mock_module(),
-    "ingestion": _make_mock_module(),
-    "ingestion.db": _make_mock_module(),
-    "ingestion.doc_timing": _make_mock_module(),
-    "ingestion.case_type_resolver": _make_mock_module(),
-    "ingestion.extract": _make_mock_module(),
-    "ingestion.llm_extract": _make_mock_module(),
-    "ingestion.llm_providers": _make_mock_module(),
-    "ingestion.ruling_guards": _make_mock_module(),
-    "ingestion.split_ids": _make_mock_module(),
-    "validation": _make_mock_module(),
-    "validation.deterministic": _make_mock_module(),
-    "validation.gate": _make_mock_module(),
-    "courts": _make_mock_module(),
-}
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
 # Some imports need their attributes to resolve to something callable that
 # returns a recognisable sentinel.  ``configure_structlog`` is called at
 # module top level (line ~242) so it must not raise.
-_modules_to_mock["structlog"].get_logger = MagicMock(return_value=MagicMock())
-_modules_to_mock["framework.logging"].configure_structlog = MagicMock(
-    return_value=None,
-)
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger = MagicMock(return_value=MagicMock())
+_mock_framework_logging = MagicMock()
+_mock_framework_logging.configure_structlog = MagicMock(return_value=None)
 
 # ``is_split_child_id`` is called from the pre-pass; the default MagicMock
 # returns a truthy MagicMock(), which would cause the pre-pass to skip
 # every document.  Override with an explicit False default — tests that
 # need True can patch via ``reingest_from_s3.is_split_child_id``.
-_modules_to_mock["ingestion.split_ids"].is_split_child_id = MagicMock(
-    return_value=False,
-)
+_mock_ingestion_split_ids = MagicMock()
+_mock_ingestion_split_ids.is_split_child_id = MagicMock(return_value=False)
 
-_saved_modules: dict[str, object] = {}
-for _mod_name, _mock_mod in _modules_to_mock.items():
-    if _mod_name in sys.modules:
-        _saved_modules[_mod_name] = sys.modules[_mod_name]
-    sys.modules[_mod_name] = _mock_mod
+_modules_to_mock: dict[str, MagicMock] = {
+    "psycopg": MagicMock(),
+    "structlog": _mock_structlog,
+    "framework": MagicMock(),
+    "framework.extraction_config": MagicMock(),
+    "framework.llm_enrichment": MagicMock(),
+    "framework.llm_extractor": MagicMock(),
+    "framework.llm_schema": MagicMock(),
+    "framework.logging": _mock_framework_logging,
+    "framework.models": MagicMock(),
+    "ingestion": MagicMock(),
+    "ingestion.db": MagicMock(),
+    "ingestion.doc_timing": MagicMock(),
+    "ingestion.case_type_resolver": MagicMock(),
+    "ingestion.extract": MagicMock(),
+    "ingestion.llm_extract": MagicMock(),
+    "ingestion.llm_providers": MagicMock(),
+    "ingestion.ruling_guards": MagicMock(),
+    "ingestion.split_ids": _mock_ingestion_split_ids,
+    "validation": MagicMock(),
+    "validation.deterministic": MagicMock(),
+    "validation.gate": MagicMock(),
+    "courts": MagicMock(),
+}
 
-import reingest_from_s3 as reingest  # noqa: E402
-
-# Restore sys.modules so the mock injection doesn't pollute other test files
-# collected in the same pytest run (#4426).  ``reingest_from_s3``'s own module
-# globals already captured the mock references at the ``import reingest_from_s3``
-# above, so the tests still see mocks via ``reingest.<attr>`` and
-# ``@patch("reingest_from_s3.<attr>")`` targets — those are bound in the
-# script's namespace, not via ``sys.modules`` lookups.  Leaving the mocks in
-# ``sys.modules`` for the rest of the session breaks any later test that
-# imports the real ``structlog`` / ``framework.logging`` (e.g.
-# ``test_drain_splitter_carry_forward_clusters.py::TestLoggerExtraFieldsSurfaceInOutput``,
-# which calls ``isinstance(..., structlog.stdlib.ProcessorFormatter)`` against
-# the real ``framework.logging`` and crashes when ``structlog`` is a
-# ``MagicMock``).
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(_modules_to_mock):
+    import reingest_from_s3 as reingest  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

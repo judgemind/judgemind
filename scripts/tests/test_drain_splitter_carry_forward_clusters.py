@@ -49,36 +49,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ``pytest.importorskip("structlog")`` and reach for the real
 # ``configure_structlog`` so they only run when structlog is actually
 # available (developer laptop with the scraper-framework venv, or any CI
-# job that installs scraper-framework).
+# job that installs scraper-framework). Save/replay envelope is centralised
+# in ``scripts/tests/_mock_helpers.py`` (#4430).
 # ---------------------------------------------------------------------------
+
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
 _mock_structlog = MagicMock()
 _mock_structlog.get_logger.return_value = MagicMock()
-_mock_framework = MagicMock()
-_mock_framework_logging = MagicMock()
 
-_modules_to_mock = {
-    "structlog": _mock_structlog,
-    "framework": _mock_framework,
-    "framework.logging": _mock_framework_logging,
-}
-
-_saved_modules: dict[str, object] = {}
-for _mod_name, _mock_mod in _modules_to_mock.items():
-    if _mod_name in sys.modules:
-        _saved_modules[_mod_name] = sys.modules[_mod_name]
-    sys.modules[_mod_name] = _mock_mod  # type: ignore[assignment]
-
-import drain_splitter_carry_forward_clusters as _script  # noqa: E402
-
-# Restore sys.modules so the mock injection doesn't break other test files
-# (and so ``TestLoggerExtraFieldsSurfaceInOutput`` can re-import the real
-# ``framework.logging`` if it's available).
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(
+    {
+        "structlog": _mock_structlog,
+        "framework": MagicMock(),
+        "framework.logging": MagicMock(),
+    }
+):
+    import drain_splitter_carry_forward_clusters as _script  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
