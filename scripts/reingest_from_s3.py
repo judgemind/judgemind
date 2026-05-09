@@ -159,13 +159,14 @@ Options:
                         under-match.  See #3659.
     --skip-judge-prepass
                         Disable the one-shot judge pre-pass that walks the
-                        FETCH cursor up front to seed full-name judges into
-                        ``derived.judges`` before the main per-doc loop
-                        runs.  Default: pre-pass runs.  Reserved for
-                        emergency rollback when the pre-pass itself
-                        misbehaves; in normal operation it closes the
-                        chronological resolver-race class.  See #4408
-                        (parent #4397).
+                        FETCH cursor (standard mode) or listed S3 keys
+                        (--prefix mode) up front to seed full-name judges
+                        into ``derived.judges`` before the main per-doc
+                        loop / worker pool runs.  Default: pre-pass runs.
+                        Reserved for emergency rollback when the pre-pass
+                        itself misbehaves; in normal operation it closes
+                        the chronological resolver-race class.  See #4408
+                        (parent #4397) and #4419 (extended to prefix mode).
 """
 
 from __future__ import annotations
@@ -3802,6 +3803,244 @@ def _build_prefix_event(
     return event
 
 
+def _seed_judges_from_keys(
+    conn: psycopg.Connection,
+    s3_client: object,
+    keys: list[str],
+    bucket: str,
+    court_ids: dict[str, str],
+    *,
+    parse_timeout: float,
+    concurrency: int,
+) -> dict[str, int]:
+    """Walk S3 keys once and seed full-name judges into ``derived.judges``.
+
+    This is the prefix-mode counterpart to
+    :func:`_seed_judges_from_cursor`.  It applies the same #4408 judge
+    pre-pass pattern to :func:`run_reingest_from_prefix`, which discovers
+    documents via S3 prefix listing rather than the FETCH cursor.
+
+    Why prefix mode also needs the pre-pass
+    ---------------------------------------
+    Prefix mode submits each S3 key to a ``ProcessPoolExecutor`` and
+    consumes results via :func:`concurrent.futures.as_completed`.  The
+    completion order is non-deterministic and parallel.  When LA per-case
+    docs carrying only a surname (``JUDGE/DEPT: <Surname>/<dept>``) finish
+    their DB write *before* the boilerplate doc carrying the full
+    ``JUDGE <FIRST> <LAST>`` string has had time to upsert into
+    ``derived.judges``, the per-case docs would commit ``judge_id = NULL``
+    until a second reingest pass fills the gap.  This is the same
+    chronological-resolver-race class surfaced by #4397 (FETCH-cursor mode)
+    and closed for that mode by #4408.
+
+    The pre-pass walks every key in ``keys`` once before the main
+    :class:`ProcessPoolExecutor` runs.  For every key with valid raw S3
+    content, it runs ``extract_judge_name`` against the document text and,
+    when a *full* name (≥2 words, passing ``_looks_like_valid_judge_name``)
+    is found, calls ``resolve_judge`` to upsert the judge into
+    ``derived.judges``.  The per-document write loop's
+    ``_expand_single_word_judge_surname`` Step 4 lookup
+    (``packages/scraper-framework/src/ingestion/db.py``) finds the seeded
+    judge via the suffix-LIKE match regardless of which doc the worker pool
+    completes first, so single-word surnames resolve on the first prefix-mode
+    invocation.
+
+    Operational notes:
+      * Skipped under ``dry_run=True`` (caller's responsibility — the helper
+        always commits when it seeds).
+      * Skipped under ``--skip-judge-prepass`` (caller's responsibility).
+      * Operates on RAW S3 content + ``_extract_text_from_content`` regex,
+        so it works for HTML, PDF, and other formats equally —
+        ``extract_judge_name`` is regex-only and incurs no LLM cost.
+      * S3 content is re-fetched by :func:`_process_prefix_document`.
+        Overhead is comparable to the FETCH-cursor pre-pass; see #4408.
+      * Keys whose ``(state, county)`` cannot be mapped to an entry in
+        ``court_ids`` are skipped with a debug log — the main pass would
+        skip them too via ``_parse_s3_key``.
+
+    Parameters
+    ----------
+    conn:
+        Open psycopg connection.  Pre-pass commits once per page.
+    s3_client:
+        boto3 S3 client (mockable in tests).
+    keys:
+        Pre-listed content-addressed S3 keys (output of ``_list_s3_keys``).
+        The pre-pass walks the same key list the main pool consumes.
+    bucket:
+        S3 bucket name; passed through to ``_fetch_s3_content``.
+    court_ids:
+        Mapping ``{court_code: court_id}`` returned by ``_seed_courts``.
+        ``court_code`` is built via ``_derive_court_code`` from the parsed
+        ``(state, county)``; the mapping must already include every court
+        the prefix walk encounters or the helper will skip those docs.
+    parse_timeout:
+        Per-document text-extraction timeout (seconds).  Forwarded to
+        ``_extract_text_from_content``.
+    concurrency:
+        Thread pool size for parallel S3 fetches inside the pre-pass.
+
+    Returns
+    -------
+    dict[str, int]
+        ``{"docs_scanned": N, "judges_seeded": M, "judges_skipped_invalid": K}``
+        — N is the number of documents the pre-pass observed (after
+        unparseable-key / no-S3-content skips), M is the number of
+        ``resolve_judge`` calls that returned a judge_id (i.e. successfully
+        upserted), K is the number of judge names rejected by
+        ``_looks_like_valid_judge_name`` (typically bare surnames).
+    """
+    docs_scanned = 0
+    judges_seeded = 0
+    judges_skipped_invalid = 0
+
+    # Resolve each key to a small per-doc descriptor up front; skip any
+    # key whose pattern doesn't match (the main pool also skips these via
+    # ``_parse_s3_key``) or whose court is missing from ``court_ids``.
+    scan_targets: list[dict[str, str]] = []
+    for key in keys:
+        parsed = _parse_s3_key(key)
+        if not parsed:
+            continue
+        state = _unsluggify(parsed["state"])
+        county = _unsluggify(parsed["county"])
+        court_code = _derive_court_code(state, county)
+        court_id = court_ids.get(court_code)
+        if not court_id:
+            logger.debug(
+                "judge prepass: court_id missing for key, skipping",
+                s3_key=key,
+                court_code=court_code,
+            )
+            continue
+        scan_targets.append(
+            {
+                "s3_key": key,
+                "court_id": court_id,
+                "format": _EXT_TO_FORMAT.get(parsed["ext"], "bin"),
+            }
+        )
+
+    if not scan_targets:
+        logger.info(
+            "judge_prepass_no_keys",
+            total_keys=len(keys),
+        )
+        return {
+            "docs_scanned": 0,
+            "judges_seeded": 0,
+            "judges_skipped_invalid": 0,
+        }
+
+    # Parallel S3 fetch.  We fetch every target up front; for typical
+    # 100-500 doc dept-scoped prefix scans this is bounded enough to fit
+    # in memory.  Larger scans should rely on FETCH-cursor mode (which
+    # walks pages) — prefix mode is intentionally for fresh-slice
+    # backfills (#4049, this issue's parent #4408 follow-up).
+    s3_results: dict[int, bytes] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(
+                _fetch_s3_content,
+                s3_client,
+                bucket,
+                target["s3_key"],
+            ): idx
+            for idx, target in enumerate(scan_targets)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                s3_results[idx] = future.result()
+            except Exception:
+                # Best-effort: missing-S3-content just skips the doc for
+                # the pre-pass.  The main pool logs and accounts for it
+                # on its own re-fetch.
+                logger.debug(
+                    "judge prepass: S3 fetch failed",
+                    s3_key=scan_targets[idx]["s3_key"],
+                    exc_info=True,
+                )
+
+    seeded_any = False
+    for idx, target in enumerate(scan_targets):
+        raw_content = s3_results.get(idx)
+        if raw_content is None:
+            continue
+
+        docs_scanned += 1
+
+        try:
+            text = _extract_text_from_content(
+                raw_content,
+                target["format"],
+                pdf_timeout=parse_timeout,
+            )
+        except Exception:
+            logger.debug(
+                "judge prepass: text extraction failed",
+                s3_key=target["s3_key"],
+                exc_info=True,
+            )
+            continue
+
+        judge_name = extract_judge_name(text)
+        if not judge_name:
+            continue
+
+        # Only seed FULL names — single-word surnames would just be
+        # rejected by ``resolve_judge``'s ``_looks_like_valid_judge_name``
+        # guard (which requires ≥2 words).  Mirrors the same gate in
+        # ``_seed_judges_from_cursor``.
+        if not _looks_like_valid_judge_name(judge_name):
+            judges_skipped_invalid += 1
+            continue
+
+        try:
+            judge_id = resolve_judge(conn, judge_name, target["court_id"])
+        except Exception:
+            logger.warning(
+                "judge prepass: resolve_judge failed",
+                s3_key=target["s3_key"],
+                judge_name=judge_name,
+                exc_info=True,
+            )
+            continue
+
+        if judge_id:
+            judges_seeded += 1
+            seeded_any = True
+            logger.debug(
+                "judge prepass: seeded judge",
+                s3_key=target["s3_key"],
+                judge_name=judge_name,
+                judge_id=judge_id,
+            )
+
+    # Commit once at the end so partial pre-pass progress survives a
+    # crash mid-prepass.  Only commit if we actually seeded — committing
+    # an empty pass adds a redundant TX round-trip and breaks tests that
+    # mock ``conn.commit`` to assert "no batch-level commit".
+    if seeded_any:
+        conn.commit()
+
+    logger.info(
+        "judge_prepass_complete_prefix",
+        total_keys=len(keys),
+        scan_targets=len(scan_targets),
+        docs_scanned=docs_scanned,
+        judges_seeded=judges_seeded,
+        judges_skipped_invalid=judges_skipped_invalid,
+        committed=seeded_any,
+    )
+
+    return {
+        "docs_scanned": docs_scanned,
+        "judges_seeded": judges_seeded,
+        "judges_skipped_invalid": judges_skipped_invalid,
+    }
+
+
 def _process_prefix_document(
     key: str,
     bucket: str,
@@ -3942,6 +4181,8 @@ def run_reingest_from_prefix(
     limit: int | None = None,
     dry_run: bool = False,
     bust_llm_cache: bool = False,
+    parse_timeout: float = 60.0,
+    skip_judge_prepass: bool = False,
 ) -> dict[str, Any]:
     """Scan S3 by key prefix and ingest documents not in the DB.
 
@@ -3950,6 +4191,13 @@ def run_reingest_from_prefix(
     one through ``IngestionWorker.process_event()``.  This is the correct
     approach when documents were captured and archived to S3 but never
     written to the database (e.g. dead-lettered events).
+
+    Like :func:`run_reingest`, this path now runs the #4408 judge pre-pass
+    by default (gated by ``skip_judge_prepass``).  See #4419 for why prefix
+    mode also needs the pre-pass: ``ProcessPoolExecutor`` consumes results
+    via ``as_completed`` so completion order is non-deterministic, which
+    re-exposes the chronological-resolver-race class (#4397) when both
+    surname-only and boilerplate full-name docs sit under the same prefix.
 
     Parameters
     ----------
@@ -3963,6 +4211,8 @@ def run_reingest_from_prefix(
         Maximum number of documents to process.
     dry_run:
         If True, list keys and seed courts but skip document processing.
+        Also implicitly skips the judge pre-pass because the pre-pass
+        writes real ``derived.judges`` rows.
     bust_llm_cache:
         If True, the per-process ``IngestionWorker`` is constructed with
         ``bust_llm_cache=True`` so every ``LlmExtractor`` it builds skips
@@ -3972,10 +4222,27 @@ def run_reingest_from_prefix(
         ``is_split_child_id`` guard to avoid the #2416 exponential
         explosion, so the prefix path is the only avenue once a parent has
         been split.  See #4049.
+    parse_timeout:
+        Per-document text-extraction timeout (seconds) used by the judge
+        pre-pass when extracting text from PDFs.  Forwarded to
+        ``_extract_text_from_content``.  Default 60s matches
+        :func:`run_reingest`.
+    skip_judge_prepass:
+        When *True*, skip the one-shot judge pre-pass that walks the listed
+        S3 keys up front and seeds full-name judges into ``derived.judges``
+        before the main ``ProcessPoolExecutor`` runs (#4408, extended to
+        prefix mode in #4419).  Default ``False`` (the pre-pass runs).
+        Reserved for emergency rollback when the pre-pass itself
+        misbehaves; in normal operation it closes the chronological
+        resolver-race class (#4397) and should always run.  Always
+        implicitly skipped under ``dry_run=True``.
 
     Returns
     -------
-    dict with keys: ``total_keys``, ``processed``, ``errors``, ``skipped``.
+    dict with keys: ``total_keys``, ``processed``, ``errors``, ``skipped``,
+    ``hash_mismatch_warnings``, ``wall_time_seconds``, and (when the judge
+    pre-pass ran) ``judge_prepass_docs_scanned``,
+    ``judge_prepass_judges_seeded``, ``judge_prepass_judges_skipped_invalid``.
     """
     bucket = os.environ.get(
         "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
@@ -4030,6 +4297,39 @@ def run_reingest_from_prefix(
             "errors": 0,
             "skipped": 0,
         }
+
+    # Step 2b: Judge pre-pass (#4408 / #4419) — seed full-name judges
+    # before the per-doc ``ProcessPoolExecutor`` runs so single-word
+    # JUDGE/DEPT surnames resolve on the first prefix-mode invocation
+    # regardless of worker-pool completion order.  Closes the
+    # chronological-resolver-race class surfaced by #4397 for the prefix
+    # path (the FETCH-cursor path was closed by #4408).
+    prepass_stats: dict[str, int] | None = None
+    if skip_judge_prepass:
+        logger.warning(
+            "judge_prepass_skipped",
+            reason="--skip-judge-prepass flag set (emergency rollback)",
+        )
+    else:
+        prepass_t0 = time.monotonic()
+        with psycopg.connect(dsn) as prepass_conn:
+            prepass_stats = _seed_judges_from_keys(
+                prepass_conn,
+                s3_client,
+                keys,
+                bucket,
+                court_ids,
+                parse_timeout=parse_timeout,
+                concurrency=concurrency,
+            )
+        logger.info(
+            "judge_prepass_complete",
+            mode="prefix",
+            docs_scanned=prepass_stats["docs_scanned"],
+            judges_seeded=prepass_stats["judges_seeded"],
+            judges_skipped_invalid=prepass_stats["judges_skipped_invalid"],
+            wall_time_seconds=round(time.monotonic() - prepass_t0, 2),
+        )
 
     # Step 3: Process documents using child processes.
     # Uses ProcessPoolExecutor (like rebuild_db.py) because pdfplumber/pdfminer
@@ -4117,6 +4417,12 @@ def run_reingest_from_prefix(
         "hash_mismatch_warnings": hash_mismatch_warnings,
         "wall_time_seconds": wall_time,
     }
+    if prepass_stats is not None:
+        stats["judge_prepass_docs_scanned"] = prepass_stats["docs_scanned"]
+        stats["judge_prepass_judges_seeded"] = prepass_stats["judges_seeded"]
+        stats["judge_prepass_judges_skipped_invalid"] = prepass_stats[
+            "judges_skipped_invalid"
+        ]
 
     logger.info(
         "Prefix reingest complete",
@@ -4754,14 +5060,16 @@ def main() -> None:
         action="store_true",
         dest="skip_judge_prepass",
         help=(
-            "Skip the judge pre-pass that walks the FETCH cursor up front "
-            "and seeds full-name judges into derived.judges before the main "
-            "per-doc loop runs (#4408).  Default: pre-pass runs.  This flag "
-            "is reserved for emergency rollback when the pre-pass itself "
-            "misbehaves; in normal operation it closes the chronological "
-            "resolver-race class (#4397) and should always run.  Always "
-            "implicitly skipped under --dry-run because the pre-pass writes "
-            "real judge rows."
+            "Skip the judge pre-pass that walks the FETCH cursor (standard "
+            "mode) or the listed S3 keys (--prefix mode) up front and seeds "
+            "full-name judges into derived.judges before the main per-doc "
+            "loop / worker pool runs (#4408, extended to prefix mode in "
+            "#4419).  Default: pre-pass runs.  This flag is reserved for "
+            "emergency rollback when the pre-pass itself misbehaves; in "
+            "normal operation it closes the chronological resolver-race "
+            "class (#4397) and should always run.  Always implicitly "
+            "skipped under --dry-run because the pre-pass writes real "
+            "judge rows."
         ),
     )
     args = parser.parse_args()
@@ -4800,6 +5108,8 @@ def main() -> None:
             limit=args.limit,
             dry_run=args.dry_run,
             bust_llm_cache=args.bust_llm_cache,
+            parse_timeout=args.parse_timeout,
+            skip_judge_prepass=args.skip_judge_prepass,
         )
         logger.info(
             "Prefix reingest complete",
@@ -4807,6 +5117,7 @@ def main() -> None:
             processed=stats["processed"],
             errors=stats["errors"],
             skipped=stats["skipped"],
+            judge_prepass_judges_seeded=stats.get("judge_prepass_judges_seeded"),
         )
         return
 
