@@ -35,6 +35,7 @@ jobs:
       githooks: ${{ steps.changes.outputs.githooks }}
       dispatcher-terminals: ${{ steps.changes.outputs.dispatcher-terminals }}
       dispatcher-image: ${{ steps.changes.outputs.dispatcher-image }}
+      deploy-workflows: ${{ steps.changes.outputs.deploy-workflows }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -155,6 +156,16 @@ jobs:
               # job are exercised on the PR that introduces them. Without this, the
               # paths filter makes the job SKIP on its own PR — the #2410/#2505
               # footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
+            deploy-workflows:
+              # Trigger the deploy-workflow-rollout-check job on any change
+              # to a `.github/workflows/deploy-*.yml` file (the targets of the
+              # check) or to the check script itself. Including ci.yml closes
+              # the #2410/#2505 footgun — edits to the job body must be
+              # exercised on the PR that introduces them.
+              - '.github/workflows/deploy-*.yml'
+              - 'scripts/check-deploy-workflow-rollout.sh'
+              - 'scripts/tests/test_check_deploy_workflow_rollout.sh'
               - '.github/workflows/ci.yml'
       - name: Check if any coverage-producing package changed
         id: any-testable
@@ -1205,6 +1216,30 @@ jobs:
         run: scripts/check-cleanup-step-continue-on-error.sh
 
   # ---------------------------------------------------------------
+  # Deploy-workflow rollout guard: every `.github/workflows/deploy-*.yml`
+  # workflow that pushes an image to ECR must also call a downstream
+  # rollout (`aws ecs update-service`, `aws scheduler update-schedule`,
+  # `aws ecs register-task-definition`, or the `./.github/actions/ecs-deploy`
+  # composite). Closes the silent-drift class behind #2772 — a deploy
+  # workflow shipped with `build-and-push` only, the service was scaled
+  # past desired_count=0 in a follow-up PR, and every subsequent merge
+  # silently drifted. See #2777.
+  # ---------------------------------------------------------------
+  # The script's own unit tests live at
+  # scripts/tests/test_check_deploy_workflow_rollout.sh and are run by
+  # the auto-discovering `scripts-tests` shell-fast shard above; this job
+  # only runs the production check against the live `.github/workflows/`
+  # tree on every PR that touches a deploy workflow.
+  deploy-workflow-rollout-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.deploy-workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify deploy workflows that push to ECR also roll
+        run: scripts/check-deploy-workflow-rollout.sh
+
+  # ---------------------------------------------------------------
   # parse_document reingest-safety marker guard: every Live-only
   # parse_document under packages/scraper-framework/src/courts/ must
   # carry a docstring marker that names the reingest hazard.  Closes
@@ -2024,7 +2059,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, split-ruling-propagation-check, cleanup-step-continue-on-error-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, terraform-ecs-entrypoint-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, case-type-fallback-parity-check, oneshot-imports-check, no-basicconfig-with-extra-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, repo-walk-exclusions-canonical-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check, fix-block-coverage-complete-check, ci-guards-skip-list-coverage-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, redos-pattern-check, split-ruling-propagation-check, cleanup-step-continue-on-error-check, deploy-workflow-rollout-check, parse-document-reingest-safety-check, tests-use-reingest-helper-check, hardcoded-models-check, terraform-empty-resource-check, terraform-ecs-entrypoint-check, hardcoded-colors-check, bare-shadcn-accent-check, docs-tailwind-drift-check, llm-json-loads-check, llm-paths-symmetry-check, case-type-fallback-parity-check, oneshot-imports-check, no-basicconfig-with-extra-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, test-statuscode-assertions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, workflow-paths-filter-coverage-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, no-graphql-instanceof-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, dispatcher-integration-tests, ci-passed-coverage-check, placeholder-gates-check, repo-walk-exclusions-canonical-check, dispatcher-terminal-statuses-check, dispatcher-dispatch-vocabulary-check, script-headers-check, filename-separator-hygiene-check, removed-exports-check, vitest-environment-deps-check, fix-block-coverage-complete-check, ci-guards-skip-list-coverage-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
