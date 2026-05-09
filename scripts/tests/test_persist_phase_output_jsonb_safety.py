@@ -134,6 +134,13 @@ def _bootstrap_test_database(admin_dsn: str) -> str:
     # Build the test DSN.
     test_dsn = admin_dsn.rsplit("/", 1)[0] + f"/{_TEST_DB_NAME}"
 
+    # #4418 — persist_phase_output gained a second INSERT into
+    # ``dispatcher.phase_transitions`` in #3697 (commit a5c8b6c5). The
+    # safety-test bootstrap was authored before that change and never updated,
+    # so every round-trip call here failed with rc=3 / ``relation
+    # dispatcher.phase_transitions does not exist``. The companion test
+    # ``test_persist_phase_output_writes_phase_transition.py`` already
+    # creates this table; mirroring its shape keeps both bootstraps in sync.
     schema_sql = textwrap.dedent("""
         CREATE SCHEMA IF NOT EXISTS dispatcher;
         CREATE TABLE IF NOT EXISTS dispatcher.phase_outputs (
@@ -146,6 +153,12 @@ def _bootstrap_test_database(admin_dsn: str) -> str:
         CREATE UNIQUE INDEX IF NOT EXISTS
             idx_phase_outputs_test_agent_phase_attempt
             ON dispatcher.phase_outputs (agent_id, phase, attempt);
+        CREATE TABLE IF NOT EXISTS dispatcher.phase_transitions (
+            transition_id   bigserial   PRIMARY KEY,
+            agent_id        uuid        NOT NULL,
+            phase           text        NOT NULL,
+            ts              timestamptz NOT NULL DEFAULT now()
+        );
     """)
     r = subprocess.run(
         ["psql", "-X", test_dsn, "-v", "ON_ERROR_STOP=1", "-c", schema_sql],
