@@ -1713,6 +1713,33 @@ jobs:
         run: scripts/check-no-manual-sys-modules-mock.sh
 
   # ---------------------------------------------------------------
+  # Duplicate framework helper guard: scripts/*.py must not re-define
+  # names exported by ``framework.s3_keys`` (#4456). PR #4447 extracted
+  # the flat-hash S3 key helpers (parse_flat_hash_key, is_mislabel,
+  # build_twin_key, head_object_metadata_hash, KEY_PATTERN) into the
+  # shared module so ECS oneshot scripts could import them via the
+  # standard ``from framework.s3_keys import ...`` path. PR #4453
+  # promptly re-duplicated them in scripts/create_missing_twins_4446.py
+  # because the agent had read the pre-#4447 docstring of
+  # repoint_mislabeled_documents_4439.py. This guard prevents the next
+  # agent who clones one of those scripts from inheriting the same
+  # duplication. Files that legitimately need to redefine (archive
+  # copies, intentionally different regex shapes) opt out via the
+  # ``# allow-duplicate-framework-helpers: <issue-or-PR>`` marker.
+  # The step name below intentionally avoids quoting the forbidden
+  # token (per docs/agent/code-standards.md §Hygiene-check CI steps
+  # and #2541/#2542).
+  # ---------------------------------------------------------------
+  duplicate-framework-helpers-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true' || needs.detect-changes.outputs.scraper-framework == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Forbid scripts that re-define names exported by framework.s3_keys
+        run: scripts/check-no-duplicate-framework-helpers.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot repo-path guard: flag scripts that use REPO_ROOT
   # without a validated fallback for when the repo is unavailable (#1277)
   # ---------------------------------------------------------------
@@ -2156,6 +2183,7 @@ jobs:
       - oneshot-imports-check
       - no-basicconfig-with-extra-check
       - no-manual-sys-modules-mock-check
+      - duplicate-framework-helpers-check
       - oneshot-repo-paths-check
       - duplicate-functions-check
       - test-except-pass-check
