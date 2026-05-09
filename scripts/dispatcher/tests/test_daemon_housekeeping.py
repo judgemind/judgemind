@@ -1699,6 +1699,14 @@ class TestHousekeepingTickWiresInOrphanPRGC:
         )
         monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
         monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+        # Issue #4499: sibling sweep is also called from _housekeeping_tick;
+        # neutralize so this test stays focused on the orphan-PR helper.
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_sweep_completed_parents",
+            lambda: {"exit_code": 0, "summary_tail": ""},
+            raising=True,
+        )
 
         d._housekeeping_tick()
 
@@ -1723,6 +1731,14 @@ class TestHousekeepingTickWiresInOrphanPRGC:
         )
         monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
         monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+        # Issue #4499: neutralize the sibling sweep so this test stays
+        # focused on the orphan-PR helper's exception path.
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_sweep_completed_parents",
+            lambda: {"exit_code": 0, "summary_tail": ""},
+            raising=True,
+        )
 
         target_count = len(daemon.DispatcherDaemon._HOUSEKEEPING_TARGETS)
         conn.cursor_instance.fetch_queue = [None] * target_count
@@ -1731,6 +1747,216 @@ class TestHousekeepingTickWiresInOrphanPRGC:
         result = d._housekeeping_tick()
 
         failure_events = handler.events("housekeeping_orphan_pr_gc_failed")
+        assert len(failure_events) == 1
+        assert "queue_snapshots" in result
+        assert d._housekeeping_ticks == 1
+
+
+# --------------------------------------------------------------------------
+# _housekeeping_sweep_completed_parents (#4499)
+# --------------------------------------------------------------------------
+
+
+class TestHousekeepingSweepCompletedParents:
+    """``_housekeeping_sweep_completed_parents`` invokes the sweep script (#4499).
+
+    The bash + Python helpers are exercised separately in
+    ``scripts/tests/test_sweep_completed_parents.py``; the daemon-side
+    helper just shells out to the script via ``_subprocess_with_retry``.
+    These tests cover only the daemon's responsibilities: missing-script
+    fallback, success-path summary log, and subprocess-failure handling.
+    """
+
+    def test_logs_summary_tail_on_success(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Happy path: subprocess returns 0, helper logs the summary tail."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        # Place a fake script under tmp_path so the existence check passes.
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "sweep-completed-parents.sh").write_text("#!/bin/bash\nexit 0\n")
+        monkeypatch.setattr(d, "_git_parent_root", lambda: tmp_path)
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            captured_cmds.append(cmd)
+            assert event_name == "sweep_completed_parents"
+            return _ok_outcome(
+                "Sweeping completed-parent candidates in judgemind/judgemind\n"
+                "Found 0 candidate parent(s)\n"
+                "Closed 1 parent(s); skipped 2; errors 0.\n"
+            )
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        result = d._housekeeping_sweep_completed_parents()
+
+        assert result["exit_code"] == 0
+        assert result["summary_tail"] == "Closed 1 parent(s); skipped 2; errors 0."
+
+        # Subprocess invoked exactly once with the resolved script path.
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0][0].endswith("sweep-completed-parents.sh")
+
+        # Structured log captures the summary tail.
+        events = handler.events("housekeeping_sweep_completed_parents")
+        assert len(events) == 1
+        assert events[0].summary_tail == "Closed 1 parent(s); skipped 2; errors 0."
+        assert events[0].exit_code == 0
+        assert events[0].run_id == "test-run-id"
+
+    def test_returns_127_when_script_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """No script on disk: helper logs and returns exit_code=127 (no subprocess)."""
+        d, _conn, handler = _make_daemon_with_capture()
+        # Empty tmp_path — no scripts/ subdir → script_path does not exist.
+        monkeypatch.setattr(d, "_git_parent_root", lambda: tmp_path)
+
+        called = {"count": 0}
+
+        def fail_subprocess(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            called["count"] += 1
+            return _ok_outcome("")
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fail_subprocess)
+
+        result = d._housekeeping_sweep_completed_parents()
+
+        assert result["exit_code"] == 127
+        assert called["count"] == 0  # subprocess never invoked
+        events = handler.events("sweep_completed_parents_missing")
+        assert len(events) == 1
+
+    def test_logs_warning_on_subprocess_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """When the subprocess returns non-zero, the daemon logs and surfaces it."""
+        d, _conn, handler = _make_daemon_with_capture()
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "sweep-completed-parents.sh").write_text("#!/bin/bash\nexit 2\n")
+        monkeypatch.setattr(d, "_git_parent_root", lambda: tmp_path)
+
+        def fail_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return _fail_outcome(reason="nonzero_exit", exit_code=2)
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fail_subprocess)
+
+        result = d._housekeeping_sweep_completed_parents()
+
+        assert result["exit_code"] == 2
+        events = handler.events("sweep_completed_parents_failed")
+        assert len(events) == 1
+        assert events[0].exit_code == 2
+
+    def test_tick_invokes_sweep_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The hourly tick must call ``_housekeeping_sweep_completed_parents`` exactly once.
+
+        Regression: an accidental decouple would silently stop the sweep
+        from running without any test failure in the unit-level helper
+        tests above. Mirrors the orphan-PR GC tick-wiring test (#3852).
+        """
+        d, _conn, handler = _make_daemon_with_capture()
+
+        called: dict[str, int] = {"count": 0}
+
+        def fake_sweep() -> dict[str, Any]:
+            called["count"] += 1
+            return {"exit_code": 0, "summary_tail": ""}
+
+        # Neutralize sibling helpers so the test focuses on the new wiring.
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_close_orphan_prs",
+            lambda: {
+                "closed": 0,
+                "scanned": 0,
+                "skipped_non_agent": 0,
+                "skipped_no_target": 0,
+                "skipped_open_target": 0,
+            },
+            raising=True,
+        )
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
+        monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_sweep_completed_parents",
+            fake_sweep,
+            raising=True,
+        )
+
+        d._housekeeping_tick()
+
+        assert called["count"] == 1
+        # Tick still completes cleanly with no sweep-failure log line.
+        assert handler.events("housekeeping_sweep_completed_parents_failed") == []
+
+    def test_tick_catches_sweep_helper_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the sweep helper raises, the tick logs and continues."""
+        d, conn, handler = _make_daemon_with_capture()
+
+        def boom() -> dict[str, Any]:
+            raise RuntimeError("gh unavailable")
+
+        # Other healers must not raise — they would mask the sweep
+        # exception in the assertion below.
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_close_orphan_prs",
+            lambda: {
+                "closed": 0,
+                "scanned": 0,
+                "skipped_non_agent": 0,
+                "skipped_no_target": 0,
+                "skipped_open_target": 0,
+            },
+            raising=True,
+        )
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
+        monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+        monkeypatch.setattr(
+            d,
+            "_housekeeping_sweep_completed_parents",
+            boom,
+            raising=True,
+        )
+
+        target_count = len(daemon.DispatcherDaemon._HOUSEKEEPING_TARGETS)
+        conn.cursor_instance.fetch_queue = [None] * target_count
+
+        # Must not propagate.
+        result = d._housekeeping_tick()
+
+        failure_events = handler.events("housekeeping_sweep_completed_parents_failed")
         assert len(failure_events) == 1
         assert "queue_snapshots" in result
         assert d._housekeeping_ticks == 1

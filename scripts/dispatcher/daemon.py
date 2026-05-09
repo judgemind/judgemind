@@ -27546,6 +27546,82 @@ class DispatcherDaemon:
             "skipped_open_target": skipped_open_target,
         }
 
+    def _housekeeping_sweep_completed_parents(self) -> dict[str, Any]:
+        """Auto-close parent meta-tasks whose Path-C sub-tasks all closed (#4499).
+
+        Invokes ``scripts/sweep-completed-parents.sh`` as a subprocess. The
+        bash entry point + Python helper read open issues that carry
+        ``Parent: #<N>`` in their bodies, group them by parent, and close
+        any parent whose children are ALL closed for >= 24 hours with no
+        human follow-up comment. The invocation is bounded by the same
+        ``GH_POLL_SUBPROCESS_TIMEOUT_SECONDS`` budget the orphan-PR GC
+        uses, since both call ``gh issue ...`` repeatedly under the hood.
+
+        Failures are caught by the caller (:meth:`_housekeeping_tick`).
+        Returns a small dict for observability: ``exit_code`` + a one-line
+        ``summary_tail`` so the structured log captures the script's
+        ``Closed N; skipped M; errors K`` final line. The script is
+        intentionally chatty on stdout so a passing dry-run reads as a
+        candidate list — we do not bound that output here.
+
+        Pattern matches :meth:`_housekeeping_close_orphan_prs` (#3852) so
+        operators reading the code see the same shape for both "close
+        leftover open thing" healers.
+        """
+        # Use _git_parent_root() for the production Fargate path (baseline
+        # clone) and the local-dev/test fallback (cwd) — same selector the
+        # diagnoser and worktree-creation paths use.
+        repo_root = self._git_parent_root()
+        script_path = repo_root / "scripts" / "sweep-completed-parents.sh"
+        if not script_path.exists():
+            self._log.warning(
+                "daemon.sweep_completed_parents_missing",
+                extra={
+                    "event": "sweep_completed_parents_missing",
+                    "run_id": self._run_id,
+                    "script_path": str(script_path),
+                },
+            )
+            return {"exit_code": 127, "summary_tail": "script missing"}
+
+        cmd = [str(script_path)]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="sweep_completed_parents",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if not outcome["ok"]:
+            self._log.warning(
+                "daemon.sweep_completed_parents_failed",
+                extra={
+                    "event": "sweep_completed_parents_failed",
+                    "run_id": self._run_id,
+                    "reason": outcome.get("reason"),
+                    "exit_code": outcome.get("exit_code"),
+                    "stderr_tail": outcome.get("stderr_tail"),
+                },
+            )
+            return {
+                "exit_code": int(outcome.get("exit_code") or 1),
+                "summary_tail": str(outcome.get("stderr_tail") or "").splitlines()[-1:],
+            }
+
+        result = outcome["result"]
+        # Tail the last non-empty stdout line — it carries the
+        # ``Closed N; skipped M; errors K`` summary the helper emits.
+        summary_lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+        summary_tail = summary_lines[-1] if summary_lines else ""
+        self._log.info(
+            "daemon.housekeeping_sweep_completed_parents",
+            extra={
+                "event": "housekeeping_sweep_completed_parents",
+                "run_id": self._run_id,
+                "summary_tail": summary_tail,
+                "exit_code": result.returncode,
+            },
+        )
+        return {"exit_code": result.returncode, "summary_tail": summary_tail}
+
     def _housekeeping_tick(self) -> dict[str, int]:
         """Run one housekeeping tick. Prunes stale rows from dispatcher tables.
 
@@ -27708,6 +27784,26 @@ class DispatcherDaemon:
                 "daemon.housekeeping_orphan_pr_gc_failed",
                 extra={
                     "event": "housekeeping_orphan_pr_gc_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Issue #4499: auto-close parent meta-tasks whose Path-C sub-tasks
+        # have all closed >= 24h ago. Path C decomposition writes only
+        # ``Parent: #N`` (hierarchy, not dependency), so the existing
+        # unblock-dependents.sh flow does not auto-close the parent — and
+        # the parent stays in ``status/in-progress`` for days, re-entering
+        # the agent/ready queue to be verify-and-closed manually. This
+        # sweep invokes ``scripts/sweep-completed-parents.sh`` to close
+        # that loop. Runs in its own try/except so a gh flake here does
+        # not break the prune loop or sibling healers.
+        try:
+            self._housekeeping_sweep_completed_parents()
+        except Exception:
+            self._log.exception(
+                "daemon.housekeeping_sweep_completed_parents_failed",
+                extra={
+                    "event": "housekeeping_sweep_completed_parents_failed",
                     "run_id": self._run_id,
                 },
             )
