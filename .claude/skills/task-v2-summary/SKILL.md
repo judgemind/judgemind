@@ -309,7 +309,7 @@ Emit `{worktree}/tmp/dispatcher-output/summary.json` with all fields above. Exit
 ## What this skill does NOT do
 
 - **Does not open the PR.** Daemon does that after consuming this output.
-- **Does not post comments.** Daemon posts `process_summary_md` on the issue.
+- **Does not post comments.** Daemon posts `process_summary_md` on the issue. The daemon has its own retry envelope around the `gh issue comment` call (`_gh_issue_comment` in `scripts/dispatcher/daemon.py`, see #4231). The interactive `/task` path uses the equivalent `scripts/gh-comment-with-retry.sh` wrapper for the same 504-after-success failure mode (#4478) — neither path is exercised by this skill itself.
 - **Does not commit or push.** Daemon handles git operations. (The daemon's `push_and_pr` runs `git commit --amend -F` to rewrite ralph's placeholder commit with this skill's `commit_message` output — see #2971.)
 - **Does not read GitHub directly.** All issue + comment + diff data comes through the input JSON.
 - **Does not run tests.** Any pre-PR check reruns happen in ralph's final iteration or the daemon's pre-push hook.
