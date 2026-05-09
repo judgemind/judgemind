@@ -76,6 +76,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 35 | `scripts/check-migration-files.sh` | self-diagnosing (Fix block) | **Upgraded #4346:** emits a `Fix:` block with concrete `git mv N_*.sql <expected>_*.sql` rename suggestions for naming-pattern, duplicate-number, and gap errors. Prior shape only printed the violation. |
 | 36 | `scripts/check-migration-number-collision.sh` | wrapper (delegates to helper) | Wrapper for `check-migration-number-collision.py` whose `format_collision()` already emits a 5-step Remediation block. |
 | 37 | `scripts/check-no-api-github-fetch.sh` | self-diagnosing (Fix block) | Emits the `gh` CLI replacement. |
+| 37a | `scripts/check-no-basicconfig-with-extra.sh` | self-diagnosing (Fix block) | AST-walks every top-level `scripts/*.py` and flags files that call `logging.basicConfig(...)` AND pass `extra=` to a logger method AND do NOT also call `configure_structlog(...)`. Catches the #4368 bug class — `basicConfig(format="%(asctime)s %(levelname)-8s %(message)s")` silently drops every `extra=` field from CloudWatch output. Emits a `Fix:` block naming the canonical `from framework.logging import configure_structlog` + `configure_structlog(json=True, stdlib_bridge=True)` replacement and citing `scripts/drain_splitter_carry_forward_clusters.py` (PR #4368) as the reference implementation. Wired by `no-basicconfig-with-extra-check` in `.github/workflows/ci.yml` (gated on `detect-changes.outputs.scripts == 'true'`). Tracking: #4376 (this guard), #4368 (root-cause incident), #4373 (bulk migration of pre-existing affected scripts). |
 | 38 | `scripts/check-no-duplicate-stubs.sh` | self-diagnosing (Fix block) | Emits "remove the duplicate" guidance with file:line pairs. |
 | 39 | `scripts/check-no-ecs-wait-services-stable.sh` | self-diagnosing (Fix block) | Emits the `wait-for-deploy.sh` replacement. |
 | 40 | `scripts/check-no-git-repo-root-anchor.sh` | self-diagnosing (Fix block) | Emits the `git -C "$REPO_ROOT"` replacement. |
@@ -123,6 +124,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 76 | `scripts/check-transition-dispatch-vocabulary.sh` | self-diagnosing (Fix block) | Emits the canonical-vocabulary list. |
 | 77 | `scripts/check-vitest-environment-deps.sh` | self-diagnosing (Fix block) | Emits the `npm install` invocation. |
 | 78 | `scripts/check-workflow-paths-filter-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-workflow-paths-filter-coverage.py`. |
+| 78a | `scripts/check_no_basicconfig_with_extra.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:logging.basicConfig + extra= at line(s) ...` per violating file; wrapper sh adds the `Fix:` block naming the canonical `configure_structlog(json=True, stdlib_bridge=True)` replacement. Tracking: #4376. |
 | 79 | `scripts/check_no_redos_pattern.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:<pattern>` per violation; wrapper sh adds the Fix-options block. |
 | 80 | `scripts/check_parse_document_reingest_safety.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:<label>` per violation; wrapper sh adds the required-marker block. |
 | 81 | `scripts/check_split_ruling_fields_propagated.py` | self-diagnosing (Fix block) | Reference upgrade from PR #4345 — emits per-violation Fix block with the `_DATACLASS_SCOPE` patch literal. |
@@ -132,7 +134,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 
 ## Summary
 
-- Total guards: 93 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381).
+- Total guards: 95 (#31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381; #37a `check-no-basicconfig-with-extra.sh` + #78a `check_no_basicconfig_with_extra.py` added by #4376).
 - Already self-diagnosing (Fix block or actionable text) before #4346: 71.
 - Wrappers (delegate to helper): 18.
 - Operational health probes: 5.

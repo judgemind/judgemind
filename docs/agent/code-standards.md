@@ -56,6 +56,31 @@ The `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories under `script
 
 **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 
+#### Logger configuration
+
+Top-level `scripts/*.py` scripts that emit logger calls with `extra=` kwargs MUST configure logging via `configure_structlog`, not `logging.basicConfig`. The basicConfig idiom — `logging.basicConfig(format="%(asctime)s %(levelname)-8s %(message)s")` — silently drops every `extra=` field from the LogRecord because the format string only references `%(asctime)s`, `%(levelname)s`, and `%(message)s`. Issue #4368 documented the production incident: a backfill script's `extra=` fields disappeared from CloudWatch Logs Insights, and the post-deploy verification that depended on those fields silently passed.
+
+The canonical pattern is:
+
+```python
+#!/usr/bin/env python3
+# venv: scraper-framework
+# permanent: true
+"""Module docstring."""
+from __future__ import annotations
+
+import logging
+
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(json=True, stdlib_bridge=True)
+logger = logging.getLogger(__name__)
+```
+
+`configure_structlog(json=True, stdlib_bridge=True)` routes stdlib `logging.getLogger(__name__)` calls through structlog's ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its extras as one event per line. The `stdlib_bridge=True` flag is the load-bearing piece — without it, `extra=` fields still drop because structlog and stdlib `logging` remain unwired.
+
+`scripts/drain_splitter_carry_forward_clusters.py` (PR #4368) is the reference implementation. PR #4373 migrated the other 13 affected `scripts/*.py` files. The `no-basicconfig-with-extra-check` CI job (`scripts/check-no-basicconfig-with-extra.sh`, #4376) enforces the contract: it AST-walks every top-level `scripts/*.py` and fails CI when a file calls `logging.basicConfig(...)` AND passes `extra=` to a logger method AND does NOT also call `configure_structlog(...)`. Files that call both `basicConfig` and `configure_structlog` are accepted — the contributor has been deliberate about routing.
+
 ## TypeScript (API, frontend)
 
 - Strict mode always.
