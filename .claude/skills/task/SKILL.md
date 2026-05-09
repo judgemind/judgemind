@@ -163,9 +163,13 @@ Assign it to yourself (write — MCP auth currently blocked, stays on `gh`):
 gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
 ```
 
-Write the claim comment to a temp file, then post it (write — stays on `gh`):
+Write the claim comment to a temp file, then post it via the
+`scripts/gh-comment-with-retry.sh` wrapper (write — stays on `gh`).
+The wrapper transparently handles the 504-after-success failure
+mode where `gh issue comment` returns a 5xx with a multi-KB
+"Unicorn!" HTML page even though the comment posted (#4478):
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/claim_comment.txt
+{worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/claim_comment.txt
 ```
 Comment content: `Picking this up in {agent-id}.` (Use the same `{agent-id}` resolved in Step 0 — i.e. `AGENT_ID` env var if set, else cwd-derived.)
 
@@ -606,9 +610,9 @@ Before committing or creating a PR, post a process summary comment on the GitHub
 <Any intentional exclusions or scope boundaries — what was NOT done and why>
 ```
 
-Post it (write — stays on `gh` until MCP writes land):
+Post it via `scripts/gh-comment-with-retry.sh` (write — stays on `gh` until MCP writes land). The wrapper transparently handles the 504-after-success failure mode (#4478) so a flaky GitHub response doesn't surface as a duplicate comment or a false-failure block on the PR push:
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/process_summary.txt
+{worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/process_summary.txt
 ```
 
 **GATE CHECK:** If any acceptance criterion is "not met" and the reason is NOT "requires post-deploy verification" or "not applicable," do NOT proceed to A.3. Go back to A.2 and address the gap first. The process summary is a self-check — if it reveals unmet criteria, the implementation is not complete.
@@ -934,9 +938,9 @@ If functional verification **fails**: diagnose the issue. If it's a simple fix, 
 
 After verification succeeds (or after determining the change has no deployed component), you MUST post a verification evidence comment on the issue. This is a hard gate — the task cannot proceed to A.9 without this comment.
 
-Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it (write — stays on `gh` until MCP writes land):
+Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it via `scripts/gh-comment-with-retry.sh` (write — stays on `gh` until MCP writes land). The wrapper transparently handles the 504-after-success failure mode (#4478):
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
+{worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/verification_evidence.txt
 ```
 
 **For deployed changes**, the comment must include concrete evidence from the verification table above AND per-criterion verification results. Example format:
