@@ -223,6 +223,43 @@ write_failure_response() {
 JSON
 }
 
+# Write a check-runs response that mirrors the #4407 wedge: one `cancelled`
+# non-required check (e.g. Vercel `Check major pages` cancelled by
+# `concurrency: cancel-in-progress`) alongside a green `ci-passed`. The
+# canonical merge gate considers this safe to merge — `wait-for-ci.sh` must
+# exit 0 via the fast-path within one poll, NOT exit 1 treating CANCELLED
+# as a hard failure.
+write_cancelled_with_success_response() {
+    local file="$1"
+    cat > "$file" << 'JSON'
+{
+  "check_runs": [
+    {"name": "lint",              "status": "completed", "conclusion": "success",   "details_url": "https://example.com/lint"},
+    {"name": "unit-tests",        "status": "completed", "conclusion": "success",   "details_url": "https://example.com/unit"},
+    {"name": "ci-passed",         "status": "completed", "conclusion": "success",   "details_url": "https://example.com/ci"},
+    {"name": "Check major pages", "status": "completed", "conclusion": "cancelled", "details_url": "https://example.com/check-major-pages"}
+  ]
+}
+JSON
+}
+
+# Write a check-runs response that pairs a `cancelled` non-required check
+# with a real `failure`. The script must still exit 1 — the cancelled count
+# is non-blocking, but a real failure on the SAME SHA still trips the
+# early-failure branch. Defense-in-depth for #4407.
+write_cancelled_plus_real_failure_response() {
+    local file="$1"
+    cat > "$file" << 'JSON'
+{
+  "check_runs": [
+    {"name": "lint",              "status": "completed", "conclusion": "success",   "details_url": "https://example.com/lint"},
+    {"name": "unit-tests",        "status": "completed", "conclusion": "failure",   "details_url": "https://example.com/unit"},
+    {"name": "Check major pages", "status": "completed", "conclusion": "cancelled", "details_url": "https://example.com/check-major-pages"}
+  ]
+}
+JSON
+}
+
 # Write a check-runs response with one failed check whose details_url uses
 # the canonical GitHub Actions URL format. This is what production check-runs
 # actually emit and is required for the auto-rerun classifier path (#4148)
@@ -898,6 +935,121 @@ LOG
     fi
 }
 
+# Test 15 (#4407 AC#1): canonical merge gate fast-path with one CANCELLED
+# non-required check. This is the canonical wedge filed by the issue —
+# `Check major pages` got cancelled by Vercel's `concurrency:
+# cancel-in-progress`, but `ci-passed` is success and `mergeable` is
+# MERGEABLE. The script must exit 0 via the canonical fast-path within ~30s
+# AND must NOT print `ERROR: ... check(s) failed`.
+test_cancelled_non_required_does_not_block_merge_gate() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_cancelled_with_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code start_ts end_ts elapsed
+    exit_code=0
+    start_ts=$(date +%s)
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 4406 --poll-interval 1 --timeout-secs 30 2>&1) || exit_code=$?
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "cancelled_non_required: exits 0 even when one check is CANCELLED"
+    else
+        fail "cancelled_non_required: exits 0 even when one check is CANCELLED" "exit=$exit_code output=$output"
+    fi
+
+    if [ "$elapsed" -lt 10 ]; then
+        pass "cancelled_non_required: exits in <10s (actual: ${elapsed}s)"
+    else
+        fail "cancelled_non_required: exits in <10s" "elapsed=${elapsed}s — fast-path must not stall on cancelled checks"
+    fi
+
+    if echo "$output" | grep -q "canonical merge gate green"; then
+        pass "cancelled_non_required: stdout contains 'canonical merge gate green'"
+    else
+        fail "cancelled_non_required: stdout contains 'canonical merge gate green'" "output=$output"
+    fi
+
+    # The bug from #4407 — output should NOT contain `ERROR: 1 check(s) failed`.
+    if echo "$output" | grep -qE "ERROR: [0-9]+ check\(s\) failed"; then
+        fail "cancelled_non_required: must NOT print ERROR for CANCELLED-only state" "output=$output"
+    else
+        pass "cancelled_non_required: does not falsely report a failure"
+    fi
+
+    # Per-poll status line must reflect the new cancelled= field so callers
+    # reading the log can see the count was non-zero.
+    if echo "$output" | grep -qE "cancelled=[1-9]"; then
+        pass "cancelled_non_required: per-poll status line names cancelled count"
+    else
+        fail "cancelled_non_required: per-poll status line names cancelled count" "output=$output"
+    fi
+}
+
+# Test 16 (#4407 AC#1 fallback): cancelled-only state with mergeable=UNKNOWN
+# must still exit 0 via the all-checks-complete fallback path. This guards
+# against a regression where the fallback path stops firing because of the
+# new CANCELLED bookkeeping.
+test_cancelled_falls_through_to_all_checks_complete() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_cancelled_with_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=UNKNOWN MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 4406 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "cancelled_all_checks_complete: exits 0 when mergeable=UNKNOWN but pending=0"
+    else
+        fail "cancelled_all_checks_complete: exits 0 when mergeable=UNKNOWN but pending=0" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "all checks complete"; then
+        pass "cancelled_all_checks_complete: stdout contains 'all checks complete'"
+    else
+        fail "cancelled_all_checks_complete: stdout contains 'all checks complete'" "output=$output"
+    fi
+}
+
+# Test 17 (#4407 AC#2): real FAILURE checks still exit 1, even when a
+# CANCELLED check is also present. Splitting CANCELLED out of the failure
+# count must not let real failures slip through.
+test_real_failure_with_cancelled_still_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_cancelled_plus_real_failure_response "$tmpdir/responses/01.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=DIRTY \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "real_failure_with_cancelled: exits 1 on real failure even with cancelled present"
+    else
+        fail "real_failure_with_cancelled: exits 1 on real failure even with cancelled present" "exit=$exit_code output=$output"
+    fi
+
+    # Output must mention the failed unit-tests check.
+    if echo "$output" | grep -q "unit-tests"; then
+        pass "real_failure_with_cancelled: output names the real failing check"
+    else
+        fail "real_failure_with_cancelled: output names the real failing check" "output=$output"
+    fi
+
+    # Output must NOT list `Check major pages` in the failure list — cancelled
+    # is no longer reported as a failure.
+    if echo "$output" | grep -qE "^\s+- Check major pages: conclusion=cancelled"; then
+        fail "real_failure_with_cancelled: cancelled checks must not be listed as failures" "output=$output"
+    else
+        pass "real_failure_with_cancelled: cancelled checks correctly excluded from failure list"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -916,6 +1068,9 @@ test_real_failure_no_rerun
 test_no_auto_rerun_flag_disables_classifier
 test_flake_telemetry_emits_jsonl_line
 test_flake_telemetry_aggregatable
+test_cancelled_non_required_does_not_block_merge_gate
+test_cancelled_falls_through_to_all_checks_complete
+test_real_failure_with_cancelled_still_exits_1
 
 echo ""
 echo "────────────────────────────────────────────"
