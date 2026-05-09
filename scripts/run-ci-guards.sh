@@ -166,6 +166,16 @@ SKIP_LIST=(
     # exits 2 with "one of the arguments --check --regenerate --print is
     # required". The CI step runs it explicitly as `--check`.
     "check-fix-block-coverage.py"
+    # check-no-check-prefix-on-ecs-oneshots.py — every `required=True`
+    # mention in this script is in module docstrings / inline comments
+    # (it documents the argparse-required-shape signal it scans for).
+    # Plain regex matching trips the sibling meta-check
+    # (#11a / #4379) on those FP matches. Blind invocation IS safe
+    # (no real required arg; the CI step runs it bare too) — SKIP_LIST
+    # entry is just to silence the false-positive crash in the
+    # umbrella runner. The .sh wrapper (#37e) is `exec python3 ...py
+    # "$@"` and runs blind cleanly. Tracking: #4563.
+    "check-no-check-prefix-on-ecs-oneshots.py"
 )
 
 # is_in_skip_list <basename> -> 0 if skipped, 1 otherwise

@@ -2252,6 +2252,22 @@ jobs:
         run: scripts/check-ci-guards-skip-list-coverage.sh
 
   # ---------------------------------------------------------------
+  # ECS-oneshot naming rule (#4558): forbid scripts/check-*.{sh,py}
+  # files shaped like ECS-oneshot data-check scripts (`# venv: <pkg>`
+  # + `# permanent: true` + required argparse / `${1:?}`). Active
+  # enforcement of the rule the docs section in code-standards.md
+  # documents passively. Sibling pattern to ci-guards-skip-list-
+  # coverage-check (#4379) and fix-block-coverage-complete-check
+  # (#4367). See #4563.
+  # ---------------------------------------------------------------
+  no-check-prefix-on-ecs-oneshots-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify no check-prefixed ECS-oneshot data-check scripts in scripts/
+        run: scripts/check-no-check-prefix-on-ecs-oneshots.sh
+
+  # ---------------------------------------------------------------
   # ci-passed coverage guard: assert every top-level job appears in
   # ci-passed.needs: so gaps like #3919 are caught before merge.
   # ---------------------------------------------------------------
@@ -2349,6 +2365,7 @@ jobs:
       - fix-block-coverage-complete-check
       - dx-fix-block-coverage-check
       - ci-guards-skip-list-coverage-check
+      - no-check-prefix-on-ecs-oneshots-check
     if: always()
     runs-on: ubuntu-latest
     steps:
