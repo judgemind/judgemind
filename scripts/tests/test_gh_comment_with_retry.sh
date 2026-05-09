@@ -117,6 +117,10 @@ STDERR_EOF
             echo "error: authentication required" >&2
             exit 4
             ;;
+        graphql_rate_limit)
+            echo "GraphQL: API rate limit already exceeded for user ID 3708633." >&2
+            exit 1
+            ;;
         *)
             echo "mock gh: unknown MOCK_COMMENT_MODE=$mode" >&2
             exit 99
@@ -130,7 +134,32 @@ if [[ "${1:-}" == "api" && "${2:-}" == "/user" ]]; then
     exit 0
 fi
 
-# ── gh api /repos/.../issues/<N>/comments?... ──────────────────────────────
+# ── gh api -X POST /repos/.../issues/<N>/comments (REST fallback path) ────
+# Distinct from the GET-comments path below: the wrapper invokes this
+# only after a GraphQL-rate-limit-exceeded stderr match. Behavior
+# controlled by ``MOCK_REST_POST_MODE`` env var:
+#   - "success" : exit 0, print html_url on stdout (default).
+#   - "fail"    : exit 1, print "error: secondary failure" on stderr.
+if [[ "${1:-}" == "api" && "${2:-}" == "-X" && "${3:-}" == "POST" \
+        && "${4:-}" =~ ^/repos/.*/issues/[0-9]+/comments$ ]]; then
+    rest_mode="${MOCK_REST_POST_MODE:-success}"
+    case "$rest_mode" in
+        success)
+            echo "https://github.com/judgemind/judgemind/issues/100#issuecomment-rest-77"
+            exit 0
+            ;;
+        fail)
+            echo "error: secondary REST failure (rate limit or auth)" >&2
+            exit 1
+            ;;
+        *)
+            echo "mock gh: unknown MOCK_REST_POST_MODE=$rest_mode" >&2
+            exit 99
+            ;;
+    esac
+fi
+
+# ── gh api /repos/.../issues/<N>/comments?... (GET — 504 recovery path) ────
 if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/issues/[0-9]+/comments ]]; then
     if [[ -n "${MOCK_COMMENTS_FILE:-}" && -f "${MOCK_COMMENTS_FILE}" ]]; then
         cat "${MOCK_COMMENTS_FILE}"
@@ -441,6 +470,140 @@ if [[ "$recovery_calls" == "0" ]]; then
     pass "D: auth-fail makes no recovery API calls"
 else
     fail "D: auth-fail makes no recovery API calls" "found $recovery_calls api calls"
+fi
+
+# ── Test F — GraphQL rate-limit exhaustion → REST fallback (#4503) ────────
+
+# F.1 — gh issue comment hits GraphQL quota; REST fallback succeeds.
+BODY_FILE_F1=$(mktemp)
+register_temp_file "$BODY_FILE_F1"
+echo "test body F.1 — GraphQL exhausted, REST should rescue" > "$BODY_FILE_F1"
+
+INVOCATIONS_F1="$MOCK_BIN_DIR/invocations_f1.txt"
+: > "$INVOCATIONS_F1"
+
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_F1" \
+    MOCK_COMMENT_MODE=graphql_rate_limit \
+    MOCK_REST_POST_MODE=success \
+    "$WRAPPER" 100 --body-file "$BODY_FILE_F1" 2>/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "F.1: GraphQL rate-limit + REST success exits 0"
+else
+    fail "F.1: GraphQL rate-limit + REST success exits 0" "expected 0, got $exit_code"
+fi
+
+if [[ "$stdout_output" == *"REST fallback"* ]]; then
+    pass "F.1: stdout names 'REST fallback' on the recovery path"
+else
+    fail "F.1: stdout names 'REST fallback' on the recovery path" "got: $stdout_output"
+fi
+
+if [[ "$stdout_output" == *"https://github.com/judgemind/judgemind/issues/100#issuecomment-rest-77"* ]]; then
+    pass "F.1: stdout includes the REST-posted comment URL"
+else
+    fail "F.1: stdout includes the REST-posted comment URL" "got: $stdout_output"
+fi
+
+# Verify the wrapper actually invoked `gh api -X POST /repos/.../issues/100/comments`
+# with a body=@<file> form arg. Both signals must be present in the recorded invocations.
+if grep -qE "^api -X POST /repos/.*/issues/100/comments( |$)" "$INVOCATIONS_F1"; then
+    pass "F.1: wrapper invoked 'gh api -X POST /repos/.../issues/100/comments'"
+else
+    fail "F.1: wrapper invoked 'gh api -X POST /repos/.../issues/100/comments'" \
+        "invocations: $(cat "$INVOCATIONS_F1")"
+fi
+
+if grep -qE "body=@.*$(basename "$BODY_FILE_F1")" "$INVOCATIONS_F1"; then
+    pass "F.1: wrapper passed -F body=@<body-file> to gh api"
+else
+    fail "F.1: wrapper passed -F body=@<body-file> to gh api" \
+        "invocations: $(cat "$INVOCATIONS_F1")"
+fi
+
+# Verify the 504-recovery path was NOT taken — there should be no GET on
+# /repos/.../comments and no /user lookup (those are 504-path artifacts).
+graphql_path_only_calls=$(awk '/^api \/repos\/.*\/comments\?/ {n++} /^api \/user/ {n++} END {print n+0}' "$INVOCATIONS_F1")
+if [[ "$graphql_path_only_calls" == "0" ]]; then
+    pass "F.1: 504-recovery path was NOT exercised (no GET comments / no /user)"
+else
+    fail "F.1: 504-recovery path was NOT exercised (no GET comments / no /user)" \
+        "found $graphql_path_only_calls 504-recovery calls"
+fi
+
+# F.2 — gh issue comment hits GraphQL quota; REST fallback ALSO fails.
+BODY_FILE_F2=$(mktemp)
+register_temp_file "$BODY_FILE_F2"
+echo "test body F.2 — both paths fail" > "$BODY_FILE_F2"
+
+INVOCATIONS_F2="$MOCK_BIN_DIR/invocations_f2.txt"
+: > "$INVOCATIONS_F2"
+
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_F2" \
+    MOCK_COMMENT_MODE=graphql_rate_limit \
+    MOCK_REST_POST_MODE=fail \
+    "$WRAPPER" 100 --body-file "$BODY_FILE_F2" 2>&1 >/dev/null
+) || exit_code=$?
+
+if [[ "$exit_code" -ne 0 ]]; then
+    pass "F.2: GraphQL rate-limit + REST fail exits non-zero"
+else
+    fail "F.2: GraphQL rate-limit + REST fail exits non-zero" "expected non-zero, got $exit_code"
+fi
+
+if [[ "$err_output" == *"REST also failed"* ]]; then
+    pass "F.2: stderr names 'REST also failed' to disambiguate from gh failure"
+else
+    fail "F.2: stderr names 'REST also failed' to disambiguate from gh failure" "got: $err_output"
+fi
+
+if [[ "$err_output" == *"GraphQL: API rate limit"* ]]; then
+    pass "F.2: stderr surfaces the original GraphQL rate-limit error for context"
+else
+    fail "F.2: stderr surfaces the original GraphQL rate-limit error for context" "got: $err_output"
+fi
+
+if [[ "$err_output" == *"secondary REST failure"* ]]; then
+    pass "F.2: stderr surfaces the REST-side failure too"
+else
+    fail "F.2: stderr surfaces the REST-side failure too" "got: $err_output"
+fi
+
+# F.3 — Generic GraphQL error (NOT rate-limit) should NOT trigger REST fallback.
+# We piggyback on the existing 'auth' mode which produces a non-rate-limit error.
+# Already covered indirectly by Test D, but verify the explicit
+# trigger-only-on-rate-limit-marker decision rule with a positive assertion.
+BODY_FILE_F3=$(mktemp)
+register_temp_file "$BODY_FILE_F3"
+echo "test body F.3" > "$BODY_FILE_F3"
+
+INVOCATIONS_F3="$MOCK_BIN_DIR/invocations_f3.txt"
+: > "$INVOCATIONS_F3"
+
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_F3" \
+    MOCK_COMMENT_MODE=auth \
+    "$WRAPPER" 100 --body-file "$BODY_FILE_F3" >/dev/null 2>&1 || exit_code=$?
+
+# Auth failure should still pass through (exit 4) — REST fallback NOT invoked.
+if [[ "$exit_code" -eq 4 ]]; then
+    pass "F.3: auth-fail does NOT trigger REST fallback (passthrough preserved)"
+else
+    fail "F.3: auth-fail does NOT trigger REST fallback (passthrough preserved)" \
+        "expected 4, got $exit_code"
+fi
+
+rest_post_calls=$(awk '/^api -X POST / {n++} END {print n+0}' "$INVOCATIONS_F3")
+if [[ "$rest_post_calls" == "0" ]]; then
+    pass "F.3: auth-fail makes no REST POST calls"
+else
+    fail "F.3: auth-fail makes no REST POST calls" \
+        "found $rest_post_calls REST POST calls"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
 # permanent: true
-# gh-comment-with-retry.sh — Post a `gh issue comment` and tolerate the
-# 504-after-success failure mode.
+# gh-comment-with-retry.sh — Post a `gh issue comment` and tolerate two
+# distinct flaky failure modes (504-after-success + GraphQL-quota
+# exhaustion).
 #
 # Why this helper exists
 # ----------------------
-# `gh issue comment <N> --body-file <file>` periodically returns a
-# `504 Gateway Timeout` (with a multi-KB HTML "Unicorn!" error page in
-# stderr) **after the comment has already posted**. A naive retry
-# creates a duplicate comment. Treating it as a hard failure misleads
-# the agent about pipeline state.
+# `gh issue comment <N> --body-file <file>` has two flaky failure modes
+# that the bare `gh` call does not handle:
 #
-# This is the comment-post analogue of the `gh pr merge` 5xx case
-# documented in `.claude/skills/task/SKILL.md` §A.7 (#4231): the API
-# already accepted the request, only the response failed. Recipe:
-# re-fetch state and treat already-posted-with-matching-body as
-# success.
+#   1. **504-after-success (#4478):** the request periodically returns a
+#      `504 Gateway Timeout` (with a multi-KB HTML "Unicorn!" error page
+#      in stderr) **after the comment has already posted**. A naive
+#      retry creates a duplicate; treating it as a hard failure
+#      misleads the agent about pipeline state. Recipe: re-fetch the
+#      issue's recent comments, treat already-posted-with-matching-body
+#      as success.
 #
-# Tracking: issue #4478.
+#   2. **GraphQL-quota-exhausted (#4503):** `gh issue comment` posts
+#      the comment via GitHub's GraphQL API, which has a separate
+#      5,000-req/hr quota from the REST core API. Long agent sessions
+#      (dispatcher, multi-PR /task runs) regularly exhaust GraphQL —
+#      consumed by `gh pr view`, `gh pr merge`, `gh issue view --json`,
+#      etc. — while the REST core quota stays healthy. Recipe: fall
+#      back to `gh api -X POST /repos/<owner>/<repo>/issues/<N>/comments
+#      -F body=@<file>`. The REST endpoint is the same logical
+#      operation and `-F body=@<file>` accepts the body the same way
+#      `--body-file` does.
+#
+# Both failure modes share the same shape — the API can accept the
+# request, the wrapper just needs the right fallback path. See
+# `.claude/skills/task/SKILL.md` §A.7 for the `gh pr merge` 5xx
+# analogue (#4231).
+#
+# Tracking: issues #4478 (504-after-success) and #4503 (GraphQL-quota
+# REST fallback).
 #
 # Usage
 # -----
@@ -30,7 +47,15 @@
 #   1. Calls ``gh issue comment <N> --repo <repo> --body-file <path>``.
 #   2. On exit 0: prints the returned comment URL to stdout, exits 0.
 #   3. On non-zero exit AND the captured stderr matches
-#      ``504 Gateway Timeout`` or ``<title>Unicorn!``:
+#      ``GraphQL: API rate limit already exceeded`` (#4503):
+#      - Falls back to ``gh api -X POST /repos/<owner>/<repo>/issues/<N>/comments
+#        -F body=@<path>``.
+#      - On REST success: prints "comment posted (REST fallback): <url>"
+#        and exits 0.
+#      - On REST failure: prints both stderrs (gh + REST, truncated to
+#        5 KB each) and exits non-zero with the REST exit code.
+#   4. On non-zero exit AND the captured stderr matches
+#      ``504 Gateway Timeout`` or ``<title>Unicorn!`` (#4478):
 #      - Re-fetches the issue's recent comments via
 #        ``gh api /repos/<repo>/issues/<N>/comments?per_page=100&sort=created&direction=desc``.
 #      - Filters to comments by the current ``gh`` user
@@ -41,15 +66,27 @@
 #        and exits 0.
 #      - If they don't match: prints the captured stderr (truncated to
 #        first 5 KB) and exits non-zero.
-#   4. On any other non-zero exit (auth failure, rate limit, etc.):
+#   5. On any other non-zero exit (auth failure, generic 5xx, etc.):
 #      prints the captured stderr and exits with the original code.
+#
+# Decision rules for the REST fallback (#4503)
+# --------------------------------------------
+# - Trigger ONLY on the explicit GraphQL-rate-limit-exceeded marker.
+#   Generic 5xx failures hit the existing 504 path.
+# - Do NOT trigger on 403 / authentication errors — those need
+#   operator intervention and the REST endpoint will reject for the
+#   same reason.
+# - The REST endpoint (`POST /repos/.../issues/N/comments`) consumes
+#   from the REST core 5,000-req/hr quota, which is rarely exhausted
+#   even in long sessions.
 #
 # Rate-budget hygiene
 # -------------------
 # Stays well within the 5,000 reqs/hr GitHub API budget — at most one
 # extra ``GET /repos/.../issues/<N>/comments`` and one ``GET /user``
-# per 504. No exponential backoff retries: a single confirm-or-fail
-# round trip is enough to disambiguate the 504-after-success case.
+# per 504, or one ``POST /repos/.../issues/<N>/comments`` per
+# GraphQL-quota-exhaustion. No exponential backoff retries: a single
+# confirm-or-fail round trip is enough.
 #
 # Integration
 # -----------
@@ -192,9 +229,58 @@ if [[ "$GH_EXIT" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2 — Non-zero exit. Inspect stderr for the 504-after-success signature.
+# Step 2 — Non-zero exit. Inspect stderr for known recoverable signatures.
 # ---------------------------------------------------------------------------
 
+# Step 2a — GraphQL-rate-limit-exceeded (#4503).
+#
+# `gh issue comment` posts via GitHub's GraphQL API. The GraphQL quota
+# is a separate 5,000-req/hr bucket from the REST core quota and is
+# routinely exhausted on long agent sessions. The explicit marker is:
+#   "GraphQL: API rate limit already exceeded for user ID <N>."
+# When we see it, fall back to the REST endpoint (which draws from the
+# core quota) instead of failing the whole post.
+if grep -qE "GraphQL: API rate limit already exceeded" "$STDERR_FILE"; then
+    echo "gh-comment-with-retry: GraphQL rate-limit exhausted, falling back to REST API..." >&2
+
+    # Split owner / repo for the REST URL. The wrapper validates REPO
+    # as `<owner>/<repo>` upstream by passing `--repo` to gh; the
+    # default is judgemind/judgemind. We don't need additional parsing
+    # — the slash form is what the REST endpoint expects.
+    REST_STDERR_FILE=$(mktemp)
+    REST_STDOUT_FILE=$(mktemp)
+    # shellcheck disable=SC2064  # cleanup paths fixed at trap-install time.
+    trap "rm -f '$STDERR_FILE' '$STDOUT_FILE' '$REST_STDERR_FILE' '$REST_STDOUT_FILE'" EXIT
+
+    set +e
+    gh api -X POST "/repos/$REPO/issues/$ISSUE/comments" \
+        -F "body=@$BODY_FILE" \
+        --jq '.html_url' \
+        > "$REST_STDOUT_FILE" 2> "$REST_STDERR_FILE"
+    REST_EXIT=$?
+    set -e
+
+    if [[ "$REST_EXIT" -eq 0 ]]; then
+        REST_URL=$(cat "$REST_STDOUT_FILE")
+        echo "comment posted (REST fallback): $REST_URL"
+        exit 0
+    fi
+
+    # REST also failed. Surface both stderrs so the operator can
+    # diagnose (likely cause: the REST core quota is also exhausted,
+    # or the body file changed mid-flight).
+    echo "ERROR: GraphQL rate-limit fallback to REST also failed (gh exit $REST_EXIT)." >&2
+    echo "  --- gh issue comment stderr (first 5 KB) ---" >&2
+    head -c 5120 "$STDERR_FILE" >&2
+    echo "" >&2
+    echo "  --- gh api POST stderr (first 5 KB) ---" >&2
+    head -c 5120 "$REST_STDERR_FILE" >&2
+    echo "" >&2
+    exit "$REST_EXIT"
+fi
+
+# Step 2b — 504-after-success (#4478).
+#
 # Two markers are diagnostic of the GitHub 504 / Unicorn page:
 #   - Literal "504 Gateway Timeout" (HTTP status line gh sometimes echoes)
 #   - "<title>Unicorn!" (HTML error page GitHub renders for 5xx)
