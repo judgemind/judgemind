@@ -1,31 +1,21 @@
 """Root conftest for scraper-framework package.
 
-Configures pytest to gracefully handle collection errors from test files
-that reference scripts with heavy external dependencies (psycopg, boto3,
-scraper-framework internals) not installed in the scraper-framework-tests
-CI venv.  These tests are NOT currently run in any CI job — they are
-suppressed here as a transitional measure while follow-up issues (#3387)
-sweep and clean them up.
+The historical `collect_ignore_glob` here was a transitional measure for
+broken tests that imported `scripts/<name>.py` modules that had since been
+moved to `scripts/archive/`.  Those tests have been deleted (issue #4459 —
+"scraper-framework tests import archived scripts that no longer exist in
+scripts/"), so the glob is no longer needed.
+
+The two `test_reingest_*` tests are still excluded by the CI workflow's
+explicit `--ignore=` flags (see `.github/workflows/ci.yml` lines 247-248),
+not here — they collect cleanly with the standard scraper-framework venv but
+require additional fixtures the CI shard does not stage.
 """
 
 from __future__ import annotations
 
-# Test files that reference scripts with dependencies (psycopg, boto3,
-# framework) not installed in the scraper-framework-tests CI venv.
-# NOTE: these tests are NOT run anywhere in CI — they are ignored here
-# to prevent collection failures.  Entries are kept while follow-up
-# issues clean up the remaining dead tests; do not remove globs until
-# the underlying test files are deleted or relocated to scripts/tests/.
-collect_ignore_glob = [
-    "tests/test_audit*.py",
-    "tests/test_backfill*.py",
-    "tests/test_cleanup*.py",
-    "tests/test_dedup*.py",
-    "tests/test_merge*.py",
-    "tests/test_riverside_remediation.py",
-    "tests/test_reingest_from_s3.py",
-    "tests/test_reingest_registry.py",
-]
+# No collect_ignore_glob is needed.  Surviving test files in this directory
+# all collect cleanly with the scraper-framework `[dev]` venv.
 
 
 def pytest_configure(config: object) -> None:
