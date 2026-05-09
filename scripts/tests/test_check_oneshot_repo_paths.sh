@@ -129,6 +129,66 @@ create_test_file "func_param.py" 'def summarize(worktree, repo_root, issue_numbe
 assert_passes "Function parameter named repo_root does not flag"
 reset_tmpdir
 
+# ─── Test 11: REPO_ROOT only inside a docstring should NOT flag (#4483) ─────
+# Module / function / class docstrings that mention _REPO_ROOT or REPO_ROOT
+# in prose must not trigger. The pre-#4483 text-grep flagged these as false
+# positives; the AST-walk replacement only inspects Name references.
+create_test_file "docstring_mention.py" '"""Helper that documents the AST shape it parses.
+
+The path-construction expression is roughly
+``_REPO_ROOT / "scripts" / "<name>.py"`` and we walk it with ast.parse.
+"""
+def main():
+    print("hello")
+'
+assert_passes "REPO_ROOT mention only inside a module docstring does not flag (#4483)"
+reset_tmpdir
+
+# ─── Test 12: REPO_ROOT only inside a string literal should NOT flag (#4483)
+# Fix-block / error-message output that names REPO_ROOT in a printed
+# string is not a real REPO_ROOT use. Only Name references (variable
+# load/store) should flag.
+create_test_file "string_literal_mention.py" 'def emit_fix_block():
+    lines = []
+    lines.append("    sys.path.insert(0, str(REPO_ROOT / '\''scripts'\'' / '\''archive'\''))")
+    return "\n".join(lines)
+'
+assert_passes "REPO_ROOT mention only inside a string literal does not flag (#4483)"
+reset_tmpdir
+
+# ─── Test 13: Combined docstring + string-literal mentions stay clean (#4483)
+# The canonical false-positive pattern from check_test_script_imports_resolvable.py
+# (#4464): docstring on line 189 + lines.append() on line 602.
+create_test_file "combined_clean.py" '"""Module that mentions ``_REPO_ROOT / "scripts" / "<name>.py"`` in its docstring."""
+def emit():
+    msg = "REPO_ROOT / scripts / archive"  # noqa: doc-only literal
+    lines = []
+    lines.append("    sys.path.insert(0, str(REPO_ROOT / '\''scripts'\'' / '\''archive'\''))")
+    return msg, lines
+'
+assert_passes "Combined docstring + string-literal REPO_ROOT mentions do not flag (#4483)"
+reset_tmpdir
+
+# ─── Test 14: Real Name reference in code DOES flag even when docstring also mentions it
+# Sanity-check that the AST walk does not over-skip — a real
+# module-level _REPO_ROOT assignment + Name load still trips the guard.
+create_test_file "mixed_real_and_doc.py" '"""Mentions ``_REPO_ROOT / scripts`` in the docstring AND uses it for real."""
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG = _REPO_ROOT / "config.json"
+'
+assert_fails "Real _REPO_ROOT Name reference is flagged even when a docstring also mentions it (#4483)"
+reset_tmpdir
+
+# ─── Test 15: AnnAssign target is also a real reference (#4483) ─────────────
+# An annotated module-level assignment must still be flagged.
+create_test_file "annassign.py" 'from pathlib import Path
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+DATA = REPO_ROOT / "data" / "x.json"
+'
+assert_fails "AnnAssign target named REPO_ROOT is flagged (#4483)"
+reset_tmpdir
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
