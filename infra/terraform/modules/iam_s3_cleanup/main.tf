@@ -50,8 +50,14 @@ resource "aws_iam_role" "s3_cleanup" {
 # Actions included:
 #   - s3:ListBucket — required so the script can paginate
 #     `list_objects_v2` to find delete candidates. The
-#     `s3:prefix` condition restricts list visibility to `ca/*/*/raw/`
-#     subtrees only.
+#     `s3:prefix` condition restricts list visibility to the `ca/`
+#     subtree only — the cleanup script paginates from ``ca/`` and
+#     filters keys client-side via the `ca/{county}/{court}/raw/<hex64>`
+#     regex (#2661), so the prefix patterns must accept ``ca/`` and any
+#     deeper child path under it. Listing outside ``ca/`` (e.g.
+#     ``derived/``, ``processed/``, ``transcripts/``, ``staging/``,
+#     ``spotcheck/``) remains denied. DeleteObject is separately and
+#     more narrowly scoped to ``ca/*/*/raw/*`` below.
 #   - s3:GetObject + s3:HeadObject — required by the cleanup script's
 #     metadata-hash safety check (`head_object_metadata_hash` reads the
 #     object's metadata before deciding to delete).
@@ -85,10 +91,20 @@ resource "aws_iam_policy" "s3_raw_cleanup" {
         Resource = var.document_archive_bucket_arn
         Condition = {
           StringLike = {
+            # The cleanup script paginates list_objects_v2 from the
+            # state-level prefix ("ca/") and filters keys client-side
+            # via a `ca/{county}/{court}/raw/<hex64>` regex. The
+            # `s3:prefix` condition gates which Prefix values the
+            # ListBucket call may pass — so it must accept "ca/" and
+            # any deeper child path under it. The narrower
+            # `ca/*/*/raw/*` patterns alone reject `Prefix='ca/'` (#2661
+            # AccessDenied at apply). DeleteObject below remains
+            # narrowly scoped to `ca/*/*/raw/*` so this widening does
+            # not expand the actual destructive blast radius.
             "s3:prefix" = [
-              "ca/*/*/raw/*",
-              "ca/*/*/raw/",
-              "ca/*/*/raw"
+              "ca",
+              "ca/",
+              "ca/*"
             ]
           }
         }

@@ -137,13 +137,46 @@ fi
 #
 # `s3:ListBucket` against the bucket ARN without an `s3:prefix` condition
 # would let the role enumerate every key in the bucket. The condition
-# must restrict prefix to `ca/*/*/raw/*`.
+# must restrict prefix so the role can only list under the `ca/` subtree.
+# This is widened from `ca/*/*/raw/*` to `ca/*` because the cleanup
+# script paginates from `ca/` and filters keys client-side (the
+# narrower form rejected `Prefix='ca/'` at apply time, see #2661).
+# DeleteObject remains narrowly scoped to `ca/*/*/raw/*` so the
+# destructive blast radius is unchanged.
 if grep -q '"s3:ListBucket"' "$main_tf"; then
     if grep -q '"s3:prefix"' "$main_tf"; then
         check "s3:ListBucket is gated by s3:prefix condition" 0
     else
         check "s3:ListBucket is gated by s3:prefix condition" 1
     fi
+
+    # The s3:prefix list must include at least one ca/-anchored pattern
+    # so the policy is gated to the ca/ subtree (no listing of
+    # derived/, processed/, transcripts/, staging/, or spotcheck/).
+    if grep -qE '"(ca|ca/|ca/\*)"' "$main_tf"; then
+        check "s3:prefix list includes a ca/-anchored pattern" 0
+    else
+        check "s3:prefix list includes a ca/-anchored pattern" 1
+    fi
+
+    # The s3:prefix list must NOT include patterns that escape ca/ —
+    # e.g. a bare "*", "" (empty allow-anything), "derived/*",
+    # "processed/*", "transcripts/*", "staging/*", or "spotcheck/*".
+    forbidden_prefix_patterns=(
+        '"\*"'
+        '"derived'
+        '"processed'
+        '"transcripts'
+        '"staging'
+        '"spotcheck'
+    )
+    for pat in "${forbidden_prefix_patterns[@]}"; do
+        if grep -qE "$pat" "$main_tf"; then
+            check "s3:prefix list does not escape ca/ via '${pat}'" 1
+        else
+            check "s3:prefix list does not escape ca/ via '${pat}'" 0
+        fi
+    done
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
