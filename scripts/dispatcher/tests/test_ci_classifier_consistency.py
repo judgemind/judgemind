@@ -32,8 +32,15 @@ import pytest
 
 
 _DISPATCHER_DIR = Path(__file__).resolve().parents[1]
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2]
 _CLI_PATH = _DISPATCHER_DIR / "ci_classifier_cli.py"
 
+# Match the import pattern peer dispatcher tests use (e.g.
+# test_daemon_phase3b.py): put ``scripts/`` on sys.path so the
+# ``dispatcher`` package resolves without requiring the repo to be
+# pip-installed.
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 if str(_DISPATCHER_DIR) not in sys.path:
     sys.path.insert(0, str(_DISPATCHER_DIR))
 
@@ -209,7 +216,10 @@ def test_daemon_extract_failing_jobs_matches_shared_helper(
     ``phase_transitions.extract_failing_jobs``.
     """
     # Late import — daemon pulls in heavy deps (boto3, psycopg).
-    from scripts.dispatcher import daemon  # noqa: PLC0415
+    # Use ``from dispatcher import daemon`` to match peer-test pattern
+    # (no repo-as-package install required); ``_SCRIPTS_DIR`` is on
+    # sys.path at module top.
+    from dispatcher import daemon  # noqa: PLC0415
 
     shared = extract_failing_jobs(payload, max_jobs=daemon.FIX_CI_MAX_FAILING_JOBS)
     daemon_result = daemon.DispatcherDaemon._extract_failing_jobs(payload)
