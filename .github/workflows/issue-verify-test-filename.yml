@@ -1,0 +1,91 @@
+name: Validate Verify test filenames
+
+# Lint test filenames referenced in any ``Verify:`` line of an issue
+# body against the runner's helper-prefix filter
+# (scripts/run-scripts-tests.sh::is_helper). If the script
+# (scripts/check-issue-verify-test-filename.py) finds a filename that
+# would be silently skipped by CI, post a comment on the issue and
+# strip the agent/ready label so the issue is not picked up before the
+# AC is corrected.
+#
+# Tracking: issue #4549 (parent: #4545, surfaced via #4540).
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  validate-verify-test-filename:
+    if: github.event.issue.state == 'open'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run check-issue-verify-test-filename.py
+        id: check
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set +e
+          ./scripts/check-issue-verify-test-filename.py --issue "$ISSUE_NUMBER" \
+            > "$RUNNER_TEMP/check.stdout" 2> "$RUNNER_TEMP/check.stderr"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          {
+            echo "stderr<<__EOF__"
+            cat "$RUNNER_TEMP/check.stderr"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+          # Exit 0 always — we surface the result via outputs and let
+          # the next step decide. (Exit 2 = gh failure; we don't want
+          # infrastructure flakes to block issue authoring.)
+          exit 0
+      - name: Comment + strip agent/ready on filename violation
+        if: steps.check.outputs.rc == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          DIAGNOSTIC: ${{ steps.check.outputs.stderr }}
+        run: |
+          # Build the comment header / footer in two parts so the
+          # diagnostic stderr lands inside a fenced code block. Using a
+          # single-quoted heredoc disables shell expansion of the
+          # literal markdown backticks (shellcheck SC2016 friendly).
+          cat > "$RUNNER_TEMP/comment.md" <<'HEADER_EOF'
+          ## Test filename validation failed
+
+          A `Verify:` line in this issue prescribes a test filename that the runner `scripts/run-scripts-tests.sh::is_helper` would silently skip — see lines ~100-111 of that script.
+
+          ```
+          HEADER_EOF
+          printf '%s\n' "$DIAGNOSTIC" >> "$RUNNER_TEMP/comment.md"
+          cat >> "$RUNNER_TEMP/comment.md" <<'FOOTER_EOF'
+          ```
+
+          Fix: rename the prescribed test filename to `scripts/tests/test_<thing>.sh` (default) or `scripts/tests/test__<thing>.sh` (when the test specifically exercises a shared `_<thing>.sh` helper). See `docs/agent/issue-authoring.md` §"Don't prescribe `_`-prefixed test filenames under `scripts/tests/`".
+
+          The `agent/ready` label has been removed; re-add it once the AC is corrected. (Tracking: #4549.)
+          FOOTER_EOF
+
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+            --body-file "$RUNNER_TEMP/comment.md"
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+            --remove-label "agent/ready" || true
+
+          # Fail the workflow so the check is visible on the issue's
+          # workflow runs list. The label / comment side-effects above
+          # already happened.
+          exit 1
+      - name: Note infrastructure failure (rc=2) but do not block
+        if: steps.check.outputs.rc == '2'
+        run: |
+          echo "::warning::check-issue-verify-test-filename.py exited 2 — gh fetch failed; not blocking issue authoring."
+          cat "$RUNNER_TEMP/check.stderr" || true
