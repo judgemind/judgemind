@@ -3273,6 +3273,95 @@ class TestResolveJudgeFromDepartment:
         # Only two execute calls: court_code + historical snapshot — no fallback
         assert len(cur.execute.call_args_list) == 2
 
+    def test_falls_back_from_c_prefix_to_bare_numeric_for_sd_legacy_snapshot(
+        self,
+    ) -> None:
+        """``C-NN`` department resolves against a snapshot that has only ``NN`` (#4437).
+
+        Regression: 54 SD rulings on civil-Central depts ``C-63``..``C-75`` had
+        hearing dates predating the earliest SD snapshot (2026-03-31), and the
+        earliest snapshot only had bare-numeric keys (``"63"``, ``"64"``, ...)
+        because the dual-key writer in
+        ``sd_dept_judges.build_department_judge_map`` (#3862) had not yet
+        landed when those snapshots were captured.  The pre-snapshot fallback
+        (#2618) found the earliest snapshot, but the literal+lower-case
+        lookup against ``"C-63"`` failed against keys ``"63"``, returning
+        ``None`` despite a perfectly good mapping entry under the alternate
+        form.  The SD-form fallback recovers the bare-numeric key.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Earliest snapshot has only the bare-numeric form — mirrors the
+        # pre-#3862 SD snapshot shape.
+        earliest_mapping = {"63": "Katherine A. Bacal", "64": "Loren G. Freestone"}
+        cur.fetchone.side_effect = [
+            ("ca-san-diego",),
+            None,  # historical snapshot: no row (hearing predates window)
+            (earliest_mapping,),  # earliest-snapshot fallback returns bare-numeric mapping
+        ]
+        hearing_dt = date(2026, 3, 27)
+
+        result = resolve_judge_from_department(
+            conn, "court-uuid-1", "C-63", hearing_date=hearing_dt
+        )
+        assert result == "Katherine A. Bacal"
+
+    def test_falls_back_from_bare_numeric_to_c_prefix(self) -> None:
+        """Inverse: ``63`` resolves against a snapshot that has only ``C-63`` (#4437).
+
+        Defensive guard against the symmetric mismatch — if a future
+        ingestion path writes ``r.department = "63"`` (bare numeric) but
+        the relevant snapshot only has ``"C-63"``, the fallback should
+        still resolve.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"C-63": "Katherine A. Bacal"}
+        cur.fetchone.side_effect = [("ca-san-diego",), (mapping,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "63")
+        assert result == "Katherine A. Bacal"
+
+    def test_sd_form_fallback_uses_case_insensitive_alt_form_match(self) -> None:
+        """SD-form fallback also handles case-insensitive alt-form matches (#4437).
+
+        If a snapshot was captured with a lowercased ``c-63`` key, the
+        alternate-form lookup against ``"63"`` (which is unaffected by case)
+        still succeeds via the case-insensitive iteration.  This branch
+        guards the case-insensitive alt-form matcher (line 1251 of db.py).
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Mapping has only the lowercased C-prefix form.
+        mapping = {"c-63": "Katherine A. Bacal"}
+        cur.fetchone.side_effect = [("ca-san-diego",), (mapping,)]
+
+        # Lookup with bare-numeric form — neither literal nor lowercase
+        # match the only key, so the SD-form fallback fires and tries
+        # ``"C-63"`` against ``"c-63"`` via the case-insensitive matcher.
+        result = resolve_judge_from_department(conn, "court-uuid-1", "63")
+        assert result == "Katherine A. Bacal"
+
+    def test_sd_form_fallback_does_not_fire_on_alphanumeric_tail(self) -> None:
+        """``C-NQ`` does NOT trigger the bare-form fallback (#4437).
+
+        The fallback is intentionally narrow — numeric tail only — so a
+        hypothetical alphanumeric code like ``C-NQ`` does not get
+        rewritten to a bare ``NQ`` lookup.  This guards against
+        spurious cross-form matches in counties that use ``C-`` for
+        unrelated codes.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"NQ": "Some Judge", "63": "Katherine A. Bacal"}
+        cur.fetchone.side_effect = [("ca-san-diego",), (mapping,)]
+
+        # ``C-NQ`` does not match ``^[Cc]-(\d+)$`` so the fallback does not
+        # fire — the literal/lower-case lookups already failed, so we get
+        # ``None`` instead of an unrelated ``"NQ"`` -> ``"Some Judge"`` hit.
+        result = resolve_judge_from_department(conn, "court-uuid-1", "C-NQ")
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # delete_stale_split_children
