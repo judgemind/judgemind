@@ -187,7 +187,10 @@ element's role so future theme rebalances flow naturally.
   the "secondary action" filled state (intended pair:
   `<Button variant="secondary">`). Avoid on bare elements — the same
   always-visible-shadcn-token footgun that prompted the `bg-accent` guard
-  applies here.
+  applies here. If you mean a CTA, use `<Button variant="default">`. Hand-rolled
+  `<button className="bg-secondary">` produces near-invisible white-on-white
+  chrome and is blocked by `scripts/check-button-bg-secondary.sh` (#4226);
+  waive deliberate uses with an inline `secondary-cta: intentional` comment.
 - `bg-accent` — the shadcn hover surface, NOT the brand amber. Always pair
   with a modifier (`hover:bg-accent`, `data-[selected=true]:bg-accent`).
   Bare always-visible `bg-accent` is blocked by

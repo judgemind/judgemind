@@ -1460,6 +1460,25 @@ jobs:
         run: scripts/check-bare-shadcn-accent.sh
 
   # ---------------------------------------------------------------
+  # Hand-rolled CTA bg-secondary guard: block hand-rolled <button>
+  # and <a> JSX elements that use bg-secondary directly (not via the
+  # sanctioned <Button> wrapper). bg-secondary resolves to a near-white
+  # surface in light mode and a near-black surface in dark mode, so on
+  # a CTA-shaped element it paints invisible chrome — the same
+  # severity as the #2816 text-accent regression that prompted the
+  # companion bare-shadcn-accent guard. Today there are zero such
+  # usages; this guard ships preventatively (#4226). Legitimate
+  # parent-paired or shadcn-slot idioms are waived via inline
+  # `secondary-cta: intentional` comments.
+  # ---------------------------------------------------------------
+  bare-button-bg-secondary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Forbid hand-rolled CTA elements with shadcn surface tokens
+        run: scripts/check-button-bg-secondary.sh
+
+  # ---------------------------------------------------------------
   # BRAND.md ↔ tailwind.config.ts drift check: ensure the Accent
   # table and Tailwind Token Mapping block in docs/BRAND.md stay in
   # sync with packages/web/tailwind.config.ts (#2831).
@@ -2277,6 +2296,7 @@ jobs:
       - terraform-ecs-entrypoint-check
       - hardcoded-colors-check
       - bare-shadcn-accent-check
+      - bare-button-bg-secondary-check
       - docs-tailwind-drift-check
       - llm-json-loads-check
       - llm-paths-symmetry-check
