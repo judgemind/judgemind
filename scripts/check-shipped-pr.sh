@@ -18,7 +18,12 @@
 #   1. Fetch the issue body via `gh issue view`.
 #   2. Extract candidate file paths from the body using a fixed regex
 #      that covers the four conventional repo roots
-#      (scripts/, packages/, docs/, infra/) plus `.github/`.
+#      (scripts/, packages/, docs/, infra/) plus `.github/`. Each path
+#      is classified as either *target-context* (narrative / Proposal /
+#      AC text — load-bearing change targets) or *search-context*
+#      (cited only inside Verify: / grep / pytest / aws / curl / rg
+#      invocations or fenced shell-output blocks — search arguments,
+#      not change targets). #4340.
 #   3. For each unique file path, query the commits API on `main` to find
 #      commits that touched it (`gh api /repos/.../commits?path=<file>`),
 #      and parse the squash-merge PR number from each commit headline
@@ -26,9 +31,15 @@
 #   4. For each candidate PR, fetch its merge metadata and changed files
 #      via `gh pr view --json mergedAt,baseRefName,files`. Drop the
 #      candidate if `mergedAt` is null or `baseRefName != main`.
-#   5. Compute overlap of the candidate PR's changed files vs the file
-#      paths extracted from the issue body. Treat ≥1 file overlap as a
-#      high-confidence shipped match.
+#   5. Compute overlap of the candidate PR's changed files vs the
+#      candidate paths. Apply the high-confidence threshold AGAINST THE
+#      TARGET-CONTEXT SUBSET ONLY — search-context overlaps don't trip
+#      a shipped match by themselves (#4340). Threshold: ≥1 added
+#      target-context overlap OR ≥2 total target-context overlaps. The
+#      "added" classification uses changeType:"ADDED" (or status:
+#      "added" from the raw GitHub REST API), falling back to a
+#      deletions==0 heuristic when neither authoritative signal is
+#      present.
 #   6. On match: print a `shipped:` line and a JSON summary to stdout,
 #      exit 0. On no match: print a `not-shipped:` line, exit 1. On
 #      error: print an `error:` line to stderr, exit 2.
@@ -88,14 +99,56 @@ if ! issue_json=$("$GH_BIN" issue view "$issue_num" --repo "$REPO" --json body,t
 fi
 
 # Extract candidate file paths from the issue body via Python (so the regex
-# dialect is portable across BSD vs GNU grep).
-candidate_files=""
-if ! candidate_files=$(printf '%s' "$issue_json" | python3 \
+# dialect is portable across BSD vs GNU grep). The helper emits one TAB-
+# separated line per path:  ``<path>\t<context>`` where ``<context>`` is
+# ``target`` (narrative / Proposal / AC text) or ``search`` (Verify: /
+# grep / pytest / aws / curl / rg invocations, or fenced shell blocks).
+# We split out:
+#   - ``candidate_lines`` — the raw output (path\tcontext per line)
+#   - ``candidate_files`` — column 1 only (paths), used for the per-file
+#       commits API query
+#   - ``target_files``    — paths classified as target-context, used by
+#       the overlap helper to apply the target-context-aware threshold
+#       (#4340 — Verify-line-only overlaps no longer trip false-positive
+#       shipped matches).
+candidate_lines=""
+if ! candidate_lines=$(printf '%s' "$issue_json" | python3 \
     "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_extract_files.py" \
     2>/dev/null); then
     echo "error: failed to extract candidate file paths from issue #${issue_num} (exit 2)" >&2
     exit 2
 fi
+
+# Split by TAB into (path, context). Defensive against legacy single-
+# column output (callers that test the helper without the new column
+# would emit just the path) — fall back to treating the whole line as
+# the path with context=target. Today's helper always emits the TAB-
+# separated form, but this keeps the bash glue robust to future helper
+# refactors that emit only paths.
+candidate_files=""
+target_files=""
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Tab-split into path + context. If no tab, default to target.
+    path="${line%%$'\t'*}"
+    if [[ "$line" == *$'\t'* ]]; then
+        ctx="${line#*$'\t'}"
+    else
+        ctx="target"
+    fi
+    if [[ -z "$candidate_files" ]]; then
+        candidate_files="$path"
+    else
+        candidate_files="${candidate_files}"$'\n'"${path}"
+    fi
+    if [[ "$ctx" == "target" ]]; then
+        if [[ -z "$target_files" ]]; then
+            target_files="$path"
+        else
+            target_files="${target_files}"$'\n'"${path}"
+        fi
+    fi
+done <<< "$candidate_lines"
 
 # Extract the issue's createdAt timestamp for the date-ordering guard
 # (#4353). The helper exits 0 unconditionally and emits an empty string
@@ -172,6 +225,15 @@ best_added_list=""
 # overlap helper.
 candidate_files_csv=$(printf '%s' "$candidate_files" | tr '\n' ',' | sed 's/,$//')
 
+# Same conversion for target_files. The overlap helper applies a
+# target-context-aware threshold (#4340) — Verify-line-only overlaps
+# (where every overlap path is search-context) no longer trip false-
+# positive shipped matches.
+target_files_csv=""
+if [[ -n "$target_files" ]]; then
+    target_files_csv=$(printf '%s' "$target_files" | tr '\n' ',' | sed 's/,$//')
+fi
+
 # Iterate candidate PRs (comma-separated)
 IFS=',' read -ra prs_array <<< "$candidate_prs"
 for pr_num in "${prs_array[@]}"; do
@@ -210,6 +272,7 @@ for pr_num in "${prs_array[@]}"; do
     overlap_result=""
     if ! overlap_result=$(printf '%s' "$pr_json" | \
         CHECK_SHIPPED_CANDIDATE_FILES="$candidate_files_csv" \
+        CHECK_SHIPPED_TARGET_FILES="$target_files_csv" \
         CHECK_SHIPPED_ISSUE_CREATED_AT="$issue_created_at" \
         python3 \
         "$(dirname "${BASH_SOURCE[0]}")/_check_shipped_pr_overlap.py" \

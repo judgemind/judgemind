@@ -832,6 +832,208 @@ else
     fail "PR merged AFTER issue createdAt is still a valid shipped match (#4353 sanity)" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 21: Verify-line-only file overlap → exit 1 (#4340) ─────────────
+
+# Regression for #4340. Issue body cites three files only inside a
+# `Verify:` line — they're search arguments to grep, not load-bearing
+# targets. A merged PR happens to touch all three for unrelated reasons
+# (1 MODIFIED with deletions>0, 1 MODIFIED with deletions==0, 1
+# MODIFIED with deletions>0). Pre-fix: 1 added (heuristic-misclassified
+# "scripts/rebuild_db.py +120 -0" as added) → exit 0 false-positive
+# shipped match. Post-fix: those three are search-context only, the
+# only target-context candidate has no overlap, threshold fails → exit 1.
+#
+# Concrete case: issue #4331 (filed 2026-05-08) hit a false positive
+# against PR #3552 (merged 2026-04-27) — the PR body is the LLM-
+# enrichment retry plumbing, completely unrelated to the splitter alias
+# mechanism. The Verify line in #4331 cites
+#   `grep -n "..." packages/A.py packages/B.py scripts/C.py`
+# as a re-run convenience; PR #3552 happened to touch the three paths
+# for unrelated reasons.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "## Problem\n\nSomething is wrong.\n\n## Acceptance criteria\n\n- [ ] Splitter aliases registered.\n  Verify: `grep -n alias packages/scraper-framework/src/courts/ca/sc_tentatives.py packages/scraper-framework/src/ingestion/worker.py scripts/reingest_from_s3.py`", "title": "feat: register CA splitters under aliases", "createdAt": "2026-05-08T17:28:43Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        # Each candidate path returns the same incidental PR.
+        echo "fix(ingestion): add retry-on-transient (#3552)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            # PR #3552 — three modified files, all with deletions > 0.
+            # changeType: MODIFIED is the authoritative gh-CLI signal —
+            # post-fix the deletions==0 fallback no longer mis-classifies
+            # these as ADDED.
+            cat << 'JSON'
+{"baseRefName": "main", "body": "Closes #3549", "files": [{"path": "packages/scraper-framework/src/courts/ca/sc_tentatives.py", "additions": 50, "deletions": 5, "changeType": "MODIFIED"}, {"path": "packages/scraper-framework/src/ingestion/worker.py", "additions": 13, "deletions": 32, "changeType": "MODIFIED"}, {"path": "scripts/reingest_from_s3.py", "additions": 15, "deletions": 19, "changeType": "MODIFIED"}], "mergedAt": "2026-04-27T10:16:05Z", "number": 3552, "title": "fix(ingestion): add retry-on-transient and exit-on-exhaustion for LLM enrichment"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4331 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "exits 1 when overlap is ONLY on Verify-line search-context paths (regression #4340)"
+else
+    fail "exits 1 when overlap is ONLY on Verify-line search-context paths (regression #4340)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 22: pure-additive MODIFIED diff is not "added" (#4340 changeType) ─
+
+# Pre-#4340, the helper used a deletions==0 && additions>0 heuristic
+# to detect added files (since gh CLI didn't surface a status field in
+# older docs). That heuristic mis-classifies large *modifications* like
+# `scripts/rebuild_db.py +120 -0` as "added" — exactly the false-
+# positive pattern that tripped #4340. Post-fix the helper consults
+# changeType: "ADDED"/"MODIFIED" (the authoritative gh CLI signal) and
+# only falls back to deletions==0 when changeType is absent.
+#
+# Mock: a single MODIFIED file with `+200 -0` and `changeType: "MODIFIED"`.
+# Issue body cites the file in narrative (target-context). Pre-fix:
+# heuristic flags it as ADDED → 1 added overlap → shipped (false-
+# positive). Post-fix: changeType=MODIFIED authoritative → 0 added,
+# 1 total → fails threshold → not-shipped.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Update scripts/big-mod.sh to add the new feature.", "title": "dx: extend big-mod"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "feat: add helper (#7000)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            # Pure-additive MODIFIED diff. changeType is authoritative
+            # — overrides the deletions==0 fallback.
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/big-mod.sh", "additions": 200, "deletions": 0, "changeType": "MODIFIED"}], "mergedAt": "2026-04-15T00:00:00Z", "number": 7000, "title": "feat: add helper"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4400 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "exits 1 when changeType:MODIFIED overrides deletions==0 heuristic (regression #4340)"
+else
+    fail "exits 1 when changeType:MODIFIED overrides deletions==0 heuristic (regression #4340)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 23: changeType:ADDED is the authoritative ADDED signal (#4340) ──
+
+# Sanity check — the changeType signal must NOT block legitimate adds.
+# Issue body cites a target-context file in narrative; PR adds it
+# (changeType: "ADDED"). Expect exit 0 (shipped).
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Add scripts/new-helper.sh to validate widgets.", "title": "dx: add new-helper"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "feat: add helper (#8000)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/new-helper.sh", "additions": 100, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-04-15T00:00:00Z", "number": 8000, "title": "feat: add helper"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4500 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"8000"* ]]; then
+    pass "exits 0 when changeType:ADDED ratifies legitimate added-file overlap (regression #4340)"
+else
+    fail "exits 0 when changeType:ADDED ratifies legitimate added-file overlap (regression #4340)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 24: canonical #2831 ↔ PR #3229 still detected (#4340 AC3) ──────
+
+# AC3 of #4340: the fix must NOT regress the original #4204 use case —
+# genuine zombie issues (closed PRs that shipped the work without
+# `Closes #N`) are still detected. The canonical case from #2831 ↔ PR
+# #3229: PR title is `WIP: ralph output` (placeholder), body is empty
+# (no `Closes #N` keyword fired the auto-close), the PR added the file
+# named in the issue's narrative.
+#
+# This test mirrors the existing Test 17 (canonical placeholder PR
+# empty-body case) but uses the new authoritative changeType:"ADDED"
+# signal instead of relying on the deletions==0 heuristic — locks in
+# that the changeType fix doesn't regress this AC2 path.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: add scripts/foo.sh"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "WIP: ralph output (#3229)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-04-24T00:00:00Z", "number": 3229, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3229"* ]]; then
+    pass "AC3: canonical #2831 ↔ PR #3229 still detected (regression #4340)"
+else
+    fail "AC3: canonical #2831 ↔ PR #3229 still detected (regression #4340)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
