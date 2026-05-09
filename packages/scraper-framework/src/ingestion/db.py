@@ -1110,6 +1110,18 @@ def resolve_judge_from_department(
     during both normal ingestion and rebuilds, regardless of ``_llm_extracted``
     status.
 
+    Lookup chain
+    ------------
+    1. Literal match against the snapshot mapping.
+    2. Case-insensitive match against every key.
+    3. **San Diego legacy-snapshot fallback (#4437):** if the input
+       department is ``C-NN`` (numeric tail) and only ``NN`` is in the
+       mapping — or vice versa — return the alternate-form mapping value.
+       The SD scraper aliases both keys for civil-Central departments
+       (#3862), so any cross-form match is provably the same judge.  The
+       fallback is intentionally narrow (numeric tail only) so it cannot
+       fire on unrelated ``C-`` prefixes in other counties.
+
     Parameters
     ----------
     conn : psycopg.Connection
@@ -1206,6 +1218,37 @@ def resolve_judge_from_department(
     for key, value in mapping.items():
         if key.lower().strip() == dept_lower:
             return value
+
+    # San Diego legacy-snapshot fallback (#4437): the SD scraper now writes
+    # both ``"NN"`` and ``"C-NN"`` keys for civil-Central departments
+    # (#3862, ``sd_dept_judges.build_department_judge_map``), but snapshots
+    # captured before that fix landed (2026-04-30) only carry the
+    # bare-numeric form.  When a ruling's department string is ``C-NN`` and
+    # the snapshot only has ``NN`` (or vice versa), the literal/lower-case
+    # match above fails and the resolver returns ``None`` — leaving 54
+    # SD rulings (in dev as of 2026-05-04) with ``judge_id = NULL``
+    # despite a perfectly good mapping entry under the alternate form.
+    #
+    # The aliasing is provably safe for SD: the dual-key writer aliases
+    # exactly these two forms ("NN" → judge X also writes "C-NN" → judge X),
+    # so any cross-form match against an SD snapshot recovers the same
+    # judge name a current snapshot would return for the literal form.
+    # The fallback is intentionally narrow — only the C-NN ↔ NN pair, where
+    # NN is purely numeric — so it cannot fire spuriously on alphanumeric
+    # codes like "C-NQ" or other counties' unrelated "C-" prefixes.
+    alt_forms: list[str] = []
+    c_match = re.match(r"^[Cc]-(\d+)$", department.strip())
+    if c_match is not None:
+        alt_forms.append(c_match.group(1))
+    elif department.strip().isdigit():
+        alt_forms.append(f"C-{department.strip()}")
+    for alt in alt_forms:
+        if alt in mapping:
+            return mapping[alt]
+        alt_lower = alt.lower().strip()
+        for key, value in mapping.items():
+            if key.lower().strip() == alt_lower:
+                return value
     return None
 
 
