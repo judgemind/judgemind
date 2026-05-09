@@ -3,9 +3,9 @@
 # permanent: true
 """_gh_comment_with_retry_match.py — Helper for gh-comment-with-retry.sh.
 
-Reads a GitHub issue-comments JSON list from stdin, finds the most recent
-comment by ``$GH_USER``, writes its body to ``$LATEST_BODY_FILE``, and
-prints the comment's ``html_url`` on stdout.
+Reads a GitHub issue/PR-comments JSON list from stdin, finds the most
+recent comment by ``$GH_USER``, writes its body to ``$LATEST_BODY_FILE``,
+and prints the comment's ``html_url`` on stdout.
 
 Why a sibling helper instead of an inline ``python3 -c``
 --------------------------------------------------------
@@ -18,7 +18,8 @@ files are fine), and stays under the project's "Multi-line Python
 always goes in a .py file" rule for consistency.
 
 Stdin: the raw JSON body of GET /repos/<owner>/<repo>/issues/<N>/comments
-(an array of comment objects).
+(an array of comment objects). The same endpoint serves both issue
+comments and PR top-level comments (#4484), so this helper handles both.
 
 Env:
     GH_USER (str): the gh user login whose comment we want to match.
@@ -35,7 +36,7 @@ Output:
     no stdout output. The wrapper interprets exit 1 as
     "no-recent-comment-by-us-found".
 
-Tracking: issue #4478.
+Tracking: issues #4478 (initial), #4484 (PR-comment generalization).
 """
 
 from __future__ import annotations
