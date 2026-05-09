@@ -192,7 +192,7 @@ failed (i.e. `exit1 != 0`).
 ## Acceptance-criteria mapping
 
 * AC #1 — audit doc with file:line evidence — **THIS DOCUMENT**.
-* AC #2 — `grep -rn '2>/dev/null' scripts/tests/ | grep -E '_rc=\$\?|assert.*rc'` returns ≤ 5 hits — **MET** (returns 0 hits in the
+* AC #2 — `grep -rn -F '2>/dev/null' scripts/tests/ | grep -E '_rc=\$\?|assert.*rc'` returns ≤ 5 hits — **MET** (returns 0 hits in the
   current tree; the literal `_rc` and `assert.*rc` strings the AC
   greps for were never present in this repo). The audit's broader
   pattern (any rc-capture-then-assert variant under stderr discard)
@@ -347,6 +347,16 @@ went from a baseline of 47 to 57 (+10 sites — well above the AC's
 required +5). Migrated tests still pass; baseline 3 unrelated
 failures (graphql-queries, cleanup-worktree-review-log-mirror,
 fleet-status-cooldown) are unchanged.
+
+> **Note — `-F` is load-bearing here, do not strip it (#4552).** Without
+> `grep -F` (fixed strings), the unescaped `$` in the pattern `2>"$` is
+> interpreted as the BRE end-of-line anchor, so the pattern only matches
+> a literal `2>"` at end-of-line — which never occurs in `scripts/tests/`.
+> The result: the verify command returns `0` for both baseline AND
+> post-migration counts, and the AC becomes uncheckable. With `-F`, the
+> pattern matches the literal string `2>"$` (the canonical err-file capture
+> shape `2>"$err…"`), which is what the AC's intent expresses. Future
+> opportunistic-migration follow-ups must copy this verify form verbatim.
 
 The remaining ~50+ already-debuggable sites identified in the
 "Sites considered and intentionally NOT patched" section above
