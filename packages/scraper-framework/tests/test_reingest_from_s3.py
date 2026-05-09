@@ -6356,6 +6356,11 @@ class TestProgressLogging:
             "output_tokens",
             "llm_api_calls",
             "estimated_cost_usd",
+            # judge_prepass_complete is appended when the pre-pass runs
+            # (default behaviour, #4408).  The pre-pass is skipped only
+            # under ``dry_run=True`` or ``skip_judge_prepass=True`` —
+            # neither applies in this test, so the key is always present.
+            "judge_prepass",
         }
         assert set(stats.keys()) == expected_keys
 
