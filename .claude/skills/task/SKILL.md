@@ -719,12 +719,13 @@ The **Post-deploy verification** section must include at least one concrete veri
 - [ ] N/A — no deployed component (docs/CI/tooling only)
 ```
 
-Create the PR (write — stays on `gh` until MCP writes land):
+Create the PR via the `gh-pr-with-retry.sh` wrapper (#4527). The wrapper invokes `gh pr create` first and falls back to `gh api -X POST /repos/.../pulls` on the explicit `GraphQL: API rate limit already exceeded` stderr marker — same shape as `gh-comment-with-retry.sh` (#4503). Auth, validation, and other 5xx failures pass through unchanged. Pass the worktree branch explicitly to `--head` (the wrapper does not infer it from `git rev-parse`):
 ```
-gh pr create --repo judgemind/judgemind \
+{worktree}/scripts/gh-pr-with-retry.sh create \
     --title "..." \
     --body-file {worktree}/tmp/pr_body.txt \
-    --base main
+    --base main \
+    --head <branch>
 ```
 
 #### A.4 — Verify no merge conflicts
@@ -790,9 +791,9 @@ Fetch the current PR body via MCP:
 mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
 ```
 
-Check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then (write — `gh pr edit` has no MCP equivalent, stays on `gh`):
+Check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then update via the `gh-pr-with-retry.sh` wrapper (#4527 — same GraphQL-quota REST fallback as A.3):
 ```
-gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
+{worktree}/scripts/gh-pr-with-retry.sh edit <PR-N> --body-file {worktree}/tmp/pr_body.txt
 ```
 
 #### A.7 — Merge the PR
@@ -819,9 +820,9 @@ gh pr view <PR-N> --repo judgemind/judgemind \
   --jq '{mergeable, rollup: [.statusCheckRollup[] | {name, conclusion}]}'
 ```
 
-If `mergeable` is `MERGEABLE`, `ci-passed` is `SUCCESS`, and nothing is `FAILURE`, merge (stays on `gh` — MCP's `merge_pull_request` has no `--delete-branch` flag):
+If `mergeable` is `MERGEABLE`, `ci-passed` is `SUCCESS`, and nothing is `FAILURE`, merge via the `gh-pr-with-retry.sh` wrapper (#4527). The wrapper invokes `gh pr merge` first and falls back to `gh api -X PUT /repos/.../pulls/<N>/merge` on the explicit `GraphQL: API rate limit already exceeded` stderr marker, plus a follow-up `DELETE /repos/.../git/refs/heads/<head>` when `--delete-branch` is passed (mirroring the one-shot semantic of native `gh pr merge`). The two #4058 / #4231 fallbacks documented below are unchanged — they handle different failure modes (`base branch policy prohibits the merge` and `5xx / 504 Gateway Timeout`) that the wrapper does NOT auto-recover from:
 ```
-gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
+{worktree}/scripts/gh-pr-with-retry.sh merge <PR-N> --squash --delete-branch
 ```
 
 **Fallback — `gh pr merge` rejects with `base branch policy prohibits the merge` (#4058).**
