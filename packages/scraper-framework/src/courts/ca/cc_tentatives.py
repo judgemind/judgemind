@@ -2,7 +2,7 @@
 
 Scraper ID: ``ca-cc-tentatives``. Runs concurrently with ``ca-cc-tentatives-portal``
 during the Phase 2 dual-run period (#2610). Daily coverage diff is produced by
-``scripts/check-cc-dual-run-diff.py``.
+``scripts/cc-dual-run-diff.py``.
 
 Verified against live site 2026-03-11:
   URL:  https://retired.cc-courts.org/civil/motions-hearings-tentative.aspx

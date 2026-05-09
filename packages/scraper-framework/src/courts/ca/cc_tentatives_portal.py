@@ -2,7 +2,7 @@
 
 Scraper ID: ``ca-cc-tentatives-portal``. Runs concurrently with ``ca-cc-tentatives``
 during the Phase 2 dual-run period (#2610). Daily coverage diff is produced by
-``scripts/check-cc-dual-run-diff.py``.
+``scripts/cc-dual-run-diff.py``.
 
 This scraper targets the new Drupal-based portal at contracosta.courts.ca.gov,
 running in parallel with the legacy ``cc_tentatives.py`` scraper (which targets

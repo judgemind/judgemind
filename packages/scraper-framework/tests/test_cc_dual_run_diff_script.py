@@ -1,4 +1,4 @@
-"""Integration tests for scripts/check-cc-dual-run-diff.py.
+"""Integration tests for scripts/cc-dual-run-diff.py.
 
 Tests cover:
   - CLI argparse: date, json flag, exit-code semantics
@@ -28,7 +28,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
-ccdiff = import_module("check-cc-dual-run-diff")
+ccdiff = import_module("cc-dual-run-diff")
 
 # Grab the public symbols we test
 _parse_args = ccdiff._parse_args

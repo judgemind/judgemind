@@ -34,7 +34,7 @@ Usage:
     scripts/with-secret.sh \\
         -e DATABASE_URL=judgemind/dev/db/connection:.url \\
         -- packages/scraper-framework/.venv/bin/python3 \\
-        scripts/check-cc-dual-run-diff.py --date 2026-04-15
+        scripts/cc-dual-run-diff.py --date 2026-04-15
 
 Options:
     --date YYYY-MM-DD   Hearing date to compare (required).
@@ -81,10 +81,15 @@ from framework.dual_run_diff import (  # noqa: E402
     format_summary,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use the same structlog configuration as scripts/drain_splitter_carry_forward_clusters.py
+# so ``extra=`` fields passed to ``logger.info(...)`` calls surface in CloudWatch Logs
+# Insights output. ``stdlib_bridge=True`` routes stdlib ``logging.getLogger(__name__)``
+# calls through structlog's ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord
+# plus its extras as one event per line. The previous ``logging.basicConfig`` format
+# string silently dropped every ``extra=`` field — see #4368/#4373/#4400.
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
