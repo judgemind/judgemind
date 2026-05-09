@@ -15369,10 +15369,12 @@ class DispatcherDaemon:
         * **Green** (all SUCCESS/SKIPPED + ``mergeable=MERGEABLE`` +
           ``mergeStateStatus=CLEAN``) — merge with squash, transition
           ``phase='awaiting_deploy'``.
-        * **Red** (any FAILURE/CANCELLED/TIMED_OUT/ACTION_REQUIRED) —
-          spawn ``/task-v2-fix-ci``. Verdict PATCHED applies the patch
-          + pushes + stays in awaiting_ci with ``retries_used++``.
-          Verdicts BLOCKED / max-retries-exceeded mark failed.
+        * **Red** (any FAILURE/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE)
+          — spawn ``/task-v2-fix-ci``. Verdict PATCHED applies the
+          patch + pushes + stays in awaiting_ci with
+          ``retries_used++``. Verdicts BLOCKED / max-retries-exceeded
+          mark failed. ``CANCELLED`` is non-blocking (#4414) and does
+          NOT route here.
         """
         agent_id = agent["agent_id"]
         pr_number = agent["pr_number"]
@@ -16433,10 +16435,13 @@ class DispatcherDaemon:
         dicts — the daemon fills ``log_tail`` later via
         ``_fetch_job_log_tail``. Capped at ``FIX_CI_MAX_FAILING_JOBS``
         to bound the payload size handed to fix-ci.
+
+        ``CANCELLED`` is intentionally excluded (#4414) — it is
+        non-blocking per :data:`phase_transitions._CI_CANCELLED_CONCLUSIONS`
+        and not a failure to fix.
         """
         failure_conclusions = {
             "FAILURE",
-            "CANCELLED",
             "TIMED_OUT",
             "ACTION_REQUIRED",
             "STARTUP_FAILURE",

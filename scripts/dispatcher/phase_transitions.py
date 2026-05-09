@@ -995,8 +995,9 @@ def transition_from_awaiting_ci(
     * **Red / conflict** (``mergeStateStatus=DIRTY`` or
       ``mergeable=CONFLICTING``) — advance to ``fix_conflict``
       (#3431; code-side rebase required).
-    * **Red / CI failure** (any FAILURE/CANCELLED/TIMED_OUT/
-      ACTION_REQUIRED) — advance to ``fix_ci``.
+    * **Red / CI failure** (any FAILURE/TIMED_OUT/ACTION_REQUIRED/
+      STARTUP_FAILURE) — advance to ``fix_ci``. ``CANCELLED`` is
+      non-blocking (#4414) and does NOT route here.
     """
     state = _ci_rollup_state(pr_status)
     if state == "green":
@@ -1260,15 +1261,30 @@ def transition_from_retro(retro_succeeded: bool) -> PhaseTransition:
 # ---------------------------------------------------------------------------
 
 #: Check-run conclusions that count as red.
+#:
+#: ``CANCELLED`` is intentionally NOT in this set (#4414) — it
+#: classifies as non-blocking via :data:`_CI_CANCELLED_CONCLUSIONS`
+#: below. The canonical merge gate documented in
+#: ``docs/agent/code-standards.md`` §"Interpreting mergeStateStatus
+#: (UNSTABLE-but-green)" allows non-required ``CANCELLED`` checks
+#: (typical Vercel ``concurrency: cancel-in-progress`` pattern)
+#: without blocking merge. Same fix as #4407 / PR #4411 for
+#: ``scripts/wait-for-ci.sh``.
 _CI_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
     {
         "FAILURE",
-        "CANCELLED",
         "TIMED_OUT",
         "ACTION_REQUIRED",
         "STARTUP_FAILURE",
     }
 )
+
+#: Check-run conclusions that count as cancelled — non-blocking,
+#: skip-equivalent for the rollup classification (#4414). Vercel /
+#: smoke-test ``concurrency: cancel-in-progress`` cancels surface
+#: here when a newer push supersedes a deploy; treating them as red
+#: would loop the daemon into ``fix_ci`` on already-mergeable PRs.
+_CI_CANCELLED_CONCLUSIONS: frozenset[str] = frozenset({"CANCELLED"})
 
 #: Check-run conclusions that count as green.
 _CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
@@ -1303,9 +1319,11 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     Rules (short-circuit ordering):
 
     1. If any check has a RED outcome (CheckRun conclusion in
-       FAILURE / CANCELLED / TIMED_OUT / ACTION_REQUIRED /
-       STARTUP_FAILURE, or StatusContext state in FAILURE / ERROR)
-       → red.
+       FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE, or
+       StatusContext state in FAILURE / ERROR) → red. ``CANCELLED``
+       is NOT red — see :data:`_CI_CANCELLED_CONCLUSIONS` and
+       #4414 (typical Vercel ``concurrency: cancel-in-progress``
+       cancels are non-blocking).
     2. If any check is not yet complete (CheckRun status
        in_progress / queued / pending, or StatusContext state
        EXPECTED / PENDING) → pending.
@@ -1347,6 +1365,11 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
             if conclusion in _CI_FAILURE_CONCLUSIONS:
                 return "red"
             if conclusion in _CI_SUCCESS_CONCLUSIONS:
+                continue
+            if conclusion in _CI_CANCELLED_CONCLUSIONS:
+                # #4414 — Vercel ``concurrency: cancel-in-progress``
+                # and similar cancels are non-blocking; treat as
+                # skip-equivalent for the rollup classification.
                 continue
             # COMPLETED with an unrecognized conclusion — treat as
             # red rather than silently green.

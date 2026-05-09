@@ -1132,10 +1132,13 @@ def _extract_failing_jobs(pr_status: dict) -> list[dict]:
     """Mirror DispatcherDaemon._extract_failing_jobs (pre-log-tail).
 
     Returns up to ``FIX_CI_MAX_FAILING_JOBS`` entries.
+
+    ``CANCELLED`` is intentionally excluded (#4414) — it is
+    non-blocking per the canonical merge gate and not a failure to
+    fix. Matches ``DispatcherDaemon._extract_failing_jobs``.
     """
     failure_conclusions = {
         "FAILURE",
-        "CANCELLED",
         "TIMED_OUT",
         "ACTION_REQUIRED",
         "STARTUP_FAILURE",
@@ -4341,14 +4344,21 @@ classify_pr_rollup() {
                         else "pending" end
                   else
                       # CheckRun (default) — the pre-#3200 code path.
+                      # CANCELLED is non-blocking (#4414): typical Vercel
+                      # ``concurrency: cancel-in-progress`` cancels surface
+                      # here when a newer push supersedes a deploy. Treat
+                      # as skip-equivalent ("ok"), matching
+                      # phase_transitions._CI_CANCELLED_CONCLUSIONS and
+                      # scripts/wait-for-ci.sh (#4407).
                       (.status // "" | ascii_upcase) as $st
                       | (.conclusion // "" | ascii_upcase) as $co
                       | if $st == "COMPLETED" then
-                            if ($co == "FAILURE" or $co == "CANCELLED"
-                                or $co == "TIMED_OUT" or $co == "ACTION_REQUIRED"
+                            if ($co == "FAILURE" or $co == "TIMED_OUT"
+                                or $co == "ACTION_REQUIRED"
                                 or $co == "STARTUP_FAILURE") then "red"
                             elif ($co == "SUCCESS" or $co == "SKIPPED"
-                                  or $co == "NEUTRAL" or $co == "STALE") then "ok"
+                                  or $co == "NEUTRAL" or $co == "STALE"
+                                  or $co == "CANCELLED") then "ok"
                             else "red" end
                         else "pending" end
                   end]) as $outcomes

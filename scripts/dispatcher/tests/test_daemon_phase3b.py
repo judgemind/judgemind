@@ -382,7 +382,7 @@ class TestExtractFailingJobs:
             "statusCheckRollup": [
                 {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
                 {"status": "COMPLETED", "conclusion": "FAILURE", "name": "tests"},
-                {"status": "COMPLETED", "conclusion": "CANCELLED", "name": "build"},
+                {"status": "COMPLETED", "conclusion": "TIMED_OUT", "name": "build"},
             ]
         }
         failing = daemon.DispatcherDaemon._extract_failing_jobs(status)
@@ -390,6 +390,24 @@ class TestExtractFailingJobs:
         assert "tests" in names
         assert "build" in names
         assert "lint" not in names
+
+    def test_excludes_cancelled(self) -> None:
+        """#4414 — ``CANCELLED`` is non-blocking, not a failure to fix.
+
+        Vercel ``concurrency: cancel-in-progress`` cancels surface as
+        ``CANCELLED`` in the rollup; treating them as failures fed the
+        daemon into ``fix_ci`` retries on already-mergeable PRs.
+        """
+        status = {
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "FAILURE", "name": "tests"},
+                {"status": "COMPLETED", "conclusion": "CANCELLED", "name": "deploy"},
+            ]
+        }
+        failing = daemon.DispatcherDaemon._extract_failing_jobs(status)
+        names = [f["name"] for f in failing]
+        assert "tests" in names
+        assert "deploy" not in names
 
     def test_caps_at_max(self) -> None:
         status = {

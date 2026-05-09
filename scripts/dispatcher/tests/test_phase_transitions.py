@@ -324,13 +324,70 @@ class TestTransitionFromAwaitingCi:
         assert result.action == pt.TransitionAction.ADVANCE
         assert result.next_phase == pt.PHASE_FIX_CI
 
-    def test_cancelled_counts_as_red(self) -> None:
+    def test_cancelled_does_not_block_merge_gate(self) -> None:
+        """#4414 — ``CANCELLED`` is non-blocking (skip-equivalent).
+
+        Replaces the pre-#4414 ``test_cancelled_counts_as_red``: a
+        rollup with a single ``CANCELLED`` entry plus the canonical
+        green merge gate (``mergeable=MERGEABLE`` +
+        ``mergeStateStatus=CLEAN``) routes to ``merge``, not
+        ``fix_ci``. Matches ``scripts/wait-for-ci.sh`` after #4407 /
+        PR #4411 and the canonical gate documented in
+        ``docs/agent/code-standards.md`` §"Interpreting
+        mergeStateStatus (UNSTABLE-but-green)".
+        """
         status = self._make_status(
             [
                 {"status": "COMPLETED", "conclusion": "CANCELLED", "name": "test"},
             ]
         )
         result = pt.transition_from_awaiting_ci(status)
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_MERGE
+
+    def test_cancelled_with_green_ci_passed_returns_green(self) -> None:
+        """#4414 AC#1 — Vercel concurrency-cancel wedge.
+
+        The canonical wedge: a PR with one ``CANCELLED`` non-required
+        entry (e.g. ``Check major pages``) AND ``ci-passed: SUCCESS``
+        AND ``mergeable=MERGEABLE`` AND ``mergeStateStatus=CLEAN``
+        must classify as ``green`` from ``_ci_rollup_state``
+        (previously returned ``red`` and looped the daemon into
+        ``fix_ci`` until retry-cap exhaustion).
+        """
+        status = self._make_status(
+            [
+                {
+                    "status": "COMPLETED",
+                    "conclusion": "CANCELLED",
+                    "name": "Check major pages",
+                },
+                {
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "name": "ci-passed",
+                },
+            ]
+        )
+        assert pt._ci_rollup_state(status) == "green"
+
+    def test_real_failure_with_cancelled_still_routes_to_fix_ci(self) -> None:
+        """#4414 AC#3 — real failures still classify as red.
+
+        Defense-in-depth: a rollup with one ``CANCELLED`` AND one
+        real ``FAILURE`` must still route to ``fix_ci``. Splitting
+        ``CANCELLED`` out of ``_CI_FAILURE_CONCLUSIONS`` must not
+        accidentally suppress real failures that happen to
+        co-occur.
+        """
+        status = self._make_status(
+            [
+                {"status": "COMPLETED", "conclusion": "CANCELLED", "name": "deploy"},
+                {"status": "COMPLETED", "conclusion": "FAILURE", "name": "test"},
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.action == pt.TransitionAction.ADVANCE
         assert result.next_phase == pt.PHASE_FIX_CI
 
     def test_timed_out_counts_as_red(self) -> None:
