@@ -90,17 +90,18 @@ MOCKGH
 chmod +x "$MOCK_BIN_DIR/gh"
 
 exit_code=0
-output=$("$WRAPPER" 99999 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test2.err"
+output=$("$WRAPPER" 99999 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 1 ]]; then
     pass "exits 1 when no duplicate PR exists"
 else
-    fail "exits 1 when no duplicate PR exists" "expected exit 1, got $exit_code"
+    fail "exits 1 when no duplicate PR exists" "expected exit 1, got $exit_code stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 if [[ "$output" == *"ok"* ]]; then
     pass "prints ok line to stdout when no duplicate"
 else
-    fail "prints ok line to stdout when no duplicate" "expected stdout containing 'ok', got '$output'"
+    fail "prints ok line to stdout when no duplicate" "expected stdout containing 'ok', got '$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 3: exit 0 and prints duplicate line when a duplicate exists ────────
@@ -125,27 +126,29 @@ MOCKGH
 chmod +x "$MOCK_BIN_DIR/gh"
 
 exit_code=0
-output=$("$WRAPPER" 42 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test3.err"
+output=$("$WRAPPER" 42 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 0 ]]; then
     pass "exits 0 when a duplicate PR exists"
 else
-    fail "exits 0 when a duplicate PR exists" "expected exit 0, got $exit_code"
+    fail "exits 0 when a duplicate PR exists" "expected exit 0, got $exit_code stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 if [[ "$output" == *"duplicate:"* && "$output" == *"1234"* ]]; then
     pass "prints duplicate line with PR number to stdout"
 else
-    fail "prints duplicate line with PR number to stdout" "expected stdout containing 'duplicate:' and '1234', got '$output'"
+    fail "prints duplicate line with PR number to stdout" "expected stdout containing 'duplicate:' and '1234', got '$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 4: strips a leading '#' from the issue argument ───────────────────
 
 exit_code=0
-output=$("$WRAPPER" "#42" 2>/dev/null) || exit_code=$?
+err="$MOCK_BIN_DIR/test4.err"
+output=$("$WRAPPER" "#42" 2>"$err") || exit_code=$?
 if [[ "$exit_code" -eq 0 && "$output" == *"duplicate:"* && "$output" == *"1234"* ]]; then
     pass "strips leading '#' from the issue argument"
 else
-    fail "strips leading '#' from the issue argument" "exit=$exit_code output='$output'"
+    fail "strips leading '#' from the issue argument" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
 # ── Test 5: exit 2 when gh CLI call fails (API error) ──────────────────────

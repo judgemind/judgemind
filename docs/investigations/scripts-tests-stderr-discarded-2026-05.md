@@ -327,3 +327,29 @@ opportunistic migration as they're touched for other reasons; a
 wholesale sweep is still not worth it (the `fail` message + stdout
 remain a sufficient signal in most cases), but the upgrade is now
 mechanical.
+
+## Update — 2026-05-09: long-tail migration first chunk shipped (#4546)
+
+The first opportunistic chunk of the long-tail migration shipped as
+part of issue #4546. Migrated 10 sites across two test files using
+the hand-rolled `tail -n 50 "$err"` form (since both files define
+their own `pass`/`fail` and do not source `_test-helpers.sh`):
+
+* `scripts/tests/test_check_issue_plan_blocked.sh` — 7 sites
+  (Tests 3, 4, 5, 6, 7, 8, 9). Each `output=$("$WRAPPER" 1 2>/dev/null)`
+  now captures stderr to `$MOCK_BIN_DIR/test<N>.err` and the `fail`
+  message includes `stderr=$(tail -n 50 "$err" 2>/dev/null)`.
+* `scripts/tests/test_check_duplicate_pr.sh` — 3 sites (Tests 2, 3, 4).
+  Same pattern.
+
+The grep verification (`grep -rn -F '2>"$' scripts/tests/ | wc -l`)
+went from a baseline of 47 to 57 (+10 sites — well above the AC's
+required +5). Migrated tests still pass; baseline 3 unrelated
+failures (graphql-queries, cleanup-worktree-review-log-mirror,
+fleet-status-cooldown) are unchanged.
+
+The remaining ~50+ already-debuggable sites identified in the
+"Sites considered and intentionally NOT patched" section above
+remain unmigrated by design — the cost/benefit math says migrate
+opportunistically as those tests are touched, not in a wholesale
+sweep.
