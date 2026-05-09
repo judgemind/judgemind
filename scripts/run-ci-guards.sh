@@ -84,6 +84,19 @@
 #   0 — every applicable guard passed (or SKIP_CI_GUARDS=1 was set).
 #   1 — one or more guards failed.
 #   2 — usage / discovery error (e.g. invoked from outside the repo).
+#
+# Requires-argument hint (#4534)
+# ──────────────────────────────
+# When a guard fails with what looks like a "rejected blind invocation
+# because it needs arguments" pattern (exit 2 + stderr containing
+# "requires X argument" / "the following arguments are required" /
+# "one of the arguments ... is required" / `${1:?}`'s "parameter null
+# or not set"), the failure summary appends a copy-pasteable Fix block
+# naming the SKIP_LIST as the remedy. The proactive guard
+# `scripts/check-ci-guards-skip-list-coverage.sh` (#11a) catches most
+# of this class at hygiene-check time; the runtime hint is a backstop
+# for guards that ship before their SKIP_LIST entry lands or use
+# argument-shapes the meta-check does not yet detect.
 
 set -uo pipefail
 
@@ -289,6 +302,11 @@ echo "run-ci-guards: running ${#runnable[@]} guard(s) (${#skipped[@]} skipped)..
 
 failures=0
 failed_names=()
+# Names of failures that look like "requires-argument" — we surface a
+# dedicated SKIP_LIST Fix block in the summary so operators don't have to
+# grep this script to discover the remedy. See is_requires_argument_failure
+# below for the heuristic.
+requires_arg_failures=()
 
 # Empty-runnable guard: under bash 3.2 + set -u, iterating
 # ``"${runnable[@]}"`` when the array is empty trips ``unbound
@@ -298,6 +316,42 @@ if [ "${#runnable[@]}" -eq 0 ]; then
     echo "run-ci-guards: no runnable guard(s); nothing to do." >&2
     exit 0
 fi
+
+# is_requires_argument_failure <log_file> <rc> -> 0 if the failure looks
+# like the guard rejected a blind invocation because it requires an
+# argument the umbrella cannot supply, 1 otherwise.
+#
+# The proactive guard `scripts/check-ci-guards-skip-list-coverage.sh`
+# (#11a) catches most of this class at hygiene-check time by AST-walking
+# argparse / `${1:?}` shapes — but a brand-new guard pushed before its
+# row lands, or an exotic argparse shape the meta-check does not yet
+# detect, can still slip through to umbrella-runtime. When that happens,
+# the operator sees "FAILED: scripts/check-foo.sh (exit 2)" and has to
+# read this script to find SKIP_LIST. The Fix block in the summary saves
+# them that round-trip.
+#
+# Heuristic: rc must be 2 (the conventional argparse-style usage exit
+# code, also `${1:?}`'s exit code), AND the captured stderr must contain
+# one of the known "requires X" or "is required" patterns. We require
+# both signals together so a guard that legitimately exits 2 with an
+# unrelated message (e.g. a real source-code violation) does not mis-fire
+# the SKIP_LIST hint.
+is_requires_argument_failure() {
+    local log_file="$1"
+    local rc="$2"
+    [ "$rc" -eq 2 ] || return 1
+    # Match argparse "the following arguments are required:", custom
+    # "requires an issue number argument" / "requires a <X> argument",
+    # bash "${1:?usage}" parameter-substitution emission, and
+    # mutually-exclusive-group "one of the arguments ... is required".
+    grep -qiE \
+        -e 'requires (an? )?[a-z_-]+ (number )?argument' \
+        -e 'the following arguments are required' \
+        -e 'one of the arguments .* is required' \
+        -e ': parameter (null or )?not set' \
+        -e ': usage:' \
+        "$log_file" 2>/dev/null
+}
 
 for path in "${runnable[@]}"; do
     name="$(basename "$path")"
@@ -324,6 +378,9 @@ for path in "${runnable[@]}"; do
     if [ "$rc" -ne 0 ]; then
         failures=$((failures + 1))
         failed_names+=("$name")
+        if is_requires_argument_failure "$log_file" "$rc"; then
+            requires_arg_failures+=("$name")
+        fi
         echo "" >&2
         echo "  FAILED: $name (exit $rc)" >&2
         echo "  Last 20 lines of output:" >&2
@@ -346,6 +403,36 @@ if [ "$failures" -gt 0 ]; then
         for fname in "${failed_names[@]}"; do
             echo "  - $fname" >&2
         done
+    fi
+    # ────────────────────────────────────────────────────────────────
+    # Requires-argument SKIP_LIST hint (#4534)
+    # ────────────────────────────────────────────────────────────────
+    # When a failure looks like "guard rejected blind invocation
+    # because it needs arguments the umbrella cannot supply", surface
+    # the SKIP_LIST remedy as a copy-pasteable Fix block. Same Fix-block
+    # contract as the rest of the hygiene-guard fleet
+    # (docs/dx/check-script-fix-block-coverage.md / #4346).
+    if [ "${#requires_arg_failures[@]}" -gt 0 ]; then
+        echo "" >&2
+        echo "Fix: the guard(s) below appear to require an argument that the" >&2
+        echo "umbrella cannot supply blind. Add each one to SKIP_LIST in" >&2
+        echo "scripts/run-ci-guards.sh (alphabetical order), and add a row" >&2
+        echo "in docs/dx/check-script-fix-block-coverage.md naming the" >&2
+        echo "verdict (typically \"decision flow (no violation list)\")." >&2
+        echo "" >&2
+        echo "  SKIP_LIST=(" >&2
+        echo "      \"check-issue-author.sh\"" >&2
+        echo "      ..." >&2
+        for fname in "${requires_arg_failures[@]}"; do
+            echo "      \"$fname\"   # <-- insert here, alphabetical order" >&2
+        done
+        echo "  )" >&2
+        echo "" >&2
+        echo "If the guard is genuinely runnable blind from the local tree" >&2
+        echo "and the failure is a real violation, ignore this hint and fix" >&2
+        echo "the underlying issue instead. The hint fires on argparse-style" >&2
+        echo "exit-2 + \"requires/required\" stderr; a true violation that" >&2
+        echo "happens to use exit 2 will be a false positive." >&2
     fi
     echo "" >&2
     echo "Fix the issues above and re-run.  These are the same guards CI" >&2

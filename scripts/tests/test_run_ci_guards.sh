@@ -31,6 +31,13 @@
 #  11.  Built-in skip list (check-issue-verify-sql.py) — exits 0, listed
 #       as SKIP (#4372 regression — script requires --issue/--body-file
 #       and exits 2 with usage error when invoked blind).
+#  12.  Requires-argument SKIP_LIST hint — a stub guard that exits 2 with
+#       "requires an issue number argument" stderr triggers the
+#       copy-pasteable SKIP_LIST Fix block in the failure summary (#4534).
+#  13.  Requires-argument hint negative case — exit 2 with unrelated
+#       stderr does NOT trigger the SKIP_LIST hint (#4534).
+#  14.  Requires-argument hint covers argparse "the following arguments
+#       are required" shape (#4534).
 #
 # Run:
 #   scripts/tests/test_run_ci_guards.sh
@@ -367,6 +374,89 @@ if [ "$rc_buf" -ne 0 ]; then
     report_fail "check-issue-verify-sql.py ran despite skip-list (rc=$rc_buf, #4372)" "$out_buf"
 else
     report_pass "check-issue-verify-sql.py not invoked during full run (#4372)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 12: requires-argument SKIP_LIST hint — exit 2 + "requires an
+#               issue number argument" stderr triggers the copy-pasteable
+#               SKIP_LIST Fix block in the failure summary (#4534).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 12] requires-argument SKIP_LIST hint fires (#4534)"
+synth_scripts="$(seed_synthetic_scripts s12)"
+cat > "$synth_scripts/check-needs-issue-arg.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ERROR: this guard requires an issue number argument" >&2
+exit 2
+SH
+chmod +x "$synth_scripts/check-needs-issue-arg.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with failing requires-arg guard, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "Fix: the guard(s) below appear to require an argument"; then
+    report_fail "expected SKIP_LIST Fix block header in summary (#4534)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "SKIP_LIST=("; then
+    report_fail "expected SKIP_LIST array sketch in Fix block (#4534)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "\"check-needs-issue-arg.sh\""; then
+    report_fail "expected the offending guard name to appear inside SKIP_LIST" "$out_buf"
+elif ! echo "$out_buf" | grep -q "alphabetical order"; then
+    report_fail "expected 'alphabetical order' insertion guidance (#4534)" "$out_buf"
+else
+    report_pass "requires-argument SKIP_LIST hint fires with copy-pasteable Fix block (#4534)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 13: requires-argument hint negative case — exit 2 with
+#               unrelated stderr does NOT trigger the SKIP_LIST hint
+#               (#4534).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 13] requires-argument hint negative case (#4534)"
+synth_scripts="$(seed_synthetic_scripts s13)"
+cat > "$synth_scripts/check-real-violation.sh" <<'SH'
+#!/usr/bin/env bash
+# Simulates a hygiene guard that exits 2 with a real source-code
+# violation that has nothing to do with missing arguments.
+echo "FAIL: forbidden pattern detected at packages/foo/bar.py:42" >&2
+exit 2
+SH
+chmod +x "$synth_scripts/check-real-violation.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with failing guard, got $rc_buf" "$out_buf"
+elif echo "$out_buf" | grep -q "Fix: the guard(s) below appear to require an argument"; then
+    report_fail "SKIP_LIST hint mis-fired on unrelated exit-2 violation (#4534)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "FAILED: check-real-violation.sh"; then
+    report_fail "expected the failure to still surface in the summary" "$out_buf"
+else
+    report_pass "requires-argument hint correctly suppressed on unrelated exit-2 violation (#4534)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 14: requires-argument hint covers argparse "the following
+#               arguments are required" shape (#4534).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 14] requires-argument hint covers argparse shape (#4534)"
+synth_scripts="$(seed_synthetic_scripts s14)"
+cat > "$synth_scripts/check-argparse-required.py" <<'PY'
+import sys
+print(
+    "usage: check-argparse-required.py [-h] --issue ISSUE",
+    file=sys.stderr,
+)
+print(
+    "check-argparse-required.py: error: the following arguments are required: --issue",
+    file=sys.stderr,
+)
+sys.exit(2)
+PY
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with failing argparse guard, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "Fix: the guard(s) below appear to require an argument"; then
+    report_fail "expected SKIP_LIST hint to fire on argparse 'required' stderr (#4534)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "\"check-argparse-required.py\""; then
+    report_fail "expected the offending .py guard inside SKIP_LIST sketch" "$out_buf"
+else
+    report_pass "requires-argument hint covers argparse 'required' shape (#4534)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
