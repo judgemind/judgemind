@@ -101,33 +101,33 @@ while read -r worker_num branch worker_path; do
             issue_num="#${linked_issue}"
         fi
 
-        # CI status from statusCheckRollup
+        # CI status from statusCheckRollup. ``mergeable`` and
+        # ``mergeStateStatus`` are also fetched so the canonical
+        # classifier (scripts/dispatcher/ci_classifier_cli.py — #4417)
+        # can apply rules 3-4 (DIRTY ⇒ red, UNSTABLE ⇒ pending) and
+        # not just count individual check conclusions.
         ci_json=$(gh pr view "$pr_number" --repo judgemind/judgemind \
-            --json statusCheckRollup 2>/dev/null || echo "{}")
+            --json statusCheckRollup,mergeable,mergeStateStatus \
+            2>/dev/null || echo "{}")
 
-        # Determine overall CI status from individual check conclusions.
-        # CANCELLED is intentionally NOT counted as failure (#4414):
-        # typical Vercel ``concurrency: cancel-in-progress`` cancels
-        # surface there when a newer push supersedes a deploy, and the
-        # canonical merge gate documented in
-        # docs/agent/code-standards.md §"Interpreting mergeStateStatus"
-        # treats them as non-blocking. Matches
-        # phase_transitions._CI_CANCELLED_CONCLUSIONS and
-        # scripts/wait-for-ci.sh (#4407).
-        ci_status=$(echo "$ci_json" | awk '
-            BEGIN { has_checks = 0; has_pending = 0; has_failure = 0 }
-            /"conclusion"/ || /"status"/ {
-                has_checks = 1
-                if (/"FAILURE"/ || /"ERROR"/ || /"TIMED_OUT"/) has_failure = 1
-                if (/"PENDING"/ || /"IN_PROGRESS"/ || /"QUEUED"/) has_pending = 1
-            }
-            END {
-                if (!has_checks) print "pending"
-                else if (has_failure) print "failed"
-                else if (has_pending) print "running"
-                else print "green"
-            }
-        ')
+        # Single source of truth for "what counts as red / green /
+        # pending" — delegate to the canonical Python classifier.
+        # ``CANCELLED`` is non-blocking (#4414); ``STALE`` is treated
+        # as green (matches the agent-runner's pre-refactor jq).
+        # Pre-#4417 this was a bespoke awk regex that diverged from
+        # the Python rule on STALE handling and required parallel
+        # fixes for #4407 / #4414. Mapping: green→green, red→failed,
+        # pending→running, error→pending (treat unparseable rollup as
+        # transient rather than a hard failure).
+        ci_verdict=$(echo "$ci_json" \
+            | python3 "$REPO_ROOT/scripts/dispatcher/ci_classifier_cli.py" \
+            2>/dev/null || echo "error")
+        case "$ci_verdict" in
+            green) ci_status="green" ;;
+            red) ci_status="failed" ;;
+            pending) ci_status="running" ;;
+            *) ci_status="pending" ;;
+        esac
     else
         ci_status="No PR"
     fi

@@ -434,13 +434,28 @@ def main(argv: list[str]) -> int:
         for name in imports:
             import_to_files.setdefault(name, set()).add(path)
 
-    # 2. Filter out stdlib, internal, and __future__.
+    # 2. Compute the set of dispatcher-sibling top-level modules. Any
+    #    ``foo.py`` file directly inside ``source_dir`` exposes a
+    #    top-level module name ``foo`` that another sibling can
+    #    ``import foo`` (when invoked as a standalone script after a
+    #    sys.path push) without needing a pip install. Scripts like
+    #    ``ci_classifier_cli.py`` (#4417) use this pattern because
+    #    they're invoked via ``python3 path/to/script.py`` rather than
+    #    ``python -m scripts.dispatcher.script``.
+    sibling_modules: set[str] = set()
+    for entry in args.source_dir.glob("*.py"):
+        if entry.name.startswith("test_"):
+            continue
+        sibling_modules.add(entry.stem)
+
+    # 3. Filter out stdlib, internal, sibling, and __future__.
     stdlib = set(sys.stdlib_module_names)
     external_imports: dict[str, set[Path]] = {
         name: files
         for name, files in import_to_files.items()
         if name not in stdlib
         and name not in INTERNAL_TOPLEVEL_PACKAGES
+        and name not in sibling_modules
         and name != "__future__"
     }
 

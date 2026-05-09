@@ -109,6 +109,7 @@ from .phase_transitions import (  # noqa: E402
     FAILURE_HINT_RALPH_AC_INFEASIBLE,
     PHASE_FIX_CONFLICT,
     TransitionAction,
+    extract_failing_jobs as _shared_extract_failing_jobs,
     transition_from_awaiting_ci,
     transition_from_awaiting_deploy,
     transition_from_fix_ci,
@@ -16429,42 +16430,21 @@ class DispatcherDaemon:
 
     @staticmethod
     def _extract_failing_jobs(pr_status: dict[str, Any]) -> list[dict[str, Any]]:
-        """Pull the failing check-run entries out of the PR rollup.
+        """Delegate to :func:`phase_transitions.extract_failing_jobs` (#4417).
+
+        The canonical failure-conclusion vocabulary lives in
+        :data:`phase_transitions._CI_FAILURE_CONCLUSIONS` so this
+        method and the Fargate agent-runner's mirror in
+        ``agent-runner-entrypoint.sh`` classify identically. Pre-#4417
+        each spelled out its own ``failure_conclusions`` set; the
+        duplication bit twice on ``CANCELLED`` handling (#4407 / #4414).
 
         Returns a list of ``{name, conclusion, databaseId, detailsUrl}``
         dicts — the daemon fills ``log_tail`` later via
         ``_fetch_job_log_tail``. Capped at ``FIX_CI_MAX_FAILING_JOBS``
         to bound the payload size handed to fix-ci.
-
-        ``CANCELLED`` is intentionally excluded (#4414) — it is
-        non-blocking per :data:`phase_transitions._CI_CANCELLED_CONCLUSIONS`
-        and not a failure to fix.
         """
-        failure_conclusions = {
-            "FAILURE",
-            "TIMED_OUT",
-            "ACTION_REQUIRED",
-            "STARTUP_FAILURE",
-        }
-        rollup = pr_status.get("statusCheckRollup") or []
-        failing: list[dict[str, Any]] = []
-        for check in rollup:
-            if not isinstance(check, dict):
-                continue
-            conclusion = str(check.get("conclusion") or "").upper()
-            status = str(check.get("status") or "").upper()
-            if status == "COMPLETED" and conclusion in failure_conclusions:
-                failing.append(
-                    {
-                        "name": check.get("name") or check.get("context") or "",
-                        "conclusion": conclusion,
-                        "databaseId": check.get("databaseId"),
-                        "detailsUrl": check.get("detailsUrl"),
-                    }
-                )
-            if len(failing) >= FIX_CI_MAX_FAILING_JOBS:
-                break
-        return failing
+        return _shared_extract_failing_jobs(pr_status, max_jobs=FIX_CI_MAX_FAILING_JOBS)
 
     def _fetch_pr_diff(self, worktree: Path, pr_number: int) -> str:
         """Return the PR's full base-to-head diff, empty string on error."""
