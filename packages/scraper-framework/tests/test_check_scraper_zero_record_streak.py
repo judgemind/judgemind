@@ -289,6 +289,52 @@ class TestCheckZeroRecordStreaks:
 
 
 # ---------------------------------------------------------------------------
+# Module-level EXCLUSIONS regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestModuleExclusions:
+    """Lock the contents of the module-level ``EXCLUSIONS`` set.
+
+    Each entry in ``EXCLUSIONS`` permanently silences the silent-outage
+    guard for one scraper. Adding an entry without a tracked root-cause
+    follow-up is the failure mode this test class guards against — the
+    streak alert was originally added precisely so silently-zero scrapers
+    could not ride along undetected. See #4531 / #4539.
+    """
+
+    def test_excludes_dept_judges_rosters(self) -> None:
+        """Court directory / roster scrapers are zero-by-design — see EXCLUSIONS docstring."""
+        for sid in (
+            "ca-oc-dept-judges",
+            "ca-la-dept-judges",
+            "ca-fresno-dept-judges",
+            "ca-kern-dept-judges",
+            "ca-sd-dept-judges",
+            "ca-sb-dept-judges",
+            "ca-ventura-dept-judges",
+            "ca-sf-dept-judges",
+            "ca-riverside-dept-judges",
+        ):
+            assert sid in zrs.EXCLUSIONS, f"{sid} should remain in EXCLUSIONS"
+
+    def test_excludes_governor_appointments(self) -> None:
+        """Quarterly cadence — most runs legitimately return zero."""
+        assert "ca-governor-appointments" in zrs.EXCLUSIONS
+
+    def test_excludes_ca_sd_calendar_pending_4539(self) -> None:
+        """ca-sd-calendar is excluded as the structural day_numbers=[2] fix
+        in #4539 is pending. The entry MUST be removed once #4539 ships
+        (the day_numbers default flips to ``[1, 2, 3, 4, 5]`` and the
+        Friday-clustered motion calendar is captured on every run day).
+        See #4531 for the originating alert.
+        """
+        assert "ca-sd-calendar" in zrs.EXCLUSIONS, (
+            "ca-sd-calendar must remain in EXCLUSIONS until #4539 ships"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Formatting tests
 # ---------------------------------------------------------------------------
 
