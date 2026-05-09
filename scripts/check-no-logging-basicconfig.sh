@@ -76,9 +76,15 @@ ALLOW_MARKER='# basic-config-allow:'
 
 # ─── Files that legitimately mention the pattern as context ──────────────
 # The check script and its test must spell the pattern literally.
+# Peer guards from #4376 (the narrower basicConfig+extra= companion) also
+# need to spell the literal pattern in their docstrings/source — exclude
+# them here so this guard doesn't false-positive on its sibling.
 EXCLUDE_FILES=(
     "scripts/check-no-logging-basicconfig.sh"
+    "scripts/check-no-basicconfig-with-extra.sh"
+    "scripts/check_no_basicconfig_with_extra.py"
     "scripts/tests/test_check_no_logging_basicconfig.sh"
+    "scripts/tests/test_check_no_basicconfig_with_extra.sh"
 )
 
 # ─── Scan ────────────────────────────────────────────────────────────────
