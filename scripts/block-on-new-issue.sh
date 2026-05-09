@@ -160,11 +160,19 @@ fi
 
 # Build the gh issue create invocation.
 CREATE_ARGS=(issue create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE")
-for label in "${LABELS[@]}"; do
-    if [ -n "$label" ]; then
-        CREATE_ARGS+=(--label "$label")
-    fi
-done
+# bash 3.2 (macOS) trips ``unbound variable`` on ``"${LABELS[@]}"`` when
+# LABELS=() and no --label / --priority was supplied — the conditional
+# ``LABELS+=(...)`` inside the arg-parse loop is invisible to the static
+# `check-bash-set-u-empty-array.sh` linear scan. Length-guard the iteration
+# so the loop body is skipped when LABELS is still empty. Surfaced by
+# tests/test_block_on_new_issue.sh "I: happy path" (#4051 regression test).
+if [ "${#LABELS[@]}" -gt 0 ]; then
+    for label in "${LABELS[@]}"; do
+        if [ -n "$label" ]; then
+            CREATE_ARGS+=(--label "$label")
+        fi
+    done
+fi
 
 echo "Creating new tracker issue in $REPO..." >&2
 NEW_URL="$(gh "${CREATE_ARGS[@]}")"
