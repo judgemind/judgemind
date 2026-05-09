@@ -36,6 +36,8 @@ a package).
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -685,3 +687,391 @@ def test_probe_first_match_wins_when_multiple_siblings(probe_module):
     pr, sibling, _ = hit
     assert pr == 4345
     assert sibling == 4322
+
+
+# ─── #4523: extension-class suppression gate ──────────────────────────────
+
+
+def test_cited_issue_numbers_extracts_all(probe_module):
+    """``extract_cited_issue_numbers`` returns every ``#N`` reference (#4523).
+
+    Used by the extension-class suppression gate to identify candidate
+    PRs / siblings the current issue is asking the agent to extend.
+    """
+    body = (
+        "## Found by\n"
+        "\n"
+        "`/task` retrospective on issue #4519 (extending the lineage probe).\n"
+        "\n"
+        "## Description\n"
+        "\n"
+        "PR #4517 shipped the original. Sibling #4515 cited it. See also\n"
+        "#4304 for the parent retrospective.\n"
+    )
+    assert probe_module.extract_cited_issue_numbers(body) == {4304, 4515, 4517, 4519}
+
+
+def test_cited_issue_numbers_empty_body(probe_module):
+    """``extract_cited_issue_numbers`` returns empty set for empty body (#4523)."""
+    assert probe_module.extract_cited_issue_numbers("") == set()
+
+
+def test_cited_issue_numbers_no_hash_references(probe_module):
+    """Body without ``#N`` returns empty set (#4523)."""
+    body = "Some prose that mentions issue numbers like 4515 but never with a hash.\n"
+    assert probe_module.extract_cited_issue_numbers(body) == set()
+
+
+def test_is_extension_class_via_extend_keyword(probe_module):
+    """``is_extension_class`` returns True for ``extend`` titles (#4523).
+
+    The classifier reuses the audit-class verb list, which already
+    includes ``extend|extension``. An issue titled ``extend the lineage
+    probe`` matches without any classifier change.
+    """
+    title = "fix(dx): extend the lineage probe to recognize more idioms"
+    body = "Some body."
+    assert probe_module.is_extension_class(title, body) is True
+
+
+def test_is_extension_class_via_additional_keyword(probe_module):
+    """``is_extension_class`` returns True for ``additional`` (#4523)."""
+    title = "dx: additional patterns for foo"
+    body = ""
+    assert probe_module.is_extension_class(title, body) is True
+
+
+def test_is_extension_class_returns_false_for_non_audit(probe_module):
+    """``is_extension_class`` returns False for canonical non-audit titles (#4523)."""
+    title = "feat(api): expose new graphql resolver for caseDetail"
+    body = "Add the resolver and the corresponding schema entry."
+    assert probe_module.is_extension_class(title, body) is False
+
+
+def test_extension_class_suppresses_lineage(probe_module):
+    """Extension-class title + cited sibling → lineage match suppressed (#4523).
+
+    AC1: When the current issue's title classifies as extension-class
+    via ``is_audit_class()`` AND the lineage candidate's sibling number
+    (or candidate PR number) appears in the issue body's ``#N`` set,
+    ``probe()`` returns None instead of emitting ``shipped:``.
+
+    Setup:
+      - Title contains ``extend`` (extension-class)
+      - Body cites #4515 (the sibling) directly in prose
+      - Lineage walks #4304 → finds sibling #4515 → finds closing PR
+        #4517 → token overlap exists
+      - Gate fires because #4515 ∈ cited_numbers → continue
+      - No other candidates → return None
+    """
+    title = "fix(dx): extend the lineage probe to recognize extension-class issues"
+    issue_body = (
+        "## Description\n"
+        "\n"
+        "Extend `find_sibling_retrospectives` to handle the extension-class\n"
+        "case. Sibling #4515 already shipped the base implementation.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_body = (
+        "## Summary\n\nAdd `find_sibling_retrospectives` and friends.\n\nCloses #4515\n"
+    )
+    responses = {
+        ("search", "issues"): (0, '[{"number": 4515}]'),
+        ("issue", "view", "4515"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4517, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4517"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body,
+            repo="judgemind/judgemind",
+            current_issue=4519,
+            title=title,
+        )
+    # Suppression gate fires — no match emitted.
+    assert hit is None
+
+
+def test_reproduce_4519_false_positive(probe_module):
+    """Reproduces the exact #4519 ↔ PR #4517 ↔ sibling #4515 FP (#4523).
+
+    The reproducer recreates the situation that motivated #4523:
+
+      - #4519's title is ``extend the lineage probe to recognize more
+        idioms`` (extension-class via ``extend`` and ``additional``-shape
+        intent).
+      - #4519's body has ``Found by: retrospective on #4304`` and
+        cites both #4515 (the sibling) and #4517 (the candidate PR)
+        in prose.
+      - PR #4517 closed sibling #4515 and added
+        ``find_sibling_retrospectives``.
+      - Token overlap between #4519's body and PR #4517's body fires
+        on ``find_sibling_retrospectives``.
+
+    Pre-#4523, the probe emitted ``shipped: PR #4517 matches issue
+    #4519`` — a false positive that would have pivoted /task to a
+    bogus verify-and-close path. With the gate in place, the probe
+    returns None and the agent proceeds to do the work the issue
+    actually asked for.
+    """
+    title = "fix(dx): extend the lineage probe to recognize more idioms"
+    issue_body = (
+        "## Description\n"
+        "\n"
+        "`scripts/check-shipped-pr.sh` returned a false positive for issue\n"
+        "#4519: the lineage probe matched PR #4517 against #4519 because\n"
+        "of `find_sibling_retrospectives` overlap. Sibling #4515 is closed\n"
+        "by PR #4517. The probe walks #4515 → PR #4517 → emits `shipped`.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_4517_body = (
+        "## Summary\n"
+        "\n"
+        "Add the retrospective-lineage probe channel for\n"
+        "`check-shipped-pr.sh`. Introduces `find_sibling_retrospectives`\n"
+        "and `extract_lineage_parents`.\n"
+        "\n"
+        "Closes #4515\n"
+    )
+    responses = {
+        ("search", "issues"): (0, '[{"number": 4515}]'),
+        ("issue", "view", "4515"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4517, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4517"): (
+            0,
+            '{"body": '
+            + repr(pr_4517_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-07T12:00:00Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body,
+            repo="judgemind/judgemind",
+            current_issue=4519,
+            title=title,
+        )
+    assert hit is None, (
+        "Pre-#4523, this would emit shipped:4517 — extension-class gate "
+        "must suppress the FP."
+    )
+
+
+def test_extension_class_suppresses_when_pr_cited(probe_module):
+    """Suppression also fires when the candidate PR # is cited directly (#4523).
+
+    Variant of the AC1 case: the issue body cites the candidate PR (not
+    the sibling) by number. The gate suppresses based on either signal —
+    sibling-cited OR PR-cited — because either signal indicates the AC
+    author already knows about the prior work.
+    """
+    title = "refactor(dx): refactor the lineage probe"
+    issue_body = (
+        "Refactor `find_sibling_retrospectives` for clarity.\n"
+        "PR #4517 introduced the function originally.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_body = "Add `find_sibling_retrospectives` and friends.\n\nCloses #4322"
+    responses = {
+        # Sibling 4322 is NOT cited in body, but its closing PR (4517) IS.
+        ("search", "issues"): (0, '[{"number": 4322}]'),
+        ("issue", "view", "4322"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4517, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4517"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body,
+            repo="judgemind/judgemind",
+            current_issue=4520,
+            title=title,
+        )
+    # PR #4517 is cited in body → suppression fires.
+    assert hit is None
+
+
+def test_extension_class_does_not_suppress_when_neither_cited(probe_module):
+    """Extension-class title alone is not enough — must also cite (#4523).
+
+    Precision case: an extension-class title with an unrelated lineage
+    candidate (sibling not cited, PR not cited in body) should still
+    emit the match. The gate is conjunctive: extension-class AND
+    cited. A bare extension-class title without explicit prior-art
+    references doesn't indicate the author already knows about the
+    prior PR.
+    """
+    title = "refactor(scraper): refactor the URL parser"
+    issue_body = (
+        "Refactor the URL parser to extract `_DATACLASS_SCOPE` cleanly.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_body = "Updates `_DATACLASS_SCOPE` self-diagnosis.\n\nCloses #4322"
+    responses = {
+        # Neither sibling 4322 nor closing PR 4345 appears in issue body.
+        ("search", "issues"): (0, '[{"number": 4322}]'),
+        ("issue", "view", "4322"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4345, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4345"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body,
+            repo="judgemind/judgemind",
+            current_issue=4515,
+            title=title,
+        )
+    # Extension-class is True, but neither sibling 4322 nor PR 4345 is
+    # cited in the issue body → gate does NOT fire → match emits.
+    assert hit is not None
+    pr, sibling, _ = hit
+    assert pr == 4345
+    assert sibling == 4322
+
+
+def test_non_extension_class_match_unaffected(probe_module):
+    """Non-extension-class issues match exactly as before (#4523 regression).
+
+    Confirms the gate is a no-op on the canonical non-audit case. An
+    ordinary feature-add issue with retrospective lineage that overlaps
+    the candidate PR's body still matches — the gate only fires for
+    extension-class titles.
+    """
+    title = "feat(scraper): add new URL parser"
+    issue_body = (
+        "Add a new URL parser. Sibling #4322 covered the read path.\n"
+        "Update `_DATACLASS_SCOPE`.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_body = "Updates `_DATACLASS_SCOPE` self-diagnosis.\n\nCloses #4322"
+    responses = {
+        ("search", "issues"): (0, '[{"number": 4322}]'),
+        ("issue", "view", "4322"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4345, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4345"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body,
+            repo="judgemind/judgemind",
+            current_issue=4515,
+            title=title,
+        )
+    # Non-extension-class title → gate is a no-op → match emits.
+    assert hit is not None
+    pr, sibling, _ = hit
+    assert pr == 4345
+    assert sibling == 4322
+
+
+def test_probe_title_default_empty_preserves_compat(probe_module):
+    """Calling probe() without ``title=`` keeps pre-#4523 behavior.
+
+    Backwards compat: pre-#4523 callers (and the existing test suite)
+    invoke ``probe(body, repo=..., current_issue=...)`` without the
+    title kwarg. With the default ``title=""``, ``is_extension_class``
+    returns False (no audit keywords in empty title + canonical body)
+    and the gate is a no-op.
+    """
+    issue_body = "Update `_DATACLASS_SCOPE`.\n\nFound by: retrospective on #4304.\n"
+    pr_body = "Updates `_DATACLASS_SCOPE` self-diagnosis.\n\nCloses #4322"
+    responses = {
+        ("search", "issues"): (0, '[{"number": 4322}]'),
+        ("issue", "view", "4322"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4345, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4345"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body, repo="judgemind/judgemind", current_issue=4515
+        )
+    assert hit is not None
+    pr, sibling, _ = hit
+    assert pr == 4345
+    assert sibling == 4322
+
+
+def test_main_reads_title_from_stdin_envelope(probe_module, capsys, monkeypatch):
+    """``main()`` reads ``title`` from JSON stdin and applies the gate (#4523).
+
+    End-to-end probe of the ``main()`` entrypoint: the shell wrapper
+    pipes ``gh issue view --json body,title,createdAt`` JSON to the
+    probe; ``main()`` must parse the title and pass it to ``probe()``
+    so the extension-class gate can fire on real invocations.
+
+    Constructs the same #4519-shaped reproducer but exercises the
+    stdin / argv / env path rather than calling ``probe()`` directly.
+    """
+    title = "fix(dx): extend the lineage probe to recognize more idioms"
+    issue_body = (
+        "## Description\n"
+        "\n"
+        "PR #4517 introduced `find_sibling_retrospectives`. Sibling #4515.\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+    )
+    pr_body = "Add `find_sibling_retrospectives` and friends.\n\nCloses #4515"
+    envelope = {"title": title, "body": issue_body, "createdAt": "2026-05-09T13:00:00Z"}
+    responses = {
+        ("search", "issues"): (0, '[{"number": 4515}]'),
+        ("issue", "view", "4515"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4517, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4517"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-07T12:00:00Z", "baseRefName": "main"}',
+        ),
+    }
+    monkeypatch.setenv("CHECK_SHIPPED_LINEAGE_REPO", "judgemind/judgemind")
+    monkeypatch.setenv("CHECK_SHIPPED_LINEAGE_ISSUE", "4519")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(envelope)))
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        rc = probe_module.main()
+    captured = capsys.readouterr()
+    # Suppression fires → main() returns 1, no `shipped:` line emitted.
+    assert rc == 1
+    assert "shipped:" not in captured.out
