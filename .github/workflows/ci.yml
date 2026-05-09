@@ -1314,6 +1314,26 @@ jobs:
         run: scripts/check-test-script-imports-mapped.sh
 
   # ---------------------------------------------------------------
+  # Test-imports-resolvable guard (#4464, sibling of #4452): no
+  # test under packages/scraper-framework/tests/ may import a
+  # scripts/<name>.py module that has been archived (lives in
+  # scripts/archive/ or scripts/oneoff/) without explicitly
+  # injecting that subtree onto sys.path.  Without this guard,
+  # tests sit in the tree as silent dead weight — they fail
+  # collection in any environment that runs them, and only
+  # surface when an unrelated PR trips them (the #4459 back-catalog
+  # of 22 such tests).  Catches all four AST shapes:
+  # `import X`, `from X import Y`, `importlib.import_module("X")`,
+  # `importlib.util.spec_from_file_location("X", <path>)`.
+  # ---------------------------------------------------------------
+  test-script-imports-resolvable-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify test-imported scripts resolve to a live location
+        run: scripts/check-test-script-imports-resolvable.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded model guard: enforce model ID centralization
   # ---------------------------------------------------------------
   hardcoded-models-check:
@@ -2183,6 +2203,7 @@ jobs:
       - parse-document-reingest-safety-check
       - tests-use-reingest-helper-check
       - test-script-imports-mapped-check
+      - test-script-imports-resolvable-check
       - hardcoded-models-check
       - hardcoded-llm-provider-check
       - terraform-empty-resource-check

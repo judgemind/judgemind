@@ -51,10 +51,13 @@ What the check does
    The candidate <name> is a "real" import if it matches the stem
    (or full filename, for hyphen-named scripts) of an existing
    top-level ``scripts/*.py`` file.  Imports of archived /
-   nonexistent scripts (``scripts/archive/<name>.py``) are
-   intentionally ignored — those are a separate hygiene problem
-   (broken/skipped tests) and not in scope for the path-filter
-   mapping invariant.
+   nonexistent scripts (``scripts/archive/<name>.py``,
+   ``scripts/oneoff/<name>.py``) are intentionally ignored here
+   because the path-filter mapping invariant only applies to live
+   ``scripts/*.py``.  The orthogonal hygiene problem ("a test
+   imports a script that has been archived without explicit
+   intent") is covered by the sibling guard
+   ``scripts/check-test-script-imports-resolvable.sh`` (#4464).
 
 3. Determine the CI job that runs each test based on the explicit
    shard mapping below (mirrors the ``run:`` blocks in
