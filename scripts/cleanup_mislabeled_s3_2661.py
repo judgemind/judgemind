@@ -63,10 +63,14 @@ import boto3
 import psycopg
 from botocore.exceptions import ClientError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+from framework.logging import configure_structlog
+
+# Canonical stdout/CloudWatch logger pattern (#4368/#4373).  Routes
+# stdlib ``logging.getLogger(__name__)`` calls through structlog's
+# ProcessorFormatter + ExtraAdder so any ``extra=`` field reaches
+# CloudWatch Logs Insights as a structured JSON field — the legacy
+# ``logging.basicConfig(format=...)`` block drops them silently.
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

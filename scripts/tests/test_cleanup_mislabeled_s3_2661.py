@@ -36,6 +36,10 @@ _mock_psycopg = MagicMock()
 _mock_boto3 = MagicMock()
 _mock_botocore = MagicMock()
 _mock_botocore_exceptions = MagicMock()
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
+_mock_framework = MagicMock()
+_mock_framework_logging = MagicMock()
 
 
 # ClientError needs a real exception class so `except ClientError` works in
@@ -56,6 +60,9 @@ _modules_to_mock = {
     "boto3": _mock_boto3,
     "botocore": _mock_botocore,
     "botocore.exceptions": _mock_botocore_exceptions,
+    "structlog": _mock_structlog,
+    "framework": _mock_framework,
+    "framework.logging": _mock_framework_logging,
 }
 
 _saved_modules: dict[str, object] = {}
