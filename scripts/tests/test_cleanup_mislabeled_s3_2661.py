@@ -13,8 +13,10 @@ Tests cover:
 
 The script imports psycopg + boto3 at module level, which may not be
 installed in the CI scripts-tests environment. We mock those in
-sys.modules before importing the script under test, mirroring the
-pattern used by test_cleanup_riverside_case_prefixes.py.
+sys.modules before importing the script under test via the
+``mock_sys_modules`` context manager from ``_mock_helpers`` (#4430) —
+the helper restores ``sys.modules`` automatically on exit so the mocks
+do not leak into later test files in the same pytest process (#4426).
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ import pytest
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
 _mock_psycopg = MagicMock()
 _mock_boto3 = MagicMock()
@@ -55,33 +59,25 @@ class _FakeClientError(Exception):
 _mock_botocore_exceptions.ClientError = _FakeClientError
 _mock_botocore.exceptions = _mock_botocore_exceptions
 
-_modules_to_mock = {
-    "psycopg": _mock_psycopg,
-    "boto3": _mock_boto3,
-    "botocore": _mock_botocore,
-    "botocore.exceptions": _mock_botocore_exceptions,
-    "structlog": _mock_structlog,
-    "framework": _mock_framework,
-    "framework.logging": _mock_framework_logging,
-}
+with mock_sys_modules(
+    {
+        "psycopg": _mock_psycopg,
+        "boto3": _mock_boto3,
+        "botocore": _mock_botocore,
+        "botocore.exceptions": _mock_botocore_exceptions,
+        "structlog": _mock_structlog,
+        "framework": _mock_framework,
+        "framework.logging": _mock_framework_logging,
+    }
+):
+    import cleanup_mislabeled_s3_2661  # noqa: E402
 
-_saved_modules: dict[str, object] = {}
-for mod_name, mock_mod in _modules_to_mock.items():
-    if mod_name in sys.modules:
-        _saved_modules[mod_name] = sys.modules[mod_name]
-    sys.modules[mod_name] = mock_mod
-
-import cleanup_mislabeled_s3_2661  # noqa: E402
-
-# Restore sys.modules so the mock injection doesn't break other test files
-# that use @patch("boto3.client") (e.g. test_api_error_check.py). The cleanup
-# script's module-level boto3/psycopg bindings remain as mocks (captured at
-# import time), so tests in this file continue to work correctly.
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+# The script's module-level boto3/psycopg bindings remain as mocks
+# (captured at import time inside the context manager), so tests in
+# this file continue to work correctly. The ``mock_sys_modules``
+# helper has already restored sys.modules so other test files that
+# use @patch("boto3.client") (e.g. test_api_error_check.py) see the
+# real modules.
 
 parse_flat_hash_key = cleanup_mislabeled_s3_2661.parse_flat_hash_key
 is_mislabel = cleanup_mislabeled_s3_2661.is_mislabel
