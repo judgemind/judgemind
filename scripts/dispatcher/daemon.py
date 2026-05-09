@@ -881,6 +881,25 @@ TASK_SKILL_KIND = "task-skill"
 #: visible in ``gh issue view --json comments`` output.
 PLAN_BLOCKED_COMMENT_SENTINEL = "<!-- dispatcher-plan-blocked -->"
 
+#: Machine-readable recommendation footer embedded as the LAST line of
+#: the plan-blocked comment body. Issue #4438 stretch AC. Lets a future
+#: agent (``/task`` Step 4a.3, ``scripts/check-issue-plan-blocked.sh``)
+#: pattern-match the comment without parsing the prose block reason —
+#: the marker tells the agent "the plan-phase agent already concluded
+#: this issue needs operator triage, do NOT re-run ralph from scratch".
+#: The footer is parallel to :data:`PLAN_BLOCKED_COMMENT_SENTINEL` (the
+#: line-1 idempotence sentinel) — one marker on each end of the body
+#: gives consumers a stable detection target regardless of how the
+#: prose between them evolves. The recommendation token is fixed at
+#: ``operator-triage`` because the daemon's plan-blocked handler always
+#: hands the issue to the operator (the caller doesn't know whether the
+#: right action is close, re-scope, or block-on-other-work). Future
+#: extensions of the daemon can mint additional tokens (e.g.
+#: ``close-completed-no-pr``) by introducing parallel constants.
+PLAN_BLOCKED_RECOMMENDATION_FOOTER = (
+    "<!-- dispatcher-plan-blocked-recommendation: operator-triage -->"
+)
+
 #: Timeout for the ``gh issue view``/``gh issue comment``/``gh issue edit``
 #: subprocess calls used by the plan_blocked handler. Tight enough that
 #: a hung GitHub request can't stall the scheduler tick for multiple
@@ -11247,7 +11266,8 @@ class DispatcherDaemon:
     def _render_plan_blocked_comment(self, agent_id: str, block_reason: str) -> str:
         """Render the plan-blocked issue comment body.
 
-        Shape (sentinel MUST be line 1 — see issue #2857 AC2):
+        Shape (sentinel MUST be line 1 — see issue #2857 AC2; footer
+        MUST be the last non-empty line — see issue #4438 stretch AC):
 
             <!-- dispatcher-plan-blocked -->
             ## Plan phase output — `go=false` (autonomous dispatcher run <ISO-8601>)
@@ -11257,11 +11277,18 @@ class DispatcherDaemon:
             > <block_reason, each line prefixed with `> `>
 
             Moving this out of `agent/ready` pending operator triage. Agent: `<short>`.
+            <!-- dispatcher-plan-blocked-recommendation: operator-triage -->
 
         The block_reason is rendered as a markdown blockquote. Each
         line is prefixed with ``> `` so multi-line reasons stay valid
         blockquote markup. Empty lines inside the reason become ``>`` to
         keep the blockquote from breaking at the first blank line.
+
+        The footer is a parallel HTML-comment marker that lets future
+        agents (``/task`` Step 4a.3,
+        ``scripts/check-issue-plan-blocked.sh``) detect that an
+        operator-triage recommendation is in flight without parsing the
+        prose. See :data:`PLAN_BLOCKED_RECOMMENDATION_FOOTER`.
         """
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -11284,6 +11311,8 @@ class DispatcherDaemon:
             f"\n"
             f"Moving this out of `agent/ready` pending operator triage. "
             f"Agent: `{short_id}`.\n"
+            f"\n"
+            f"{PLAN_BLOCKED_RECOMMENDATION_FOOTER}\n"
         )
 
     def _post_plan_blocked_comment(
