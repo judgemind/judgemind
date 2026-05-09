@@ -48,6 +48,16 @@ jobs:
             scraper:
               - 'packages/scraper-framework/**'
               - 'packages/judgemind-config/**'
+              # Top-level scripts/*.py imported by tests in the
+              # ingestion-tests job (test_reingest_from_s3.py,
+              # test_reingest_registry.py).  Without these entries a PR
+              # that only modifies the script skips ingestion-tests
+              # entirely — the slip-through that produced #4449 (PR
+              # #4421 modified scripts/reingest_from_s3.py only, the
+              # KeyError regression hid for ~2 weeks until the next
+              # unrelated scraper PR surfaced it).  See #4452 and the
+              # check-test-script-imports-mapped guard wired below.
+              - 'scripts/reingest_from_s3.py'
             scraper-framework:
               - 'packages/scraper-framework/src/framework/**'
               - 'packages/scraper-framework/src/ingestion/**'
@@ -55,6 +65,21 @@ jobs:
               - 'packages/scraper-framework/tests/**'
               - 'packages/scraper-framework/pyproject.toml'
               - 'packages/judgemind-config/**'
+              # Top-level scripts/*.py imported by tests in the
+              # scraper-framework-tests job.  Without these entries a
+              # PR that only modifies the script skips
+              # scraper-framework-tests entirely — same slip-through
+              # shape as the ingestion-tests case (#4449).  Kept
+              # in sync with the imports in
+              # packages/scraper-framework/tests/**.py by
+              # scripts/check-test-script-imports-mapped.sh.  See #4452.
+              - 'scripts/audit_oc_ruling_integrity.py'
+              - 'scripts/backfill_llm_enrichment.py'
+              - 'scripts/check-scraper-registry.py'
+              - 'scripts/check_tests_use_reingest_helper.py'
+              - 'scripts/dq_trend_storage.py'
+              - 'scripts/rebuild_db.py'
+              - 'scripts/reingest_from_s3.py'
             scraper-courts:
               - 'packages/scraper-framework/src/courts/**'
               - 'packages/scraper-framework/tests/courts/**'
@@ -1274,6 +1299,21 @@ jobs:
         run: scripts/check-tests-use-reingest-helper.sh
 
   # ---------------------------------------------------------------
+  # Test-imports-script-mapping guard (#4452): every top-level
+  # scripts/*.py imported by a test under
+  # packages/scraper-framework/tests/ must be in the path filter
+  # that gates the CI job which runs that test.  Without this,
+  # PRs that modify only the imported script skip the test job
+  # entirely — the slip-through that produced #4449.
+  # ---------------------------------------------------------------
+  test-script-imports-mapped-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify test-imported scripts are in CI path filters
+        run: scripts/check-test-script-imports-mapped.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded model guard: enforce model ID centralization
   # ---------------------------------------------------------------
   hardcoded-models-check:
@@ -2103,6 +2143,7 @@ jobs:
       - deploy-workflow-rollout-check
       - parse-document-reingest-safety-check
       - tests-use-reingest-helper-check
+      - test-script-imports-mapped-check
       - hardcoded-models-check
       - terraform-empty-resource-check
       - terraform-ecs-entrypoint-check
