@@ -63,6 +63,15 @@ PATH_REGEX = re.compile(r"(?:scripts/|packages/|docs/|infra/|\.github/)[^\s\]\)`
 # often follows an inline file reference but is not part of the path).
 TRAILING_STRIP = ".,:;"
 
+# Strip a trailing line-range suffix like ``:47`` or ``:47-62`` from a hit
+# (#4462). Issue bodies frequently cite a file with a line range to point
+# at a specific block — e.g. ``packages/foo/bar.py:132-141`` — but the
+# downstream ``gh api /repos/.../commits?path=<path>`` query rejects line
+# ranges. Stripping the suffix collapses ``foo.py:132-141`` and ``foo.py``
+# into a single deduped path so the overlap helper sees one canonical
+# candidate.
+LINE_RANGE_SUFFIX_RE = re.compile(r":[0-9]+(?:-[0-9]+)?$")
+
 # Search-context detector. A line is search-context if it carries a
 # ``Verify:`` marker OR a shell-invocation verb followed by a space.
 # The verbs listed cover the conventional shapes the AC author uses to
@@ -156,6 +165,14 @@ def _path_hits_per_line(line: str) -> list[str]:
         # Strip trailing punctuation
         while path and path[-1] in TRAILING_STRIP:
             path = path[:-1]
+        # Strip trailing line-range suffix (#4462). Run AFTER the
+        # punctuation strip so a cite like ``foo.py:47-62.`` (with a
+        # trailing sentence period) loses the ``.`` first, then loses
+        # the ``:47-62``. A second punctuation pass after the line-
+        # range strip is unnecessary because ``LINE_RANGE_SUFFIX_RE``
+        # is anchored at end-of-string and does not consume trailing
+        # punctuation.
+        path = LINE_RANGE_SUFFIX_RE.sub("", path)
         if "*" in path or "?" in path:
             continue
         if path.endswith("/"):
