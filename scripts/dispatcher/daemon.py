@@ -104,6 +104,7 @@ if TYPE_CHECKING:  # pragma: no cover — types only
 # ``scripts/check-dispatcher-image-deps.py`` CI guard flags as a
 # missing pip dep (the fallback top-level ``dispatcher`` is not a pip
 # package — it is a sibling module).
+from .parent_issue import parse_parent_issue as _shared_parse_parent_issue  # noqa: E402
 from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
 from .phase_transitions import (  # noqa: E402
     FAILURE_HINT_RALPH_AC_INFEASIBLE,
@@ -7553,11 +7554,15 @@ class DispatcherDaemon:
 
     @staticmethod
     def _parse_parent_issue(body: str) -> int | None:
-        """Extract the first ``Parent: #N`` reference, or None."""
-        import re  # noqa: PLC0415
+        """Extract the first ``Parent: #N`` reference, or None.
 
-        match = re.search(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$", body)
-        return int(match.group(1)) if match else None
+        Thin shim around :func:`scripts.dispatcher.parent_issue.parse_parent_issue`.
+        Kept as a static method on ``DispatcherDaemon`` so the existing call
+        sites (``daemon.py:7323`` and ``test_daemon_phase3a.py``'s
+        ``TestParseParentIssue``) keep working unchanged. The regex itself
+        lives in :mod:`scripts.dispatcher.parent_issue` — see #4508.
+        """
+        return _shared_parse_parent_issue(body)
 
     def _phase_io_root(self, worktree: Path, phase: str) -> Path:
         """Return the filesystem root that the phase subprocess will treat as cwd.

@@ -775,10 +775,11 @@ def _parse_blocked_by(body: str) -> list[int]:
     return [int(m) for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)]
 
 
-def _parse_parent_issue(body):
-    """Mirror DispatcherDaemon._parse_parent_issue."""
-    match = re.search(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$", body)
-    return int(match.group(1)) if match else None
+# Import the canonical Parent: #N parser. The sys.path setup above
+# already inserted /app/scripts/dispatcher (or REPO_ROOT/scripts/dispatcher
+# in tests) so ``parent_issue`` resolves as a sibling module. This is the
+# single source of truth for the regex — see #4508.
+from parent_issue import parse_parent_issue as _parse_parent_issue  # noqa: E402
 
 
 def _extract_acceptance_criteria(body: str) -> list[str]:

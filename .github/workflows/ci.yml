@@ -1780,6 +1780,27 @@ jobs:
         run: scripts/check-no-duplicate-framework-helpers.sh
 
   # ---------------------------------------------------------------
+  # Duplicate parent-issue regex guard: forbid copies of the canonical
+  # ``Parent: #N`` regex outside scripts/dispatcher/parent_issue.py
+  # (#4508). Prior to extraction the regex lived in three places
+  # (daemon.py, agent-runner-entrypoint.sh, _sweep_completed_parents.py);
+  # this guard prevents future re-introductions. Files that legitimately
+  # need a local copy opt out via the
+  # ``# allow-duplicate-parent-regex: <issue-or-PR>`` marker. The step
+  # name below intentionally avoids quoting the forbidden token (per
+  # docs/agent/code-standards.md §Hygiene-check CI steps and
+  # #2541/#2542).
+  # ---------------------------------------------------------------
+  duplicate-parent-regex-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Forbid copies of the canonical Parent issue regex outside its home
+        run: scripts/check-no-duplicate-parent-regex.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot repo-path guard: flag scripts that use REPO_ROOT
   # without a validated fallback for when the repo is unavailable (#1277)
   # ---------------------------------------------------------------
@@ -2226,6 +2247,7 @@ jobs:
       - no-basicconfig-with-extra-check
       - no-manual-sys-modules-mock-check
       - duplicate-framework-helpers-check
+      - duplicate-parent-regex-check
       - oneshot-repo-paths-check
       - duplicate-functions-check
       - test-except-pass-check

@@ -10,7 +10,8 @@ Algorithm
 1. Read ``CHILDREN_FILE`` — a JSON array of {number, state, closedAt, body}
    produced by ``gh issue list --search 'in:body "Parent: #"' --state all``.
 2. For each child, parse the canonical ``Parent: #<N>`` line out of its
-   body (regex shared with daemon's ``_parse_parent_issue``).
+   body via :func:`scripts.dispatcher.parent_issue.parse_parent_issue`
+   (shared single source of truth — see #4508).
 3. Group children by parent number. The PARENT SET is the unique set of
    parent numbers extracted in step 2.
 4. For each candidate parent:
@@ -40,16 +41,24 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# Canonical regex for the ``Parent: #N`` body reference. Matches the daemon's
-# ``DispatcherDaemon._parse_parent_issue`` (#3 of dispatcher/daemon.py:7559).
-_PARENT_RE = re.compile(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$")
+# Make the canonical Parent: #N regex helper importable when this script
+# runs directly (``python3 scripts/_sweep_completed_parents.py``). The
+# helper lives at ``scripts/dispatcher/parent_issue.py`` and is the
+# single source of truth — see #4508. CI's pytest run already has
+# ``PYTHONPATH=scripts`` so the import would resolve there too, but the
+# direct-invocation path needs an explicit insert.
+_DISPATCHER_DIR = Path(__file__).resolve().parent / "dispatcher"
+if str(_DISPATCHER_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(_DISPATCHER_DIR.parent))
+
+from dispatcher.parent_issue import parse_parent_issue  # noqa: E402
 
 # Bot-author logins whose comments are filtered out of the
 # "comments-since-last-child-closed" check. A trailing ``[bot]`` segment is
@@ -116,9 +125,13 @@ def _is_bot_author(login: str | None) -> bool:
 
 
 def parse_parent_number(body: str) -> int | None:
-    """Extract the first ``Parent: #N`` reference from an issue body."""
-    match = _PARENT_RE.search(body or "")
-    return int(match.group(1)) if match else None
+    """Backwards-compatible alias for :func:`parse_parent_issue`.
+
+    The legacy name is retained because :mod:`scripts.tests.test_sweep_completed_parents`
+    imports it. The implementation lives in
+    :mod:`scripts.dispatcher.parent_issue` — see #4508.
+    """
+    return parse_parent_issue(body)
 
 
 def group_children_by_parent(
@@ -128,7 +141,7 @@ def group_children_by_parent(
     grouped: dict[int, list[_Child]] = defaultdict(list)
     for entry in children:
         body = entry.get("body") or ""
-        parent = parse_parent_number(body)
+        parent = parse_parent_issue(body)
         if parent is None:
             continue
         grouped[parent].append(
