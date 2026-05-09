@@ -586,8 +586,12 @@ class CourtListenerScraper(BaseScraper):
 
         # Extract court identifier — prefer the resolved docket sub-resource
         # because cluster.court is empty in every CourtListener API response
-        # we capture today (#4247).  Fall back to cluster.court for
-        # backward compatibility with old envelopes / future API shapes.
+        # we capture today (#4247).  ``_resolve_court_id`` reads
+        # ``docket.court_id`` (the bare short-id) first, then parses the URL
+        # form in ``docket.court`` -- which contains a ``?format=json``
+        # query string and previously produced ``?format=json`` as the
+        # court id (#4310).  Falls back to cluster fields for backward
+        # compatibility with old envelopes / future API shapes.
         court_id = _resolve_court_id(cluster, docket)
 
         # Resolve jurisdiction from court_id mapping.
@@ -644,33 +648,55 @@ def _resolve_court_id(
 ) -> str:
     """Resolve the CourtListener court short-id from a cluster + docket pair.
 
-    Resolution order (#4247):
-      1. ``docket.court`` if the docket sub-resource is present and the field is truthy.
-      2. ``cluster.court`` as backward-compat fallback.
+    Resolution order (#4247, expanded by #4310):
+      1. ``docket.court_id`` -- the canonical bare short-id on the resolved docket.
+      2. ``docket.court`` -- a URL pointing at the court resource, parsed for the short-id.
+      3. ``cluster.court_id`` -- fallback for envelopes lacking a docket sub-resource.
+      4. ``cluster.court`` -- backward-compat fallback (typically empty in real responses).
 
-    The "court" field is typically a URL path like ``/api/rest/v4/courts/scotus/``;
-    the short-id is extracted from the last path segment.  Bare short-ids
-    (no slashes) are returned verbatim.
+    On real CourtListener responses, ``docket.court`` is a full URL with a
+    query string -- e.g. ``https://www.courtlistener.com/api/rest/v4/courts/dcd/?format=json``
+    -- not the relative path ``/api/rest/v4/courts/dcd/`` the previous parser
+    expected. The previous implementation produced ``?format=json`` as the
+    "court id" for every doc and every CourtListener capture landed in
+    ``(Unknown, Unknown)`` jurisdiction (#4310). Reading ``docket.court_id``
+    directly avoids URL parsing entirely; the URL-parser path remains as a
+    fallback for older responses that omit ``court_id``.
 
-    Returns an empty string when neither source has a usable reference.
+    The "court" URL parser:
+      * strips any ``?...`` query string before splitting,
+      * handles trailing-slash and no-trailing-slash variants,
+      * returns the bare short-id (last path segment).
+
+    Bare short-ids (no slashes) are returned verbatim, which matches what
+    ``court_id`` already returns on most modern responses.
+
+    Returns an empty string when no source has a usable reference.
     The caller decides what to do on empty (today: fall back to config defaults).
 
     Why docket-first: ``cluster.court`` is empty in every CourtListener API
     response we capture today, so reading it first produces Federal/Federal
-    misclassification on every doc.  ``docket.court`` is reliably populated
-    on the resolved docket sub-resource.
+    misclassification on every doc. The docket sub-resource is reliably
+    populated.
     """
     candidates: list[str] = []
     if docket:
+        # Prefer the bare short-id when available; the URL form is a fallback.
+        candidates.append(str(docket.get("court_id") or ""))
         candidates.append(str(docket.get("court") or ""))
+    candidates.append(str(cluster.get("court_id") or ""))
     candidates.append(str(cluster.get("court") or ""))
     for raw in candidates:
         if not raw:
             continue
-        if "/" in raw:
-            parts = raw.rstrip("/").split("/")
+        # Strip any ?... query string before path-splitting -- real responses
+        # ship URLs like ``.../courts/dcd/?format=json`` and the previous
+        # implementation emitted ``?format=json`` as the court id (#4310).
+        without_query = raw.split("?", 1)[0]
+        if "/" in without_query:
+            parts = without_query.rstrip("/").split("/")
             return parts[-1] if parts and parts[-1] else raw
-        return raw
+        return without_query
     return ""
 
 

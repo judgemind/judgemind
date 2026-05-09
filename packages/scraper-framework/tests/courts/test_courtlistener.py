@@ -536,6 +536,49 @@ class TestDataMapping:
         assert _resolve_court_id({"court": ""}, {"court": "texapp14"}) == "texapp14"
         assert _resolve_court_id({"court": "scotus"}, None) == "scotus"
 
+    def test_resolve_court_id_handles_full_url_with_query_string(self) -> None:
+        """Regression for #4310: docket.court is a full URL with ?format=json
+        query string (e.g. ``https://www.courtlistener.com/api/rest/v4/courts/dcd/?format=json``).
+
+        The previous implementation split the raw URL on ``/`` and took the last
+        segment, which produced ``?format=json`` — every CourtListener doc landed
+        in ``(Unknown, Unknown)`` jurisdiction.
+
+        The fix must extract ``dcd`` (the court short-id) from the URL even
+        when a query string is present.
+        """
+        cluster = {"court": None}
+        docket = {"court": "https://www.courtlistener.com/api/rest/v4/courts/dcd/?format=json"}
+        assert _resolve_court_id(cluster, docket) == "dcd"
+
+    def test_resolve_court_id_prefers_docket_court_id_short_form(self) -> None:
+        """#4310: docket.court_id is the canonical bare short-id, prefer it
+        over the URL form in docket.court when both are present.
+
+        On real CourtListener responses, ``docket.court`` is the URL
+        ``https://www.courtlistener.com/api/rest/v4/courts/dcd/?format=json``
+        and ``docket.court_id`` is the bare short-id ``"dcd"``. Reading
+        ``court_id`` directly avoids URL parsing entirely.
+        """
+        cluster = {"court": None}
+        docket = {
+            "court": "https://www.courtlistener.com/api/rest/v4/courts/dcd/?format=json",
+            "court_id": "dcd",
+        }
+        assert _resolve_court_id(cluster, docket) == "dcd"
+
+    def test_resolve_court_id_handles_full_url_without_trailing_slash(self) -> None:
+        """Belt-and-suspenders: a URL that omits the trailing slash before
+        the query string still yields the right short-id."""
+        cluster = {"court": None}
+        docket = {"court": "https://www.courtlistener.com/api/rest/v4/courts/scotus?format=json"}
+        assert _resolve_court_id(cluster, docket) == "scotus"
+
+    def test_resolve_court_id_falls_back_to_cluster_court_id(self) -> None:
+        """When docket is absent, cluster.court_id is preferred over cluster.court."""
+        cluster = {"court": None, "court_id": "ca9"}
+        assert _resolve_court_id(cluster, None) == "ca9"
+
     def test_extract_docket_number(self) -> None:
         """Extract docket number from cluster."""
         cluster = _make_cluster(docket_number="22-1234")
