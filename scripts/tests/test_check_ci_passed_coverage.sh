@@ -129,6 +129,120 @@ jobs:
 EOF
 }
 
+# Fixture E — block-list form of ci-passed.needs: (one job per line). This
+# is the canonical shape per #4444 — adjacent guard-adding PRs land on
+# separate lines so non-adjacent insertions auto-merge cleanly. The parser
+# in check-ci-passed-coverage.py must accept BOTH the inline `needs: [...]`
+# form (Fixtures A/B/C/D) and this block-list form. All jobs covered →
+# must exit 0.
+write_fixture_block_list() {
+    cat > "$TMPDIR_TEST/.github/workflows/ci.yml" <<'EOF'
+name: CI
+on:
+  push:
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo detecting
+
+  scripts-tests:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+
+  extra-job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo extra
+
+  ci-passed:
+    needs:
+      - scripts-tests
+      - extra-job
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed or were skipped
+        run: echo ok
+EOF
+}
+
+# Fixture F — block-list form with a missing job. extra-job is defined as
+# a top-level job but is NOT in the block-list needs:. The parser must
+# detect the missing entry exactly as it does for the inline form.
+write_fixture_block_list_missing() {
+    cat > "$TMPDIR_TEST/.github/workflows/ci.yml" <<'EOF'
+name: CI
+on:
+  push:
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo detecting
+
+  scripts-tests:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+
+  extra-job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo extra
+
+  ci-passed:
+    needs:
+      - scripts-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed or were skipped
+        run: echo ok
+EOF
+}
+
+# Fixture G — block-list form with a stale entry. The block lists a job
+# name that no longer exists at the top level. Direction-2 detection must
+# work for the block form too.
+write_fixture_block_list_stale() {
+    cat > "$TMPDIR_TEST/.github/workflows/ci.yml" <<'EOF'
+name: CI
+on:
+  push:
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo detecting
+
+  scripts-tests:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+
+  bare-shadcn-accent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo accent
+
+  ci-passed:
+    needs:
+      - scripts-tests
+      - admin-dispatcher-brand-accent-check
+      - bare-shadcn-accent-check
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed or were skipped
+        run: echo ok
+EOF
+}
+
 # Fixture D — both directions wrong: scripts-tests is missing AND
 # admin-dispatcher-brand-accent-check is stale. The script must report
 # both failure modes in a single run.
@@ -255,7 +369,25 @@ assert_fails_with \
     "both missing and stale are reported in a single run (stale message)" \
     "do not correspond to any top-level job"
 
-# ─── Test 6: docstring documents both directions (#4207) ─────────────────────
+# ─── Test 6: block-list form of ci-passed.needs: passes (#4444) ──────────────
+# The canonical shape after #4444 is one job per line under `needs:`.
+# The parser must accept this form exactly the same as the inline form.
+write_fixture_block_list
+assert_passes "block-list form of ci-passed.needs: is parsed and passes"
+
+# ─── Test 6b: block-list form with missing job is flagged (#4444) ────────────
+write_fixture_block_list_missing
+assert_fails_with \
+    "block-list form: missing job is flagged" \
+    "extra-job"
+
+# ─── Test 6c: block-list form with stale entry is flagged (#4444) ────────────
+write_fixture_block_list_stale
+assert_fails_with \
+    "block-list form: stale entry is flagged" \
+    "admin-dispatcher-brand-accent-check"
+
+# ─── Test 7: docstring documents both directions (#4207) ─────────────────────
 TESTS=$((TESTS + 1))
 header=$(head -60 "$CHECK_SCRIPT")
 if grep -qE 'stale|removed|renamed|nonexistent' <<<"$header"; then
@@ -265,7 +397,7 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-# ─── Test 7: help flag works ──────────────────────────────────────────────────
+# ─── Test 8: help flag works ──────────────────────────────────────────────────
 TESTS=$((TESTS + 1))
 if python3 "$CHECK_SCRIPT" --help 2>&1 | grep -q "ci-passed"; then
     echo "PASS: --help describes the script"
