@@ -220,9 +220,24 @@ def emit_violation(path: Path, uses: list[tuple[int, str]]) -> None:
     )
     print("    3. If this script is NEVER run as an ECS oneshot, add it to the")
     print("       LOCAL_ONLY array in scripts/check_oneshot_repo_paths.py.")
-    print("    4. If the fallback already exists, add the script to the VALIDATED")
-    print("       array in scripts/check_oneshot_repo_paths.py with a comment")
-    print("       documenting the fallback mechanism.")
+    print("    4. If the script uses the canonical ECS-oneshot sys.path fallback")
+    print("       pattern, add the script to the VALIDATED array in")
+    print("       scripts/check_oneshot_repo_paths.py with a one-line comment")
+    print("       naming the issue. The canonical pattern is:")
+    print()
+    print("           _SCRIPT_DIR = Path(__file__).resolve().parent")
+    print("           _REPO_ROOT = _SCRIPT_DIR.parent")
+    print('           _SF_SRC = _REPO_ROOT / "packages" / "scraper-framework" / "src"')
+    print("           if _SF_SRC.is_dir() and str(_SF_SRC) not in sys.path:")
+    print("               sys.path.insert(0, str(_SF_SRC))")
+    print()
+    print("       Inside the ECS container the .is_dir() guard is False (no repo")
+    print("       filesystem at /tmp), so the sys.path.insert is a no-op there;")
+    print("       the imports resolve from the venv-installed scraper-framework")
+    print(
+        "       package at /app instead. Reference impls: scripts/cc-dual-run-diff.py"
+    )
+    print("       and scripts/drain_splitter_carry_forward_clusters.py.")
     print()
 
 
