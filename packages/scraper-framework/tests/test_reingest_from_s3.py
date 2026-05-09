@@ -12146,12 +12146,25 @@ class TestRunReingestFromPrefix:
         future2.result.return_value = "ok"
         pool.submit.side_effect = [future1, future2]
 
-        # Mock as_completed to return both futures
+        # Mock as_completed to return both futures.
+        #
+        # ``skip_judge_prepass=True`` bypasses the #4419 judge pre-pass.
+        # Without it the test trips ``KeyError: <MagicMock>`` at the prepass's
+        # ``idx = futures[future]`` line: the global ``as_completed`` patch
+        # below returns the outer-pool futures, but the prepass passes its
+        # own local ``futures`` dict (whose keys are
+        # ``ThreadPoolExecutor.submit(_fetch_s3_content, ...)`` futures, not
+        # the outer-pool ones) to that same patched ``as_completed``.  See
+        # #4449 for the slip-through-via-``ingestion-tests``-skip diagnosis.
+        # This test exercises the main ``ProcessPoolExecutor`` flow only —
+        # the prepass has dedicated coverage in
+        # ``TestRunReingestFromPrefixJudgePrepassBoundary``.
         with patch("reingest_from_s3.as_completed", return_value=[future1, future2]):
             stats = reingest.run_reingest_from_prefix(
                 "postgresql://test",
                 prefix="federal/",
                 concurrency=4,
+                skip_judge_prepass=True,
             )
 
         assert stats["total_keys"] == 2
@@ -12260,6 +12273,8 @@ class TestRunReingestFromPrefix:
         pool.submit.side_effect = [future1, future2, future3]
 
         mock_logger = MagicMock()
+        # ``skip_judge_prepass=True`` — see comment in
+        # ``test_processes_documents_with_pool`` and #4449.
         with (
             patch(
                 "reingest_from_s3.as_completed",
@@ -12271,6 +12286,7 @@ class TestRunReingestFromPrefix:
                 "postgresql://test",
                 prefix="federal/",
                 concurrency=4,
+                skip_judge_prepass=True,
             )
 
         assert stats["total_keys"] == 3
@@ -12343,6 +12359,8 @@ class TestRunReingestFromPrefix:
         pool.submit.side_effect = [future1, future2]
 
         mock_logger = MagicMock()
+        # ``skip_judge_prepass=True`` — see comment in
+        # ``test_processes_documents_with_pool`` and #4449.
         with (
             patch(
                 "reingest_from_s3.as_completed",
@@ -12354,6 +12372,7 @@ class TestRunReingestFromPrefix:
                 "postgresql://test",
                 prefix="federal/",
                 concurrency=4,
+                skip_judge_prepass=True,
             )
 
         assert stats["hash_mismatch_warnings"] == 0
@@ -13915,12 +13934,15 @@ class TestRunReingestFromPrefixBustCachePropagation:
         future2.result.return_value = {"status": "ok", "hash_mismatch": False}
         pool.submit.side_effect = [future1, future2]
 
+        # ``skip_judge_prepass=True`` — see comment in
+        # ``test_processes_documents_with_pool`` and #4449.
         with patch("reingest_from_s3.as_completed", return_value=[future1, future2]):
             reingest.run_reingest_from_prefix(
                 "postgresql://test",
                 prefix="federal/",
                 concurrency=4,
                 bust_llm_cache=True,
+                skip_judge_prepass=True,
             )
 
         assert pool.submit.call_count == 2
@@ -13981,16 +14003,216 @@ class TestRunReingestFromPrefixBustCachePropagation:
         future.result.return_value = {"status": "ok", "hash_mismatch": False}
         pool.submit.return_value = future
 
+        # ``skip_judge_prepass=True`` — see comment in
+        # ``test_processes_documents_with_pool`` and #4449.
         with patch("reingest_from_s3.as_completed", return_value=[future]):
             reingest.run_reingest_from_prefix(
                 "postgresql://test",
                 prefix="federal/",
                 concurrency=1,
+                skip_judge_prepass=True,
             )
 
         assert pool.submit.call_count == 1
         call = pool.submit.call_args_list[0]
         assert call.args[6] is False
+
+
+class TestRunReingestFromPrefixJudgePrepassBoundary:
+    """Regression coverage for #4449 — the #4419 judge pre-pass added to
+    ``run_reingest_from_prefix`` must not collide with tests that mock the
+    main ``ProcessPoolExecutor``'s ``as_completed`` globally.
+
+    Slip-through pattern (documented so the same shape can't recur silently):
+
+    * PR #4421 added a new ``ThreadPoolExecutor`` + ``as_completed`` block
+      to seed judges before the main ``ProcessPoolExecutor`` runs (lines
+      ~3940-3963 in ``scripts/reingest_from_s3.py``).
+    * The pre-pass's local ``futures`` dict has different keys than the
+      main pool's local ``futures`` dict.
+    * Five tests in ``TestRunReingestFromPrefix*`` patch
+      ``reingest_from_s3.as_completed`` globally with ``return_value=[<main
+      pool's futures>]``.  When the prepass calls ``as_completed`` on its
+      own local ``futures`` dict, it gets the test's main-pool futures back
+      and ``idx = futures[future]`` raises ``KeyError`` (line 3952).
+    * The regression hid in main CI because the path-filter-conditional
+      ``ingestion-tests`` job in ``.github/workflows/ci.yml`` is skipped on
+      every PR/main commit that doesn't touch ``packages/scraper-framework/``.
+      PR #4421 only modified ``scripts/reingest_from_s3.py``, so its CI run
+      skipped these tests entirely.
+
+    Tests in this class exercise the prepass-vs-main-pool boundary directly
+    by mocking ``_seed_judges_from_keys`` itself rather than the global
+    ``as_completed``.  They would have caught #4449 at PR-time on PR #4421.
+    """
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3._seed_judges_from_keys")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_prepass_runs_by_default_without_keyerror(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_seed_judges: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Default behavior (``skip_judge_prepass=False``): the prepass
+        is invoked and the run completes without ``KeyError``.
+
+        This test mocks ``_seed_judges_from_keys`` at the function boundary
+        (rather than mocking ``as_completed`` globally) so it does NOT
+        interact with the prepass's internal ``ThreadPoolExecutor`` state.
+        On the PR #4421 SHA without the test fix in this PR, every
+        ``run_reingest_from_prefix`` call that mocks ``as_completed``
+        globally (without bypassing this boundary) trips
+        ``KeyError: <MagicMock>`` at line 3952.
+        """
+        keys = ["federal/federal/courtlistener/raw/aaa111.html"]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        # Prepass returns its declared shape — no KeyError, no real S3
+        # fetch, no real DB write.
+        mock_seed_judges.return_value = {
+            "docs_scanned": 1,
+            "judges_seeded": 0,
+            "judges_skipped_invalid": 0,
+        }
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future = MagicMock()
+        future.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.return_value = future
+
+        with patch("reingest_from_s3.as_completed", return_value=[future]):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=1,
+                # skip_judge_prepass intentionally omitted — defaults to
+                # False so the prepass code path runs.
+            )
+
+        # Prepass was invoked exactly once, with the listed keys.
+        mock_seed_judges.assert_called_once()
+        call_kwargs = mock_seed_judges.call_args.kwargs
+        call_args = mock_seed_judges.call_args.args
+        # Positional arg layout: (conn, s3_client, keys, bucket, court_ids)
+        assert call_args[2] == keys, "prepass should receive the same keys list"
+        assert call_kwargs.get("concurrency") == 1
+        # Prepass stats are surfaced into the run summary.
+        assert stats["judge_prepass_docs_scanned"] == 1
+        assert stats["judge_prepass_judges_seeded"] == 0
+        assert stats["judge_prepass_judges_skipped_invalid"] == 0
+        # Main pool ran on top of the prepass without raising.
+        assert stats["total_keys"] == 1
+        assert stats["processed"] == 1
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3._seed_judges_from_keys")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_skip_judge_prepass_flag_bypasses_prepass(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_seed_judges: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``skip_judge_prepass=True`` must bypass ``_seed_judges_from_keys``
+        entirely.
+
+        This is the escape hatch the five sibling tests in
+        ``TestRunReingestFromPrefix`` and
+        ``TestRunReingestFromPrefixBustCachePropagation`` rely on to mock
+        ``as_completed`` globally without tripping the prepass's local
+        ``futures`` dict.  Verify the flag is honored so future refactors
+        don't silently re-introduce the prepass on the bypass path.
+        """
+        mock_list.return_value = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+        ]
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future = MagicMock()
+        future.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.return_value = future
+
+        with patch("reingest_from_s3.as_completed", return_value=[future]):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=1,
+                skip_judge_prepass=True,
+            )
+
+        # Prepass MUST NOT run when skip flag is set.
+        mock_seed_judges.assert_not_called()
+        # Prepass keys are absent from the summary when the prepass is skipped.
+        assert "judge_prepass_docs_scanned" not in stats
+        # Main pool still ran.
+        assert stats["total_keys"] == 1
+        assert stats["processed"] == 1
 
 
 class TestSplitChildGuardUntouched:
