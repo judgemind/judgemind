@@ -32,14 +32,29 @@
 # A trailing punctuation strip removes `.`, `,`, `:`, `;` (sentence
 # punctuation that often follows an inline file reference).
 #
-# Search-context classifier (issue #4340):
+# Search-context classifier (issue #4340, refined #4469):
 #   A line is a *search-context line* if it matches any of:
-#     - ``Verify:`` (case-insensitive, anywhere in the line)
-#     - a shell invocation verb followed by a space — ``grep ``,
-#       ``pytest ``, ``aws ``, ``curl ``, or ``ripgrep ``/``rg ``
+#     - a shell-invocation verb followed by a space, preceded by start-
+#       of-line / whitespace / backtick — ``grep ``, ``pytest ``,
+#       ``aws ``, ``curl ``, ``ripgrep `` / ``rg ``, ``bash ``,
+#       ``python `` / ``python3 ``, or ``./`` (direct script
+#       execution)
 #   A line is also search-context if it falls inside a fenced code
 #   block (between triple backticks) AND the fenced block contains
 #   a shell-invocation verb anywhere in its body.
+#
+#   ``Verify:`` token alone DOES NOT make a line search-context (#4469).
+#   Plain-prose Verify clauses — e.g. ``Verify: <path> is committed`` —
+#   cite the path as the load-bearing target of the change, not as a
+#   search argument. Only Verify clauses that wrap an actual shell
+#   invocation (``Verify: `grep -n widget <path>` ``, ``Verify: `bash
+#   <path>` exits 0`` etc.) classify as search-context, and they do so
+#   by virtue of the verb regex, not the bare ``Verify:`` trigger.
+#
+#   The verb regex uses a backtick-aware leading boundary so a verb
+#   wrapped in inline code (``Verify: `grep ...` ``) still matches —
+#   the backtick character before the verb counts as a boundary
+#   alongside whitespace and start-of-line.
 #
 #   A path's classification is determined by ALL lines it appears in:
 #     - If the path appears at least once on a NON-search-context line,
@@ -73,15 +88,36 @@ TRAILING_STRIP = ".,:;"
 LINE_RANGE_SUFFIX_RE = re.compile(r":[0-9]+(?:-[0-9]+)?$")
 
 # Search-context detector. A line is search-context if it carries a
-# ``Verify:`` marker OR a shell-invocation verb followed by a space.
-# The verbs listed cover the conventional shapes the AC author uses to
-# write a re-run command (``Verify: pytest ...``, ``Verify: grep ...``,
-# ``Verify: aws ...``, ``Verify: curl ...``). The space after the verb
-# anchors the match to actual invocations and avoids false positives
-# on prose like "use grep when..." (which would otherwise match the
-# bare ``grep`` token).
+# shell-invocation verb followed by a space. The leading boundary
+# alternation accepts start-of-line, whitespace, OR a backtick — so
+# verbs wrapped in inline code (``Verify: `grep -n widget <path>` ``)
+# match the same way bare verbs do.
+#
+# The verb list covers the conventional shapes the AC author uses to
+# write a re-run command:
+#
+#   - ``grep`` / ``ripgrep`` / ``rg`` — search invocations.
+#   - ``pytest`` — test selectors.
+#   - ``aws`` / ``curl`` — service / HTTP probes.
+#   - ``bash`` / ``python`` / ``python3`` — explicit interpreter
+#     invocations of a script (``Verify: `bash scripts/foo.sh` ``).
+#   - ``./`` — direct script execution by relative path
+#     (``Verify: `./scripts/foo.sh` ``).
+#
+# The space after the verb anchors the match to actual invocations
+# and avoids false positives on prose like "use grep when..." (which
+# would otherwise match the bare ``grep`` token).
+#
+# Issue #4469 dropped the bare ``Verify:`` trigger that previously
+# fired this regex on every Verify line. The trigger over-matched on
+# "existence Verify" patterns — ``Verify: <path> is committed`` —
+# where the cited path IS the load-bearing target of the change, not
+# a search argument. Plain-prose Verify clauses now classify as
+# target-context; only Verify clauses that actually wrap a shell
+# invocation (matching the verb half of this regex) classify as
+# search-context.
 SEARCH_CONTEXT_LINE_REGEX = re.compile(
-    r"(?:Verify:|(?:^|\s)(?:grep|pytest|aws|curl|ripgrep|rg)\s)",
+    r"(?:^|\s|`)(?:grep|pytest|aws|curl|ripgrep|rg|bash|python3?|\./)\s",
     re.IGNORECASE,
 )
 
