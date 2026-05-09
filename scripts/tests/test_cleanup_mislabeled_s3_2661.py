@@ -2,8 +2,11 @@
 
 Tests cover:
 - parse_flat_hash_key for valid, malformed, and edge-case keys
+  (re-exported from ``framework.s3_keys`` after #4447)
 - is_mislabel for matching/mismatching/missing-metadata cases
+  (re-exported from ``framework.s3_keys`` after #4447)
 - head_object_metadata_hash with mocked S3 client (200, 404, missing field)
+  (re-exported from ``framework.s3_keys`` after #4447)
 - enumerate_mislabels end-to-end with mocked paginator + HEAD
 - find_referenced_keys with mocked psycopg connection
 - delete_in_batches in dry-run and apply modes, batch boundary
@@ -17,10 +20,18 @@ sys.modules before importing the script under test via the
 ``mock_sys_modules`` context manager from ``_mock_helpers`` (#4430) —
 the helper restores ``sys.modules`` automatically on exit so the mocks
 do not leak into later test files in the same pytest process (#4426).
+
+After #4447, the small pure helpers (``parse_flat_hash_key``,
+``is_mislabel``, ``head_object_metadata_hash``, ``KEY_PATTERN``) live in
+``framework.s3_keys``. We load that real module via ``importlib`` from
+its source path inside the mock_sys_modules block so the script under
+test imports the genuine implementation rather than a MagicMock — the
+helpers are pure-Python over ``re`` and the mocked ``botocore`` ``ClientError``.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -59,6 +70,33 @@ class _FakeClientError(Exception):
 _mock_botocore_exceptions.ClientError = _FakeClientError
 _mock_botocore.exceptions = _mock_botocore_exceptions
 
+
+def _load_real_s3_keys() -> object:
+    """Load ``framework.s3_keys`` from source so the script-under-test
+    imports the real helpers, not a MagicMock attribute. The module is
+    pure Python over ``re`` and ``botocore.exceptions.ClientError``;
+    this function is invoked INSIDE the ``mock_sys_modules`` block so
+    s3_keys' ``from botocore.exceptions import ClientError`` resolves to
+    the mocked ``_FakeClientError`` — making the ``except ClientError``
+    branch in ``head_object_metadata_hash`` reachable from tests that
+    raise ``_FakeClientError``."""
+    s3_keys_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "packages",
+        "scraper-framework",
+        "src",
+        "framework",
+        "s3_keys.py",
+    )
+    spec = importlib.util.spec_from_file_location("framework.s3_keys", s3_keys_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 with mock_sys_modules(
     {
         "psycopg": _mock_psycopg,
@@ -68,8 +106,19 @@ with mock_sys_modules(
         "structlog": _mock_structlog,
         "framework": _mock_framework,
         "framework.logging": _mock_framework_logging,
+        # Placeholder — replaced below with the real loaded module so the
+        # ``mock_sys_modules`` restore path cleans it up on exit.
+        "framework.s3_keys": MagicMock(),
     }
 ):
+    # Replace the placeholder with the genuine ``framework.s3_keys`` module
+    # loaded via importlib. The load happens INSIDE the mock context so the
+    # ``from botocore.exceptions import ClientError`` inside s3_keys.py
+    # resolves to ``_FakeClientError`` — keeping the ``except ClientError``
+    # branch reachable from tests that raise ``_FakeClientError``.
+    import sys as _sys
+
+    _sys.modules["framework.s3_keys"] = _load_real_s3_keys()
     import cleanup_mislabeled_s3_2661  # noqa: E402
 
 # The script's module-level boto3/psycopg bindings remain as mocks
@@ -89,7 +138,12 @@ report_enumeration = cleanup_mislabeled_s3_2661.report_enumeration
 run_cleanup = cleanup_mislabeled_s3_2661.run_cleanup
 build_parser = cleanup_mislabeled_s3_2661.build_parser
 main = cleanup_mislabeled_s3_2661.main
-ClientError = cleanup_mislabeled_s3_2661.ClientError
+# After #4447 the ``except ClientError`` branch lives in
+# ``framework.s3_keys.head_object_metadata_hash``, which uses the
+# ``_FakeClientError`` class that we installed on the mocked
+# ``botocore.exceptions``. Tests raise this same class so the ``isinstance``
+# check inside the helper succeeds.
+ClientError = _FakeClientError
 
 
 # ---------------------------------------------------------------------------

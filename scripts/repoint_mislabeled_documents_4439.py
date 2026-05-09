@@ -67,16 +67,20 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
 
 import boto3
 import psycopg
-from botocore.exceptions import ClientError
 
 from framework.logging import configure_structlog
+from framework.s3_keys import (
+    build_twin_key,
+    head_object_metadata_hash,
+    is_mislabel,
+    parse_flat_hash_key,
+)
 
 # Canonical stdout/CloudWatch logger pattern (#4368/#4373).  Routes
 # stdlib ``logging.getLogger(__name__)`` calls through structlog's
@@ -91,93 +95,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "judgemind-document-archive-dev")
 
-# Matches content-addressed flat-hash keys: ca/{county}/{court}/raw/{hex64}.{ext}.
-# Captures county and the filename hash so the enumerate pass can group results
-# and build the twin key without re-parsing.
-KEY_PATTERN = re.compile(
-    r"^(?P<state>[a-z]{2})/(?P<county>[^/]+)/(?P<court>[^/]+)/raw/(?P<hash>[0-9a-f]{64})\.(?P<ext>\w+)$"
-)
-
 # Sample size to log per county before truncating.
 SAMPLE_SIZE = 20
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (unit-tested)
-# ---------------------------------------------------------------------------
-
-
-def parse_flat_hash_key(key: str) -> dict[str, str] | None:
-    """Parse a flat-hash content-addressed key.
-
-    Returns a dict with keys ``state``, ``county``, ``court``, ``hash``, ``ext``
-    on match, or ``None`` if the key does not match the expected shape.
-
-    Anything that does not match (e.g. date-partitioned legacy keys,
-    court_directory snapshots, non-raw paths) is silently skipped.
-
-    NOTE: this duplicates the helper in ``cleanup_mislabeled_s3_2661.py``
-    deliberately. ECS oneshot scripts cannot import from other ``scripts/*.py``
-    files (per CLAUDE.md / docs/agent/code-standards.md), so the small parser
-    is copied rather than shared.
-    """
-    m = KEY_PATTERN.match(key)
-    if m is None:
-        return None
-    return dict(m.groupdict())
-
-
-def is_mislabel(filename_hash: str, metadata_hash: str | None) -> bool:
-    """Return True if *filename_hash* differs from *metadata_hash*.
-
-    A missing metadata hash (``None`` or empty) does **not** count as a
-    mislabel — that is a separate problem class handled by
-    ``audit_s3_raw_mislabels.py``.
-    """
-    if not metadata_hash:
-        return False
-    return filename_hash != metadata_hash
-
-
-def build_twin_key(mislabel_key: str, metadata_hash: str) -> str | None:
-    """Build the correctly-named twin key for *mislabel_key*.
-
-    The twin key reuses the same ``state/county/court/raw/`` prefix and file
-    extension but replaces the filename hash with *metadata_hash* — i.e. the
-    location at which a correctly-named copy of the same bytes would live if
-    one exists.
-
-    Returns ``None`` if *mislabel_key* doesn't parse.
-    """
-    parsed = parse_flat_hash_key(mislabel_key)
-    if parsed is None:
-        return None
-    return (
-        f"{parsed['state']}/{parsed['county']}/{parsed['court']}/raw/"
-        f"{metadata_hash}.{parsed['ext']}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # S3 enumeration
 # ---------------------------------------------------------------------------
-
-
-def head_object_metadata_hash(s3_client: object, bucket: str, key: str) -> str | None:
-    """Return the metadata ``content-hash`` for *key*, or ``None`` if missing.
-
-    Returns ``None`` for both a missing metadata field AND a 404 — callers
-    must treat both as "not a mislabel" / "no twin available."
-    """
-    try:
-        head = s3_client.head_object(Bucket=bucket, Key=key)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return None
-        raise
-    metadata: dict[str, str] = head.get("Metadata", {}) or {}
-    return metadata.get("content-hash") or None
+#
+# ``parse_flat_hash_key``, ``is_mislabel``, ``head_object_metadata_hash``,
+# and ``build_twin_key`` (and the underlying ``KEY_PATTERN`` regex) are
+# imported from ``framework.s3_keys`` (see #4447). The ``framework.*``
+# imports are reachable inside the ECS oneshot container because the
+# helpers are bundled into the scraper-framework Docker image — same
+# precedent as the ``framework.logging`` import above.
 
 
 def verify_twin(s3_client: object, bucket: str, twin_key: str) -> bool:
@@ -207,7 +138,7 @@ def enumerate_repoint_pairs(
 ) -> dict[str, list[dict[str, str]]]:
     """Enumerate (mislabel, twin) repoint candidates under *prefix*, grouped by county.
 
-    For each key under *prefix* that matches ``KEY_PATTERN``:
+    For each key parsed by :func:`framework.s3_keys.parse_flat_hash_key`:
       1. HEAD the object to read its metadata ``content-hash``.
       2. If filename hash != metadata hash, build the twin key
          (same prefix, filename = metadata hash).

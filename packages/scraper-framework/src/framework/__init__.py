@@ -57,6 +57,12 @@ from .retry import retry_async, retry_sync
 from .runner import get_scraper_ids, run_scrapers
 from .s3_cache import CachedS3Client, make_s3_client
 from .s3_integrity import S3MislabelError, assert_key_matches_bytes, verify_key_matches_bytes
+from .s3_keys import (
+    build_twin_key,
+    head_object_metadata_hash,
+    is_mislabel,
+    parse_flat_hash_key,
+)
 from .search import IndexingConsumer, create_index
 from .storage import S3Archiver, build_s3_key
 from .turnstile_solver import solve_turnstile
@@ -89,6 +95,10 @@ __all__ = [
     "S3Archiver",
     "S3MislabelError",
     "assert_key_matches_bytes",
+    "build_twin_key",
+    "head_object_metadata_hash",
+    "is_mislabel",
+    "parse_flat_hash_key",
     "verify_key_matches_bytes",
     "ScraperConfig",
     "ScraperHealthEvent",

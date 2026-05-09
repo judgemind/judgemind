@@ -54,16 +54,19 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
 
 import boto3
 import psycopg
-from botocore.exceptions import ClientError
 
 from framework.logging import configure_structlog
+from framework.s3_keys import (
+    head_object_metadata_hash,
+    is_mislabel,
+    parse_flat_hash_key,
+)
 
 # Canonical stdout/CloudWatch logger pattern (#4368/#4373).  Routes
 # stdlib ``logging.getLogger(__name__)`` calls through structlog's
@@ -79,12 +82,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = os.environ.get("S3_BUCKET", "judgemind-document-archive-dev")
 
-# Matches content-addressed flat-hash keys: ca/{county}/{court}/raw/{hex64}.{ext}
-# Captures county and the filename hash for downstream grouping/comparison.
-KEY_PATTERN = re.compile(
-    r"^(?P<state>[a-z]{2})/(?P<county>[^/]+)/(?P<court>[^/]+)/raw/(?P<hash>[0-9a-f]{64})\.(?P<ext>\w+)$"
-)
-
 # Sample size to log per county before truncating.
 SAMPLE_SIZE = 20
 
@@ -93,74 +90,15 @@ DELETE_BATCH_SIZE = 1000
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (unit-tested)
-# ---------------------------------------------------------------------------
-
-
-def parse_flat_hash_key(key: str) -> dict[str, str] | None:
-    """Parse a flat-hash content-addressed key.
-
-    Returns a dict with keys ``state``, ``county``, ``court``, ``hash``, ``ext``
-    on match, or ``None`` if the key does not match the expected shape.
-
-    The function is the source of truth for what counts as a "flat-hash" key
-    in this script — anything that does not match (e.g. date-partitioned legacy
-    keys, court_directory snapshots, non-raw paths) is silently skipped.
-
-    Examples::
-
-        parse_flat_hash_key("ca/orange/superior_court/raw/aabb...64.pdf")
-        # -> {"state": "ca", "county": "orange", "court": "superior_court",
-        #     "hash": "aabb...64", "ext": "pdf"}
-
-        parse_flat_hash_key("ca/orange/superior_court/raw/2026/04/01/x.pdf")
-        # -> None
-    """
-    m = KEY_PATTERN.match(key)
-    if m is None:
-        return None
-    return dict(m.groupdict())
-
-
-def is_mislabel(filename_hash: str, metadata_hash: str | None) -> bool:
-    """Return True if *filename_hash* differs from *metadata_hash*.
-
-    The mislabel signature from the 2026-03-28 migration is:
-    filename hex64 ≠ metadata ``content-hash``. Both must be hex64 strings (we
-    do not normalise here — the caller is expected to have read the metadata
-    via ``HeadObject`` which preserves the original casing).
-
-    A missing metadata hash (``None`` or empty) does **not** count as a
-    mislabel — the audit script (``audit_s3_raw_mislabels.py``) treats missing
-    metadata as a separate problem class and is the right place to surface it.
-    This script is narrowly scoped to "filename ≠ metadata" (issue #2661).
-    """
-    if not metadata_hash:
-        return False
-    return filename_hash != metadata_hash
-
-
-# ---------------------------------------------------------------------------
 # S3 enumeration
 # ---------------------------------------------------------------------------
-
-
-def head_object_metadata_hash(s3_client: object, bucket: str, key: str) -> str | None:
-    """Return the metadata ``content-hash`` for *key*, or ``None`` if missing.
-
-    Returns ``None`` for both a missing metadata field AND a 404 — callers are
-    expected to handle both cases as "not a mislabel" (the audit script is
-    the right place to surface those edge cases).
-    """
-    try:
-        head = s3_client.head_object(Bucket=bucket, Key=key)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return None
-        raise
-    metadata: dict[str, str] = head.get("Metadata", {}) or {}
-    return metadata.get("content-hash") or None
+#
+# ``parse_flat_hash_key``, ``is_mislabel``, and ``head_object_metadata_hash``
+# (and the underlying ``KEY_PATTERN`` regex) are imported from
+# ``framework.s3_keys`` (see #4447). The ``framework.*`` imports are
+# reachable inside the ECS oneshot container because the helpers are
+# bundled into the scraper-framework Docker image — same precedent as the
+# ``framework.logging`` import above.
 
 
 def enumerate_mislabels(
@@ -170,7 +108,7 @@ def enumerate_mislabels(
 ) -> dict[str, list[dict[str, str]]]:
     """Enumerate mislabeled flat-hash keys under *prefix*, grouped by county.
 
-    For each key under *prefix* that matches ``KEY_PATTERN``:
+    For each key parsed by :func:`framework.s3_keys.parse_flat_hash_key`:
       1. HEAD the object to read its metadata ``content-hash``.
       2. If the metadata hash differs from the filename hash, record it.
 
