@@ -449,14 +449,17 @@ class TestRunAuditIntegration:
         assert sf["case_title_text_mismatch"]["count"] == 1
 
     def test_cluster_signal(self) -> None:
-        # Cluster query result shape: (county, s3_key, scraper_id, case_title, count)
+        # Cluster query result shape (post-#4344):
+        # (county, case_title, ruling_count, s3_keys[], content_hashes[],
+        #  scraper_ids[])
         cluster_rows = [
             (
                 "Ventura",
-                "ca/ventura/raw/cluster.pdf",
-                "ca-ventura-tentatives",
                 "Smith v. Jones",
                 7,
+                ["ca/ventura/raw/cluster.pdf"],
+                ["abc123def456"],
+                ["ca-ventura-tentatives"],
             )
         ]
         conn = _mock_cursor_with_rows([], cluster_rows)
@@ -467,6 +470,161 @@ class TestRunAuditIntegration:
         ex = ven["all_same_case_title_cluster"]["examples"][0]
         assert ex["ruling_count"] == 7
         assert ex["s3_key"] == "ca/ventura/raw/cluster.pdf"
+        assert ex["case_title"] == "Smith v. Jones"
+        assert ex["distinct_blobs"] == 1
+        assert ex["distinct_keys"] == 1
+        assert ex["content_hash"] == "abc123def456"
+
+    def test_cluster_distinct_blobs_field_present(self) -> None:
+        """AC #1: every cluster example has a ``distinct_blobs`` field
+        (#4344). Single-key/single-blob example baseline."""
+        cluster_rows = [
+            (
+                "Riverside",
+                "Acme v. Widgets",
+                3,
+                ["ca/riverside/raw/single.pdf"],
+                ["singleblobhash"],
+                ["ca-riverside-tentatives-civil"],
+            )
+        ]
+        conn = _mock_cursor_with_rows([], cluster_rows)
+        with self._patch_psycopg(conn):
+            summary = run_audit("postgres://stub")
+        riv = summary["counties"]["Riverside"]
+        ex = riv["all_same_case_title_cluster"]["examples"][0]
+        # Every cluster example has the new distinct_blobs key.
+        assert "distinct_blobs" in ex
+        assert isinstance(ex["distinct_blobs"], int)
+
+    def test_cluster_keys_outnumber_blobs_inflation(self) -> None:
+        """AC #1+#2: 15 keys → 1 blob (mislabeled-s3-writes-2026-04 shape).
+
+        The audit reports the cluster once with ``distinct_blobs=1`` and
+        ``distinct_keys=15``, exposing the inflation factor at audit time
+        instead of producing 15 separate cluster rows the way the pre-#4344
+        ``GROUP BY s3_key`` query did.
+        """
+        s3_keys = [f"ca/santa-clara/raw/dept-6-tues_{i}.pdf" for i in range(15)]
+        cluster_rows = [
+            (
+                "Santa Clara",
+                "Doe v. Roe",
+                30,
+                s3_keys,
+                ["483f1da9e800deadbeef"],  # Single underlying blob
+                ["ca-santa-clara-tentatives"],
+            )
+        ]
+        conn = _mock_cursor_with_rows([], cluster_rows)
+        with self._patch_psycopg(conn):
+            summary = run_audit("postgres://stub")
+        sc = summary["counties"]["Santa Clara"]
+        # One cluster row, not 15.
+        assert sc["all_same_case_title_cluster"]["count"] == 1
+        ex = sc["all_same_case_title_cluster"]["examples"][0]
+        assert ex["ruling_count"] == 30
+        assert ex["distinct_keys"] == 15
+        assert ex["distinct_blobs"] == 1
+        # AC #2: examples deduped to one entry per content_hash —
+        # the s3_keys array still carries all 15, but only 1
+        # content_hash entry, and we expose just one example record for
+        # this cluster.
+        assert len(ex["content_hashes"]) == 1
+        assert ex["content_hashes"][0] == "483f1da9e800deadbeef"
+        assert len(ex["s3_keys"]) == 15
+
+    def test_cluster_examples_unique_content_hash_per_record(self) -> None:
+        """AC #2: when multiple distinct case_titles each have their own
+        ``content_hash``, every example object has a unique
+        ``content_hash``. (Two clusters → two examples → two distinct
+        content_hashes.)
+        """
+        cluster_rows = [
+            (
+                "San Francisco",
+                "Smith v. Jones",
+                4,
+                ["ca/sf/raw/key-a.pdf", "ca/sf/raw/key-a-mislabel.pdf"],
+                ["hash-a-aaaa"],
+                ["ca-sf-tentatives-civil"],
+            ),
+            (
+                "San Francisco",
+                "Doe v. Roe",
+                3,
+                ["ca/sf/raw/key-b.pdf"],
+                ["hash-b-bbbb"],
+                ["ca-sf-tentatives-civil"],
+            ),
+        ]
+        conn = _mock_cursor_with_rows([], cluster_rows)
+        with self._patch_psycopg(conn):
+            summary = run_audit("postgres://stub")
+        sf = summary["counties"]["San Francisco"]
+        examples = sf["all_same_case_title_cluster"]["examples"]
+        assert len(examples) == 2
+        seen_hashes = [ex["content_hash"] for ex in examples]
+        assert len(set(seen_hashes)) == len(seen_hashes), (
+            "every example must have a unique content_hash"
+        )
+
+    def test_cluster_genuinely_multi_blob(self) -> None:
+        """``distinct_blobs > 1`` reveals genuinely-different PDFs
+        sharing the same case_title — not S3 mislabeling. The audit
+        leaves both blobs visible in the example record so investigators
+        can tell apart `15 keys → 1 blob` (mislabel) from
+        `2 keys → 2 blobs` (real).
+        """
+        cluster_rows = [
+            (
+                "Orange",
+                "John Doe v. Jane Doe",
+                5,
+                ["ca/orange/raw/key-1.pdf", "ca/orange/raw/key-2.pdf"],
+                ["hash-1", "hash-2"],
+                ["ca-orange-tentatives"],
+            )
+        ]
+        conn = _mock_cursor_with_rows([], cluster_rows)
+        with self._patch_psycopg(conn):
+            summary = run_audit("postgres://stub")
+        oc = summary["counties"]["Orange"]
+        ex = oc["all_same_case_title_cluster"]["examples"][0]
+        assert ex["distinct_blobs"] == 2
+        assert ex["distinct_keys"] == 2
+        assert sorted(ex["content_hashes"]) == ["hash-1", "hash-2"]
+
+    def test_cluster_null_arrays_handled(self) -> None:
+        """Defensive: when psycopg returns ``None`` (or arrays with NULL
+        entries) for the aggregated array columns, the audit doesn't
+        crash and the per-cluster counts default to 0 / empty list.
+
+        ``ARRAY_AGG`` over a column where every row is NULL returns
+        ``[NULL]`` (a 1-element array containing NULL), not ``[]`` —
+        callers must handle both shapes. This test pins that contract.
+        """
+        cluster_rows = [
+            (
+                "Ventura",
+                "Some v. Title",
+                2,
+                None,  # s3_keys NULL
+                [None],  # content_hashes contains a NULL entry
+                ["ca-ventura-tentatives"],
+            )
+        ]
+        conn = _mock_cursor_with_rows([], cluster_rows)
+        with self._patch_psycopg(conn):
+            summary = run_audit("postgres://stub")
+        ven = summary["counties"]["Ventura"]
+        ex = ven["all_same_case_title_cluster"]["examples"][0]
+        assert ex["distinct_keys"] == 0
+        assert ex["distinct_blobs"] == 0
+        assert ex["s3_keys"] == []
+        assert ex["content_hashes"] == []
+        assert ex["content_hash"] is None
+        assert ex["s3_key"] is None
 
     def test_examples_capped(self) -> None:
         # 10 rulings all triggering outcome_continue, default limit_examples=5.
@@ -558,3 +716,124 @@ class TestRenderTextReport:
         assert "Carry-forward signals detected" in out
         assert "Ventura" in out
         assert "Since: 2026-01-01" in out
+
+    def test_cluster_detail_inflation_render(self) -> None:
+        """AC #3: human-readable output shows ``count: N (K keys → B blobs)``
+        when keys outnumber blobs (#4344). 30 rulings × 15 keys × 1 blob
+        is the canonical mislabeled-s3-writes-2026-04 shape.
+        """
+        summary = {
+            "filter": {"county": None, "since": None},
+            "counties": {
+                "Santa Clara": {
+                    "total_rulings": 100,
+                    "outcome_continue": {"count": 0, "examples": []},
+                    "motion_type_contradiction": {"count": 0, "examples": []},
+                    "case_title_text_mismatch": {"count": 0, "examples": []},
+                    "all_same_case_title_cluster": {
+                        "count": 1,
+                        "examples": [
+                            {
+                                "case_title": "Doe v. Roe",
+                                "ruling_count": 30,
+                                "distinct_keys": 15,
+                                "distinct_blobs": 1,
+                                "content_hash": "483f1da9",
+                                "s3_key": "ca/santa-clara/raw/dept-6-tues_0.pdf",
+                                "content_hashes": ["483f1da9"],
+                                "s3_keys": [
+                                    f"ca/santa-clara/raw/dept-6-tues_{i}.pdf"
+                                    for i in range(15)
+                                ],
+                                "scraper_id": "ca-santa-clara-tentatives",
+                                "scraper_ids": ["ca-santa-clara-tentatives"],
+                            }
+                        ],
+                    },
+                }
+            },
+            "totals": {
+                "rulings_audited": 100,
+                "outcome_continue": 0,
+                "motion_type_contradiction": 0,
+                "case_title_text_mismatch": 0,
+                "all_same_case_title_cluster": 1,
+            },
+            "all_clean": False,
+        }
+        out = render_text_report(summary)
+        # The exact phrasing "30 (15 keys → 1 blob)" is the AC #3 contract.
+        assert "30 (15 keys → 1 blob)" in out
+        assert "Doe v. Roe" in out
+        assert "Cluster details" in out
+
+    def test_cluster_detail_one_to_one_render(self) -> None:
+        """When ``keys == blobs`` (no S3 mislabeling) the same shape
+        renders both numbers — so investigators always have the
+        keys-vs-blobs comparator visible without re-running with --json.
+        """
+        summary = {
+            "filter": {"county": None, "since": None},
+            "counties": {
+                "Riverside": {
+                    "total_rulings": 50,
+                    "outcome_continue": {"count": 0, "examples": []},
+                    "motion_type_contradiction": {"count": 0, "examples": []},
+                    "case_title_text_mismatch": {"count": 0, "examples": []},
+                    "all_same_case_title_cluster": {
+                        "count": 1,
+                        "examples": [
+                            {
+                                "case_title": "Acme v. Widgets",
+                                "ruling_count": 4,
+                                "distinct_keys": 1,
+                                "distinct_blobs": 1,
+                                "content_hash": "h1",
+                                "s3_key": "ca/riverside/raw/single.pdf",
+                                "content_hashes": ["h1"],
+                                "s3_keys": ["ca/riverside/raw/single.pdf"],
+                                "scraper_id": "ca-riv",
+                                "scraper_ids": ["ca-riv"],
+                            }
+                        ],
+                    },
+                }
+            },
+            "totals": {
+                "rulings_audited": 50,
+                "outcome_continue": 0,
+                "motion_type_contradiction": 0,
+                "case_title_text_mismatch": 0,
+                "all_same_case_title_cluster": 1,
+            },
+            "all_clean": False,
+        }
+        out = render_text_report(summary)
+        # Pluralization: 1 key, 1 blob (not "1 keys", not "1 blobs").
+        assert "4 (1 key → 1 blob)" in out
+
+    def test_cluster_detail_skipped_when_no_examples(self) -> None:
+        """When no county has cluster examples, the detail section is
+        omitted (no empty header)."""
+        summary = {
+            "filter": {"county": None, "since": None},
+            "counties": {
+                "Riverside": {
+                    "total_rulings": 100,
+                    "outcome_continue": {"count": 0, "examples": []},
+                    "motion_type_contradiction": {"count": 0, "examples": []},
+                    "case_title_text_mismatch": {"count": 0, "examples": []},
+                    "all_same_case_title_cluster": {"count": 0, "examples": []},
+                }
+            },
+            "totals": {
+                "rulings_audited": 100,
+                "outcome_continue": 0,
+                "motion_type_contradiction": 0,
+                "case_title_text_mismatch": 0,
+                "all_same_case_title_cluster": 0,
+            },
+            "all_clean": True,
+        }
+        out = render_text_report(summary)
+        assert "Cluster details" not in out
