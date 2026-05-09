@@ -2018,6 +2018,35 @@ def test_cc_extract_calendar_header_case_numbers_mixed_formats() -> None:
     assert "P24-00230" in result
 
 
+def test_cc_extract_calendar_header_n_prefix_on_civil_dept_pdf_is_legitimate() -> None:
+    """N-prefix case on a civil-dept PDF is a legitimate calendar header entry.
+
+    Regression for #4291.  The investigation surfaced three residual NULL
+    hearing-date rulings (N25-2244, N25-2433, N26-0247) on civil-dept master
+    calendar PDFs (Dept 34, 14, 32).  The issue body's hypothesis #1 was that
+    these were LLM phantom-attribution rulings — case numbers mentioned in
+    body text, not the calendar header.  This test falsifies that hypothesis
+    on the dept-34 fixture: N25-2244 IS extracted as a top-level Format A
+    civil header entry by ``_extract_calendar_header_case_numbers``.
+
+    The actual root cause (#4291) was the CC system prompt's
+    ``N##-#### -- name change / probate`` mapping biasing the LLM to return
+    ``case_type='probate'`` for these civil rulings — fixed by adding the
+    civil-dept context override in ``framework/prompts/contra_costa.py``.
+    """
+    text = _extract_pdf_text(_load_bytes("cc_dept34_033026.pdf"))
+
+    result = _extract_calendar_header_case_numbers(text)
+
+    # N25-2244 is calendar entry #16 in the dept-34 civil PDF — see the
+    # raw text:  ``16. 9:00 AM CASE NUMBER: N25-2244``.  The phantom-ruling
+    # guard would NOT drop it because it matches Format A civil header.
+    assert "N25-2244" in result
+    # Sanity: civil C-prefix entries on the same PDF are also extracted,
+    # confirming the extraction is operating across the full calendar.
+    assert "C25-02672" in result
+
+
 # ---------------------------------------------------------------------------
 # Phantom-ruling guard in fetch_documents (#3798)
 # ---------------------------------------------------------------------------
