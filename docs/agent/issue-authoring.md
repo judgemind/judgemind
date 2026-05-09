@@ -67,6 +67,17 @@ Concrete failure mode this rule prevents: #4309's first AC `Verify:` line read `
 
 **Automated lint (#4358):** `scripts/check-issue-verify-sql.py --issue <N>` (or `--body-file <path>` for a draft) parses `schema.sql` and validates the SQL columns referenced in every `Verify:` line of the issue body. Exit 0 = clean; exit 1 = at least one column-not-found mismatch (with a per-mismatch diagnostic naming `<schema.table.col>`); exit 2 = parse / `gh` error. The `.github/workflows/issue-verify-sql.yml` workflow runs the same check on `issues: [opened, edited]` and strips `agent/ready` if it fails, so authors get the signal at issue-creation time.
 
+### Don't prescribe `_`-prefixed test filenames under `scripts/tests/`
+
+When a `Verify:` line names a new shell-test file under `scripts/tests/`, do NOT prescribe a basename starting with an underscore (e.g. `scripts/tests/_test-helpers-test.sh`). The shell-test runner `scripts/run-scripts-tests.sh` classifies any `_*.sh` file as a sourceable helper (the `is_helper` function at lines ~100-111) and silently skips execution — naming a test that way would leave it un-discoverable by CI.
+
+Use one of these two canonical naming patterns instead:
+
+1. **`scripts/tests/test_<thing>.sh`** — the default. Works for any test that does not specifically exercise a `_<helper>.sh` shared helper.
+2. **`scripts/tests/test__<thing>.sh`** (double-underscore) — when the test is specifically the test for a shared `_<thing>.sh` helper. The double-underscore disambiguates the test from the helper without tripping the runner's `is_helper` filter.
+
+Concrete example surfaced via #4540: an AC originally specified `scripts/tests/_test-helpers-test.sh` as the test filename for the shared `_test-helpers.sh` library. That filename would have matched the runner's `is_helper` filter and never executed — the implementer renamed to `test__test_helpers.sh` to keep the AC's intent (a runnable test) intact. See #4545 and the load-bearing filter at `scripts/run-scripts-tests.sh::is_helper`.
+
 ### Cleanup AC queries — anchor on document status
 
 When writing an AC that counts/filters `derived.rulings`, `derived.cases`, `derived.judges`, `derived.attorneys`, `derived.parties`, or any other row whose source-of-truth is a `derived.documents` row, always join `derived.documents` and filter `d.status = 'active'`. Supersede chains (post-#3722 multimodal-fix and similar reingest events) routinely leave rows with the OLD case_number / OLD case_title / null judge_id behind under `status = 'superseded'`, and a naive count picks up that noise as if it were live regression. The cleanup AC then looks unmet long after the fix has actually landed and re-extracted everything.

@@ -8,6 +8,16 @@
 # the file's last 50 lines bracketed with the standard
 # ``── #4540 stderr dump ──`` banner.
 #
+# Naming convention: tests for this helper itself live at
+# ``scripts/tests/test__test_helpers.sh`` (double-underscore). Do NOT
+# name a runnable test ``scripts/tests/_*-test.sh`` — the
+# ``scripts/run-scripts-tests.sh`` runner classifies any ``_*.sh`` as
+# a sourceable helper (the ``is_helper`` filter at lines ~100-111) and
+# silently skips execution. Use ``test_<thing>.sh`` or
+# ``test__<thing>.sh`` instead. See ``docs/agent/issue-authoring.md``
+# §"Don't prescribe `_`-prefixed test filenames under `scripts/tests/`"
+# and #4545.
+#
 # Usage:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #   . "$SCRIPT_DIR/tests/_test-helpers.sh"
