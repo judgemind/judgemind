@@ -33,36 +33,25 @@ import pytest
 # the script loads. The script's top-level
 # ``from framework.logging import configure_structlog`` would otherwise raise
 # ModuleNotFoundError in the lightweight CI scripts-tests (python) shard.
-# See #4373.
+# See #4373. Save/replay envelope is centralised in
+# ``scripts/tests/_mock_helpers.py`` (#4430).
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
+
 _mock_structlog = MagicMock()
 _mock_structlog.get_logger.return_value = MagicMock()
-_mock_framework = MagicMock()
-_mock_framework_logging = MagicMock()
 
-_modules_to_mock = {
-    "structlog": _mock_structlog,
-    "framework": _mock_framework,
-    "framework.logging": _mock_framework_logging,
-}
-
-_saved_modules: dict[str, object] = {}
-for _mod_name, _mock_mod in _modules_to_mock.items():
-    if _mod_name in sys.modules:
-        _saved_modules[_mod_name] = sys.modules[_mod_name]
-    sys.modules[_mod_name] = _mock_mod
-
-import audit_scraper_field_population as _script  # noqa: E402
-
-# Restore sys.modules to avoid polluting other test files.
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(
+    {
+        "structlog": _mock_structlog,
+        "framework": MagicMock(),
+        "framework.logging": MagicMock(),
+    }
+):
+    import audit_scraper_field_population as _script  # noqa: E402
 
 REGISTRY = _script.REGISTRY
 get_spec = _script.get_spec

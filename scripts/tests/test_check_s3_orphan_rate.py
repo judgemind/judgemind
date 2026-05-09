@@ -24,32 +24,17 @@ import pytest
 
 # ---------------------------------------------------------------------------
 # Pre-import mocking — inject boto3 + psycopg mocks before the script loads.
+# Save/replay envelope is centralised in ``scripts/tests/_mock_helpers.py``
+# (#4430).
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "spotcheck"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-_mock_boto3 = MagicMock()
-_mock_psycopg = MagicMock()
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
 
-_modules_to_mock = {
-    "boto3": _mock_boto3,
-    "psycopg": _mock_psycopg,
-}
-
-_saved_modules: dict[str, object] = {}
-for _mod_name, _mock_mod in _modules_to_mock.items():
-    if _mod_name in sys.modules:
-        _saved_modules[_mod_name] = sys.modules[_mod_name]
-    sys.modules[_mod_name] = _mock_mod
-
-import check_s3_orphan_rate as _script  # noqa: E402
-
-# Restore sys.modules to avoid polluting other test files.
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(["boto3", "psycopg"]):
+    import check_s3_orphan_rate as _script  # noqa: E402
 
 FLAT_HASH_RE = _script.FLAT_HASH_RE
 county_prefix = _script.county_prefix

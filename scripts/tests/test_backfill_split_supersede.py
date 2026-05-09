@@ -24,38 +24,26 @@ from unittest.mock import MagicMock, patch
 # ---------------------------------------------------------------------------
 # Pre-import mocking -- the script imports psycopg, structlog, and
 # framework.logging at module level, which are not installed in the CI
-# scripts-tests environment.
+# scripts-tests environment. Save/replay envelope is centralised in
+# ``scripts/tests/_mock_helpers.py`` (#4430).
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-_mock_psycopg = MagicMock()
+from tests._mock_helpers import mock_sys_modules  # noqa: E402
+
 _mock_structlog = MagicMock()
 _mock_structlog.get_logger.return_value = MagicMock()
-_mock_framework = MagicMock()
-_mock_framework_logging = MagicMock()
 
-_modules_to_mock = {
-    "psycopg": _mock_psycopg,
-    "structlog": _mock_structlog,
-    "framework": _mock_framework,
-    "framework.logging": _mock_framework_logging,
-}
-
-_saved_modules: dict[str, object] = {}
-for _mod_name, _mock_mod in _modules_to_mock.items():
-    if _mod_name in sys.modules:
-        _saved_modules[_mod_name] = sys.modules[_mod_name]
-    sys.modules[_mod_name] = _mock_mod
-
-import backfill_split_supersede as backfill  # noqa: E402
-
-# Restore sys.modules so the mock injection doesn't break other test files.
-for _mod_name in list(_modules_to_mock.keys()):
-    if _mod_name in _saved_modules:
-        sys.modules[_mod_name] = _saved_modules[_mod_name]
-    elif _mod_name in sys.modules:
-        del sys.modules[_mod_name]
+with mock_sys_modules(
+    {
+        "psycopg": MagicMock(),
+        "structlog": _mock_structlog,
+        "framework": MagicMock(),
+        "framework.logging": MagicMock(),
+    }
+):
+    import backfill_split_supersede as backfill  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -318,4 +306,3 @@ class TestMain:
         ]
         assert len(update_calls) == 0
         mock_conn.commit.assert_not_called()
-
