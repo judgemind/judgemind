@@ -1034,6 +1034,184 @@ else
     fail "AC3: canonical #2831 ↔ PR #3229 still detected (regression #4340)" "exit=$exit_code output=$output"
 fi
 
+# ─── Test 25: audit-class issue with single ADDED overlap → exit 1 (#4223) ─
+
+# Regression for #4223. Issue title contains an audit-class keyword
+# (`investigate`, `refactor`, `migrate`, `extend`, `tighten`, `harden`,
+# `audit`, `additional`); a closed PR ADDED the file the issue cites.
+# Pre-#4223: 1 added overlap clears the threshold → false-positive
+# `shipped:` match. Post-#4223 with audit-class detection, audit issues
+# require ≥2 target-context overlaps AND every overlap is ADDED → drops.
+#
+# Concrete shape: issue #4208 (investigate / audit / additional in title)
+# matched against PR #2811 (which originally CREATED the file the
+# investigation is auditing). The date-ordering guard (#4353) covers the
+# specific examples in #4223, but the residual class — recent unrelated
+# PR ADDED the file an audit issue cites — is what this test locks in.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Audit Tailwind token pairs for additional one-character footguns.\n\nThe investigation should examine packages/web/tailwind.config.ts.", "title": "investigate: audit Tailwind token pairs for additional one-character footguns", "createdAt": "2026-05-08T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "feat(brand): add Tailwind token mapping (#5800)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            # PR ADDED the file the audit cites — but the audit work
+            # is legitimately distinct from the file's creation.
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "packages/web/tailwind.config.ts", "additions": 200, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-05-09T00:00:00Z", "number": 5800, "title": "feat(brand): add Tailwind token mapping"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4208 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "audit-class issue with single ADDED overlap drops to not-shipped (regression #4223)"
+else
+    fail "audit-class issue with single ADDED overlap drops to not-shipped (regression #4223)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 26: audit-class issue with 2 MODIFIED overlaps → exit 1 (#4223) ──
+
+# Companion to Test 25. Audit-class issue cites two files; a closed PR
+# MODIFIED both. Pre-#4223: 2 total overlaps clears the threshold →
+# false-positive shipped. Post-#4223: audit issues require all-ADDED →
+# the modifications drop the match.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Refactor scripts/dispatcher/foo.py and scripts/dispatcher/bar.py to use the new dispatcher.", "title": "refactor(dispatcher): migrate to fetch_responses", "createdAt": "2026-05-08T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "fix(dispatcher): unrelated bug (#6900)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/dispatcher/foo.py", "additions": 5, "deletions": 5, "changeType": "MODIFIED"}, {"path": "scripts/dispatcher/bar.py", "additions": 8, "deletions": 3, "changeType": "MODIFIED"}], "mergedAt": "2026-05-09T00:00:00Z", "number": 6900, "title": "fix(dispatcher): unrelated bug"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4213 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* ]]; then
+    pass "audit-class issue with 2 MODIFIED overlaps drops to not-shipped (regression #4223)"
+else
+    fail "audit-class issue with 2 MODIFIED overlaps drops to not-shipped (regression #4223)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 27: audit-class issue with 2 ADDED overlaps → exit 0 (#4223) ─────
+
+# Sanity: audit-class tightening must NOT block legitimate shipped
+# matches where a PR genuinely created BOTH files the audit cites. The
+# tightened rule is "≥2 target-context AND all-ADDED" — clearing both
+# halves emits a shipped match.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "Audit needs scripts/audit-foo.sh and scripts/audit-bar.sh to be created.", "title": "investigate: audit foo and bar", "createdAt": "2026-05-08T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "feat: ship audit helpers (#7100)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/audit-foo.sh", "additions": 50, "deletions": 0, "changeType": "ADDED"}, {"path": "scripts/audit-bar.sh", "additions": 60, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-05-09T00:00:00Z", "number": 7100, "title": "feat: ship audit helpers"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 4209 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"7100"* ]]; then
+    pass "audit-class issue with 2 ADDED overlaps still reports shipped (regression #4223 sanity)"
+else
+    fail "audit-class issue with 2 ADDED overlaps still reports shipped (regression #4223 sanity)" "exit=$exit_code output=$output"
+fi
+
+# ─── Test 28: non-audit issue retains pre-#4223 threshold → exit 0 (#4223) ─
+
+# Companion to Test 25. Same single-ADDED-overlap shape, but the issue
+# title is `dx: add scripts/foo.sh` (no audit-class verb). The classifier
+# does NOT fire → existing threshold (≥1 added) applies → shipped.
+# This is the canonical zombie shape (#2831 ↔ #3229) — must NOT regress.
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"body": "We need scripts/foo.sh to validate widgets.", "title": "dx: add scripts/foo.sh", "createdAt": "2026-05-08T00:00:00Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "WIP: ralph output (#3229)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "files": [{"path": "scripts/foo.sh", "additions": 100, "deletions": 0, "changeType": "ADDED"}], "mergedAt": "2026-05-09T00:00:00Z", "number": 3229, "title": "WIP: ralph output"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$("$WRAPPER" 2831 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 && "$output" == *"shipped:"* && "$output" == *"3229"* ]]; then
+    pass "non-audit issue retains pre-#4223 single-ADDED threshold (regression #4223 sanity)"
+else
+    fail "non-audit issue retains pre-#4223 single-ADDED threshold (regression #4223 sanity)" "exit=$exit_code output=$output"
+fi
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 

@@ -183,6 +183,55 @@ def main() -> int:
     if len(target_added_overlap) < 1 and len(target_overlap) < 2:
         return 0
 
+    # Audit-class tightening (#4223). When the issue is classified as
+    # audit / investigation / refactor / migrate / extend / tighten /
+    # harden / additional (see `_check_shipped_pr_classify_issue.py`),
+    # apply a stricter threshold: the candidate PR must have ADDED
+    # ALL of the target-context overlap files. This drops the canonical
+    # FP class for this issue type — investigation issues that name a
+    # specific file as the *subject of further work*, where some prior
+    # unrelated PR happened to create or modify that same file.
+    #
+    # Rationale: an audit/investigation issue is by intent asking for
+    # MORE work on an existing file. The work is legitimately distinct
+    # from anything a prior PR shipped on the same file — even if that
+    # prior PR added the file in the first place. The strict rule
+    # "every target-context overlap must be ADDED" effectively requires
+    # the candidate PR to be the file's creation commit AND for the
+    # match to be at-least 2 target-context paths (#4353's date guard
+    # handles the case where a creation commit predates the issue).
+    #
+    # Tradeoffs (issue #4223 §Proposal option 1):
+    #   - false-negative cost is LOW — audit issues that ARE shipped
+    #     get re-investigated cheaply (the worst case is one extra
+    #     /task cycle, not a wrong-fix-merged regression).
+    #   - false-positive cost is HIGH — without this guard the daemon
+    #     auto-closes legitimate `agent/ready` audit issues whenever
+    #     any prior PR touched the same file, which is structurally
+    #     guaranteed to happen on a healthy codebase.
+    #
+    # When CHECK_SHIPPED_AUDIT_CLASS is unset / empty / "0", this guard
+    # is a no-op — preserving pre-#4223 behavior so downstream tests
+    # whose mocks omit the new env var continue to work.
+    audit_class = os.environ.get("CHECK_SHIPPED_AUDIT_CLASS", "")
+    if audit_class and audit_class != "0":
+        target_added_set = set(target_added_overlap)
+        # Tightened rule (per #4223 proposal option 1):
+        #
+        #   total target-context overlap ≥ 2  AND
+        #   EVERY target-context overlap is ADDED
+        #
+        # The "≥2" half drops single-file overlaps regardless of class
+        # (the most common FP shape — issue cites one file, one prior
+        # PR touched it). The "all-ADDED" half drops 2+ overlaps where
+        # any are modifications (the second-most-common FP — issue
+        # cites multiple files in a directory, one prior PR refactored
+        # them).
+        if len(target_overlap) < 2:
+            return 0
+        if any(p not in target_added_set for p in target_overlap):
+            return 0
+
     # Output format: <count>\t<comma-separated-overlap>\t<comma-separated-added>
     # The fix-CI / pivot path consumes this as best_overlap_count and
     # best_overlap_list; added_overlap is informational for the JSON
