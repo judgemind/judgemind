@@ -111,6 +111,22 @@
 #     → no candidate PRs → exit 1. This is by design — the channel only
 #     fires when a sibling has DEMONSTRABLY shipped (closed by a merged
 #     PR), not when one is just open.
+#   - Extension-class suppression (#4523). When the current issue's
+#     title classifies as audit / extension-class via the existing
+#     audit-class classifier (``audit``, ``investigate``, ``refactor``,
+#     ``migrate``, ``extend``, ``tighten``, ``harden``, ``additional``
+#     plus noun forms — see ``_check_shipped_pr_classify_issue.py``)
+#     AND the lineage candidate PR's number OR the sibling's number
+#     appears among the ``#N`` references in the current issue's body,
+#     the probe suppresses that candidate. Concrete reproducer:
+#     issue #4519 ↔ PR #4517 ↔ sibling #4515. #4519's title
+#     ``extend the lineage probe to recognize more idioms`` matches
+#     ``extend`` (extension-class), and #4519's body cites ``#4515``
+#     and ``#4517`` directly — the candidate is suppressed because
+#     the AC author already knows about the prior PR and is asking
+#     for follow-up work, not declaring the work done. The probe
+#     continues to the next candidate; if none clear the gate, the
+#     probe exits 1.
 #
 # Environment variables:
 #   CHECK_SHIPPED_LINEAGE_REPO     — override "judgemind/judgemind"
@@ -128,11 +144,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 # ─── Lineage parent extraction ─────────────────────────────────────────────
 
@@ -212,6 +230,114 @@ def extract_lineage_parents(body: str) -> list[int]:
             seen.add(n)
             out.append(n)
     return out
+
+
+# ─── Cited-issue / cited-PR extraction (#4523 extension-class gate) ───────
+
+# Match every ``#N`` reference in an issue body: the parent retrospective,
+# explicit sibling links, prior-art PR / issue numbers, etc. Word boundary
+# on the right keeps ``#4515`` from also matching ``#45151``-style longer
+# runs by accident; the digit class is greedy by default.
+#
+# This is a SUPERSET of `LINEAGE_PARENT_RES`. The lineage parent regex
+# only fires when the ``#N`` appears inside a recognized lineage idiom
+# (``Found by: retrospective on``, etc.); this regex captures every
+# bare ``#N`` mention regardless of surrounding text. The two are used
+# for different purposes — lineage parents drive the search, cited
+# numbers drive the extension-class suppression gate.
+CITED_ISSUE_RE = re.compile(r"#(\d+)\b")
+
+
+def extract_cited_issue_numbers(body: str) -> set[int]:
+    """Return the set of every ``#N`` reference in ``body``.
+
+    Used by the extension-class suppression gate (#4523). When the
+    current issue's title classifies as audit/extension-class AND the
+    lineage candidate PR — or its sibling — appears in this set, the
+    issue is by intent asking for follow-up work on the same code
+    path and the lineage match is almost always a false positive.
+    """
+    out: set[int] = set()
+    for m in CITED_ISSUE_RE.finditer(body):
+        try:
+            out.add(int(m.group(1)))
+        except ValueError:
+            # Defensive: \d+ guarantees an integer, but keep the
+            # try/except so a future regex tweak that introduces a
+            # broader capture group does not crash the probe.
+            continue
+    return out
+
+
+# ─── Audit-class classifier import (#4523) ────────────────────────────────
+#
+# The lineage probe consults the existing audit-class classifier from
+# `_check_shipped_pr_classify_issue.py` to decide whether the current
+# issue's title is "extension-class" — i.e. the AC author is asking for
+# follow-up work on already-shipped code. The classifier's verb list
+# (``audit``, ``investigate``, ``refactor``, ``migrate``, ``extend``,
+# ``tighten``, ``harden``, ``additional``) already covers the
+# extension-class intent the lineage gate needs; sharing the verb list
+# keeps it in one place.
+#
+# Loading via ``importlib.util.spec_from_file_location`` because the
+# sibling helper's filename starts with an underscore (``_check_...``)
+# and ``scripts/`` is not a Python package — the standard
+# ``import scripts._check_shipped_pr_classify_issue`` path doesn't apply.
+# Same loader pattern as the test file uses to import the probe itself.
+def _load_classifier_module():
+    """Load the audit-class classifier module by file path.
+
+    Returns the loaded module, or None if the helper cannot be located
+    (defensive against ad-hoc invocations / partial checkouts). When
+    None, the extension-class gate becomes a no-op — the probe behaves
+    exactly as it did pre-#4523, which is the intended degradation
+    path: a missing classifier helper falls back to the higher-recall
+    pre-gate behavior (more matches, including some FPs), not to a
+    crash.
+    """
+    here = Path(__file__).resolve().parent
+    classifier_path = here / "_check_shipped_pr_classify_issue.py"
+    if not classifier_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "check_shipped_pr_classify_issue", classifier_path
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    return module
+
+
+def is_extension_class(title: str, body: str) -> bool:
+    """Return True when ``title`` + ``body`` classify as extension-class.
+
+    The lineage probe's extension-class gate (#4523) suppresses FPs
+    where the current issue's intent is "extend / harden / refactor
+    work that already shipped." This is exactly the audit-class verb
+    set the classifier already implements (see
+    ``_check_shipped_pr_classify_issue.py`` — ``audit``, ``investigate``,
+    ``refactor``, ``migrate``, ``extend``, ``tighten``, ``harden``,
+    ``additional`` plus noun forms). Reuse rather than duplicate.
+
+    When the classifier helper cannot be loaded (ad-hoc invocation,
+    partial checkout), this function returns False — the gate becomes
+    a no-op and pre-#4523 behavior is preserved.
+    """
+    mod = _load_classifier_module()
+    if mod is None:
+        return False
+    fn = getattr(mod, "is_audit_class", None) or getattr(mod, "classify", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(title, body))
+    except Exception:
+        return False
 
 
 # ─── Backtick-token extraction ─────────────────────────────────────────────
@@ -469,12 +595,30 @@ def fetch_pr_body(pr: int, *, repo: str) -> tuple[str, bool] | None:
 
 
 def probe(
-    body: str, *, repo: str, current_issue: int
+    body: str, *, repo: str, current_issue: int, title: str = ""
 ) -> tuple[int, int, list[str]] | None:
     """Run the lineage probe against ``body``.
 
     Returns ``(pr, sibling, identifiers)`` on the first match, or None
     when no lineage candidate clears the identifier-overlap threshold.
+
+    Extension-class suppression (#4523):
+        When ``title`` + ``body`` classify as audit / extension-class
+        via ``is_extension_class()``, the gate suppresses any
+        candidate (sibling, PR) pair whose sibling number OR PR
+        number appears among the ``#N`` references in the current
+        issue's body. The current issue is by intent asking for
+        follow-up work on a code path it explicitly cites; a lineage
+        match against a PR the issue itself names is almost always
+        a false positive.
+
+        ``title`` is optional and defaults to ``""`` to preserve
+        backwards-compat with callers that don't have the title
+        handy. Empty title + body without audit-class keywords yields
+        ``is_extension_class() == False`` and the gate is a no-op.
+        Probe walks each (sibling, PR) candidate in search order and
+        emits the FIRST match that clears the identifier-overlap
+        threshold AND is not suppressed by the extension-class gate.
     """
     parents = extract_lineage_parents(body)
     if not parents:
@@ -487,6 +631,12 @@ def probe(
         # with zero backtick spans is too weak a signal for a lineage
         # match no matter how the parent's siblings shipped.
         return None
+
+    # Extension-class suppression gate (#4523). Compute once outside
+    # the inner loop — both inputs (title, body) are loop-invariant.
+    extension_class = is_extension_class(title, body)
+    cited_numbers = extract_cited_issue_numbers(body) if extension_class else set()
+
     for parent in parents:
         siblings = find_sibling_retrospectives(
             parent, repo=repo, current_issue=current_issue
@@ -505,6 +655,21 @@ def probe(
             overlap = current_tokens & pr_tokens
             if not overlap:
                 continue
+            # Extension-class suppression — does this candidate's
+            # PR or sibling appear in the cited-numbers set?
+            #
+            # Concrete reproducer (#4519 ↔ PR #4517 ↔ sibling #4515):
+            #   - issue #4519 title classifies as audit-class via
+            #     ``extend`` — extension_class == True
+            #   - #4519 body cites ``#4515`` (and ``#4517``) in
+            #     prose — both numbers land in cited_numbers
+            #   - lineage probe walks #4304 → finds sibling #4515
+            #     → finds closing PR #4517 → token overlap fires
+            #   - #4515 ∈ cited_numbers OR #4517 ∈ cited_numbers
+            #     → gate suppresses, continue to next sibling
+            #   - no other candidates clear the gate → return None
+            if extension_class and (sibling in cited_numbers or pr in cited_numbers):
+                continue
             # Sort for stable output across runs.
             return pr, sibling, sorted(overlap)
     return None
@@ -518,13 +683,18 @@ def main() -> int:
     body = data.get("body") or ""
     if not body:
         return 1
+    # Title is optional in the JSON envelope (#4523). The shell wrapper
+    # passes ``--json body,title,createdAt`` so the title is present in
+    # production calls; defensive fallback to "" preserves backwards
+    # compat for ad-hoc / partial invocations that pass only ``body``.
+    title = data.get("title") or ""
     repo = os.environ.get("CHECK_SHIPPED_LINEAGE_REPO", "judgemind/judgemind")
     current_issue_str = os.environ.get("CHECK_SHIPPED_LINEAGE_ISSUE", "")
     try:
         current_issue = int(current_issue_str) if current_issue_str else 0
     except ValueError:
         current_issue = 0
-    hit = probe(body, repo=repo, current_issue=current_issue)
+    hit = probe(body, repo=repo, current_issue=current_issue, title=title)
     if hit is None:
         return 1
     pr, sibling, identifiers = hit

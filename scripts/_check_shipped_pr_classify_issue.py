@@ -88,6 +88,28 @@ def classify(title: str, body: str) -> bool:
     return bool(AUDIT_KEYWORDS_REGEX.search(combined))
 
 
+# Predicate alias (#4523). The lineage probe consumes audit-class as a
+# boolean predicate ("should the lineage match be suppressed?"), and the
+# semantic predicate name reads more naturally at the call site than
+# ``classify(title, body)`` — which sounds like it returns the class
+# label rather than a boolean. Both names point at the same regex; the
+# alias is purely an ergonomics / readability improvement, not a
+# behavior change.
+def is_audit_class(title: str, body: str) -> bool:
+    """Predicate alias of ``classify`` — True iff title+body is audit-class.
+
+    Used by the retrospective-lineage probe (#4523) to gate FP-suppression
+    on extension-class issues. The audit-class verb list (``audit``,
+    ``investigate``, ``refactor``, ``migrate``, ``extend``, ``tighten``,
+    ``harden``, ``additional`` plus noun forms) already covers the
+    "extension-class" intent the lineage gate cares about — an issue
+    titled ``extend the lineage probe`` matches via ``extend``, an issue
+    titled ``additional patterns`` matches via ``additional``. Reusing
+    the existing classifier keeps the verb list in one place.
+    """
+    return classify(title, body)
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
