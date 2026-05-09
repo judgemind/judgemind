@@ -12,6 +12,15 @@ name: Deploy Dispatcher v3
 # this workflow lands first so the ECR repo + image-build CI exist
 # before any v3 service tries to deploy.
 #
+# deploy-rollout-lint: build-only
+#   Pairs with `scripts/check-deploy-workflow-rollout.sh` (#2777). The
+#   guard otherwise flags every `docker push`-only workflow as a
+#   silent-drift hazard (see #2772). v3 is the legitimate exception:
+#   the image goes to ECR now, and the task-def re-registers + service
+#   rollouts land alongside the per-component task-defs in follow-up
+#   issues. Drop this marker the moment a real rollout step joins the
+#   workflow.
+#
 # This file mirrors `deploy-dispatcher.yml` (build half only — service
 # rollout deferred) and `deploy-agent-runner.yml` (build + task-def
 # re-register; the re-register equivalent will land in a follow-up when
