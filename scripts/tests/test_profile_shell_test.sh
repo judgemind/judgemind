@@ -274,7 +274,13 @@ elif [[ ! -x "$ENTRYPOINT_TEST" ]]; then
     echo "SKIP: AC integration (entrypoint test not found / not executable)"
 else
     ac_tsv="$TMPDIR_TEST/entrypoint.tsv"
-    ac_out=$("$PROFILER" --tsv "$ac_tsv" --top 5 "$ENTRYPOINT_TEST" 2>/dev/null)
+    # #4383: capture stderr (do NOT discard) so a future flake records
+    # the profiler's structured beacon — `profile-shell-test:
+    # wrapped_exit=N sections=N tsv=PATH` — alongside the wrapped
+    # test's stdout. Without this capture, the only signal on failure
+    # is rc=2 with no diagnostic context.
+    ac_stderr="$TMPDIR_TEST/entrypoint.err"
+    ac_out=$("$PROFILER" --tsv "$ac_tsv" --top 5 "$ENTRYPOINT_TEST" 2>"$ac_stderr")
     ac_rc=$?
 
     ac_sections=$(wc -l < "$ac_tsv" 2>/dev/null | tr -d ' ' || echo 0)
@@ -292,7 +298,20 @@ else
         # 0 (all green) or non-zero if a flake hits, but flag the
         # mismatch.
         if [[ "$passed" -eq "$total" ]]; then
+            ac_rc_before=$TESTS
             assert_eq "profiler exit matches wrapped test (all green → rc=0)" "$ac_rc" "0"
+            # #4383: when the assertion fails, dump the captured stderr
+            # and the tail of stdout so the next CI flake is
+            # self-diagnosing. Detection: the assert_eq above incremented
+            # FAILURES if it failed.
+            if [[ "$ac_rc" != "0" ]]; then
+                echo "  ── #4383 diagnostic dump ──"
+                echo "  profiler stderr (last 50 lines):"
+                tail -n 50 "$ac_stderr" 2>/dev/null | sed 's/^/    /'
+                echo "  wrapped test stdout (last 50 lines):"
+                printf '%s\n' "$ac_out" | tail -n 50 | sed 's/^/    /'
+                echo "  ── end #4383 dump ──"
+            fi
         fi
     else
         TESTS=$((TESTS + 1))
@@ -329,6 +348,59 @@ tsv_t4183="$TMPDIR_TEST/fixture_t4183.tsv"
 "$PROFILER" --tsv "$tsv_t4183" "$fixture_t4183" >/dev/null 2>&1
 sections_t4183=$(wc -l < "$tsv_t4183" | tr -d ' ')
 assert_eq "default pattern catches Test N + T_issue<N> + T<N><a-z>" "$sections_t4183" "3"
+
+# ─── Test T_issue4383: trap rc-no-leak contract under set -e ──────────────
+# Issue #4383: when the wrapped test exits with `set -e` in force, the
+# chained EXIT trap (`_section_close; cleanup`) runs under `set -e`. Any
+# non-zero rc inside `_section_close` (e.g. a flaky `python3 -c` call,
+# a sed race) propagates as the script's exit code — overriding the
+# wrapped test's `exit 0`. The fix in `scripts/profile-shell-test.sh`
+# wraps `_section_close` and `_section_record` with local `set +e` and
+# `|| true`'s every interior command so the trap chain CANNOT leak rc.
+# This test proves that contract by running a fixture that:
+#   1. Sets `set -euo pipefail` (so `set -e` is in force at exit).
+#   2. Installs a user `trap user_cleanup EXIT` that the rewriter chains.
+#   3. Stubs `python3` on PATH to ALWAYS exit 2 — guaranteeing
+#      `_section_now_ms` would propagate rc=2 if `_section_close` ever
+#      let it. (The fixture stubs python3 instead of relying on a
+#      timing flake; this gives a deterministic regression.)
+#   4. Reaches `exit 0`.
+# Expectation: the profiler exits 0 (the wrapped test's rc), NOT 2
+# (the trap-injected `python3` rc).
+fixture_t4383_dir="$TMPDIR_TEST/t4383"
+mkdir -p "$fixture_t4383_dir/bin-stub"
+# python3 stub — always exits 2.
+cat > "$fixture_t4383_dir/bin-stub/python3" <<'PYTHON3_STUB_EOF'
+#!/usr/bin/env bash
+exit 2
+PYTHON3_STUB_EOF
+chmod +x "$fixture_t4383_dir/bin-stub/python3"
+
+# The fixture must live under the standard fixture dir AND have a name
+# the section pattern matches, otherwise the profiler sees zero sections.
+fixture_t4383=$(make_fixture "fixture_t_issue4383.sh" '#!/usr/bin/env bash
+# Wrapped test that exits with set -e in force AND a user EXIT trap,
+# AND a stubbed python3 that always exits 2. Proves the profiler does
+# NOT leak the python3 rc=2 to its own exit code.
+set -euo pipefail
+user_cleanup() {
+    : # no-op cleanup
+}
+trap user_cleanup EXIT
+
+# Test 1: alpha
+true
+
+# Test 2: beta
+true
+
+exit 0
+')
+tsv_t4383="$TMPDIR_TEST/fixture_t4383.tsv"
+# Run the profiler with python3 forced to exit 2 via PATH override.
+PATH="$fixture_t4383_dir/bin-stub:$PATH" "$PROFILER" --tsv "$tsv_t4383" "$fixture_t4383" >/dev/null 2>&1
+rc_t4383=$?
+assert_eq "profiler does not leak trap rc=2 when wrapped test exits 0 under set -e" "$rc_t4383" "0"
 
 # ─── Summary ─────────────────────────────────────────────────────────────
 echo ""
