@@ -189,6 +189,27 @@ DATA = REPO_ROOT / "data" / "x.json"
 assert_fails "AnnAssign target named REPO_ROOT is flagged (#4483)"
 reset_tmpdir
 
+# ─── Test 16: Fix block surfaces canonical sys.path fallback pattern (#4559) ─
+# When the guard flags a script, the Fix block's option 4 must literally show
+# the canonical `if _SF_SRC.is_dir() and str(_SF_SRC) not in sys.path:` pattern,
+# so operators don't have to hunt through reference impls to discover it.
+TESTS=$((TESTS + 1))
+create_test_file "fix_block_probe.py" '_REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA = _REPO_ROOT / "x.json"
+'
+out=$("$CHECK_SCRIPT" --dir "$TMPDIR_TEST" 2>&1 || true)
+if printf '%s\n' "$out" | grep -q 'is_dir() and str' \
+   && printf '%s\n' "$out" | grep -q 'sys.path.insert(0, str' \
+   && printf '%s\n' "$out" | grep -q 'cc-dual-run-diff.py'; then
+    echo "PASS: Fix block surfaces canonical sys.path fallback pattern (#4559)"
+else
+    echo "FAIL: Fix block missing canonical pattern (#4559)"
+    echo "      output was:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
