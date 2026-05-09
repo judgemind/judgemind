@@ -770,9 +770,37 @@ def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _parse_blocked_by(body: str) -> list[int]:
-    """Mirror DispatcherDaemon._parse_blocked_by."""
-    return [int(m) for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)]
+def _parse_blocked_by(body):
+    """Delegate to the canonical Blocked by #N parser — see #4514.
+
+    Imports are deferred to call-time for the same reasons as
+    ``_parse_parent_issue`` below: the shim runs in environments where
+    the dispatcher directory may not yet be on sys.path (e.g. test
+    fixtures that set ``PHASE_TRANSITIONS_DIR`` rather than
+    ``REPO_ROOT`` to point at the dispatcher source). The sys.path-setup
+    loop near the top of this shim covers the production paths
+    (``/app/scripts/dispatcher`` and ``$REPO_ROOT/scripts/dispatcher``);
+    when neither resolves we additionally probe
+    ``PHASE_TRANSITIONS_DIR`` here. If even that fails the function
+    returns ``[]`` — ``blocked_by`` is a best-effort metadata field for
+    the planning input bundle, not a correctness gate, so degrading
+    gracefully is fine.
+    """
+    try:
+        from blocked_by import parse_blocked_by as _impl  # noqa: PLC0415
+    except ImportError:
+        # Fallback: try the test-fixture env var that names the dispatcher
+        # directory directly (used by scripts/tests/test_agent_runner_entrypoint.sh).
+        _alt_dir = os.environ.get("PHASE_TRANSITIONS_DIR", "")
+        if _alt_dir and Path(_alt_dir).is_dir() and _alt_dir not in sys.path:
+            sys.path.insert(0, _alt_dir)
+            try:
+                from blocked_by import parse_blocked_by as _impl  # noqa: PLC0415
+            except ImportError:
+                return []
+        else:
+            return []
+    return _impl(body)
 
 
 def _parse_parent_issue(body):
