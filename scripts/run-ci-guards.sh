@@ -40,6 +40,7 @@
 #   * check-issue-author.sh        — needs an issue number argument
 #   * check-duplicate-pr.sh        — needs an issue number argument
 #   * check-shipped-pr.sh          — needs an issue number argument
+#   * check-issue-plan-blocked.sh  — needs an issue number argument
 #   * check-blocked-issues.sh      — scans live GitHub issues
 #   * check-task-recovery.sh       — needs a worktree path argument
 #   * check-pr-title.sh            — needs a PR number / title input
@@ -120,6 +121,7 @@ SKIP_LIST=(
     "check-issue-author.sh"
     "check-duplicate-pr.sh"
     "check-shipped-pr.sh"
+    "check-issue-plan-blocked.sh"
     "check-blocked-issues.sh"
     "check-task-recovery.sh"
     "check-pr-title.sh"
