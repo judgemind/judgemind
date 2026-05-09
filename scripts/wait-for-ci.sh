@@ -60,23 +60,35 @@
 #   0 — Success. Reached via one of two paths, in priority order:
 #       (a) **Canonical-merge-gate fast-path** (#4069): `mergeable == MERGEABLE`,
 #           any `ci-passed` entry in the filter=latest response has
-#           conclusion=success, and no latest check has conclusion=
-#           failure/timed_out/action_required/cancelled. Stdout names this
-#           path explicitly with the substring `canonical merge gate green`.
-#           This path exits immediately even if filter=latest still surfaces
-#           in_progress entries from a superseded CI run on the same SHA —
-#           the same gate documented in `docs/agent/code-standards.md`
-#           §"Interpreting mergeStateStatus (UNSTABLE-but-green)".
+#           conclusion=success, and no latest check has a hard-failure
+#           conclusion (failure, timed_out, action_required). Stdout names
+#           this path explicitly with the substring `canonical merge gate
+#           green`. This path exits immediately even if filter=latest still
+#           surfaces in_progress entries from a superseded CI run on the
+#           same SHA, or `cancelled` entries from a non-required check
+#           (e.g. Vercel's `Check major pages` `concurrency:
+#           cancel-in-progress` cancel) — the same gate documented in
+#           `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
+#           (UNSTABLE-but-green)" (#4407).
 #       (b) **All-checks-complete path:** filter=latest shows pending=0,
-#           ci-passed=success, no failures, and mergeStateStatus is CLEAN or
-#           UNSTABLE. Stdout names this path with `all checks complete`.
-#   1 — Early failure: one or more checks have a failed conclusion. Prints the
-#       failed check names and their details_url. Before exiting, the failed
-#       jobs' logs are passed to `scripts/classify-ci-flake.sh`. If any
-#       classifies as a known flake AND no rerun has fired on this run yet,
-#       `gh run rerun <run-id> --failed` is invoked once and polling continues
-#       (path stdout names the matched pattern with `flake detected: <label>`).
-#       A second flake on the same run exits 1 — see #4148.
+#           ci-passed=success, no hard failures, and mergeStateStatus is
+#           CLEAN or UNSTABLE. `cancelled` checks count as terminal here —
+#           they do not block this path either. Stdout names this path with
+#           `all checks complete`.
+#   1 — Early failure: one or more checks have a hard failed conclusion
+#       (failure, timed_out, action_required). Prints the failed check
+#       names and their details_url. **`cancelled` is NOT a hard failure**
+#       — it routinely surfaces from Vercel / smoke-test
+#       `concurrency: cancel-in-progress` guards and from manual
+#       `gh run cancel` actions, neither of which reflects a real test
+#       failure (#4407). Cancelled entries are listed in the per-poll
+#       status line but never trigger exit 1.
+#       Before exiting, the failed jobs' logs are passed to
+#       `scripts/classify-ci-flake.sh`. If any classifies as a known flake
+#       AND no rerun has fired on this run yet, `gh run rerun <run-id>
+#       --failed` is invoked once and polling continues (path stdout names
+#       the matched pattern with `flake detected: <label>`). A second
+#       flake on the same run exits 1 — see #4148.
 #   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
 #
 # ── Flake telemetry (#4163) ──────────────────────────────────────────────────
@@ -290,18 +302,31 @@ while true; do
     CHECK_RUNS_JSON=$(gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100&filter=latest" \
         | jq '.check_runs')
 
-    # Count pending, passed, and failed checks.
+    # Count pending, passed, failed (hard), and cancelled checks.
+    #
+    # `cancelled` is split out from `FAILED_COUNT` (#4407) because it is not a
+    # hard failure: Vercel and smoke-test workflows configure
+    # `concurrency: cancel-in-progress: true`, which cancels superseded check
+    # runs the moment a newer push/deploy starts. The cancel is intentional
+    # workflow behaviour, not a real test failure, and the canonical merge
+    # gate documented in `docs/agent/code-standards.md` §"Interpreting
+    # mergeStateStatus (UNSTABLE-but-green)" already permits non-required
+    # `cancelled` checks. Treating them as failures forced every /task agent
+    # to manually fall through to a separate `gh pr view` recipe on every
+    # Vercel-cancellation run; splitting the count closes that loop.
     PENDING_COUNT=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.status != "completed")] | length')
     PASSED_COUNT=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.status == "completed" and (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral"))] | length')
-    FAILED_COUNT=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled"))] | length')
+    FAILED_COUNT=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required"))] | length')
+    CANCELLED_COUNT=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.status == "completed" and .conclusion == "cancelled")] | length')
 
-    echo "[${ELAPSED}s] pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT}"
+    echo "[${ELAPSED}s] pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT} cancelled=${CANCELLED_COUNT}"
 
-    # Check for early failure: any check with a failed conclusion.
+    # Check for early failure: any check with a HARD failed conclusion. A
+    # cancelled-only state never trips this branch (#4407).
     if [ "$FAILED_COUNT" -gt 0 ]; then
         echo ""
         echo "ERROR: ${FAILED_COUNT} check(s) failed:" >&2
-        echo "$CHECK_RUNS_JSON" | jq -r '.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled")) | "  - \(.name): conclusion=\(.conclusion)  \(.details_url // "(no details url)")"' >&2
+        echo "$CHECK_RUNS_JSON" | jq -r '.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")) | "  - \(.name): conclusion=\(.conclusion)  \(.details_url // "(no details url)")"' >&2
 
         # ── Known-flake auto-rerun (#4148) ────────────────────────────────
         # Before exiting 1, classify each failed job's log tail. If any
@@ -329,7 +354,7 @@ while true; do
             # validator forbids control chars).
             FAILED_DETAILS=$(echo "$CHECK_RUNS_JSON" | jq -r '
                 .[]
-                | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "cancelled"))
+                | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required"))
                 | "\(.name // "")\t\(.details_url // "")"
             ')
 
@@ -401,35 +426,40 @@ EOF
     CI_PASSED_SUCCESS=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | any(.conclusion == "success")')
     CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed") | .conclusion] | (.[0] // "")')
 
-    # ── Canonical-merge-gate fast-path (#4069) ───────────────────────────────
+    # ── Canonical-merge-gate fast-path (#4069, #4407) ────────────────────────
     # Mirrors `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
     # (UNSTABLE-but-green)" and the `/task` skill's §A.7 merge gate. When
     # `mergeable == MERGEABLE`, the required `ci-passed` check is success on
     # its latest run, and no latest check is a hard failure, the PR is safe
     # to merge regardless of any pending entries left over from a superseded
-    # CI run on the same SHA. Exit immediately so callers don't burn the full
-    # timeout watching phantom in_progress rows that will never complete.
+    # CI run on the same SHA OR `cancelled` entries from a non-required
+    # Vercel/smoke-test concurrency cancel (#4407). Exit immediately so
+    # callers don't burn the full timeout watching phantom in_progress rows
+    # that will never complete OR fall through to a hand-rolled `gh pr view`
+    # gate every time Vercel cancels a deploy.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
         MERGEABLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeable -q .mergeable 2>/dev/null || echo "UNKNOWN")
         if [ "$MERGEABLE" = "MERGEABLE" ]; then
             echo ""
-            echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, ci-passed=success, failed=0; pending=${PENDING_COUNT} ignored as superseded)."
+            echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, ci-passed=success, failed=0; pending=${PENDING_COUNT} ignored as superseded; cancelled=${CANCELLED_COUNT} ignored as non-required)."
             exit 0
         fi
     fi
 
     # ── Existing all-checks-complete path ────────────────────────────────────
-    # When pending=0, every check has a terminal conclusion. Combined with
-    # ci-passed=success and a CLEAN/UNSTABLE mergeStateStatus, this is the
-    # original safe-to-merge signal. Kept as a fallback for the case where
-    # `mergeable` cannot be resolved (UNKNOWN, API error) so the script still
-    # exits when CI legitimately drained to zero pending.
+    # When pending=0, every check has a terminal conclusion (success, skipped,
+    # neutral, or cancelled — cancelled counts as terminal here, see #4407).
+    # Combined with ci-passed=success, no hard failures, and a CLEAN/UNSTABLE
+    # mergeStateStatus, this is the original safe-to-merge signal. Kept as a
+    # fallback for the case where `mergeable` cannot be resolved (UNKNOWN,
+    # API error) so the script still exits when CI legitimately drained to
+    # zero pending.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$PENDING_COUNT" -eq 0 ]; then
         # Secondary guard: verify mergeStateStatus is CLEAN or UNSTABLE.
         MERGE_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus -q .mergeStateStatus)
         if [ "$MERGE_STATE" = "CLEAN" ] || [ "$MERGE_STATE" = "UNSTABLE" ]; then
             echo ""
-            echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE})."
+            echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE}, cancelled=${CANCELLED_COUNT} non-blocking)."
             exit 0
         else
             echo "  ci-passed=success but mergeStateStatus=${MERGE_STATE}, still waiting..."
@@ -440,7 +470,7 @@ EOF
     if [ "$NOW_TS" -ge "$DEADLINE" ]; then
         echo ""
         echo "ERROR: Timed out after ${TIMEOUT_SECS}s waiting for CI on PR #${PR_NUMBER}." >&2
-        echo "Last state: pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT}" >&2
+        echo "Last state: pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT} cancelled=${CANCELLED_COUNT}" >&2
         echo "ci-passed conclusion: ${CI_PASSED_CONCLUSION:-(not yet present)}" >&2
         exit 2
     fi
