@@ -311,3 +311,108 @@ def test_classify_files_path_in_both_promotes_to_target(extract_module):
     target, search = extract_module.classify_files(body)
     assert target == ["scripts/foo.sh"]
     assert search == []
+
+
+# ─── Line-range suffix stripping (issue #4462) ────────────────────────
+
+
+def test_line_range_suffix_stripped_dedupes_with_bare_path(extract_module):
+    """Issue bodies often cite a file both with a line range
+    (``foo.py:47-62``) and bare (``foo.py``). The downstream
+    ``gh api /repos/.../commits?path=<path>`` query rejects line ranges,
+    so the line-ranged variant resolves to no commits and the threshold
+    is unreachable. Strip the trailing ``:N`` / ``:N-M`` suffix BEFORE
+    dedupe so both cite forms collapse to one canonical entry.
+
+    Regression for #4462. Canonical case from issue #3310 — body cited
+    ``infra/terraform/modules/iam_agent/main.tf:47-62`` and
+    ``infra/terraform/modules/iam_agent/main.tf:132-141`` in narrative
+    plus the bare path in a fenced block; pre-fix the extractor emitted
+    three separate entries.
+    """
+    body = (
+        "see infra/terraform/foo/main.tf:47-62 and "
+        "infra/terraform/foo/main.tf for the fix"
+    )
+    out = extract_module.extract_files(body)
+    assert out == ["infra/terraform/foo/main.tf"]
+
+
+def test_line_range_suffix_single_line_stripped(extract_module):
+    """Bare-line citations (``foo.py:42``, no range) also strip. The
+    suffix regex matches ``:N`` as well as ``:N-M``.
+    """
+    body = (
+        "Bug at scripts/check-shipped-pr.sh:42 — see also scripts/check-shipped-pr.sh."
+    )
+    out = extract_module.extract_files(body)
+    assert out == ["scripts/check-shipped-pr.sh"]
+
+
+def test_line_range_suffix_three_cite_forms_collapse(extract_module):
+    """Three cite forms — single line, line range, bare — all dedupe
+    to one entry. Mirrors the worked example from issue #4462.
+    """
+    body = (
+        "infra/terraform/modules/iam_agent/main.tf:47-62 and "
+        "infra/terraform/modules/iam_agent/main.tf:132 plus "
+        "infra/terraform/modules/iam_agent/main.tf bare."
+    )
+    out = extract_module.extract_files(body)
+    assert out == ["infra/terraform/modules/iam_agent/main.tf"]
+
+
+def test_line_range_suffix_with_trailing_punctuation(extract_module):
+    """A cite like ``foo.py:47-62.`` (sentence period after the line
+    range) must still strip the line range. The implementation runs
+    the punctuation strip BEFORE the line-range strip — the period
+    falls off first, then the ``:47-62`` falls off cleanly.
+    """
+    body = (
+        "Bug lives at scripts/check-shipped-pr.sh:47-62. "
+        "Reading scripts/check-shipped-pr.sh."
+    )
+    out = extract_module.extract_files(body)
+    assert out == ["scripts/check-shipped-pr.sh"]
+
+
+def test_line_range_suffix_target_wins_over_search(extract_module):
+    """When the bare path appears in narrative (target-context) and the
+    line-ranged variant appears in a Verify line, both collapse to the
+    bare path — and the precedence rule still tags it as target-context.
+    Locks in that the line-range strip runs before classification.
+    """
+    body = (
+        "Update `scripts/check-shipped-pr.sh` to handle the new shape.\n"
+        "Verify: `grep -n widget scripts/check-shipped-pr.sh:42`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    # Narrative cite (bare) is target; Verify cite (line-ranged) strips
+    # to bare and then promotes to target via the precedence rule.
+    assert target == ["scripts/check-shipped-pr.sh"]
+    assert search == []
+
+
+def test_line_range_suffix_only_in_search_context_stays_search(extract_module):
+    """If the path appears only with a line-range suffix inside a
+    Verify line (no narrative cite), the stripped path is search-
+    context — line-range stripping happens at the path-extraction
+    layer, not at the classification layer.
+    """
+    body = "Verify: `grep -n widget packages/api/src/index.ts:42-99`\n"
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert search == ["packages/api/src/index.ts"]
+
+
+def test_line_range_suffix_does_not_strip_non_numeric(extract_module):
+    """The suffix regex matches ONLY ``:<digits>`` or ``:<digits>-<digits>``
+    at end-of-string. A path with a non-numeric trailing token after the
+    colon (rare, but defensive) is not affected.
+    """
+    # Trailing colon alone is already stripped by TRAILING_STRIP.
+    # A path like ``foo.py:abc`` is not a real cite — defensive: don't
+    # strip anything past the colon.
+    body = "See packages/api/src/index.ts (the entry point)."
+    out = extract_module.extract_files(body)
+    assert out == ["packages/api/src/index.ts"]
