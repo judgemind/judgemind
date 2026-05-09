@@ -647,13 +647,21 @@ jobs:
           # test_agent_runner_entrypoint.sh). Pre-#4067 this was the
           # `shell` shard; it observed ~21 min wall-clock dominated by
           # serial execution behind the long pole.
-          # Estimated wall-clock ~10 min today (next-largest test is
-          # test_dev_db_query.sh at ~5m25s; the rest are <1 min each).
-          # timeout-minutes:14 = ~1.4× current — adds room for setup
-          # variance + the dispatcher-tests step that runs after.
-          # See issues #3307 (original sharding) + #4067 (this split).
+          # #4497 cut test_dev_db_query.sh from ~5m25s to ~30s by baking
+          # LIST_TASKS_POLL_TIMEOUT_SECS=0 / EXEC_AGENT_POLL_TIMEOUT_SECS=0
+          # defaults into the test's run_script wrapper — the 5 tests that
+          # reach the AWS-polling stage now fail-fast on the first
+          # list-tasks "None" response instead of waiting the script's
+          # production 60-second deadline. Expected shard wall-clock is
+          # now ~6-7 min. The hard timeout-minutes:10 is the new
+          # regression gate per #4497's AC — fails the shard if a future
+          # change reintroduces a comparable long pole. Don't bump back
+          # to 14 without a follow-up issue documenting why the
+          # structural trim is no longer holding.
+          # See issues #3307 (original sharding), #4067 (this split +
+          # 14-min gate), and #4497 (structural trim + 10-min gate).
           - shard: shell-fast
-            timeout-minutes: 14
+            timeout-minutes: 10
             shard-filter: not-slow
           # Shard shell-slow (#4067): runs only paths in SLOW_TESTS so
           # the other tests in shell-fast no longer queue behind them.
