@@ -47,6 +47,17 @@ def main() -> int:
         "candidate_files": candidate_files,
     }
 
+    # Verify-clause channel (#4472). When the wrapper resolved the match
+    # via _check_shipped_pr_verify_probe.py rather than path-overlap, the
+    # canonical Verify clause that fired is passed through this env var
+    # so the JSON summary can name it. Empty string → no verify-channel
+    # match → field is omitted (preserves pre-#4472 JSON shape for
+    # path-overlap-driven matches that downstream consumers may already
+    # parse).
+    verify_clause = os.environ.get("CHECK_SHIPPED_VERIFY_CLAUSE", "")
+    if verify_clause:
+        summary["verify_clause"] = verify_clause
+
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
