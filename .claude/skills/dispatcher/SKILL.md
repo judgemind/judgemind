@@ -735,9 +735,30 @@ In the main loop (step 5), after handling merges and syncing:
 
 1. Check if `prs_since_last_audit >= 20`.
 2. Check that no `/audit` agent is already running (avoid overlapping audits).
-3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent.
+3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent (see "Spawn pattern" below for the exact Agent-tool block — bare `prompt: "/audit"` is insufficient).
 4. Reset `prs_since_last_audit` to 0 and persist to `tmp/dispatcher_state.json`.
 5. Send a Telegram notification using the **Audit triggered** template from the Message Templates table
+
+### Spawn pattern — MANDATORY explicit form
+
+**Use this exact Agent-tool spawn block.** The bare-prompt form `prompt: "/audit"` is a known failure mode (see #4091): the spawned subagent receives a one-token user message with no context, frequently fails to recognise it as a slash-command invocation, replies with "I don't have an `/audit` skill" without invoking any tools, and exits in 4-5 seconds with zero work done. The fix is to spell out the skill invocation in the prompt body so the spawned LLM cannot misinterpret it.
+
+The `audit` skill is loaded into every Agent-tool subagent's `available-skills` list — the bug was never that the skill was missing; the bug was that the bare prompt did not direct the subagent to invoke the Skill tool.
+
+```
+Agent tool with:
+  isolation: "worktree"
+  description: "Audit (every 20 PRs)"
+  prompt: |
+    Invoke the audit skill via the Skill tool with skill: "audit".
+
+    This is the periodic codebase health audit triggered by the dispatcher
+    every 20 merged PRs. The audit skill (.claude/skills/audit/SKILL.md) is
+    available in your skills list — call it now and work through every step
+    autonomously. Do not ask for confirmation.
+```
+
+The same pattern applies to any other dispatcher-spawned periodic skill (e.g. `/spotcheck` when the queue is low — see "Queue low or empty → spawn /spotcheck instead of idling"): always provide an explicit prompt that names the skill, references its SKILL.md, and tells the subagent to invoke it via the Skill tool.
 
 ### Slot usage
 
