@@ -332,3 +332,57 @@ class TestFormatSummary:
             )
         ]
         assert isinstance(format_summary(rows), str)
+
+    def test_summary_renders_mismatch_block(self) -> None:
+        """Summary includes a MISMATCHED CASE SETS section when any row has
+        flag='mismatch'. Covers the dual_run_diff.format_summary mismatch
+        rendering branch (lines 218-226).
+        """
+        rows = [
+            DiffRow(
+                department="16",
+                count_a=2,
+                count_b=2,
+                cases_only_a=["C24-00001"],
+                cases_only_b=["C24-00099"],
+                flag="mismatch",
+            ),
+        ]
+        summary = format_summary(rows)
+        assert "MISMATCHED CASE SETS" in summary
+        assert "dept 16" in summary
+        # Both only_retired and only_portal lines should render when
+        # the cases_only_* lists are non-empty
+        assert "only_retired=" in summary
+        assert "only_portal=" in summary
+
+
+# ---------------------------------------------------------------------------
+# Additional — None-department filtering (AC#2 edge case)
+# ---------------------------------------------------------------------------
+
+
+class TestNoneDepartmentFiltering:
+    def test_captures_with_none_department_excluded(self) -> None:
+        """Captures whose department is None are filtered out before diff —
+        e.g. a portal capture whose PDF filename did not match the dept-prefix
+        pattern. Covers dual_run_diff line 129 (the ``if cap.department is None``
+        continue branch).
+        """
+        # Retired side has a real dept-16 capture; portal side has one capture
+        # with department=None (e.g. PDF filename had no parseable prefix).
+        captures_a = [_retired("16", "C24-01001")]
+        captures_b = [
+            Capture(
+                scraper_id="ca-cc-tentatives-portal",
+                department=None,
+                case_number="C24-01001",
+                hearing_date=DATE_A,
+            )
+        ]
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        # Portal side filtered to empty → dept 16 appears as missing_portal
+        assert len(rows) == 1
+        assert rows[0].department == "16"
+        assert rows[0].flag == "missing_portal"
+        assert rows[0].count_b == 0
