@@ -45,6 +45,28 @@
 #                     with --county, the reset is scoped to just that county's
 #                     rows (per-county reset); otherwise it truncates the
 #                     derived schema globally.
+#
+# Decision: use --reset?
+#
+#   Use plain ``--county <N>`` (no --reset) when:
+#     * You want to fill in NULL fields (e.g., a new ruling_text_html column).
+#     * Live scraper bug fix that affects only correctable facts
+#       (hearing_date, outcome, motion_type, department, ruling_text,
+#       ruling_text_html, summary).
+#     * The upsert's preserve-first behavior on identity anchors is desired
+#       (you do NOT want existing case_id / judge_id values to change).
+#
+#   Use ``--reset --county <N>`` when:
+#     * Fixing wrong identity-anchor fields (judge_id, case_id) — without
+#       --reset, ON CONFLICT preserves the existing wrong value via
+#       ``COALESCE(rulings.col, EXCLUDED.col)`` and the rebuild silently
+#       no-ops on those columns (#3732, #4284).
+#     * Cleaning up rows produced by a known-bad pre-fix scraper run.
+#     * You want a fresh delete-and-reingest scoped to one county.
+#
+#   See ``packages/scraper-framework/src/ingestion/db.py::insert_ruling`` for the
+#   full ON CONFLICT column classification (identity anchor vs correctable fact).
+#
 #   --force-split-child-loss
 #                     Deprecated no-op kept for CLI/tooling compatibility.  As
 #                     of #2494, the rebuild re-derives split-children from the
@@ -1742,7 +1764,16 @@ def main() -> None:
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Truncate all derived tables and delete OpenSearch index before rebuilding",
+        help=(
+            "Truncate all derived tables and delete OpenSearch index before "
+            "rebuilding (scoped to --county / --court when those flags are "
+            "also set, otherwise global). REQUIRED when fixing wrong "
+            "identity-anchor fields like judge_id or case_id — without it, "
+            "ON CONFLICT preserves the existing value via COALESCE and the "
+            "rebuild silently no-ops on those columns (#3732, #4284). "
+            "Correctable facts (hearing_date, outcome, motion_type, "
+            "department, ruling_text) update without --reset."
+        ),
     )
     _scope_group = parser.add_mutually_exclusive_group()
     _scope_group.add_argument(
