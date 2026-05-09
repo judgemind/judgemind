@@ -244,8 +244,7 @@ MOCK
 run_script() {
     local tmpdir="$1"
     shift
-    local mock_gh
-    mock_gh=$(setup_mock_gh "$tmpdir")
+    setup_mock_gh "$tmpdir" >/dev/null
 
     PATH="$tmpdir:$PATH" \
     RESPONSES_DIR="$tmpdir/responses" \
