@@ -298,9 +298,9 @@ Evaluate:
   ```
   (Use the PR's `headRefName` from `mcp__github__get_pull_request` for `<existing-PR-branch>`.) If the existing branch name conflicts with the auto-created worktree branch, a throwaway `adopt-<N>` tracking branch is fine — the push target is the original PR's head ref, not this worktree's branch name.
 - **`state: CLOSED` (merged or declined):** MCP returned a stale hit for a PR that has since closed. Treat as no duplicate and continue to Path A / Path B normally.
-- **Ambiguous case** (e.g. the existing PR addresses a *different* sub-scope of the issue and the current task is a legitimate follow-up, or the existing PR is stalled with no clear path forward): post a comment on the issue explaining the adoption decision and exit terminal. Write the comment to `{worktree}/tmp/adoption_bail_comment.txt`, then:
+- **Ambiguous case** (e.g. the existing PR addresses a *different* sub-scope of the issue and the current task is a legitimate follow-up, or the existing PR is stalled with no clear path forward): post a comment on the issue explaining the adoption decision and exit terminal. Write the comment to `{worktree}/tmp/adoption_bail_comment.txt`, then post via `scripts/gh-comment-with-retry.sh` (the wrapper transparently handles the 504-after-success failure mode #4478):
   ```
-  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/adoption_bail_comment.txt
+  {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/adoption_bail_comment.txt
   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
   ```
   The comment should name the existing PR, explain why the current agent can't adopt it (stalled, scope mismatch, author disagreement), and either re-add `agent/ready` or leave the label off for human review. Then stop — worktree cleanup is automatic.
@@ -337,10 +337,10 @@ When the issue's title or body classifies as **audit-class** — any of `audit`,
 Read the JSON summary from stdout (the `shipped_pr` field names the merged PR; `overlap_files` and `added_files` show what landed). Then:
 
 1. **Run any acceptance-criteria `Verify:` commands that look mechanical.** Walk the issue body, extract each `Verify:` line, and run only those that are concrete commands (e.g. `Verify: scripts/foo.sh exits 0`, `Verify: pytest -k test_x`, `Verify: grep -n <pattern> <file>`). Skip free-form prose verifies ("Verify: manual sanity — flip a hex...") — those need a human.
-2. **All-green path:** if every mechanical `Verify:` command exits clean, the issue is done. Post a verification-evidence comment quoting the verify commands + their output + naming the shipped PR, close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
+2. **All-green path:** if every mechanical `Verify:` command exits clean, the issue is done. Post a verification-evidence comment quoting the verify commands + their output + naming the shipped PR via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478), close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
 
    ```
-   gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
+   {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/verification_evidence.txt
    gh issue close <N> --repo judgemind/judgemind --reason completed
    {worktree}/scripts/unblock-dependents.sh <N>
    gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
@@ -376,9 +376,9 @@ The verify-and-close path should be the common case when this check fires — pr
   - **Reduced docs-only PR** — when there is a residual docs delta worth producing (e.g. "document that Container Insights is enabled and cite the Terraform attribute that landed it"). The AC's intent usually has a residual of this shape; complete it as a minimal PR before proceeding to merge.
   - **Verification-only close** — when there is no remaining docs delta, which is the common case for `fix(test)` and `test(...)` issues whose acceptance criteria are exhausted by "the test passes." The AC's `Verify:` command output IS the verification evidence; post it, name the PR that landed the fix, close the issue with `--reason completed`, and run `scripts/unblock-dependents.sh <N>` if anything was blocking on it. Skip Path A entirely — there is no PR to file. The label-interlock teardown (`gh issue edit <N> --remove-label status/in-progress`) still runs at the close.
 
-  Write the comment to `{worktree}/tmp/gap_probe_comment.txt` and post it:
+  Write the comment to `{worktree}/tmp/gap_probe_comment.txt` and post it via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478):
   ```
-  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/gap_probe_comment.txt
+  {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/gap_probe_comment.txt
   ```
 - **Probe ambiguous** (e.g. the AWS API returns unexpected output, the grep hits unrelated files, the state is partially configured): treat as "gap real" and continue to Path A.
 
@@ -425,9 +425,9 @@ Exit codes:
   - Continue investigating to root-cause from observed symptoms (treat the issue as Path B / investigation), OR
   - Re-scope the issue: post a comment proposing the corrected hypothesis and prescribed fix, and proceed with Path A against the new scope.
 
-  Write the comment to `{worktree}/tmp/hypothesis_falsified_comment.txt` and post it:
+  Write the comment to `{worktree}/tmp/hypothesis_falsified_comment.txt` and post it via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478):
   ```
-  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/hypothesis_falsified_comment.txt
+  {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/hypothesis_falsified_comment.txt
   ```
 - **Probe ambiguous** (the function returns something unexpected but not clearly right or wrong; the sample input may not be representative): instrument before guessing. Add a structured log to the suspected layer that captures the raw input/output it actually saw, ship that as an instrumentation-only PR (or local probe), and re-trigger. See `docs/agent/investigation-patterns.md` §"Instrument before you guess." Don't extend the prescribed fix on top of an ambiguous probe.
 
@@ -486,9 +486,9 @@ The step runs `git fetch origin main` + `git rebase origin/main` under the hood,
     ```
     git -C {worktree} rebase --abort
     ```
-    Write a short block comment to `{worktree}/tmp/rebase_block.txt` naming the conflicting files and the competing origin/main commit(s), then (writes — stay on `gh`):
+    Write a short block comment to `{worktree}/tmp/rebase_block.txt` naming the conflicting files and the competing origin/main commit(s), then post via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478) and update labels (writes — stay on `gh`):
     ```
-    gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/rebase_block.txt
+    {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/rebase_block.txt
     gh issue edit <N> --repo judgemind/judgemind --add-label status/blocked --remove-label status/in-progress
     ```
     Stop — do not proceed to A.1. Worktree cleanup is automatic. A follow-up agent (or a human) can pick the issue up after the conflicting PR has been triaged.
@@ -1047,9 +1047,9 @@ Post a summary comment on the investigation issue listing the findings and linki
 
 **Close the investigation issue after posting findings.** Investigation issues are fully resolved once findings are documented and follow-up issues are filed. Leaving them open causes duplicate agent work — another agent will pick up the still-open issue and re-investigate.
 
-Write the close comment to `{worktree}/tmp/close_comment.txt`, then post and close (writes — stay on `gh`; `gh issue close --reason completed` has no MCP equivalent):
+Write the close comment to `{worktree}/tmp/close_comment.txt`, then post via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478) and close (writes — stay on `gh`; `gh issue close --reason completed` has no MCP equivalent):
 ```
-gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/close_comment.txt
+{worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/close_comment.txt
 gh issue close <N> --repo judgemind/judgemind --reason completed
 ```
 

@@ -29,9 +29,9 @@ You have full authority to execute operational work:
 - **Bash** — `scripts/ecs-run-task.sh` for ECS oneshot script runs, `scripts/dev-db-query.sh` for SQL queries, `gh` for issue/label/comment operations, `aws s3` for artifact downloads, `psql` via the scripts for DB validation. Set `timeout: 1200000` on long-running commands.
 - **Read / Glob / Grep** — full filesystem access for reading issue context, scripts, and docs.
 - **MCP servers** — `mcp__github__*` for GitHub reads, `mcp__awslabs_cloudwatch-mcp-server__*` and `mcp__awslabs_ecs-mcp-server__*` for ECS + CloudWatch reads.
-- **gh CLI** — `gh issue comment`, `gh issue close`, `gh issue edit`, `gh issue view`.
+- **gh CLI** — `gh issue comment` (via `scripts/gh-comment-with-retry.sh` wrapper), `gh issue close`, `gh issue edit`, `gh issue view`.
 
-> **MCP vs `gh`:** `mcp__github__get_issue` for reads. `gh issue comment --body-file`, `gh issue close`, `gh issue edit --add-label` for writes. See `docs/agent/github-api-access.md`.
+> **MCP vs `gh`:** `mcp__github__get_issue` for reads. `scripts/gh-comment-with-retry.sh` (wrapper around `gh issue comment --body-file` that handles the 504-after-success failure mode #4478), `gh issue close`, `gh issue edit --add-label` for writes. See `docs/agent/github-api-access.md`.
 
 > **MCP vs `aws` CLI:** `scripts/ecs-run-task.sh` for ECS oneshot task launch (handles network config, log streaming, exit-code propagation). `mcp__awslabs_ecs-mcp-server__*` for cluster/task reads. See `docs/agent/aws-api-access.md`.
 
@@ -182,10 +182,10 @@ Write the evidence markdown to a temp file then post:
 # Do NOT use heredoc — write evidence to a file first, then use --body-file
 ```
 
-Write `{worktree}/tmp/dispatcher-operational/evidence.md` with a `## Verification Evidence` section, then:
+Write `{worktree}/tmp/dispatcher-operational/evidence.md` with a `## Verification Evidence` section, then post via `scripts/gh-comment-with-retry.sh` (the wrapper transparently handles the 504-after-success failure mode #4478, so a flaky GitHub response doesn't surface as a duplicate comment or false-failure verdict):
 
 ```
-gh issue comment <issue_number> --repo judgemind/judgemind --body-file {worktree}/tmp/dispatcher-operational/evidence.md
+{worktree}/scripts/gh-comment-with-retry.sh <issue_number> --body-file {worktree}/tmp/dispatcher-operational/evidence.md
 ```
 
 If the task is complete and the AC say to close the issue:

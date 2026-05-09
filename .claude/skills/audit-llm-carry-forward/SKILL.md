@@ -114,10 +114,10 @@ Replace `FINDING_PREFIX` with the bracketed prefix from the finding's title (e.g
 
   (`N` is the finding's index in the `findings` array, 0-based.)
 
-  Then post the comment:
+  Then post the comment via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478):
 
   ```
-  gh issue comment ISSUE_NUMBER --repo judgemind/judgemind --body-file tmp/llm-carry-forward/comment-N.txt
+  scripts/gh-comment-with-retry.sh ISSUE_NUMBER --body-file tmp/llm-carry-forward/comment-N.txt
   ```
 
   Record the comment URL.
@@ -166,10 +166,10 @@ gh issue list --repo judgemind/judgemind --label source/audit-llm-carry-forward-
   tmp/llm-carry-forward/heartbeat.txt
   ```
 
-  Post:
+  Post via `scripts/gh-comment-with-retry.sh` (the wrapper handles the 504-after-success failure mode #4478):
 
   ```
-  gh issue comment LOG_ISSUE_NUMBER --repo judgemind/judgemind --body-file tmp/llm-carry-forward/heartbeat.txt
+  scripts/gh-comment-with-retry.sh LOG_ISSUE_NUMBER --body-file tmp/llm-carry-forward/heartbeat.txt
   ```
 
 * **No matching open issue:** create the long-lived audit-log issue once. Subsequent weeks will append comments to it.
