@@ -706,6 +706,18 @@ jobs:
       - name: Check shell scripts pipe data into python3 without heredoc shadowing
         if: matrix.shard == 'python'
         run: scripts/check-no-heredoc-pipe-shadow.sh
+      # Issue #4400: top-level scripts/*.py must use configure_structlog
+      # rather than the stdlib basicConfig anti-pattern.  The format-string
+      # logger silently drops every extra= field passed to logger calls
+      # (extras disappear in CloudWatch Logs Insights), which surfaced as
+      # the post-deploy verification incident in #4368.  #4373 migrated 13
+      # files; #4399 closed out the residual.  This guard prevents a new
+      # top-level script from regressing to the old shape.  Files needing
+      # genuine basicConfig opt out via the # basic-config-allow: marker
+      # (e.g. scripts/telemetry_upload.py).
+      - name: Check top-level scripts use configure_structlog for logger setup
+        if: matrix.shard == 'python'
+        run: scripts/check-no-logging-basicconfig.sh
       # Issue #4119: every aws_cloudwatch_metric_alarm in
       # infra/terraform/modules/ must have a row in docs/agent/infrastructure-reference.md
       # (§"CloudWatch Alarms"). Drift accumulates silently otherwise — the

@@ -102,6 +102,13 @@ def mirror_to_s3(
 if __name__ == "__main__":
     import sys
 
+    # basic-config-allow: #4400 — telemetry_upload.py is a tiny CLI shim
+    # whose only job is to upload one local file to S3.  It does not call
+    # ``logger.<level>(..., extra={...})``; the WARNING-level stderr stream
+    # is sufficient for the operator-only failure paths.  Migrating to
+    # ``configure_structlog`` here would add a framework dependency the
+    # script does not otherwise need.  See #4400 for the guard that
+    # forbids the pattern in every other ``scripts/*.py``.
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     if len(sys.argv) != 3:
         print(
