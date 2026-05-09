@@ -106,6 +106,11 @@ VALIDATED: tuple[str, ...] = (
     # drain_splitter_carry_forward_clusters.py — _SCRAPER_SRC is no-op in ECS;
     # scraper-framework installed in /app venv; /app/scripts baked into image (#4321)
     "drain_splitter_carry_forward_clusters.py",
+    # cc-dual-run-diff.py — _SF_SRC has .is_dir() guard; scraper-framework
+    # installed in /app venv inside ECS, so the sys.path append is a no-op there;
+    # the helper imports (courts.ca.cc_tentatives_portal._cc_dept_from_filename,
+    # framework.dual_run_diff.*) resolve from the venv-installed package (#2610)
+    "cc-dual-run-diff.py",
 )
 
 # Module-level variable name pattern: REPO_ROOT or _REPO_ROOT (no
