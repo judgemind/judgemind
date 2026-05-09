@@ -387,6 +387,43 @@ The recommendation token (`operator-triage` for daemon-posted comments per #4438
 
 The verify-and-close path should be the common case when this check fires — the plan-phase agent's "operator should close" recommendation is almost always correct (they ran a full plan analysis to derive it), the only thing missing is the close.
 
+#### 4a.4 — Companion-closed obsoletion check (zombie-companion pivot, MANDATORY when 4a.3 returned exit 1)
+
+**Why this runs after 4a.3:** When an issue's body cites a sibling `#N` as the structural fix it depends on (framing like "removed when #N lands", "blocked on #N", "depends on #N", "until #N", "after #N"), that sibling closing-as-completed often obsoletes the dependent issue entirely. The canonical worked example is #4409 ↔ #4408 ↔ PR #4416 (2026-05-09): #4409 was a temporary-caveat docstring meant to be added "until #4408 lands", PR #4416 closed #4408 *and* shipped the post-fix docstring update, so by the time `/task` picked up #4409 ~16h later the docstring change had already landed. §4b's gap probe caught it via the AC's `grep` Verify line — but only because that AC happened to ship a perfect probe. A more general pre-§4b check can catch the same obsoletion shape from issue text alone, before any AC-specific probe runs. Issue #4557 is the agent-side fix.
+
+Run the check as a single tool call (only after `check-issue-plan-blocked.sh` returned exit 1):
+
+```
+{worktree}/scripts/check-issue-companion-closed.sh <N>
+```
+
+Exit codes:
+
+- **Exit 1 (`clear:` line on stdout) — no actionable companion-closed signal.** Continue to Step 4b. This is the common case. The script emits `clear:no-references` when the body cites no `#N` at all, `clear:no-companion` when it cites `#N` but none appear inside companion framing (e.g. "see #N for context", "Closes #N", "Parent: #N"), and `clear:no-closed-completed` when companion-framed cites exist but no cited sibling is `state == closed` AND `stateReason == COMPLETED` (still-open siblings, or `stateReason == NOT_PLANNED` siblings, do not fire).
+- **Exit 0 (`companion-closed:<N>` line on stdout) — the body cites a closed-completed companion in companion-framed context.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, malformed JSON).** Fail-open: continue to Step 4b.
+
+**False-positive guard:** the check only fires when the cited sibling is `state == closed` AND `stateReason == COMPLETED`. A still-open sibling, or a closed-as-not-planned sibling (operator decided the work isn't needed), leaves the issue alone — the structural fix isn't coming, so the dependent issue's temporary-caveat work might still be needed. Bare cites without companion-framing keywords (`see #N for context`, `Closes #N`, `Parent: #N`) do not fire either — those are informational links, not obsoletion signals.
+
+##### 4a.4.1 — Verify-and-close pivot (only runs on exit 0)
+
+The cited companion number is informational — the action is the same regardless of which sibling triggered. The companion-closed signal says "the structural fix this issue depended on already shipped, AND it closed-as-completed, so the AC's intent is likely already satisfied." The pivot's job is to either confirm-and-close OR explicitly fall through if a residual remains.
+
+1. **Run the §4a.2.1 mechanical-verify pass.** Walk the issue body, extract each concrete `Verify:` command, and run each one. Skip free-form prose verifies. Same procedure as §4a.2.1 step 1 — driven by a different upstream signal (companion closed-completed, not shipped-PR detection). The PR that closed the cited companion almost always landed the dependent work as a side-effect; running the AC's verify commands either confirms that or surfaces the residual.
+2. **All-green path:** if every mechanical `Verify:` command exits clean, the obsoletion stands. Post a verification-evidence comment quoting the verify commands + their output + naming the closed companion AND the PR that closed it (look up via `mcp__github__get_issue` on the cited #N → `closedByPullRequestsReferences`). Close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
+
+   ```
+   {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/verification_evidence.txt
+   gh issue close <N> --repo judgemind/judgemind --reason completed
+   {worktree}/scripts/unblock-dependents.sh <N>
+   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+   ```
+
+   The verification-evidence comment must explicitly cite the closed companion (link or quote the framing line from the body) so the audit trail is clear: "The companion #M closed-as-completed via PR #P on $DATE; today's mechanical verify pass confirmed the AC's intent is satisfied; closing." This is the canonical zombie-companion flow and should be the common case when this check fires.
+3. **Any-failure path:** if any mechanical `Verify:` command fails (or the issue has no mechanical verifies), post a comment naming the closed companion + the failed verify line, leave the issue open, and **fall through to Step 4b.** Normal /task flow continues from there. The PR that closed the companion may not have shipped the dependent work after all — §4b's gap probe and ralph will figure out what's still needed. The comment should make explicit that the agent ran `check-issue-companion-closed.sh`, found that #M is closed-as-completed, ran the mechanical verifies, and at least one is still unmet — so the residual is real.
+
+The verify-and-close path should be the common case when this check fires — when a structural fix lands as `closed-as-completed`, the PR that closed it usually shipped the dependent work alongside it.
+
 ---
 
 ### Step 4b — Verify gap is real (current state probe)
