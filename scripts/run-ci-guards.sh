@@ -49,6 +49,10 @@
 #                                    PATH``; blind invocation exits 2 with
 #                                    "one of the arguments --issue
 #                                    --body-file is required" (#4372)
+#   * check-issue-verify-test-filename.py
+#                                  — same shape as check-issue-verify-sql.py;
+#                                    needs ``--issue N`` or ``--body-file
+#                                    PATH``; blind invocation exits 2 (#4549)
 #   * check-graphql-queries.sh     — requires ``packages/web`` npm install
 #   * check-migration-number-collision.{sh,py}
 #                                  — requires ``gh pr list`` for cross-PR
@@ -144,6 +148,10 @@ SKIP_LIST=(
     # blind invocation exits 2 with "one of the arguments --issue
     # --body-file is required" (#4372).
     "check-issue-verify-sql.py"
+    # check-issue-verify-test-filename.py mirrors the sibling above —
+    # needs --issue N or --body-file PATH; blind invocation exits 2
+    # (#4549).
+    "check-issue-verify-test-filename.py"
     "check-graphql-queries.sh"
     "check-migration-number-collision.sh"
     "check-migration-number-collision.py"
