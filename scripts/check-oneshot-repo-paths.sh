@@ -61,6 +61,7 @@ LOCAL_ONLY=(
     "check-no-unbounded-timeouts.py"
     "check-no-tmp-oneshot-file-path-derivation.py"
     "check-issue-verify-sql.py"
+    "check_test_script_imports_resolvable.py"
     # Developer/dispatcher tooling — only run locally
     "dispatcher-request.py"
     "phase_timer.py"
