@@ -47,9 +47,9 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 9 | `scripts/check-brand-md-tokens.sh` | self-diagnosing (Fix block) | Emits canonical token list. |
 | 10 | `scripts/check-case-type-fallback-parity.sh` | wrapper (delegates to helper) | Wrapper for `check-case-type-fallback-parity.py`. |
 | 11 | `scripts/check-ci-job-skipped.sh` | wrapper (delegates to helper) | Wrapper for `check-ci-job-skipped.py`. |
-| 11a | `scripts/check-ci-guards-skip-list-coverage.sh` | self-diagnosing (Fix block) | Meta-check guarding `run-ci-guards.sh`'s SKIP_LIST: fails when a guard is missing from SKIP_LIST AND has no `# ci-guards: skip` marker. Detects four required-kinds — `argparse required=True` / `add_mutually_exclusive_group(required=True)`, top-level `os.environ["VAR"]` reads, shell `${1:?}` strict positional, and shell `${VAR:?}` strict env var (file-scope only). Emits per-violation `Fix:` block tagged with the detected required-kind so operators see whether the trigger was a CLI argument or an environment variable. Tracking: #4384 (env-var extension), #4379 (parent meta-check, parent: #4332). |
+| 11a | `scripts/check-ci-guards-skip-list-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-ci-guards-skip-list-coverage.py`. Meta-check guarding `run-ci-guards.sh`'s SKIP_LIST: fails when a guard is missing from SKIP_LIST AND has no `# ci-guards: skip` marker. Detects four required-kinds — `argparse required=True` / `add_mutually_exclusive_group(required=True)`, top-level `os.environ["VAR"]` reads, shell `${1:?}` strict positional, and shell `${VAR:?}` strict env var (file-scope only). The helper emits per-violation `Fix:` block tagged with the detected required-kind so operators see whether the trigger was a CLI argument or an environment variable. Tracking: #4384 (env-var extension), #4379 (parent meta-check, parent: #4332). |
 | 12 | `scripts/check-ci-passed-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-ci-passed-coverage.py`. |
-| 13 | `scripts/check-cleanup-step-continue-on-error.sh` | self-diagnosing (Fix block) | Inline Python emits "Add `continue-on-error: true` at the step level". |
+| 13 | `scripts/check-cleanup-step-continue-on-error.sh` | self-diagnosing (actionable text) | Inline Python emits "Add `continue-on-error: true` at the step level". Verdict downgraded to actionable text (#4349) — the emission is concrete imperative guidance but not a labelled `Fix:` block. |
 | 14 | `scripts/check-cloudwatch-alarm-docs.sh` | self-diagnosing (actionable text) | "Add a row to the §'CloudWatch Alarms' table with prefix, module, source metric, ...". Could be upgraded to emit a literal markdown-row patch. |
 | 14a | `scripts/check-deploy-workflow-rollout.sh` | self-diagnosing (Fix block) | Validates that every `.github/workflows/deploy-*.yml` workflow that pushes an image to ECR also rolls the running ECS service / scheduler — flags the silent-drift class behind #2772 (build-and-push job shipped without a rollout sibling, every subsequent merge silently drifts the live image from the running task). Detects `docker push` / `aws ecr put-image` as the push signal and `aws ecs update-service` / `aws scheduler update-schedule` / `aws ecs register-task-definition` / `uses: ./.github/actions/ecs-deploy` as the rollout signal. Workflows that are intentionally build-only (e.g. `deploy-dispatcher-v3.yml` — image lands now, task-def re-registers and service rollouts land in follow-up issues) opt out via the literal `# deploy-rollout-lint: build-only` comment paired with a justification. Emits a `Fix:` block naming the four canonical rollout signals plus the opt-out marker recipe. Wired by `deploy-workflow-rollout-check` in `.github/workflows/ci.yml` (gated on `detect-changes.outputs.deploy-workflows == 'true'`) and the `.githooks/pre-push` hook on `.github/workflows/deploy-*.yml` / `scripts/check-deploy-workflow-rollout.sh` changes. Tracking: #2777 (this guard), #2772 (root-cause incident). |
 | 15 | `scripts/check-deprecated-models.sh` | self-diagnosing (Fix block) | Emits literal model-name replacement table. |
@@ -63,6 +63,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 22 | `scripts/check-duplicate-functions.sh` | wrapper (delegates to helper) | Wrapper for `check-duplicate-functions.py`. |
 | 23 | `scripts/check-duplicate-pr.sh` | decision flow (no violation list) | Returns 0/1/2 with a single status line for callers (`/task` skill). No code violation. |
 | 23a | `scripts/check-fix-block-coverage-complete.sh` | self-diagnosing (Fix block) | Inventory-coverage guard: fails when a runnable hygiene guard exists in the tree without a matching row here. Emits per-violation `Fix:` block naming the doc, the verdict vocabulary, and the letter-suffix-row pattern. Mirrors `run-ci-guards.sh --list` discovery so .py companions are covered by their .sh wrapper's row. Tracking: #4367. |
+| 23b | `scripts/check-fix-block-coverage.py` | self-diagnosing (Fix block) | Verdict-correctness guard: regenerable survey for this inventory. `--check` mode (CI default) verifies the Verdict column of every row matches the classifier's output for the corresponding guard; `--regenerate` prints a fully regenerated table to stdout (verdicts only — manual Notes are intentionally lost). Classifier priority: decision flow > Fix block > operational probe > wrapper > actionable text > NEEDS UPGRADE. Emits a labelled `Fix:` block in `--check` failure mode plus per-row drift detail. Wired by `dx-fix-block-coverage-check` in `.github/workflows/ci.yml`. Tracking: #4349 (this guard), #4346 (the inventory). |
 | 24 | `scripts/check-git-gh-retries.sh` | self-diagnosing (Fix block) | Emits the `git_with_retry` / `gh_with_retry` wrapper pattern. |
 | 25 | `scripts/check-graphql-nullability-drift.sh` | wrapper (delegates to helper) | Wrapper for `check-graphql-nullability-drift.py`. |
 | 26 | `scripts/check-graphql-queries.sh` | self-diagnosing (Fix block) | Emits the `mock` / `__typename` add suggestion. |
@@ -103,11 +104,11 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 50b | `scripts/check-no-unbounded-timeouts.py` | self-diagnosing (Fix block) | Validates IO call sites under `scripts/dispatcher/` carry bounded timeouts (boto3, psycopg, requests, urllib3). Emits per-violation `Fix: add the missing kwarg, or annotate the call with ...` block. No `.sh` wrapper — invoked directly via `python3 scripts/check-no-unbounded-timeouts.py` from CI and pre-push. Tracking: #3353 (root cause), #4364/#4365 (pre-push wiring). |
 | 51 | `scripts/check-nullable-column-reads.sh` | wrapper (delegates to helper) | Wrapper for `check-nullable-column-reads.py`. |
 | 52 | `scripts/check-oneshot-imports.sh` | self-diagnosing (Fix block) | Emits "Fix: inline the helper" guidance. |
-| 53 | `scripts/check-oneshot-repo-paths.sh` | self-diagnosing (Fix block) | Emits the `Path(__file__).resolve().parent.parent` replacement. |
+| 53 | `scripts/check-oneshot-repo-paths.sh` | wrapper (delegates to helper) | Wrapper for `check_oneshot_repo_paths.py` (post-#4483 — was previously a self-contained grep guard, replaced by an AST walk). The helper emits the `Path(__file__).resolve().parent.parent` Fix-options block. |
 | 54 | `scripts/check-parse-document-reingest-safety.sh` | self-diagnosing (Fix block) | Emits required-marker substring list + canonical-example file paths. |
 | 55 | `scripts/check-per-phase-timeouts.sh` | wrapper (delegates to helper) | Wrapper for `check-per-phase-timeouts.py`. |
 | 56 | `scripts/check-placeholder-gates.sh` | self-diagnosing (Fix block) | Emits "remove the placeholder, ship the real check". |
-| 57 | `scripts/check-pr-title.sh` | self-diagnosing (actionable text) | Emits "Remediation: task-v2-summary did not run — re-trigger or amend manually". |
+| 57 | `scripts/check-pr-title.sh` | self-diagnosing (Fix block) | Emits "Remediation: task-v2-summary did not run — re-trigger or amend manually". The labelled `Remediation:` block makes this Fix-block-shaped (#4349 verdict reclassification). |
 | 58 | `scripts/check-rebase-no-silent-drop.sh` | self-diagnosing (Fix block) | Emits `git rebase --abort` + investigation steps. |
 | 59 | `scripts/check-removed-exports.sh` | self-diagnosing (Fix block) | Emits "Either restore the export or update the importers" with a file list. |
 | 60 | `scripts/check-repo-walk-exclusions-canonical.sh` | self-diagnosing (Fix block) | Emits "Required shape:" with literal `source preflight.sh` + iteration block. |
@@ -119,7 +120,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 64 | `scripts/check-shard-coverage.sh` | self-diagnosing (Fix block) | Emits the `--shard-of-N` invocation hint. |
 | 65 | `scripts/check-shipped-pr.sh` | decision flow (no violation list) | Returns shipped/not-shipped verdict for callers. No code violation. |
 | 65a | `scripts/check-short-unsubstantive-rulings.py` | operational health probe | Scheduled-cron data-quality probe — counts per-county rulings with `char_length(ruling_text) < 200 AND motion_type IS NULL AND outcome IS NULL` over the last 7 days. Fires when any county exceeds the configured threshold (signal that extraction is silently dropping useful fields). Fix is to investigate the extraction pipeline for that county; no source-code patch literal applies. Wired by `.github/workflows/short-unsubstantive-ruling-check.yml`. Tracking: #2671. |
-| 66 | `scripts/check-split-ruling-fields-propagated.sh` | wrapper (delegates to helper) | Wrapper for `check_split_ruling_fields_propagated.py` whose `_suggest_scope_entry()` emits the canonical Fix block (the reference upgrade from PR #4345). |
+| 66 | `scripts/check-split-ruling-fields-propagated.sh` | self-diagnosing (Fix block) | The wrapper itself emits a `Fix options:` block (in addition to delegating to `check_split_ruling_fields_propagated.py`, which emits the canonical per-violation Fix block — the reference upgrade from PR #4345). Verdict promoted to Fix block (#4349) — the wrapper's own emission qualifies. |
 | 66a | `scripts/check-sql-columns.py` | self-diagnosing (Fix block) | Validates qualified (`alias.column`) and unqualified column references in Python SQL string literals against `packages/api/src/data-access/schema.sql`. Emits per-violation `Fix: check the table's column definitions in schema.sql.` block. No `.sh` wrapper — invoked directly via `python3 scripts/check-sql-columns.py` from CI (`sql-column-check` job). Tracking: #1929 (qualified-drift), #4271 (unqualified-drift). |
 | 67 | `scripts/check-sql-conflicts.sh` | wrapper (delegates to helper) | Wrapper for `check-sql-conflicts.py`. |
 | 68 | `scripts/check-subprocess-timeouts.sh` | self-diagnosing (Fix block) | Emits `timeout=N` argument suggestion. |
@@ -131,7 +132,7 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 73a | `scripts/check-test-script-imports-mapped.sh` | wrapper (delegates to helper) | Wrapper for `check_test_script_imports_mapped.py`. Verifies that every top-level `scripts/*.py` imported by a test under `packages/scraper-framework/tests/` is in the `dorny/paths-filter` filter that gates the CI job which runs that test. Catches the #4452 / #4449 slip-through class — a PR that modifies only the imported `scripts/*.py` skips the test job entirely (because the path filter is scoped to `packages/scraper-framework/**`), and the regression hides until the next unrelated PR touches the package. Fix block names the missing script paths grouped by filter name (`scraper:` vs `scraper-framework:` vs `scraper-courts:`). Wired by `test-script-imports-mapped-check` in `.github/workflows/ci.yml`. Tracking: #4452 (this guard), #4449 (root-cause incident), #4421 (the PR that produced the slip). |
 | 73b | `scripts/check-test-script-imports-resolvable.sh` | wrapper (delegates to helper) | Wrapper for `check_test_script_imports_resolvable.py`. Sibling guard to `check-test-script-imports-mapped.sh` (#73a) covering the orthogonal hygiene class: a test under `packages/scraper-framework/tests/` may NOT import a `scripts/<name>.py` module that has been archived (`scripts/archive/<name>.py` or `scripts/oneoff/<name>.py`) without explicitly injecting that subtree onto `sys.path`. Catches the four AST shapes the issue body in #4464 itemized — `import X`, `from X import Y` (the headline new shape), `importlib.import_module("X")`, and `importlib.util.spec_from_file_location("X", literal Path)` (the second new shape). Suppresses violations when the test deliberately points `sys.path.insert` / `sys.path.append` at `scripts/archive/` or `scripts/oneoff/` (string literal, `Path / "scripts" / "<sub>"` chain, `os.path.join(..., "scripts", "<sub>")`, with one-shot module-level alias propagation for the production shape `_SCRIPTS_ONEOFF_DIR = os.path.join(...); sys.path.insert(0, _SCRIPTS_ONEOFF_DIR)`). Tests under `tests/archive/` are exempted entirely. Fix block proposes two options per offending file — delete the test (canonical for one-off backfills, mirrors #4459 resolution) or move it under `tests/archive/` and re-point its `sys.path.insert`. Wired by `test-script-imports-resolvable-check` in `.github/workflows/ci.yml`. Tracking: #4464 (this guard), #4452 (sibling), #4459 (the back-catalog cleanup that surfaced the gap). |
 | 74 | `scripts/check-test-statuscode-assertions.sh` | wrapper (delegates to helper) | Wrapper for `check-test-statuscode-assertions.py`. |
-| 75 | `scripts/check-tests-use-reingest-helper.sh` | self-diagnosing (Fix block) | Emits `make_reingest_cap_doc(...)` template. |
+| 75 | `scripts/check-tests-use-reingest-helper.sh` | self-diagnosing (actionable text) | Emits the `make_reingest_cap_doc(...)` template plus "tests MUST use the shared helper instead". Verdict downgraded to actionable text (#4349) — concrete imperative guidance, but not a labelled `Fix:` block. |
 | 76 | `scripts/check-transition-dispatch-vocabulary.sh` | self-diagnosing (Fix block) | Emits the canonical-vocabulary list. |
 | 77 | `scripts/check-vitest-environment-deps.sh` | self-diagnosing (Fix block) | Emits the `npm install` invocation. |
 | 78 | `scripts/check-workflow-paths-filter-coverage.sh` | wrapper (delegates to helper) | Wrapper for `check-workflow-paths-filter-coverage.py`. |
@@ -146,24 +147,26 @@ first read of the failing CI job names the fix, copy-pasteable.
 | 81 | `scripts/check_split_ruling_fields_propagated.py` | self-diagnosing (Fix block) | Reference upgrade from PR #4345 — emits per-violation Fix block with the `_DATACLASS_SCOPE` patch literal. |
 | 81a | `scripts/check_test_script_imports_mapped.py` | self-diagnosing (Fix block) | AST scanner for `scripts/check-test-script-imports-mapped.sh`. Walks `packages/scraper-framework/tests/**.py` for top-level `scripts/*.py` imports (three shapes: `import X`, `from X import ...`, `importlib.import_module("X")` including hyphen-named scripts), parses the `filters: \|` block in `.github/workflows/ci.yml`, and asserts each imported script's path appears in the filter that gates the test's CI job. Emits a per-filter copy-pasteable Fix block listing the missing script paths under each filter name (`scraper`, `scraper-framework`, `scraper-courts`). Imports of archived/missing scripts are intentionally ignored — that's a separate hygiene problem outside the path-filter mapping invariant (covered by sibling #81b). Tracking: #4452. |
 | 81b | `scripts/check_test_script_imports_resolvable.py` | self-diagnosing (Fix block) | AST scanner for `scripts/check-test-script-imports-resolvable.sh` (#73b). Orthogonal counterpart to #81a — same domain (test files under `packages/scraper-framework/tests/`), different invariant: every imported script-name candidate must resolve to a *live* `scripts/<name>.py`, not to `scripts/archive/<name>.py` or `scripts/oneoff/<name>.py`. Walks four AST shapes: `import X` / `from X import Y` (the headline new shape from #4464) / `importlib.import_module("X")` / `importlib.util.spec_from_file_location("X", <path>)` — for `spec_from_file_location` the path-arg is also classified, picking up a literal `Path / "scripts" / "<name>.py"` chain. Suppresses violations on tests that explicitly inject the archive/oneoff subtree onto `sys.path` (string literal, pathlib chain, `os.path.join(...)` with module-level alias propagation for the production `_DIR = os.path.join(..., "scripts", "oneoff")` shape). Exempts the entire `tests/archive/` subtree (the canonical place to keep tests for archived scripts). Fix block proposes per-test delete-or-move options. Tracking: #4464. |
-| 82 | `scripts/check_tests_use_reingest_helper.py` | self-diagnosing (Fix block) | Emits `<path>:<lineno>:CapturedDocument(...)` per violation; wrapper sh adds the helper-template block. |
+| 82 | `scripts/check_tests_use_reingest_helper.py` | self-diagnosing (actionable text) | Emits `<path>:<lineno>:CapturedDocument(...)` per violation; wrapper sh adds the helper-template block. Verdict downgraded to actionable text (#4349) — the effective guidance is imperative ("tests MUST use the shared helper") but not a labelled `Fix:` block. |
 | 83 | `scripts/check_tf_ecs_entrypoint.py` | self-diagnosing (Fix block) | **Upgraded #4346:** emits per-violation `Fix:` block with literal `entryPoint = ["<interpreter>"]` patch + the actual `command =` carryover, naming the resource and container. |
 | 84 | `scripts/check_tf_empty_resource.py` | self-diagnosing (Fix block) | **Upgraded #4346:** emits per-violation `Fix:` block with literal `count = length(local.compacted_<name>) > 0 ? 1 : 0` patch + a `locals { compacted_<name> = compact([...]) }` template, naming the actual variables. |
 
 ## Summary
 
-- Total guards: 112 (#14a `check-deploy-workflow-rollout.sh` added by #2777; #31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381; #37a `check-no-basicconfig-with-extra.sh` + #78a `check_no_basicconfig_with_extra.py` added by #4376; #78b `check_fix_block_coverage_complete.py` added by #4405; #44a `check-no-logging-basicconfig.sh` added by #4400; #21a `check-dispatcher-test-imports.sh` added by #4429; #44c `check-no-manual-sys-modules-mock.sh` + #78c `check_no_manual_sys_modules_mock.py` added by #4434; #73a `check-test-script-imports-mapped.sh` + #81a `check_test_script_imports_mapped.py` added by #4452; #37b `check-no-duplicate-framework-helpers.sh` + #78d `check_no_duplicate_framework_helpers.py` added by #4456; #42a `check-no-hardcoded-llm-provider.sh` + #78e `check_no_hardcoded_llm_provider.py` added by #4050; #73b `check-test-script-imports-resolvable.sh` + #81b `check_test_script_imports_resolvable.py` added by #4464; #79a `check_oneshot_repo_paths.py` added by #4483; #37c `check-no-duplicate-parent-regex.sh` added by #4508; #37d `check-no-duplicate-blocked-by-regex.sh` added by #4514).
-- Already self-diagnosing (Fix block or actionable text) before #4346: 71.
-- Wrappers (delegate to helper): 18.
+- Total guards: 113 (#14a `check-deploy-workflow-rollout.sh` added by #2777; #31a `check-issue-verify-sql.py` added by #4358; #23a `check-fix-block-coverage-complete.sh`, #50b `check-no-unbounded-timeouts.py`, #62a `check-scraper-zero-record-runner.py`, #62b `check-scraper-zero-record-streak.py`, #65a `check-short-unsubstantive-rulings.py`, #66a `check-sql-columns.py` added by #4367; #11a `check-ci-guards-skip-list-coverage.sh` added by #4379; #50a `check-no-tmp-oneshot-file-path-derivation.py` added by #4381; #37a `check-no-basicconfig-with-extra.sh` + #78a `check_no_basicconfig_with_extra.py` added by #4376; #78b `check_fix_block_coverage_complete.py` added by #4405; #44a `check-no-logging-basicconfig.sh` added by #4400; #21a `check-dispatcher-test-imports.sh` added by #4429; #44c `check-no-manual-sys-modules-mock.sh` + #78c `check_no_manual_sys_modules_mock.py` added by #4434; #73a `check-test-script-imports-mapped.sh` + #81a `check_test_script_imports_mapped.py` added by #4452; #37b `check-no-duplicate-framework-helpers.sh` + #78d `check_no_duplicate_framework_helpers.py` added by #4456; #42a `check-no-hardcoded-llm-provider.sh` + #78e `check_no_hardcoded_llm_provider.py` added by #4050; #73b `check-test-script-imports-resolvable.sh` + #81b `check_test_script_imports_resolvable.py` added by #4464; #79a `check_oneshot_repo_paths.py` added by #4483; #37c `check-no-duplicate-parent-regex.sh` added by #4508; #37d `check-no-duplicate-blocked-by-regex.sh` added by #4514; #23b `check-fix-block-coverage.py` added by #4349).
+- Self-diagnosing (Fix block): 76.
+- Self-diagnosing (actionable text): 7.
+- Wrappers (delegate to helper): 21.
 - Operational health probes: 5.
 - Decision flows: 4.
+- NEEDS UPGRADE: 0.
 - **Upgraded by #4346: 5** (#6 `check-bash-compat.sh`, #29 `check-hyphen-underscore-collision.sh`, #35 `check-migration-files.sh`, #71 `check_tf_ecs_entrypoint.py`, #72 `check_tf_empty_resource.py`).
-- No future upgrade currently warranted: the remaining "actionable text" guards (#8, #14, #16, #33, #57) have human-readable guidance that's already concrete enough; upgrading them to literal-patch shape would add noise relative to the friction they cause.
+- No future upgrade currently warranted: the remaining "actionable text" guards have human-readable guidance that's already concrete enough; upgrading them to literal-patch shape would add noise relative to the friction they cause.
 
 ## How this list is maintained
 
-This survey was authored manually for the #4346 audit (2026-05-08). Future
-contributors:
+This survey was authored manually for the #4346 audit (2026-05-08) and made
+self-checking in #4349. Future contributors:
 
 - When you add a new `scripts/check-*.{sh,py}` guard: append a row. To
   minimise renumbering churn use a letter-suffix row number at the
@@ -171,10 +174,29 @@ contributors:
   `scripts/check-fix-block-coverage-complete.sh` CI guard (#23a) fails
   the build if you forget.
 - When you upgrade a guard's error output: update the Verdict and Notes.
+  The `scripts/check-fix-block-coverage.py --check` CI guard (#23b) fails
+  the build if the verdict column drifts from the classifier's output.
+  Run `scripts/check-fix-block-coverage.py --print` to see what the
+  classifier says about every guard, one line per guard.
 - When you delete a guard: remove the row.
+
+Two CI gates protect this inventory:
+
+1. **`fix-block-coverage-complete-check`** — every executable guard
+   under `scripts/check-*.{sh,py}` must have a row in this doc. See
+   `scripts/check-fix-block-coverage-complete.sh` (#23a) and #4367.
+2. **`dx-fix-block-coverage-check`** — every row's Verdict column must
+   match the classifier output of `scripts/check-fix-block-coverage.py
+   --check`. See #4349 (this guard) and #4346 (the inventory's parent
+   audit).
+
+To regenerate the survey table from scratch (verdicts only — manual
+Notes are intentionally lost):
+
+```
+python3 scripts/check-fix-block-coverage.py --regenerate
+```
 
 The audit's `/audit` skill (§1.9) counts top-level scripts via marker
 headers; this doc is a per-guard health check the audit can cross-reference
-against the count. The `scripts/check-fix-block-coverage-complete.sh` guard
-(wired into CI as `fix-block-coverage-complete-check`) catches drift at PR
-time — see #4367.
+against the count.
