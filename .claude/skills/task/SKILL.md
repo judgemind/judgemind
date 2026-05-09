@@ -391,6 +391,23 @@ The verify-and-close path should be the common case when this check fires — th
 
 ### Step 4b — Verify gap is real (current state probe)
 
+**Companion check — near-duplicate-issue probe (#4520, informational).** Before running the gap probe, run the near-duplicate probe as a single tool call:
+
+```
+{worktree}/scripts/check-near-duplicate-issue.sh <N>
+```
+
+The probe lists recently-closed issues (default 7-day window ending at the current issue's createdAt) and scores title-token + target-context-path overlap. It's the issue-side complement to `check-shipped-pr.sh`'s #4353 date-ordering guard: when issue X is filed shortly after a sibling Y closes AND X's title / body overlap heavily with Y, X is almost certainly a near-duplicate of Y.
+
+Exit codes:
+
+- **Exit 1 (`ok:` line on stdout) — no near-duplicate.** Continue to the §4b gap probe below. This is the common case.
+- **Exit 0 (`near-duplicate:` line on stdout, plus a second-line tab-separated `<closed_issue>\t<closing_pr>\t<channel>\t<overlap>` payload).** **Informational, NOT a hard gate.** Read the closed sibling issue and (if present) the PR that closed it. Then decide: is the current issue genuinely distinct work (a sibling improvement, a follow-up scope), or is it a near-duplicate that should be closed without re-implementing? If genuinely distinct, continue to the §4b gap probe. If a duplicate, fall back to the §4a.2 verify-and-close path — post a comment naming the closed sibling, close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and release the `status/in-progress` label. The probe is calibrated for low FP rate (<1 FP per 10 pairs on the calibration sample); when it fires, the closed sibling is worth the 30-second read.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, etc.).** Fail-open: continue to the §4b gap probe.
+
+The canonical recurrence this check addresses is #4321 ↔ #4355 (PR #4325 closed #4321 ~2.5h before #4355 was filed asking for the same `scripts/drain_splitter_carry_forward_clusters.py` helper). Without this check, a less careful agent would have re-implemented the helper and produced a duplicate PR.
+
+
 **Trigger condition:** Run this step when any of these are true — (a) the issue title or body contains a gap-assertion verb ("enable", "add", "introduce", "expose", "document"); (b) the issue carries a `type/dx` or `type/infra` label; (c) the issue's acceptance criteria contain an explicit literal command on a `Verify:` line — `Verify: pytest ...`, `Verify: ./scripts/...`, `Verify: grep ...`, `Verify: npm ...`, etc. Issues with no gap-assertion signal AND no literal `Verify:` command (e.g. pure bug fixes against active production failures, investigation tasks, refactoring) skip this step entirely.
 
 **Default rule — run the AC's `Verify:` command first.** If the issue's acceptance criteria provide a literal `Verify:` command, run that command **verbatim** as the §4b probe before falling back to a verb-keyed probe below. The AC author already wrote the cheapest possible state check — running it first short-circuits the "what to grep for" decision and produces probe output that is *also* the canonical evidence to cite in the issue comment if the gap is already satisfied (see "Decision tree" below). This applies whether the AC's `Verify:` line is `pytest -k <test_name>`, `grep -n <pattern> <file>`, `./scripts/<probe>.sh`, an `aws` describe call, or any other concrete command.
