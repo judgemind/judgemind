@@ -104,6 +104,7 @@ if TYPE_CHECKING:  # pragma: no cover — types only
 # ``scripts/check-dispatcher-image-deps.py`` CI guard flags as a
 # missing pip dep (the fallback top-level ``dispatcher`` is not a pip
 # package — it is a sibling module).
+from .blocked_by import parse_blocked_by as _shared_parse_blocked_by  # noqa: E402
 from .parent_issue import parse_parent_issue as _shared_parse_parent_issue  # noqa: E402
 from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
 from .phase_transitions import (  # noqa: E402
@@ -2650,8 +2651,6 @@ def _normalize_issue_enrichment(
     so this function stays pure — the lookup is built one level up and
     shared across all issues in the tick (issue #2989).
     """
-    import re  # noqa: PLC0415 — lazy import
-
     number = issue.get("number")
     title = issue.get("title") if isinstance(issue.get("title"), str) else ""
     created_at = (
@@ -2679,10 +2678,7 @@ def _normalize_issue_enrichment(
         # Build blockedBy when a lookup is provided (issue #2989).
         if blocker_title_lookup is not None:
             body_str = body if isinstance(body, str) else ""
-            blocker_numbers = [
-                int(m)
-                for m in re.findall(r"(?im)^\s*blocked by:?\s+#(\d+)\s*$", body_str)
-            ]
+            blocker_numbers = _shared_parse_blocked_by(body_str)
             record["blockedBy"] = [
                 {"number": n, "title": blocker_title_lookup.get(n)}
                 for n in blocker_numbers
@@ -7340,16 +7336,20 @@ class DispatcherDaemon:
     def _parse_blocked_by(body: str) -> list[int]:
         """Extract ``Blocked by #N`` references from an issue body.
 
+        Thin shim around :func:`scripts.dispatcher.blocked_by.parse_blocked_by`.
+        Kept as a static method on ``DispatcherDaemon`` so the existing call
+        sites (``daemon.py:_fetch_issue_bundle`` and
+        ``test_daemon_phase3a.py``'s ``TestParseBlockedBy``) keep working
+        unchanged. The regex itself lives in
+        :mod:`scripts.dispatcher.blocked_by` — see #4514.
+
         Matches the same convention ``scripts/unblock-dependents.sh``
         uses: one or more ``Blocked by #N`` lines, case-insensitive,
-        anywhere in the body.  Accepts the optional colon variant
+        anywhere in the body. Accepts the optional colon variant
         ``Blocked by: #N`` as well as the canonical ``Blocked by #N``
         form so that both styles are recognised.
         """
-        import re  # noqa: PLC0415 — lazy import
-
-        matches = re.findall(r"(?im)^\s*blocked by:?\s+#(\d+)\s*$", body)
-        return [int(m) for m in matches]
+        return _shared_parse_blocked_by(body)
 
     def _fetch_issue_titles_for_blockers(
         self, numbers: set[int]

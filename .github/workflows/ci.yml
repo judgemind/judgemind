@@ -1801,6 +1801,28 @@ jobs:
         run: scripts/check-no-duplicate-parent-regex.sh
 
   # ---------------------------------------------------------------
+  # Duplicate Blocked-by regex guard: forbid copies of the canonical
+  # ``Blocked by #N`` regex outside scripts/dispatcher/blocked_by.py
+  # (#4514). Sibling pattern to duplicate-parent-regex-check above —
+  # prior to extraction the regex lived in three places (daemon.py
+  # has two sites, agent-runner-entrypoint.sh inline-Python shim);
+  # this guard prevents future re-introductions. Files that
+  # legitimately need a local copy opt out via the
+  # ``# allow-duplicate-blocked-by-regex: <issue-or-PR>`` marker.
+  # The step name below intentionally avoids quoting the forbidden
+  # token (per docs/agent/code-standards.md §Hygiene-check CI steps
+  # and #2541/#2542).
+  # ---------------------------------------------------------------
+  duplicate-blocked-by-regex-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Forbid copies of the canonical Blocked-by issue regex outside its home
+        run: scripts/check-no-duplicate-blocked-by-regex.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot repo-path guard: flag scripts that use REPO_ROOT
   # without a validated fallback for when the repo is unavailable (#1277)
   # ---------------------------------------------------------------
@@ -2248,6 +2270,7 @@ jobs:
       - no-manual-sys-modules-mock-check
       - duplicate-framework-helpers-check
       - duplicate-parent-regex-check
+      - duplicate-blocked-by-regex-check
       - oneshot-repo-paths-check
       - duplicate-functions-check
       - test-except-pass-check
