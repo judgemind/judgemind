@@ -719,6 +719,8 @@ scripts/wait-for-ci.sh <PR-N>
 
 This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 via either of two paths: (a) the canonical-merge-gate fast-path — `mergeable == MERGEABLE`, any `ci-passed` entry is `success`, no latest check has failed — fires immediately even if stale `in_progress` entries from a superseded CI run linger in the response (#4069); (b) the all-checks-complete fallback — `pending == 0`, `ci-passed` is `success`, no failures, `mergeStateStatus` is `CLEAN` or `UNSTABLE` — fires when CI legitimately drains to zero pending. Stdout names the path explicitly with `canonical merge gate green` or `all checks complete`. Exit 1 = failure, Exit 2 = timeout.
 
+**Exit 3 — REBASE_REQUIRED (#4412).** When CI is green (`ci-passed=success`, no latest failures) but `mergeStateStatus=DIRTY` (a concurrent merge landed on origin/main that conflicts with this PR's diff), `wait-for-ci.sh` exits 3 immediately on the first poll iteration where this is true rather than continuing to poll until timeout. There is no path forward by waiting — the agent must rebase before the PR can merge. On exit 3, follow the A.4 rebase recipe (`git fetch origin main && git rebase origin/main && git push --force-with-lease`), then re-enter the CI watch loop, incrementing the `ci-watch (N)` phase counter and re-emitting `awaiting_ci`. The exit-3 path is the rebase-fast-path equivalent of A.4's merge-conflict handling — both bottom out in the same rebase + force-push, but exit 3 surfaces the signal in <1s instead of the ~10 min the script previously burned re-logging `still waiting...` until timeout.
+
 For workflow-run-level watching (deploy workflows in §A.8), `gh run watch` stays as the fallback:
 
 ```

@@ -903,6 +903,161 @@ LOG
     fi
 }
 
+# Test 15 (#4412): Exit 3 (REBASE_REQUIRED) when CI is green but
+# mergeStateStatus=DIRTY (a concurrent merge landed on origin/main that
+# conflicts with the PR's diff). The script must exit 3 within one polling
+# cycle rather than continuing to poll until timeout.
+test_rebase_required_exits_3_on_first_poll() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code start_ts end_ts elapsed
+    exit_code=0
+    start_ts=$(date +%s)
+    # ci-passed=success, failures=0, mergeStateStatus=DIRTY. mergeable would be
+    # CONFLICTING in production; the mock returns whatever MERGEABLE_RESPONSE is
+    # set to. We pass UNKNOWN to prove the exit-3 path doesn't depend on the
+    # mergeable enum (DIRTY is the load-bearing signal).
+    output=$(MERGEABLE_RESPONSE=CONFLICTING MERGE_STATE_RESPONSE=DIRTY \
+        run_script "$tmpdir" 42 --poll-interval 5 --timeout-secs 60 2>&1) || exit_code=$?
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+
+    if [ "$exit_code" -eq 3 ]; then
+        pass "rebase_required: exits 3 on green-but-DIRTY"
+    else
+        fail "rebase_required: exits 3 on green-but-DIRTY" "exit=$exit_code output=$output"
+    fi
+
+    # AC#1: must exit within one polling cycle (well before --poll-interval).
+    if [ "$elapsed" -lt 5 ]; then
+        pass "rebase_required: exits in <5s (actual: ${elapsed}s) — one polling cycle"
+    else
+        fail "rebase_required: exits in <5s" "elapsed=${elapsed}s — must not wait for second poll"
+    fi
+
+    # AC#2: stdout/stderr names the action with the exact rebase command.
+    if echo "$output" | grep -q "mergeStateStatus=DIRTY"; then
+        pass "rebase_required: output names mergeStateStatus=DIRTY"
+    else
+        fail "rebase_required: output names mergeStateStatus=DIRTY" "output=$output"
+    fi
+
+    if echo "$output" | grep -q "rebase required to merge"; then
+        pass "rebase_required: output names the required action"
+    else
+        fail "rebase_required: output names the required action" "output=$output"
+    fi
+
+    if echo "$output" | grep -q "git fetch origin main && git rebase origin/main && git push --force-with-lease"; then
+        pass "rebase_required: output includes the literal rebase command"
+    else
+        fail "rebase_required: output includes the literal rebase command" "output=$output"
+    fi
+}
+
+# Test 16 (#4412): The exit-3 path must NOT fire when mergeStateStatus is
+# CLEAN or UNSTABLE — those go through the existing exit-0 paths. Defense in
+# depth against a future refactor that mis-orders the branch chain.
+test_rebase_required_does_not_fire_on_clean_or_unstable() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local exit_code
+    exit_code=0
+    MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 >/dev/null 2>&1 || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "rebase_required_no_misfire_clean: CLEAN exits 0, not 3"
+    else
+        fail "rebase_required_no_misfire_clean: CLEAN exits 0, not 3" "exit=$exit_code"
+    fi
+
+    # Re-run with UNSTABLE.
+    local tmpdir2
+    tmpdir2=$(make_temp_dir)
+    write_all_success_response "$tmpdir2/responses/01.json"
+    exit_code=0
+    MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir2" 42 --poll-interval 0 --timeout-secs 30 >/dev/null 2>&1 || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "rebase_required_no_misfire_unstable: UNSTABLE exits 0, not 3"
+    else
+        fail "rebase_required_no_misfire_unstable: UNSTABLE exits 0, not 3" "exit=$exit_code"
+    fi
+}
+
+# Test 17 (#4412): Failure short-circuits the exit-3 path. If a check has
+# conclusion=failure AND mergeStateStatus=DIRTY, exit 1 (failure) wins over
+# exit 3 (rebase) — the agent must fix the failure before considering rebase.
+test_rebase_required_does_not_fire_when_failure_present() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_failure_response "$tmpdir/responses/01.json" "web-tests"
+
+    local exit_code output
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=CONFLICTING MERGE_STATE_RESPONSE=DIRTY \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "rebase_required_no_misfire_failure: exits 1 (not 3) when a check failed"
+    else
+        fail "rebase_required_no_misfire_failure: exits 1 (not 3) when a check failed" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "rebase required to merge"; then
+        fail "rebase_required_no_misfire_failure: must NOT log the rebase action when a check failed" "output=$output"
+    else
+        pass "rebase_required_no_misfire_failure: rebase action correctly suppressed by failure"
+    fi
+}
+
+# Test 18 (#4412): The exit-3 path must NOT fire while ci-passed is still
+# in_progress, even if mergeStateStatus=DIRTY. We can't tell the agent to
+# rebase based on a partial CI signal — they may still need to wait for a
+# real failure to surface. Times out (exit 2) instead.
+test_rebase_required_does_not_fire_while_ci_passed_in_progress() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_in_progress_ci_passed_response "$tmpdir/responses/01.json"
+
+    local exit_code output
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=CONFLICTING MERGE_STATE_RESPONSE=DIRTY \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 2 ]; then
+        pass "rebase_required_no_misfire_ci_in_progress: times out (exit 2), does not exit 3"
+    else
+        fail "rebase_required_no_misfire_ci_in_progress: times out (exit 2), does not exit 3" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 19 (#4412): --help output must list exit code 3 alongside 0/1/2.
+test_help_documents_exit_3() {
+    local output exit_code
+    exit_code=0
+    output=$("$SCRIPT_UNDER_TEST" --help 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "help_documents_exit_3: --help exits 0"
+    else
+        fail "help_documents_exit_3: --help exits 0" "exit=$exit_code"
+    fi
+
+    # Must mention exit 3 / REBASE_REQUIRED.
+    if echo "$output" | grep -qE 'REBASE_REQUIRED|^\s*3 —|^\s*3 -'; then
+        pass "help_documents_exit_3: --help output names exit code 3"
+    else
+        fail "help_documents_exit_3: --help output names exit code 3" "output=$output"
+    fi
+}
+
 # Test 14 (#4148): --no-auto-rerun must disable the classifier path entirely
 # even when a flake pattern is present in the job log.
 test_no_auto_rerun_flag_disables_classifier() {
@@ -1071,6 +1226,11 @@ test_flake_telemetry_aggregatable
 test_cancelled_non_required_does_not_block_merge_gate
 test_cancelled_falls_through_to_all_checks_complete
 test_real_failure_with_cancelled_still_exits_1
+test_rebase_required_exits_3_on_first_poll
+test_rebase_required_does_not_fire_on_clean_or_unstable
+test_rebase_required_does_not_fire_when_failure_present
+test_rebase_required_does_not_fire_while_ci_passed_in_progress
+test_help_documents_exit_3
 
 echo ""
 echo "────────────────────────────────────────────"

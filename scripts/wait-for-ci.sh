@@ -90,6 +90,14 @@
 #       the matched pattern with `flake detected: <label>`). A second
 #       flake on the same run exits 1 — see #4148.
 #   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
+#   3 — REBASE_REQUIRED (#4412): CI is green (`ci-passed=success`, no latest
+#       failures) but `mergeStateStatus=DIRTY` — a concurrent merge landed on
+#       origin/main that conflicts with this PR's diff. There is no path
+#       forward by waiting; the agent must rebase before re-entering the CI
+#       watch. Exits 3 immediately on the first poll iteration where the
+#       condition is met. Stdout names the action with the literal command:
+#       `mergeStateStatus=DIRTY — rebase required to merge.
+#        Run: git fetch origin main && git rebase origin/main && git push --force-with-lease.`
 #
 # ── Flake telemetry (#4163) ──────────────────────────────────────────────────
 #
@@ -146,7 +154,7 @@ print_help() {
     grep '^#   --' "$0" | sed 's/^# //'
     echo ""
     grep '^# Exit codes:' "$0" | sed 's/^# //'
-    grep '^#   [012]' "$0" | sed 's/^# //'
+    grep '^#   [0123]' "$0" | sed 's/^# //'
 }
 
 while [ $# -gt 0 ]; do
@@ -425,6 +433,29 @@ EOF
     # `any` form returns a single boolean string.
     CI_PASSED_SUCCESS=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | any(.conclusion == "success")')
     CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed") | .conclusion] | (.[0] // "")')
+
+    # ── Rebase-required fast-path (#4412) ────────────────────────────────────
+    # When CI is green (ci-passed=success, no latest failures) but
+    # mergeStateStatus is DIRTY, a concurrent merge landed on origin/main that
+    # conflicts with the PR's diff. There is no path forward by polling — the
+    # agent must rebase before re-entering the CI watch. Exit 3 immediately
+    # on the first poll iteration where this is true so the caller can pivot
+    # to the rebase + force-push path documented in `.claude/skills/task/SKILL.md`
+    # §A.5.
+    #
+    # Checked BEFORE the canonical-merge-gate fast-path because mergeable will
+    # be CONFLICTING (not MERGEABLE) when mergeStateStatus=DIRTY, so the gate
+    # cannot fire on this state — but we want to surface the rebase signal
+    # promptly rather than fall through to the all-checks-complete path which
+    # would log "still waiting" repeatedly until timeout.
+    if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
+        MERGE_STATE_FOR_DIRTY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus -q .mergeStateStatus 2>/dev/null || echo "UNKNOWN")
+        if [ "$MERGE_STATE_FOR_DIRTY" = "DIRTY" ]; then
+            echo ""
+            echo "[${ELAPSED}s] mergeStateStatus=DIRTY — rebase required to merge. Run: git fetch origin main && git rebase origin/main && git push --force-with-lease."
+            exit 3
+        fi
+    fi
 
     # ── Canonical-merge-gate fast-path (#4069, #4407) ────────────────────────
     # Mirrors `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
