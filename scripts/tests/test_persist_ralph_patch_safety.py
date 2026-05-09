@@ -187,33 +187,47 @@ def _invoke_persist_ralph_patch(
 ) -> tuple[int, str, str]:
     """Source persist_ralph_patch and call it with a fake SHIP patch.
 
-    Writes patch_content to ``$AGENT_WORKSPACE/ralph-ship.patch``, provides a
-    stub ``git rev-parse HEAD`` via a minimal git repo (or a PATH shim), and
-    calls the function.
-
-    Returns (returncode, stdout, stderr).
+    Writes patch_content to ``$AGENT_WORKSPACE/ralph-ship.original.patch``
+    and arranges a ``git format-patch`` shim that ``cat``s that file to
+    stdout. The real function does ``git format-patch -1 HEAD --stdout >
+    "$_patch_file"`` (line ~3889 of agent-runner-entrypoint.sh), which
+    truncates ``$_patch_file`` BEFORE the shim runs — so a no-op shim
+    leaves an empty file and the function bails out via the
+    ``ralph_patch_skip_empty`` branch (rc=0, but no row inserted). #4418
+    diagnosed this fixture bug; the round-trip semantics the test wants to
+    cover require the shim to actually emit the patch bytes on its
+    stdout, which the shell redirect then captures into the file the
+    function reads back into psql.
     """
-    # Write the patch file that persist_ralph_patch expects.
-    patch_file = workspace_dir / "ralph-ship.patch"
-    patch_file.write_text(patch_content, encoding="utf-8")
+    # Write the patch file under an alternate name so the function's own
+    # ``> "$_patch_file"`` redirect (which truncates ralph-ship.patch
+    # before the shim runs) cannot clobber our test fixture.
+    original_patch_file = workspace_dir / "ralph-ship.original.patch"
+    original_patch_file.write_text(patch_content, encoding="utf-8")
 
     fn_body = _extract_function_body("persist_ralph_patch")
 
-    # Stub git so that `git -C "$REPO_ROOT" rev-parse HEAD` returns a fake SHA.
-    # We write a tiny shim script into a temp bin dir on PATH.
+    # Stub git so that `git -C "$REPO_ROOT" rev-parse HEAD` returns a fake
+    # SHA and `git format-patch -1 HEAD --stdout` emits the test patch
+    # content on stdout (which the function's redirect then writes into
+    # $_patch_file). #4418 — previously the shim was a no-op for
+    # format-patch, but the function's redirect truncates the file before
+    # the shim runs, so the function saw an empty file and skipped the
+    # INSERT.
     shim_bin = workspace_dir / "shim-bin"
     shim_bin.mkdir(exist_ok=True)
     git_shim = shim_bin / "git"
     git_shim.write_text(
-        textwrap.dedent("""\
+        textwrap.dedent(f"""\
             #!/usr/bin/env bash
-            # Stub: rev-parse HEAD -> fixed SHA; format-patch -> copy existing file.
+            # Stub: rev-parse HEAD -> fixed SHA; format-patch -> echo test fixture.
             if [[ "$*" == *"rev-parse HEAD"* ]]; then
                 printf 'deadbeef1234567890abcdef1234567890abcdef'
             elif [[ "$*" == *"format-patch"* ]]; then
-                # The real function writes to $_patch_file before calling us;
-                # the file already exists — nothing to do.
-                true
+                # Emit the test patch content on stdout. The caller's
+                # redirect (> "$_patch_file") writes this into the path
+                # the function then reads back into psql.
+                cat '{original_patch_file}'
             else
                 /usr/bin/git "$@"
             fi
@@ -285,12 +299,20 @@ def _roundtrip_patch(
         timeout=10,
     )
     assert sel.returncode == 0, f"SELECT failed: {sel.stderr}"
-    # psql -At strips the trailing newline from each row; add it back only
-    # if the original content ended with a newline (psql convention).
-    persisted = sel.stdout
-    # psql appends a newline to the last row in unaligned mode; strip it once.
-    if persisted.endswith("\n"):
-        persisted = persisted[:-1]
+    # Strip all trailing newlines from psql -At output. Two layers shed
+    # newlines on the way through: (a) psql's ``\set var `cat :'path'```
+    # backtick operator strips ONE trailing newline (documented psql
+    # behaviour, like shell ``$()`` substitution), and (b) psql -At
+    # always appends a newline to the last row in unaligned mode. The
+    # combined effect is that a patch with K trailing newlines round-
+    # trips to K-1 trailing newlines from the perspective of the
+    # ``patch_content`` column. The test's call sites compare against
+    # ``patch_content.rstrip("\n")``, which strips ALL trailing newlines,
+    # so we normalise both sides identically here. The metacharacter-
+    # safety property the test exercises (``$()`` / backticks / ``$VAR``
+    # not expanded by bash before reaching psql) is unaffected by the
+    # newline-stripping convention.
+    persisted = sel.stdout.rstrip("\n")
     return rc, persisted, stderr
 
 
