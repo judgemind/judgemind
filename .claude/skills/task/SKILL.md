@@ -319,7 +319,12 @@ Exit codes:
 - **Exit 0 (`shipped:` line on stdout + JSON summary) — a closed PR merged onto `main` already shipped this issue's work.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
 - **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, etc.).** Fail-open: continue to Step 4b.
 
-The high-confidence threshold the script applies is **≥1 added overlap OR ≥2 total overlap** between the file paths in the issue body and the file paths the candidate PR landed (with the PR's `mergedAt` non-null and `baseRefName == main`). A single *modified*-file overlap is intentionally below the threshold — that case routinely fires on adjacent scripts the issue cites as references rather than load-bearing targets.
+The high-confidence threshold the script applies is **≥1 added overlap OR ≥2 total overlap on *target-context* candidate paths** (with the PR's `mergedAt` non-null and `baseRefName == main`). The extractor classifies issue-body file paths into two contexts:
+
+- **target-context** — paths in narrative prose / Proposal / AC text. These are the load-bearing locations the issue intends to change.
+- **search-context** — paths cited only inside `Verify:` lines, `grep` / `pytest` / `aws` / `curl` / `rg` invocations, or fenced shell-output blocks. These are search arguments, not change targets.
+
+Search-context overlaps never count toward the threshold by themselves (#4340 — fixes the false-positive where issue Verify lines list files purely as grep arguments). A single *modified*-file overlap is intentionally below the threshold — that case routinely fires on adjacent scripts the issue cites as references rather than load-bearing targets. The "added" classification uses the authoritative `changeType: "ADDED"` signal from `gh pr view --json files` (or `status: "added"` from the raw GitHub REST API), falling back to a `deletions == 0 && additions > 0` heuristic only when neither authoritative signal is present.
 
 ##### 4a.2.1 — Verify-and-close pivot (only runs on exit 0)
 

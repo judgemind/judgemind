@@ -160,3 +160,154 @@ def test_short_paths_excluded(extract_module):
     body = "See scripts/ and docs/ for more details."
     # All four are either too short or end in `/` — both filters drop them.
     assert extract_module.extract_files(body) == []
+
+
+# ─── Search-context vs target-context classification (issue #4340) ────
+
+
+def test_classify_files_separates_verify_line_paths(extract_module):
+    """Paths that appear ONLY inside a ``Verify:`` line are classified as
+    *search-context*, not *target-context*. The grep/pytest/aws verbs
+    inside the Verify line treat any cited paths as search arguments,
+    not as files the resolution must touch.
+
+    Regression for #4340. Issue #4331's Verify line is::
+
+        Verify: ``grep -n "..." packages/A.py packages/B.py scripts/C.py``
+
+    All three paths are search arguments to grep — not files the issue
+    resolution targets. PR #3552 happened to touch all three for
+    unrelated reasons (LLM retry plumbing) → false-positive shipped
+    match. Post-fix the classifier must tag those three as
+    ``search-context`` so the threshold helper can require ≥1
+    *target-context* overlap.
+    """
+    body = (
+        "## Acceptance criteria\n"
+        "\n"
+        "- [ ] Splitter aliases registered.\n"
+        '  Verify: `grep -n "alias" packages/scraper-framework/src/courts/ca/sc_tentatives.py '
+        "packages/scraper-framework/src/ingestion/worker.py "
+        "scripts/reingest_from_s3.py`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert sorted(search) == sorted(
+        [
+            "packages/scraper-framework/src/courts/ca/sc_tentatives.py",
+            "packages/scraper-framework/src/ingestion/worker.py",
+            "scripts/reingest_from_s3.py",
+        ]
+    )
+
+
+def test_classify_files_target_context_in_narrative(extract_module):
+    """Paths in narrative prose (Problem / Proposal / non-Verify AC text)
+    are *target-context* — they describe the load-bearing locations the
+    issue intends to change.
+    """
+    body = (
+        "## Proposal\n"
+        "\n"
+        "Update `scripts/check-shipped-pr.sh` to handle the verify-context case.\n"
+        "\n"
+        "## Acceptance criteria\n"
+        "\n"
+        "- [ ] `scripts/check-shipped-pr.sh` no longer flags PR #3552.\n"
+        "  Verify: `bash scripts/tests/test_check_shipped_pr.sh` exits 0.\n"
+    )
+    target, search = extract_module.classify_files(body)
+    # The Verify line cites scripts/tests/test_check_shipped_pr.sh.
+    # Narrative cites scripts/check-shipped-pr.sh (twice — proposal + AC text).
+    assert "scripts/check-shipped-pr.sh" in target
+    assert "scripts/tests/test_check_shipped_pr.sh" in search
+    # No path appears in BOTH — once classified as search-context (Verify
+    # line), it stays there even if narrative also cites it. (See
+    # docstring on classify_files for the precedence rule.)
+    assert "scripts/check-shipped-pr.sh" not in search
+
+
+def test_classify_files_fenced_block_treated_as_search_context(extract_module):
+    """Paths inside fenced code blocks (``` ```) that contain shell
+    invocations (grep / pytest / aws / curl) are *search-context*, not
+    *target-context*. Issue bodies frequently paste shell-output blocks
+    naming files that are search arguments, not change targets.
+    """
+    body = (
+        "## Problem\n"
+        "\n"
+        "Found during /task pickup:\n"
+        "\n"
+        "```\n"
+        "$ grep -n widget scripts/run-foo.sh packages/api/src/index.ts\n"
+        "scripts/run-foo.sh:42: widget = make_widget()\n"
+        "```\n"
+        "\n"
+        "## Proposal\n"
+        "\n"
+        "Patch `scripts/render-widget.sh` to handle the new shape.\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert "scripts/render-widget.sh" in target
+    assert "scripts/run-foo.sh" in search
+    assert "packages/api/src/index.ts" in search
+    # No leakage in the other direction.
+    assert "scripts/render-widget.sh" not in search
+
+
+def test_classify_files_pytest_line_search_context(extract_module):
+    """``Verify: pytest <path>`` cites ``<path>`` as a test selector,
+    not as a file the resolution edits. Tag as search-context.
+    """
+    body = (
+        "## Acceptance criteria\n"
+        "\n"
+        "- [ ] New behavior tested.\n"
+        "  Verify: `pytest packages/scraper-framework/tests/test_split_registry.py -v`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert "packages/scraper-framework/tests/test_split_registry.py" in search
+
+
+def test_classify_files_extract_files_back_compat(extract_module):
+    """The legacy ``extract_files()`` API returns the union (search ∪
+    target) so callers that don't care about classification keep
+    working. Tests that lock in directory / glob / short-path filters
+    still pass against ``extract_files()``.
+    """
+    body = (
+        "Update `scripts/check-shipped-pr.sh`.\n"
+        "Verify: `grep -n widget scripts/run-foo.sh`.\n"
+    )
+    out = extract_module.extract_files(body)
+    # Both paths land in the union, regardless of context.
+    assert sorted(out) == sorted(["scripts/check-shipped-pr.sh", "scripts/run-foo.sh"])
+
+
+def test_classify_files_path_first_seen_in_verify_stays_search(extract_module):
+    """Precedence rule: a path is target-context only if it appears at
+    least once OUTSIDE a search-context line. A path cited only inside
+    Verify lines / shell-invocation fenced blocks is search-context
+    even if it appears multiple times.
+    """
+    body = (
+        "Verify: `grep packages/api/src/index.ts`\n"
+        "Verify: `pytest packages/api/src/index.ts`\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert target == []
+    assert search == ["packages/api/src/index.ts"]
+
+
+def test_classify_files_path_in_both_promotes_to_target(extract_module):
+    """If a path appears in BOTH narrative and a Verify line, it is
+    target-context — the narrative reference is the load-bearing
+    intent and the Verify line is just a re-run convenience."""
+    body = (
+        "Update `scripts/foo.sh` to handle the new format.\n"
+        "Verify: `bash scripts/foo.sh`.\n"
+    )
+    target, search = extract_module.classify_files(body)
+    assert target == ["scripts/foo.sh"]
+    assert search == []

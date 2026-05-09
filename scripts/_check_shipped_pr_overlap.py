@@ -56,11 +56,29 @@ def compute_overlap(
         path = f.get("path")
         if not path:
             continue
-        # Either the explicit GitHub-API `status: "added"` field (when the
-        # caller passes raw API output) or the gh-CLI heuristic (deletions
-        # == 0 && additions > 0).
+        # Three possible signals for "this file was newly added by the PR":
+        #   1. ``status: "added"`` — raw GitHub REST API.
+        #   2. ``changeType: "ADDED"`` — gh CLI's ``--json files``
+        #      output (uppercased; equivalent to the REST API's ``status``).
+        #   3. ``deletions == 0 && additions > 0`` — fallback heuristic
+        #      for callers that pass neither of the above. This was the
+        #      pre-#4340 default but mis-classifies large pure-additive
+        #      *modifications* (e.g. PR #3552's
+        #      ``scripts/rebuild_db.py +120 -0`` is a modification but
+        #      reads as "added" to the heuristic). Only used when neither
+        #      authoritative signal is present.
         if f.get("status") == "added":
             added_paths.add(path)
+            continue
+        change_type = f.get("changeType")
+        if isinstance(change_type, str):
+            # When the authoritative signal is present, trust it
+            # exclusively — do NOT fall through to the deletions==0
+            # heuristic (which would re-add modified files with
+            # ``+N -0`` diffs, exactly the false-positive pattern that
+            # tripped the original #4340 bug against PR #3552).
+            if change_type.upper() == "ADDED":
+                added_paths.add(path)
             continue
         deletions = f.get("deletions")
         additions = f.get("additions")
@@ -133,19 +151,36 @@ def main() -> int:
     if not candidates:
         return 0
 
+    # Target-context candidate paths (#4340). The threshold below is
+    # applied AGAINST THIS SUBSET ONLY — search-context paths
+    # (Verify: / grep / pytest / aws / curl / rg invocation arguments)
+    # cannot trip a shipped match by themselves. When the env var is
+    # missing or empty the overlap helper falls back to treating ALL
+    # candidates as target-context — preserving pre-#4340 behavior so
+    # downstream callers that don't pass the new env var keep working.
+    target_csv = os.environ.get("CHECK_SHIPPED_TARGET_FILES")
+    if target_csv is None:
+        targets = candidates
+    else:
+        targets = [c for c in target_csv.split(",") if c]
+
     pr_files = data.get("files") or []
     overlap, added_overlap = compute_overlap(pr_files, candidates)
     if not overlap:
         return 0
 
-    # High-confidence threshold: at least one ADDED overlap (PR created a
-    # file the issue prescribed), OR ≥2 total overlaps. A single overlap
-    # on a *modified* file is too weak — it routinely fires on adjacent
-    # scripts that the issue cites as references rather than load-bearing
-    # targets (e.g. issue #4204 references scripts/check-duplicate-pr.sh
-    # only as the file it extends, and the PR that originally created
-    # that script then trips a 1-file-modified false positive).
-    if len(added_overlap) < 1 and len(overlap) < 2:
+    # High-confidence threshold (target-context-aware as of #4340):
+    #
+    #   ≥1 ADDED overlap on a target-context path
+    #   OR ≥2 total overlaps that are ALL on target-context paths
+    #
+    # Search-context overlaps (Verify-line-only file references) never
+    # count toward the threshold by themselves. The pre-#4340 rule —
+    # ≥1 added OR ≥2 total — is preserved over the target subset.
+    target_set = set(targets)
+    target_overlap = [p for p in overlap if p in target_set]
+    target_added_overlap = [p for p in added_overlap if p in target_set]
+    if len(target_added_overlap) < 1 and len(target_overlap) < 2:
         return 0
 
     # Output format: <count>\t<comma-separated-overlap>\t<comma-separated-added>
