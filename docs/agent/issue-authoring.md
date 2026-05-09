@@ -139,6 +139,78 @@ Before filing a "does X" / "enable X" / "add X" issue, run a single command that
 
 **Decision after probing:** If the gap is genuinely absent (the feature/setting/doc does not yet exist), file the issue normally. If the gap is already satisfied, either close the draft, pivot scope to a doc-only update that confirms the current state (e.g., "document that Container Insights is enabled and cite the Terraform attribute"), or — for `fix(test)` issues whose ACs are exhausted by "the test passes" — skip filing and post the verification-only evidence elsewhere (a comment on the parent issue, or no action at all). If the probe is ambiguous, treat as real and file normally — agents can do their own probe at pickup time per Step 4b in `.claude/skills/task/SKILL.md`.
 
+## CloudWatch metric filters: probe `@message` shape before specifying a pattern
+
+When filing an issue that proposes a new `aws_cloudwatch_log_metric_filter`, **always probe the actual `@message` shape of the target log group via Logs Insights before writing the `pattern` value into the issue body.** A pattern that looks correct against synthetic JSON-shaped events can produce a metric filter that NEVER FIRES against real log lines, and the failure mode is silent — the metric just sits at zero forever, indistinguishable from "the warning hasn't fired yet."
+
+The trap is specific to JSON patterns proposed against stdlib-`logging` emitters:
+
+- `logger.warning("event.name", extra={"key": "value"})` using stdlib `logging.Logger` does **NOT** serialize `extra` into the rendered message body. CloudWatch only sees the raw message string `event.name` — the keys in `extra` (including `telemetry_event`, `document_id`, etc.) are present on the `LogRecord` object but never reach the log stream unless a JSON formatter is wired up.
+- A JSON pattern like `{ $.telemetry_event = "case_title_unrecoverable" }` matches against JSON-shaped log events. With stdlib emitters, no such JSON exists in CloudWatch — so the pattern never fires.
+- structlog (or any code path that calls `json.dumps()` and passes the result to the log message body) DOES emit JSON-shaped events. JSON patterns are correct against structlog/json-formatter emitters and wrong against stdlib emitters.
+
+This is a sneaky bug class because the failure is invisible at every layer except live CloudWatch logs:
+
+- Code review of the Terraform PR cannot catch it — the HCL is syntactically valid and the pattern looks plausible.
+- `terraform validate` does not catch it.
+- `aws logs test-metric-filter` against synthetic JSON events incorrectly reports the pattern works — the trap only surfaces when the pattern is tested against ACTUAL log lines from the target log group.
+
+### Required probe before filing
+
+Run a Logs Insights query against the target log group via `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` (or `aws logs start-query`) to see what CloudWatch actually receives:
+
+```
+filter @message like /<keyword from the log line>/
+| limit 5
+| sort @timestamp desc
+```
+
+For example, before filing an issue to add a metric filter for `case_title.unrecoverable`:
+
+```
+log_group_names: ["/ecs/judgemind-ingestion-worker-dev"]
+query_string: filter @message like /case_title.unrecoverable/ | limit 5 | sort @timestamp desc
+```
+
+Inspect the returned `@message` field on each row:
+
+- **Plain string** like `case_title.unrecoverable` (with no surrounding `{...}` JSON envelope) → the emitter is stdlib `logging`. **Use a literal-substring pattern** in the metric filter: `pattern = "\"case_title.unrecoverable\""`. The double-quotes around the substring are the CloudWatch metric-filter-syntax convention for substring matching, not JSON.
+- **JSON envelope** like `{"event": "case_title.unrecoverable", "telemetry_event": "...", ...}` → the emitter is structlog or another JSON formatter. **JSON patterns are appropriate**: `pattern = "{ $.telemetry_event = \"case_title_unrecoverable\" }"`.
+- **Mixed shape** (some events JSON, some plain string) — the source has multiple emitters or a partial migration in progress. Pick the shape that covers all events you want to count, or escalate the inconsistency as its own issue.
+
+### What to put in the issue body
+
+Once the probe has confirmed the message shape, include the probe result in the issue body alongside the proposed pattern, so the implementing agent does not have to re-derive it:
+
+```
+## Probe result
+
+Logs Insights query against /ecs/judgemind-ingestion-worker-dev:
+  filter @message like /case_title.unrecoverable/ | limit 5
+
+Returned @message values are plain strings (no JSON envelope), confirming
+worker.py:1161 uses stdlib logging. Pattern must be literal-substring,
+NOT JSON.
+
+## Proposed pattern
+
+  pattern = "\"case_title.unrecoverable\""
+```
+
+For issues filed without a probe, an agent picking up the issue must run the probe themselves before writing the Terraform — same shape, same cost (one Logs Insights call, ~30s). Document the probe result in the PR body so reviewers can confirm.
+
+### Worked example — #4076
+
+The issue body for #4076 ("CloudWatch metric filter for case_title.unrecoverable") proposed a JSON pattern:
+
+```hcl
+pattern = "{ $.telemetry_event = \"case_title_unrecoverable\" }"
+```
+
+The agent picking up the issue ran a §4c hypothesis-verification probe via Logs Insights against `/ecs/judgemind-ingestion-worker-dev` and found 413 hits in a recent 168k-record window — all with plain-string `@message = "case_title.unrecoverable"`, no JSON envelope. The proposed JSON pattern would have produced a metric filter that never fires; the agent switched to `pattern = "\"case_title.unrecoverable\""` (literal-substring match) before merging. See PR #4493.
+
+If the issue body had included the probe result up front, the agent could have skipped the hypothesis-verification step and gone straight to the correct pattern.
+
 ## Hypothesis vs. evidence
 
 Bug-fix issues frequently mix three different things into a single body: what was *observed* (symptoms — the data the filer can actually see), what is *suspected* (root cause — the filer's best current theory), and what should *change* (prescribed fix — the code/config edit the filer expects). When all three are run together as "here's the bug, here's the fix," an agent that picks the issue up will mentally lock in on the prescribed fix path before doing any verification — and if the suspected root cause is wrong, the entire ralph cycle is wasted.
