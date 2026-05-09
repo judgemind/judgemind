@@ -55,10 +55,18 @@ import psycopg
 
 from ingestion.judge_seed import seed_judges_from_directory_snapshots
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-)
+# Use ``configure_structlog`` so any ``extra=`` fields passed to logger calls
+# surface in CloudWatch Logs Insights output. ``stdlib_bridge=True`` routes
+# stdlib ``logging.getLogger(__name__)`` calls through structlog's
+# ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its
+# extras as one event per line. The previous ``logging.basicConfig`` format
+# string (``"%(asctime)s %(levelname)-8s %(message)s"``) silently dropped
+# every ``extra=`` field — see #4368 for the post-deploy verification
+# incident that motivated migrating every ``scripts/*.py`` to this pattern
+# (#4373).
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(json=True, stdlib_bridge=True)
 logger = logging.getLogger(__name__)
 
 
