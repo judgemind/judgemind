@@ -41,3 +41,15 @@ variable "apply_immediately" {
   type        = bool
   default     = false
 }
+
+variable "enable_alerts" {
+  description = "Whether to create CloudWatch alarms on the ElastiCache cluster (DatabaseMemoryUsagePercentage warn at 80%, critical at 95%). See #4475 for the failure mode these catch."
+  type        = bool
+  default     = false
+}
+
+variable "alert_sns_topic_arn" {
+  description = "ARN of the SNS topic that receives alarm notifications. Empty string disables SNS actions but the alarms still exist (state changes visible in the CloudWatch console). Typically wired to module.compute.alerts_topic_arn so cache + scraper alarms share one topic."
+  type        = string
+  default     = ""
+}

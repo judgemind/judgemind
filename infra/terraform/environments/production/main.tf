@@ -63,6 +63,12 @@ module "cache" {
   private_subnet_ids = module.networking.private_subnet_ids
   node_type          = "cache.t4g.micro"
   num_cache_nodes    = 1
+
+  # CloudWatch memory alarms — see #4475 / #4470. The compute module owns the
+  # SNS topic (judgemind-scraper-alerts-production); we share it so cache alerts
+  # land in the same place as scraper alerts.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
 }
 
 module "compute" {

@@ -947,3 +947,57 @@ resource "aws_cloudwatch_metric_alarm" "ingestion_worker_idle" {
   alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
 }
+
+# ─── Scraper Redis Emit Failure Alerts ───────────────────────────────────────
+# CloudWatch alarm that fires when scrapers fail to emit `document.captured`
+# events to the Redis Streams event bus. This is the upstream signal that
+# would have caught the 2026-05-04 → 2026-05-09 ingestion outage (#4470, #4475)
+# days earlier: when ElastiCache crossed 100% memory, Redis started rejecting
+# `XADD` calls with OOM, the scraper's event_bus.py logged
+# "Failed to emit document.captured event" once per ruling, and ingestion
+# stalled silently.
+#
+# Source of the literal log line:
+#   packages/scraper-framework/src/framework/event_bus.py:75
+#       logger.warning("Failed to emit document.captured event", error=str(exc))
+#
+# Threshold: > 1 occurrence in any 1-minute window. A single retry-able blip
+# during a Redis maintenance window is acceptable; sustained emit failures are
+# the signature of a real producer-side problem (cache OOM, network partition,
+# Redis restart). #4475 acceptance criterion: > 1 per minute.
+
+resource "aws_cloudwatch_log_metric_filter" "scraper_emit_failure" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "judgemind-scraper-emit-failure-${var.environment}"
+  pattern        = "\"Failed to emit document.captured event\""
+  log_group_name = aws_cloudwatch_log_group.scraper.name
+
+  metric_transformation {
+    name          = "ScraperRedisEmitFailures"
+    namespace     = "judgemind/scraper"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scraper_emit_failure" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-scraper-emit-failure-${var.environment}"
+  alarm_description = "Scraper logged \"Failed to emit document.captured event\" > 1 time in a minute (${var.environment}). Producer-side ingestion failure — typically Redis OOM (cache memory > 95%) or a Redis network partition. See #4470 / #4475 for the failure-mode background."
+
+  namespace   = "judgemind/scraper"
+  metric_name = "ScraperRedisEmitFailures"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 1
+  period              = 60
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
+  ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
+}
