@@ -3103,7 +3103,7 @@ class LlmExtractor:
         response = call_llm(
             system_prompt=system_prompt,
             user_message=user_message,
-            provider="google",
+            provider=self._provider,
             model=self._model,
             max_tokens=self._max_output_tokens,
             timeout=60.0,

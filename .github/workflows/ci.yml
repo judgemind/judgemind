@@ -1324,6 +1324,18 @@ jobs:
         run: scripts/check-hardcoded-models.sh
 
   # ---------------------------------------------------------------
+  # Hardcoded LLM provider guard (#4050): enforce LLM_PROVIDER env-var
+  # control over LLM-adapter call sites. Pinning provider= as a string
+  # literal at a call site silently bypasses the env var.
+  # ---------------------------------------------------------------
+  hardcoded-llm-provider-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for hardcoded LLM-adapter provider literals
+        run: scripts/check-no-hardcoded-llm-provider.sh
+
+  # ---------------------------------------------------------------
   # Terraform empty-resource risk guard: detect IAM resources with
   # compact([var.*]) Resource lists that lack a count/for_each guard
   # ---------------------------------------------------------------
@@ -2172,6 +2184,7 @@ jobs:
       - tests-use-reingest-helper-check
       - test-script-imports-mapped-check
       - hardcoded-models-check
+      - hardcoded-llm-provider-check
       - terraform-empty-resource-check
       - terraform-ecs-entrypoint-check
       - hardcoded-colors-check
