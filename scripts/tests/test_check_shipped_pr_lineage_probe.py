@@ -120,6 +120,73 @@ def test_extract_ignores_unrelated_retrospective(probe_module):
     assert probe_module.extract_lineage_parents(body) == []
 
 
+# ─── #4519: additional lineage idioms ─────────────────────────────────────
+
+
+def test_extract_found_while_shipping(probe_module):
+    """``Found while shipping #N`` is captured (#4519).
+
+    Issue #4322 uses ``Found while shipping #4303`` instead of the
+    canonical ``Found by: retrospective on #4304`` — same lineage signal,
+    different phrasing.
+    """
+    body = "## Background\n\nFound while shipping #4303.\n"
+    assert probe_module.extract_lineage_parents(body) == [4303]
+
+
+def test_extract_found_while_shipping_lowercase(probe_module):
+    """``found while shipping #N`` (lowercase) is captured (regex i flag)."""
+    body = "found while shipping #4303\n"
+    assert probe_module.extract_lineage_parents(body) == [4303]
+
+
+def test_extract_same_lesson_as(probe_module):
+    """``Same lesson as #N`` is captured (#4519, explicit cross-reference)."""
+    body = "## Note\n\nSame lesson as #4250.\n"
+    assert probe_module.extract_lineage_parents(body) == [4250]
+
+
+def test_extract_same_lesson_as_lowercase(probe_module):
+    """``same lesson as #N`` (lowercase) is captured (regex i flag)."""
+    body = "same lesson as #4250\n"
+    assert probe_module.extract_lineage_parents(body) == [4250]
+
+
+def test_extract_adjacent_to(probe_module):
+    """``Adjacent to #N`` is captured (#4519, sibling-issue link)."""
+    body = "## Note\n\nAdjacent to #4099.\n"
+    assert probe_module.extract_lineage_parents(body) == [4099]
+
+
+def test_extract_adjacent_to_lowercase(probe_module):
+    """``adjacent to #N`` (lowercase) is captured (regex i flag)."""
+    body = "adjacent to #4099\n"
+    assert probe_module.extract_lineage_parents(body) == [4099]
+
+
+def test_extract_multiple_idioms_in_one_body(probe_module):
+    """Body using multiple idioms yields all parents in body order (#4519).
+
+    Order is by first body-position across all idioms — matchers don't
+    cluster output by phrase.
+    """
+    body = (
+        "## Background\n"
+        "\n"
+        "Found by: retrospective on #4304.\n"
+        "Same lesson as #4250.\n"
+        "Adjacent to #4099.\n"
+        "Found while shipping #4303.\n"
+    )
+    assert probe_module.extract_lineage_parents(body) == [4304, 4250, 4099, 4303]
+
+
+def test_extract_dedupes_across_idioms(probe_module):
+    """Same parent cited via two different idioms yields one entry (#4519)."""
+    body = "Found by: retrospective on #4304.\nAlso: same lesson as #4304.\n"
+    assert probe_module.extract_lineage_parents(body) == [4304]
+
+
 # ─── Layer 2: Backtick-token extraction ───────────────────────────────────
 
 
@@ -457,6 +524,131 @@ def test_probe_malformed_search_json_exits_clean(probe_module):
             issue_body, repo="judgemind/judgemind", current_issue=4515
         )
     assert hit is None
+
+
+def test_probe_finds_sibling_via_found_while_shipping(probe_module):
+    """End-to-end (#4519): sibling whose body uses ``Found while shipping #N``.
+
+    AC3: ``find_sibling_retrospectives`` returns the union of issues
+    matching any of the recognized lineage phrases. A current issue
+    citing ``Found while shipping #4303`` finds a sibling whose body
+    also cites ``Found while shipping #4303``, and the lineage match
+    fires.
+
+    The test simulates the search behavior by routing all four phrase
+    queries (``retrospective on #4303``, ``Found while shipping #4303``,
+    ``Same lesson as #4303``, ``Adjacent to #4303``) to the SAME mock
+    response. In the real world, only the matching phrase would return
+    the sibling — but the probe must work regardless of which idiom
+    surfaces it.
+    """
+    issue_body = (
+        "## Description\n"
+        "\n"
+        "Update the `widget_handler` to drain quickly when the queue is\n"
+        "empty.\n"
+        "\n"
+        "## Background\n"
+        "\n"
+        "Found while shipping #4303.\n"
+    )
+    pr_body = (
+        "## Summary\n"
+        "\n"
+        "Make `widget_handler` self-diagnose empty-queue drain.\n"
+        "\n"
+        "Closes #4321\n"
+    )
+    responses = {
+        # All four phrases route to the same response; any of them
+        # surfacing the sibling is sufficient for the union.
+        ("search", "issues"): (
+            0,
+            '[{"number": 4321}]',
+        ),
+        ("issue", "view", "4321"): (
+            0,
+            '{"closedByPullRequestsReferences": [{"number": 4399, "state": "MERGED"}]}',
+        ),
+        ("pr", "view", "4399"): (
+            0,
+            '{"body": '
+            + repr(pr_body).replace("'", '"')
+            + ', "mergedAt": "2026-05-08T18:58:05Z", "baseRefName": "main"}',
+        ),
+    }
+    with mock.patch("subprocess.run", side_effect=_make_gh_mock(responses)):
+        hit = probe_module.probe(
+            issue_body, repo="judgemind/judgemind", current_issue=4519
+        )
+    assert hit is not None
+    pr, sibling, identifiers = hit
+    assert pr == 4399
+    assert sibling == 4321
+    assert "widget_handler" in identifiers
+
+
+def test_find_sibling_unions_all_phrases(probe_module):
+    """``find_sibling_retrospectives`` issues a search for each phrase (#4519).
+
+    Direct test of the union behavior: simulate three phrases that each
+    return a different sibling. Function must return the deduplicated
+    union of all four searches.
+    """
+    # Each phrase returns a different sibling. We use a stateful mock
+    # that returns successive payloads for successive ``search issues``
+    # calls — gh search is the only call exercised here so the order
+    # is deterministic.
+    search_payloads = [
+        '[{"number": 4321}]',  # phrase 1: retrospective on #4303
+        '[{"number": 4322}]',  # phrase 2: Found while shipping #4303
+        '[{"number": 4323}]',  # phrase 3: Same lesson as #4303
+        '[{"number": 4324}]',  # phrase 4: Adjacent to #4303
+    ]
+    state = {"call_count": 0}
+
+    def _stateful(args, **_kwargs):
+        argv = tuple(args[1:])
+        if argv[:2] == ("search", "issues"):
+            idx = state["call_count"]
+            state["call_count"] += 1
+            if idx < len(search_payloads):
+                return mock.Mock(returncode=0, stdout=search_payloads[idx], stderr="")
+        return mock.Mock(returncode=1, stdout="", stderr="")
+
+    with mock.patch("subprocess.run", side_effect=_stateful):
+        siblings = probe_module.find_sibling_retrospectives(
+            4303, repo="judgemind/judgemind", current_issue=4519
+        )
+    # All four searches ran and the union is preserved in order.
+    assert state["call_count"] == 4
+    assert siblings == [4321, 4322, 4323, 4324]
+
+
+def test_find_sibling_dedupes_across_phrases(probe_module):
+    """Sibling returned by multiple phrase searches is included once (#4519).
+
+    If two different phrase searches both return sibling #4321 (because
+    the sibling's body uses two different lineage idioms), the union must
+    de-duplicate.
+    """
+    # Each phrase returns sibling 4321; only the first inclusion counts.
+    state = {"call_count": 0}
+
+    def _stateful(args, **_kwargs):
+        argv = tuple(args[1:])
+        if argv[:2] == ("search", "issues"):
+            state["call_count"] += 1
+            return mock.Mock(returncode=0, stdout='[{"number": 4321}]', stderr="")
+        return mock.Mock(returncode=1, stdout="", stderr="")
+
+    with mock.patch("subprocess.run", side_effect=_stateful):
+        siblings = probe_module.find_sibling_retrospectives(
+            4303, repo="judgemind/judgemind", current_issue=4519
+        )
+    # Four phrase searches ran but the sibling appears once.
+    assert state["call_count"] == 4
+    assert siblings == [4321]
 
 
 def test_probe_first_match_wins_when_multiple_siblings(probe_module):
