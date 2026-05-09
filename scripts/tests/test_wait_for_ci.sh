@@ -89,13 +89,48 @@ MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}"
 LOG_FAILED_FILE="${LOG_FAILED_FILE:-}"
 RERUN_LOG_FILE="${RERUN_LOG_FILE:-}"
 
+# GraphQL rate-limit simulation (#4507). When set to "1", every
+# `gh pr view --json X` call fails with the canonical "GraphQL: API rate
+# limit already exceeded" stderr — the wrapper's fallback path must then
+# fall through to `gh api /repos/.../pulls/N` and translate the field shape.
+# The REST path is served by the `api ... pulls/...` route below from the
+# same SHA / MERGE_STATE / MERGEABLE env vars (translated to REST shape).
+PR_VIEW_GRAPHQL_RATE_LIMIT="${PR_VIEW_GRAPHQL_RATE_LIMIT:-0}"
+# Optional invocation log, same shape as test_gh_comment_with_retry.sh's
+# MOCK_INVOCATIONS — used by tests that need to count REST fallback calls.
+PR_VIEW_INVOCATIONS_LOG="${PR_VIEW_INVOCATIONS_LOG:-}"
+
 ARGS="$*"
+
+if [ -n "$PR_VIEW_INVOCATIONS_LOG" ]; then
+    echo "$ARGS" >> "$PR_VIEW_INVOCATIONS_LOG"
+fi
 
 # Route: pr view ... headRefOid — return canned SHA (plain string, like gh -q output).
 # Note: order matters — match `mergeStateStatus` before `mergeable` because the
 # substring `mergeable` appears within `mergeStateStatus` patterns in some gh
 # JSON enum outputs.
 case "$ARGS" in
+    "pr view "*)
+        if [ "$PR_VIEW_GRAPHQL_RATE_LIMIT" = "1" ]; then
+            echo "GraphQL: API rate limit already exceeded for user ID 99999." >&2
+            exit 1
+        fi
+        case "$ARGS" in
+            *"headRefOid"*)
+                printf '%s\n' "$SHA_RESPONSE"
+                exit 0
+                ;;
+            *"mergeStateStatus"*)
+                printf '%s\n' "$MERGE_STATE_RESPONSE"
+                exit 0
+                ;;
+            *"mergeable"*)
+                printf '%s\n' "$MERGEABLE_RESPONSE"
+                exit 0
+                ;;
+        esac
+        ;;
     *"headRefOid"*)
         printf '%s\n' "$SHA_RESPONSE"
         exit 0
@@ -106,6 +141,49 @@ case "$ARGS" in
         ;;
     *"mergeable"*)
         printf '%s\n' "$MERGEABLE_RESPONSE"
+        exit 0
+        ;;
+    "api /repos/"*"/pulls/"*)
+        # REST fallback path (#4507). The wrapper invokes
+        # `gh api /repos/<owner>/<repo>/pulls/<N> --jq '<expr>'`.
+        # We don't have a full PR JSON to feed jq through, but the wrapper
+        # only cares about three fields (head.sha, mergeable, mergeable_state).
+        # Construct a minimal JSON object reflecting the canned env-var
+        # values, then run the wrapper's jq against it via the real jq.
+        #
+        # Translate the GraphQL-shape canned values back to REST shape:
+        #   MERGEABLE_RESPONSE     | REST .mergeable field
+        #     MERGEABLE            | true
+        #     CONFLICTING          | false
+        #     UNKNOWN              | null
+        #   MERGE_STATE_RESPONSE   | REST .mergeable_state field (lowercase)
+        rest_mergeable="null"
+        case "$MERGEABLE_RESPONSE" in
+            MERGEABLE)   rest_mergeable="true" ;;
+            CONFLICTING) rest_mergeable="false" ;;
+            *)           rest_mergeable="null" ;;
+        esac
+        rest_mergeable_state=$(printf '%s' "$MERGE_STATE_RESPONSE" | tr '[:upper:]' '[:lower:]')
+
+        rest_json="{\"head\":{\"sha\":\"$SHA_RESPONSE\"},\"mergeable\":$rest_mergeable,\"mergeable_state\":\"$rest_mergeable_state\"}"
+
+        # Find the --jq argument the wrapper passed, run jq with it.
+        jq_expr=""
+        seen_jq_flag=0
+        for arg in "$@"; do
+            if [ "$seen_jq_flag" -eq 1 ]; then
+                jq_expr="$arg"
+                break
+            fi
+            if [ "$arg" = "--jq" ]; then
+                seen_jq_flag=1
+            fi
+        done
+        if [ -n "$jq_expr" ]; then
+            printf '%s' "$rest_json" | jq -r "$jq_expr"
+        else
+            printf '%s\n' "$rest_json"
+        fi
         exit 0
         ;;
     *"run rerun"*)
@@ -177,8 +255,11 @@ run_script() {
     MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}" \
     LOG_FAILED_FILE="${LOG_FAILED_FILE:-}" \
     RERUN_LOG_FILE="${RERUN_LOG_FILE:-}" \
+    PR_VIEW_GRAPHQL_RATE_LIMIT="${PR_VIEW_GRAPHQL_RATE_LIMIT:-0}" \
+    PR_VIEW_INVOCATIONS_LOG="${PR_VIEW_INVOCATIONS_LOG:-}" \
     WAIT_FOR_CI_RERUN_SENTINEL_FILE="${WAIT_FOR_CI_RERUN_SENTINEL_FILE:-$tmpdir/rerun-sentinel}" \
     WAIT_FOR_CI_FLAKE_LOG="${WAIT_FOR_CI_FLAKE_LOG:-$tmpdir/flakes-default.jsonl}" \
+    WAIT_FOR_CI_GRAPHQL_FALLBACK_SENTINEL="${WAIT_FOR_CI_GRAPHQL_FALLBACK_SENTINEL:-$tmpdir/graphql-fallback-sentinel}" \
         "$SCRIPT_UNDER_TEST" "$@"
 }
 
@@ -1205,6 +1286,146 @@ test_real_failure_with_cancelled_still_exits_1() {
     fi
 }
 
+# ── #4507: GraphQL rate-limit REST fallback ─────────────────────────────────
+
+# Test (#4507 AC#2): When `gh pr view --json X` fails with the canonical
+# GraphQL rate-limit marker, the script must fall back to
+# `gh api /repos/.../pulls/N`, translate the field shape, and continue
+# polling. The mock simulates GraphQL exhaustion by setting
+# PR_VIEW_GRAPHQL_RATE_LIMIT=1 — every `gh pr view --json` call exits 1
+# with the canonical stderr. The REST `api ... pulls/N` route returns
+# JSON shaped like REST does so the wrapper's jq translation runs end-to-end.
+test_graphql_rate_limit_falls_back_to_rest() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local invocations_log="$tmpdir/pr_view_invocations.txt"
+    : > "$invocations_log"
+
+    local output exit_code
+    exit_code=0
+    output=$(
+        PR_VIEW_GRAPHQL_RATE_LIMIT=1 \
+        PR_VIEW_INVOCATIONS_LOG="$invocations_log" \
+        SHA_RESPONSE="cafebabecafebabecafebabecafebabecafebabe" \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1
+    ) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "graphql_rate_limit_falls_back_to_rest: exits 0 via REST fallback"
+    else
+        fail "graphql_rate_limit_falls_back_to_rest: exits 0 via REST fallback" \
+            "exit=$exit_code output=$output"
+    fi
+
+    # The script must emit the canonical merge-gate-green message — proves the
+    # REST fallback successfully resolved mergeable=MERGEABLE.
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        pass "graphql_rate_limit_falls_back_to_rest: emits a green/complete message"
+    else
+        fail "graphql_rate_limit_falls_back_to_rest: emits a green/complete message" \
+            "output=$output"
+    fi
+
+    # The REST fallback must actually have been called. Look for at least one
+    # `api /repos/.../pulls/42` invocation in the recorded mock invocations.
+    if grep -qE "^api /repos/[^[:space:]]+/pulls/42" "$invocations_log"; then
+        pass "graphql_rate_limit_falls_back_to_rest: invoked 'gh api /repos/.../pulls/42'"
+    else
+        fail "graphql_rate_limit_falls_back_to_rest: invoked 'gh api /repos/.../pulls/42'" \
+            "invocations:\n$(cat "$invocations_log")"
+    fi
+
+    # The wrapper resolved the SHA via REST too — the `pr view ... headRefOid`
+    # call must have been made (and failed) before the fallback fired.
+    if grep -qE "^pr view 42 .* --json headRefOid" "$invocations_log"; then
+        pass "graphql_rate_limit_falls_back_to_rest: attempted GraphQL headRefOid first"
+    else
+        fail "graphql_rate_limit_falls_back_to_rest: attempted GraphQL headRefOid first" \
+            "invocations:\n$(cat "$invocations_log")"
+    fi
+}
+
+# Test (#4507 AC#3): The `info: GraphQL rate-limited, falling back to REST`
+# notice must appear on stderr exactly once per script invocation, even
+# though three distinct `gh pr view --json` callsites each individually
+# trigger the fallback during a single happy-path run (headRefOid, mergeable
+# inside the canonical-gate fast-path, mergeStateStatus inside the rebase-
+# required check). Defends against the AC#3 log-spam regression.
+test_graphql_rate_limit_info_emitted_once_per_session() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(
+        PR_VIEW_GRAPHQL_RATE_LIMIT=1 \
+        MERGEABLE_RESPONSE=MERGEABLE \
+        MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1
+    ) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "graphql_rate_limit_info_once: exits 0"
+    else
+        fail "graphql_rate_limit_info_once: exits 0" "exit=$exit_code output=$output"
+    fi
+
+    # Count the canonical info line. Must be exactly 1 — multiple callsites
+    # share a single sentinel file so only the first prints.
+    local info_count
+    info_count=$(echo "$output" | grep -cE "info: GraphQL rate-limited, falling back to REST" || true)
+    if [ "$info_count" -eq 1 ]; then
+        pass "graphql_rate_limit_info_once: emits exactly 1 info line (got $info_count)"
+    else
+        fail "graphql_rate_limit_info_once: emits exactly 1 info line (got $info_count)" \
+            "output=$output"
+    fi
+}
+
+# Test (#4507): A non-rate-limit gh pr view failure must NOT trigger the REST
+# fallback — the original error must pass through. Defends against
+# false-positive fallback on auth errors / generic 5xx where REST would
+# fail for the same reason.
+#
+# The mock's PR_VIEW_GRAPHQL_RATE_LIMIT=0 + a stripped-down failure mode
+# isn't currently wired (the existing happy path always succeeds), so we
+# verify the negative case indirectly: with PR_VIEW_GRAPHQL_RATE_LIMIT
+# unset, the canonical happy-path must NOT emit any "info: GraphQL
+# rate-limited" line. This proves the wrapper doesn't emit the info on
+# the success path.
+test_graphql_rate_limit_no_false_positive_info() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(
+        MERGEABLE_RESPONSE=MERGEABLE \
+        MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1
+    ) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "graphql_rate_limit_no_false_positive: happy path still exits 0"
+    else
+        fail "graphql_rate_limit_no_false_positive: happy path still exits 0" \
+            "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "info: GraphQL rate-limited"; then
+        fail "graphql_rate_limit_no_false_positive: must NOT emit info on happy path" \
+            "output=$output"
+    else
+        pass "graphql_rate_limit_no_false_positive: no info line on happy path"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -1231,6 +1452,9 @@ test_rebase_required_does_not_fire_on_clean_or_unstable
 test_rebase_required_does_not_fire_when_failure_present
 test_rebase_required_does_not_fire_while_ci_passed_in_progress
 test_help_documents_exit_3
+test_graphql_rate_limit_falls_back_to_rest
+test_graphql_rate_limit_info_emitted_once_per_session
+test_graphql_rate_limit_no_false_positive_info
 
 echo ""
 echo "────────────────────────────────────────────"

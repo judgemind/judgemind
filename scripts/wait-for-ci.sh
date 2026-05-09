@@ -99,6 +99,24 @@
 #       `mergeStateStatus=DIRTY — rebase required to merge.
 #        Run: git fetch origin main && git rebase origin/main && git push --force-with-lease.`
 #
+# ── GraphQL rate-limit fallback (#4507) ─────────────────────────────────────
+#
+# Every `gh pr view --json X` call in this script consumes from GitHub's
+# GraphQL 5,000-req/hr quota. When the dispatcher or a /task agent burns
+# through GraphQL during a long session — common with /dispatcher 5 — the
+# polling loop's `gh pr view` calls fail with `GraphQL: API rate limit
+# already exceeded` and the script bails. The REST `core` 5,000-req/hr
+# quota is a separate bucket that almost always still has headroom.
+#
+# `gh_pr_view_with_rest_fallback <field>` (defined below) wraps every
+# `gh pr view --json <field> -q .<field>` call: on GraphQL rate-limit
+# error it falls back to a single `gh api /repos/.../pulls/N` REST call
+# and translates the field shape (mergeable becomes
+# MERGEABLE/CONFLICTING/UNKNOWN, mergeable_state uppercases to match the
+# GraphQL enum). Per AC #3 of #4507, only one
+# `info: GraphQL rate-limited, falling back to REST` line is emitted to
+# stderr per script invocation — additional fallbacks proceed silently.
+#
 # ── Flake telemetry (#4163) ──────────────────────────────────────────────────
 #
 # Every time the auto-rerun classifier fires `gh run rerun` for a known flake,
@@ -202,10 +220,123 @@ if [ -z "$PR_NUMBER" ]; then
     exit 1
 fi
 
+# ── GraphQL rate-limit fallback (#4507) ───────────────────────────────────────
+#
+# `gh pr view --json <field>` posts via GitHub's GraphQL API, which has a
+# separate 5,000-req/hr quota from the REST core API. Long agent sessions
+# (dispatcher, multi-PR /task runs) regularly exhaust GraphQL while REST stays
+# healthy. When that happens, every `gh pr view --json X` call in this script
+# fails with "GraphQL: API rate limit already exceeded" — and the polling loop
+# bails. The REST equivalent endpoint
+# (`GET /repos/{owner}/{repo}/pulls/{n}`) consumes from the REST core quota
+# and is rarely exhausted in the same session.
+#
+# `gh_pr_view_with_rest_fallback <field>` runs `gh pr view --json <field>`
+# first; on GraphQL rate-limit failure it falls back to a single REST
+# `gh api /repos/.../pulls/N` call and extracts the equivalent field.
+# Translates the field name + value shape from REST to the GraphQL form the
+# rest of the script expects:
+#
+#     field name        | GraphQL value      | REST field        | translation
+#     ------------------|--------------------|-------------------|---------------------
+#     headRefOid        | "<40-char SHA>"    | head.sha          | none (verbatim)
+#     mergeable         | MERGEABLE / etc.   | mergeable         | true→MERGEABLE,
+#                       |                    |                   | false→CONFLICTING,
+#                       |                    |                   | null→UNKNOWN
+#     mergeStateStatus  | CLEAN / DIRTY/...  | mergeable_state   | uppercase
+#
+# Per AC #3 of #4507, only one `info: GraphQL rate-limited, falling back to
+# REST` line is emitted to stderr per script invocation — additional
+# fallbacks reuse the REST path silently. The sentinel must survive
+# command-substitution subshells (`MERGEABLE=$(gh_pr_view_with_rest_fallback
+# mergeable)`), so it's a temp file, not a shell variable. The file is
+# created on first GraphQL fallback and removed on script exit. Tests can
+# override the path via WAIT_FOR_CI_GRAPHQL_FALLBACK_SENTINEL.
+GRAPHQL_FALLBACK_SENTINEL_FILE="${WAIT_FOR_CI_GRAPHQL_FALLBACK_SENTINEL:-${TMPDIR:-/tmp}/wait-for-ci-graphql-fallback.$$}"
+# shellcheck disable=SC2064  # path fixed at trap-install time.
+trap "rm -f '$GRAPHQL_FALLBACK_SENTINEL_FILE'" EXIT
+
+gh_pr_view_with_rest_fallback() {
+    local field="$1"
+    local pr_view_stderr
+    local pr_view_stdout
+    local pr_view_exit
+    pr_view_stderr=$(mktemp)
+    pr_view_stdout=$(mktemp)
+
+    set +e
+    gh pr view "$PR_NUMBER" --repo "$REPO" --json "$field" -q ".$field" \
+        > "$pr_view_stdout" 2> "$pr_view_stderr"
+    pr_view_exit=$?
+    set -e
+
+    if [ "$pr_view_exit" -eq 0 ]; then
+        cat "$pr_view_stdout"
+        rm -f "$pr_view_stderr" "$pr_view_stdout"
+        return 0
+    fi
+
+    # Detect the explicit GraphQL rate-limit-exceeded marker. Anything else
+    # is a real failure and is passed through (stderr replayed, original
+    # exit code preserved).
+    if ! grep -qE "GraphQL: API rate limit already exceeded" "$pr_view_stderr"; then
+        cat "$pr_view_stderr" >&2
+        rm -f "$pr_view_stderr" "$pr_view_stdout"
+        return "$pr_view_exit"
+    fi
+
+    # First fallback in this session — emit one info line, then suppress
+    # subsequent ones to avoid log spam during a 30-min rate-limit window.
+    # File-based sentinel survives `$(...)` subshells; the parent's exit
+    # trap removes it.
+    if [ ! -f "$GRAPHQL_FALLBACK_SENTINEL_FILE" ]; then
+        echo "info: GraphQL rate-limited, falling back to REST" >&2
+        : > "$GRAPHQL_FALLBACK_SENTINEL_FILE"
+    fi
+
+    rm -f "$pr_view_stderr" "$pr_view_stdout"
+
+    # REST path. The `pulls/N` endpoint returns the full PR object; we extract
+    # the equivalent field via jq. `mergeStateStatus` and `mergeable` need
+    # value-shape translation since REST's enums are lowercase / boolean.
+    local rest_field rest_jq
+    case "$field" in
+        headRefOid)
+            rest_field="head.sha"
+            rest_jq=".head.sha // \"\""
+            ;;
+        mergeable)
+            # REST returns true / false / null. GraphQL returns
+            # MERGEABLE / CONFLICTING / UNKNOWN. Map.
+            rest_field="mergeable"
+            rest_jq='if .mergeable == true then "MERGEABLE" elif .mergeable == false then "CONFLICTING" else "UNKNOWN" end'
+            ;;
+        mergeStateStatus)
+            # REST returns lowercase "clean" / "dirty" / "unstable" / "blocked"
+            # / "behind" / "has_hooks" / "unknown" / "draft". Uppercase to
+            # match the GraphQL enum.
+            rest_field="mergeable_state"
+            rest_jq='(.mergeable_state // "unknown") | ascii_upcase'
+            ;;
+        *)
+            echo "ERROR: gh_pr_view_with_rest_fallback: unsupported field '$field'." >&2
+            return 1
+            ;;
+    esac
+
+    # Single REST call. Don't suppress stderr here — if REST also fails (e.g.
+    # core quota exhausted, auth broken), the operator needs the diagnostic.
+    if ! gh api "/repos/${REPO}/pulls/${PR_NUMBER}" --jq "$rest_jq"; then
+        echo "ERROR: REST fallback for '$field' also failed." >&2
+        return 1
+    fi
+    return 0
+}
+
 # ── Resolve PR head SHA ───────────────────────────────────────────────────────
 
 echo "Resolving head SHA for PR #${PR_NUMBER} in ${REPO}..."
-SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid -q .headRefOid)
+SHA=$(gh_pr_view_with_rest_fallback headRefOid)
 
 if [ -z "$SHA" ]; then
     echo "ERROR: Could not resolve head SHA for PR #${PR_NUMBER}." >&2
@@ -449,7 +580,12 @@ EOF
     # promptly rather than fall through to the all-checks-complete path which
     # would log "still waiting" repeatedly until timeout.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
-        MERGE_STATE_FOR_DIRTY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus -q .mergeStateStatus 2>/dev/null || echo "UNKNOWN")
+        # No `2>/dev/null` — gh_pr_view_with_rest_fallback only writes to
+        # stderr in two cases the operator must see: the once-per-session
+        # GraphQL fallback notice and a real REST-also-failed error. The
+        # `|| echo "UNKNOWN"` still tolerates a non-zero exit (both gh paths
+        # failed) by treating mergeStateStatus as unknown.
+        MERGE_STATE_FOR_DIRTY=$(gh_pr_view_with_rest_fallback mergeStateStatus || echo "UNKNOWN")
         if [ "$MERGE_STATE_FOR_DIRTY" = "DIRTY" ]; then
             echo ""
             echo "[${ELAPSED}s] mergeStateStatus=DIRTY — rebase required to merge. Run: git fetch origin main && git rebase origin/main && git push --force-with-lease."
@@ -469,7 +605,8 @@ EOF
     # that will never complete OR fall through to a hand-rolled `gh pr view`
     # gate every time Vercel cancels a deploy.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
-        MERGEABLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeable -q .mergeable 2>/dev/null || echo "UNKNOWN")
+        # No `2>/dev/null` — same rationale as the DIRTY branch above.
+        MERGEABLE=$(gh_pr_view_with_rest_fallback mergeable || echo "UNKNOWN")
         if [ "$MERGEABLE" = "MERGEABLE" ]; then
             echo ""
             echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, ci-passed=success, failed=0; pending=${PENDING_COUNT} ignored as superseded; cancelled=${CANCELLED_COUNT} ignored as non-required)."
@@ -487,7 +624,7 @@ EOF
     # zero pending.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$PENDING_COUNT" -eq 0 ]; then
         # Secondary guard: verify mergeStateStatus is CLEAN or UNSTABLE.
-        MERGE_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus -q .mergeStateStatus)
+        MERGE_STATE=$(gh_pr_view_with_rest_fallback mergeStateStatus)
         if [ "$MERGE_STATE" = "CLEAN" ] || [ "$MERGE_STATE" = "UNSTABLE" ]; then
             echo ""
             echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE}, cancelled=${CANCELLED_COUNT} non-blocking)."
