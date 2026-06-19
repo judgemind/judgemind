@@ -1,7 +1,8 @@
 """Tests for audit_scraper_field_population.
 
 Covers:
-- REGISTRY contains the 3 highest-volume JSON-envelope scrapers
+- REGISTRY contains the surviving JSON-envelope scrapers (CourtListener
+  was retired per #4571 / #4474; SF civil + CC portal remain)
 - lookup_field walks dotted paths and tolerates missing/non-dict segments
 - is_populated treats None / "" / [] / {} as not populated and 0 / False as populated
 - audit_one_scraper skips below min-captures, returns drift on 0/N, healthy on >0/N
@@ -76,15 +77,17 @@ fetch_envelope = _script.fetch_envelope
 class TestRegistry:
     """The registry must cover the 3 highest-volume JSON-envelope scrapers."""
 
-    def test_courtlistener_is_registered(self) -> None:
-        spec = get_spec("federal-courtlistener-opinions")
-        assert spec is not None
-        # Per #4310: docket.court_id is the canonical bare short-id.  docket.court
-        # is a URL with a ?format=json query string and was previously the
-        # registered field, but parsing it produced "?format=json" as the court
-        # id (#4310).  docket.court_id is the bare short-id directly and avoids
-        # URL parsing entirely.
-        assert "docket.court_id" in spec.field_paths
+    def test_courtlistener_is_retired(self) -> None:
+        """CourtListener federal-opinions was retired per #4571 / #4474.
+
+        Its envelopes drove dev ElastiCache OOM, so the scraper was
+        de-registered from the runner and dropped from this audit REGISTRY.
+        The two surviving JSON-envelope scrapers must remain registered so
+        the audit still covers them.
+        """
+        assert get_spec("federal-courtlistener-opinions") is None
+        assert get_spec("ca-sf-civil-tentatives") is not None
+        assert get_spec("ca-cc-tentatives-portal") is not None
 
     def test_sf_civil_is_registered(self) -> None:
         spec = get_spec("ca-sf-civil-tentatives")
@@ -98,9 +101,13 @@ class TestRegistry:
         assert "judge_id" in spec.field_paths
         assert "judge_name_dropdown" in spec.field_paths
 
-    def test_at_least_three_scrapers_covered(self) -> None:
-        """AC #4: registry covers at least 3 highest-volume scrapers."""
-        assert len(REGISTRY) >= 3
+    def test_surviving_scrapers_covered(self) -> None:
+        """Registry covers the surviving JSON-envelope scrapers.
+
+        CourtListener was retired per #4571 / #4474, leaving the two CA
+        JSON-envelope scrapers (SF civil + CC portal).
+        """
+        assert len(REGISTRY) >= 2
 
     def test_all_specs_are_json_envelope(self) -> None:
         """Initial registry only inspects JSON envelopes -- PDF/HTML are out of scope."""
@@ -242,10 +249,14 @@ _NOW = datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC)
 
 
 class TestAuditOneScraper:
+    # Re-fixtured from the retired ``federal-courtlistener-opinions`` (#4571 /
+    # #4474) to the surviving ``ca-sf-civil-tentatives`` JSON-envelope scraper.
+    # SF civil has two load-bearing field paths (``case_number`` + ``department``),
+    # so each audited scraper now yields TWO FieldResults instead of CL's one.
     def test_skip_when_below_min_captures(self) -> None:
-        conn = _make_conn({"federal-courtlistener-opinions": 10}, {})
+        conn = _make_conn({"ca-sf-civil-tentatives": 10}, {})
         s3 = _make_s3({})
-        spec = get_spec("federal-courtlistener-opinions")
+        spec = get_spec("ca-sf-civil-tentatives")
         assert spec is not None
 
         results, skip = audit_one_scraper(
@@ -264,9 +275,9 @@ class TestAuditOneScraper:
         assert skip["capture_count"] == 10
 
     def test_skip_when_no_sample_keys(self) -> None:
-        conn = _make_conn({"federal-courtlistener-opinions": 100}, {})
+        conn = _make_conn({"ca-sf-civil-tentatives": 100}, {})
         s3 = _make_s3({})
-        spec = get_spec("federal-courtlistener-opinions")
+        spec = get_spec("ca-sf-civil-tentatives")
         assert spec is not None
 
         results, skip = audit_one_scraper(
@@ -284,25 +295,19 @@ class TestAuditOneScraper:
         assert skip["reason"] == "no_sample_keys"
 
     def test_drift_when_field_empty_in_all_samples(self) -> None:
-        """The motivating bug class (#4247 / #4310): docket.court_id empty
-        in 10/10 samples.  Now keyed on docket.court_id (the bare short-id)
-        rather than docket.court (the URL form) -- see #4310."""
-        keys = [f"federal/dc/dc_district/raw/{'a' * 63}{i:x}.txt" for i in range(10)]
-        # Simulates the #4310 scenario: docket present but court_id empty.
-        envelopes = {
-            k: {
-                "cluster": {"id": i, "case_name": "X v. Y"},
-                "opinion": {"id": i, "plain_text": "text"},
-                "docket": {"id": i, "court_id": ""},  # empty -- the bug!
-            }
-            for i, k in enumerate(keys)
-        }
+        """The motivating bug class (#4247): a load-bearing field empty in
+        10/10 samples.  Re-fixtured to the surviving SF civil scraper after
+        CourtListener's retirement (#4571 / #4474): case_number is empty in
+        every sample while department stays populated."""
+        keys = [f"ca/sf/sf_civil/raw/{'a' * 63}{i:x}.json" for i in range(10)]
+        # case_number empty in every sample -- the drift; department populated.
+        envelopes = {k: {"case_number": "", "department": "12"} for k in keys}
         conn = _make_conn(
-            {"federal-courtlistener-opinions": 100},
-            {"federal-courtlistener-opinions": keys},
+            {"ca-sf-civil-tentatives": 100},
+            {"ca-sf-civil-tentatives": keys},
         )
         s3 = _make_s3(envelopes)  # type: ignore[arg-type]
-        spec = get_spec("federal-courtlistener-opinions")
+        spec = get_spec("ca-sf-civil-tentatives")
         assert spec is not None
 
         results, skip = audit_one_scraper(
@@ -316,31 +321,31 @@ class TestAuditOneScraper:
             now=_NOW,
         )
         assert skip is None
-        assert len(results) == 1
-        assert results[0].scraper_id == "federal-courtlistener-opinions"
-        assert results[0].field_path == "docket.court_id"
-        assert results[0].populated == 0
-        assert results[0].sampled == 10
-        assert results[0].drifted is True
+        # SF civil has two load-bearing fields.
+        assert len(results) == 2
+        by_path = {r.field_path: r for r in results}
+        assert by_path["case_number"].scraper_id == "ca-sf-civil-tentatives"
+        assert by_path["case_number"].populated == 0
+        assert by_path["case_number"].sampled == 10
+        assert by_path["case_number"].drifted is True
+        # department stays populated -- not drifted.
+        assert by_path["department"].populated == 10
+        assert by_path["department"].drifted is False
 
     def test_healthy_when_field_populated_in_at_least_one(self) -> None:
         """1/N populated is enough to clear -- the audit's floor is 'at least one'."""
-        keys = [f"federal/dc/dc_district/raw/{'a' * 63}{i:x}.txt" for i in range(10)]
-        # Only one sample has docket.court_id populated; the audit clears.
+        keys = [f"ca/sf/sf_civil/raw/{'a' * 63}{i:x}.json" for i in range(10)]
+        # Only one sample has case_number populated; the audit clears.
         envelopes = {}
         for i, k in enumerate(keys):
-            court_id = "ca9" if i == 0 else ""
-            envelopes[k] = {
-                "cluster": {},
-                "opinion": {},
-                "docket": {"court_id": court_id},
-            }
+            case_number = "CGC-24-0001" if i == 0 else ""
+            envelopes[k] = {"case_number": case_number, "department": "12"}
         conn = _make_conn(
-            {"federal-courtlistener-opinions": 100},
-            {"federal-courtlistener-opinions": keys},
+            {"ca-sf-civil-tentatives": 100},
+            {"ca-sf-civil-tentatives": keys},
         )
         s3 = _make_s3(envelopes)  # type: ignore[arg-type]
-        spec = get_spec("federal-courtlistener-opinions")
+        spec = get_spec("ca-sf-civil-tentatives")
         assert spec is not None
 
         results, skip = audit_one_scraper(
@@ -354,25 +359,26 @@ class TestAuditOneScraper:
             now=_NOW,
         )
         assert skip is None
-        assert len(results) == 1
-        assert results[0].populated == 1
-        assert results[0].sampled == 10
-        assert results[0].drifted is False
+        assert len(results) == 2
+        by_path = {r.field_path: r for r in results}
+        assert by_path["case_number"].populated == 1
+        assert by_path["case_number"].sampled == 10
+        assert by_path["case_number"].drifted is False
 
     def test_unparseable_envelope_skipped(self) -> None:
         """Envelopes that aren't valid JSON or aren't dicts don't count toward sampled."""
         keys = ["k1", "k2", "k3"]
         envelopes = {
             "k1": b"not json at all",  # parse fail
-            "k2": {"docket": {"court_id": "ca9"}},  # OK
+            "k2": {"case_number": "CGC-24-0001", "department": "12"},  # OK
             "k3": b"[1, 2, 3]",  # JSON but not a dict
         }
         conn = _make_conn(
-            {"federal-courtlistener-opinions": 100},
-            {"federal-courtlistener-opinions": keys},
+            {"ca-sf-civil-tentatives": 100},
+            {"ca-sf-civil-tentatives": keys},
         )
         s3 = _make_s3(envelopes)  # type: ignore[arg-type]
-        spec = get_spec("federal-courtlistener-opinions")
+        spec = get_spec("ca-sf-civil-tentatives")
         assert spec is not None
 
         results, skip = audit_one_scraper(
@@ -386,11 +392,12 @@ class TestAuditOneScraper:
             now=_NOW,
         )
         assert skip is None
-        assert len(results) == 1
+        assert len(results) == 2
+        by_path = {r.field_path: r for r in results}
         # Only k2 was inspected; populated=1, sampled=1.
-        assert results[0].sampled == 1
-        assert results[0].populated == 1
-        assert results[0].drifted is False
+        assert by_path["case_number"].sampled == 1
+        assert by_path["case_number"].populated == 1
+        assert by_path["case_number"].drifted is False
 
 
 # ---------------------------------------------------------------------------
@@ -400,16 +407,19 @@ class TestAuditOneScraper:
 
 class TestRunAudit:
     def test_scraper_filter_limits_scope(self) -> None:
-        # Only courtlistener has captures; the others below threshold.
-        keys = [f"federal/dc/dc_district/raw/{'a' * 63}{i:x}.txt" for i in range(10)]
-        envelopes = {k: {"docket": {"court": "ca9"}} for k in keys}
+        # Only SF civil has captures; the other is below threshold.  Re-fixtured
+        # from the retired CourtListener scraper (#4571 / #4474) to SF civil,
+        # which has two load-bearing field paths.
+        keys = [f"ca/sf/sf_civil/raw/{'a' * 63}{i:x}.json" for i in range(10)]
+        envelopes = {
+            k: {"case_number": "CGC-24-0001", "department": "12"} for k in keys
+        }
         conn = _make_conn(
             {
-                "federal-courtlistener-opinions": 100,
-                "ca-sf-civil-tentatives": 0,
+                "ca-sf-civil-tentatives": 100,
                 "ca-cc-tentatives-portal": 0,
             },
-            {"federal-courtlistener-opinions": keys},
+            {"ca-sf-civil-tentatives": keys},
         )
         s3 = _make_s3(envelopes)  # type: ignore[arg-type]
 
@@ -420,19 +430,21 @@ class TestRunAudit:
             sample_size=10,
             min_captures=50,
             lookback_days=7,
-            scraper_filter=["federal-courtlistener-opinions"],
+            scraper_filter=["ca-sf-civil-tentatives"],
             now=_NOW,
         )
         # No skipped entries for the others -- they were filtered out.
-        assert len(result.field_results) == 1
-        assert result.field_results[0].scraper_id == "federal-courtlistener-opinions"
+        # SF civil has two load-bearing fields, so two FieldResults.
+        assert len(result.field_results) == 2
+        assert all(
+            r.scraper_id == "ca-sf-civil-tentatives" for r in result.field_results
+        )
         assert result.skipped == []
 
     def test_full_run_records_skipped(self) -> None:
         """Without --scraper, all REGISTRY entries are tried; below-threshold ones are skipped."""
         conn = _make_conn(
             {
-                "federal-courtlistener-opinions": 0,
                 "ca-sf-civil-tentatives": 0,
                 "ca-cc-tentatives-portal": 0,
             },
@@ -460,11 +472,17 @@ class TestRunAudit:
 
 class TestSyntheticDriftResult:
     def test_synthetic_is_unhealthy(self) -> None:
-        """The synthetic scenario simulates the #4247 / #4310 bug class."""
+        """The synthetic scenario simulates the #4247 bug class.
+
+        Re-fixtured to the surviving ``ca-sf-civil-tentatives`` scraper after
+        CourtListener's retirement (#4571 / #4474): case_number empty in
+        every sample.
+        """
         result = synthetic_drift_result()
         assert result.healthy is False
         assert result.drift_count == 1
-        assert result.field_results[0].field_path == "docket.court_id"
+        assert result.field_results[0].scraper_id == "ca-sf-civil-tentatives"
+        assert result.field_results[0].field_path == "case_number"
         assert result.field_results[0].drifted is True
 
 
@@ -477,8 +495,8 @@ class TestBuildIssueBody:
     def test_body_contains_scraper_and_field(self) -> None:
         result = synthetic_drift_result()
         body = build_issue_body(result)
-        assert "federal-courtlistener-opinions" in body
-        assert "docket.court_id" in body
+        assert "ca-sf-civil-tentatives" in body
+        assert "case_number" in body
         # Markdown table delimiter present.
         assert "| Scraper |" in body
 
@@ -509,7 +527,7 @@ class TestMainDryRun:
         assert out.exists()
         text = out.read_text()
         assert "Scraper Field-Mapping Drift Alert" in text
-        assert "docket.court_id" in text
+        assert "case_number" in text
 
     def test_dry_run_returns_1_when_unhealthy(self) -> None:
         rc = _script.main(["--dry-run"])
@@ -523,9 +541,9 @@ class TestMainDryRun:
 
 class TestDbHelpers:
     def test_fetch_capture_count(self) -> None:
-        conn = _make_conn({"federal-courtlistener-opinions": 42}, {})
+        conn = _make_conn({"ca-sf-civil-tentatives": 42}, {})
         n = fetch_capture_count(
-            conn, "federal-courtlistener-opinions", _NOW - timedelta(days=7)
+            conn, "ca-sf-civil-tentatives", _NOW - timedelta(days=7)
         )
         assert n == 42
 
@@ -537,9 +555,9 @@ class TestDbHelpers:
     def test_fetch_sample_keys_truncates_to_sample_size(self) -> None:
         conn = _make_conn(
             {},
-            {"federal-courtlistener-opinions": [f"k{i}" for i in range(20)]},
+            {"ca-sf-civil-tentatives": [f"k{i}" for i in range(20)]},
         )
-        keys = fetch_sample_keys(conn, "federal-courtlistener-opinions", 5)
+        keys = fetch_sample_keys(conn, "ca-sf-civil-tentatives", 5)
         assert keys == [f"k{i}" for i in range(5)]
 
 
