@@ -109,7 +109,7 @@ module "cache" {
   environment        = "dev"
   vpc_id             = module.networking.vpc_id
   private_subnet_ids = module.networking.private_subnet_ids
-  node_type          = "cache.t4g.micro"
+  node_type          = "cache.t4g.small"
   num_cache_nodes    = 1
 
   # Dev applies node_type / engine_version / parameter-group changes on the

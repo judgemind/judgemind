@@ -112,6 +112,11 @@ EXCLUSIONS: set[str] = {
     # Governor appointments scraper runs quarterly-ish; most runs legitimately
     # return zero records. Exclude until dedicated health signal is wired.
     "ca-governor-appointments",
+    # CourtListener federal-opinions scraper retired per #4571 / #4474 — its
+    # envelopes drove dev ElastiCache OOM and wedged the dispatcher. Kept in
+    # EXCLUSIONS so the silent-outage guard does not alert on the now-retired
+    # (de-registered) scraper.
+    "federal-courtlistener-opinions",
 }
 
 # Scrapers that run more than once per day ("frequent"). All others are

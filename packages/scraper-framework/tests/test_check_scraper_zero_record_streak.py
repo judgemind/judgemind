@@ -322,6 +322,16 @@ class TestModuleExclusions:
         """Quarterly cadence — most runs legitimately return zero."""
         assert "ca-governor-appointments" in zrs.EXCLUSIONS
 
+    def test_excludes_federal_courtlistener_opinions_after_4571(self) -> None:
+        """CourtListener federal-opinions retired per #4571 / #4474.
+
+        The scraper was de-registered (its envelopes drove dev ElastiCache
+        OOM and wedged the dispatcher). It is kept in EXCLUSIONS so the
+        silent-outage guard does not alert on the now-retired scraper.
+        See #4571 for the retirement and #4474 for the operator decision.
+        """
+        assert "federal-courtlistener-opinions" in zrs.EXCLUSIONS
+
     def test_does_not_exclude_ca_sd_calendar_after_4539(self) -> None:
         """ca-sd-calendar must NOT be in EXCLUSIONS now that #4539 has
         shipped. The structural fix flipped the ``day_numbers`` default

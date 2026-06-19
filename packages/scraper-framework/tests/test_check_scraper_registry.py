@@ -159,10 +159,14 @@ class TestFindRegisteredModules:
             "courts.ca.sd_tentatives",
             "courts.ca.sf_tentatives",
             "courts.ca.ventura_tentatives",
-            "courts.federal.courtlistener",
         }
         for mod in expected:
             assert mod in registered, f"Expected {mod} to be registered in runner.py"
+        # CourtListener was retired per #4571 / #4474 — de-registered from the
+        # runner while the module stays in tree. It must NOT appear as a
+        # registered import, and the guard tolerates it via RETIRED_MODULES.
+        assert "courts.federal.courtlistener" not in registered
+        assert "courts.federal.courtlistener" in check_registry.RETIRED_MODULES
 
     def test_with_synthetic_runner(self, tmp_path: Path) -> None:
         """Parses imports from a synthetic runner.py file."""

@@ -15,9 +15,9 @@ CourtListener ``cluster.court`` field documented as canonical but empty
 in every actual API response). Running this audit daily catches drift
 within ~24 h instead of weeks.
 
-Scope (initial registry):
-  - ``federal-courtlistener-opinions`` -- envelope is JSON
-    {cluster, opinion, docket}; load-bearing field is ``docket.court``.
+Scope (registry):
+  The CourtListener federal-opinions scraper was retired per #4571 / #4474
+  (its envelopes drove dev ElastiCache OOM) and is no longer audited here.
   - ``ca-sf-civil-tentatives`` -- envelope is a flat JSON dict of
     ParsedRuling fields plus ruling_id/department. Load-bearing fields
     are ``case_number`` and ``department``.
@@ -135,27 +135,14 @@ class ScraperFieldSpec:
     rationale: str
 
 
-# Initial registry (issue #4255 acceptance criterion: cover the
-# 3 highest-volume JSON-envelope scrapers).  CourtListener is the
-# motivating case (#4247).  SF civil and CC portal are the other two
-# JSON-envelope scrapers in the codebase today; OC / LA / SD store
-# binary PDFs or bare HTML that don't admit field-path introspection
-# from S3 alone.
+# Registry (issue #4255 acceptance criterion: cover the highest-volume
+# JSON-envelope scrapers).  SF civil and CC portal are the JSON-envelope
+# scrapers in the codebase today; OC / LA / SD store binary PDFs or bare
+# HTML that don't admit field-path introspection from S3 alone.  The
+# CourtListener federal-opinions scraper was the original motivating case
+# (#4247) but was retired per #4571 / #4474 (its envelopes drove dev
+# ElastiCache OOM), so it no longer appears in this registry.
 REGISTRY: tuple[ScraperFieldSpec, ...] = (
-    ScraperFieldSpec(
-        scraper_id="federal-courtlistener-opinions",
-        envelope_format="json",
-        field_paths=("docket.court_id",),
-        rationale=(
-            "docket.court_id is the canonical bare short-id (e.g. "
-            "'dcd', 'scotus', 'texapp1') after #4247 / #4310. "
-            "cluster.court / cluster.court_id are empty in every "
-            "CourtListener API response we capture; docket.court is a "
-            "URL with a ?format=json query string and previously parsed "
-            "to '?format=json' (#4310).  docket.court_id is the bare "
-            "short-id directly and avoids URL parsing entirely."
-        ),
-    ),
     ScraperFieldSpec(
         scraper_id="ca-sf-civil-tentatives",
         envelope_format="json",
@@ -470,21 +457,24 @@ def run_audit(
 def synthetic_drift_result() -> AuditResult:
     """Return a synthetic AuditResult for --dry-run.
 
-    Simulates the bug class behind #4247: courtlistener's docket.court
-    empty in 10/10 samples.  Used for the AC verification step
-    "dry-run against a synthetic empty-field scenario produces a
-    generated issue body in tmp/" and for unit tests.
+    Simulates the bug class behind #4247: a load-bearing field empty in
+    10/10 samples.  CourtListener (the original motivating scraper) was
+    retired per #4571 / #4474, so this synthetic scenario is now keyed on
+    the surviving ``ca-sf-civil-tentatives`` JSON-envelope scraper with
+    ``case_number`` empty.  Used for the AC verification step "dry-run
+    against a synthetic empty-field scenario produces a generated issue
+    body in tmp/" and for unit tests.
     """
-    spec = get_spec("federal-courtlistener-opinions")
-    assert spec is not None, "registry must contain courtlistener"
+    spec = get_spec("ca-sf-civil-tentatives")
+    assert spec is not None, "registry must contain ca-sf-civil-tentatives"
     drifted = FieldResult(
         scraper_id=spec.scraper_id,
-        field_path="docket.court_id",
+        field_path="case_number",
         populated=0,
         sampled=10,
         sample_keys=[
-            f"federal/dc/dc_district/raw/{'a' * 64}.txt",
-            f"federal/dc/dc_district/raw/{'b' * 64}.txt",
+            f"ca/sf/sf_civil/raw/{'a' * 64}.json",
+            f"ca/sf/sf_civil/raw/{'b' * 64}.json",
         ],
     )
     return AuditResult(field_results=[drifted])
