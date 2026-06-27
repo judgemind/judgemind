@@ -101,6 +101,7 @@ from typing import Any
 import psycopg
 import structlog
 
+from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
 
 structlog.configure(
@@ -427,24 +428,10 @@ def _process_one_document(
 
         rc = redis_lib.Redis.from_url(redis_url, decode_responses=False)
         if os_url:
-            from opensearchpy import OpenSearch
-
-            # 30s timeout + 3 retries: opensearchpy defaults to 10s and no
-            # retries, which produces sporadic ``ConnectionTimeout`` entries
-            # during rebuild under load (#2481).  ``IndexingConsumer`` also
-            # swallows terminal timeouts as a warning so a missed index
-            # never fails document processing.
-            os_kwargs: dict = {
-                "hosts": [os_url],
-                "timeout": 30,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-            }
-            os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-            os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-            if os_user and os_pass:
-                os_kwargs["http_auth"] = (os_user, os_pass)
-            os_client = OpenSearch(**os_kwargs)
+            # SigV4-preferred client with local-dev basic-auth fallback; keeps
+            # the 30s timeout + 3 retries that make rebuild self-healing under
+            # load (#2481).  See framework.opensearch_client (#4040).
+            os_client = make_opensearch_client(os_url)
         else:
             os_client = MagicMock()
         s3 = _make_s3()
@@ -1499,21 +1486,9 @@ def reset_derived_tables_for_court(
 
 def reset_opensearch_index(os_url: str) -> None:
     """Delete the OpenSearch tentative_rulings index so it's rebuilt from scratch."""
-    from opensearchpy import OpenSearch
-
-    # 30s timeout + 3 retries — same rationale as the per-worker client
-    # constructed in ``_process_one_document``.  See #2481.
-    os_kwargs: dict = {
-        "hosts": [os_url],
-        "timeout": 30,
-        "max_retries": 3,
-        "retry_on_timeout": True,
-    }
-    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-    if os_user and os_pass:
-        os_kwargs["http_auth"] = (os_user, os_pass)
-    client = OpenSearch(**os_kwargs)
+    # SigV4-preferred client with local-dev basic-auth fallback; same timeout
+    # rationale as ``_process_one_document`` (#2481).  See #4040.
+    client = make_opensearch_client(os_url)
 
     index_name = "tentative_rulings_v1"
     if client.indices.exists(index=index_name):
@@ -1535,19 +1510,8 @@ def delete_opensearch_docs_for_county(os_url: str, county: str) -> int:
 
     Returns the number of OS docs deleted (0 if index missing).
     """
-    from opensearchpy import OpenSearch
-
-    os_kwargs: dict = {
-        "hosts": [os_url],
-        "timeout": 30,
-        "max_retries": 3,
-        "retry_on_timeout": True,
-    }
-    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-    if os_user and os_pass:
-        os_kwargs["http_auth"] = (os_user, os_pass)
-    client = OpenSearch(**os_kwargs)
+    # SigV4-preferred client with local-dev basic-auth fallback (#2481, #4040).
+    client = make_opensearch_client(os_url)
 
     index_name = "tentative_rulings_v1"
     if not client.indices.exists(index=index_name):
@@ -1594,19 +1558,8 @@ def delete_opensearch_docs_for_court(
 
     Returns the number of OS docs deleted (0 if index missing).
     """
-    from opensearchpy import OpenSearch
-
-    os_kwargs: dict = {
-        "hosts": [os_url],
-        "timeout": 30,
-        "max_retries": 3,
-        "retry_on_timeout": True,
-    }
-    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-    if os_user and os_pass:
-        os_kwargs["http_auth"] = (os_user, os_pass)
-    client = OpenSearch(**os_kwargs)
+    # SigV4-preferred client with local-dev basic-auth fallback (#2481, #4040).
+    client = make_opensearch_client(os_url)
 
     index_name = "tentative_rulings_v1"
     if not client.indices.exists(index=index_name):

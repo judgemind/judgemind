@@ -11,8 +11,12 @@ Required environment variables:
 
 Optional:
     MAX_RETRIES            — Per-message retry limit (default: 3)
-    OPENSEARCH_USERNAME    — OpenSearch basic auth username
-    OPENSEARCH_PASSWORD    — OpenSearch basic auth password
+    OPENSEARCH_USERNAME    — OpenSearch basic-auth username (local-dev fallback)
+    OPENSEARCH_PASSWORD    — OpenSearch basic-auth password (local-dev fallback)
+
+OpenSearch auth: SigV4-signed requests (from the ambient AWS credential chain)
+are the preferred, deployed path; ``OPENSEARCH_USERNAME``/``OPENSEARCH_PASSWORD``
+are a local-dev basic-auth fallback.  See framework.opensearch_client and #4040.
 """
 
 from __future__ import annotations
@@ -22,9 +26,9 @@ import sys
 
 import redis
 import structlog
-from opensearchpy import OpenSearch
 
 from framework.logging import configure_structlog
+from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
 
 from .worker import InfrastructureError, IngestionWorker
@@ -65,25 +69,10 @@ def main() -> None:
         redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
         redis_client.ping()  # Fail fast on bad URL
 
-        # timeout/max_retries/retry_on_timeout: opensearchpy defaults to a
-        # 10s read_timeout and no retries, which produces sporadic
-        # ``ConnectionTimeout`` failures during rebuilds under load.  Bumping
-        # the timeout to 30s and enabling retries makes transient network
-        # blips self-healing; ``IndexingConsumer`` also swallows terminal
-        # timeouts as a warning so a Postgres write never gates on a flaky
-        # search backend.  See #2481.
-        os_kwargs: dict = {
-            "hosts": [opensearch_url],
-            "timeout": 30,
-            "max_retries": 3,
-            "retry_on_timeout": True,
-        }
-        os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-        os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-        if os_user and os_pass:
-            os_kwargs["http_auth"] = (os_user, os_pass)
-
-        opensearch_client = OpenSearch(**os_kwargs)
+        # SigV4-preferred client with local-dev basic-auth fallback; keeps the
+        # 30s timeout + 3 retries that make rebuilds self-healing under load
+        # (#2481).  See framework.opensearch_client (#4040).
+        opensearch_client = make_opensearch_client(opensearch_url)
         s3_client = make_s3_client()
 
         worker = IngestionWorker(
