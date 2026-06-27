@@ -36,17 +36,32 @@ Listing table row format:
     </td>
   </tr>
 
-Detail page format:
+Detail page format (current portal, #4598):
   <article role="article" about="/tentative-ruling/l24-04564">
-    ... h2 sections for Case Number, Case Type, Hearing Date, Nature of Proceedings ...
-    <div class="field--name-body">
-      <a href="/system/files/general/16_012925.pdf">Tentative Ruling PDF</a>
-      <p>Before the Court are ...</p>
+    <div class="jcc-body__main-text usa-prose clearfix">
+      <h2>Case Number</h2><p><span>L24-04564</span></p>
+      <h2>Case Type</h2><p><div>Civil</div></p>
+      <h2>Hearing Date / Time</h2><p> Wed, 01/29/2025 - 08:31 </p>
+      <h2>Nature of Proceedings</h2><p> CASE MANAGEMENT CONFERENCE </p>
+      <h2>Tentative Ruling</h2>
+      <p><p><a href="/system/files/general/16_012925.pdf">Tentative Ruling PDF</a></p>
+         <p>Before the Court are ...</p></p>
     </div>
     <aside class="jcc-body__aside">
       <h4>BENJAMIN REYES</h4>
     </aside>
+    <aside class="usa-footer">
+      <a href="/system/files/traffic/tr-320-info.pdf">Traffic info</a>
+    </aside>
   </article>
+
+  The ruling content lives under the <h2>Tentative Ruling</h2> heading inside
+  <div class="jcc-body__main-text">.  Every detail page also carries a
+  boilerplate /system/files/traffic/ PDF (e.g. in a footer aside) that MUST be
+  ignored — the real ruling PDF is the /system/files/general/ link inside the
+  ruling section.  The parser falls back to the legacy
+  <div class="field--name-body"> container for archived/older pages (which
+  predate the jcc-body__main-text restructure).
 
 Case number formats (matches the retired scraper):
   Civil:    C + 2-digit year + hyphen + 5 digits  (C24-02490)
@@ -70,7 +85,7 @@ from urllib.parse import urljoin
 
 import httpx
 import structlog
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 
@@ -248,6 +263,94 @@ def _parse_listing_table(html: str) -> list[dict]:
     return rows_data
 
 
+def _ruling_section_paragraphs(main_text: Tag) -> list[Tag]:
+    """Collect the leaf <p> tags belonging to the Tentative Ruling section.
+
+    The ``jcc-body__main-text`` div holds several <h2> sections (Case Number,
+    Case Type, Hearing Date, Nature of Proceedings, Tentative Ruling).  Anchor
+    on the <h2> whose text is "Tentative Ruling" and collect the leaf
+    paragraphs that follow it (up to the next <h2>, if any), so the PDF link
+    and ruling body are read from the ruling section only — never from Case
+    Number etc., and never from the boilerplate traffic PDF that lives outside
+    this container.
+
+    Traversal uses ``find_all_next()`` (document order) rather than
+    ``find_next_siblings()`` so the section boundary is detected at the next
+    <h2> *regardless of nesting* — a future portal theming change that wraps a
+    section in a styling <div> (``<h2>Tentative Ruling</h2><div>...<h2>Next
+    Section</h2>...</div>``) still stops at that inner <h2> instead of leaking
+    the following section's paragraphs into the ruling.  Candidates are scoped
+    to descendants of ``main_text`` so the traversal never wanders into the
+    sibling <aside>/footer that carries the boilerplate traffic PDF.
+    """
+    headings = main_text.find_all("h2")
+    ruling_h2 = None
+    for h2 in headings:
+        if h2.get_text(strip=True).lower() == "tentative ruling":
+            ruling_h2 = h2
+            break
+    if ruling_h2 is None:
+        return []
+
+    potential: list[Tag] = []
+    for tag in ruling_h2.find_all_next():
+        if not isinstance(tag, Tag):
+            continue
+        # Only consider nodes inside the jcc-body__main-text container; the
+        # document-order traversal would otherwise reach the sibling
+        # <aside>/footer that holds the boilerplate traffic PDF.
+        if main_text not in tag.parents:
+            continue
+        # The next <h2> in document order ends the Tentative Ruling section,
+        # whether it is a direct sibling or nested inside a wrapper <div>.
+        if tag.name == "h2":
+            break
+        if tag.name == "p":
+            potential.append(tag)
+
+    # De-duplicate preserving order, then keep only leaf <p> (no nested <p>)
+    # so wrapper paragraphs do not double-count text. lxml flattens invalid
+    # nested <p><p>...</p></p> into siblings, so each real ruling paragraph is
+    # already a leaf.
+    unique = list(dict.fromkeys(potential))
+    return [p for p in unique if not p.find("p")]
+
+
+def _select_pdf_url(anchors: list[Tag]) -> str | None:
+    """Pick the ruling PDF href from a list of <a> tags.
+
+    Prefers a link under ``/system/files/general/`` (the real ruling PDF),
+    falling back to the first ``.pdf`` link that is NOT under
+    ``/system/files/traffic/`` (the boilerplate traffic PDF carried on every
+    detail page).  Returns an absolute URL via ``urljoin``, or None.
+    """
+    fallback: str | None = None
+    for a in anchors:
+        href = a.get("href", "")
+        if not href or ".pdf" not in href.lower():
+            continue
+        if "/system/files/general/" in href:
+            return urljoin(BASE_URL, href)
+        if "/system/files/traffic/" in href:
+            continue
+        if fallback is None:
+            fallback = urljoin(BASE_URL, href)
+    return fallback
+
+
+def _leaf_paragraphs(container: Tag) -> list[Tag]:
+    """Return only the innermost (leaf) <p> tags under a container element.
+
+    Used for the legacy ``field--name-body`` <div>, whose ruling paragraphs
+    are direct children.  ``find_all("p")`` returns the inner <p> descendants
+    and does NOT include the ``container`` element itself.  BeautifulSoup/lxml
+    auto-flattens the invalid nested ``<p><p>...</p></p>`` markup into sibling
+    <p> tags, so a <p> never actually contains a nested <p> post-parse; the
+    ``not p.find("p")`` guard simply keeps the predicate robust.
+    """
+    return [p for p in container.find_all("p") if not p.find("p")]
+
+
 def _parse_detail_page(html: str) -> dict:
     """Extract structured fields from a detail page.
 
@@ -259,29 +362,38 @@ def _parse_detail_page(html: str) -> dict:
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # --- PDF URL and ruling text from the body field ---
-    # The body field div contains a PDF link and ruling text paragraphs.
+    # --- PDF URL and ruling text from the ruling content ---
     ruling_text: str | None = None
     ruling_text_html: str | None = None
     pdf_url: str | None = None
 
-    # Look for the field--name-body div
-    body_field = soup.find("div", class_=lambda c: c and "field--name-body" in c)
-    if body_field:
-        # Find PDF link
-        for a in body_field.find_all("a"):
-            href = a.get("href", "")
-            if href and ".pdf" in href.lower():
-                pdf_url = urljoin(BASE_URL, href)
-                break
+    # Current portal: ruling content lives under
+    # <div class="jcc-body__main-text"> after an <h2>Tentative Ruling</h2>
+    # heading.  Archived/older pages used <div class="field--name-body">.
+    main_text = soup.find("div", class_=lambda c: c and "jcc-body__main-text" in c)
+    ruling_section: list = []
+    body_field = None
+    if main_text:
+        ruling_section = _ruling_section_paragraphs(main_text)
+    else:
+        body_field = soup.find("div", class_=lambda c: c and "field--name-body" in c)
+        if body_field:
+            ruling_section = _leaf_paragraphs(body_field)
 
-        # Extract ruling text from paragraphs (excluding the PDF link paragraph)
+    if ruling_section:
+        # PDF URL: prefer /system/files/general/, never /system/files/traffic/.
+        anchors: list = []
+        for p in ruling_section:
+            anchors.extend(p.find_all("a"))
+        pdf_url = _select_pdf_url(anchors)
+
+        # Ruling body: leaf paragraphs whose only anchors are .pdf links are
+        # the PDF-link paragraph and are excluded.
         text_parts: list[str] = []
         html_parts: list[str] = []
-        for p in body_field.find_all("p"):
-            # Skip paragraphs that only contain the PDF link
-            anchors = p.find_all("a")
-            if anchors and all(".pdf" in a.get("href", "").lower() for a in anchors):
+        for p in ruling_section:
+            p_anchors = p.find_all("a")
+            if p_anchors and all(".pdf" in a.get("href", "").lower() for a in p_anchors):
                 continue
             text = p.get_text(separator=" ", strip=True)
             if text:
