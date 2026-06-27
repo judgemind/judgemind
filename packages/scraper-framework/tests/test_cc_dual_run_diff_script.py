@@ -274,3 +274,94 @@ class TestWritesDataQualityMetricsRow:
         assert any("cc_dual_run_diff" in s for s in param_strs), (
             f"Expected 'cc_dual_run_diff' in insert params, got: {params}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. Total-coverage signal in JSON payload + metrics metadata (issue #4600)
+# ---------------------------------------------------------------------------
+
+
+class TestTotalCoverageSignalPayload:
+    def test_total_zero_signal_in_json_payload(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Portal captured nothing while retired had data → JSON carries the
+        total-coverage failure signal."""
+        # Retired scraper has two depts; portal has nothing.
+        rows = [
+            _row_retired("16", "C24-01001"),
+            _row_retired("30", "N25-0001"),
+        ]
+        conn = _make_conn(rows)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            exit_code = main(["--date", TARGET_DATE_STR])
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+
+        assert payload["portal_total_zero"] is True
+        assert payload["retired_total"] == 2
+        assert payload["portal_total"] == 0
+        assert "total-coverage failure" in payload["total_coverage_headline"]
+        assert exit_code == 1  # every retired dept is missing_portal
+
+    def test_partial_coverage_signal_absent_from_payload(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Partial coverage → portal_total_zero False and empty headline."""
+        rows = [
+            _row_retired("16", "C24-01001"),
+            _row_retired("30", "N25-0001"),
+            _row_portal(_PORTAL_S3_KEY_DEPT30, "N25-0001"),
+        ]
+        conn = _make_conn(rows)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            main(["--date", TARGET_DATE_STR])
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+
+        assert payload["portal_total_zero"] is False
+        assert payload["total_coverage_headline"] == ""
+        assert payload["portal_total"] == 1
+
+    def test_total_zero_signal_in_metrics_metadata(self) -> None:
+        """The metrics metadata JSONB carries the total-coverage signal fields."""
+        rows = [_row_retired("16", "C24-01001")]
+        cur = _make_cursor(rows)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        conn.__enter__ = MagicMock(return_value=conn)
+        conn.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            main(["--date", TARGET_DATE_STR])
+
+        insert_calls = [
+            c
+            for c in cur.execute.call_args_list
+            if "data_quality_metrics" in str(c).lower() and "INSERT" in str(c).upper()
+        ]
+        assert insert_calls, "Expected an INSERT into data_quality_metrics"
+
+        insert_call = insert_calls[0]
+        params = (
+            insert_call.args[1]
+            if len(insert_call.args) > 1
+            else insert_call.kwargs.get("params", ())
+        )
+        # The metadata JSON is the last param.
+        metadata = json.loads(params[-1])
+        assert metadata["portal_total_zero"] is True
+        assert metadata["retired_total"] == 1
+        assert metadata["portal_total"] == 0
+        assert "total-coverage failure" in metadata["total_coverage_headline"]

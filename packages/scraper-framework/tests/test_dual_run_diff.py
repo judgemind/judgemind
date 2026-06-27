@@ -15,7 +15,9 @@ from datetime import date
 from framework.dual_run_diff import (
     Capture,
     DiffRow,
+    TotalCoverageSignal,
     compute_per_department_diff,
+    compute_total_coverage_signal,
     format_summary,
 )
 
@@ -386,3 +388,161 @@ class TestNoneDepartmentFiltering:
         assert rows[0].department == "16"
         assert rows[0].flag == "missing_portal"
         assert rows[0].count_b == 0
+
+
+# ---------------------------------------------------------------------------
+# Total-coverage signal — distinguishes total-coverage failure from
+# per-department gaps (issue #4600)
+# ---------------------------------------------------------------------------
+
+
+class TestTotalCoverageSignal:
+    def test_portal_zero_single_retired_department(self) -> None:
+        """Portal captured nothing while retired has one department → total-zero."""
+        captures_a = [_retired("16", "C24-01001"), _retired("16", "C24-01002")]
+        captures_b: list[Capture] = []
+
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert isinstance(signal, TotalCoverageSignal)
+        assert signal.portal_total_zero is True
+        assert signal.retired_total == 2
+        assert signal.portal_total == 0
+        assert "total-coverage failure" in signal.headline
+
+    def test_portal_zero_multiple_retired_departments(self) -> None:
+        """Portal captured nothing while retired spans multiple depts → total-zero."""
+        captures_a = [
+            _retired("09", "C24-01001"),
+            _retired("16", "C24-01002"),
+            _retired("30", "N25-0001"),
+        ]
+        captures_b: list[Capture] = []
+
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert signal.portal_total_zero is True
+        assert signal.retired_total == 3
+        assert signal.portal_total == 0
+        assert "total-coverage failure" in signal.headline
+
+    def test_partial_coverage_is_not_total_zero(self) -> None:
+        """Portal has some departments but not all → not a total-coverage failure."""
+        captures_a = [_retired("16", "C24-01001"), _retired("30", "N25-0001")]
+        captures_b = [_portal("30", "N25-0001")]
+
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert signal.portal_total_zero is False
+        assert signal.retired_total == 2
+        assert signal.portal_total == 1
+        assert signal.headline == ""
+
+    def test_both_empty_is_not_total_zero(self) -> None:
+        """Neither side captured anything → not flagged (retired_total == 0)."""
+        rows = compute_per_department_diff([], [], DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert signal.portal_total_zero is False
+        assert signal.retired_total == 0
+        assert signal.portal_total == 0
+        assert signal.headline == ""
+
+    def test_portal_ahead_is_not_total_zero(self) -> None:
+        """Portal has data the retired scraper lacks → not a total-coverage failure."""
+        captures_a: list[Capture] = []
+        captures_b = [_portal("16", "C24-01001"), _portal("30", "N25-0001")]
+
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert signal.portal_total_zero is False
+        assert signal.portal_total == 2
+        assert signal.headline == ""
+
+    def test_equal_coverage_is_not_total_zero(self) -> None:
+        """Both sides match → not a total-coverage failure."""
+        captures_a = [_retired("16", "C24-01001")]
+        captures_b = [_portal("16", "C24-01001")]
+
+        rows = compute_per_department_diff(captures_a, captures_b, DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert signal.portal_total_zero is False
+        assert signal.headline == ""
+
+    def test_headline_names_retired_total(self) -> None:
+        """Headline reports the retired total it was compared against."""
+        captures_a = [_retired("16", "C24-01001"), _retired("16", "C24-01002")]
+        rows = compute_per_department_diff(captures_a, [], DATE_A)
+        signal = compute_total_coverage_signal(rows)
+
+        assert "0 of 2 rulings" in signal.headline
+
+
+# ---------------------------------------------------------------------------
+# format_summary total-coverage failure rendering (AC2 / AC3)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSummaryTotalCoverage:
+    def test_total_zero_leads_with_headline_and_keeps_per_dept(self) -> None:
+        """When portal total is zero, summary leads with the total-coverage
+        failure headline AND still renders the per-department missing rows."""
+        rows = [
+            DiffRow(
+                department="16",
+                count_a=3,
+                count_b=0,
+                cases_only_a=["C24-00001", "C24-00002", "C24-00003"],
+                cases_only_b=[],
+                flag="missing_portal",
+            ),
+            DiffRow(
+                department="30",
+                count_a=1,
+                count_b=0,
+                cases_only_a=["N25-0001"],
+                cases_only_b=[],
+                flag="missing_portal",
+            ),
+        ]
+        summary = format_summary(rows)
+
+        # AC3 — leads with the total-coverage failure signal
+        assert "total-coverage failure" in summary
+        assert "TOTAL-COVERAGE FAILURE" in summary
+        # AC2 — per-department rows still rendered below
+        assert "MISSING FROM PORTAL" in summary
+        assert "dept 16" in summary
+        assert "dept 30" in summary
+
+    def test_partial_summary_has_no_total_coverage_headline(self) -> None:
+        """A normal partial-coverage scenario does NOT mention total-coverage failure."""
+        rows = [
+            DiffRow(
+                department="16",
+                count_a=1,
+                count_b=0,
+                cases_only_a=["C24-00001"],
+                cases_only_b=[],
+                flag="missing_portal",
+            ),
+            DiffRow(
+                department="30",
+                count_a=1,
+                count_b=1,
+                cases_only_a=[],
+                cases_only_b=[],
+                flag="equal",
+            ),
+        ]
+        summary = format_summary(rows)
+
+        assert "total-coverage failure" not in summary
+        assert "TOTAL-COVERAGE FAILURE" not in summary
+        # Per-department rendering still present
+        assert "MISSING FROM PORTAL" in summary

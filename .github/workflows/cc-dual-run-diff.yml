@@ -123,7 +123,19 @@ jobs:
           missing = [r for r in diff if r.get("flag") == "missing_portal"]
           check_date = os.environ.get("CHECK_DATE", "unknown")
 
-          lines = [
+          # Total-coverage failure signal (issue #4600): when the portal captured
+          # zero documents all-day while the retired scraper had data, the dominant
+          # signal is a total-coverage failure (judge discovery / fetch), not a set
+          # of independent per-department gaps. Lead the alert with it.
+          portal_total_zero = bool(data.get("portal_total_zero", False))
+          headline = data.get("total_coverage_headline", "")
+
+          lines = []
+          if portal_total_zero and headline:
+              lines.append(f"> **TOTAL-COVERAGE FAILURE:** {headline}")
+              lines.append("")
+
+          lines += [
               f"**Date checked:** {check_date}",
               "",
               "| Department | Retired count | Portal count | Cases only in retired |",
@@ -140,12 +152,16 @@ jobs:
               )
           open("/tmp/alert_summary.md", "w").write("\n".join(lines))
 
-          # Telegram one-liner
-          depts = [r["department"] for r in missing]
-          open("/tmp/alert_telegram.txt", "w").write(
-              f"Depts missing from portal on {check_date}: {', '.join(depts)}"
-              if depts else "Unknown alert"
-          )
+          # Telegram one-liner — lead with the total-coverage failure when set.
+          if portal_total_zero and headline:
+              tg = f"TOTAL-COVERAGE FAILURE on {check_date}: {headline}"
+          else:
+              depts = [r["department"] for r in missing]
+              tg = (
+                  f"Depts missing from portal on {check_date}: {', '.join(depts)}"
+                  if depts else "Unknown alert"
+              )
+          open("/tmp/alert_telegram.txt", "w").write(tg)
           PY
 
           echo "Alert summary:"

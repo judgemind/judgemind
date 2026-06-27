@@ -77,7 +77,9 @@ if _SF_SRC.is_dir() and str(_SF_SRC) not in sys.path:
 from courts.ca.cc_tentatives_portal import _cc_dept_from_filename  # noqa: E402
 from framework.dual_run_diff import (  # noqa: E402
     Capture,
+    TotalCoverageSignal,
     compute_per_department_diff,
+    compute_total_coverage_signal,
     format_summary,
 )
 
@@ -213,6 +215,7 @@ def _write_metrics_row(
     target_date: date,
     diff_payload: list[dict[str, Any]],
     missing_portal_count: int,
+    signal: TotalCoverageSignal,
     now: datetime,
 ) -> None:
     """Insert one row into ``telemetry.data_quality_metrics``."""
@@ -220,6 +223,10 @@ def _write_metrics_row(
         "date": target_date.isoformat(),
         "diff": diff_payload,
         "missing_portal_count": missing_portal_count,
+        "portal_total_zero": signal.portal_total_zero,
+        "retired_total": signal.retired_total,
+        "portal_total": signal.portal_total,
+        "total_coverage_headline": signal.headline,
     }
     metadata_json = json.dumps(metadata_obj)
 
@@ -311,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
 
         missing_portal_count = sum(1 for r in diff_rows if r.flag == "missing_portal")
 
+        signal = compute_total_coverage_signal(diff_rows)
+
         # Serialize diff rows for JSON output and metrics storage
         diff_payload: list[dict[str, Any]] = [
             {
@@ -324,7 +333,9 @@ def main(argv: list[str] | None = None) -> int:
             for r in diff_rows
         ]
 
-        _write_metrics_row(conn, target_date, diff_payload, missing_portal_count, now)
+        _write_metrics_row(
+            conn, target_date, diff_payload, missing_portal_count, signal, now
+        )
 
     healthy = missing_portal_count == 0
 
@@ -336,6 +347,10 @@ def main(argv: list[str] | None = None) -> int:
             "diff": diff_payload,
             "healthy": healthy,
             "missing_portal_count": missing_portal_count,
+            "portal_total": signal.portal_total,
+            "portal_total_zero": signal.portal_total_zero,
+            "retired_total": signal.retired_total,
+            "total_coverage_headline": signal.headline,
             "total_departments": len(diff_rows),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
