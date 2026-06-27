@@ -28,7 +28,7 @@ from framework.llm_extractor import (
     _apply_pdf_cache_hit_filters,
     _apply_text_cache_hit_filters,
 )
-from framework.llm_schema import EXTRACTION_SYSTEM_PROMPT, ExtractedRuling
+from framework.llm_schema import EXTRACTION_SYSTEM_PROMPT, ExtractedParty, ExtractedRuling
 
 
 def _build_extractor_with_cache(cache: object) -> LlmExtractor:
@@ -371,6 +371,149 @@ class TestApplyPdfCacheHitFilters:
         # Stub must remain unchanged because target text is too short to copy.
         assert result[1].ruling_text == stub_text
         assert result[1].cross_reference_source is None
+
+    # -----------------------------------------------------------------------
+    # County sanitizers now run on the PDF cache-hit path too (#4028).
+    # SB and Riverside tentative rulings are PDFs, so on a rebuild cache hit
+    # these sanitizers must fire just as they do on the text path.
+    # -----------------------------------------------------------------------
+
+    def test_sb_inherited_case_number_guard_fires_on_pdf_cache_hit(self) -> None:
+        """SB inherited-case-number guard (#3898) fires through the PDF cache path (#4028).
+
+        Two rulings share SB case_number CIVSB2438559 but have disjoint
+        plaintiff sets: the anchor (short ruling) is Bernard Austin; the
+        subsequent (long ruling) is Maria Juana Montalvo.  The subsequent
+        ruling's case_number must be nulled while the anchor's is untouched.
+
+        This test FAILS on main (the sanitizers were not wired into the PDF
+        cache-hit path) and PASSES after the fix.
+        """
+        long_ruling_text = (
+            "Tentative Ruling: The motion for summary judgment is DENIED. "
+            "Plaintiff Maria Juana Montalvo has demonstrated a triable issue "
+            "of material fact as to causation. Defendant Loma Linda University "
+            "Medical Center failed to carry its burden on the standard-of-care "
+            "element and the motion is therefore DENIED in its entirety."
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="CIVSB2438559",
+                extracted_case_title="Bernard Austin v. Pepper Dale",
+                ruling_text=(
+                    "Tentative Ruling: GRANT motion to compel further responses. "
+                    "Plaintiff Bernard Austin's motion is granted and Defendant "
+                    "Pepper Dale shall serve verified, code-compliant responses "
+                    "without objection within twenty (20) days of this order."
+                ),
+                extracted_parties=[
+                    ExtractedParty(name="Bernard Austin", role="plaintiff"),
+                    ExtractedParty(name="Pepper Dale", role="defendant"),
+                ],
+            ),
+            ExtractedRuling(
+                extracted_case_number="CIVSB2438559",
+                extracted_case_title="Maria Juana Montalvo v. Loma Linda University Medical Center",
+                ruling_text=long_ruling_text,
+                extracted_parties=[
+                    ExtractedParty(name="Maria Juana Montalvo", role="plaintiff"),
+                    ExtractedParty(name="Loma Linda University Medical Center", role="defendant"),
+                ],
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+
+        # Anchor unchanged.
+        assert result[0].extracted_case_number == "CIVSB2438559"
+        # Subsequent ruling's inherited case_number is nulled.
+        assert result[1].extracted_case_number is None
+
+    def test_sb_role_literal_title_rebuilt_on_pdf_cache_hit(self) -> None:
+        """SB role-literal title rebuild fires through the PDF cache path (#4028)."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="CIVSB2322876",
+                extracted_case_title="Plaintiff v. Defendant",
+                ruling_text="Tentative Ruling: GRANT. The demurrer is overruled.",
+                extracted_parties=[
+                    ExtractedParty(name="Lorenzo Solis", role="plaintiff"),
+                    ExtractedParty(name="General Motors LLC", role="defendant"),
+                ],
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+        assert result[0].extracted_case_title == "Lorenzo Solis v. General Motors LLC"
+
+    def test_riverside_sanitizer_fires_on_pdf_cache_hit(self) -> None:
+        """Riverside cross-case ruling_text truncation fires through the PDF path (#4028).
+
+        Mirrors ``test_sanitize_riverside_rulings_truncates_cross_case_ruling_text``
+        but driven through ``_apply_pdf_cache_hit_filters``: ruling_text that
+        bleeds into a foreign Riverside case number must be truncated at the
+        boundary.  This is a Riverside-sanitizer-specific behavior — it is not
+        performed by any other filter in the PDF chain.
+        """
+        text = (
+            "Tentative Ruling: DENY.\n\n"
+            "Analysis: The motion lacks merit because the moving party has not "
+            "established good cause for the relief requested under the applicable "
+            "statute and supporting authority.\n\n"
+            "2.\nCVRI2500736\nSERNA VS JOHNSON\nTentative: GRANT."
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="CVRI2500796",
+                extracted_case_title="Linton v. Joshua Linton",
+                ruling_text=text,
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+        assert "CVRI2500736" not in result[0].ruling_text
+        assert result[0].ruling_text.startswith("Tentative Ruling: DENY.")
+
+    def test_non_sb_non_riverside_rulings_untouched_on_pdf_cache_hit(self) -> None:
+        """Orange County rulings are not disturbed by the county sanitizers (#4028)."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01",
+                extracted_case_title="Plaintiff v. Defendant",
+                ruling_text=(
+                    "The demurrer is SUSTAINED without leave to amend. "
+                    "Plaintiff's complaint fails to state a cause of action."
+                ),
+                extracted_parties=[
+                    ExtractedParty(name="Alice Adams", role="plaintiff"),
+                    ExtractedParty(name="Bob Builders Inc", role="defendant"),
+                ],
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+        # Orange case number → SB/Riverside sanitizers skip it; title untouched.
+        assert result[0].extracted_case_number == "30-2024-01"
+        assert result[0].extracted_case_title == "Plaintiff v. Defendant"
+
+    def test_county_sanitizers_idempotent_on_pdf_cache_hit(self) -> None:
+        """Applying the PDF cache-hit filters twice equals once for SB rulings (#4028)."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="CIVSB2322876",
+                extracted_case_title="Plaintiff v. Defendant",
+                ruling_text="Tentative Ruling: GRANT. The demurrer is overruled.",
+                extracted_parties=[
+                    ExtractedParty(name="Lorenzo Solis", role="plaintiff"),
+                    ExtractedParty(name="General Motors LLC", role="defendant"),
+                ],
+            ),
+        ]
+        once = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+        twice = _apply_pdf_cache_hit_filters(once, content_key="abc123def456")
+        assert len(once) == len(twice) == 1
+        assert once[0].extracted_case_number == twice[0].extracted_case_number
+        assert (
+            once[0].extracted_case_title
+            == twice[0].extracted_case_title
+            == ("Lorenzo Solis v. General Motors LLC")
+        )
 
 
 class TestApplyTextCacheHitFilters:
