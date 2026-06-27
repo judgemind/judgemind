@@ -2284,6 +2284,29 @@ CIRCUIT_BREAKER_WINDOW_SECONDS = 24 * 60 * 60
 #: is missing or malformed. Matches the migration-26 seed ``0.30``.
 DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 0.30
 
+#: Config key persisting the wall-clock instant the diagnoser circuit
+#: breaker last flipped ``diagnoser_enabled`` to ``false``. Written as a
+#: JSON-encoded ISO-8601 UTC string by :meth:`_check_diagnoser_circuit_breaker`
+#: on trip; read + cleared by :meth:`_check_diagnoser_breaker_auto_recover`.
+#: Issue #4586: the diagnoser breaker's recovery semantics were one-way
+#: (no diagnoses → no measurement → breaker can never re-evaluate), so the
+#: flag stayed ``false`` until an operator manually flipped it. Persisting
+#: the trip time lets the daemon time-bound the degradation.
+DIAGNOSER_BREAKER_TRIPPED_AT_KEY = "diagnoser_breaker_tripped_at"
+
+#: Config key for the time-bounded auto-recovery window (seconds). When
+#: ``now() - diagnoser_breaker_tripped_at`` exceeds this, the daemon
+#: re-enables the diagnoser. If the fallback rate is still bad the breaker
+#: simply retrips on the next window — trading "silent degradation forever"
+#: for "limited blast radius per trip" (#4586 Option 1).
+DIAGNOSER_BREAKER_RECOVERY_WINDOW_KEY = "diagnoser_breaker_recovery_window_seconds"
+
+#: Default auto-recovery window when the config row is missing or
+#: malformed. 24 h — one full fallback-measurement window
+#: (:data:`CIRCUIT_BREAKER_WINDOW_SECONDS`), so a retrip evaluates a
+#: fresh 24 h of diagnoses rather than the stale window that tripped it.
+DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS = 24 * 60 * 60
+
 # --------------------------------------------------------------------------
 # Overnight-safety circuit breaker (#2860) — separate from the diagnoser
 # circuit breaker above. This one trips on a streak of bad terminal agent
@@ -20125,6 +20148,13 @@ class DispatcherDaemon:
                 pass
             return False
 
+        # Persist the trip instant so the time-bounded auto-recovery
+        # path (#4586) can re-enable the diagnoser after the window
+        # elapses. Best-effort: a failure here does not undo the flip —
+        # the breaker is still tripped, only auto-recovery is lost (the
+        # operator can still manually re-enable, the pre-#4586 behaviour).
+        self._record_diagnoser_breaker_tripped_at()
+
         self._log.warning(
             "daemon.diagnoser_circuit_breaker_tripped",
             extra={
@@ -20137,7 +20167,338 @@ class DispatcherDaemon:
                 "min_diagnoses": CIRCUIT_BREAKER_MIN_DIAGNOSES,
             },
         )
+
+        # Loud alert on trip (#4586 Option 2). The prior trip was only a
+        # ``self._log.warning(...)`` — easy to miss, which is how the
+        # diagnoser stayed silently degraded for days. Best-effort: a
+        # Telegram failure is logged but the breaker stays tripped.
+        try:
+            self._send_diagnoser_breaker_telegram_alert(
+                fallback_rate=fallback_rate,
+                threshold=threshold,
+                total_diagnoses=total_n,
+                failed_diagnoses=failed_n,
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_telegram_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_telegram_failed",
+                    "run_id": self._run_id,
+                },
+            )
         return True
+
+    def _record_diagnoser_breaker_tripped_at(self) -> None:
+        """UPSERT ``diagnoser_breaker_tripped_at`` = now() into config.
+
+        Best-effort (#4586). Stores a JSON-encoded ISO-8601 UTC string so
+        :meth:`_check_diagnoser_breaker_auto_recover` can time-bound the
+        degradation. A failure is logged but does not undo the breaker
+        flip — only auto-recovery is forfeited for that trip.
+        """
+        assert self._conn is not None, "connect() must run before breaker write"
+        tripped_at = datetime.now(UTC).isoformat()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.config (key, value, updated_at, updated_by) "
+                    "VALUES (%s, %s::jsonb, now(), 'diagnoser_circuit_breaker') "
+                    "ON CONFLICT (key) DO UPDATE "
+                    "SET value = EXCLUDED.value, "
+                    "    updated_at = now(), "
+                    "    updated_by = 'diagnoser_circuit_breaker'",
+                    (DIAGNOSER_BREAKER_TRIPPED_AT_KEY, json.dumps(tripped_at)),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_record_tripped_at_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_record_tripped_at_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+
+    def _diagnoser_breaker_recovery_window_seconds(self) -> int:
+        """Read ``diagnoser_breaker_recovery_window_seconds`` from config.
+
+        Falls back to
+        :data:`DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS` (24 h) on
+        missing row, malformed JSON, or non-positive value. A non-positive
+        window would auto-recover on the same tick as the trip — defeating
+        the breaker — so it is coerced to the default (#4586).
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    (DIAGNOSER_BREAKER_RECOVERY_WINDOW_KEY,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+
+        if row is None or row[0] is None:
+            return DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        try:
+            seconds = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        if seconds <= 0:
+            return DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        return seconds
+
+    def _read_diagnoser_breaker_tripped_at(self) -> datetime | None:
+        """Read ``diagnoser_breaker_tripped_at`` as a UTC-aware datetime.
+
+        Returns ``None`` on missing row, NULL, malformed JSON, or an
+        unparseable timestamp. The value is stored as a JSON-encoded
+        ISO-8601 string by :meth:`_record_diagnoser_breaker_tripped_at`;
+        naive datetimes are coerced to UTC so the elapsed comparison in
+        :meth:`_check_diagnoser_breaker_auto_recover` is well-defined.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    (DIAGNOSER_BREAKER_TRIPPED_AT_KEY,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return None
+
+        if row is None or row[0] is None:
+            return None
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(raw, str):
+            return None
+        try:
+            ts = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return ts
+
+    def _check_diagnoser_breaker_auto_recover(self) -> bool:
+        """Time-bounded re-enable of the diagnoser breaker (#4586 Option 1).
+
+        Called once per supervisor tick BEFORE
+        :meth:`_check_diagnoser_circuit_breaker`. When the diagnoser is
+        currently disabled AND a ``diagnoser_breaker_tripped_at`` exists
+        AND ``now() - tripped_at`` exceeds the recovery window, flip
+        ``diagnoser_enabled`` back to ``true`` and clear the trip
+        timestamp. This breaks the one-way "no diagnoses → no measurement
+        → breaker can never re-evaluate" deadlock: after recovery the
+        diagnoser runs again, and if the fallback rate is still bad the
+        breaker retrips on the next 24 h window.
+
+        Returns True if the breaker was auto-recovered this tick, False
+        otherwise. The hot path (diagnoser already enabled) is a single
+        config read + early return.
+
+        Operator-reflip interplay: if an operator manually re-enables the
+        diagnoser, the hot path early-returns without ever clearing the
+        stale trip timestamp. That is harmless — the timestamp is only
+        consulted while ``diagnoser_enabled`` is false, and a subsequent
+        retrip overwrites it. We do not clear it on the operator path to
+        keep this method's only write the recovery flip itself.
+        """
+        assert self._conn is not None, "connect() must run before auto-recover"
+
+        # Hot path: diagnoser is enabled — nothing to recover.
+        if self._diagnoser_enabled():
+            return False
+
+        tripped_at = self._read_diagnoser_breaker_tripped_at()
+        if tripped_at is None:
+            # Breaker is off but we have no trip timestamp — either the
+            # operator manually disabled it (no auto-recovery owed) or the
+            # trip-time write failed. Leave the open state to the operator.
+            return False
+
+        window_seconds = self._diagnoser_breaker_recovery_window_seconds()
+        elapsed = datetime.now(UTC) - tripped_at
+        if elapsed < timedelta(seconds=window_seconds):
+            return False
+
+        # Window elapsed — re-enable the diagnoser and clear the trip
+        # timestamp so a future trip starts a fresh window.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = 'true', "
+                    "    updated_at = now(), "
+                    "    updated_by = 'diagnoser_circuit_breaker_auto_recover' "
+                    "WHERE key = %s",
+                    ("diagnoser_enabled",),
+                )
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = 'null', "
+                    "    updated_at = now(), "
+                    "    updated_by = 'diagnoser_circuit_breaker_auto_recover' "
+                    "WHERE key = %s",
+                    (DIAGNOSER_BREAKER_TRIPPED_AT_KEY,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_auto_recover_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_auto_recover_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return False
+
+        self._log.warning(
+            "daemon.diagnoser_circuit_breaker_auto_recovered",
+            extra={
+                "event": "diagnoser_circuit_breaker_auto_recovered",
+                "run_id": self._run_id,
+                "tripped_at": tripped_at.isoformat(),
+                "elapsed_seconds": int(elapsed.total_seconds()),
+                "recovery_window_seconds": window_seconds,
+            },
+        )
+        return True
+
+    def _send_diagnoser_breaker_telegram_alert(
+        self,
+        *,
+        fallback_rate: float,
+        threshold: float,
+        total_diagnoses: int,
+        failed_diagnoses: int,
+    ) -> None:
+        """Fire a Telegram alert when the diagnoser breaker trips (#4586).
+
+        Best-effort — a non-zero exit from ``scripts/notify-telegram.sh``
+        is logged as a warning and the breaker stays tripped (the
+        ``diagnoser_enabled=false`` flip is the safety action; the alert
+        is operator-UX). Mirrors
+        :meth:`_send_circuit_breaker_telegram_alert` (the overnight-safety
+        breaker), reusing :func:`_map_notify_telegram_exit_code` for the
+        exit-code → event mapping so #3061's false-success guard applies
+        here too.
+        """
+        repo_root = self._repo_root_for_notify_script()
+        notify_script = repo_root / NOTIFY_TELEGRAM_SCRIPT_RELPATH
+        if not notify_script.exists():
+            self._log.info(
+                "daemon.diagnoser_circuit_breaker_telegram_skipped_no_script",
+                extra={
+                    "event": "diagnoser_circuit_breaker_telegram_skipped_no_script",
+                    "run_id": self._run_id,
+                    "script_path": str(notify_script),
+                },
+            )
+            return
+
+        message = self._render_diagnoser_breaker_telegram_message(
+            fallback_rate=fallback_rate,
+            threshold=threshold,
+            total_diagnoses=total_diagnoses,
+            failed_diagnoses=failed_diagnoses,
+        )
+        tmp_dir = repo_root / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        msg_path = tmp_dir / f"diagnoser-breaker-alert-{self._run_id or 'unknown'}.txt"
+        msg_path.write_text(message, encoding="utf-8")
+
+        try:
+            result = subprocess.run(
+                [str(notify_script), "--message-file", str(msg_path)],
+                capture_output=True,
+                text=True,
+                timeout=NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.diagnoser_circuit_breaker_telegram_timeout",
+                extra={
+                    "event": "diagnoser_circuit_breaker_telegram_timeout",
+                    "run_id": self._run_id,
+                    "timeout_s": NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS,
+                },
+            )
+            return
+
+        event_suffix, reason = _map_notify_telegram_exit_code(result.returncode)
+        event_name = f"diagnoser_circuit_breaker_telegram_{event_suffix}"
+        log_extra: dict[str, Any] = {
+            "event": event_name,
+            "run_id": self._run_id,
+            "exit_code": result.returncode,
+        }
+        if reason is not None:
+            log_extra["reason"] = reason
+        if result.returncode != 0:
+            log_extra["stderr_tail"] = (result.stderr or "")[-500:]
+
+        if result.returncode == 0:
+            self._log.info(f"daemon.{event_name}", extra=log_extra)
+        else:
+            self._log.warning(f"daemon.{event_name}", extra=log_extra)
+
+    def _render_diagnoser_breaker_telegram_message(
+        self,
+        *,
+        fallback_rate: float,
+        threshold: float,
+        total_diagnoses: int,
+        failed_diagnoses: int,
+    ) -> str:
+        """Render the diagnoser-breaker Telegram alert body (plain text)."""
+        window_hours = round(self._diagnoser_breaker_recovery_window_seconds() / 3600)
+        return (
+            "Dispatcher DIAGNOSER circuit breaker TRIPPED\n"
+            f"{failed_diagnoses}/{total_diagnoses} diagnoses in the last 24h "
+            f"fell back ({round(fallback_rate * 100)}% > "
+            f"{round(threshold * 100)}% threshold).\n"
+            "diagnoser_enabled has been set to false — tier-2/3 failures "
+            "will NOT be auto-diagnosed until the breaker recovers.\n"
+            f"Auto-recovery will re-enable the diagnoser in ~{window_hours}h "
+            "if you take no action; it will retrip if the fallback rate is "
+            "still high.\n"
+            "To re-enable immediately: UPDATE dispatcher.config SET "
+            "value = 'true' WHERE key = 'diagnoser_enabled';"
+        )
 
     # ── Overnight-safety circuit breaker (#2860) ───────────────────────
 
@@ -25389,6 +25750,22 @@ class DispatcherDaemon:
         # side only writes comments/labels if the recommendation
         # action requires them, and those are unavoidable regardless
         # of budget.)
+        # Issue #4586: time-bounded auto-recovery runs BEFORE the breaker
+        # check so a stale trip (diagnoser disabled past the recovery
+        # window) is re-enabled this tick, then the breaker re-evaluates
+        # the fresh window below and retrips if the fallback rate is still
+        # bad. This breaks the one-way deadlock where a tripped breaker
+        # could never re-measure because no diagnoses were running.
+        try:
+            self._check_diagnoser_breaker_auto_recover()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_auto_recover_check_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_auto_recover_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
         try:
             self._check_diagnoser_circuit_breaker()
         except Exception:
