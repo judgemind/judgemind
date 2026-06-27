@@ -4171,6 +4171,7 @@ def run_reingest_from_prefix(
     bust_llm_cache: bool = False,
     parse_timeout: float = 60.0,
     skip_judge_prepass: bool = False,
+    s3_key_list: list[str] | None = None,
 ) -> dict[str, Any]:
     """Scan S3 by key prefix and ingest documents not in the DB.
 
@@ -4224,6 +4225,23 @@ def run_reingest_from_prefix(
         misbehaves; in normal operation it closes the chronological
         resolver-race class (#4397) and should always run.  Always
         implicitly skipped under ``dry_run=True``.
+    s3_key_list:
+        Optional list of full S3 keys (e.g.
+        ``ca/orange/superior_court/raw/<sha>.pdf``) to restrict the run to.
+        When non-empty, the keys listed under ``prefix`` are intersected
+        with this list: only keys that appear in *both* the S3 listing and
+        ``s3_key_list`` are processed (S3-listing order preserved).
+        Requested keys not found under the prefix are dropped with a warning.
+        The intersection is applied *before* the ``limit`` truncation and
+        *before* court discovery / the judge pre-pass, so every downstream
+        step operates on the narrowed set.  When ``None`` or empty, the full
+        prefix is processed (behavior unchanged).  Combining ``--prefix`` +
+        ``--s3-key-list`` + ``--bust-llm-cache`` is the surgical path for
+        re-extracting a hand-picked set of already-split parent PDFs: DB-row
+        mode skips split-child rows via the ``is_split_child_id`` guard to
+        avoid the #2416 exponential explosion (see #4049), so the prefix path
+        is the only avenue once a parent has been split — and this filter
+        keeps that path from rescanning the entire prefix (see #3855).
 
     Returns
     -------
@@ -4253,6 +4271,40 @@ def run_reingest_from_prefix(
             "errors": 0,
             "skipped": 0,
         }
+
+    # Step 1b: Narrow to the --s3-key-list intersection (#3855/#4049).
+    # Applied before --limit truncation and before court discovery / the
+    # judge pre-pass so every downstream step sees the narrowed set.
+    if s3_key_list:
+        requested = set(s3_key_list)
+        matched = [key for key in keys if key in requested]
+        missing = requested - set(matched)
+        logger.info(
+            "Filtered prefix keys by --s3-key-list",
+            requested=len(requested),
+            matched=len(matched),
+            missing=len(missing),
+        )
+        if missing:
+            logger.warning(
+                "Some --s3-key-list keys were not found under the prefix",
+                missing_count=len(missing),
+                prefix=prefix,
+            )
+        keys = matched
+        if not keys:
+            logger.warning(
+                "No --s3-key-list keys matched under prefix",
+                prefix=prefix,
+            )
+            return {
+                "total_keys": 0,
+                "processed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "hash_mismatch_warnings": 0,
+                "wall_time_seconds": 0.0,
+            }
 
     if limit is not None:
         total_available = len(keys)
@@ -4980,7 +5032,9 @@ def main() -> None:
             "Combine with --bust-llm-cache to re-extract already-split "
             "documents (the only path once parent PDFs have produced "
             "split-child rows; DB-row mode skips them to avoid #2416). "
-            "See #4049."
+            "See #4049.  Combine with --s3-key-list to narrow the scan to a "
+            "hand-picked subset of keys under the prefix instead of the whole "
+            "prefix (#3855)."
         ),
     )
     parser.add_argument(
@@ -5025,7 +5079,11 @@ def main() -> None:
             "PDFs whose cached LLM payload predates #3655) — where county-wide "
             "rescope would over-shoot 10-100x and --date-from/--date-to clamp "
             "to whole days only.  Combine with --bust-llm-cache to force "
-            "fresh LLM extraction on those keys."
+            "fresh LLM extraction on those keys.  Can be combined with "
+            "--prefix: in prefix mode the listed keys are intersected with "
+            "the keys found under the prefix (#3855), the surgical path for "
+            "re-extracting already-split parent PDFs that DB-row mode skips "
+            "(#4049)."
         ),
     )
     parser.add_argument(
@@ -5098,6 +5156,7 @@ def main() -> None:
             bust_llm_cache=args.bust_llm_cache,
             parse_timeout=args.parse_timeout,
             skip_judge_prepass=args.skip_judge_prepass,
+            s3_key_list=s3_key_list_values,
         )
         logger.info(
             "Prefix reingest complete",

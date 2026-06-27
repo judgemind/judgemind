@@ -12185,6 +12185,287 @@ class TestRunReingestFromPrefix:
     @patch("reingest_from_s3._seed_courts")
     @patch("reingest_from_s3._discover_courts")
     @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_intersects_listed_keys(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """#3855/#4049: ``s3_key_list`` narrows the prefix scan to the
+        intersection of S3-listed keys and the requested list; requested
+        keys not found under the prefix are dropped."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        # Request two real keys + one that does not exist under the prefix.
+        requested = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/missing.pdf",
+        ]
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=requested,
+            dry_run=True,
+        )
+        # Only the 2 keys present under the prefix survive the intersection.
+        assert stats["total_keys"] == 2
+        # _discover_courts must receive the narrowed set, not the full prefix.
+        discovered_keys = mock_discover.call_args[0][0]
+        assert set(discovered_keys) == {
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        }
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_none_processes_full_prefix(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``s3_key_list=None`` leaves prefix behavior unchanged: every key
+        under the prefix is processed."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=None,
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 3
+        discovered_keys = mock_discover.call_args[0][0]
+        assert set(discovered_keys) == set(keys)
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_empty_processes_full_prefix(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """An empty ``s3_key_list`` is treated like ``None`` (full prefix)."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=[],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_dry_run_reports_narrowed_total(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``--dry-run`` with ``--prefix --s3-key-list`` reports the narrowed
+        ``total_keys`` (the intersection count), not the full prefix size."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/ddd.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=["ca/orange/superior_court/raw/bbb.pdf"],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 1
+        assert stats["processed"] == 0
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_applied_before_limit(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """The intersection happens BEFORE ``--limit`` truncation, so limit
+        applies to the narrowed set."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/ddd.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=[
+                "ca/orange/superior_court/raw/bbb.pdf",
+                "ca/orange/superior_court/raw/ccc.pdf",
+                "ca/orange/superior_court/raw/ddd.pdf",
+            ],
+            limit=2,
+            dry_run=True,
+        )
+        # Intersection narrows to 3, then limit caps to 2.
+        assert stats["total_keys"] == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_no_matches_returns_zeros(
+        self,
+        mock_psycopg: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """When none of the requested keys are found under the prefix, the
+        narrowed set is empty and the function returns zeros early."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=["ca/orange/superior_court/raw/nope.pdf"],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 0
+        assert stats["processed"] == 0
+        assert stats["errors"] == 0
+        assert stats["skipped"] == 0
+        # The no-match early return honors the function's documented return
+        # schema (hash_mismatch_warnings + wall_time_seconds) so any
+        # programmatic consumer can read these keys without a KeyError.
+        assert stats["hash_mismatch_warnings"] == 0
+        assert stats["wall_time_seconds"] == 0.0
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
     def test_limit_caps_keys(
         self,
         mock_psycopg: MagicMock,
@@ -13384,6 +13665,67 @@ class TestCLIBustLlmCacheFlag:
             reingest.main()
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs["bust_llm_cache"] is False
+
+
+class TestCLIPrefixS3KeyListPlumbing:
+    """#3855/#4049: main() forwards --s3-key-list into the --prefix path."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    @patch("reingest_from_s3._read_s3_key_list_file")
+    def test_main_passes_s3_key_list_to_prefix(
+        self,
+        mock_read: MagicMock,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """``--prefix`` + ``--s3-key-list`` forwards the parsed key list to
+        ``run_reingest_from_prefix`` (mirrors the standard-mode plumbing test
+        ``test_s3_key_list_filter_passed_through``)."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_read.return_value = keys
+        mock_run_prefix.return_value = {
+            "total_keys": 2,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "ca/orange/superior_court/raw/",
+            "--s3-key-list",
+            "keys.txt",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run_prefix.assert_called_once()
+        assert mock_run_prefix.call_args.kwargs["s3_key_list"] == keys
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_main_prefix_without_key_list_forwards_none(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """``--prefix`` alone forwards ``s3_key_list=None`` (unchanged behavior)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 0,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "ca/orange/superior_court/raw/",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run_prefix.assert_called_once()
+        assert mock_run_prefix.call_args.kwargs["s3_key_list"] is None
 
 
 class TestBustLlmCachePassedThrough:
