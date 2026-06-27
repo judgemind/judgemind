@@ -375,7 +375,7 @@ is_requires_argument_failure() {
 
 # emit_indented_capped <log_file> -> prints the last MAX_TAIL_LINES lines of
 # the log to stderr, each indented by four spaces, with any line longer than
-# MAX_LINE_CHARS truncated and a "…[truncated <N> chars]" marker appended.
+# MAX_LINE_BYTES truncated and a "…[truncated <N> bytes]" marker appended.
 #
 # Why this exists (#4602)
 # ───────────────────────
@@ -399,14 +399,68 @@ is_requires_argument_failure() {
 # For the common small-match case (≤ MAX_TAIL_LINES short lines), the output
 # is byte-identical to the old ``sed 's/^/    /'`` path: each line is
 # prefixed with exactly four spaces and nothing is truncated.
+#
+# Multibyte safety (#4608)
+# ────────────────────────
+# Both BSD awk (macOS, the target env) and gawk (Linux CI) treat ``substr``
+# and ``length`` as byte operations regardless of locale. A naive
+# ``substr($0, 1, max)`` can therefore slice through the middle of a UTF-8
+# multibyte sequence, leaving a dangling partial byte before the ``…``
+# marker. We trim any trailing *incomplete* sequence after the byte cut so
+# the emitted prefix is always valid UTF-8, and the marker honestly reports
+# the count in **bytes** (which is what ``length`` counts). ``ord[]`` is a
+# byte→ordinal map built once in BEGIN; both awks populate it because
+# ``sprintf("%c", i)`` yields a one-byte string for 0..255.
 MAX_TAIL_LINES=20
-MAX_LINE_CHARS=2000
+MAX_LINE_BYTES=2000
 emit_indented_capped() {
     local log_file="$1"
-    tail -n "$MAX_TAIL_LINES" "$log_file" 2>/dev/null | awk -v max="$MAX_LINE_CHARS" '
+    tail -n "$MAX_TAIL_LINES" "$log_file" 2>/dev/null | awk -v max="$MAX_LINE_BYTES" '
+        BEGIN {
+            for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+        }
         {
             if (length($0) > max) {
-                printf "    %s…[truncated %d chars]\n", substr($0, 1, max), length($0) - max
+                prefix = substr($0, 1, max)
+                # Walk backward from the byte cut, dropping any trailing
+                # incomplete UTF-8 sequence so we never emit a partial
+                # codepoint. Continuation bytes are 0x80-0xBF; lead bytes
+                # are >= 0xC0 with a declared sequence length.
+                k = length(prefix)
+                while (k > 0) {
+                    o = ord[substr(prefix, k, 1)]
+                    if (o >= 128 && o < 192) {
+                        # Trailing continuation byte: provisionally drop it,
+                        # keep walking back to find its lead byte.
+                        k--
+                        continue
+                    }
+                    if (o >= 192) {
+                        # Lead byte. Declared length: 2 (0xC0-0xDF),
+                        # 3 (0xE0-0xEF), 4 (0xF0-0xF7).
+                        if (o >= 240) seqlen = 4
+                        else if (o >= 224) seqlen = 3
+                        else seqlen = 2
+                        # Two cases at the lead byte:
+                        #  * Incomplete sequence — its declared length runs
+                        #    past the bytes captured. Drop the lead byte too
+                        #    (keep k-1) so we never emit a partial codepoint.
+                        #  * Complete sequence — it fit entirely within the
+                        #    cap (ended at or before the cut). Restore k to the
+                        #    full prefix length so the whole character is kept;
+                        #    otherwise k still points at the sequence start and
+                        #    the trailing substr would chop its tail, emitting a
+                        #    lone dangling lead byte.
+                        if (k + seqlen - 1 > length(prefix)) {
+                            k--
+                        } else {
+                            k = length(prefix)
+                        }
+                    }
+                    break
+                }
+                prefix = substr(prefix, 1, k)
+                printf "    %s…[truncated %d bytes]\n", prefix, length($0) - length(prefix)
             } else {
                 printf "    %s\n", $0
             }
