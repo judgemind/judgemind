@@ -38,6 +38,11 @@
 #       stderr does NOT trigger the SKIP_LIST hint (#4534).
 #  14.  Requires-argument hint covers argparse "the following arguments
 #       are required" shape (#4534).
+#  15.  Requires-argument hint includes Option C rename remediation (#4558).
+#  16.  Large guard match block does not crash the formatting path with
+#       Abort trap: 6 — umbrella exits 1, output intact (#4602).
+#  17.  Small-match formatting keeps the four-space indent unchanged (#4602).
+#  18.  Over-long line truncated with prefix preserved + marker (#4602).
 #
 # Run:
 #   scripts/tests/test_run_ci_guards.sh
@@ -493,6 +498,102 @@ elif ! echo "$out_buf" | grep -q "code-standards.md"; then
     report_fail "expected code-standards.md cross-reference (#4558)" "$out_buf"
 else
     report_pass "requires-argument hint includes Option C rename remediation (#4558)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 16: large guard match block does not crash the formatting path
+#               with Abort trap: 6 (#4602). A failing guard that emits a
+#               large block — many lines plus a single pathologically long
+#               line — used to be piped through ``sed 's/^/    /'``, which on
+#               macOS BSD sed can abort with ``Assertion failed: (advance >
+#               0), function substitute, file process.c`` / ``Abort trap:
+#               6`` (SIGABRT, exit 134). The hardened awk path must keep the
+#               umbrella's exit at the normal guard-failure code (1) and
+#               leave the output intact and readable.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 16] large guard match block — no Abort trap, exit 1 (#4602)"
+synth_scripts="$(seed_synthetic_scripts s16)"
+# Guard emits 50 lines, one of which is a single 500k-char line — a "large
+# match block" of exactly the shape the issue describes (a noisy guard / real
+# multi-file violation / false positive walk).
+cat > "$synth_scripts/check-bigblock.sh" <<'SH'
+#!/usr/bin/env bash
+for i in $(seq 1 49); do
+    echo "violation at packages/foo/bar_$i.py:$i"
+done
+# One pathologically long single line (no embedded newlines).
+python3 -c 'print("x" * 500000)'
+exit 1
+SH
+chmod +x "$synth_scripts/check-bigblock.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -eq 134 ] || [ "$rc_buf" -ge 128 ]; then
+    report_fail "umbrella aborted with signal $((rc_buf - 128)) (rc=$rc_buf) on large match block (#4602)" "$out_buf"
+elif [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 (normal guard-failure) on large match block, got $rc_buf (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -qi "Abort trap"; then
+    report_fail "output contains 'Abort trap' — formatting path crashed (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "FAILED: check-bigblock.sh"; then
+    report_fail "expected 'FAILED: check-bigblock.sh' — output should be intact (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "truncated"; then
+    report_fail "expected '…[truncated N chars]' marker on the over-long line (#4602)" "$out_buf"
+else
+    report_pass "large guard match block does not crash; exits 1 with intact output (#4602)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 17: small-match formatting is byte-identical to the old
+#               ``sed 's/^/    /'`` path (#4602). The hardening must not
+#               regress the common small-failure output — each emitted line
+#               keeps exactly the four-space indent and is not truncated.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 17] small-match formatting unchanged — four-space indent (#4602)"
+synth_scripts="$(seed_synthetic_scripts s17)"
+cat > "$synth_scripts/check-smallfail.sh" <<'SH'
+#!/usr/bin/env bash
+echo "deliberate failure line one"
+echo "deliberate failure line two"
+exit 1
+SH
+chmod +x "$synth_scripts/check-smallfail.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 on small failing guard, got $rc_buf (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "^    deliberate failure line one$"; then
+    report_fail "expected four-space-indented 'deliberate failure line one' (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "^    deliberate failure line two$"; then
+    report_fail "expected four-space-indented 'deliberate failure line two' (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -q "truncated"; then
+    report_fail "small lines should NOT be truncated (#4602)" "$out_buf"
+else
+    report_pass "small-match output keeps four-space indent, no truncation (#4602)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 18: over-long-line truncation preserves the line prefix and
+#               appends the char-count marker (#4602). Confirms the bounded
+#               formatting still surfaces the start of a huge match line so
+#               the operator can see what failed.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 18] over-long line truncated with prefix preserved (#4602)"
+synth_scripts="$(seed_synthetic_scripts s18)"
+cat > "$synth_scripts/check-longline.sh" <<'SH'
+#!/usr/bin/env bash
+python3 -c 'print("BEGINMARKER" + "y" * 300000 + "ENDMARKER")'
+exit 1
+SH
+chmod +x "$synth_scripts/check-longline.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 on long-line guard, got $rc_buf (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "BEGINMARKER"; then
+    report_fail "expected the start-of-line 'BEGINMARKER' to survive truncation (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -q "ENDMARKER"; then
+    report_fail "expected the far end 'ENDMARKER' to be truncated away (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -qE "truncated [0-9]+ chars"; then
+    report_fail "expected '…[truncated N chars]' marker after the prefix (#4602)" "$out_buf"
+else
+    report_pass "over-long line truncated, prefix preserved, marker appended (#4602)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
