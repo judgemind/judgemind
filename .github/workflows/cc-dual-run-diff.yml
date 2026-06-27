@@ -123,12 +123,23 @@ jobs:
           missing = [r for r in diff if r.get("flag") == "missing_portal"]
           check_date = os.environ.get("CHECK_DATE", "unknown")
 
-          lines = [
+          # Total-coverage failure: portal captured nothing at all. Lead with
+          # the dominant signal above the per-department table. Tolerate the
+          # keys being absent (older JSON) — default to no headline. See #4600.
+          portal_total_zero = bool(data.get("portal_total_zero", False))
+          headline = data.get("total_coverage_headline", "") or ""
+
+          lines = []
+          if portal_total_zero and headline:
+              lines.append(f"> **TOTAL-COVERAGE FAILURE:** {headline}")
+              lines.append("")
+
+          lines.extend([
               f"**Date checked:** {check_date}",
               "",
               "| Department | Retired count | Portal count | Cases only in retired |",
               "| --- | --- | --- | --- |",
-          ]
+          ])
           for r in missing:
               lines.append(
                   "| {dept} | {ca} | {cb} | {only_a} |".format(
@@ -142,10 +153,13 @@ jobs:
 
           # Telegram one-liner
           depts = [r["department"] for r in missing]
-          open("/tmp/alert_telegram.txt", "w").write(
+          tg = (
               f"Depts missing from portal on {check_date}: {', '.join(depts)}"
               if depts else "Unknown alert"
           )
+          if portal_total_zero and headline:
+              tg = f"TOTAL-COVERAGE FAILURE — {tg}"
+          open("/tmp/alert_telegram.txt", "w").write(tg)
           PY
 
           echo "Alert summary:"
