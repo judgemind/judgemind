@@ -3699,6 +3699,52 @@ class TestReadS3KeyListFile:
         with pytest.raises(FileNotFoundError):
             reingest._read_s3_key_list_file(str(path))
 
+    def test_s3_uri_reads_keys_from_s3(self) -> None:
+        """An ``s3://bucket/key`` URI fetches the keylist body from S3 and
+        applies the same parsing semantics as a local file."""
+        body_mock = MagicMock()
+        body_mock.read.return_value = (
+            b"# extracted from #3855 spotcheck\n"
+            b"ca/orange/superior_court/raw/aaa.pdf\n"
+            b"\n"
+            b"  ca/orange/superior_court/raw/bbb.pdf  \n"
+            b"ca/orange/superior_court/raw/aaa.pdf\n"
+        )
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": body_mock}
+        with patch.object(reingest.boto3, "client", return_value=s3) as mock_client:
+            keys = reingest._read_s3_key_list_file(
+                "s3://judgemind-assets-dev/keylists/orange-78.txt"
+            )
+        assert keys == [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_client.assert_called_once_with("s3")
+        s3.get_object.assert_called_once_with(
+            Bucket="judgemind-assets-dev",
+            Key="keylists/orange-78.txt",
+        )
+
+    def test_s3_uri_empty_object_raises_value_error(self) -> None:
+        """An s3:// object whose body is empty (or all comments/blanks) raises
+        ValueError, matching the local-file fail-loud behavior."""
+        body_mock = MagicMock()
+        body_mock.read.return_value = b"# only comments\n\n   \n"
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": body_mock}
+        with patch.object(reingest.boto3, "client", return_value=s3):
+            with pytest.raises(ValueError, match="empty"):
+                reingest._read_s3_key_list_file("s3://bucket/keylists/empty.txt")
+
+    def test_s3_uri_without_key_raises_value_error(self) -> None:
+        """A malformed ``s3://bucket-only`` URI with no key component raises a
+        clear ValueError before any S3 call is made."""
+        with patch.object(reingest.boto3, "client") as mock_client:
+            with pytest.raises(ValueError, match="s3://"):
+                reingest._read_s3_key_list_file("s3://bucket-only")
+        mock_client.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Cursor minimum values

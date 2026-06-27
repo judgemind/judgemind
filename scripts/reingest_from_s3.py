@@ -154,9 +154,14 @@ Options:
                         the old prompt hash.  See #2424.
     --s3-key-list PATH  Path to a file listing S3 keys (one per line, blank
                         lines and ``#`` comments ignored) to restrict the
-                        reingest to.  Surgical scope for hand-picked SHAs
-                        where county / date / regex filters all over- or
-                        under-match.  See #3659.
+                        reingest to.  May be a container-local path or an
+                        ``s3://bucket/key`` URI — the URI form lets the
+                        surgical path run from ECS, where companion files
+                        cannot be staged into the task (see #4606): upload
+                        the keylist with ``aws s3 cp`` and pass the URI.
+                        Surgical scope for hand-picked SHAs where county /
+                        date / regex filters all over- or under-match.
+                        See #3659.
     --skip-judge-prepass
                         Disable the one-shot judge pre-pass that walks the
                         FETCH cursor (standard mode) or listed S3 keys
@@ -618,22 +623,28 @@ def _build_filters(
     return " ".join(clauses), params
 
 
-def _read_s3_key_list_file(path: str) -> list[str]:
-    """Read a list of S3 keys from a file, one per line.
+def _parse_s3_key_list_text(raw: str, source: str) -> list[str]:
+    """Parse keylist text into a de-duplicated, order-preserving list of keys.
 
     Blank lines and lines starting with ``#`` are skipped, leading/trailing
     whitespace on each entry is stripped, and duplicates are de-duplicated
-    while preserving first-occurrence order.
+    while preserving first-occurrence order. Shared by the local-file and
+    ``s3://`` branches of :func:`_read_s3_key_list_file`.
+
+    Parameters
+    ----------
+    raw:
+        The full keylist text (decoded UTF-8).
+    source:
+        Human-readable origin (local path or s3:// URI) used in the
+        empty-list error message.
 
     Raises
     ------
-    FileNotFoundError
-        If *path* does not exist.
     ValueError
-        If the file produces an empty key list (every line was blank or a
+        If *raw* produces an empty key list (every line was blank or a
         comment) — fail loud rather than silently match every document.
     """
-    raw = Path(path).read_text(encoding="utf-8")
     seen: set[str] = set()
     keys: list[str] = []
     for line in raw.splitlines():
@@ -645,9 +656,47 @@ def _read_s3_key_list_file(path: str) -> list[str]:
         seen.add(stripped)
         keys.append(stripped)
     if not keys:
-        msg = f"--s3-key-list file is empty after stripping blanks/comments: {path}"
+        msg = f"--s3-key-list source is empty after stripping blanks/comments: {source}"
         raise ValueError(msg)
     return keys
+
+
+def _read_s3_key_list_file(path: str) -> list[str]:
+    """Read a list of S3 keys, one per line, from a local file or S3 object.
+
+    *path* may be either a container-local filesystem path or an
+    ``s3://bucket/key`` URI. The latter form lets the surgical reingest path
+    run from ECS, where companion files cannot be staged into the task
+    (see #4606): upload the keylist with ``aws s3 cp`` and pass the URI.
+
+    Blank lines and lines starting with ``#`` are skipped, leading/trailing
+    whitespace on each entry is stripped, and duplicates are de-duplicated
+    while preserving first-occurrence order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* is a local path that does not exist.
+    ValueError
+        If *path* is a malformed ``s3://`` URI with no key component, or if
+        the source produces an empty key list (every line was blank or a
+        comment) — fail loud rather than silently match every document.
+    """
+    if path.startswith("s3://"):
+        without_scheme = path[len("s3://") :]
+        bucket, _, key = without_scheme.partition("/")
+        if not bucket or not key:
+            msg = (
+                "--s3-key-list s3:// URI must include both a bucket and a key "
+                f"(e.g. s3://my-bucket/path/keys.txt): {path}"
+            )
+            raise ValueError(msg)
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        raw = response["Body"].read().decode("utf-8")
+        return _parse_s3_key_list_text(raw, path)
+    raw = Path(path).read_text(encoding="utf-8")
+    return _parse_s3_key_list_text(raw, path)
 
 
 def _is_real_case_number(case_number: str | None) -> bool:
@@ -5071,8 +5120,12 @@ def main() -> None:
         default=None,
         dest="s3_key_list",
         help=(
-            "Path to a file listing S3 keys (one per line) to restrict the "
-            "reingest to.  Blank lines and lines starting with '#' are "
+            "File listing S3 keys (one per line) to restrict the reingest to. "
+            "Accepts a container-local path OR an s3://bucket/key URI; the "
+            "s3:// form lets this surgical path run from ECS, where companion "
+            "files cannot be staged into the task — upload the keylist with "
+            "'aws s3 cp keys.txt s3://bucket/keylists/<name>.txt' and pass the "
+            "URI (#4606).  Blank lines and lines starting with '#' are "
             "ignored.  Adds an AND d.s3_key = ANY(...) clause to the document "
             "query.  Useful for surgical backfills against a hand-picked set "
             "of SHAs — e.g. #3659 (re-resolve cross-references on the 13 SC "
