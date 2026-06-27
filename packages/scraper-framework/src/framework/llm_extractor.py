@@ -2248,6 +2248,14 @@ def _apply_pdf_cache_hit_filters(
     ``entry_number`` are resolved before the drop/dedup filters discard them,
     mirroring the filter ordering in the fresh-extract path.
 
+    The county sanitizers (Riverside + San Bernardino) run at the end of the
+    chain too (#4028) — they had previously only been wired into the text
+    cache-hit path, but SB and Riverside tentative rulings are PDFs, so the
+    #3898 inherited-case-number guard and the role-literal title rebuild never
+    fired on a ``rebuild_db.py`` cache hit.  All three sanitizers are no-ops
+    on non-SB / non-Riverside case numbers and are idempotent, so running them
+    on the PDF path is safe for every county.
+
     Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
     filters dropped rows — useful for observing the effect of filter
     widening in production without re-running LLM calls.
@@ -2261,6 +2269,9 @@ def _apply_pdf_cache_hit_filters(
     rulings = _truncate_repeated_name_tails(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _filter_citation_artifacts(rulings)
+    rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
+    rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
     if len(rulings) != original_count:
         logger.info(
             "llm_extractor.cache_hit_filters_dropped",
