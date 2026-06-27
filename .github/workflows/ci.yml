@@ -2268,6 +2268,20 @@ jobs:
         run: scripts/check-no-check-prefix-on-ecs-oneshots.sh
 
   # ---------------------------------------------------------------
+  # Dispatcher circuit-breaker hygiene (#4593): every config-flag
+  # circuit breaker in scripts/dispatcher/daemon.py must declare a
+  # recovery path AND a Telegram alert path. Catches the #4586 smell
+  # (diagnoser breaker shipped a one-way kill-switch flip with no
+  # recovery) and the pre-#3779 overnight-safety breaker shape.
+  # ---------------------------------------------------------------
+  dispatcher-breaker-recovery-alert-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify every daemon circuit breaker has a recovery and alert path
+        run: scripts/check-dispatcher-breaker-recovery-alert.sh
+
+  # ---------------------------------------------------------------
   # ci-passed coverage guard: assert every top-level job appears in
   # ci-passed.needs: so gaps like #3919 are caught before merge.
   # ---------------------------------------------------------------
@@ -2366,6 +2380,7 @@ jobs:
       - dx-fix-block-coverage-check
       - ci-guards-skip-list-coverage-check
       - no-check-prefix-on-ecs-oneshots-check
+      - dispatcher-breaker-recovery-alert-check
     if: always()
     runs-on: ubuntu-latest
     steps:
