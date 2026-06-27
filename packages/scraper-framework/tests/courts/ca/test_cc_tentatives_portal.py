@@ -1,7 +1,7 @@
 """Tests for the Contra Costa tentative rulings portal scraper (Phase 1).
 
 Fixtures in tests/fixtures/cc_portal/:
-  form.html              — /test-page-tentative-rulings (judge dropdown)
+  form.html              — /tentative-rulings judge dropdown (now on the live listing page, #4591)
   listing_devine.html    — /tentative-rulings?field_judge_target_id=238 (7 rows, 3 test entries)
   listing_reyes.html     — /tentative-rulings?field_judge_target_id=245 (L24-04564)
   listing_weil.html      — /tentative-rulings?field_judge_target_id=280 (MSN23-2201)
@@ -261,12 +261,15 @@ def test_fetch_documents_filters_test_entries_and_emits_skip_log() -> None:
     pdf_bytes = _load_bytes("sample.pdf")
     detail_html = _load_html("detail_l24-04564.html")
 
-    # Stub the form
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=devine_only_form))
-    # Stub the listing
+    # Stub the per-judge listing FIRST so the params-specific route claims
+    # the listing fetch before the no-param form route (FORM_URL == LISTING_URL
+    # since #4591 — respx matches routes in registration order, and a
+    # params-less route matches any request to the same path).
     respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    # Stub the form (judge dropdown) — the params-less fetch falls through here.
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=devine_only_form))
     # Stub detail pages for valid entries
     for slug in ["c22-01620", "c24-00123", "l23-05678", "n25-1234"]:
         respx.get(f"{BASE_URL}/tentative-ruling/{slug}").mock(
@@ -325,10 +328,11 @@ def test_fetch_documents_archives_envelope_with_pdf_and_detail_html() -> None:
     detail_html_bytes = _load_bytes("detail_l24-04564.html")
     pdf_bytes = _load_bytes("sample.pdf")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "245"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
     respx.get(f"{BASE_URL}/tentative-ruling/l24-04564").mock(
         return_value=httpx.Response(200, content=detail_html_bytes)
     )
@@ -381,10 +385,11 @@ def test_fetch_documents_handles_empty_judge_listing() -> None:
     )
     empty_listing_html = _load_html("listing_empty.html")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=weil_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
         return_value=httpx.Response(200, text=empty_listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=weil_only_form))
 
     config = portal_default_config()
     config = config.model_copy(update={"request_delay_seconds": 0.0})
@@ -411,10 +416,11 @@ def test_fetch_documents_handles_new_judge_id_in_dropdown() -> None:
     )
     empty_listing_html = _load_html("listing_empty.html")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=form_with_new_judge))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "999"}).mock(
         return_value=httpx.Response(200, text=empty_listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=form_with_new_judge))
 
     config = portal_default_config()
     config = config.model_copy(update={"request_delay_seconds": 0.0})
@@ -447,10 +453,11 @@ def test_scraper_extracts_fields_civil_limited_probate() -> None:
     detail_html_bytes = _load_bytes("detail_l24-04564.html")
     pdf_bytes = _load_bytes("sample.pdf")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "245"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
     respx.get(f"{BASE_URL}/tentative-ruling/l24-04564").mock(
         return_value=httpx.Response(200, content=detail_html_bytes)
     )
@@ -755,3 +762,58 @@ def test_coerce_hearing_date_none_returns_none() -> None:
 
 def test_coerce_hearing_date_garbage_string_returns_none() -> None:
     assert _coerce_hearing_date("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# 16. Judge-discovery URL contract + loud-failure regression tests (#4591)
+# ---------------------------------------------------------------------------
+
+
+def test_form_url_points_at_live_listing_page() -> None:
+    """FORM_URL must target the live listing page that carries the dropdown (#4591).
+
+    The judge dropdown migrated off the now-restricted
+    ``/test-page-tentative-rulings`` page (which returns an access-denied
+    200 body with no ``<select>``) onto the live ``/tentative-rulings``
+    page.  Pinning ``FORM_URL == LISTING_URL`` is the test that would have
+    caught the all-time-zero-capture regression; the prior tests mocked
+    ``FORM_URL`` so they passed regardless of its value.
+    """
+    assert FORM_URL != f"{BASE_URL}/test-page-tentative-rulings"
+    assert FORM_URL == LISTING_URL
+
+
+@respx.mock
+def test_fetch_documents_logs_error_when_no_judges() -> None:
+    """An access-denied-style page (no dropdown) returns [] and logs at error level (#4591).
+
+    Pre-#4591 this logged a ``warning`` and returned ``[]`` silently, so
+    the zero-record / scraper-health alerting never fired and the total
+    coverage failure went undetected for the whole dual-run period.
+    Upgrading ``cc_portal.no_judges_found`` to ``error`` makes the
+    breakage loud while still not raising (an exception would abort the
+    whole 17-scraper run).
+    """
+    access_denied_html = (
+        "<html><body><h1>Access Denied</h1>"
+        "<p>This page requires authorization to access.</p>"
+        "</body></html>"
+    )
+
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=access_denied_html))
+
+    config = portal_default_config()
+    config = config.model_copy(update={"request_delay_seconds": 0.0})
+    scraper = CCTentativesPortalScraper(config=config)
+
+    with structlog.testing.capture_logs() as cap:
+        docs = scraper.fetch_documents()
+
+    assert docs == []
+
+    no_judges_events = [e for e in cap if e.get("event") == "cc_portal.no_judges_found"]
+    assert len(no_judges_events) == 1, (
+        f"Expected 1 cc_portal.no_judges_found event, got {len(no_judges_events)}: "
+        f"{no_judges_events}"
+    )
+    assert no_judges_events[0].get("log_level") == "error"

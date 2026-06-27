@@ -16,8 +16,12 @@ as separate follow-up issues under the parent #2601.
 Portal discovery and migration plan: docs/investigations/contra-costa-portal-migration-2026-04.md
 
 HTML structure (new portal):
-  Form page at /test-page-tentative-rulings exposes a
+  The /tentative-rulings listing page exposes a
   <select name="field_judge_target_id"> dropdown with known judge IDs.
+  (The dropdown previously lived on a separate /test-page-tentative-rulings
+  form page, but that page is now access-restricted and returns an HTTP 200
+  access-denied body with no <select>, so judge discovery reads the live
+  listing page instead — see #4591.)
   For each judge, GET /tentative-rulings?field_judge_target_id=<id> returns
   a Drupal Views table of rulings. Each row links to a detail page at
   /tentative-ruling/<slug>.
@@ -77,7 +81,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://contracosta.courts.ca.gov"
-FORM_URL = f"{BASE_URL}/test-page-tentative-rulings"
+FORM_URL = f"{BASE_URL}/tentative-rulings"
 LISTING_URL = f"{BASE_URL}/tentative-rulings"
 
 # Case number pattern — matches civil, limited, probate, and misc formats.
@@ -393,7 +397,7 @@ class CCTentativesPortalScraper(BaseScraper):
 
             judges = _parse_judge_dropdown(form_response.text)
             if not judges:
-                self._log.warning("cc_portal.no_judges_found", url=FORM_URL)
+                self._log.error("cc_portal.no_judges_found", url=FORM_URL)
                 return []
 
             self._log.info("cc_portal.judges_found", count=len(judges))
