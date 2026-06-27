@@ -373,6 +373,47 @@ is_requires_argument_failure() {
         "$log_file" 2>/dev/null
 }
 
+# emit_indented_capped <log_file> -> prints the last MAX_TAIL_LINES lines of
+# the log to stderr, each indented by four spaces, with any line longer than
+# MAX_LINE_CHARS truncated and a "…[truncated <N> chars]" marker appended.
+#
+# Why this exists (#4602)
+# ───────────────────────
+# The previous formatting path was ``tail -n 20 "$log" | sed 's/^/    /'``.
+# When a guard produces a large match block — many matches and/or a single
+# pathologically long line (a noisy new guard, a real multi-file violation,
+# or a false positive like the ``.venv-scripts`` walk that #4597 fixed) —
+# piping that output through BSD ``sed``'s substitute engine can trip the
+# macOS libc assertion ``Assertion failed: (advance > 0), function
+# substitute, file process.c`` and abort with ``Abort trap: 6`` (SIGABRT,
+# exit 134). That turns a plain guard failure (exit 1) into a SIGABRT that
+# makes the failure look catastrophic and unreadable.
+#
+# The hardening: do the indentation with ``awk`` (which does not share BSD
+# sed's ``substitute`` codepath) and bound each emitted line's length so no
+# arbitrarily long / arbitrarily-encoded guard output ever reaches a
+# substitution engine unbounded. ``awk`` reads line by line and we cap the
+# emitted substring with ``substr``, so per-line work stays bounded
+# regardless of guard output size.
+#
+# For the common small-match case (≤ MAX_TAIL_LINES short lines), the output
+# is byte-identical to the old ``sed 's/^/    /'`` path: each line is
+# prefixed with exactly four spaces and nothing is truncated.
+MAX_TAIL_LINES=20
+MAX_LINE_CHARS=2000
+emit_indented_capped() {
+    local log_file="$1"
+    tail -n "$MAX_TAIL_LINES" "$log_file" 2>/dev/null | awk -v max="$MAX_LINE_CHARS" '
+        {
+            if (length($0) > max) {
+                printf "    %s…[truncated %d chars]\n", substr($0, 1, max), length($0) - max
+            } else {
+                printf "    %s\n", $0
+            }
+        }
+    ' >&2
+}
+
 for path in "${runnable[@]}"; do
     name="$(basename "$path")"
     log_file="${TMPDIR:-/tmp}/run-ci-guards-${name//\//_}.log"
@@ -403,8 +444,11 @@ for path in "${runnable[@]}"; do
         fi
         echo "" >&2
         echo "  FAILED: $name (exit $rc)" >&2
-        echo "  Last 20 lines of output:" >&2
-        tail -n 20 "$log_file" | sed 's/^/    /' >&2
+        echo "  Last $MAX_TAIL_LINES lines of output:" >&2
+        # Indent + length-cap via awk, not ``sed 's/^/    /'`` — a large or
+        # pathologically long guard match block fed to BSD sed's substitute
+        # engine can abort with ``Abort trap: 6`` (#4602).
+        emit_indented_capped "$log_file"
         echo "  Full log: $log_file" >&2
     fi
 done
