@@ -4130,24 +4130,12 @@ def _process_prefix_document(
 
         rc = redis_lib.Redis.from_url(redis_url, decode_responses=False)
         if os_url:
-            from opensearchpy import OpenSearch
+            from framework.opensearch_client import make_opensearch_client
 
-            # 30s timeout + 3 retries: opensearchpy defaults to 10s and no
-            # retries, which produces sporadic ``ConnectionTimeout`` entries
-            # under load (#2481).  ``IndexingConsumer`` also swallows
-            # terminal timeouts as a warning so a missed index never fails
-            # document processing.
-            os_kwargs: dict = {
-                "hosts": [os_url],
-                "timeout": 30,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-            }
-            os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-            os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-            if os_user and os_pass:
-                os_kwargs["http_auth"] = (os_user, os_pass)
-            os_client = OpenSearch(**os_kwargs)
+            # SigV4-preferred client with local-dev basic-auth fallback; keeps
+            # the 30s timeout + 3 retries that make reingest self-healing under
+            # load (#2481).  See framework.opensearch_client (#4040).
+            os_client = make_opensearch_client(os_url)
         else:
             os_client = MagicMock()
         s3_for_worker = _make_s3()

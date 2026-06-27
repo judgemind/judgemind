@@ -35,7 +35,7 @@ def _make_env() -> dict[str, str]:
 
 @patch("ingestion.__main__.IngestionWorker")
 @patch("ingestion.__main__.make_s3_client")
-@patch("ingestion.__main__.OpenSearch")
+@patch("ingestion.__main__.make_opensearch_client")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_logs_infrastructure_error_and_exits(
@@ -64,7 +64,7 @@ def test_main_logs_infrastructure_error_and_exits(
 
 @patch("ingestion.__main__.IngestionWorker")
 @patch("ingestion.__main__.make_s3_client")
-@patch("ingestion.__main__.OpenSearch")
+@patch("ingestion.__main__.make_opensearch_client")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_logs_unhandled_exception_and_exits(
@@ -91,7 +91,7 @@ def test_main_logs_unhandled_exception_and_exits(
 
 @patch("ingestion.__main__.IngestionWorker")
 @patch("ingestion.__main__.make_s3_client")
-@patch("ingestion.__main__.OpenSearch")
+@patch("ingestion.__main__.make_opensearch_client")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_infrastructure_error_includes_cause_in_log(
@@ -127,7 +127,7 @@ def test_main_infrastructure_error_includes_cause_in_log(
 
 @patch("ingestion.__main__.IngestionWorker")
 @patch("ingestion.__main__.make_s3_client")
-@patch("ingestion.__main__.OpenSearch")
+@patch("ingestion.__main__.make_opensearch_client")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_normal_run_does_not_exit(
@@ -154,7 +154,7 @@ def test_main_normal_run_does_not_exit(
 
 @patch("ingestion.__main__.IngestionWorker")
 @patch("ingestion.__main__.make_s3_client")
-@patch("ingestion.__main__.OpenSearch")
+@patch("ingestion.__main__.make_opensearch_client")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_redis_connection_failure_exits(
