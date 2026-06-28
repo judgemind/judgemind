@@ -4201,6 +4201,121 @@ class TestLlmExtractRulingsRoleLiteralTitle:
         assert len(result) == 1
         assert result[0].case_title == "Aasi v. American Honda"
 
+    def test_role_literal_right_side_dropped_when_no_parties(self) -> None:
+        """Right-side role-literal 'Acme Corp v. Defendants' + no parties → None (#4618)."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV11111",
+                "extracted_case_title": "Acme Corp v. Defendants",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV11111</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title is None
+
+    def test_role_literal_right_side_compound_dropped_when_no_parties(self) -> None:
+        """Right-side compound 'Tcfi Cp Llc v. Defendants/Cross-Complainants' → None (#4618)."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV22222",
+                "extracted_case_title": "Tcfi Cp Llc v. Defendants/Cross-Complainants",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV22222</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title is None
+
+    def test_role_literal_right_side_rebuilt_from_parties(self) -> None:
+        """Right-side role-literal WITH real parties → rebuilt to plaintiff v. defendant (#4618)."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV33333",
+                "extracted_case_title": "Acme Corp v. Defendants",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [
+                    {"name": "Acme Corp", "role": "plaintiff"},
+                    {"name": "General Motors, LLC", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV33333</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Acme Corp v. General Motors, LLC"
+
+    def test_role_literal_right_side_respondent_rebuilt_petitioner_pair(self) -> None:
+        """Right-side 'Respondents' selects the petitioner/respondent pair on rebuild (#4618)."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCP44444",
+                "extracted_case_title": "Jane Roe v. Respondents",
+                "outcome": "granted",
+                "ruling_text": "The petition is GRANTED.",
+                "parties": [
+                    {"name": "Jane Roe", "role": "petitioner"},
+                    {"name": "City of Los Angeles", "role": "respondent"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCP44444</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Jane Roe v. City of Los Angeles"
+
+    def test_role_literal_real_company_defendants_inc_passthrough(self) -> None:
+        """'Smith v. Defendants Inc.' is a real company → passes through unchanged (#4618).
+
+        No parties supplied so the reversed-title sanitizer cannot fire; the
+        false-positive guard must leave this real-company title intact.
+        """
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV55555",
+                "extracted_case_title": "Smith v. Defendants Inc.",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV55555</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Smith v. Defendants Inc."
+
 
 # ---------------------------------------------------------------------------
 # TestLlmExtractRulingsReversedTitle — reversed case_title correction (#3846)

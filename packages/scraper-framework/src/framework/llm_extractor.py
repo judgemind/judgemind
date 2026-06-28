@@ -136,14 +136,68 @@ _SB_CASE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches a case_title that is a role-literal placeholder: the LLM emitted the
-# role word ("Plaintiff", "Defendant", "Petitioner", "Respondent") as the party
-# name instead of the real name from the ruling body.  Both singular and plural
-# forms are covered.  See #2565.
+# Matches a case_title whose LEFT segment is a role-literal placeholder: the LLM
+# emitted the role word ("Plaintiff", "Defendant", "Petitioner", "Respondent") as
+# the party name instead of the real name from the ruling body.  Both singular and
+# plural forms are covered.  Left-anchored only — kept for back-compat and as the
+# left-side building block of :func:`_is_role_literal_title`, which extends
+# detection to a role-literal placeholder on EITHER side of ``v.`` (#4618).
+# See #2565.
 _ROLE_LITERAL_TITLE_RE = re.compile(
     r"^\s*(?:Plaintiff|Defendant|Petitioner|Respondent)s?\s+v[s]?\.?\s",
     re.IGNORECASE,
 )
+
+# A single role token, allowing singular/plural and the cross-prefixed forms.
+# Used by :func:`_is_role_literal_title` to test whether a ``/``-separated piece
+# of a title segment is a pure role word.  See #4618.
+_ROLE_TOKEN = r"(?:Cross-)?(?:Plaintiff|Defendant|Petitioner|Respondent|Complainant)s?"
+
+# Matches a title segment (one side of ``v.``) that is ENTIRELY a role-literal
+# compound — every ``/``-separated piece is a role token, with no trailing real
+# text.  Anchored start-to-end so ``Defendants Inc.`` (real company) does NOT
+# match while ``Defendants/Cross-Complainants`` does.  See #4618.
+_ROLE_LITERAL_SEGMENT_RE = re.compile(
+    rf"^\s*{_ROLE_TOKEN}(?:\s*/\s*{_ROLE_TOKEN})*\s*$",
+    re.IGNORECASE,
+)
+
+# Splits a title on the ``v.``/``vs.``/``v``/``vs`` party separator using a word
+# boundary so it does not fire inside a real word.  See #4618.
+_VS_SEPARATOR_RE = re.compile(r"\bv[s]?\.?\s+", re.IGNORECASE)
+
+
+def _is_role_literal_title(title: str | None) -> bool:
+    """Return True when EITHER side of the ``v.`` separator is a role-literal (#4618).
+
+    A *role-literal title* is one where the LLM substituted a role word
+    ("Plaintiff", "Defendant", "Petitioner", "Respondent", their plurals, and the
+    cross-prefixed / ``/``-joined compounds) for a real party name, on the left,
+    the right, or both sides of the ``v.``/``vs.`` separator. Examples that match:
+
+    - ``Plaintiff v. General Motors, LLC`` (left)
+    - ``Acme Corp v. Defendants`` (right)
+    - ``Tcfi Cp Llc v. Defendants/Cross-Complainants`` (right compound)
+    - ``Plaintiff/Petitioner v. Defendant/Respondent`` (both)
+
+    The detection is anchored to the WHOLE segment, so a real party name that
+    merely contains a role word as a substring is NOT flagged:
+
+    - ``Smith v. Defendants Inc.`` (trailing real text → not role-literal)
+    - ``Plaintiff Holdings LLC v. Smith`` (leading role word + real text)
+    - ``Aasi v. American Honda`` / ``Doe v. Roe`` (clean)
+
+    Returns ``False`` for ``None``, empty, whitespace-only, or any title without a
+    recognisable ``v.`` separator.
+    """
+    if not title or not title.strip():
+        return False
+    parts = _VS_SEPARATOR_RE.split(title, maxsplit=1)
+    if len(parts) != 2:
+        return False
+    left, right = parts
+    return bool(_ROLE_LITERAL_SEGMENT_RE.match(left) or _ROLE_LITERAL_SEGMENT_RE.match(right))
+
 
 # Matches a case_title that contains an LLM-hallucinated bracketed placeholder
 # for a party name, e.g. "Ezra Arce v. [Defendant not specified]" or
@@ -1416,13 +1470,15 @@ def _rebuild_title_from_parties(
     title: str | None,
     parties: list,
 ) -> str | None:
-    """Rebuild a role-literal ``case_title`` from ``extracted_parties`` (#2565).
+    """Rebuild a role-literal ``case_title`` from ``extracted_parties`` (#2565, #4618).
 
-    If *title* matches ``_ROLE_LITERAL_TITLE_RE`` (e.g. ``"Plaintiff v. Defendant"``),
-    attempt to reconstruct ``"<first-plaintiff> v. <first-defendant>"`` from
-    *parties*.  Returns ``None`` when the title does not match the pattern or
-    when the required parties are not available (so the caller can leave the
-    field unchanged or emit a warning).
+    If *title* is role-literal per :func:`_is_role_literal_title` — a role word on
+    EITHER side of ``v.``, e.g. ``"Plaintiff v. Defendant"`` or
+    ``"Acme Corp v. Defendants"`` — or matches
+    ``_BRACKETED_PLACEHOLDER_TITLE_RE``, attempt to reconstruct
+    ``"<first-plaintiff> v. <first-defendant>"`` from *parties*.  Returns ``None``
+    when the title is not a placeholder or when the required parties are not
+    available (so the caller can leave the field unchanged or emit a warning).
 
     Parameters
     ----------
@@ -1440,14 +1496,16 @@ def _rebuild_title_from_parties(
         parties are insufficient to rebuild.
     """
     if not title or not (
-        _ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title)
+        _is_role_literal_title(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title)
     ):
         return None
 
     # Determine which role pair to look for.  Petitions use petitioner/respondent;
-    # everything else uses plaintiff/defendant.
+    # everything else uses plaintiff/defendant.  With right-side placeholders the
+    # role word may be on the right (e.g. ``"<RealName> v. Respondents"``), so a
+    # petitioner/respondent token on EITHER side selects that pair (#4618).
     title_lower = title.lower().strip()
-    if title_lower.startswith("petitioner"):
+    if "petitioner" in title_lower or "respondent" in title_lower:
         plaintiff_roles = {"petitioner"}
         defendant_roles = {"respondent"}
     else:
@@ -2145,8 +2203,9 @@ def _drop_short_unsubstantive_rulings(
 # case_number instead of the real one.
 #
 # Drop condition (all three must hold):
-#   * ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
-#     ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
+#   * ``_is_role_literal_title`` is True for ``extracted_case_title`` (role word
+#     on EITHER side of ``v.`` — #4618), OR ``_BRACKETED_PLACEHOLDER_TITLE_RE``
+#     matches anywhere in the title
 #   * ``extracted_case_number`` is None or empty string
 #   * ``entry_number`` is None
 #
@@ -2168,8 +2227,10 @@ def _drop_role_literal_orphan_rulings(
        ``extracted_case_title``, and ``entry_number`` (a stub
        cross-reference text like "Ctrl Click on Line N …").
     2. A **body-section orphan** with empty ``extracted_case_number``,
-       a role-literal title like ``"Plaintiff v. FCA"`` (matching
-       ``_ROLE_LITERAL_TITLE_RE``), and no ``entry_number``.
+       a role-literal title like ``"Plaintiff v. FCA"`` or
+       ``"Acme Corp v. Defendants"`` (detected by
+       :func:`_is_role_literal_title` on either side of ``v.`` — #4618), and
+       no ``entry_number``.
 
     The orphan is an artefact of multi-page PDF parsing — the ruling body
     starts on a fresh page without a proper case header, so the LLM
@@ -2180,7 +2241,8 @@ def _drop_role_literal_orphan_rulings(
     Rules:
 
     - A ruling is dropped when ALL THREE conditions hold:
-      1. ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
+      1. ``_is_role_literal_title`` is True for ``extracted_case_title`` (role
+         word on either side of ``v.`` — #4618), OR
          ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
       2. ``extracted_case_number`` is None or empty
       3. ``entry_number`` is None
@@ -2196,7 +2258,7 @@ def _drop_role_literal_orphan_rulings(
         has_case_number = bool(ruling.extracted_case_number)
         has_entry_number = ruling.entry_number is not None
         if (
-            (_ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title))
+            (_is_role_literal_title(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title))
             and not has_case_number
             and not has_entry_number
         ):

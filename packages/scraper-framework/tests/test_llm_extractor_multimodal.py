@@ -4850,6 +4850,40 @@ class TestRoleLiteralOrphanDrop:
         assert len(result) == 1
         assert result[0].extracted_case_number == "25CV458975"
 
+    def test_drops_right_side_role_literal_orphan(self) -> None:
+        """Right-side role-literal orphan (no case_number, no entry) is dropped (#4618)."""
+        orphan = ExtractedRuling(
+            extracted_case_title="Tcfi Cp Llc v. Defendants/Cross-Complainants",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text="The Court rules as follows: DENIED." * 30,
+        )
+        result = _drop_role_literal_orphan_rulings([orphan])
+        assert result == []
+
+    def test_preserves_right_side_role_literal_lookalike_with_case_number(self) -> None:
+        """A real-company 'X v. Defendants Inc.' WITH a case_number is preserved (#4618)."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Smith v. Defendants Inc.",
+            extracted_case_number="24CV654321",
+            entry_number=None,
+            ruling_text="The motion is DENIED." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([ruling])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "24CV654321"
+
+    def test_preserves_right_side_role_literal_lookalike_orphan(self) -> None:
+        """'X v. Defendants Inc.' is NOT role-literal → not dropped even as an orphan (#4618)."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Smith v. Defendants Inc.",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text="The motion is DENIED." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([ruling])
+        assert len(result) == 1
+
     # ------------------------------------------------------------------
     # SC end-to-end via _join_page_rows (#3663 AC1 + AC2)
     # ------------------------------------------------------------------
