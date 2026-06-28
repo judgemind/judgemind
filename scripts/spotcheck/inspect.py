@@ -147,6 +147,121 @@ def is_empty_text(row: dict[str, Any]) -> bool:
     return n is None or n == 0
 
 
+# ---------------------------------------------------------------------------
+# Bad-short-title heuristic (#4620)
+# ---------------------------------------------------------------------------
+#
+# A Federal ``case_title`` is suspect when it is short (< 40 chars) AND lacks
+# any legitimate caption structure. The canonical SQL equivalent lives in
+# ``.claude/skills/spotcheck/SKILL.md`` (kept in sync by reference). The Python
+# predicate is stricter than the SQL allow-list: it also rejects role-literal
+# captions (e.g. ``Plaintiff v. Defendant``) that the SQL ``ILIKE '% v %'``
+# allow-list would let through.
+
+SHORT_TITLE_MAX_LEN = 40
+
+# Legitimate caption prefixes (matched case-insensitively at the start of the
+# title). Mirrors the SQL ``NOT ILIKE '<prefix> %'`` allow-list.
+LEGIT_TITLE_PREFIXES: tuple[str, ...] = (
+    "in re ",
+    "in re:",
+    "in the matter of ",
+    "matter of ",
+    "ex parte ",
+    "united states ",
+    "people ",
+    "peo in interest of ",
+    "in interest of ",
+    "marriage of ",
+    "detention of ",
+    "parental resp",
+    "estate of ",
+)
+
+# Versus connectors (surrounded by spaces) that mark a real caption. Ordered
+# longest-first so that, when splitting a title on the first matching connector,
+# the most specific connector wins (e.g. " v. " is tried before " v "). The
+# connectors do not actually overlap as substrings for well-formed titles
+# (the period/no-period variants are mutually exclusive), but the defensive
+# ordering keeps the split robust for any oddly-spaced input.
+VERSUS_CONNECTORS: tuple[str, ...] = (" vs. ", " vs ", " v. ", " v ")
+
+# Role-literal tokens — extraction-contamination placeholders, not real party
+# names. A title composed solely of these (even with a ``v.`` connector) is
+# contamination, not a legitimate caption.
+ROLE_LITERAL_TOKENS: frozenset[str] = frozenset(
+    {
+        "plaintiff",
+        "plaintiffs",
+        "defendant",
+        "defendants",
+        "petitioner",
+        "petitioners",
+        "respondent",
+        "respondents",
+        "appellant",
+        "appellants",
+        "appellee",
+        "appellees",
+        "claimant",
+        "defendant(s)",
+        "plaintiff(s)",
+    }
+)
+
+
+def _is_role_literal_only(title: str) -> bool:
+    """Return True if ``title`` is composed solely of role-literal tokens.
+
+    Splits on any versus connector; a title is role-literal contamination when
+    every non-empty side consists only of role-literal tokens (e.g.
+    ``Plaintiff v. Defendant``, ``Defendants v Plaintiffs``), or when the whole
+    title is a single role-literal token (e.g. ``Defendant``).
+    """
+    lowered = title.lower()
+    sides = [lowered]
+    for connector in VERSUS_CONNECTORS:
+        if connector in lowered:
+            sides = lowered.split(connector)
+            break
+    sides = [s.strip() for s in sides if s.strip()]
+    if not sides:
+        return False
+    return all(side in ROLE_LITERAL_TOKENS for side in sides)
+
+
+def is_bad_short_title(row: dict[str, Any]) -> bool:
+    """Return True if ``row['case_title']`` is a bad short title (#4620).
+
+    A title is BAD when it is non-null, short (< ``SHORT_TITLE_MAX_LEN``), and
+    either lacks any legitimate caption structure OR is role-literal
+    contamination (e.g. ``Plaintiff v. Defendant``). Null/empty titles and
+    titles >= the length threshold are never flagged.
+    """
+    title = row.get("case_title")
+    if not isinstance(title, str):
+        return False
+    title = title.strip()
+    if not title:
+        return False
+    if len(title) >= SHORT_TITLE_MAX_LEN:
+        return False
+
+    # Role-literal placeholders are contamination even when they carry a ``v.``.
+    if _is_role_literal_only(title):
+        return True
+
+    lowered = title.lower()
+    # A real versus caption (non-role-literal) is legitimate.
+    if any(connector in lowered for connector in VERSUS_CONNECTORS):
+        return False
+    if any(lowered.startswith(prefix) for prefix in LEGIT_TITLE_PREFIXES):
+        return False
+
+    # Short, non-null, no legitimate caption, not role-literal: bad.
+    return True
+
+
 def in_departments(row: dict[str, Any], departments: list[str]) -> bool:
     """Return True if ``row['department']`` matches any of ``departments``.
 
@@ -170,6 +285,7 @@ def filter_rows(
     null_judge_only: bool = False,
     null_department_only: bool = False,
     empty_text_only: bool = False,
+    bad_short_title_only: bool = False,
     departments: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply filters in AND fashion. All filters compose."""
@@ -183,6 +299,8 @@ def filter_rows(
         if null_department_only and not is_null_department(row):
             continue
         if empty_text_only and not is_empty_text(row):
+            continue
+        if bad_short_title_only and not is_bad_short_title(row):
             continue
         if depts and not in_departments(row, depts):
             continue
@@ -299,6 +417,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep only rows where ruling_text_length is 0/missing.",
     )
     parser.add_argument(
+        "--bad-short-title-only",
+        action="store_true",
+        help=(
+            "Keep only rows with a bad short case_title (#4620): short, "
+            "non-null, no legitimate caption, or role-literal contamination."
+        ),
+    )
+    parser.add_argument(
         "--department-in",
         nargs="+",
         default=[],
@@ -331,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         null_judge_only=args.null_judge_only,
         null_department_only=args.null_department_only,
         empty_text_only=args.empty_text_only,
+        bad_short_title_only=args.bad_short_title_only,
         departments=args.department_in,
     )
 

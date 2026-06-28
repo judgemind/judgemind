@@ -238,6 +238,16 @@ class TestFilterRows:
         rows = spotcheck_inspect.iter_rulings(result_fixture)
         assert spotcheck_inspect.filter_rows(rows) == rows
 
+    def test_bad_short_title_only(self) -> None:
+        rows = [
+            {"ruling_id": "good", "case_title": "Smith v. Jones"},
+            {"ruling_id": "legit_matter", "case_title": "In the Matter of Smith"},
+            {"ruling_id": "role", "case_title": "Plaintiff v. Defendant"},
+            {"ruling_id": "bare", "case_title": "Jane Doe"},
+        ]
+        out = spotcheck_inspect.filter_rows(rows, bad_short_title_only=True)
+        assert {r["ruling_id"] for r in out} == {"role", "bare"}
+
 
 # ---------------------------------------------------------------------------
 # Predicate helpers
@@ -273,6 +283,62 @@ class TestPredicates:
             is True
         )
         assert spotcheck_inspect.in_departments({"department": None}, ["C20"]) is False
+
+
+# ---------------------------------------------------------------------------
+# is_bad_short_title — refined Federal case_title heuristic (#4620)
+# ---------------------------------------------------------------------------
+
+
+class TestBadShortTitle:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "In the Matter of Smith",
+            "In Re Taylor Dant",
+            "In Re: Michael White",
+            "Doe V. Roe",
+            "Doe V Roe",
+            "Smith v. Jones",
+            "Smith vs. Jones",
+            "Peo in Interest of A.B.",
+            "Marriage of Lee",
+            "In Interest of J.D.",
+            "Detention Of Gomez",
+            "Parental Resp of Ng",
+            "People V. Garcia",
+            "Estate of Smith",
+        ],
+    )
+    def test_legit_caption_not_flagged(self, title: str) -> None:
+        assert spotcheck_inspect.is_bad_short_title({"case_title": title}) is False
+
+    def test_long_title_not_flagged_even_without_caption(self) -> None:
+        # >= 40 chars: length gate short-circuits, never a "short" title.
+        long_title = "Abcdefghij Klmnopqrst Uvwxyz Anonymous Name"
+        assert len(long_title) >= 40
+        assert spotcheck_inspect.is_bad_short_title({"case_title": long_title}) is False
+
+    def test_null_empty_whitespace_not_flagged(self) -> None:
+        assert spotcheck_inspect.is_bad_short_title({"case_title": None}) is False
+        assert spotcheck_inspect.is_bad_short_title({}) is False
+        assert spotcheck_inspect.is_bad_short_title({"case_title": ""}) is False
+        assert spotcheck_inspect.is_bad_short_title({"case_title": "   "}) is False
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Plaintiff v. Defendant",
+            "Defendants v Plaintiffs",
+            "Defendant",
+            "Dhc",
+            "Jane Doe",
+            "Don Mccoin",
+            "Abdalla",
+        ],
+    )
+    def test_contamination_flagged(self, title: str) -> None:
+        assert spotcheck_inspect.is_bad_short_title({"case_title": title}) is True
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +461,7 @@ class TestMainCli:
             "--null-judge-only",
             "--null-department-only",
             "--empty-text-only",
+            "--bad-short-title-only",
             "--department-in",
             "--format",
         ]:
@@ -464,6 +531,31 @@ class TestMainCli:
             assert not any(k.startswith("__") for k in row), (
                 "JSON output must strip __source / __county augment keys"
             )
+
+    def test_bad_short_title_only_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """``--bad-short-title-only --format json`` selects only contamination."""
+        result = {
+            "rulings_by_county": {
+                "Federal": [
+                    {"ruling_id": "good", "case_title": "Smith v. Jones"},
+                    {"ruling_id": "legit", "case_title": "In Re Taylor Dant"},
+                    {"ruling_id": "role", "case_title": "Plaintiff v. Defendant"},
+                    {"ruling_id": "bare", "case_title": "Abdalla"},
+                ],
+            },
+        }
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+        rc = spotcheck_inspect.main(
+            [str(path), "--bad-short-title-only", "--format", "json"]
+        )
+        assert rc == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert {r["ruling_id"] for r in rows} == {"role", "bare"}
 
     def test_missing_file_returns_exit_2(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
