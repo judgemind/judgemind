@@ -2294,36 +2294,43 @@ def _drop_role_literal_orphan_rulings(
 # structurally not portable to the PDF cache-hit path.
 
 
-def _apply_pdf_cache_hit_filters(
-    rulings: list[ExtractedRuling],
-    *,
-    content_key: str,
-) -> list[ExtractedRuling]:
-    """Re-apply post-processing filters on the PDF cache-hit path (#2513).
+def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[ExtractedRuling]:
+    """Run the shared PDF post-processing filter tail (#4625).
 
-    Mirrors the subset of filters in :func:`_join_page_rows` that operate
-    purely on the final ``ExtractedRuling[]`` list.  Order matches
-    ``_join_page_rows`` so the cache-hit output is equivalent to what a
-    fresh extraction would produce.
+    This is the single source of truth for the filter sequence that BOTH PDF
+    paths run AFTER cross-reference resolution: the fresh-extract path
+    (:func:`_join_page_rows`, cache miss) and the cache-hit path
+    (:func:`_apply_pdf_cache_hit_filters`, ``rebuild_db.py``).  Keeping it in
+    one place guarantees the same input PDF yields identical
+    ``derived.rulings`` output whether or not the Gemini LLM cache is warm —
+    the fully-rebuildable ``derived.*`` contract requires rebuild == capture.
 
-    Cross-reference resolution (#3608) runs first so stub rulings that carry
-    ``entry_number`` are resolved before the drop/dedup filters discard them,
-    mirroring the filter ordering in the fresh-extract path.
+    Cross-reference resolution (#2317/#3857/#3608) is intentionally NOT part of
+    this helper: the fresh path passes entry_number/case_number index maps it
+    builds while joining page rows, whereas the cache-hit path has no maps.
+    Each caller therefore invokes ``_resolve_cross_references`` itself and then
+    delegates the remaining tail here.
 
-    The county sanitizers (Riverside + San Bernardino) run at the end of the
-    chain too (#4028) — they had previously only been wired into the text
-    cache-hit path, but SB and Riverside tentative rulings are PDFs, so the
-    #3898 inherited-case-number guard and the role-literal title rebuild never
-    fired on a ``rebuild_db.py`` cache hit.  All three sanitizers are no-ops
-    on non-SB / non-Riverside case numbers and are idempotent, so running them
-    on the PDF path is safe for every county.
+    The filter order is significant — see the inline notes for the rationale:
 
-    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
-    filters dropped rows — useful for observing the effect of filter
-    widening in production without re-running LLM calls.
+    - ``_drop_role_literal_orphan_rulings`` (#3663): drop SC body-section
+      orphans BEFORE the calendar-listing filter so the orphan's long
+      ruling_text does not confuse the calendar-only heuristic.
+    - ``_drop_calendar_listing_rulings`` (#2446) / ``_drop_short_unsubstantive_rulings``
+      (#2645): drop OC calendar-only / empty-cell noise rows; both run after
+      cross-reference resolution so legitimate shared text is not misclassified.
+    - ``_truncate_concatenated_case_titles`` (#2562) / ``_truncate_repeated_name_tails``:
+      run BEFORE dedup so the truncated title is a more accurate dedup signal.
+    - ``_deduplicate_ruling_texts`` (#2096): null out duplicate ruling_text.
+    - ``_filter_citation_artifacts`` (#2448): drop RJN citation artifacts.
+    - County sanitizers (Riverside #2565/#3898, San Bernardino) plus the
+      county-agnostic ``_drop_riverside_no_tentative_ruling_stubs`` (#3715):
+      the two case-number-gated sanitizers are no-ops on non-SB / non-Riverside
+      case numbers and idempotent, so running them on the PDF path is safe for
+      every county; the stub-dropper IS county-agnostic and drops bare
+      "No tentative ruling." stubs (< 200 chars, no cross_reference_source) on
+      every county including Orange.
     """
-    original_count = len(rulings)
-    rulings = _resolve_cross_references(rulings)
     rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
@@ -2334,6 +2341,41 @@ def _apply_pdf_cache_hit_filters(
     rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
     rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
     rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+    return rulings
+
+
+def _apply_pdf_cache_hit_filters(
+    rulings: list[ExtractedRuling],
+    *,
+    content_key: str,
+) -> list[ExtractedRuling]:
+    """Re-apply post-processing filters on the PDF cache-hit path (#2513).
+
+    Runs the identical filter tail as the fresh-extract path via the shared
+    :func:`_apply_pdf_post_join_filters` helper (#4625), so the cache-hit
+    output is equivalent to what a fresh extraction would produce.
+
+    Cross-reference resolution (#3608) runs first so stub rulings that carry
+    ``entry_number`` are resolved before the drop/dedup filters discard them,
+    mirroring the filter ordering in the fresh-extract path.
+
+    The county sanitizers (Riverside + San Bernardino) run at the end of the
+    shared tail (#4028).  Per ``extraction_config.py``, RIVERSIDE and SAN
+    BERNARDINO are ``ExtractionMethod.LLM`` (the text path), and only ORANGE is
+    ``ExtractionMethod.MULTIMODAL`` (the PDF path that reaches this function) —
+    so SB/Riverside tentative rulings never actually flow through here.  The two
+    case-number-gated sanitizers run on the PDF path purely for symmetry and
+    idempotency (they are no-ops on Orange case numbers); the county-agnostic
+    ``_drop_riverside_no_tentative_ruling_stubs`` DOES apply to Orange and drops
+    bare "No tentative ruling." stubs.
+
+    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
+    filters dropped rows — useful for observing the effect of filter
+    widening in production without re-running LLM calls.
+    """
+    original_count = len(rulings)
+    rulings = _resolve_cross_references(rulings)
+    rulings = _apply_pdf_post_join_filters(rulings)
     if len(rulings) != original_count:
         logger.info(
             "llm_extractor.cache_hit_filters_dropped",
@@ -4601,54 +4643,15 @@ def _join_page_rows(
         rulings, entry_number_to_index or None, case_number_to_index
     )
 
-    # Post-processing: drop SC body-section orphans (#3663).
-    # SC multi-page PDFs produce a body-section row with an empty
-    # case_number, role-literal title ("Plaintiff v. FCA"), and no
-    # entry_number.  Must run AFTER cross-reference resolution so any
-    # calendar row that WAS resolved keeps its real ruling_text, and the
-    # orphan — which has no entry_number and thus was never a cross-ref
-    # target — is discarded.  Run BEFORE the calendar-listing filter so the
-    # orphan's long ruling_text doesn't confuse the calendar-only heuristic.
-    rulings = _drop_role_literal_orphan_rulings(rulings)
-
-    # Post-processing: drop calendar-listing-only rows (#2446).
-    # Orange County department calendar PDFs sometimes list cases with only
-    # the motion-type heading or "OFF-CALENDAR" marker in place of an actual
-    # tentative ruling body.  These rows are not substantive rulings.  Run
-    # this AFTER cross-reference resolution so legitimate shared text is
-    # not accidentally classified as calendar-only.
-    rulings = _drop_calendar_listing_rulings(rulings)
-
-    # Post-processing: drop short-unsubstantive rulings that slipped
-    # through the pattern-based calendar-listing filter (#2645).  Catches
-    # empty-cell OC calendar rows where the LLM filled ruling_text with
-    # noise (case caption fragment, motion label without disposition)
-    # instead of a real tentative ruling body.  Must run AFTER the
-    # pattern-based filter so pattern-matched rows log under their specific
-    # marker, and AFTER cross-reference resolution so shared text isn't
-    # misclassified as unsubstantive.
-    rulings = _drop_short_unsubstantive_rulings(rulings)
-
-    # Post-processing: truncate concatenated case titles (#2562).
-    # Santa Clara multi-case PDFs sometimes produce an ``extracted_case_title``
-    # that fuses adjacent calendar lines ("Smith v. Jones Doe v. Roe").  Run
-    # this BEFORE ``_deduplicate_ruling_texts`` because the truncated title
-    # is a more accurate signal for downstream dedup heuristics and for the
-    # deterministic flag rule ``check_no_multiple_adversarial_patterns`` in
-    # the worker's validation step.
-    rulings = _truncate_concatenated_case_titles(rulings)
-    rulings = _truncate_repeated_name_tails(rulings)
-
-    # Post-processing: deduplicate identical ruling texts (#2096).
-    # The LLM sometimes produces the same ruling text for multiple cases
-    # in the same PDF.  Keep only the first occurrence; null out duplicates.
-    rulings = _deduplicate_ruling_texts(rulings)
-
-    # Post-processing: remove citation artifacts (#2448).
-    # When a PDF contains a Request for Judicial Notice citing many other
-    # courts' orders, the LLM may return each citation as a separate ruling.
-    # Filter those out using title+length heuristics.
-    rulings = _filter_citation_artifacts(rulings)
+    # Post-processing: run the shared PDF filter tail (#4625).  This is the
+    # SAME sequence applied on the cache-hit path by
+    # ``_apply_pdf_cache_hit_filters``, so a fresh extraction and a rebuild
+    # cache hit produce identical ``ExtractedRuling[]`` output.  The helper
+    # docstring documents each filter's ordering rationale (orphan drop ->
+    # calendar-listing -> short-unsubstantive -> title truncation -> dedup ->
+    # citation-artifact -> county sanitizers + the county-agnostic
+    # no-tentative-ruling stub dropper).
+    rulings = _apply_pdf_post_join_filters(rulings)
 
     return rulings
 
