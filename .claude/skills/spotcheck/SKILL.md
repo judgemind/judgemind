@@ -145,6 +145,43 @@ When something looks wrong, trace it before filing. Examples of what "trace it" 
 
 A finding without a traced root cause is half-done — you'll either file a vague issue someone else has to re-investigate, or fix the symptom without preventing the regression.
 
+### Bad-short-title heuristic (Federal case_title contamination, #4620)
+
+When checking the **Case title** row of the table above against Federal `derived.cases`, use the refined bad-short-title heuristic. A Federal `case_title` is suspect when it is short (< 40 chars) **and** lacks any legitimate caption structure. The canonical refined SQL (case-insensitive via `ILIKE`, kept in sync with `scripts/spotcheck/inspect.py::is_bad_short_title`):
+
+```sql
+-- Bad-short-title heuristic (#4620): a Federal case_title is suspect when it is
+-- short (< 40 chars) AND lacks any legitimate caption structure. Case-insensitive
+-- via ILIKE. Mirrors scripts/spotcheck/inspect.py::is_bad_short_title.
+SELECT cs.case_title
+FROM derived.cases cs
+JOIN derived.rulings r ON r.case_id = cs.id
+JOIN derived.courts c ON r.court_id = c.id
+JOIN derived.documents d ON d.id = r.document_id AND d.status = 'active'
+WHERE c.county = 'Federal'
+  AND cs.case_title IS NOT NULL
+  AND length(cs.case_title) < 40
+  AND cs.case_title NOT ILIKE '% v %'
+  AND cs.case_title NOT ILIKE '% v. %'
+  AND cs.case_title NOT ILIKE '% vs %'
+  AND cs.case_title NOT ILIKE '% vs. %'
+  AND cs.case_title NOT ILIKE 'In re %'
+  AND cs.case_title NOT ILIKE 'In re:%'
+  AND cs.case_title NOT ILIKE 'In the Matter of %'
+  AND cs.case_title NOT ILIKE 'Matter of %'
+  AND cs.case_title NOT ILIKE 'Ex parte %'
+  AND cs.case_title NOT ILIKE 'United States %'
+  AND cs.case_title NOT ILIKE 'People %'
+  AND cs.case_title NOT ILIKE 'Peo in Interest of %'
+  AND cs.case_title NOT ILIKE 'In Interest of %'
+  AND cs.case_title NOT ILIKE 'Marriage of %'
+  AND cs.case_title NOT ILIKE 'Detention of %'
+  AND cs.case_title NOT ILIKE 'Parental Resp%'
+  AND cs.case_title NOT ILIKE 'Estate of %';
+```
+
+The SQL `ILIKE '% v %'` allow-list lets role-literal captions like `Plaintiff v. Defendant` through (a known limitation of a pure-SQL allow-list). The Python `inspect.py --bad-short-title-only` filter is **stricter and preferred for sampling** — it additionally rejects role-literal captions (`Plaintiff v. Defendant`, `Defendant`) as extraction contamination. Use the SQL as the quick dev-DB count; use `inspect.py --bad-short-title-only` when you want a clean sample to eyeball.
+
 ---
 
 ## Step 3 — Look beyond the bidirectional sample
@@ -204,6 +241,7 @@ The script is permanent (`# permanent: true`) and exits 0 always — it's a disc
 - `scripts/dev-db-query.sh "<SQL>"` — quick read against dev Postgres (no scripts; SELECT/EXPLAIN only).
 - `scripts/ecs-run-task.sh scripts/<file>.py -- <args>` — anything heavier (data scripts, backfills, multi-statement reads).
 - `scripts/run-py.sh scripts/screenshot.py <path>` — UI spot-check on `dev.judgemind.org`.
+- `scripts/run-py.sh scripts/spotcheck/inspect.py <s3-or-path> --bad-short-title-only` — sample Federal `case_title` contamination (the stricter, preferred tool over the bad-short-title SQL above; also rejects role-literal captions). See the bad-short-title heuristic note in Step 2.
 - `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` — dispatcher logs, scraper logs, ingestion-worker logs.
 - `mcp__awslabs_ecs-mcp-server__ecs_resource_management` — service / task / cluster reads.
 - `mcp__github__search_code` — find code patterns across the repo.
