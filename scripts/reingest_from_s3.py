@@ -174,11 +174,23 @@ Options:
                         (parent #4397) and #4419 (extended to prefix mode).
     --max-error-ratio R Fail the process (exit non-zero) when the observed
                         error ratio strictly exceeds R (a fraction 0.0-1.0,
-                        e.g. 0.05 for 5%).  When unset (default), the exit
-                        code is unchanged — all-success and partial-failure
-                        both exit 0 — preserving the ECS-oneshot exit-code
-                        contract for existing callers.  Applies to both
-                        --prefix and standard mode.  See #4619.
+                        e.g. 0.05 for 5%).  When unset, the exit code is
+                        unchanged for standard mode and non-cache-bust prefix
+                        runs — all-success and partial-failure both exit 0 —
+                        preserving the ECS-oneshot exit-code contract for
+                        existing callers (#4619).  **Exception (#4624):** a
+                        ``--bust-llm-cache`` prefix reingest defaults to a
+                        0.10 (10%) gate when this flag is unset, so the path
+                        that recreated the #3855 incident fails loud by
+                        default.  Pass --no-fail-on-errors to opt out, or an
+                        explicit --max-error-ratio to set your own threshold.
+                        Applies to both --prefix and standard mode.
+    --no-fail-on-errors Opt out of the partial-failure exit gate entirely,
+                        even for --bust-llm-cache prefix reingests where it is
+                        on by default (#4624).  Exits 0 on partial failure
+                        like every pre-#4619 caller.  Overrides
+                        --max-error-ratio when both are passed.  Reserved for
+                        runs where partial failure is expected.
     --write-failed-manifest s3://bucket/key
                         In --prefix mode, when at least one key fails, write
                         the failed keys (one per line) to this S3 object so a
@@ -5050,14 +5062,68 @@ def run_reingest(
     return result
 
 
+# Default partial-failure exit-gate threshold applied automatically to
+# ``--bust-llm-cache`` prefix reingests when the operator does not pass an
+# explicit ``--max-error-ratio`` and does not opt out via
+# ``--no-fail-on-errors`` (#4624).  A cache-bust prefix reingest is the exact
+# path that recreated the #3855 incident (Orange residual OOM-killed 167/768
+# PDFs, exited 0).  ``--bust-llm-cache`` runs re-extract every key through the
+# LLM, so a non-trivial error fraction is always a signal that the run
+# silently lost data — failing loud by default closes the "operator forgot
+# --max-error-ratio" gap that is the same root cause as the original
+# incident.  0.10 (10%) is deliberately permissive: it does not trip on the
+# occasional single-key transcription error in a small prefix, but it does
+# catch the bulk-OOM / bulk-timeout failure mode #3855 produced.
+_DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO = 0.10
+
+
+def _resolve_effective_max_error_ratio(
+    *,
+    explicit_max_error_ratio: float | None,
+    no_fail_on_errors: bool,
+    prefix: str | None,
+    bust_llm_cache: bool,
+) -> float | None:
+    """Decide the effective partial-failure exit threshold for this run (#4624).
+
+    Resolution order (first match wins):
+
+    1.  ``--no-fail-on-errors`` → return ``None`` (explicit opt-out).  The run
+        exits 0 on partial failure exactly like every pre-#4619 caller.  This
+        is the escape hatch for the rare run where partial failure is expected
+        (e.g. a known-bad prefix being drained best-effort).
+    2.  An explicit ``--max-error-ratio`` → return it verbatim (operator chose
+        their own threshold; their choice always wins, including ``0.0`` for
+        a fail-on-any-error run or a deliberately high ceiling).
+    3.  A ``--bust-llm-cache`` **prefix** reingest with no explicit threshold →
+        return :data:`_DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO`.  This is the
+        new default-on gate: the cache-bust prefix path that recreated #3855
+        now fails loud unless the operator opts out.
+    4.  Anything else (standard DB-row mode, non-cache-bust prefix runs) →
+        return ``None``, preserving the existing opt-in exit-code contract so
+        no existing caller's exit behavior changes (#4619).
+
+    Returning ``None`` means :func:`_enforce_max_error_ratio` is a no-op and
+    the run exits 0 regardless of error ratio — the backward-compatible path.
+    """
+    if no_fail_on_errors:
+        return None
+    if explicit_max_error_ratio is not None:
+        return explicit_max_error_ratio
+    if prefix and bust_llm_cache:
+        return _DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO
+    return None
+
+
 def _enforce_max_error_ratio(max_error_ratio: float | None, error_ratio: float) -> None:
     """Exit non-zero when ``error_ratio`` strictly exceeds the threshold.
 
-    No-op when ``max_error_ratio`` is ``None`` (the flag was not passed) — this
-    preserves the ECS-oneshot exit-code contract for existing callers, which
-    exit 0 on partial failure.  Only a set threshold that is strictly exceeded
-    triggers ``sys.exit(1)``; all-success and below-threshold both return.
-    See #4619.
+    No-op when ``max_error_ratio`` is ``None`` (no gate is in effect for this
+    run — neither an explicit ``--max-error-ratio`` nor the #4624 cache-bust
+    prefix default applied).  This preserves the ECS-oneshot exit-code contract
+    for existing callers, which exit 0 on partial failure.  Only a set
+    threshold that is strictly exceeded triggers ``sys.exit(1)``; all-success
+    and below-threshold both return.  See #4619 and #4624.
     """
     if max_error_ratio is None:
         return
@@ -5246,10 +5312,11 @@ def main() -> None:
             "split-child rows; DB-row mode skips them to avoid #2416). "
             "See #4049.  Combine with --s3-key-list to narrow the scan to a "
             "hand-picked subset of keys under the prefix instead of the whole "
-            "prefix (#3855).  Combine with --max-error-ratio to fail the run "
-            "when too large a fraction of keys error, and "
-            "--write-failed-manifest to capture the failed keys for a scoped "
-            "retry (#4619)."
+            "prefix (#3855).  With --bust-llm-cache, the run fails loud by "
+            "default when more than 10% of keys error (#4624) — pass "
+            "--max-error-ratio to set your own threshold or --no-fail-on-errors "
+            "to opt out — and --write-failed-manifest to capture the failed "
+            "keys for a scoped retry (#4619)."
         ),
     )
     parser.add_argument(
@@ -5353,6 +5420,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-fail-on-errors",
+        action="store_true",
+        dest="no_fail_on_errors",
+        help=(
+            "Opt out of the partial-failure exit gate entirely, even for "
+            "--bust-llm-cache prefix reingests where the gate is on by default "
+            "(#4624).  The run exits 0 on partial failure exactly like every "
+            "pre-#4619 caller.  Reserved for the rare run where partial "
+            "failure is expected (e.g. a known-bad prefix being drained "
+            "best-effort).  Overrides --max-error-ratio when both are passed."
+        ),
+    )
+    parser.add_argument(
         "--write-failed-manifest",
         type=str,
         default=None,
@@ -5413,7 +5493,15 @@ def main() -> None:
             skipped=stats["skipped"],
             judge_prepass_judges_seeded=stats.get("judge_prepass_judges_seeded"),
         )
-        _enforce_max_error_ratio(args.max_error_ratio, stats.get("error_ratio", 0.0))
+        effective_max_error_ratio = _resolve_effective_max_error_ratio(
+            explicit_max_error_ratio=args.max_error_ratio,
+            no_fail_on_errors=args.no_fail_on_errors,
+            prefix=args.prefix,
+            bust_llm_cache=args.bust_llm_cache,
+        )
+        _enforce_max_error_ratio(
+            effective_max_error_ratio, stats.get("error_ratio", 0.0)
+        )
         return
 
     # Standard mode: query the database for existing document records.
@@ -5461,7 +5549,18 @@ def main() -> None:
         llm_api_calls=stats.get("llm_api_calls", 0),
         estimated_cost_usd=stats.get("estimated_cost_usd", 0),
     )
-    _enforce_max_error_ratio(args.max_error_ratio, stats.get("error_ratio", 0.0))
+    # Standard (DB-row) mode is not a prefix run, so the #4624 cache-bust
+    # prefix default never applies here — the resolver returns the explicit
+    # --max-error-ratio (or None) unchanged, preserving the #4619 opt-in
+    # contract.  Routing through the shared resolver keeps both call sites
+    # honoring --no-fail-on-errors identically.
+    effective_max_error_ratio = _resolve_effective_max_error_ratio(
+        explicit_max_error_ratio=args.max_error_ratio,
+        no_fail_on_errors=args.no_fail_on_errors,
+        prefix=args.prefix,
+        bust_llm_cache=args.bust_llm_cache,
+    )
+    _enforce_max_error_ratio(effective_max_error_ratio, stats.get("error_ratio", 0.0))
 
 
 if __name__ == "__main__":

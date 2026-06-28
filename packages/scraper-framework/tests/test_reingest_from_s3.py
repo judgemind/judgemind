@@ -15452,3 +15452,271 @@ class TestStandardModeErrorRatioExit:
         argv = ["reingest_from_s3", "--county", "Fresno"]
         with patch("sys.argv", argv):
             reingest.main()  # must not raise
+
+
+class TestResolveEffectiveMaxErrorRatio:
+    """Unit tests for the #4624 effective-threshold resolver.
+
+    Pinpoints the decision logic that makes the partial-failure exit gate the
+    default for --bust-llm-cache prefix reingests while leaving every other
+    path's exit-code contract untouched (#4619).
+    """
+
+    def test_cache_bust_prefix_defaults_to_gate(self) -> None:
+        """The headline #4624 behavior: a --bust-llm-cache prefix reingest with
+        no explicit threshold defaults to the 10% gate."""
+        result = reingest._resolve_effective_max_error_ratio(
+            explicit_max_error_ratio=None,
+            no_fail_on_errors=False,
+            prefix="orange/",
+            bust_llm_cache=True,
+        )
+        assert result == reingest._DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO
+        assert result == 0.10
+
+    def test_prefix_without_bust_is_unchanged(self) -> None:
+        """A prefix reingest WITHOUT --bust-llm-cache keeps the opt-in
+        contract — no default gate."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=False,
+            )
+            is None
+        )
+
+    def test_bust_without_prefix_is_unchanged(self) -> None:
+        """--bust-llm-cache in standard (no --prefix) mode keeps the opt-in
+        contract — the default gate is scoped to the prefix path only."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix=None,
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+    def test_standard_mode_is_unchanged(self) -> None:
+        """Plain standard mode (no prefix, no bust) keeps the opt-in
+        contract."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix=None,
+                bust_llm_cache=False,
+            )
+            is None
+        )
+
+    def test_explicit_threshold_wins_over_default(self) -> None:
+        """An explicit --max-error-ratio always wins, even on the cache-bust
+        prefix path that would otherwise default to 0.10."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.5,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            == 0.5
+        )
+
+    def test_explicit_zero_threshold_wins(self) -> None:
+        """An explicit --max-error-ratio 0.0 (fail on any error) is honored,
+        not swallowed by the default — 0.0 is not None."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.0,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            == 0.0
+        )
+
+    def test_no_fail_on_errors_opts_out_of_default(self) -> None:
+        """--no-fail-on-errors disables the cache-bust prefix default."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=True,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+    def test_no_fail_on_errors_overrides_explicit_threshold(self) -> None:
+        """--no-fail-on-errors overrides --max-error-ratio when both are
+        passed — the opt-out always wins."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.05,
+                no_fail_on_errors=True,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+
+class TestCacheBustPrefixDefaultGateExit:
+    """main() exit-code gating for the #4624 default-on cache-bust prefix
+    gate.  Exercises the full main() dispatch, not just the resolver."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_fires_on_cache_bust_partial_failure(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """The headline regression: --prefix + --bust-llm-cache with a partial
+        failure above 10% exits non-zero WITHOUT any --max-error-ratio flag."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 601,
+            "errors": 167,
+            "skipped": 0,
+            "error_ratio": 167 / 768,  # ~0.217, the #3855 incident shape
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                reingest.main()
+        assert exc.value.code == 1
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_all_success_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A clean --bust-llm-cache prefix run (error_ratio 0.0) must still
+        exit 0 — the default gate must not break legitimate all-success
+        runs."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 768,
+            "errors": 0,
+            "skipped": 0,
+            "error_ratio": 0.0,
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # all-success → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_below_threshold_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A --bust-llm-cache prefix run with a single-key error below the 10%
+        default does NOT exit non-zero (permissive default)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 95,
+            "errors": 5,
+            "skipped": 0,
+            "error_ratio": 0.05,  # below the 0.10 default
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # below default threshold → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_no_fail_on_errors_opts_out_of_default_gate(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """--no-fail-on-errors disables the default gate even on a cache-bust
+        prefix partial failure above 10%."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 601,
+            "errors": 167,
+            "skipped": 0,
+            "error_ratio": 167 / 768,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "orange/",
+            "--bust-llm-cache",
+            "--no-fail-on-errors",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # opt-out → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_explicit_threshold_overrides_default_gate(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """An explicit --max-error-ratio above the observed ratio keeps a
+        cache-bust prefix run green even though the default 0.10 gate would
+        have failed it."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 85,
+            "errors": 15,
+            "skipped": 0,
+            "error_ratio": 0.15,  # above 0.10 default, below explicit 0.5
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "orange/",
+            "--bust-llm-cache",
+            "--max-error-ratio",
+            "0.5",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # explicit threshold not exceeded → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_non_cache_bust_prefix_partial_failure_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A prefix reingest WITHOUT --bust-llm-cache keeps the #4619 opt-in
+        contract: a partial failure above 10% still exits 0 when no
+        --max-error-ratio is passed (the default gate must NOT leak onto the
+        non-cache-bust prefix path)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 70,
+            "errors": 30,
+            "skipped": 0,
+            "error_ratio": 0.30,
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/"]
+        with patch("sys.argv", argv):
+            reingest.main()  # no bust → opt-in contract → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_standard_mode_with_bust_partial_failure_exits_zero(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        """Standard (DB-row) mode with --bust-llm-cache keeps the #4619 opt-in
+        contract: the default gate is scoped to the prefix path, so a partial
+        failure here still exits 0 without --max-error-ratio."""
+        mock_run.return_value = {
+            "total_processed": 5,
+            "total_updated": 5,
+            "total_llm_skipped": 0,
+            "error_ratio": 0.5,
+        }
+        argv = ["reingest_from_s3", "--county", "Fresno", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # standard mode → opt-in contract → no SystemExit
