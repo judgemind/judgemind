@@ -424,6 +424,45 @@ The cited companion number is informational — the action is the same regardles
 
 The verify-and-close path should be the common case when this check fires — when a structural fix lands as `closed-as-completed`, the PR that closed it usually shipped the dependent work alongside it.
 
+#### 4a.5 — Was-blocked-by, now-closed check (zombie-blocker pivot, MANDATORY when 4a.4 returned exit 1)
+
+**Why this runs after 4a.4:** When `scripts/unblock-dependents.sh` (or the `unblock-issues.yml` GitHub workflow) auto-restores `agent/ready` on a dependent issue after its blocker closes, it strips the `Blocked by #N` lines from the body — and as of #4610 leaves a durable, machine-detectable `Was-blocked-by:` provenance marker in their place. That marker is the only in-body signal that the issue was waiting on a now-shipped structural fix. The canonical recurrence is #3732 ↔ #4282/#4297/#4370: those three blockers all closed-as-completed, `unblock-dependents.sh` stripped the `Blocked by` lines and re-added `agent/ready`, and #3732 then sat `agent/ready` *un-verified* for ~7 weeks because the blocker provenance had been erased — nothing surfaced it for a verify-and-close. #4610 is the agent-side fix: the marker is preserved on strip, and this check reads it back. When every cited former blocker is closed-as-completed, the AC's intent is very likely already satisfied by the shipped structural fixes, so /task should pivot to verify-and-close rather than re-run ralph.
+
+The `Was-blocked-by` marker is the durable provenance left by `scripts/unblock-dependents.sh` / `scripts/_unblock_dependents.py` and `.github/workflows/unblock-issues.yml` — both producers write the byte-identical `Was-blocked-by: #A, #B, #C (all closed-completed YYYY-MM-DD; auto-unblocked)` line that this check greps for.
+
+Run the check as a single tool call (only after `check-issue-companion-closed.sh` returned exit 1):
+
+```
+{worktree}/scripts/check-issue-was-blocked-by.sh <N>
+```
+
+Exit codes:
+
+- **Exit 1 (`clear:` line on stdout) — no actionable was-blocked-by signal.** Continue to Step 4b. This is the common case. The script emits `clear:no-marker` when the body carries no `Was-blocked-by:` marker, and `clear:not-all-closed-completed` when a marker exists but at least one cited former blocker is still open, closed-as-not_planned, or unresolved.
+- **Exit 0 (`was-blocked-by:<nums>` line on stdout) — the body carries a marker AND every cited former blocker is `state == closed` AND `stateReason == COMPLETED`.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, malformed JSON).** Fail-open: continue to Step 4b.
+
+**False-positive guard:** the check only fires when EVERY cited former blocker is `state == closed` AND `stateReason == COMPLETED`. A still-open former blocker, or a closed-as-not_planned one (operator decided that structural fix isn't coming), leaves the issue alone — the work it was waiting on did not land as completed, so the issue's own work may still be needed and /task should run normally.
+
+##### 4a.5.1 — Verify-and-close pivot (only runs on exit 0)
+
+The cited former-blocker numbers are informational — the action is the same regardless of which siblings triggered. The was-blocked-by signal says "all the structural fixes this issue was waiting on already shipped and closed-as-completed, so the AC's intent is likely already satisfied." The pivot's job is to either confirm-and-close OR explicitly fall through if a residual remains.
+
+1. **Run the §4a.2.1 mechanical-verify pass.** Walk the issue body, extract each concrete `Verify:` command, and run each one. Skip free-form prose verifies. Same procedure as §4a.2.1 step 1 — driven by a different upstream signal (former blockers all closed-completed, not shipped-PR detection). The PRs that closed the former blockers almost always landed the dependent work as a side-effect; running the AC's verify commands either confirms that or surfaces the residual.
+2. **All-green path:** if every mechanical `Verify:` command exits clean, the pivot stands. Post a verification-evidence comment quoting the verify commands + their output + naming the closed former blockers (cited in the `Was-blocked-by:` marker). Close the issue with `--reason completed`, run `scripts/unblock-dependents.sh <N>`, and remove `status/in-progress`. Skip Path A entirely — there is no PR to file.
+
+   ```
+   {worktree}/scripts/gh-comment-with-retry.sh <N> --body-file {worktree}/tmp/verification_evidence.txt
+   gh issue close <N> --repo judgemind/judgemind --reason completed
+   {worktree}/scripts/unblock-dependents.sh <N>
+   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+   ```
+
+   The verification-evidence comment must explicitly cite the closed former blockers (quote the `Was-blocked-by:` marker line from the body) so the audit trail is clear: "The former blockers #A/#B/#C all closed-as-completed; today's mechanical verify pass confirmed the AC's intent is satisfied; closing." This is the canonical zombie-blocker flow (the #3732 recurrence) and should be the common case when this check fires.
+3. **Any-failure path:** if any mechanical `Verify:` command fails (or the issue has no mechanical verifies), post a comment naming the closed former blockers + the failed verify line, leave the issue open, and **fall through to Step 4b.** Normal /task flow continues from there. The PRs that closed the former blockers may not have shipped the dependent work after all — §4b's gap probe and ralph will figure out what's still needed. The comment should make explicit that the agent ran `check-issue-was-blocked-by.sh`, found all former blockers closed-as-completed, ran the mechanical verifies, and at least one is still unmet — so the residual is real.
+
+The verify-and-close path should be the common case when this check fires — when all the structural fixes an issue was blocked on land as `closed-as-completed`, the dependent work is usually already satisfied; the only thing missing is the close that the stripped-provenance gap (#4610) previously prevented.
+
 ---
 
 ### Step 4b — Verify gap is real (current state probe)

@@ -42,6 +42,7 @@
 #   * check-shipped-pr.sh          — needs an issue number argument
 #   * check-issue-plan-blocked.sh  — needs an issue number argument
 #   * check-issue-companion-closed.sh — needs an issue number argument
+#   * check-issue-was-blocked-by.sh — needs an issue number argument
 #   * check-near-duplicate-issue.sh — needs an issue number argument
 #   * check-blocked-issues.sh      — scans live GitHub issues
 #   * check-task-recovery.sh       — needs a worktree path argument
@@ -142,6 +143,7 @@ SKIP_LIST=(
     "check-shipped-pr.sh"
     "check-issue-plan-blocked.sh"
     "check-issue-companion-closed.sh"
+    "check-issue-was-blocked-by.sh"
     "check-near-duplicate-issue.sh"
     "check-blocked-issues.sh"
     "check-task-recovery.sh"
