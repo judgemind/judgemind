@@ -20,13 +20,15 @@ happen.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from framework.llm_extractor import (
     PDF_PER_PAGE_PROMPT,
     LlmExtractor,
     _apply_pdf_cache_hit_filters,
+    _apply_pdf_post_join_filters,
     _apply_text_cache_hit_filters,
+    _join_page_rows,
 )
 from framework.llm_schema import EXTRACTION_SYSTEM_PROMPT, ExtractedParty, ExtractedRuling
 
@@ -374,8 +376,11 @@ class TestApplyPdfCacheHitFilters:
 
     # -----------------------------------------------------------------------
     # County sanitizers now run on the PDF cache-hit path too (#4028).
-    # SB and Riverside tentative rulings are PDFs, so on a rebuild cache hit
-    # these sanitizers must fire just as they do on the text path.
+    # Per extraction_config.py, RIVERSIDE and SAN BERNARDINO use
+    # ExtractionMethod.LLM (the text path); only ORANGE is MULTIMODAL/PDF, so
+    # SB/Riverside never actually flow through this path.  The case-number-gated
+    # sanitizers run here purely for symmetry/idempotency (no-ops on Orange
+    # numbers); the county-agnostic stub-dropper does apply to Orange (#4625).
     # -----------------------------------------------------------------------
 
     def test_sb_inherited_case_number_guard_fires_on_pdf_cache_hit(self) -> None:
@@ -849,3 +854,193 @@ class TestCacheHitFilterReapplicationRegression:
         # Only the real ruling survives — seven stale listings dropped.
         assert len(rulings) == 1
         assert rulings[0].extracted_case_number == "30-2024-A"
+
+
+# ---------------------------------------------------------------------------
+# Regression: fresh PDF path and cache-hit path apply an IDENTICAL filter tail
+# ---------------------------------------------------------------------------
+
+
+class TestPdfPathFilterSymmetry:
+    """Fresh PDF path and cache-hit path must produce identical output (#4625).
+
+    PR #4613 added the three county sanitizers (including the county-agnostic
+    ``_drop_riverside_no_tentative_ruling_stubs``) to the PDF cache-hit path
+    but NOT to the fresh-extract path (``_join_page_rows``).  The same input
+    PDF therefore produced different ``derived.rulings`` output depending only
+    on whether the Gemini LLM cache was warm — breaking the rebuild == capture
+    invariant for the fully-rebuildable ``derived.*`` tier.
+
+    These tests drive the same logical input through both paths and assert the
+    resulting ``ExtractedRuling`` lists are equal.  The decisive case is an
+    Orange-style (non-Riverside / non-SB) bare "No tentative ruling." stub that
+    the county-agnostic dropper must remove on BOTH paths.
+    """
+
+    # An Orange-style (non-Riverside / non-SB) "No tentative ruling." stub of
+    # 100-199 chars: long enough to escape BOTH the calendar-listing filter
+    # (rejects > 100 chars) and the short-unsubstantive filter (only fires
+    # < 100 chars), so the ONLY filter that drops it is the county-agnostic
+    # ``_drop_riverside_no_tentative_ruling_stubs`` (< 200 chars + regex match).
+    # This isolates the divergence #4625 fixes: on main the fresh path lacked
+    # that dropper, so this stub survived a fresh capture but was dropped on a
+    # rebuild cache hit.
+    _ORANGE_STUB_TEXT = (
+        "Motion to Compel Further Responses to Form Interrogatories\n"
+        "No tentative ruling. Appearances are required at the hearing."
+    )
+    _REAL_RULING_TEXT = (
+        "The demurrer is SUSTAINED with leave to amend. Plaintiff shall file "
+        "an amended complaint within twenty (20) days of service of this order."
+    )
+
+    def test_orange_stub_isolates_county_agnostic_dropper(self) -> None:
+        """The Orange stub fixture is dropped ONLY by the stub dropper (#4625).
+
+        Guards the test's own premise: the stub is >= 100 chars (escapes the
+        calendar-listing and short-unsubstantive filters) and < 200 chars
+        (caught by ``_drop_riverside_no_tentative_ruling_stubs``).
+        """
+        assert 100 <= len(self._ORANGE_STUB_TEXT) < 200
+
+    def test_unit_helper_drops_orange_no_tentative_stub(self) -> None:
+        """The shared helper drops a non-Riverside/non-SB "No tentative ruling." stub."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01393434",
+                extracted_case_title="Real v. Ruling",
+                ruling_text=self._REAL_RULING_TEXT,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-01393435",
+                extracted_case_title="Stub v. Case",
+                ruling_text=self._ORANGE_STUB_TEXT,
+            ),
+        ]
+        filtered = _apply_pdf_post_join_filters(rulings)
+        assert [r.extracted_case_number for r in filtered] == ["30-2024-01393434"]
+
+    def _build_rulings(self) -> list[ExtractedRuling]:
+        """The same logical input for both paths: one real ruling + one stub."""
+        return [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01393434",
+                extracted_case_title="Smith v. Jones",
+                ruling_text=self._REAL_RULING_TEXT,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-01393435",
+                extracted_case_title="Doe v. Roe",
+                ruling_text=self._ORANGE_STUB_TEXT,
+            ),
+        ]
+
+    def test_fresh_path_drops_orange_no_tentative_stub(self) -> None:
+        """The fresh ``_join_page_rows`` path drops the Orange stub (#4625).
+
+        On main this FAILS — the fresh path did not run the county-agnostic
+        stub dropper, so the stub survived.
+        """
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-01393434 Smith v. Jones",
+                "ruling_text": self._REAL_RULING_TEXT,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-01393435 Doe v. Roe",
+                "ruling_text": self._ORANGE_STUB_TEXT,
+            },
+        ]
+        fresh = _join_page_rows(rows)
+        # The real ruling survives, the stub is dropped.  (``_join_page_rows``
+        # normalizes the OC case number by stripping the ``30-`` court prefix.)
+        assert len(fresh) == 1
+        assert fresh[0].ruling_text == self._REAL_RULING_TEXT
+
+    def test_fresh_and_cache_hit_paths_produce_identical_output(self) -> None:
+        """Same logical input -> identical rulings on cache miss vs. cache hit (#4625).
+
+        Drives the SAME ``ExtractedRuling`` list (post-join, pre-tail) through
+        both the fresh-extract filter tail (``_apply_pdf_post_join_filters``,
+        the cache-miss path) and the cache-hit path
+        (``_apply_pdf_cache_hit_filters``).  On main these diverge — the fresh
+        path lacked the county-agnostic stub dropper, so the Orange stub
+        survived a fresh capture but was dropped on a rebuild cache hit — so
+        the equality assertion FAILS.  After the fix both drop the stub.
+        """
+        fresh = _apply_pdf_post_join_filters(self._build_rulings())
+        cache_hit = _apply_pdf_cache_hit_filters(self._build_rulings(), content_key="abc123def456")
+
+        def _key(rs: list[ExtractedRuling]) -> list[tuple[str | None, str | None]]:
+            return [(r.extracted_case_number, r.ruling_text) for r in rs]
+
+        assert _key(fresh) == _key(cache_hit)
+        assert [r.extracted_case_number for r in fresh] == ["30-2024-01393434"]
+
+    def test_extract_from_pdf_cold_and_warm_cache_agree(self) -> None:
+        """End-to-end: ``extract_from_pdf`` agrees on cache miss vs. cache hit (#4625).
+
+        Cold cache exercises the fresh path (mocked per-page extraction ->
+        ``_join_page_rows``); warm cache exercises the cache-hit path.  The
+        warm payload simulates the pre-#4625 un-sanitized cache entry (stub
+        still present), proving the cache-hit path converges with the now
+        symmetric fresh path.
+        """
+        page_rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-01393434 Smith v. Jones",
+                "ruling_text": self._REAL_RULING_TEXT,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-01393435 Doe v. Roe",
+                "ruling_text": self._ORANGE_STUB_TEXT,
+            },
+        ]
+
+        # --- Cold cache: fresh extraction path ---
+        cold_cache = MagicMock()
+        cold_cache.get.return_value = None
+        fresh_extractor = _build_extractor_with_cache(cold_cache)
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"img", "image/png")],
+            ),
+            patch.object(fresh_extractor, "_extract_single_page", return_value=page_rows),
+        ):
+            fresh_rulings = fresh_extractor.extract_from_pdf(b"pdf-bytes-content")
+
+        # The fresh path wrote its (now-sanitized) output to the cache.
+        cold_cache.put.assert_called_once()
+        cached_payload = cold_cache.put.call_args.args[2]
+
+        # --- Warm cache: cache-hit path on a stale (un-sanitized) payload ---
+        stale_payload: list[dict[str, Any]] = [
+            {
+                "extracted_case_number": "30-2024-01393434",
+                "extracted_case_title": "Smith v. Jones",
+                "ruling_text": self._REAL_RULING_TEXT,
+            },
+            {
+                "extracted_case_number": "30-2024-01393435",
+                "extracted_case_title": "Doe v. Roe",
+                "ruling_text": self._ORANGE_STUB_TEXT,
+            },
+        ]
+        warm_cache = MagicMock()
+        warm_cache.get.return_value = stale_payload
+        warm_extractor = _build_extractor_with_cache(warm_cache)
+        warm_rulings = warm_extractor.extract_from_pdf(b"pdf-bytes-content")
+
+        # Both paths drop the stub: same surviving ruling set.  (Compare on
+        # ruling_text/count — the fresh path normalizes the OC ``30-`` case
+        # number prefix in ``_join_page_rows`` while the cache-hit path echoes
+        # the stored value verbatim; that normalization is unrelated to #4625.)
+        assert [r.ruling_text for r in fresh_rulings] == [r.ruling_text for r in warm_rulings]
+        assert [r.ruling_text for r in fresh_rulings] == [self._REAL_RULING_TEXT]
+        # The fresh path's CACHED output also has the stub dropped (1 entry).
+        assert [c["ruling_text"] for c in cached_payload] == [self._REAL_RULING_TEXT]
