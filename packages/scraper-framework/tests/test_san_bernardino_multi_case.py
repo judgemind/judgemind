@@ -31,6 +31,7 @@ from framework.llm_extractor import (
     _BRACKETED_PLACEHOLDER_TITLE_RE,
     _SB_CASE_NUMBER_RE,
     _disjoint_plaintiff_names,
+    _is_role_literal_title,
     _rebuild_title_from_parties,
     _sanitize_san_bernardino_rulings,
     _truncate_concatenated_case_titles,
@@ -566,3 +567,62 @@ def test_sanitize_sb_rulings_inherited_case_number_no_anchor_parties_is_noop() -
     result = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
     # Conservative: anchor has no plaintiffs so subsequent is left unchanged
     assert result[1].extracted_case_number == shared_cn
+
+
+# ---------------------------------------------------------------------------
+# _is_role_literal_title — detection on EITHER side of v. (#4618)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Left-anchored (old regex behaviour — must still detect)
+        "Plaintiff v. General Motors, LLC",
+        "Defendant v. Smith",
+        "Petitioner v. Smith",
+        "Respondent v. Smith",
+        "Plaintiffs v. Smith",
+        "Defendants v. Smith",
+        # Right-only (the new behaviour — previously MISSED)
+        "Acme Corp v. Defendants",
+        "Tcfi Cp Llc v. Defendants/Cross-Complainants",
+        "Smith v. Defendant",
+        "Plaintiff/Petitioner v. Defendant/Respondent",
+        "Jane Roe v. Respondents",
+        # vs. / vs / v separator variants
+        "Acme Corp vs. Defendants",
+        "Acme Corp vs Defendants",
+        "Acme Corp v Defendants",
+    ],
+)
+def test_is_role_literal_title_detected(title: str) -> None:
+    """A role-literal placeholder on either side of v. is detected (#4618)."""
+    assert _is_role_literal_title(title) is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Segment merely starts with / contains a role word but has real text
+        "Smith v. Defendants Inc.",
+        "Plaintiff Holdings LLC v. Smith",
+        # Clean real-party titles
+        "Aasi v. American Honda",
+        "Doe v. Roe",
+        # No separator at all
+        "In re Estate of Smith",
+        # Compound where one piece is NOT a role token
+        "Acme Corp v. Defendants/Acme",
+    ],
+)
+def test_is_role_literal_title_false_positive_guard(title: str) -> None:
+    """A real party name that merely contains a role word is NOT flagged (#4618)."""
+    assert _is_role_literal_title(title) is False
+
+
+def test_is_role_literal_title_none_and_empty_return_false() -> None:
+    """None and empty-string inputs return False (#4618)."""
+    assert _is_role_literal_title(None) is False
+    assert _is_role_literal_title("") is False
+    assert _is_role_literal_title("   ") is False
