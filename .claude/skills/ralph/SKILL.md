@@ -255,6 +255,12 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 **Pre-generate diff and changed files before launching reviewers.** This must happen once, before any reviewer starts. Run these two commands sequentially (as separate Bash tool calls):
 
 1. Generate `diff.txt`:
+
+   First, make untracked (new) files visible to `git diff` with an intent-to-add. Without this, both `git diff` and `git diff --cached` omit untracked files, so any new file a task created (new scripts, modules, or test files — the common case) is absent from the diff the reviewers read, and they return a spurious "implementation missing" REVISE (see #4616; recurrence #4610 / PR #4615). `add -N` records intent-to-add only — it does **not** stage file content — so it does not interfere with the worker's later explicit staging in `/task` A.3:
+   ```
+   git -C {worktree} add -N .
+   ```
+   Then write the unstaged diff (now including the new-file content via the intent-to-add markers):
    ```
    git -C {worktree} diff > {worktree}/tmp/ralph/diff.txt
    ```
@@ -316,7 +322,7 @@ Run this sub-step only when `## Testable: no`.
 Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running Claude reviewer for iteration N (non-testable)`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-reviewer (N)"`
 
-**Pre-generate diff and changed files before launching the reviewer.** Same procedure as 2b — write `{worktree}/tmp/ralph/diff.txt` and `{worktree}/tmp/ralph/changed_files.txt`.
+**Pre-generate diff and changed files before launching the reviewer.** Same procedure as 2b — write `{worktree}/tmp/ralph/diff.txt` and `{worktree}/tmp/ralph/changed_files.txt`. In particular, run `git -C {worktree} add -N .` (intent-to-add for untracked files) **before** the `git diff` calls so new (untracked) files appear in `diff.txt`; otherwise the reviewer sees a diff missing any new-file content and returns a spurious "implementation missing" REVISE (see #4616).
 
 **Skip the two Gemini reviews** — they are code-review-oriented and add no signal on docs / db_migration / dx_tooling / no_deployed_component diffs. The non-testable branch accepts a single Claude review.
 
