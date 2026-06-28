@@ -22,12 +22,29 @@ Streak-counting rules:
   = 0`` rows. As soon as a row with ``records_captured > 0`` is seen the
   streak is broken.
 * If the scraper has **no** historical run with ``records_captured > 0`` it
-  is reported as ``insufficient_history`` — never a breach. This avoids
-  false positives on brand-new scrapers and on permanently-quiet feeds
-  (court directory rosters that only record when the roster file changes).
+  may be reported either as ``insufficient_history`` (never a breach) or as a
+  ``never_captured`` breach, depending on age and run count (see below). This
+  distinction avoids false positives on brand-new scrapers while still
+  catching the silent-outage-since-deploy case (#4611).
+* A ``never_captured`` breach fires for a registered, scheduled, non-excluded
+  scraper that has captured 0 records on **every** run in its **entire**
+  history, **and** whose oldest in-window run is at least
+  ``--never-captured-min-age-days`` old, **and** which has at least
+  ``max(applicable_threshold, --never-captured-min-runs)`` runs. Younger /
+  barely-run never-captured scrapers stay ``insufficient_history`` to preserve
+  the brand-new false-positive guard.
+* When all in-window runs are zero, the unbounded ``scraper_runs`` history is
+  probed (``_ever_captured``) to tell a true never-captured scraper from a long
+  ``streak`` breach whose last nonzero run predates the lookback window (e.g.
+  15 days of zeros with a 14d lookback). If the scraper ever captured, it is a
+  ``streak`` breach (gated on ``applicable_threshold``), NOT ``never_captured``
+  — this keeps the AC#3 distinction correct.
+* This is distinct from the ordinary ``streak`` breach (started capturing, then
+  stopped); the ``category`` field on each breach names which is which.
 * An explicit ``EXCLUSIONS`` allowlist suppresses specific scraper IDs
   regardless of streak length (e.g. roster / directory scrapers that
-  legitimately emit zero-record runs).
+  legitimately emit zero-record runs). EXCLUSIONS suppress never_captured
+  breaches too.
 
 Usage:
     scripts/with-secret.sh \\
@@ -42,6 +59,10 @@ Options:
     --daily-threshold N Override the daily-scraper threshold (default: 2).
     --scraper ID        Check only the specified scraper ID.
     --lookback-days N   Runs older than this are ignored (default: 14).
+    --never-captured-min-age-days N  Min age before a never-captured scraper
+                        breaches (default: 3).
+    --never-captured-min-runs N      Min run count before a never-captured
+                        scraper breaches (default: 3).
 
 Exit code: 0 if no breaches, 1 if one or more scrapers are in breach.
 
@@ -91,6 +112,14 @@ DEFAULT_DAILY_STREAK_THRESHOLD = 2
 # How far back to pull runs when computing the streak. 14 days is more than
 # enough for any daily or frequent scraper and caps query cost.
 DEFAULT_LOOKBACK_DAYS = 14
+
+# Never-captured breach thresholds. A registered, scheduled, non-excluded
+# scraper that has produced 0 records on EVERY run in its history is a silent
+# outage that started at birth (#4611). It breaches only once it is both old
+# enough (so genuinely-new scrapers are not flagged) AND has accumulated
+# enough runs (so a scraper with a couple of runs is not flagged).
+DEFAULT_NEVER_CAPTURED_MIN_AGE_DAYS = 3
+DEFAULT_NEVER_CAPTURED_MIN_RUNS = 3
 
 # Scrapers that legitimately produce zero-record runs by design.
 # Each entry must include a rationale comment so future maintainers can
@@ -146,6 +175,11 @@ class Breach:
     last_zero_at: str  # ISO-8601
     last_nonzero_at: str | None  # ISO-8601 or None if none seen in window
     message: str
+    # Breach category — defaulted so existing positional constructions and the
+    # ECS runner keep working. ``streak`` = started capturing then stopped;
+    # ``never_captured`` = registered/scheduled but 0 records since deploy
+    # (#4611). ``format_json``'s ``asdict`` surfaces it automatically.
+    category: str = "streak"
 
 
 @dataclass
@@ -283,6 +317,32 @@ def has_historical_nonzero(runs: list[tuple[datetime, int, str]]) -> bool:
     return any(records > 0 for _, records, _ in runs)
 
 
+# Unbounded (no time filter) probe: has this scraper EVER captured? Used to
+# distinguish a true never-captured scraper from a long streak whose last
+# nonzero run predates the lookback window (#4611).
+EVER_CAPTURED_QUERY = (
+    "SELECT 1 FROM scraper_runs WHERE scraper_id = %s AND records_captured > 0 LIMIT 1"
+)
+
+
+def _ever_captured(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    scraper_id: str,
+) -> bool:
+    """True if the scraper has ANY run (unbounded history) with records > 0.
+
+    Unlike ``has_historical_nonzero`` (which only inspects the in-window runs),
+    this queries the full ``scraper_runs`` history. A scraper that captured for
+    months and then broke, producing zeros for longer than ``lookback_days``,
+    has all-zero in-window runs but is NOT never-captured — it is a long
+    ``streak`` breach (#4611). One cheap ``LIMIT 1`` query, only for the small
+    subset of scrapers with zero in-window captures.
+    """
+    with conn.cursor() as cur:
+        cur.execute(EVER_CAPTURED_QUERY, (scraper_id,))
+        return cur.fetchone() is not None
+
+
 # ---------------------------------------------------------------------------
 # Main check
 # ---------------------------------------------------------------------------
@@ -307,6 +367,8 @@ def check_zero_record_streaks(
     threshold: int = DEFAULT_STREAK_THRESHOLD,
     daily_threshold: int = DEFAULT_DAILY_STREAK_THRESHOLD,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    min_age_days: int = DEFAULT_NEVER_CAPTURED_MIN_AGE_DAYS,
+    min_runs: int = DEFAULT_NEVER_CAPTURED_MIN_RUNS,
     scraper_id: str | None = None,
     exclusions: set[str] | None = None,
     frequent_scraper_ids: set[str] | None = None,
@@ -326,6 +388,12 @@ def check_zero_record_streaks(
             is already ~48h of silent outage.
         lookback_days: How far back to consider runs. Runs older than
             this are ignored entirely.
+        min_age_days: Minimum age (oldest run in window vs ``now``) before a
+            never-captured scraper breaches. Younger scrapers stay
+            ``insufficient_history``. See #4611.
+        min_runs: Minimum run count before a never-captured scraper breaches.
+            The applied run-count floor is ``max(applicable_threshold,
+            min_runs)``.
         scraper_id: Optional single scraper ID to check.
         exclusions: Scrapers to skip. Defaults to ``EXCLUSIONS``.
         frequent_scraper_ids: Scraper IDs that run more than once per day.
@@ -389,14 +457,82 @@ def check_zero_record_streaks(
             continue
 
         if not has_historical_nonzero(runs):
+            # All runs in the lookback window are zero. This is EITHER a true
+            # never-captured scraper OR a long streak whose last nonzero run
+            # predates the window (e.g. 15 days of zeros with a 14d lookback).
+            # ``has_historical_nonzero`` only inspects in-window rows, so we
+            # must probe the unbounded history to tell them apart (#4611) —
+            # otherwise a "started then stopped" scraper is mislabeled
+            # never_captured, the exact distinction AC#3 exists to surface.
+            run_count = len(runs)
+            oldest_started_at = runs[-1][0]
+            if oldest_started_at.tzinfo is None:
+                oldest_started_at = oldest_started_at.replace(tzinfo=UTC)
+            age = now - oldest_started_at
+
+            if _ever_captured(conn, sid):
+                # Long streak breach: last nonzero run is older than the
+                # lookback window. Gate on the ordinary streak threshold (NOT
+                # the never-captured run-count floor); too-few in-window runs
+                # fall through to insufficient_history below.
+                if run_count >= applicable_threshold:
+                    breaches.append(
+                        Breach(
+                            scraper_id=sid,
+                            streak=run_count,
+                            threshold=applicable_threshold,
+                            first_zero_at=_iso(first_zero),
+                            last_zero_at=_iso(last_zero),
+                            last_nonzero_at=None,
+                            message=(
+                                f"{sid}: at least {run_count} consecutive "
+                                f"zero-record runs (threshold: "
+                                f"{applicable_threshold}); last nonzero run is "
+                                f"older than the {lookback_days}d lookback "
+                                f"window"
+                            ),
+                            category="streak",
+                        )
+                    )
+                    continue
+            else:
+                # True never-captured. Distinguish a genuinely new / barely-run
+                # scraper (suppress as insufficient_history) from a registered,
+                # scheduled, non-excluded scraper that has silently captured 0
+                # records since deploy (breach). See #4611.
+                run_count_floor = max(applicable_threshold, min_runs)
+                if age >= timedelta(days=min_age_days) and run_count >= run_count_floor:
+                    age_days = age.total_seconds() / 86400
+                    breaches.append(
+                        Breach(
+                            scraper_id=sid,
+                            streak=run_count,
+                            threshold=run_count_floor,
+                            first_zero_at=_iso(first_zero),
+                            last_zero_at=_iso(last_zero),
+                            last_nonzero_at=None,
+                            message=(
+                                f"{sid}: registered/scheduled but never captured "
+                                f"since deploy — {run_count} zero-record runs over "
+                                f"{age_days:.1f} days (run-count floor: "
+                                f"{run_count_floor}, min age: {min_age_days}d)"
+                            ),
+                            category="never_captured",
+                        )
+                    )
+                    continue
+
+            # No breach fired for either sub-path (too young / too few runs for
+            # never-captured; below applicable_threshold for the long streak).
+            # Keep the brand-new false-positive guard intact.
             insufficient.append(
                 InsufficientHistory(
                     scraper_id=sid,
                     zero_run_count=streak,
                     message=(
-                        f"{sid}: {streak} zero-record runs in window but no "
-                        f"historical nonzero run — insufficient history, "
-                        f"not a breach"
+                        f"{sid}: {streak} zero-record runs but no historical "
+                        f"nonzero run in the lookback window — insufficient "
+                        f"history, not a breach"
                     ),
                 )
             )
@@ -485,7 +621,8 @@ def format_text(result: CheckResult) -> str:
         lines.append("")
         lines.append("BREACHES:")
         for b in result.breaches:
-            lines.append(f"  * {b.message}")
+            label = "NEVER CAPTURED" if b.category == "never_captured" else "STREAK"
+            lines.append(f"  * [{label}] {b.message}")
             lines.append(f"      first_zero_at={b.first_zero_at}")
             lines.append(f"      last_zero_at={b.last_zero_at}")
             lines.append(f"      last_nonzero_at={b.last_nonzero_at or '(none)'}")
@@ -550,6 +687,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_LOOKBACK_DAYS,
         help=(f"Runs older than this are ignored (default: {DEFAULT_LOOKBACK_DAYS})."),
     )
+    parser.add_argument(
+        "--never-captured-min-age-days",
+        type=int,
+        default=DEFAULT_NEVER_CAPTURED_MIN_AGE_DAYS,
+        help=(
+            "Minimum age before a never-captured scraper breaches "
+            f"(default: {DEFAULT_NEVER_CAPTURED_MIN_AGE_DAYS})."
+        ),
+    )
+    parser.add_argument(
+        "--never-captured-min-runs",
+        type=int,
+        default=DEFAULT_NEVER_CAPTURED_MIN_RUNS,
+        help=(
+            "Minimum run count before a never-captured scraper breaches "
+            f"(default: {DEFAULT_NEVER_CAPTURED_MIN_RUNS})."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -571,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
             threshold=args.threshold,
             daily_threshold=args.daily_threshold,
             lookback_days=args.lookback_days,
+            min_age_days=args.never_captured_min_age_days,
+            min_runs=args.never_captured_min_runs,
             scraper_id=args.scraper,
         )
 

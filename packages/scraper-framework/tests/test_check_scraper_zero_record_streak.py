@@ -113,15 +113,28 @@ class TestHasHistoricalNonzero:
 # ---------------------------------------------------------------------------
 
 
-def _mock_conn(rows: list[tuple[str, datetime, int, str]]) -> MagicMock:
+def _mock_conn(
+    rows: list[tuple[str, datetime, int, str]],
+    *,
+    ever_captured: bool = False,
+) -> MagicMock:
     """Build a MagicMock that mimics psycopg's cursor().execute()/fetchall().
 
     ``rows`` should be a flat list of ``(scraper_id, started_at, records_captured, status)``
     tuples in the order the SQL query would return them (grouped by scraper_id,
     started_at DESC within each group).
+
+    ``ever_captured`` controls the ``fetchone()`` answer for the unbounded
+    ``_ever_captured`` probe (``SELECT 1 ... LIMIT 1``). It is only reached for
+    scrapers whose in-window runs are all zero. Default False → the probe says
+    the scraper has never captured (true never-captured path). Set True to
+    simulate a scraper whose last nonzero run predates the lookback window
+    (long streak path). Tests with a nonzero in-window run never reach the
+    probe, so the default is safe for all.
     """
     cur = MagicMock()
     cur.fetchall.return_value = list(rows)
+    cur.fetchone.return_value = (1,) if ever_captured else None
     cur.__enter__ = MagicMock(return_value=cur)
     cur.__exit__ = MagicMock(return_value=False)
 
@@ -287,6 +300,238 @@ class TestCheckZeroRecordStreaks:
         )
         assert not result.breaches
 
+    def test_existing_streak_breach_has_streak_category(self) -> None:
+        """AC#3: an ordinary (started-then-stopped) streak breach is
+        categorized ``streak``, distinct from never-captured breaches."""
+        rows = [
+            ("ca-oc-tentatives", NOW - timedelta(hours=2), 0, "success"),
+            ("ca-oc-tentatives", NOW - timedelta(hours=26), 0, "success"),
+            ("ca-oc-tentatives", NOW - timedelta(hours=50), 18, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+        )
+        assert len(result.breaches) == 1
+        assert result.breaches[0].category == "streak"
+
+
+# ---------------------------------------------------------------------------
+# Never-captured breach tests (#4611)
+# ---------------------------------------------------------------------------
+
+
+class TestNeverCapturedBreach:
+    """A scraper that is registered, scheduled, not excluded, old enough,
+    and has captured 0 records on EVERY run in its history is a silent
+    outage that started at birth — it must breach, not be excused as
+    insufficient_history. See #4611 (Contra Costa #4591 / #4598)."""
+
+    def test_never_captured_old_enough_breaches(self) -> None:
+        """AC#1: never-captured, schedule-active, non-excluded, older than
+        the min-age window → breach with category ``never_captured``."""
+        rows = [
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=1), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=25), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=49), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=73), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=97), 0, "success"),
+        ]
+        # ever_captured=False → unbounded probe confirms a TRUE never-captured
+        # scraper (no nonzero run anywhere), so the category stays
+        # never_captured. See #4611.
+        conn = _mock_conn(rows, ever_captured=False)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert not result.insufficient_history
+        assert len(result.breaches) == 1
+        b = result.breaches[0]
+        assert b.scraper_id == "ca-cc-judge-discovery"
+        assert b.category == "never_captured"
+        assert "never captured" in b.message
+        assert b.streak == 5
+        assert b.last_nonzero_at is None
+        # Runner-read attributes must all be populated.
+        assert b.first_zero_at is not None
+        assert b.last_zero_at is not None
+        # Run-count floor = max(applicable_threshold=2 daily, min_runs=3) = 3.
+        assert b.threshold == 3
+
+    def test_never_captured_too_young_stays_insufficient(self) -> None:
+        """AC#2: never-captured but younger than the min-age window stays
+        insufficient_history (no new false positive)."""
+        rows = [
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=1), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=5), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=9), 0, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert not result.breaches
+        assert len(result.insufficient_history) == 1
+        assert result.insufficient_history[0].scraper_id == "ca-cc-judge-discovery"
+
+    def test_never_captured_too_few_runs_stays_insufficient(self) -> None:
+        """AC#2: old enough but too few runs (below the run-count floor)
+        stays insufficient_history."""
+        rows = [
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=1), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=97), 0, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            min_runs=3,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert not result.breaches
+        assert len(result.insufficient_history) == 1
+
+    def test_never_captured_excluded_is_suppressed(self) -> None:
+        """AC#2: an EXCLUSIONS-listed never-captured scraper is still
+        skipped entirely — no breach, no insufficient_history."""
+        rows = [
+            ("ca-oc-dept-judges", NOW - timedelta(hours=1), 0, "success"),
+            ("ca-oc-dept-judges", NOW - timedelta(hours=25), 0, "success"),
+            ("ca-oc-dept-judges", NOW - timedelta(hours=49), 0, "success"),
+            ("ca-oc-dept-judges", NOW - timedelta(hours=97), 0, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions={"ca-oc-dept-judges"},
+            known_scraper_ids={"ca-oc-dept-judges"},
+        )
+        assert result.excluded_count == 1
+        assert not result.breaches
+        assert not result.insufficient_history
+
+    def test_never_captured_naive_datetimes_handled(self) -> None:
+        """tz-defensiveness: naive started_at values must not blow up the
+        age computation (mirror the _iso normalization)."""
+        sid = "ca-cc-judge-discovery"
+        rows = [
+            (sid, (NOW - timedelta(hours=1)).replace(tzinfo=None), 0, "success"),
+            (sid, (NOW - timedelta(hours=49)).replace(tzinfo=None), 0, "success"),
+            (sid, (NOW - timedelta(hours=97)).replace(tzinfo=None), 0, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert len(result.breaches) == 1
+        assert result.breaches[0].category == "never_captured"
+
+
+class TestLongStoppedScraperStreak:
+    """#4611 reviewer fix: a scraper that captured for months then broke,
+    producing zeros for LONGER than the lookback window, has all-zero
+    in-window runs but is NOT never-captured. The unbounded ``_ever_captured``
+    probe must categorize it as a long ``streak`` breach, NOT never_captured —
+    the exact distinction AC#3 exists to surface."""
+
+    def test_long_stopped_scraper_is_streak_not_never_captured(self) -> None:
+        """All in-window runs zero + ever_captured=True (historical nonzero
+        predates the window) → breach with category ``streak`` (NOT
+        never_captured), gated on applicable_threshold."""
+        rows = [
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=1), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=25), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=49), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=73), 0, "success"),
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=97), 0, "success"),
+        ]
+        conn = _mock_conn(rows, ever_captured=True)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            lookback_days=14,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert not result.insufficient_history
+        assert len(result.breaches) == 1
+        b = result.breaches[0]
+        assert b.scraper_id == "ca-cc-judge-discovery"
+        assert b.category == "streak"
+        # Last nonzero run is outside the window.
+        assert b.last_nonzero_at is None
+        # Gated on the daily streak threshold, NOT the never-captured floor.
+        assert b.threshold == 2
+        assert b.streak == 5
+        # Message must NOT claim never captured since deploy.
+        assert "never captured" not in b.message
+        assert "lookback window" in b.message
+        # Runner-read attributes populated.
+        assert b.first_zero_at is not None
+        assert b.last_zero_at is not None
+
+    def test_long_stopped_too_few_runs_is_insufficient(self) -> None:
+        """ever_captured=True but in-window run count below
+        applicable_threshold → no breach, falls through to
+        insufficient_history (streak gate honored)."""
+        rows = [
+            ("ca-cc-judge-discovery", NOW - timedelta(hours=1), 0, "success"),
+        ]
+        conn = _mock_conn(rows, ever_captured=True)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            lookback_days=14,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-cc-judge-discovery"},
+        )
+        assert not result.breaches
+        assert len(result.insufficient_history) == 1
+        ih = result.insufficient_history[0]
+        assert ih.scraper_id == "ca-cc-judge-discovery"
+        # The scraper DID capture historically (ever_captured=True), just
+        # before the lookback window — so the message must scope its claim to
+        # the window, not falsely assert "no historical nonzero run" (#4611).
+        assert "lookback window" in ih.message
+        assert "in window but no historical nonzero run" not in ih.message
+
 
 # ---------------------------------------------------------------------------
 # Module-level EXCLUSIONS regression tests
@@ -393,6 +638,79 @@ class TestOutputFormatting:
         assert payload["healthy"] is False
         assert len(payload["breaches"]) == 1
         assert payload["breaches"][0]["scraper_id"] == "ca-sf-tentatives-civil"
+
+    def test_format_json_breach_includes_category(self) -> None:
+        """AC#3: JSON output surfaces a ``category`` field distinguishing
+        never_captured from streak breaches."""
+        import json as _json
+
+        result = CheckResult(
+            breaches=[
+                Breach(
+                    scraper_id="ca-streak",
+                    streak=3,
+                    threshold=3,
+                    first_zero_at="2026-04-16T12:00:00+00:00",
+                    last_zero_at="2026-04-18T00:00:00+00:00",
+                    last_nonzero_at="2026-04-15T12:00:00+00:00",
+                    message="streak breach",
+                    category="streak",
+                ),
+                Breach(
+                    scraper_id="ca-never",
+                    streak=5,
+                    threshold=5,
+                    first_zero_at="2026-04-14T12:00:00+00:00",
+                    last_zero_at="2026-04-18T00:00:00+00:00",
+                    last_nonzero_at=None,
+                    message="never captured",
+                    category="never_captured",
+                ),
+            ],
+            insufficient_history=[],
+            checked_count=2,
+            excluded_count=0,
+        )
+        payload = _json.loads(format_json(result))
+        cats = {b["scraper_id"]: b["category"] for b in payload["breaches"]}
+        assert cats["ca-streak"] == "streak"
+        assert cats["ca-never"] == "never_captured"
+
+    def test_format_text_labels_never_captured(self) -> None:
+        """AC#3: format_text labels never-captured breaches distinctly."""
+        result = CheckResult(
+            breaches=[
+                Breach(
+                    scraper_id="ca-never",
+                    streak=5,
+                    threshold=5,
+                    first_zero_at="2026-04-14T12:00:00+00:00",
+                    last_zero_at="2026-04-18T00:00:00+00:00",
+                    last_nonzero_at=None,
+                    message="never captured since deploy",
+                    category="never_captured",
+                ),
+            ],
+            insufficient_history=[],
+            checked_count=1,
+            excluded_count=0,
+        )
+        text = format_text(result)
+        assert "NEVER" in text.upper()
+
+    def test_breach_category_defaults_to_streak(self) -> None:
+        """Positional Breach construction (no category) defaults to ``streak``
+        so the runner and legacy callers keep working."""
+        b = Breach(
+            scraper_id="ca-x",
+            streak=3,
+            threshold=3,
+            first_zero_at="2026-04-16T12:00:00+00:00",
+            last_zero_at="2026-04-18T00:00:00+00:00",
+            last_nonzero_at=None,
+            message="m",
+        )
+        assert b.category == "streak"
 
     def test_format_text_lists_breaches(self) -> None:
         result = CheckResult(
