@@ -56,6 +56,23 @@ Example invocation:
 scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --county orange --bust-llm-cache
 ```
 
+**Partial-failure exit gate (#4624).** For `--bust-llm-cache` **prefix**
+reingests, the script fails loud by default — it exits non-zero when more than
+10% of keys error, so a run that silently lost data (the #3855 OOM failure
+mode) surfaces as a non-zero exit instead of a false success. You do not need
+to pass anything to get this; the gate is the default for the cache-bust prefix
+path:
+
+```
+scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+```
+
+To override the threshold pass `--max-error-ratio 0.05` (your value always
+wins). To opt out of the gate entirely for a run where partial failure is
+expected, pass `--no-fail-on-errors`. Standard (DB-row) mode and non-cache-bust
+prefix runs keep the pre-#4619 opt-in behavior — pass `--max-error-ratio`
+explicitly there if you want the gate. See #4619 and #4624.
+
 ## When surgical DB cleanup is appropriate
 
 The default cleanup path for `derived.*` data is always `rebuild_db.py --county <name>` per CLAUDE.md. Prefer a rebuild when the bad data exists in S3 (i.e., the raw document is fine and the ingestion pipeline will produce correct output on replay).
