@@ -47,6 +47,12 @@ from .llm_schema import (
     FieldConfidence,
 )
 from .llm_utils import parse_llm_json, strip_llm_json_fences
+from .title_heuristics import (
+    BRACKETED_PLACEHOLDER_TITLE_RE as _BRACKETED_PLACEHOLDER_TITLE_RE,
+)
+from .title_heuristics import (
+    is_role_literal_title as _is_role_literal_title,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -148,76 +154,12 @@ _ROLE_LITERAL_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A single role token, allowing singular/plural and the cross-prefixed forms.
-# Used by :func:`_is_role_literal_title` to test whether a ``/``-separated piece
-# of a title segment is a pure role word.  See #4618.
-_ROLE_TOKEN = r"(?:Cross-)?(?:Plaintiff|Defendant|Petitioner|Respondent|Complainant)s?"
-
-# Matches a title segment (one side of ``v.``) that is ENTIRELY a role-literal
-# compound — every ``/``-separated piece is a role token, with no trailing real
-# text.  Anchored start-to-end so ``Defendants Inc.`` (real company) does NOT
-# match while ``Defendants/Cross-Complainants`` does.  See #4618.
-_ROLE_LITERAL_SEGMENT_RE = re.compile(
-    rf"^\s*{_ROLE_TOKEN}(?:\s*/\s*{_ROLE_TOKEN})*\s*$",
-    re.IGNORECASE,
-)
-
-# Splits a title on the ``v.``/``vs.``/``v``/``vs`` party separator using a word
-# boundary so it does not fire inside a real word.  See #4618.
-_VS_SEPARATOR_RE = re.compile(r"\bv[s]?\.?\s+", re.IGNORECASE)
-
-
-def _is_role_literal_title(title: str | None) -> bool:
-    """Return True when EITHER side of the ``v.`` separator is a role-literal (#4618).
-
-    A *role-literal title* is one where the LLM substituted a role word
-    ("Plaintiff", "Defendant", "Petitioner", "Respondent", their plurals, and the
-    cross-prefixed / ``/``-joined compounds) for a real party name, on the left,
-    the right, or both sides of the ``v.``/``vs.`` separator. Examples that match:
-
-    - ``Plaintiff v. General Motors, LLC`` (left)
-    - ``Acme Corp v. Defendants`` (right)
-    - ``Tcfi Cp Llc v. Defendants/Cross-Complainants`` (right compound)
-    - ``Plaintiff/Petitioner v. Defendant/Respondent`` (both)
-
-    The detection is anchored to the WHOLE segment, so a real party name that
-    merely contains a role word as a substring is NOT flagged:
-
-    - ``Smith v. Defendants Inc.`` (trailing real text → not role-literal)
-    - ``Plaintiff Holdings LLC v. Smith`` (leading role word + real text)
-    - ``Aasi v. American Honda`` / ``Doe v. Roe`` (clean)
-
-    Returns ``False`` for ``None``, empty, whitespace-only, or any title without a
-    recognisable ``v.`` separator.
-    """
-    if not title or not title.strip():
-        return False
-    parts = _VS_SEPARATOR_RE.split(title, maxsplit=1)
-    if len(parts) != 2:
-        return False
-    left, right = parts
-    return bool(_ROLE_LITERAL_SEGMENT_RE.match(left) or _ROLE_LITERAL_SEGMENT_RE.match(right))
-
-
-# Matches a case_title that contains an LLM-hallucinated bracketed placeholder
-# for a party name, e.g. "Ezra Arce v. [Defendant not specified]" or
-# "[Plaintiff name unknown] v. Smith".  The bracket must contain a role word
-# (plaintiff/defendant/petitioner/respondent/party/name/case) followed by a
-# qualifier (not specified, unknown, missing, not listed, not provided, tbd).
-# No anchor — the bracket can appear anywhere in the title.  See #3988.
-#
-# Explicit non-match envelope (do NOT widen without product confirmation — #4002):
-#   - Role-only:        [DEFENDANT], [Defendant 1]  — no qualifier word present
-#   - Qualifier-only:   [TBD], [Insert defendant here]  — no leading role word
-#   - Possessives:      [defendant's name]  — possessive breaks the role-word token
-#   - Ordinals:         [Defendant 1]  — digit suffix is not a qualifier keyword
-#   - Free-form:        [Name to be determined]  — "Name" alone is not a role word
-#                       used in this position; qualifier phrase not in the allowlist
-_BRACKETED_PLACEHOLDER_TITLE_RE = re.compile(
-    r"\[(?:plaintiff|defendant|petitioner|respondent|party|name|case)[^\]]*"
-    r"(?:not specified|unknown|missing|not listed|not provided|tbd)[^\]]*\]",
-    re.IGNORECASE,
-)
+# The role-literal / bracketed-placeholder title primitives (``_is_role_literal_title``
+# and ``_BRACKETED_PLACEHOLDER_TITLE_RE``) now live in the shared, dependency-light
+# :mod:`framework.title_heuristics` module and are re-imported at the top of this
+# file under their historical underscore-prefixed names (#4628).  Note:
+# ``_ROLE_LITERAL_TITLE_RE`` above is a SEPARATE left-anchored legacy symbol and
+# stays defined locally.
 
 # ---------------------------------------------------------------------------
 # LLM result cache
