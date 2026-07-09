@@ -308,6 +308,7 @@ jobs:
               tests/courts/test_sd_pipeline.py
               tests/courts/test_sf_civil_tentatives.py
               tests/courts/test_sf_tentatives.py
+              tests/courts/test_proxy_auth_diagnosis_wiring.py
               tests/courts/test_ventura_tentatives.py
               tests/courts/test_ventura_dept_judges.py
     defaults:
