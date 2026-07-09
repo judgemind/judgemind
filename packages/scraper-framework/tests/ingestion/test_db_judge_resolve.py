@@ -119,6 +119,59 @@ class TestRosterTypoArbitration:
             f"Expected >= 2 judge_aliases INSERT calls (old typo + new name), got {insert_calls}"
         )
 
+    def test_arbitration_alias_inserts_match_partial_unique_index(self) -> None:
+        """Arbitration-promotion judge_aliases INSERTs carry the partial-index predicate.
+
+        Regression for #3855: migration 54 creates a PARTIAL unique index
+        ``idx_judge_aliases_judge_raw_source_uniq`` on
+        ``(judge_id, lower(raw_name), source) WHERE source IS NOT NULL``.
+        PostgreSQL only accepts a partial index as an ``ON CONFLICT`` arbiter
+        when the conflict clause repeats the index predicate. The
+        arbitration-promotion INSERTs in ``_maybe_arbitrate`` previously used
+        ``ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING`` with no
+        ``WHERE source IS NOT NULL`` — which Postgres rejects at runtime with
+        ``InvalidColumnReference: there is no unique or exclusion constraint
+        matching the ON CONFLICT specification``, aborting the transaction. On
+        the Orange OC multimodal reingest this aborted 50% of the PDFs
+        mid-split, so the null judge/dept rulings never drained. Every
+        judge_aliases INSERT that targets the partial index by column list must
+        also carry the ``WHERE source IS NOT NULL`` predicate.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # Step 3b: court_code
+            ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
+            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+            # Arbitration: alias table has one non-roster source already -> promote
+            [("matthew c. braner", "sd_calendar")],
+        ]
+
+        resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_calendar")
+
+        # Collect the raw SQL of every judge_aliases INSERT the promotion issued.
+        alias_insert_sql = [
+            call.args[0]
+            for call in mock_cur.execute.call_args_list
+            if call.args and "INSERT INTO judge_aliases" in call.args[0]
+        ]
+        assert alias_insert_sql, "Expected at least one judge_aliases INSERT during promotion"
+
+        for sql in alias_insert_sql:
+            # Only INSERTs that name the partial index by its column list need
+            # the predicate; those are the ones that hit the #3855 bug.
+            if "ON CONFLICT (judge_id, lower(raw_name), source)" in sql:
+                assert "source IS NOT NULL" in sql, (
+                    "judge_aliases ON CONFLICT targeting the partial unique index "
+                    "must repeat its 'WHERE source IS NOT NULL' predicate, else "
+                    "Postgres raises InvalidColumnReference (regression #3855):\n" + sql
+                )
+
     def test_single_non_roster_source_does_not_override_yet(self) -> None:
         """A single-source contradiction with no corroboration leaves canonical untouched.
 
