@@ -365,3 +365,104 @@ class TestTotalCoverageSignal:
         assert metadata["retired_total"] == 1
         assert metadata["portal_total"] == 0
         assert "total-coverage failure" in metadata["total_coverage_headline"]
+
+
+# ---------------------------------------------------------------------------
+# 6. agent_actionable classification — #4631
+# ---------------------------------------------------------------------------
+
+
+class TestAgentActionable:
+    """A total-coverage failure (portal captured nothing) is NOT agent-actionable
+    — it is the expected "portal not yet authoritative" Phase-2 signal, which no
+    agent code change can fix. A per-department gap (portal live but missing a
+    department) IS a genuine regression and stays agent-actionable. See #4631.
+    """
+
+    def test_total_coverage_failure_is_not_agent_actionable(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Retired has dept 16; portal captured nothing → total-coverage failure.
+        rows = [
+            _row_retired("16", "C24-01001"),
+        ]
+        conn = _make_conn(rows)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            exit_code = main(["--date", TARGET_DATE_STR])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["portal_total_zero"] is True
+        assert payload["agent_actionable"] is False
+        # Exit-code semantics unchanged: a missing_portal row still exits 1.
+        assert exit_code == 1
+
+    def test_partial_department_gap_is_agent_actionable(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Portal is live (captured dept 16) but missing dept 30 → real regression.
+        rows = [
+            _row_retired("16", "C24-01001"),
+            _row_retired("30", "N25-0001"),
+            _row_portal(_PORTAL_S3_KEY_DEPT16, "C24-01001"),
+        ]
+        conn = _make_conn(rows)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            exit_code = main(["--date", TARGET_DATE_STR])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["portal_total_zero"] is False
+        assert payload["missing_portal_count"] == 1
+        assert payload["agent_actionable"] is True
+        assert exit_code == 1
+
+    def test_healthy_is_not_agent_actionable(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Both scrapers agree → healthy, nothing to action.
+        rows = [
+            _row_retired("16", "C24-01001"),
+            _row_portal(_PORTAL_S3_KEY_DEPT16, "C24-01001"),
+        ]
+        conn = _make_conn(rows)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            exit_code = main(["--date", TARGET_DATE_STR])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["healthy"] is True
+        assert payload["agent_actionable"] is False
+        assert exit_code == 0
+
+    def test_metrics_metadata_carries_agent_actionable(self) -> None:
+        rows = [
+            _row_retired("16", "C24-01001"),
+        ]
+        cur = _make_cursor(rows)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        conn.__enter__ = MagicMock(return_value=conn)
+        conn.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://fake"}),
+            patch("psycopg.connect", return_value=conn),
+        ):
+            main(["--date", TARGET_DATE_STR])
+
+        insert_calls = [
+            c
+            for c in cur.execute.call_args_list
+            if "data_quality_metrics" in str(c).lower() and "INSERT" in str(c).upper()
+        ]
+        assert len(insert_calls) >= 1
+        metadata = json.loads(insert_calls[0].args[1][-1])
+        assert metadata["agent_actionable"] is False
