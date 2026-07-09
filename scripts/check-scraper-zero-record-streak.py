@@ -141,6 +141,15 @@ EXCLUSIONS: set[str] = {
     # Governor appointments scraper runs quarterly-ish; most runs legitimately
     # return zero records. Exclude until dedicated health signal is wired.
     "ca-governor-appointments",
+    # LA Appellate Division (casetype=appellate) is a single low-volume
+    # division that publishes tentative rulings only rarely — its scraper
+    # cleanly detects the empty state ("Appellate division has no published
+    # rulings", context=empty_state) and reports status=success/records=0.
+    # This is zero-by-design most of the time, exactly like governor
+    # appointments, so a multi-week zero streak is the expected steady state
+    # rather than a silent outage. Distinct from ca-la-tentatives-civil, which
+    # is high-volume and stays under the silent-outage guard. See #4629.
+    "ca-la-tentatives-appellate",
     # CourtListener federal-opinions scraper retired per #4571 / #4474 — its
     # envelopes drove dev ElastiCache OOM and wedged the dispatcher. Kept in
     # EXCLUSIONS so the silent-outage guard does not alert on the now-retired

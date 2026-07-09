@@ -1416,6 +1416,42 @@ def test_fresno_href_filter_accepts_ruling_urls() -> None:
     )
 
 
+def test_fresno_href_filter_accepts_alpha_suffix_urls() -> None:
+    """_HREF_FILTER_RE matches the trailing alpha-code filename format (#4629).
+
+    Around 2026-06-14 the court began appending a short alpha code (clerk /
+    judge initials, e.g. "-hbv", "-iec", "-syc") to every ruling filename.
+    The previous pattern required the filename to end at "dept-NNN[_N].pdf",
+    so it rejected EVERY ruling PDF and produced a multi-week zero-record
+    silent outage.  These are the exact URLs observed on the live index page.
+    """
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/07-08-26-dept-403-hbv.pdf")
+        is not None
+    )
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/07-09-26-dept-501-iec.pdf")
+        is not None
+    )
+    # Alpha code followed by the "_N" revision suffix.
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/07-02-26-dept-503-qpq_0.pdf")
+        is not None
+    )
+    # Uppercase initials must match too (case-insensitive).
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/07-08-26-dept-403-DTT.pdf")
+        is not None
+    )
+    # The department is still extractable from the new filename format.
+    assert _fresno_dept_from_filename("07-08-26-dept-403-hbv.pdf") == "403"
+    assert _fresno_dept_from_filename("07-02-26-dept-503-qpq_0.pdf") == "503"
+    # And the hearing date is still extractable.
+    dt = _fresno_hearing_date_from_filename("07-08-26-dept-403-hbv.pdf")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 7, 8)
+
+
 def test_fresno_href_filter_rejects_admin_notice_urls() -> None:
     """_HREF_FILTER_RE rejects non-ruling PDFs (e-Court transition notices, etc.)."""
     # The real #2644 scenario: an e-Court transition notice PDF posted to
