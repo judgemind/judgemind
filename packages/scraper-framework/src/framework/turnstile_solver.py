@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 
 import httpx
 import structlog
@@ -39,6 +40,9 @@ logger = structlog.get_logger(__name__)
 
 # CAPSolver API base URL.
 CAPSOLVER_API_BASE = "https://api.capsolver.com"
+
+# CAPSolver balance endpoint path (POST {clientKey}).
+CAPSOLVER_BALANCE_PATH = "/getBalance"
 
 # Default overall timeout in seconds for solve_turnstile (the issue notes
 # typical solve time is 10-30s; we keep 120s headroom for CAPSolver's
@@ -51,6 +55,99 @@ POLL_INTERVAL_SECONDS = 3.0
 
 # CAPSolver task type for Turnstile solves without a proxy.
 TASK_TYPE_TURNSTILE_PROXYLESS = "AntiTurnstileTaskProxyLess"
+
+
+@dataclass
+class CapsolverBalance:
+    """Result of a CAPSolver ``getBalance`` credential-health check."""
+
+    valid: bool
+    balance: float | None
+    error_code: str | None
+    error_description: str | None
+
+
+async def get_balance(api_key: str | None, *, timeout: float = 30.0) -> CapsolverBalance:
+    """Check a CAPSolver key's validity and remaining balance via ``getBalance``.
+
+    ``POST /getBalance {clientKey}``. Semantics:
+
+    * Missing/empty key -> ``valid=False`` without making an API call.
+    * ``errorId == 0`` -> ``valid=True`` with ``balance`` from the response.
+    * ``errorId != 0`` (e.g. ``ERROR_KEY_DOES_NOT_EXIST``) -> ``valid=False``
+      with ``error_code`` / ``error_description`` populated.
+    * Any httpx/JSON error -> ``valid=False`` with a detail string.
+
+    Note (#4633): CAPSolver returns HTTP ``400`` with an ``errorId`` body for an
+    invalid key, so this deliberately does NOT call ``raise_for_status`` — it
+    parses the JSON body regardless of status code to surface ``errorCode``
+    distinctly rather than reporting an opaque HTTP failure.
+
+    Args:
+        api_key: The CAPSolver API key (``clientKey``).
+        timeout: Request timeout in seconds.
+
+    Returns:
+        A :class:`CapsolverBalance` describing key validity and balance.
+    """
+    key = api_key or ""
+    if not key:
+        return CapsolverBalance(
+            valid=False,
+            balance=None,
+            error_code=None,
+            error_description="no api key",
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=CAPSOLVER_API_BASE,
+            timeout=timeout,
+            headers={"Content-Type": "application/json"},
+        ) as client:
+            response = await client.post(CAPSOLVER_BALANCE_PATH, json={"clientKey": key})
+    except httpx.HTTPError as exc:
+        logger.error("capsolver.get_balance_http_error", error=str(exc))
+        return CapsolverBalance(
+            valid=False,
+            balance=None,
+            error_code=None,
+            error_description=str(exc),
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        logger.error("capsolver.get_balance_invalid_json", error=str(exc))
+        return CapsolverBalance(
+            valid=False,
+            balance=None,
+            error_code=None,
+            error_description=f"invalid json: {exc}",
+        )
+
+    error_id = data.get("errorId", 0)
+    if error_id != 0:
+        logger.error(
+            "capsolver.get_balance_api_error",
+            error_id=error_id,
+            error_code=data.get("errorCode"),
+            error_description=data.get("errorDescription"),
+        )
+        return CapsolverBalance(
+            valid=False,
+            balance=None,
+            error_code=data.get("errorCode"),
+            error_description=data.get("errorDescription"),
+        )
+
+    balance = data.get("balance")
+    return CapsolverBalance(
+        valid=True,
+        balance=balance,
+        error_code=None,
+        error_description=None,
+    )
 
 
 async def solve_turnstile(
