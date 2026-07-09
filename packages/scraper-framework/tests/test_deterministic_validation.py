@@ -348,6 +348,36 @@ class TestUnknownAndNullTitleFail:
         result = check_unknown_and_null_title_fail("C24-01160", "Smith v. Jones")
         assert result.result == "pass"
 
+    def test_fail_unknown_case_number_and_role_literal_title(self) -> None:
+        """#4628 — UNKNOWN case_number + a left-side role-literal title must fail.
+
+        This is the exact Santa Clara repro: the LLM emitted the role word
+        ("Plaintiffs"/"Defendant") instead of a real party name, so the title
+        carries no party information and must be treated like a null title.
+        """
+        result = check_unknown_and_null_title_fail("UNKNOWN-5f0a7206", "Plaintiffs v. Defendant")
+        assert result.result == "fail"
+        assert "UNKNOWN-" in (result.reason or "")
+
+    def test_fail_unknown_case_number_and_right_role_literal_title(self) -> None:
+        """#4628 — role-literal on the RIGHT side of ``v.`` is also uninformative."""
+        result = check_unknown_and_null_title_fail("UNKNOWN-5f0a7206", "Acme Corp v. Defendants")
+        assert result.result == "fail"
+
+    def test_fail_unknown_case_number_and_bracketed_placeholder_title(self) -> None:
+        """#4628 — a bracketed LLM placeholder title is uninformative."""
+        result = check_unknown_and_null_title_fail(
+            "UNKNOWN-5f0a7206", "Ezra Arce v. [Defendant not specified]"
+        )
+        assert result.result == "fail"
+
+    def test_pass_real_case_number_and_role_literal_title(self) -> None:
+        """#4628 — a REAL case_number preserves the row even with a role-literal
+        title; only the synthetic UNKNOWN- prefix triggers the rejection.
+        """
+        result = check_unknown_and_null_title_fail("24CV123456", "Plaintiffs v. Defendant")
+        assert result.result == "pass"
+
 
 # ---------------------------------------------------------------------------
 # ruling_text_reasonable_length
@@ -913,6 +943,20 @@ class TestRunDeterministicRules:
             case_title=None,
             hearing_date=date(2026, 3, 30),
             captured_at=date(2026, 3, 29),
+        )
+        assert result.overall == "fail"
+        assert any(
+            r.rule == "unknown_and_null_title_fail" and r.result == "fail" for r in result.rules
+        )
+
+    def test_unknown_and_role_literal_title_rejected_via_aggregator(self) -> None:
+        """#4628 — UNKNOWN case_number AND a role-literal title must fail aggregator."""
+        result = run_deterministic_rules(
+            ruling_text="The motion for summary adjudication is granted.",
+            case_number="UNKNOWN-5f0a7206",
+            case_title="Plaintiffs v. Defendant",
+            hearing_date=None,
+            captured_at=None,
         )
         assert result.overall == "fail"
         assert any(
