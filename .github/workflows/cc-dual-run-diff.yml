@@ -101,13 +101,20 @@ jobs:
           PY
 
           HEALTHY=$(python3 -c "import json; print(json.load(open('/tmp/check_json.txt'))['healthy'])")
+          # agent_actionable distinguishes a genuine per-department scraper
+          # regression (agent-fixable) from a total-coverage failure (portal
+          # not yet authoritative — no agent fix exists). Default True for
+          # older JSON so we never silently suppress a real regression. See
+          # #4631.
+          ACTIONABLE=$(python3 -c "import json; print(json.load(open('/tmp/check_json.txt')).get('agent_actionable', True))")
           if [ "$HEALTHY" = "True" ]; then
             echo "healthy=true" >> "$GITHUB_OUTPUT"
             echo "CC dual-run diff: healthy — no missing_portal departments."
           else
             echo "healthy=false" >> "$GITHUB_OUTPUT"
-            echo "CC dual-run diff: breach detected (exit code $EXIT_CODE)."
+            echo "CC dual-run diff: breach detected (exit code $EXIT_CODE, agent_actionable=$ACTIONABLE)."
           fi
+          echo "agent_actionable=$ACTIONABLE" >> "$GITHUB_OUTPUT"
 
       - name: Extract alert summary
         if: steps.check.outputs.healthy == 'false'
@@ -196,50 +203,114 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CHECK_DATE: ${{ steps.args.outputs.check_date }}
+          AGENT_ACTIONABLE: ${{ steps.check.outputs.agent_actionable }}
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          {
-            echo "## CC Dual-Run Diff Alert — Portal Coverage Regression"
-            echo ""
-            echo "The portal scraper (\`ca-cc-tentatives-portal\`) is missing"
-            echo "one or more departments that the retired scraper"
-            echo "(\`ca-cc-tentatives\`) captured on **${CHECK_DATE}**."
-            echo "This may indicate a coverage regression in the new portal scraper."
-            echo ""
-            echo "### Missing Departments"
-            echo ""
-            cat /tmp/alert_summary.md
-            echo ""
-            echo ""
-            echo "### Context"
-            echo ""
-            echo "- **Workflow run:** ${RUN_URL}"
-            echo "- **Timestamp:** ${TIMESTAMP}"
-            echo "- **Date checked:** ${CHECK_DATE}"
-            echo "- **Check script:** \`scripts/cc-dual-run-diff.py\`"
-            echo "- **Parent issue:** #2601 (CC portal migration)"
-            echo ""
-            echo "### Next Steps"
-            echo ""
-            echo "1. Verify the portal scraper is running:"
-            echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-ca-cc-tentatives-portal-dev --lines 200\`"
-            echo "2. Check the retired scraper logs for comparison:"
-            echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-ca-cc-tentatives-dev --lines 200\`"
-            echo "3. Visit contracosta.courts.ca.gov for the missing departments"
-            echo "   to confirm rulings were posted that day."
-            echo "4. If the portal genuinely missed them, file a \`priority/p1\`"
-            echo "   bug against \`ca-cc-tentatives-portal\`."
-            echo ""
-            echo "This issue was created automatically by the CC dual-run diff"
-            echo "workflow. It will not create duplicates while this issue is open."
-          } > /tmp/issue_body.md
+          if [ "$AGENT_ACTIONABLE" = "True" ]; then
+            # Genuine per-department regression: the portal IS live and
+            # capturing current rulings but misses one or more departments.
+            # An agent can fix this — keep it p1 + agent/ready.
+            ISSUE_TITLE="CC portal scraper missing departments on ${CHECK_DATE}"
+            ISSUE_LABELS="priority/p1,area/scraping,cc-dual-run-alert,agent/ready"
+            {
+              echo "## CC Dual-Run Diff Alert — Portal Coverage Regression"
+              echo ""
+              echo "The portal scraper (\`ca-cc-tentatives-portal\`) is missing"
+              echo "one or more departments that the retired scraper"
+              echo "(\`ca-cc-tentatives\`) captured on **${CHECK_DATE}**, while"
+              echo "still capturing others. This indicates a per-department"
+              echo "coverage regression in the new portal scraper."
+              echo ""
+              echo "### Missing Departments"
+              echo ""
+              cat /tmp/alert_summary.md
+              echo ""
+              echo ""
+              echo "### Context"
+              echo ""
+              echo "- **Workflow run:** ${RUN_URL}"
+              echo "- **Timestamp:** ${TIMESTAMP}"
+              echo "- **Date checked:** ${CHECK_DATE}"
+              echo "- **Check script:** \`scripts/cc-dual-run-diff.py\`"
+              echo "- **Parent issue:** #2601 (CC portal migration)"
+              echo ""
+              echo "### Next Steps"
+              echo ""
+              echo "1. Verify the portal scraper is running:"
+              echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-ca-cc-tentatives-portal-dev --lines 200\`"
+              echo "2. Check the retired scraper logs for comparison:"
+              echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-ca-cc-tentatives-dev --lines 200\`"
+              echo "3. Visit contracosta.courts.ca.gov for the missing departments"
+              echo "   to confirm rulings were posted that day."
+              echo ""
+              echo "This issue was created automatically by the CC dual-run diff"
+              echo "workflow. It will not create duplicates while this issue is open."
+            } > /tmp/issue_body.md
+          else
+            # Total-coverage failure: the portal captured NOTHING while the
+            # retired scraper captured rulings. This is NOT a per-department
+            # regression — during the Phase 2 dual-run it is the expected
+            # "portal not yet the authoritative publication channel" signal
+            # (see docs/investigations/contra-costa-portal-migration-2026-04.md
+            # and #4631). No agent code change can capture data the upstream
+            # portal does not yet serve, so this is a human-triage tracker
+            # (p3, NOT agent/ready), not an autonomous work item.
+            ISSUE_TITLE="CC portal dual-run: total-coverage gap on ${CHECK_DATE} (portal not yet authoritative)"
+            ISSUE_LABELS="priority/p3,area/scraping,cc-dual-run-alert"
+            {
+              echo "## CC Dual-Run Diff — Total-Coverage Gap (portal not yet authoritative)"
+              echo ""
+              echo "The portal scraper (\`ca-cc-tentatives-portal\`) captured"
+              echo "**nothing** for **${CHECK_DATE}** while the retired scraper"
+              echo "(\`ca-cc-tentatives\`) captured rulings. This is a"
+              echo "total-coverage gap, **not** a per-department regression."
+              echo ""
+              echo "During the Phase 2 dual-run this is the expected"
+              echo "\"portal not yet the authoritative publication channel\""
+              echo "signal: Contra Costa still publishes current tentative"
+              echo "rulings only on the retired site, and the new portal's"
+              echo "Views endpoint exposes only stale seed data. No portal"
+              echo "**scraper** fix can capture rulings the upstream portal"
+              echo "does not serve, so this is a human-triage tracker"
+              echo "(\`priority/p3\`, no \`agent/ready\`) rather than an"
+              echo "autonomous work item."
+              echo ""
+              cat /tmp/alert_summary.md
+              echo ""
+              echo ""
+              echo "### Context"
+              echo ""
+              echo "- **Workflow run:** ${RUN_URL}"
+              echo "- **Timestamp:** ${TIMESTAMP}"
+              echo "- **Date checked:** ${CHECK_DATE}"
+              echo "- **Check script:** \`scripts/cc-dual-run-diff.py\`"
+              echo "- **Parent issue:** #2601 (CC portal migration)"
+              echo ""
+              echo "### Human triage"
+              echo ""
+              echo "1. Confirm the portal is still not the authoritative"
+              echo "   channel — the public \`/online-services/tentative-rulings\`"
+              echo "   page still iframes \`retired.cc-courts.org\`. If so, no"
+              echo "   action is needed; the retired scraper still has full"
+              echo "   coverage. Keep dual-running until the court cuts over."
+              echo "2. Only if the portal HAS gone live with current rulings"
+              echo "   but the scraper stopped fetching (judge-discovery /"
+              echo "   fetch break), add \`agent/ready\` + \`priority/p1\` and"
+              echo "   check the scraper logs:"
+              echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-ca-cc-tentatives-portal-dev --lines 200\`"
+              echo ""
+              echo "This issue was created automatically by the CC dual-run diff"
+              echo "workflow. It will not create duplicates while this issue is open"
+              echo "and auto-closes when the portal regains coverage."
+            } > /tmp/issue_body.md
+          fi
 
           ISSUE_URL=$(gh issue create \
             --repo "${{ github.repository }}" \
-            --title "CC portal scraper missing departments on ${CHECK_DATE}" \
+            --title "$ISSUE_TITLE" \
             --body-file /tmp/issue_body.md \
-            --label "priority/p1,area/scraping,cc-dual-run-alert,agent/ready")
+            --label "$ISSUE_LABELS")
 
           echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
           echo "created=true" >> "$GITHUB_OUTPUT"
