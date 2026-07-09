@@ -21,8 +21,10 @@ Link text format: date only — e.g. "March 10, 2026"
   No judge name or department in link text; department is extracted from the
   PDF filename (e.g. "03-10-26-dept-403.pdf" → department "403").
 
-PDF URL pattern: /system/files/tentative-rulings/{MM}-{DD}-{YY}-dept-{NNN}[_N].pdf
-  The optional "_N" suffix (e.g. "_0") appears on revised uploads.
+PDF URL pattern: /system/files/tentative-rulings/{MM}-{DD}-{YY}-dept-{NNN}[-XXX][_N].pdf
+  The optional "-XXX" alpha code (e.g. "-hbv", clerk/judge initials) was
+  added to every ruling filename by the court around 2026-06-14 (#4629);
+  the optional "_N" suffix (e.g. "_0") appears on revised uploads.
   Links whose URL filename does not match this pattern are skipped at
   capture time via ``_HREF_FILTER_RE`` — the court occasionally posts
   non-ruling PDFs (e-Court transition notices, holiday closure
@@ -97,14 +99,22 @@ _FILENAME_DATE_RE = re.compile(
 )
 
 # URL filter: a legitimate Fresno tentative-ruling PDF has a filename in the
-# format "MM-DD-YY-dept-NNN[_N].pdf".  Non-ruling PDFs (e-Court transition
-# notices, holiday closure announcements, "we moved" banners) the court
-# occasionally posts to the same index page have filenames that do not
+# format "MM-DD-YY-dept-NNN[-XXX][_N].pdf".  Non-ruling PDFs (e-Court
+# transition notices, holiday closure announcements, "we moved" banners) the
+# court occasionally posts to the same index page have filenames that do not
 # match this pattern (e.g. "eCourt-transition-notice.pdf").  Skipping
 # non-matching URLs at capture time prevents all-NULL-metadata noise rows
 # in derived.rulings (#2644).
+#
+# The optional "-XXX" segment is a trailing alpha code (typically the issuing
+# clerk / judge initials, e.g. "-hbv", "-iec", "-syc") the court began
+# appending to every ruling filename around 2026-06-14 — e.g.
+# "07-08-26-dept-403-hbv.pdf", "07-02-26-dept-503-qpq_0.pdf".  Before this
+# segment was allowed, the filter rejected every ruling PDF, producing a
+# multi-week zero-record silent outage (#4629).  The optional "_N" revision
+# suffix (e.g. "_0") may follow the alpha code on re-uploaded rulings.
 _HREF_FILTER_RE = re.compile(
-    r"/\d{2}-\d{2}-\d{2}-dept-\d{2,3}(?:_\d+)?\.pdf$",
+    r"/\d{2}-\d{2}-\d{2}-dept-\d{2,3}(?:-[a-z]+)?(?:_\d+)?\.pdf$",
     re.IGNORECASE,
 )
 

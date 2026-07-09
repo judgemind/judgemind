@@ -567,6 +567,19 @@ class TestModuleExclusions:
         """Quarterly cadence — most runs legitimately return zero."""
         assert "ca-governor-appointments" in zrs.EXCLUSIONS
 
+    def test_excludes_la_tentatives_appellate_after_4629(self) -> None:
+        """LA Appellate Division is low-volume, zero-by-design most of the time.
+
+        The casetype=appellate scraper cleanly detects the empty state
+        ("Appellate division has no published rulings", context=empty_state)
+        and reports status=success/records=0. Its multi-week zero streak is
+        the expected steady state, not a silent outage — so it is excluded
+        like ca-governor-appointments. The high-volume civil variant
+        (ca-la-tentatives-civil) must stay OUT of EXCLUSIONS. See #4629.
+        """
+        assert "ca-la-tentatives-appellate" in zrs.EXCLUSIONS
+        assert "ca-la-tentatives-civil" not in zrs.EXCLUSIONS
+
     def test_excludes_federal_courtlistener_opinions_after_4571(self) -> None:
         """CourtListener federal-opinions retired per #4571 / #4474.
 
