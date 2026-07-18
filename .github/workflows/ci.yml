@@ -1780,12 +1780,14 @@ jobs:
   # shared module so ECS oneshot scripts could import them via the
   # standard ``from framework.s3_keys import ...`` path. PR #4453
   # promptly re-duplicated them in scripts/create_missing_twins_4446.py
-  # because the agent had read the pre-#4447 docstring of
-  # repoint_mislabeled_documents_4439.py. This guard prevents the next
-  # agent who clones one of those scripts from inheriting the same
-  # duplication. Files that legitimately need to redefine (archive
-  # copies, intentionally different regex shapes) opt out via the
-  # ``# allow-duplicate-framework-helpers: <issue-or-PR>`` marker.
+  # (since archived to scripts/archive/ in #4565 after its runtime
+  # apply landed) because the agent had read the pre-#4447 docstring
+  # of repoint_mislabeled_documents_4439.py. This guard prevents the
+  # next agent who clones one of those scripts from inheriting the
+  # same duplication. Files that legitimately need to redefine
+  # (archive copies, intentionally different regex shapes) opt out
+  # via the ``# allow-duplicate-framework-helpers: <issue-or-PR>``
+  # marker.
   # The step name below intentionally avoids quoting the forbidden
   # token (per docs/agent/code-standards.md §Hygiene-check CI steps
   # and #2541/#2542).
