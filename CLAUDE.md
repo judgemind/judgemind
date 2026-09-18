@@ -96,6 +96,7 @@ Consult these docs before making changes in their domain:
 | `docs/agent/gh-to-mcp-migration.md` | Full tool-by-tool `gh` → `mcp__github__*` mapping, including the known gaps |
 | `docs/agent/aws-api-access.md` | When to use the AWS MCP servers vs the `aws` CLI vs `scripts/ecs-*.sh` — MCP-first for ECS/CloudWatch reads, scripts for launch-and-stream, CLI for writes/S3/secrets |
 | `docs/agent/aws-to-mcp-migration.md` | Full tool-by-tool `aws` → `mcp__awslabs_*` mapping, including the known gaps |
+| `docs/agent/aws-account-suspension-recovery.md` | Bringing dev back after an AWS account suspension — wedged ECS schedulers, terminal-state RDS restore, verification order |
 | `docs/agent/spec-authoring.md` | Authoring or restructuring a spec/design doc — Today vs. Direction split rules |
 
 ## Starting a New Session
