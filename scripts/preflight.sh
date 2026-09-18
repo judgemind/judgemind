@@ -338,6 +338,7 @@ REPO_WALK_EXCLUSIONS=(
     .next
     .claude
     .vite
+    .terraform
     tmp
     dist
     build
