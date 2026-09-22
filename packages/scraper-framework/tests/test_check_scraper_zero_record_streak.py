@@ -590,6 +590,18 @@ class TestModuleExclusions:
         """
         assert "federal-courtlistener-opinions" in zrs.EXCLUSIONS
 
+    def test_excludes_oc_family_law_after_4654(self) -> None:
+        """OC Family Law panel has listed no judicial officers since ~2026-07-21.
+
+        The scraper positively detects the empty panel (context=empty_state)
+        and raises on a layout change, so its zero streak is the expected
+        steady state. The high-volume OC civil and probate scrapers must stay
+        OUT of EXCLUSIONS. See #4654.
+        """
+        assert "ca-oc-tentatives-family-law" in zrs.EXCLUSIONS
+        assert "ca-oc-tentatives" not in zrs.EXCLUSIONS
+        assert "ca-oc-tentatives-probate" not in zrs.EXCLUSIONS
+
     def test_does_not_exclude_ca_sd_calendar_after_4539(self) -> None:
         """ca-sd-calendar must NOT be in EXCLUSIONS now that #4539 has
         shipped. The structural fix flipped the ``day_numbers`` default

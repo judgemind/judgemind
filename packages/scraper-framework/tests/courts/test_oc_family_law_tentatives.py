@@ -4,6 +4,9 @@ Fixtures captured from live site 2026-03-07:
   oc_family_law_page.html         — index page with 2 PDF links
   oc_family_law_claustro_c22.pdf  — Dept C22, Judge Israel Claustro (1 page, 3 cases)
   oc_family_law_kohler_l69.pdf    — Dept L69, Commissioner Robert Kohler (1 page, empty)
+
+Fixture captured from live site 2026-09-22 (#4654):
+  oc_family_law_page_empty_panel.html — trimmed index page; panel lists no officers
 """
 
 from __future__ import annotations
@@ -17,12 +20,14 @@ import respx
 
 from courts.ca.oc_family_law_tentatives import (
     INDEX_URL,
+    OCFamilyLawIndexLayoutError,
     OCFamilyLawTentativeRulingsScraper,
     _oc_fl_case_title_from_text,
     _oc_fl_courthouse,
     _oc_fl_hearing_date_from_text,
     _oc_fl_motion_type_from_text,
     _oc_fl_outcome_from_text,
+    _oc_fl_panel_officer_count,
 )
 from courts.ca.oc_family_law_tentatives import default_config as fl_default_config
 from courts.ca.pdf_link_scraper import _extract_pdf_text
@@ -258,6 +263,69 @@ def test_oc_fl_run_with_empty_rulings_pdf() -> None:
 
     # Both PDFs are boilerplate (empty template) — both should be skipped
     assert len(docs) == 0
+
+
+# ---------------------------------------------------------------------------
+# Empty panel vs. layout change (#4654)
+# ---------------------------------------------------------------------------
+
+
+def _scraper() -> OCFamilyLawTentativeRulingsScraper:
+    config = fl_default_config()
+    config.request_delay_seconds = 0
+    return OCFamilyLawTentativeRulingsScraper(config=config)
+
+
+def test_oc_fl_panel_officer_count_populated_page() -> None:
+    assert _oc_fl_panel_officer_count(_load_html("oc_family_law_page.html")) == 2
+
+
+def test_oc_fl_panel_officer_count_empty_panel() -> None:
+    html = _load_html("oc_family_law_page_empty_panel.html")
+    assert _oc_fl_panel_officer_count(html) == 0
+
+
+def test_oc_fl_panel_officer_count_missing_container() -> None:
+    assert _oc_fl_panel_officer_count("<html><body><main></main></body></html>") is None
+
+
+def test_oc_fl_panel_officer_count_plain_text_officer() -> None:
+    html = (
+        '<div class="jcc-body__main-text"><h3>Family Law Panel</h3>'
+        "<p>SMITH, Jane - Dept C99</p></div>"
+    )
+    assert _oc_fl_panel_officer_count(html) == 1
+
+
+@respx.mock
+def test_oc_fl_run_empty_panel_is_clean_empty_state(capsys: pytest.CaptureFixture) -> None:
+    """Live page since ~2026-07-21: panel heading, no officers — zero docs, no error."""
+    html = _load_html("oc_family_law_page_empty_panel.html")
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+    docs = _scraper().fetch_documents()
+
+    assert docs == []
+    assert "empty_state" in capsys.readouterr().out
+
+
+@respx.mock
+def test_oc_fl_run_officers_without_pdf_links_raises() -> None:
+    """Officers listed but links no longer end in .pdf → layout change, not empty."""
+    html = _load_html("oc_family_law_page.html").replace(".pdf", ".aspx")
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+    with pytest.raises(OCFamilyLawIndexLayoutError, match="2 judicial officer"):
+        _scraper().fetch_documents()
+
+
+@respx.mock
+def test_oc_fl_run_missing_panel_container_raises() -> None:
+    html = "<html><body><main><p>Redesigned page</p></main></body></html>"
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+    with pytest.raises(OCFamilyLawIndexLayoutError, match="not found"):
+        _scraper().fetch_documents()
 
 
 # ---------------------------------------------------------------------------
