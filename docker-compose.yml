@@ -71,7 +71,8 @@ services:
 
   # MinIO provides S3-compatible object storage locally
   minio:
-    image: minio/minio:latest
+    # Docker Hub's minio/minio was removed; MinIO publishes only to quay.io (#4658).
+    image: quay.io/minio/minio:latest
     ports:
       - "9000:9000"
       - "9001:9001" # Console UI

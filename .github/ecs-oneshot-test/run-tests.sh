@@ -101,7 +101,7 @@ setup_minio() {
         -p 9000:9000 \
         -e MINIO_ROOT_USER=minioadmin \
         -e MINIO_ROOT_PASSWORD=minioadmin \
-        minio/minio:latest \
+        quay.io/minio/minio:latest \
         server /data
 
     # Poll health endpoint (MinIO typically starts within 3s)
@@ -141,7 +141,7 @@ JSON
         --network oneshot-test-net \
         -v "${policy_file}:/tmp/uploader-policy.json" \
         --entrypoint sh \
-        minio/mc:latest \
+        quay.io/minio/mc:latest \
         -c "mc alias set local http://minio:9000 minioadmin minioadmin \
             && mc mb local/oneshot-scripts-test \
             && mc admin user add local oneshot-uploader 'upl-secret-key' \
