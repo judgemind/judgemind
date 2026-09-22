@@ -121,6 +121,18 @@ class PdfLinkScraper(BaseScraper):
         """
         return bool(_NO_RULINGS_RE.match(text))
 
+    def _handle_no_pdf_links(self, html: str) -> None:
+        """Hook called when the index page yields zero PDF links.
+
+        A zero-link index is ambiguous: the court may legitimately list no
+        judicial officers (empty state), or the page layout may have changed
+        so links are no longer discoverable (silent outage).  Subclasses that
+        can tell the two apart should override this to log the empty state
+        explicitly and raise on a layout change so the run records
+        ``status=failure`` instead of a quiet ``records=0`` success (#4654).
+        The base implementation does nothing.
+        """
+
     def fetch_documents(self) -> list[CapturedDocument]:
         pc = self._pdf_config
         docs = []
@@ -137,6 +149,8 @@ class PdfLinkScraper(BaseScraper):
 
             links = _extract_pdf_links(response.text, pc.index_url, pc.pdf_base_url)
             self._log.info("Found PDF links", count=len(links))
+            if not links:
+                self._handle_no_pdf_links(response.text)
 
             for href, link_text in links:
                 # Filter: skip links whose text does not match the expected

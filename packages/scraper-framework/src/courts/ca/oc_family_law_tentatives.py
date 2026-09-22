@@ -25,6 +25,15 @@ Courthouse mapping (derived from dept code prefix):
   N*  → North Justice Center (Fullerton)
   W*  → West Justice Center (Westminster)
 
+Empty panel (2026-07-21 onward, #4654):
+  The court removed both judicial officers (Claustro C22, Kohler L69) from the
+  "Family Law Panel" between 2026-07-20 and 2026-07-21 (confirmed against
+  Wayback Machine snapshots).  The page still renders the "Family Law Panel"
+  heading with nothing beneath it, so every run finds zero PDF links.  The
+  scraper logs this explicitly as ``context=empty_state``.  If the panel lists
+  officers but no PDF links are discoverable, that is a layout change and the
+  run raises ``OCFamilyLawIndexLayoutError`` so it records ``status=failure``.
+
 Investigation: #142
 """
 
@@ -35,6 +44,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
+from bs4 import BeautifulSoup
 
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
@@ -162,6 +172,34 @@ _EMPTY_CASE_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Container holding the "Family Law Panel" heading and its officer list.
+_PANEL_SELECTOR = "div.jcc-body__main-text"
+
+# A panel line that names a judicial officer: "LASTNAME, First - Dept C22".
+_PANEL_OFFICER_RE = re.compile(r"\bDept\b\.?\s*\S+", re.IGNORECASE)
+
+
+class OCFamilyLawIndexLayoutError(RuntimeError):
+    """Index page no longer matches the expected Family Law Panel layout."""
+
+
+def _oc_fl_panel_officer_count(html: str) -> int | None:
+    """Count judicial-officer entries in the Family Law Panel.
+
+    Returns ``None`` when the panel container is missing entirely (layout
+    change).  Otherwise returns the number of anchors plus plain-text lines
+    that name a department — either signals an officer entry is present.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    panel = soup.select_one(_PANEL_SELECTOR)
+    if panel is None:
+        return None
+    anchors = panel.find_all("a")
+    if anchors:
+        return len(anchors)
+    lines = [line.strip() for line in panel.get_text("\n").splitlines()]
+    return sum(1 for line in lines if _PANEL_OFFICER_RE.search(line))
+
 
 class OCFamilyLawTentativeRulingsScraper(PdfLinkScraper):
     """Orange County Family Law tentative rulings — PDF-link pattern."""
@@ -182,6 +220,23 @@ class OCFamilyLawTentativeRulingsScraper(PdfLinkScraper):
             return True
 
         return False
+
+    def _handle_no_pdf_links(self, html: str) -> None:
+        """Tell an empty Family Law Panel apart from a layout change (#4654)."""
+        count = _oc_fl_panel_officer_count(html)
+        if count is None:
+            raise OCFamilyLawIndexLayoutError(
+                f"Family Law Panel container ({_PANEL_SELECTOR}) not found on index page"
+            )
+        if count > 0:
+            raise OCFamilyLawIndexLayoutError(
+                f"Family Law Panel lists {count} judicial officer entries "
+                "but no PDF links were found"
+            )
+        self._log.info(
+            "Family Law Panel lists no judicial officers",
+            context="empty_state",
+        )
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
