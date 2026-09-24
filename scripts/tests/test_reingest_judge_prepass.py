@@ -70,6 +70,7 @@ _modules_to_mock: dict[str, MagicMock] = {
     "framework.llm_schema": MagicMock(),
     "framework.logging": _mock_framework_logging,
     "framework.models": MagicMock(),
+    "framework.storage": MagicMock(),
     "ingestion": MagicMock(),
     "ingestion.db": MagicMock(),
     "ingestion.doc_timing": MagicMock(),
