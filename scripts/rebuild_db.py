@@ -103,6 +103,7 @@ import structlog
 
 from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
+from framework.storage import capture_timestamp_from_s3_object
 
 structlog.configure(
     processors=[
@@ -283,6 +284,7 @@ def build_event(
     content: bytes,
     parsed: dict[str, str],
     bucket: str,
+    capture_timestamp: datetime | None = None,
 ) -> dict[str, Any]:
     """Construct an ingestion event dict from an S3 object.
 
@@ -291,6 +293,13 @@ def build_event(
     worker a head-start so ruling rows can be created even when LLM extraction
     is unavailable.  For PDFs the regex rarely works on raw binary content, so
     the worker's LLM extraction path handles hearing_date for those formats.
+
+    ``capture_timestamp`` is the object's *original* capture time (see
+    :func:`framework.storage.capture_timestamp_from_s3_object`).  It is never
+    defaulted to ``now()``: the deterministic ``hearing_date_in_range`` rule
+    compares against it, and a rebuild-time stamp rejected every ruling heard
+    >180 days before the rebuild (#4661).  ``None`` means "unknown" and the
+    rule passes.
     """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
@@ -307,7 +316,7 @@ def build_event(
         "s3_bucket": bucket,
         "scraper_id": f"rebuild-{parsed['state']}-{parsed['county']}",
         "source_url": "",
-        "capture_timestamp": datetime.now(UTC).isoformat(),
+        "capture_timestamp": capture_timestamp.isoformat() if capture_timestamp else None,
     }
 
     # For text-based formats (HTML, TXT), pass content as ruling_text.
@@ -380,6 +389,10 @@ def _process_one_document(
 
     content_format = EXT_TO_FORMAT.get(parsed["ext"], "bin")
 
+    # Original capture time — never now() (#4661).  The local cache carries no
+    # S3 metadata, so a cache read leaves it None (the validation rule's
+    # "unknown capture time" pass-through).
+    capture_timestamp: datetime | None = None
     if cache_dir:
         content = (Path(cache_dir) / key).read_bytes()
     else:
@@ -388,6 +401,7 @@ def _process_one_document(
         s3 = _make_s3()
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response["Body"].read()
+        capture_timestamp = capture_timestamp_from_s3_object(response)
 
     if not content:
         return {
@@ -414,7 +428,7 @@ def _process_one_document(
             actual_content_hash=actual_hash,
         )
 
-    event = build_event(key, content, parsed, bucket)
+    event = build_event(key, content, parsed, bucket, capture_timestamp=capture_timestamp)
     had_hearing_date = bool(event.get("hearing_date"))
 
     # Lazy per-process worker — cached on the function object.

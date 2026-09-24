@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -31,6 +34,47 @@ def build_s3_key(doc: CapturedDocument) -> str:
         f"{doc.court.lower().replace(' ', '_')}/raw/"
         f"{doc.content_hash}.{ext}"
     )
+
+
+# User-metadata key the archiver stamps on every raw object (boto3 exposes it
+# lower-cased, without the ``x-amz-meta-`` prefix, under ``Metadata``).
+CAPTURE_TIMESTAMP_METADATA_KEY = "capture-timestamp"
+
+
+def capture_timestamp_from_s3_object(response: Mapping[str, Any]) -> datetime | None:
+    """Recover a raw object's original capture time from a GetObject/HeadObject response.
+
+    Rebuild and reingest paths must feed the worker the *original* capture
+    time, never ``now()`` — the deterministic ``hearing_date_in_range`` rule
+    compares the hearing date against it, so a rebuild-time stamp rejects every
+    ruling heard >180 days before the rebuild (#4661).
+
+    Preference order:
+
+    1. ``Metadata["capture-timestamp"]`` — written by :meth:`S3Archiver.archive`
+       at capture time.
+    2. ``LastModified`` — archive-first capture writes the object once (the
+       archiver skips existing keys), so this is the first-capture time.
+    3. ``None`` — no source (e.g. a local-cache hit).  Callers must pass
+       ``None`` through rather than substituting ``now()``; the validation
+       rule treats a missing capture time as "cannot judge" and passes.
+
+    Naive timestamps are assumed to be UTC.
+    """
+    metadata = response.get("Metadata") or {}
+    raw = metadata.get(CAPTURE_TIMESTAMP_METADATA_KEY)
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    last_modified = response.get("LastModified")
+    if isinstance(last_modified, datetime):
+        return last_modified if last_modified.tzinfo else last_modified.replace(tzinfo=UTC)
+    return None
 
 
 class S3Archiver:
@@ -75,7 +119,7 @@ class S3Archiver:
                     "scraper-id": doc.scraper_id,
                     "content-hash": doc.content_hash,
                     "source-url": doc.source_url,
-                    "capture-timestamp": doc.capture_timestamp.isoformat(),
+                    CAPTURE_TIMESTAMP_METADATA_KEY: doc.capture_timestamp.isoformat(),
                 },
             )
         except (BotoCoreError, ClientError) as exc:

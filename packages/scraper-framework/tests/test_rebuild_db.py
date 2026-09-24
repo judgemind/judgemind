@@ -130,7 +130,9 @@ class TestBuildEvent:
         assert event["s3_key"] == key
         assert event["s3_bucket"] == "test-bucket"
         assert event["scraper_id"] == "rebuild-ca-orange"
-        assert event["capture_timestamp"]
+        # Key present; None without an original capture time — never now() (#4661).
+        assert "capture_timestamp" in event
+        assert event["capture_timestamp"] is None
 
     def test_txt_content_decoded_as_utf8(self) -> None:
         """TXT content should be decoded as utf-8 and set as ruling_text."""
@@ -3259,3 +3261,158 @@ class TestBuildEventCourthouse:
         # Should not raise
         event = rebuild_db.build_event(key, html, parsed, "test-bucket")
         assert isinstance(event, dict)
+
+
+# ---------------------------------------------------------------------------
+# Original capture time on rebuild (#4661)
+# ---------------------------------------------------------------------------
+
+
+def _run_one_document_from_s3(
+    content: bytes, get_object_response: dict[str, Any]
+) -> dict[str, Any]:
+    """Drive ``_process_one_document`` down the real-S3 (no cache_dir) path and
+    return the event it hands to the ingestion worker."""
+    import hashlib
+    import io
+
+    content_hash = hashlib.sha256(content).hexdigest()
+    key = f"ca/santa_clara/superior_court/raw/{content_hash}.html"
+
+    mock_s3 = MagicMock()
+    mock_s3.get_object.return_value = {"Body": io.BytesIO(content), **get_object_response}
+    mock_worker = MagicMock()
+
+    if hasattr(rebuild_db._process_one_document, "_worker"):
+        delattr(rebuild_db._process_one_document, "_worker")
+
+    with (
+        patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+        patch("redis.Redis.from_url", return_value=MagicMock()),
+        patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+    ):
+        result = rebuild_db._process_one_document(
+            key, "", "test-bucket", "postgres://test", "redis://test", ""
+        )
+
+    if hasattr(rebuild_db._process_one_document, "_worker"):
+        delattr(rebuild_db._process_one_document, "_worker")
+
+    assert result["status"] == "ok"
+    mock_worker.process_event.assert_called_once()
+    return mock_worker.process_event.call_args[0][0]
+
+
+def _worker_captured_at(event: dict[str, Any]) -> Any:
+    """Mirror worker.py: ``capture_ts = _parse_datetime(event["capture_timestamp"])``
+    then ``captured_at_date = capture_ts.date() if capture_ts else None``."""
+    from ingestion.worker import _parse_datetime
+
+    capture_ts = _parse_datetime(event.get("capture_timestamp"))
+    return capture_ts.date() if capture_ts else None
+
+
+class TestRebuildPreservesOriginalCaptureTime:
+    """#4661: rebuild must not stamp ``capture_timestamp=now()``.
+
+    The deterministic ``hearing_date_in_range`` rule rejects rulings whose
+    hearing date is >180 days from ``captured_at``.  Stamping the rebuild
+    time as the capture time made every historical ruling fail that rule on
+    a ``--reset`` rebuild, silently dropping ~113 Santa Clara rulings in the
+    #3843 rebuild.
+    """
+
+    def test_old_capture_survives_deterministic_validation(self) -> None:
+        """Regression: an S3 object captured >180 days ago, with a hearing
+        date near its capture date, must pass deterministic validation."""
+        from datetime import UTC, date, datetime
+
+        from validation.deterministic import check_hearing_date_in_range
+
+        captured = datetime(2025, 6, 4, 17, 30, tzinfo=UTC)
+        event = _run_one_document_from_s3(
+            b"<html>Date: 06/06/2025 ruling text</html>",
+            {
+                "Metadata": {"capture-timestamp": captured.isoformat()},
+                "LastModified": captured,
+            },
+        )
+
+        captured_at = _worker_captured_at(event)
+        assert captured_at == date(2025, 6, 4)
+        result = check_hearing_date_in_range(date(2025, 6, 6), captured_at)
+        assert result.result == "pass", result.reason
+
+    def test_metadata_capture_timestamp_preferred_over_last_modified(self) -> None:
+        from datetime import UTC, datetime
+
+        event = _run_one_document_from_s3(
+            b"<html>ruling</html>",
+            {
+                "Metadata": {"capture-timestamp": "2025-03-01T10:00:00+00:00"},
+                "LastModified": datetime(2025, 9, 1, tzinfo=UTC),
+            },
+        )
+        assert event["capture_timestamp"] == "2025-03-01T10:00:00+00:00"
+
+    def test_falls_back_to_last_modified(self) -> None:
+        from datetime import UTC, datetime
+
+        event = _run_one_document_from_s3(
+            b"<html>ruling</html>",
+            {"Metadata": {}, "LastModified": datetime(2025, 9, 1, 8, 0, tzinfo=UTC)},
+        )
+        assert event["capture_timestamp"] == "2025-09-01T08:00:00+00:00"
+
+    def test_no_capture_source_yields_none_not_now(self) -> None:
+        """With no capture metadata the event carries None so the rule's
+        documented ``captured_at is None`` pass-through applies."""
+        event = _run_one_document_from_s3(b"<html>ruling</html>", {})
+        assert event["capture_timestamp"] is None
+        assert _worker_captured_at(event) is None
+
+    def test_local_cache_path_yields_none_not_now(self, tmp_path: Any) -> None:
+        """The local cache has no capture metadata — never substitute now()."""
+        import hashlib
+
+        content = b"<html>ruling</html>"
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.html"
+        key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
+        key_path.mkdir(parents=True)
+        (key_path / f"{content_hash}.html").write_bytes(content)
+
+        mock_worker = MagicMock()
+        if hasattr(rebuild_db._process_one_document, "_worker"):
+            delattr(rebuild_db._process_one_document, "_worker")
+        with (
+            patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+            patch("framework.s3_cache.make_s3_client", return_value=MagicMock()),
+        ):
+            rebuild_db._process_one_document(
+                key, str(tmp_path), "test-bucket", "postgres://test", "redis://test", ""
+            )
+        if hasattr(rebuild_db._process_one_document, "_worker"):
+            delattr(rebuild_db._process_one_document, "_worker")
+
+        event = mock_worker.process_event.call_args[0][0]
+        assert event["capture_timestamp"] is None
+
+    def test_build_event_uses_supplied_capture_timestamp(self) -> None:
+        from datetime import UTC, datetime
+
+        parsed = _make_parsed()
+        event = rebuild_db.build_event(
+            _make_key(parsed),
+            b"<html>x</html>",
+            parsed,
+            "test-bucket",
+            capture_timestamp=datetime(2024, 11, 2, 9, 15, tzinfo=UTC),
+        )
+        assert event["capture_timestamp"] == "2024-11-02T09:15:00+00:00"
+
+    def test_build_event_default_is_none_not_now(self) -> None:
+        parsed = _make_parsed()
+        event = rebuild_db.build_event(_make_key(parsed), b"<html>x</html>", parsed, "b")
+        assert event["capture_timestamp"] is None

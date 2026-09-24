@@ -212,7 +212,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +243,7 @@ from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
+from framework.storage import capture_timestamp_from_s3_object  # noqa: E402
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
     insert_document_and_ruling,
@@ -3846,8 +3847,16 @@ def _build_prefix_event(
     content: bytes,
     parsed: dict[str, str],
     bucket: str,
+    capture_timestamp: datetime | None = None,
 ) -> dict[str, Any]:
-    """Construct an ingestion event dict from an S3 object for prefix mode."""
+    """Construct an ingestion event dict from an S3 object for prefix mode.
+
+    ``capture_timestamp`` is the object's original capture time (from
+    :func:`framework.storage.capture_timestamp_from_s3_object`), or ``None``
+    when unknown — never ``now()``, which made the deterministic
+    ``hearing_date_in_range`` rule reject every ruling heard >180 days
+    before the reingest (#4661).
+    """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
     content_format = _EXT_TO_FORMAT.get(parsed["ext"], "bin")
@@ -3863,7 +3872,7 @@ def _build_prefix_event(
         "s3_bucket": bucket,
         "scraper_id": f"reingest-{parsed['state']}-{parsed['county']}",
         "source_url": "",
-        "capture_timestamp": datetime.now(UTC).isoformat(),
+        "capture_timestamp": capture_timestamp.isoformat() if capture_timestamp else None,
     }
 
     # For text-based formats (HTML, TXT), pass content as ruling_text.
@@ -4222,6 +4231,7 @@ def _process_prefix_document(
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response["Body"].read()
+        capture_timestamp = capture_timestamp_from_s3_object(response)
     except Exception as exc:
         logger.warning("Failed to fetch S3 object, skipping", s3_key=key, exc_info=True)
         return {
@@ -4258,7 +4268,7 @@ def _process_prefix_document(
             actual_content_hash=actual_hash,
         )
 
-    event = _build_prefix_event(key, content, parsed, bucket)
+    event = _build_prefix_event(key, content, parsed, bucket, capture_timestamp=capture_timestamp)
 
     # Lazy per-process worker — cached on the function object.
     worker = getattr(_process_prefix_document, "_worker", None)
