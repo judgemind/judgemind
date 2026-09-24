@@ -15,6 +15,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMAGE_NAME="judgemind-ecs-oneshot-test"
+# MinIO server + mc, built from pinned source (see infra/docker/minio/Dockerfile).
+# Upstream MinIO no longer publishes pullable images (#4658, #4660).
+MINIO_IMAGE="judgemind-minio-test"
+MINIO_DOCKERFILE_DIR="$REPO_ROOT/infra/docker/minio"
 TEST_SCRIPTS_DIR="$SCRIPT_DIR/test-scripts"
 
 # Track pass/fail counts
@@ -87,6 +91,11 @@ run_test() {
 setup_minio() {
     echo "=== Setting up MinIO for S3 delivery tests ==="
 
+    # Build MinIO + mc from pinned source. The image carries both binaries,
+    # so the server runs with the default entrypoint and mc runs via
+    # --entrypoint below.
+    docker build -t "$MINIO_IMAGE" "$MINIO_DOCKERFILE_DIR"
+
     # Remove stale containers/network from a previous interrupted run
     docker rm -f minio 2>/dev/null || true
     docker network rm oneshot-test-net 2>/dev/null || true
@@ -101,7 +110,7 @@ setup_minio() {
         -p 9000:9000 \
         -e MINIO_ROOT_USER=minioadmin \
         -e MINIO_ROOT_PASSWORD=minioadmin \
-        quay.io/minio/minio:latest \
+        "$MINIO_IMAGE" \
         server /data
 
     # Poll health endpoint (MinIO typically starts within 3s)
@@ -141,7 +150,7 @@ JSON
         --network oneshot-test-net \
         -v "${policy_file}:/tmp/uploader-policy.json" \
         --entrypoint sh \
-        quay.io/minio/mc:latest \
+        "$MINIO_IMAGE" \
         -c "mc alias set local http://minio:9000 minioadmin minioadmin \
             && mc mb local/oneshot-scripts-test \
             && mc admin user add local oneshot-uploader 'upl-secret-key' \
@@ -236,6 +245,37 @@ EOF
     echo ""
 }
 
+# ─── Helper: confirm the uploader policy denies writes outside its prefix ────
+#
+# Guards the IAM mirroring itself: if the S3 sidecar ever stops enforcing the
+# uploader policy (e.g. a replacement emulator that ignores IAM), the delivery
+# test above would still pass, and we'd stop catching production IAM denials.
+
+run_test_iam_denial() {
+    echo "--- Test: uploader policy denies PutObject outside oneshot-scripts/ ---"
+
+    local aws_config
+    aws_config="$(mktemp)"
+    printf '[default]\ns3 =\n  addressing_style = path\n' > "$aws_config"
+
+    if AWS_CONFIG_FILE="$aws_config" \
+        AWS_ACCESS_KEY_ID="oneshot-uploader" \
+        AWS_SECRET_ACCESS_KEY="upl-secret-key" \
+        AWS_DEFAULT_REGION="us-east-1" \
+        aws s3 cp "$TEST_SCRIPTS_DIR/test_imports.py" \
+            "s3://oneshot-scripts-test/not-allowed/test_imports.py" \
+            --endpoint-url "http://localhost:9000" 2>&1; then
+        echo "FAIL (upload outside the allowed prefix unexpectedly succeeded)"
+        FAIL=$((FAIL + 1))
+        FAILURES+=("uploader policy denies PutObject outside prefix")
+    else
+        echo "PASS (denied as expected)"
+        PASS=$((PASS + 1))
+    fi
+    rm -f "$aws_config"
+    echo ""
+}
+
 # ─── Run test scripts ────────────────────────────────────────────────────────
 
 echo "=== Running ECS oneshot integration tests ==="
@@ -260,6 +300,7 @@ trap teardown_minio EXIT
 setup_minio
 
 run_test_s3_delivery
+run_test_iam_denial
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 

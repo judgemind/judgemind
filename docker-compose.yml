@@ -71,8 +71,10 @@ services:
 
   # MinIO provides S3-compatible object storage locally
   minio:
-    # Docker Hub's minio/minio was removed; MinIO publishes only to quay.io (#4658).
-    image: quay.io/minio/minio:latest
+    # Upstream MinIO no longer publishes pullable images (Docker Hub removed
+    # #4658, quay.io went private #4660), so build from pinned source.
+    # First `docker compose up` builds it (~1-3 min); later runs use the cache.
+    build: infra/docker/minio
     ports:
       - "9000:9000"
       - "9001:9001" # Console UI
