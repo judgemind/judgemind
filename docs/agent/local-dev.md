@@ -11,6 +11,15 @@ docker compose up -d postgres redis    # minimum for local work
 docker compose up -d                   # full stack
 ```
 
+**MinIO is built locally, not pulled.** Upstream MinIO no longer publishes
+pullable images (Docker Hub removed them, quay.io went private, and the
+repos are archived), so the `minio` service builds MinIO + `mc` from pinned
+Go module versions in `infra/docker/minio/Dockerfile` (#4660). The first
+`docker compose up minio` (or `docker compose build minio`) compiles for a
+minute or two; later runs reuse the cached image. The same Dockerfile backs
+the `ecs-oneshot-test` CI job's S3 sidecar. To bump MinIO, change the
+pinned pseudo-versions and stamped release tags in that Dockerfile together.
+
 **Local databases (two, managed by docker-compose):**
 
 | Database | URL | Used by |
