@@ -10,14 +10,18 @@ so a mislabel is detectable by comparing filename hex64 to metadata
 
 These helpers were duplicated verbatim across
 ``scripts/cleanup_mislabeled_s3_2661.py`` and
-``scripts/repoint_mislabeled_documents_4439.py`` — both are ECS oneshot
-scripts run via ``scripts/ecs-run-task.sh`` which uploads only the single
-requested script to S3 at run time, so peer-script imports are not
-available. Importing from ``framework.*`` IS available because the
-helpers are bundled into the ingestion-worker / scraper-framework Docker
-image and reachable inside the oneshot container without extra ``COPY``
-steps (the existing ``from framework.logging import configure_structlog``
-imports in those scripts are precedent).
+``scripts/repoint_mislabeled_documents_4439.py`` (both archived in
+#4565 after their runtime applies landed; the post-#4447 import shape
+is preserved verbatim at ``scripts/archive/cleanup_mislabeled_s3_2661.py``
+and ``scripts/archive/repoint_mislabeled_documents_4439.py``) — both
+are ECS oneshot scripts run via ``scripts/ecs-run-task.sh`` which
+uploads only the single requested script to S3 at run time, so
+peer-script imports are not available. Importing from ``framework.*``
+IS available because the helpers are bundled into the ingestion-worker
+/ scraper-framework Docker image and reachable inside the oneshot
+container without extra ``COPY`` steps (the existing
+``from framework.logging import configure_structlog`` imports in those
+scripts are precedent).
 
 The helpers in this module are pure functions over inputs the caller has
 already obtained (the S3 key string and the metadata ``content-hash``
@@ -135,9 +139,11 @@ def build_twin_key(mislabel_key: str, metadata_hash: str) -> str | None:
     Returns ``None`` if *mislabel_key* does not parse as a flat-hash
     key.
 
-    Used by the repoint flow (``scripts/repoint_mislabeled_documents_4439.py``)
-    to compute the candidate twin from a mislabel's metadata, then HEAD
-    the twin to confirm it exists and is itself correctly-labelled.
+    Used by the repoint flow
+    (``scripts/archive/repoint_mislabeled_documents_4439.py`` —
+    archived in #4565 after its runtime apply landed) to compute the
+    candidate twin from a mislabel's metadata, then HEAD the twin to
+    confirm it exists and is itself correctly-labelled.
     """
     parsed = parse_flat_hash_key(mislabel_key)
     if parsed is None:

@@ -10,16 +10,19 @@
 # ``packages/scraper-framework/src/framework/s3_keys.py``. ECS oneshot
 # scripts can import them via the standard ``from framework.s3_keys
 # import ...`` path because the helpers are bundled into the
-# ingestion-worker / scraper-framework Docker image.
+# ingestion-worker / scraper-framework Docker image. (Both scripts
+# were archived to ``scripts/archive/`` in #4565 after their runtime
+# applies landed; the post-#4447 import shape is preserved verbatim
+# in the archived copies.)
 #
 # Days later PR #4453 shipped ``scripts/create_missing_twins_4446.py``
 # that re-duplicated the helpers. The agent had read the *pre-#4447*
 # docstring of ``repoint_mislabeled_documents_4439.py`` (which still
 # carried the legacy NOTE about the duplication being deliberate) and
-# faithfully copied the duplication. Issue #4455 tracks the migration
-# of ``create_missing_twins_4446.py``; this guard prevents the next
-# agent who clones one of those scripts from inheriting the same
-# duplication.
+# faithfully copied the duplication. Issue #4455 tracked the migration
+# of ``create_missing_twins_4446.py`` (now ``scripts/archive/`` —
+# moved in #4565); this guard prevents the next agent who clones one
+# of those scripts from inheriting the same duplication.
 #
 # What this guard scans
 # ─────────────────────
@@ -52,12 +55,15 @@
 # whether the exemption is still warranted. The marker travels with the
 # file so renaming or moving the script does not break the exemption.
 #
-# Today's only pre-existing duplicator is
-# ``scripts/create_missing_twins_4446.py``. Its temporary marker cites
-# #4455, the issue that tracks the migration to importing from
-# ``framework.s3_keys``. When #4455 lands, the import migration removes
-# the duplicates AND the marker — the guard then runs strictly on a
-# clean tree.
+# The original pre-existing duplicator was
+# ``scripts/create_missing_twins_4446.py``; its temporary marker cited
+# #4455, the issue that tracked the migration to importing from
+# ``framework.s3_keys``. The migration landed (the archived copy at
+# ``scripts/archive/create_missing_twins_4446.py`` imports cleanly from
+# ``framework.s3_keys`` and carries no marker). The only remaining
+# allowlisted file today is ``scripts/rebuild_db.py`` (citing #4456 —
+# its local ``KEY_PATTERN`` is the broader pre-#4447 shape used to
+# enumerate every raw object during a full rebuild).
 #
 # Issue #4456. Cross-reference: #4447 (helper extraction), #4453 (the
 # regressor PR), #4455 (the migration that closes the loop).
@@ -193,8 +199,8 @@ if (( violations > 0 )); then
     echo "    +)"
     echo ""
     echo "  Reference implementations:"
-    echo "    - scripts/cleanup_mislabeled_s3_2661.py (post-#4447)"
-    echo "    - scripts/repoint_mislabeled_documents_4439.py (post-#4447)"
+    echo "    - scripts/archive/cleanup_mislabeled_s3_2661.py (post-#4447, archived #4565)"
+    echo "    - scripts/archive/repoint_mislabeled_documents_4439.py (post-#4447, archived #4565)"
     echo ""
     echo "  If your script genuinely cannot import from framework.s3_keys"
     echo "  (e.g., it lives in scripts/archive/ and is preserved verbatim"
@@ -204,7 +210,7 @@ if (( violations > 0 )); then
     echo ""
     echo "  See #4456 for the full rationale and #4455 for the canonical"
     echo "  migration shape used to close out the only pre-existing"
-    echo "  duplicator (scripts/create_missing_twins_4446.py)."
+    echo "  duplicator (scripts/archive/create_missing_twins_4446.py — archived #4565)."
     exit 1
 fi
 

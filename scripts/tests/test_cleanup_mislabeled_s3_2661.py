@@ -43,6 +43,13 @@ import pytest
 # which may not be installed in the CI scripts-tests environment.
 # ---------------------------------------------------------------------------
 
+# The script-under-test was archived to scripts/archive/ in #4565 after its
+# runtime apply landed on dev (#2661 deleted 3734 mislabels 2026-05-09). The
+# tests stay in scripts/tests/ to keep running under the existing
+# `pytest scripts/tests/` shard — matching the precedent set by
+# scripts/archive/cleanup_legacy_date_partitioned_s3.py whose test still lives
+# at scripts/tests/test_cleanup_legacy_date_partitioned_s3.py.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "archive"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tests._mock_helpers import mock_sys_modules  # noqa: E402

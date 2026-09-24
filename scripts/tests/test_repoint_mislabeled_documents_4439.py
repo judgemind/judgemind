@@ -42,9 +42,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add scripts/ to sys.path so the script-under-test imports cleanly, and
-# scripts/tests/ to sys.path so the helper module is reachable as
-# ``tests._mock_helpers``.
+# Add scripts/archive/ to sys.path so the archived script-under-test imports
+# cleanly (moved in #4565 — see precedent
+# scripts/archive/cleanup_legacy_date_partitioned_s3.py), and scripts/ to
+# sys.path so the helper module is reachable as ``tests._mock_helpers``.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "archive"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tests._mock_helpers import mock_sys_modules  # noqa: E402
