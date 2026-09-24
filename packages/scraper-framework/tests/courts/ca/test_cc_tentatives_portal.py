@@ -1,12 +1,19 @@
 """Tests for the Contra Costa tentative rulings portal scraper (Phase 1).
 
 Fixtures in tests/fixtures/cc_portal/:
-  form.html              — /test-page-tentative-rulings (judge dropdown)
+  form.html              — /tentative-rulings judge dropdown (now on the live listing page, #4591)
   listing_devine.html    — /tentative-rulings?field_judge_target_id=238 (7 rows, 3 test entries)
   listing_reyes.html     — /tentative-rulings?field_judge_target_id=245 (L24-04564)
   listing_weil.html      — /tentative-rulings?field_judge_target_id=280 (MSN23-2201)
   listing_empty.html     — empty table / no-results page
-  detail_l24-04564.html  — detail page for L24-04564
+  detail_l24-04564.html  — detail page for L24-04564 (current jcc-body__main-text
+                           structure: ruling content under an <h2>Tentative Ruling</h2>
+                           heading inside <div class="jcc-body__main-text">, plus a
+                           boilerplate /system/files/traffic/ PDF in a footer aside that
+                           the parser must NOT select; #4598)
+  detail_l24-04564_legacy.html — back-compat fixture preserving the OLD
+                           <div class="field--name-body"> structure, exercising the
+                           parser's legacy fallback path (#4598)
   sample.pdf             — minimal PDF bytes for HTTP stubbing
 """
 
@@ -186,6 +193,189 @@ def test_parse_detail_page_extracts_ruling_and_pdf() -> None:
     assert detail["ruling_text_html"] is not None
 
 
+def test_parse_detail_page_new_jcc_body_structure() -> None:
+    """Regression (#4598): parse the current jcc-body__main-text detail structure.
+
+    The portal moved ruling content out of <div class="field--name-body"> and
+    into <div class="jcc-body__main-text"> under an <h2>Tentative Ruling</h2>
+    heading, with the body <p> nested inside an outer <p>.  Every detail page
+    also carries a boilerplate /system/files/traffic/ PDF in a footer aside that
+    must NOT be selected — the real ruling PDF lives under /system/files/general/.
+    """
+    html = _load_html("detail_l24-04564.html")
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is not None
+    assert detail["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+    assert "/traffic/" not in detail["pdf_url"]
+
+    assert detail["ruling_text"] is not None
+    assert "Before the Court are a demurrer" in detail["ruling_text"]
+    # The PDF-link paragraph text must be excluded from the ruling body.
+    assert "Tentative Ruling PDF" not in detail["ruling_text"]
+
+    assert detail["ruling_text_html"] is not None
+    assert detail["judge_name"] == "BENJAMIN REYES"
+
+
+def test_parse_detail_page_traffic_only_falls_back_excluding_traffic() -> None:
+    """Regression (#4598): with no /general/ PDF, never select the traffic PDF.
+
+    Exercises the fallback path in _select_pdf_url: a non-PDF anchor is skipped,
+    the /system/files/traffic/ link is excluded, and a different .pdf link is
+    chosen as the fallback.  Also exercises the next-<h2> boundary in
+    _ruling_section_paragraphs (a trailing <h2> after the ruling section).
+    """
+    html = (
+        '<html><body><div class="jcc-body__main-text">'
+        "<h2>Case Number</h2><p><span>L24-09999</span></p>"
+        "<h2>Tentative Ruling</h2>"
+        "<p>"
+        '<p><a href="/about">About</a></p>'
+        '<p><a href="/system/files/traffic/tr-320-info.pdf">Traffic info</a></p>'
+        '<p><a href="/system/files/other/99_010125.pdf">Ruling PDF</a></p>'
+        "<p>The motion is DENIED.</p>"
+        "</p>"
+        "<h2>Footnotes</h2><p>Not part of the ruling body.</p>"
+        "</div></body></html>"
+    )
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is not None
+    assert detail["pdf_url"].endswith("/system/files/other/99_010125.pdf")
+    assert "/traffic/" not in detail["pdf_url"]
+
+    assert detail["ruling_text"] is not None
+    assert "The motion is DENIED." in detail["ruling_text"]
+    # The trailing Footnotes <h2> section is outside the ruling section.
+    assert "Not part of the ruling body." not in detail["ruling_text"]
+
+
+def test_parse_detail_page_jcc_body_without_tentative_ruling_heading() -> None:
+    """Regression (#4598): a jcc-body__main-text div lacking the ruling heading.
+
+    When the <h2>Tentative Ruling</h2> heading is absent the ruling section is
+    empty, so pdf_url / ruling_text / ruling_text_html stay None.  Exercises the
+    no-heading return in _ruling_section_paragraphs.
+    """
+    html = (
+        '<html><body><div class="jcc-body__main-text">'
+        "<h2>Case Number</h2><p><span>L24-08888</span></p>"
+        "<h2>Case Type</h2><p>Civil</p>"
+        "</div></body></html>"
+    )
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is None
+    assert detail["ruling_text"] is None
+    assert detail["ruling_text_html"] is None
+
+
+def test_parse_detail_page_legacy_field_name_body_fallback() -> None:
+    """Regression (#4598): archived pages still use the old field--name-body div.
+
+    The parser must fall back to <div class="field--name-body"> when
+    jcc-body__main-text is absent, so older S3-archived detail pages reingest
+    correctly.
+    """
+    html = _load_html("detail_l24-04564_legacy.html")
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is not None
+    assert detail["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+
+    assert detail["ruling_text"] is not None
+    assert "Before the Court are a demurrer" in detail["ruling_text"]
+    assert "Tentative Ruling PDF" not in detail["ruling_text"]
+
+    assert detail["ruling_text_html"] is not None
+    assert detail["judge_name"] == "BENJAMIN REYES"
+
+
+def test_parse_detail_page_paragraphs_wrapped_in_container() -> None:
+    """Robustness (#4598): ruling <p> wrapped in a container <div>.
+
+    If a future portal theming change nests the ruling paragraphs inside a
+    container element (e.g. a styling <div>) after the <h2>Tentative Ruling</h2>
+    heading, _ruling_section_paragraphs must still descend into the container to
+    find the PDF link and body text — capture reliability is the top priority,
+    so a container change must not silently drop the ruling.
+    """
+    html = (
+        "<html><body><article>"
+        '<div class="jcc-body__main-text usa-prose clearfix">'
+        "<h2>Case Number</h2><p><span>L24-04564</span></p>"
+        "<h2>Tentative Ruling</h2>"
+        '<div class="ruling-wrapper">'
+        '<p><a href="/system/files/general/16_012925.pdf">Tentative Ruling PDF</a></p>'
+        "<p>Before the Court are a demurrer and motion to strike.</p>"
+        "<p>The motion to strike is GRANTED.</p>"
+        "</div>"
+        "</div>"
+        '<aside class="jcc-body__aside"><h4>BENJAMIN REYES</h4></aside>'
+        '<aside class="usa-footer">'
+        '<a href="/system/files/traffic/tr-320-info.pdf">Traffic</a></aside>'
+        "</article></body></html>"
+    )
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is not None
+    assert detail["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+    assert "/traffic/" not in detail["pdf_url"]
+
+    assert detail["ruling_text"] is not None
+    assert "Before the Court are a demurrer" in detail["ruling_text"]
+    # The PDF-link paragraph text must be excluded from the ruling body.
+    assert "Tentative Ruling PDF" not in detail["ruling_text"]
+
+    assert detail["ruling_text_html"] is not None
+    assert detail["judge_name"] == "BENJAMIN REYES"
+
+
+def test_parse_detail_page_nested_h2_boundary_inside_wrapper() -> None:
+    """Robustness (#4598): the next <h2> ends the section even when nested.
+
+    If a future portal theming change wraps a *section* in a container <div>
+    (``<h2>Tentative Ruling</h2><div>...<h2>Footnotes</h2>...</div>``), the
+    document-order traversal in _ruling_section_paragraphs must stop at that
+    inner <h2> rather than leaking the following section's paragraphs into the
+    ruling body.  Uses find_all_next() (not find_next_siblings()) so the
+    boundary is detected regardless of nesting depth.
+    """
+    html = (
+        "<html><body><article>"
+        '<div class="jcc-body__main-text usa-prose clearfix">'
+        "<h2>Case Number</h2><p><span>L24-04564</span></p>"
+        "<h2>Tentative Ruling</h2>"
+        '<div class="section-wrapper">'
+        '<p><a href="/system/files/general/16_012925.pdf">Tentative Ruling PDF</a></p>'
+        "<p>Before the Court are a demurrer and motion to strike.</p>"
+        "<h2>Footnotes</h2>"
+        "<p>This footnote text should NOT be captured.</p>"
+        "</div>"
+        "</div>"
+        '<aside class="jcc-body__aside"><h4>BENJAMIN REYES</h4></aside>'
+        '<aside class="usa-footer">'
+        '<a href="/system/files/traffic/tr-320-info.pdf">Traffic</a></aside>'
+        "</article></body></html>"
+    )
+    detail = _parse_detail_page(html)
+
+    assert detail["pdf_url"] is not None
+    assert detail["pdf_url"].endswith("/system/files/general/16_012925.pdf")
+    assert "/traffic/" not in detail["pdf_url"]
+
+    assert detail["ruling_text"] is not None
+    assert "Before the Court are a demurrer" in detail["ruling_text"]
+    # The nested <h2>Footnotes</h2> ends the ruling section — its paragraph
+    # must not leak into the ruling body.
+    assert "This footnote text should NOT be captured." not in detail["ruling_text"]
+    assert "Tentative Ruling PDF" not in detail["ruling_text"]
+
+    assert detail["ruling_text_html"] is not None
+    assert detail["judge_name"] == "BENJAMIN REYES"
+
+
 # ---------------------------------------------------------------------------
 # 6. test_cc_dept_from_filename
 # ---------------------------------------------------------------------------
@@ -261,12 +451,15 @@ def test_fetch_documents_filters_test_entries_and_emits_skip_log() -> None:
     pdf_bytes = _load_bytes("sample.pdf")
     detail_html = _load_html("detail_l24-04564.html")
 
-    # Stub the form
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=devine_only_form))
-    # Stub the listing
+    # Stub the per-judge listing FIRST so the params-specific route claims
+    # the listing fetch before the no-param form route (FORM_URL == LISTING_URL
+    # since #4591 — respx matches routes in registration order, and a
+    # params-less route matches any request to the same path).
     respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    # Stub the form (judge dropdown) — the params-less fetch falls through here.
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=devine_only_form))
     # Stub detail pages for valid entries
     for slug in ["c22-01620", "c24-00123", "l23-05678", "n25-1234"]:
         respx.get(f"{BASE_URL}/tentative-ruling/{slug}").mock(
@@ -325,10 +518,11 @@ def test_fetch_documents_archives_envelope_with_pdf_and_detail_html() -> None:
     detail_html_bytes = _load_bytes("detail_l24-04564.html")
     pdf_bytes = _load_bytes("sample.pdf")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "245"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
     respx.get(f"{BASE_URL}/tentative-ruling/l24-04564").mock(
         return_value=httpx.Response(200, content=detail_html_bytes)
     )
@@ -381,10 +575,11 @@ def test_fetch_documents_handles_empty_judge_listing() -> None:
     )
     empty_listing_html = _load_html("listing_empty.html")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=weil_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
         return_value=httpx.Response(200, text=empty_listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=weil_only_form))
 
     config = portal_default_config()
     config = config.model_copy(update={"request_delay_seconds": 0.0})
@@ -411,10 +606,11 @@ def test_fetch_documents_handles_new_judge_id_in_dropdown() -> None:
     )
     empty_listing_html = _load_html("listing_empty.html")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=form_with_new_judge))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "999"}).mock(
         return_value=httpx.Response(200, text=empty_listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=form_with_new_judge))
 
     config = portal_default_config()
     config = config.model_copy(update={"request_delay_seconds": 0.0})
@@ -447,10 +643,11 @@ def test_scraper_extracts_fields_civil_limited_probate() -> None:
     detail_html_bytes = _load_bytes("detail_l24-04564.html")
     pdf_bytes = _load_bytes("sample.pdf")
 
-    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
+    # Params-specific listing route first (FORM_URL == LISTING_URL since #4591).
     respx.get(LISTING_URL, params={"field_judge_target_id": "245"}).mock(
         return_value=httpx.Response(200, text=listing_html)
     )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=reyes_only_form))
     respx.get(f"{BASE_URL}/tentative-ruling/l24-04564").mock(
         return_value=httpx.Response(200, content=detail_html_bytes)
     )
@@ -755,3 +952,58 @@ def test_coerce_hearing_date_none_returns_none() -> None:
 
 def test_coerce_hearing_date_garbage_string_returns_none() -> None:
     assert _coerce_hearing_date("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# 16. Judge-discovery URL contract + loud-failure regression tests (#4591)
+# ---------------------------------------------------------------------------
+
+
+def test_form_url_points_at_live_listing_page() -> None:
+    """FORM_URL must target the live listing page that carries the dropdown (#4591).
+
+    The judge dropdown migrated off the now-restricted
+    ``/test-page-tentative-rulings`` page (which returns an access-denied
+    200 body with no ``<select>``) onto the live ``/tentative-rulings``
+    page.  Pinning ``FORM_URL == LISTING_URL`` is the test that would have
+    caught the all-time-zero-capture regression; the prior tests mocked
+    ``FORM_URL`` so they passed regardless of its value.
+    """
+    assert FORM_URL != f"{BASE_URL}/test-page-tentative-rulings"
+    assert FORM_URL == LISTING_URL
+
+
+@respx.mock
+def test_fetch_documents_logs_error_when_no_judges() -> None:
+    """An access-denied-style page (no dropdown) returns [] and logs at error level (#4591).
+
+    Pre-#4591 this logged a ``warning`` and returned ``[]`` silently, so
+    the zero-record / scraper-health alerting never fired and the total
+    coverage failure went undetected for the whole dual-run period.
+    Upgrading ``cc_portal.no_judges_found`` to ``error`` makes the
+    breakage loud while still not raising (an exception would abort the
+    whole 17-scraper run).
+    """
+    access_denied_html = (
+        "<html><body><h1>Access Denied</h1>"
+        "<p>This page requires authorization to access.</p>"
+        "</body></html>"
+    )
+
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=access_denied_html))
+
+    config = portal_default_config()
+    config = config.model_copy(update={"request_delay_seconds": 0.0})
+    scraper = CCTentativesPortalScraper(config=config)
+
+    with structlog.testing.capture_logs() as cap:
+        docs = scraper.fetch_documents()
+
+    assert docs == []
+
+    no_judges_events = [e for e in cap if e.get("event") == "cc_portal.no_judges_found"]
+    assert len(no_judges_events) == 1, (
+        f"Expected 1 cc_portal.no_judges_found event, got {len(no_judges_events)}: "
+        f"{no_judges_events}"
+    )
+    assert no_judges_events[0].get("log_level") == "error"

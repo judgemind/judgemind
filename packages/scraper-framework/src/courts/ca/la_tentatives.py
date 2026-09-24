@@ -92,6 +92,9 @@ from framework.llm_extractor import (
     _ROLE_LITERAL_TITLE_RE as _ROLE_LITERAL_TITLE_RE,
 )
 from framework.llm_extractor import (
+    _is_role_literal_title as _is_role_literal_title,
+)
+from framework.llm_extractor import (
     _rebuild_title_from_parties as _rebuild_title_from_parties,
 )
 from framework.llm_utils import parse_llm_json
@@ -683,8 +686,7 @@ def _llm_extract_rulings(
 
         case_title = entry.get("extracted_case_title")
         if case_title and (
-            _ROLE_LITERAL_TITLE_RE.match(case_title)
-            or _BRACKETED_PLACEHOLDER_TITLE_RE.search(case_title)
+            _is_role_literal_title(case_title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(case_title)
         ):
             rebuilt = _rebuild_title_from_parties(case_title, parties)
             if rebuilt is not None:

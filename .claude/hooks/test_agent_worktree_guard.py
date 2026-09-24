@@ -155,7 +155,7 @@ run_test(
 
 run_test(
     "Agent with isolation:none from worktree allowed",
-    {"prompt": "/tdd", "isolation": "none"},
+    {"prompt": "/ralph", "isolation": "none"},
     0,
     cwd_override=SYNTHETIC_WORKTREE,
 )

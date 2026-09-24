@@ -8,6 +8,7 @@ import respx
 
 from framework.turnstile_solver import (
     CAPSOLVER_API_BASE,
+    get_balance,
     solve_turnstile,
 )
 
@@ -385,3 +386,73 @@ class TestSolveTurnstileExplicitKeyBeatsEnv:
         assert token == "TOK"
         body = _json.loads(create.calls[0].request.content)
         assert body["clientKey"] == "explicit-key"
+
+
+class TestGetBalance:
+    """get_balance reports CAPSolver key validity + remaining credit (#4638)."""
+
+    @pytest.mark.asyncio
+    async def test_valid_response_returns_balance(self) -> None:
+        """errorId 0 with a balance -> valid=True, balance parsed."""
+        with respx.mock(base_url=CAPSOLVER_API_BASE) as router:
+            router.post("/getBalance").mock(
+                return_value=httpx.Response(200, json={"errorId": 0, "balance": 12.5})
+            )
+            result = await get_balance(API_KEY)
+        assert result.valid is True
+        assert result.balance == 12.5
+        assert result.error_code is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_key_400_body_reports_error_code(self) -> None:
+        """The #4633 invalid-key response — HTTP 400 with an errorId body."""
+        with respx.mock(base_url=CAPSOLVER_API_BASE) as router:
+            router.post("/getBalance").mock(
+                return_value=httpx.Response(
+                    400,
+                    json={
+                        "errorId": 1,
+                        "errorCode": "ERROR_KEY_DOES_NOT_EXIST",
+                        "errorDescription": "clientKey is invalid",
+                    },
+                )
+            )
+            result = await get_balance(API_KEY)
+        assert result.valid is False
+        assert result.error_code == "ERROR_KEY_DOES_NOT_EXIST"
+        assert result.error_description == "clientKey is invalid"
+
+    @pytest.mark.asyncio
+    async def test_empty_key_makes_no_api_call(self) -> None:
+        """Empty key -> valid=False without hitting the API."""
+        with respx.mock(base_url=CAPSOLVER_API_BASE, assert_all_called=False) as router:
+            route = router.post("/getBalance").mock(
+                return_value=httpx.Response(200, json={"errorId": 0, "balance": 1.0})
+            )
+            result = await get_balance("")
+        assert result.valid is False
+        assert result.balance is None
+        assert not route.called
+
+    @pytest.mark.asyncio
+    async def test_none_key_makes_no_api_call(self) -> None:
+        """None key -> valid=False without hitting the API."""
+        result = await get_balance(None)
+        assert result.valid is False
+
+    @pytest.mark.asyncio
+    async def test_http_error_returns_invalid(self) -> None:
+        """A transport-level error -> valid=False with a detail string."""
+        with respx.mock(base_url=CAPSOLVER_API_BASE) as router:
+            router.post("/getBalance").mock(side_effect=httpx.ConnectError("boom"))
+            result = await get_balance(API_KEY)
+        assert result.valid is False
+        assert result.error_description is not None
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_invalid(self) -> None:
+        """A non-JSON body -> valid=False."""
+        with respx.mock(base_url=CAPSOLVER_API_BASE) as router:
+            router.post("/getBalance").mock(return_value=httpx.Response(200, text="not json"))
+            result = await get_balance(API_KEY)
+        assert result.valid is False

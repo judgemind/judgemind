@@ -3699,6 +3699,52 @@ class TestReadS3KeyListFile:
         with pytest.raises(FileNotFoundError):
             reingest._read_s3_key_list_file(str(path))
 
+    def test_s3_uri_reads_keys_from_s3(self) -> None:
+        """An ``s3://bucket/key`` URI fetches the keylist body from S3 and
+        applies the same parsing semantics as a local file."""
+        body_mock = MagicMock()
+        body_mock.read.return_value = (
+            b"# extracted from #3855 spotcheck\n"
+            b"ca/orange/superior_court/raw/aaa.pdf\n"
+            b"\n"
+            b"  ca/orange/superior_court/raw/bbb.pdf  \n"
+            b"ca/orange/superior_court/raw/aaa.pdf\n"
+        )
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": body_mock}
+        with patch.object(reingest.boto3, "client", return_value=s3) as mock_client:
+            keys = reingest._read_s3_key_list_file(
+                "s3://judgemind-assets-dev/keylists/orange-78.txt"
+            )
+        assert keys == [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_client.assert_called_once_with("s3")
+        s3.get_object.assert_called_once_with(
+            Bucket="judgemind-assets-dev",
+            Key="keylists/orange-78.txt",
+        )
+
+    def test_s3_uri_empty_object_raises_value_error(self) -> None:
+        """An s3:// object whose body is empty (or all comments/blanks) raises
+        ValueError, matching the local-file fail-loud behavior."""
+        body_mock = MagicMock()
+        body_mock.read.return_value = b"# only comments\n\n   \n"
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": body_mock}
+        with patch.object(reingest.boto3, "client", return_value=s3):
+            with pytest.raises(ValueError, match="empty"):
+                reingest._read_s3_key_list_file("s3://bucket/keylists/empty.txt")
+
+    def test_s3_uri_without_key_raises_value_error(self) -> None:
+        """A malformed ``s3://bucket-only`` URI with no key component raises a
+        clear ValueError before any S3 call is made."""
+        with patch.object(reingest.boto3, "client") as mock_client:
+            with pytest.raises(ValueError, match="s3://"):
+                reingest._read_s3_key_list_file("s3://bucket-only")
+        mock_client.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Cursor minimum values
@@ -6356,6 +6402,10 @@ class TestProgressLogging:
             "output_tokens",
             "llm_api_calls",
             "estimated_cost_usd",
+            # error_ratio is always added to the run_reingest stats so the
+            # --max-error-ratio exit gate (#4619) can read it; it is
+            # total_failed/(total_processed+total_failed), 0.0 when denom 0.
+            "error_ratio",
             # judge_prepass_complete is appended when the pre-pass runs
             # (default behaviour, #4408).  The pre-pass is skipped only
             # under ``dry_run=True`` or ``skip_judge_prepass=True`` —
@@ -12185,6 +12235,287 @@ class TestRunReingestFromPrefix:
     @patch("reingest_from_s3._seed_courts")
     @patch("reingest_from_s3._discover_courts")
     @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_intersects_listed_keys(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """#3855/#4049: ``s3_key_list`` narrows the prefix scan to the
+        intersection of S3-listed keys and the requested list; requested
+        keys not found under the prefix are dropped."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        # Request two real keys + one that does not exist under the prefix.
+        requested = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/missing.pdf",
+        ]
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=requested,
+            dry_run=True,
+        )
+        # Only the 2 keys present under the prefix survive the intersection.
+        assert stats["total_keys"] == 2
+        # _discover_courts must receive the narrowed set, not the full prefix.
+        discovered_keys = mock_discover.call_args[0][0]
+        assert set(discovered_keys) == {
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        }
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_none_processes_full_prefix(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``s3_key_list=None`` leaves prefix behavior unchanged: every key
+        under the prefix is processed."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=None,
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 3
+        discovered_keys = mock_discover.call_args[0][0]
+        assert set(discovered_keys) == set(keys)
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_empty_processes_full_prefix(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """An empty ``s3_key_list`` is treated like ``None`` (full prefix)."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=[],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_dry_run_reports_narrowed_total(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """``--dry-run`` with ``--prefix --s3-key-list`` reports the narrowed
+        ``total_keys`` (the intersection count), not the full prefix size."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/ddd.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=["ca/orange/superior_court/raw/bbb.pdf"],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 1
+        assert stats["processed"] == 0
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_applied_before_limit(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """The intersection happens BEFORE ``--limit`` truncation, so limit
+        applies to the narrowed set."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+            "ca/orange/superior_court/raw/ccc.pdf",
+            "ca/orange/superior_court/raw/ddd.pdf",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=[
+                "ca/orange/superior_court/raw/bbb.pdf",
+                "ca/orange/superior_court/raw/ccc.pdf",
+                "ca/orange/superior_court/raw/ddd.pdf",
+            ],
+            limit=2,
+            dry_run=True,
+        )
+        # Intersection narrows to 3, then limit caps to 2.
+        assert stats["total_keys"] == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_s3_key_list_no_matches_returns_zeros(
+        self,
+        mock_psycopg: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """When none of the requested keys are found under the prefix, the
+        narrowed set is empty and the function returns zeros early."""
+        mock_list.return_value = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="ca/orange/superior_court/raw/",
+            s3_key_list=["ca/orange/superior_court/raw/nope.pdf"],
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 0
+        assert stats["processed"] == 0
+        assert stats["errors"] == 0
+        assert stats["skipped"] == 0
+        # The no-match early return honors the function's documented return
+        # schema (hash_mismatch_warnings + wall_time_seconds) so any
+        # programmatic consumer can read these keys without a KeyError.
+        assert stats["hash_mismatch_warnings"] == 0
+        assert stats["wall_time_seconds"] == 0.0
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
     def test_limit_caps_keys(
         self,
         mock_psycopg: MagicMock,
@@ -13386,6 +13717,67 @@ class TestCLIBustLlmCacheFlag:
         assert mock_run.call_args.kwargs["bust_llm_cache"] is False
 
 
+class TestCLIPrefixS3KeyListPlumbing:
+    """#3855/#4049: main() forwards --s3-key-list into the --prefix path."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    @patch("reingest_from_s3._read_s3_key_list_file")
+    def test_main_passes_s3_key_list_to_prefix(
+        self,
+        mock_read: MagicMock,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """``--prefix`` + ``--s3-key-list`` forwards the parsed key list to
+        ``run_reingest_from_prefix`` (mirrors the standard-mode plumbing test
+        ``test_s3_key_list_filter_passed_through``)."""
+        keys = [
+            "ca/orange/superior_court/raw/aaa.pdf",
+            "ca/orange/superior_court/raw/bbb.pdf",
+        ]
+        mock_read.return_value = keys
+        mock_run_prefix.return_value = {
+            "total_keys": 2,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "ca/orange/superior_court/raw/",
+            "--s3-key-list",
+            "keys.txt",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run_prefix.assert_called_once()
+        assert mock_run_prefix.call_args.kwargs["s3_key_list"] == keys
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_main_prefix_without_key_list_forwards_none(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """``--prefix`` alone forwards ``s3_key_list=None`` (unchanged behavior)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 0,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "ca/orange/superior_court/raw/",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run_prefix.assert_called_once()
+        assert mock_run_prefix.call_args.kwargs["s3_key_list"] is None
+
+
 class TestBustLlmCachePassedThrough:
     """#2424: bust_llm_cache flows from run_reingest → reingest_batch → parse."""
 
@@ -14390,3 +14782,941 @@ class TestFullReparsePassesPdfBytesToSplitter:
             )
         finally:
             reingest._LLM_SPLIT_REGISTRY.pop(scraper_id, None)
+
+
+# ---------------------------------------------------------------------------
+# #4619 — reingest --prefix should surface partial failure.  These tests cover
+# the per-key error tracking + error-class capture, the loud WARNING summary,
+# the --max-error-ratio threshold-gated non-zero exit, and the optional
+# failed-keys S3 manifest.
+# ---------------------------------------------------------------------------
+
+
+class TestEmitPartialFailureWarning:
+    """Unit tests for the _emit_partial_failure_warning helper (#4619)."""
+
+    def test_returns_ratio_and_warns_when_errors(self) -> None:
+        from collections import Counter
+
+        mock_logger = MagicMock()
+        with patch.object(reingest, "logger", mock_logger):
+            ratio = reingest._emit_partial_failure_warning(
+                errors=3,
+                total=10,
+                error_classes=Counter({"BrokenProcessPool": 2, "ValueError": 1}),
+                context="reingest",
+            )
+        assert ratio == pytest.approx(0.3)
+        mock_logger.warning.assert_called_once()
+        kwargs = mock_logger.warning.call_args.kwargs
+        assert kwargs["errors"] == 3
+        assert kwargs["total"] == 10
+        assert kwargs["error_ratio"] == pytest.approx(0.3)
+        assert kwargs["top_error_class"] == "BrokenProcessPool"
+
+    def test_no_warning_when_zero_errors(self) -> None:
+        mock_logger = MagicMock()
+        with patch.object(reingest, "logger", mock_logger):
+            ratio = reingest._emit_partial_failure_warning(
+                errors=0,
+                total=10,
+                error_classes=None,
+                context="reingest",
+            )
+        assert ratio == 0.0
+        mock_logger.warning.assert_not_called()
+
+    def test_zero_total_returns_zero(self) -> None:
+        mock_logger = MagicMock()
+        with patch.object(reingest, "logger", mock_logger):
+            ratio = reingest._emit_partial_failure_warning(
+                errors=0,
+                total=0,
+                error_classes=None,
+            )
+        assert ratio == 0.0
+        mock_logger.warning.assert_not_called()
+
+    def test_top_error_class_none_without_classes(self) -> None:
+        mock_logger = MagicMock()
+        with patch.object(reingest, "logger", mock_logger):
+            ratio = reingest._emit_partial_failure_warning(
+                errors=2,
+                total=4,
+                error_classes=None,
+            )
+        assert ratio == pytest.approx(0.5)
+        assert mock_logger.warning.call_args.kwargs["top_error_class"] is None
+
+
+class TestParseS3Uri:
+    """Unit tests for the _parse_s3_uri helper (#4619)."""
+
+    def test_parses_bucket_and_key(self) -> None:
+        bucket, key = reingest._parse_s3_uri("s3://my-bucket/path/to/keys.txt")
+        assert bucket == "my-bucket"
+        assert key == "path/to/keys.txt"
+
+    def test_rejects_non_s3_uri(self) -> None:
+        with pytest.raises(ValueError):
+            reingest._parse_s3_uri("/local/path.txt")
+
+    def test_rejects_missing_key(self) -> None:
+        with pytest.raises(ValueError):
+            reingest._parse_s3_uri("s3://bucket-only")
+
+
+class TestProcessPrefixDocumentErrorClass:
+    """_process_prefix_document populates error_class (#4619)."""
+
+    def test_error_class_none_on_skip_invalid_key(self) -> None:
+        result = reingest._process_prefix_document(
+            "invalid/key",
+            "test-bucket",
+            "postgresql://test",
+            "redis://localhost:6379",
+            "",
+        )
+        assert result["status"] == "skip"
+        assert result["error_class"] is None
+
+    def test_error_class_set_on_s3_fetch_failure(self) -> None:
+        key = "federal/federal/courtlistener/raw/abc123.html"
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = KeyError("boom")
+
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        with patch("framework.s3_cache.make_s3_client", return_value=mock_s3):
+            result = reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+        assert result["status"] == "error"
+        assert result["error_class"] == "KeyError"
+
+    def test_error_class_set_on_worker_raises(self) -> None:
+        content = b"<html>ok</html>"
+        key_hash = hashlib.sha256(content).hexdigest()
+        key = f"federal/federal/courtlistener/raw/{key_hash}.html"
+
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = content
+        mock_s3.get_object.return_value = {"Body": body}
+
+        mock_worker = MagicMock()
+        mock_worker.process_event.side_effect = ValueError("bad extract")
+
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+        ):
+            result = reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+        assert result["status"] == "error"
+        assert result["error_class"] == "ValueError"
+
+    def test_error_class_none_on_success(self) -> None:
+        content = b"<html>ok</html>"
+        key_hash = hashlib.sha256(content).hexdigest()
+        key = f"federal/federal/courtlistener/raw/{key_hash}.html"
+
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = content
+        mock_s3.get_object.return_value = {"Body": body}
+
+        mock_worker = MagicMock()
+        mock_worker.process_event = MagicMock()
+
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+        ):
+            result = reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+        assert result["status"] == "ok"
+        assert result["error_class"] is None
+
+
+class TestPrefixPartialFailureStats:
+    """run_reingest_from_prefix surfaces error_ratio / top class / failed_keys
+    and writes the failed-keys manifest (#4619)."""
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_partial_failure_surfaces_ratio_and_top_class(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+            "federal/federal/courtlistener/raw/ccc333.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {
+            "status": "ok",
+            "hash_mismatch": False,
+            "error_class": None,
+        }
+        future2 = MagicMock()
+        future2.result.return_value = {
+            "status": "error",
+            "hash_mismatch": False,
+            "error_class": "BrokenProcessPool",
+        }
+        future3 = MagicMock()
+        future3.result.return_value = {
+            "status": "error",
+            "hash_mismatch": False,
+            "error_class": "BrokenProcessPool",
+        }
+        pool.submit.side_effect = [future1, future2, future3]
+
+        # Map each future back to its key so failed_keys is populated in
+        # submit order (futures patched into as_completed in the same order).
+        futures_map = {future1: keys[0], future2: keys[1], future3: keys[2]}
+
+        mock_logger = MagicMock()
+        # ``skip_judge_prepass=True`` — see test_processes_documents_with_pool
+        # and #4449.
+        with (
+            patch(
+                "reingest_from_s3.as_completed",
+                return_value=[future1, future2, future3],
+            ),
+            patch.object(reingest, "logger", mock_logger),
+        ):
+            # Patch the dict comprehension's submit/key mapping by making
+            # submit return our futures; run_reingest_from_prefix builds the
+            # futures->key dict itself from the keys list, so the ordering is
+            # preserved.
+            _ = futures_map
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+                skip_judge_prepass=True,
+            )
+
+        assert stats["errors"] == 2
+        assert stats["error_ratio"] == pytest.approx(2 / 3)
+        assert stats["top_error_class"] == "BrokenProcessPool"
+        assert set(stats["failed_keys"]) == {keys[1], keys[2]}
+
+        warn_calls = mock_logger.warning.call_args_list
+        partial_warnings = [
+            call for call in warn_calls if call.kwargs.get("top_error_class") == "BrokenProcessPool"
+        ]
+        assert partial_warnings, (
+            f"expected partial-failure warning with top_error_class. Got: {warn_calls!r}"
+        )
+        assert partial_warnings[0].kwargs["error_ratio"] == pytest.approx(2 / 3, abs=1e-3)
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_future_raising_counts_as_error_with_class(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """A future that raises (e.g. BrokenProcessPool) is tallied as an
+        error and its exception class name is captured in error_classes."""
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {
+            "status": "ok",
+            "hash_mismatch": False,
+            "error_class": None,
+        }
+        future2 = MagicMock()
+        future2.result.side_effect = RuntimeError("pool died")
+        pool.submit.side_effect = [future1, future2]
+
+        with patch(
+            "reingest_from_s3.as_completed",
+            return_value=[future1, future2],
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+                skip_judge_prepass=True,
+            )
+
+        assert stats["errors"] == 1
+        assert stats["top_error_class"] == "RuntimeError"
+        assert len(stats["failed_keys"]) == 1
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_writes_failed_manifest_when_failures(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        s3_client = MagicMock()
+        mock_boto3.client.return_value = s3_client
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {
+            "status": "ok",
+            "hash_mismatch": False,
+            "error_class": None,
+        }
+        future2 = MagicMock()
+        future2.result.return_value = {
+            "status": "error",
+            "hash_mismatch": False,
+            "error_class": "ValueError",
+        }
+        pool.submit.side_effect = [future1, future2]
+
+        with patch(
+            "reingest_from_s3.as_completed",
+            return_value=[future1, future2],
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+                skip_judge_prepass=True,
+                write_failed_manifest="s3://manifest-bucket/failed/keys.txt",
+            )
+
+        assert stats["errors"] == 1
+        put_calls = [
+            call
+            for call in s3_client.put_object.call_args_list
+            if call.kwargs.get("Bucket") == "manifest-bucket"
+        ]
+        assert put_calls, (
+            f"expected put_object to manifest-bucket. Got: {s3_client.put_object.call_args_list!r}"
+        )
+        call = put_calls[0]
+        assert call.kwargs["Key"] == "failed/keys.txt"
+        body = call.kwargs["Body"]
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        assert body == "\n".join(stats["failed_keys"]) + "\n"
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_no_manifest_when_no_failures(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        s3_client = MagicMock()
+        mock_boto3.client.return_value = s3_client
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {
+            "status": "ok",
+            "hash_mismatch": False,
+            "error_class": None,
+        }
+        future2 = MagicMock()
+        future2.result.return_value = {
+            "status": "ok",
+            "hash_mismatch": False,
+            "error_class": None,
+        }
+        pool.submit.side_effect = [future1, future2]
+
+        with patch(
+            "reingest_from_s3.as_completed",
+            return_value=[future1, future2],
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+                skip_judge_prepass=True,
+                write_failed_manifest="s3://manifest-bucket/failed/keys.txt",
+            )
+
+        assert stats["errors"] == 0
+        manifest_calls = [
+            call
+            for call in s3_client.put_object.call_args_list
+            if call.kwargs.get("Bucket") == "manifest-bucket"
+        ]
+        assert not manifest_calls
+
+
+class TestPrefixMaxErrorRatioExit:
+    """main() exit-code gating via --max-error-ratio (#4619)."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_no_flag_partial_failure_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """No --max-error-ratio: partial failure must NOT raise SystemExit
+        (backward-compatible exit 0)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 10,
+            "processed": 6,
+            "errors": 4,
+            "skipped": 0,
+            "error_ratio": 0.4,
+        }
+        argv = ["reingest_from_s3", "--prefix", "x/"]
+        with patch("sys.argv", argv):
+            reingest.main()  # must not raise
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_above_threshold_exits_nonzero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        mock_run_prefix.return_value = {
+            "total_keys": 10,
+            "processed": 5,
+            "errors": 5,
+            "skipped": 0,
+            "error_ratio": 0.5,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "x/",
+            "--max-error-ratio",
+            "0.05",
+        ]
+        with patch("sys.argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                reingest.main()
+        assert exc.value.code == 1
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_below_threshold_no_exit(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        mock_run_prefix.return_value = {
+            "total_keys": 10,
+            "processed": 7,
+            "errors": 3,
+            "skipped": 0,
+            "error_ratio": 0.3,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "x/",
+            "--max-error-ratio",
+            "0.5",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # below threshold → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_all_success_with_zero_threshold_no_exit(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """error_ratio 0.0 with --max-error-ratio 0.0 must NOT exit (strictly
+        greater-than semantics)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 10,
+            "processed": 10,
+            "errors": 0,
+            "skipped": 0,
+            "error_ratio": 0.0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "x/",
+            "--max-error-ratio",
+            "0.0",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # all-success → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_write_failed_manifest_threaded_into_prefix(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        mock_run_prefix.return_value = {
+            "total_keys": 0,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "error_ratio": 0.0,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "x/",
+            "--write-failed-manifest",
+            "s3://b/k",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()
+        assert mock_run_prefix.call_args.kwargs["write_failed_manifest"] == "s3://b/k"
+
+
+class TestStandardModeErrorRatioExit:
+    """main() standard (DB-row) mode threshold gating + run_reingest
+    error_ratio surfacing (#4619)."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_standard_above_threshold_exits_nonzero(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        mock_run.return_value = {
+            "total_processed": 5,
+            "total_updated": 5,
+            "total_llm_skipped": 0,
+            "error_ratio": 0.5,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--county",
+            "Fresno",
+            "--max-error-ratio",
+            "0.1",
+        ]
+        with patch("sys.argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                reingest.main()
+        assert exc.value.code == 1
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_standard_no_flag_partial_failure_exits_zero(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        mock_run.return_value = {
+            "total_processed": 5,
+            "total_updated": 5,
+            "total_llm_skipped": 0,
+            "error_ratio": 0.5,
+        }
+        argv = ["reingest_from_s3", "--county", "Fresno"]
+        with patch("sys.argv", argv):
+            reingest.main()  # must not raise
+
+
+class TestResolveEffectiveMaxErrorRatio:
+    """Unit tests for the #4624 effective-threshold resolver.
+
+    Pinpoints the decision logic that makes the partial-failure exit gate the
+    default for --bust-llm-cache prefix reingests while leaving every other
+    path's exit-code contract untouched (#4619).
+    """
+
+    def test_cache_bust_prefix_defaults_to_gate(self) -> None:
+        """The headline #4624 behavior: a --bust-llm-cache prefix reingest with
+        no explicit threshold defaults to the 10% gate."""
+        result = reingest._resolve_effective_max_error_ratio(
+            explicit_max_error_ratio=None,
+            no_fail_on_errors=False,
+            prefix="orange/",
+            bust_llm_cache=True,
+        )
+        assert result == reingest._DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO
+        assert result == 0.10
+
+    def test_prefix_without_bust_is_unchanged(self) -> None:
+        """A prefix reingest WITHOUT --bust-llm-cache keeps the opt-in
+        contract — no default gate."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=False,
+            )
+            is None
+        )
+
+    def test_bust_without_prefix_is_unchanged(self) -> None:
+        """--bust-llm-cache in standard (no --prefix) mode keeps the opt-in
+        contract — the default gate is scoped to the prefix path only."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix=None,
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+    def test_standard_mode_is_unchanged(self) -> None:
+        """Plain standard mode (no prefix, no bust) keeps the opt-in
+        contract."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=False,
+                prefix=None,
+                bust_llm_cache=False,
+            )
+            is None
+        )
+
+    def test_explicit_threshold_wins_over_default(self) -> None:
+        """An explicit --max-error-ratio always wins, even on the cache-bust
+        prefix path that would otherwise default to 0.10."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.5,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            == 0.5
+        )
+
+    def test_explicit_zero_threshold_wins(self) -> None:
+        """An explicit --max-error-ratio 0.0 (fail on any error) is honored,
+        not swallowed by the default — 0.0 is not None."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.0,
+                no_fail_on_errors=False,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            == 0.0
+        )
+
+    def test_no_fail_on_errors_opts_out_of_default(self) -> None:
+        """--no-fail-on-errors disables the cache-bust prefix default."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=None,
+                no_fail_on_errors=True,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+    def test_no_fail_on_errors_overrides_explicit_threshold(self) -> None:
+        """--no-fail-on-errors overrides --max-error-ratio when both are
+        passed — the opt-out always wins."""
+        assert (
+            reingest._resolve_effective_max_error_ratio(
+                explicit_max_error_ratio=0.05,
+                no_fail_on_errors=True,
+                prefix="orange/",
+                bust_llm_cache=True,
+            )
+            is None
+        )
+
+
+class TestCacheBustPrefixDefaultGateExit:
+    """main() exit-code gating for the #4624 default-on cache-bust prefix
+    gate.  Exercises the full main() dispatch, not just the resolver."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_fires_on_cache_bust_partial_failure(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """The headline regression: --prefix + --bust-llm-cache with a partial
+        failure above 10% exits non-zero WITHOUT any --max-error-ratio flag."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 601,
+            "errors": 167,
+            "skipped": 0,
+            "error_ratio": 167 / 768,  # ~0.217, the #3855 incident shape
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                reingest.main()
+        assert exc.value.code == 1
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_all_success_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A clean --bust-llm-cache prefix run (error_ratio 0.0) must still
+        exit 0 — the default gate must not break legitimate all-success
+        runs."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 768,
+            "errors": 0,
+            "skipped": 0,
+            "error_ratio": 0.0,
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # all-success → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_default_gate_below_threshold_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A --bust-llm-cache prefix run with a single-key error below the 10%
+        default does NOT exit non-zero (permissive default)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 95,
+            "errors": 5,
+            "skipped": 0,
+            "error_ratio": 0.05,  # below the 0.10 default
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # below default threshold → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_no_fail_on_errors_opts_out_of_default_gate(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """--no-fail-on-errors disables the default gate even on a cache-bust
+        prefix partial failure above 10%."""
+        mock_run_prefix.return_value = {
+            "total_keys": 768,
+            "processed": 601,
+            "errors": 167,
+            "skipped": 0,
+            "error_ratio": 167 / 768,
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "orange/",
+            "--bust-llm-cache",
+            "--no-fail-on-errors",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # opt-out → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_explicit_threshold_overrides_default_gate(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """An explicit --max-error-ratio above the observed ratio keeps a
+        cache-bust prefix run green even though the default 0.10 gate would
+        have failed it."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 85,
+            "errors": 15,
+            "skipped": 0,
+            "error_ratio": 0.15,  # above 0.10 default, below explicit 0.5
+        }
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "orange/",
+            "--bust-llm-cache",
+            "--max-error-ratio",
+            "0.5",
+        ]
+        with patch("sys.argv", argv):
+            reingest.main()  # explicit threshold not exceeded → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_non_cache_bust_prefix_partial_failure_exits_zero(
+        self,
+        mock_run_prefix: MagicMock,
+    ) -> None:
+        """A prefix reingest WITHOUT --bust-llm-cache keeps the #4619 opt-in
+        contract: a partial failure above 10% still exits 0 when no
+        --max-error-ratio is passed (the default gate must NOT leak onto the
+        non-cache-bust prefix path)."""
+        mock_run_prefix.return_value = {
+            "total_keys": 100,
+            "processed": 70,
+            "errors": 30,
+            "skipped": 0,
+            "error_ratio": 0.30,
+        }
+        argv = ["reingest_from_s3", "--prefix", "orange/"]
+        with patch("sys.argv", argv):
+            reingest.main()  # no bust → opt-in contract → no SystemExit
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_standard_mode_with_bust_partial_failure_exits_zero(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        """Standard (DB-row) mode with --bust-llm-cache keeps the #4619 opt-in
+        contract: the default gate is scoped to the prefix path, so a partial
+        failure here still exits 0 without --max-error-ratio."""
+        mock_run.return_value = {
+            "total_processed": 5,
+            "total_updated": 5,
+            "total_llm_skipped": 0,
+            "error_ratio": 0.5,
+        }
+        argv = ["reingest_from_s3", "--county", "Fresno", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()  # standard mode → opt-in contract → no SystemExit

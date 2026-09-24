@@ -78,6 +78,7 @@ from courts.ca.cc_tentatives_portal import _cc_dept_from_filename  # noqa: E402
 from framework.dual_run_diff import (  # noqa: E402
     Capture,
     compute_per_department_diff,
+    compute_total_coverage_signal,
     format_summary,
 )
 
@@ -214,12 +215,22 @@ def _write_metrics_row(
     diff_payload: list[dict[str, Any]],
     missing_portal_count: int,
     now: datetime,
+    portal_total_zero: bool,
+    retired_total: int,
+    portal_total: int,
+    total_coverage_headline: str,
+    agent_actionable: bool,
 ) -> None:
     """Insert one row into ``telemetry.data_quality_metrics``."""
     metadata_obj: dict[str, Any] = {
         "date": target_date.isoformat(),
         "diff": diff_payload,
         "missing_portal_count": missing_portal_count,
+        "portal_total_zero": portal_total_zero,
+        "retired_total": retired_total,
+        "portal_total": portal_total,
+        "total_coverage_headline": total_coverage_headline,
+        "agent_actionable": agent_actionable,
     }
     metadata_json = json.dumps(metadata_obj)
 
@@ -311,6 +322,31 @@ def main(argv: list[str] | None = None) -> int:
 
         missing_portal_count = sum(1 for r in diff_rows if r.flag == "missing_portal")
 
+        # Distinguish a total-coverage failure (portal captured nothing) from
+        # per-department gaps — see issue #4600.
+        signal = compute_total_coverage_signal(diff_rows)
+
+        # Whether this breach is actionable by an autonomous agent (#4631).
+        #
+        # A *per-department gap* (portal is live and capturing current rulings
+        # but misses one or more departments) is a genuine scraper regression
+        # an agent can fix — it stays agent-actionable.
+        #
+        # A *total-coverage failure* (``portal_total_zero`` — portal captured
+        # nothing at all while the retired scraper captured something) is NOT
+        # a per-department regression. During the Phase 2 dual-run, this is the
+        # expected "portal not yet the authoritative publication channel"
+        # signal: the Contra Costa court still publishes current rulings only
+        # on the retired site (the public /online-services/tentative-rulings
+        # page still iframes retired.cc-courts.org), so the portal's Views
+        # endpoint exposes only stale seed data and there is nothing current
+        # for the portal scraper to capture. No agent code change can conjure
+        # data the upstream portal does not serve, so filing it as an
+        # ``agent/ready`` p1 bug just churns the work queue every day. It is
+        # surfaced to humans as a low-priority tracker instead (the workflow
+        # keys issue labels/body on this flag).
+        agent_actionable = missing_portal_count > 0 and not signal.portal_total_zero
+
         # Serialize diff rows for JSON output and metrics storage
         diff_payload: list[dict[str, Any]] = [
             {
@@ -324,7 +360,18 @@ def main(argv: list[str] | None = None) -> int:
             for r in diff_rows
         ]
 
-        _write_metrics_row(conn, target_date, diff_payload, missing_portal_count, now)
+        _write_metrics_row(
+            conn,
+            target_date,
+            diff_payload,
+            missing_portal_count,
+            now,
+            portal_total_zero=signal.portal_total_zero,
+            retired_total=signal.retired_total,
+            portal_total=signal.portal_total,
+            total_coverage_headline=signal.headline,
+            agent_actionable=agent_actionable,
+        )
 
     healthy = missing_portal_count == 0
 
@@ -332,10 +379,15 @@ def main(argv: list[str] | None = None) -> int:
         print(format_summary(diff_rows))
     else:
         payload: dict[str, Any] = {
+            "agent_actionable": agent_actionable,
             "date": target_date.isoformat(),
             "diff": diff_payload,
             "healthy": healthy,
             "missing_portal_count": missing_portal_count,
+            "portal_total": signal.portal_total,
+            "portal_total_zero": signal.portal_total_zero,
+            "retired_total": signal.retired_total,
+            "total_coverage_headline": signal.headline,
             "total_departments": len(diff_rows),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))

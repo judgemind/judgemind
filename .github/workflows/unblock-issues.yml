@@ -28,6 +28,7 @@ jobs:
         run: |
           python3 - << 'PYEOF'
           import subprocess, json, re, os, sys
+          from datetime import datetime, timezone
 
           repo = os.environ['GITHUB_REPOSITORY']
           pr_body = os.environ.get('PR_BODY', '')
@@ -146,8 +147,34 @@ jobs:
                       result.append(lines[i])
                       i += 1
 
+                  # Remove trailing blank lines left over by the strip.
+                  while result and not result[-1].strip():
+                      result.pop()
+
+                  updated_body = '\n'.join(result)
+
+                  # Preserve a durable, machine-detectable provenance marker so
+                  # the only in-body signal that #N was waiting on a now-shipped
+                  # structural fix survives the strip (issue #4610). Byte-identical
+                  # to scripts/_unblock_dependents.py strip_blocked_lines.
+                  already_marked = any(
+                      re.match(r'\s*Was-blocked-by:', line)
+                      for line in updated_body.splitlines()
+                  )
+                  if blockers and not already_marked:
+                      date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                      nums = ', '.join(f"#{str(b).lstrip('#')}" for b in blockers)
+                      marker = (
+                          f"Was-blocked-by: {nums} "
+                          f"(all closed-completed {date}; auto-unblocked)"
+                      )
+                      if updated_body:
+                          updated_body = f"{updated_body}\n\n{marker}"
+                      else:
+                          updated_body = marker
+
                   with open('/tmp/updated_body.txt', 'w') as f:
-                      f.write('\n'.join(result))
+                      f.write(updated_body)
 
                   gh('issue', 'edit', str(n), '--repo', repo, '--body-file', '/tmp/updated_body.txt')
                   gh('issue', 'edit', str(n), '--repo', repo,

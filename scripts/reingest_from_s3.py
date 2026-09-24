@@ -154,9 +154,14 @@ Options:
                         the old prompt hash.  See #2424.
     --s3-key-list PATH  Path to a file listing S3 keys (one per line, blank
                         lines and ``#`` comments ignored) to restrict the
-                        reingest to.  Surgical scope for hand-picked SHAs
-                        where county / date / regex filters all over- or
-                        under-match.  See #3659.
+                        reingest to.  May be a container-local path or an
+                        ``s3://bucket/key`` URI — the URI form lets the
+                        surgical path run from ECS, where companion files
+                        cannot be staged into the task (see #4606): upload
+                        the keylist with ``aws s3 cp`` and pass the URI.
+                        Surgical scope for hand-picked SHAs where county /
+                        date / regex filters all over- or under-match.
+                        See #3659.
     --skip-judge-prepass
                         Disable the one-shot judge pre-pass that walks the
                         FETCH cursor (standard mode) or listed S3 keys
@@ -167,6 +172,30 @@ Options:
                         itself misbehaves; in normal operation it closes
                         the chronological resolver-race class.  See #4408
                         (parent #4397) and #4419 (extended to prefix mode).
+    --max-error-ratio R Fail the process (exit non-zero) when the observed
+                        error ratio strictly exceeds R (a fraction 0.0-1.0,
+                        e.g. 0.05 for 5%).  When unset, the exit code is
+                        unchanged for standard mode and non-cache-bust prefix
+                        runs — all-success and partial-failure both exit 0 —
+                        preserving the ECS-oneshot exit-code contract for
+                        existing callers (#4619).  **Exception (#4624):** a
+                        ``--bust-llm-cache`` prefix reingest defaults to a
+                        0.10 (10%) gate when this flag is unset, so the path
+                        that recreated the #3855 incident fails loud by
+                        default.  Pass --no-fail-on-errors to opt out, or an
+                        explicit --max-error-ratio to set your own threshold.
+                        Applies to both --prefix and standard mode.
+    --no-fail-on-errors Opt out of the partial-failure exit gate entirely,
+                        even for --bust-llm-cache prefix reingests where it is
+                        on by default (#4624).  Exits 0 on partial failure
+                        like every pre-#4619 caller.  Overrides
+                        --max-error-ratio when both are passed.  Reserved for
+                        runs where partial failure is expected.
+    --write-failed-manifest s3://bucket/key
+                        In --prefix mode, when at least one key fails, write
+                        the failed keys (one per line) to this S3 object so a
+                        retry can be scoped via --s3-key-list.  No-op when
+                        there are no failures or in standard mode.  See #4619.
 """
 
 from __future__ import annotations
@@ -181,6 +210,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -618,22 +648,28 @@ def _build_filters(
     return " ".join(clauses), params
 
 
-def _read_s3_key_list_file(path: str) -> list[str]:
-    """Read a list of S3 keys from a file, one per line.
+def _parse_s3_key_list_text(raw: str, source: str) -> list[str]:
+    """Parse keylist text into a de-duplicated, order-preserving list of keys.
 
     Blank lines and lines starting with ``#`` are skipped, leading/trailing
     whitespace on each entry is stripped, and duplicates are de-duplicated
-    while preserving first-occurrence order.
+    while preserving first-occurrence order. Shared by the local-file and
+    ``s3://`` branches of :func:`_read_s3_key_list_file`.
+
+    Parameters
+    ----------
+    raw:
+        The full keylist text (decoded UTF-8).
+    source:
+        Human-readable origin (local path or s3:// URI) used in the
+        empty-list error message.
 
     Raises
     ------
-    FileNotFoundError
-        If *path* does not exist.
     ValueError
-        If the file produces an empty key list (every line was blank or a
+        If *raw* produces an empty key list (every line was blank or a
         comment) — fail loud rather than silently match every document.
     """
-    raw = Path(path).read_text(encoding="utf-8")
     seen: set[str] = set()
     keys: list[str] = []
     for line in raw.splitlines():
@@ -645,9 +681,47 @@ def _read_s3_key_list_file(path: str) -> list[str]:
         seen.add(stripped)
         keys.append(stripped)
     if not keys:
-        msg = f"--s3-key-list file is empty after stripping blanks/comments: {path}"
+        msg = f"--s3-key-list source is empty after stripping blanks/comments: {source}"
         raise ValueError(msg)
     return keys
+
+
+def _read_s3_key_list_file(path: str) -> list[str]:
+    """Read a list of S3 keys, one per line, from a local file or S3 object.
+
+    *path* may be either a container-local filesystem path or an
+    ``s3://bucket/key`` URI. The latter form lets the surgical reingest path
+    run from ECS, where companion files cannot be staged into the task
+    (see #4606): upload the keylist with ``aws s3 cp`` and pass the URI.
+
+    Blank lines and lines starting with ``#`` are skipped, leading/trailing
+    whitespace on each entry is stripped, and duplicates are de-duplicated
+    while preserving first-occurrence order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* is a local path that does not exist.
+    ValueError
+        If *path* is a malformed ``s3://`` URI with no key component, or if
+        the source produces an empty key list (every line was blank or a
+        comment) — fail loud rather than silently match every document.
+    """
+    if path.startswith("s3://"):
+        without_scheme = path[len("s3://") :]
+        bucket, _, key = without_scheme.partition("/")
+        if not bucket or not key:
+            msg = (
+                "--s3-key-list s3:// URI must include both a bucket and a key "
+                f"(e.g. s3://my-bucket/path/keys.txt): {path}"
+            )
+            raise ValueError(msg)
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        raw = response["Body"].read().decode("utf-8")
+        return _parse_s3_key_list_text(raw, path)
+    raw = Path(path).read_text(encoding="utf-8")
+    return _parse_s3_key_list_text(raw, path)
 
 
 def _is_real_case_number(case_number: str | None) -> bool:
@@ -4041,6 +4115,63 @@ def _seed_judges_from_keys(
     }
 
 
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Split an ``s3://bucket/key`` URI into ``(bucket, key)``.
+
+    Raises ``ValueError`` if *uri* is not an ``s3://`` URI or is missing
+    either the bucket or the key component.  Used by the prefix path to
+    resolve ``--write-failed-manifest s3://...`` destinations (#4619).
+    """
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Not an s3:// URI: {uri}")
+    without_scheme = uri[len("s3://") :]
+    bucket, _, key = without_scheme.partition("/")
+    if not bucket or not key:
+        raise ValueError(
+            "s3:// URI must include both a bucket and a key "
+            f"(e.g. s3://my-bucket/path/keys.txt): {uri}"
+        )
+    return bucket, key
+
+
+def _emit_partial_failure_warning(
+    *,
+    errors: int,
+    total: int,
+    error_classes: Counter[str] | None = None,
+    context: str = "reingest",
+) -> float:
+    """Emit a WARNING-level summary when ``errors > 0``; return the error ratio.
+
+    Returns ``errors / total`` (0.0 when ``total == 0``).  No-ops (returns the
+    ratio without logging) when ``errors == 0`` so all-success runs stay quiet.
+    When ``error_classes`` is provided, the most common class is surfaced as
+    ``top_error_class`` so ops can see the dominant failure mode (e.g.
+    ``BrokenProcessPool`` OOM-kills).  See #4619.
+    """
+    error_ratio = errors / total if total else 0.0
+    if errors <= 0:
+        return error_ratio
+    top_error_class: str | None = None
+    if error_classes:
+        most_common = error_classes.most_common(1)
+        if most_common:
+            top_error_class = most_common[0][0]
+    logger.warning(
+        "Partial failure during %s — %d of %d documents failed (%.1f%%)",
+        context,
+        errors,
+        total,
+        100 * error_ratio,
+        errors=errors,
+        total=total,
+        error_ratio=round(error_ratio, 4),
+        top_error_class=top_error_class,
+        context=context,
+    )
+    return error_ratio
+
+
 def _process_prefix_document(
     key: str,
     bucket: str,
@@ -4069,6 +4200,11 @@ def _process_prefix_document(
 
     Returns a dict with:
       - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
+      - ``error_class``: ``None`` for ok/skip results; the exception class
+        name (e.g. ``"BrokenProcessPool"``, ``"ValueError"``) for the two
+        error-return branches (S3 fetch failure and ``worker.process_event``
+        raising).  Surfaced so the prefix path can report the dominant
+        failure class in its partial-failure WARNING (#4619).
       - ``hash_mismatch``: whether the S3 key hash did not match the object
         bytes' SHA-256.  Non-fatal — reingest proceeds using the key hash as
         the canonical ``content_hash`` so the worker's LLM split path can
@@ -4078,7 +4214,7 @@ def _process_prefix_document(
     """
     parsed = _parse_s3_key(key)
     if not parsed:
-        return {"status": "skip", "hash_mismatch": False}
+        return {"status": "skip", "hash_mismatch": False, "error_class": None}
 
     from framework.s3_cache import make_s3_client as _make_s3
 
@@ -4086,12 +4222,16 @@ def _process_prefix_document(
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response["Body"].read()
-    except Exception:
+    except Exception as exc:
         logger.warning("Failed to fetch S3 object, skipping", s3_key=key, exc_info=True)
-        return {"status": "error", "hash_mismatch": False}
+        return {
+            "status": "error",
+            "hash_mismatch": False,
+            "error_class": type(exc).__name__,
+        }
 
     if not content:
-        return {"status": "skip", "hash_mismatch": False}
+        return {"status": "skip", "hash_mismatch": False, "error_class": None}
 
     # Byte-integrity check.  A mismatch used to short-circuit with
     # ``status="error"``, but that caused the ~4% flat-hash orphan rate on
@@ -4130,24 +4270,12 @@ def _process_prefix_document(
 
         rc = redis_lib.Redis.from_url(redis_url, decode_responses=False)
         if os_url:
-            from opensearchpy import OpenSearch
+            from framework.opensearch_client import make_opensearch_client
 
-            # 30s timeout + 3 retries: opensearchpy defaults to 10s and no
-            # retries, which produces sporadic ``ConnectionTimeout`` entries
-            # under load (#2481).  ``IndexingConsumer`` also swallows
-            # terminal timeouts as a warning so a missed index never fails
-            # document processing.
-            os_kwargs: dict = {
-                "hosts": [os_url],
-                "timeout": 30,
-                "max_retries": 3,
-                "retry_on_timeout": True,
-            }
-            os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-            os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-            if os_user and os_pass:
-                os_kwargs["http_auth"] = (os_user, os_pass)
-            os_client = OpenSearch(**os_kwargs)
+            # SigV4-preferred client with local-dev basic-auth fallback; keeps
+            # the 30s timeout + 3 retries that make reingest self-healing under
+            # load (#2481).  See framework.opensearch_client (#4040).
+            os_client = make_opensearch_client(os_url)
         else:
             os_client = MagicMock()
         s3_for_worker = _make_s3()
@@ -4167,10 +4295,14 @@ def _process_prefix_document(
 
     try:
         worker.process_event(event)
-        return {"status": "ok", "hash_mismatch": hash_mismatch}
-    except Exception:
+        return {"status": "ok", "hash_mismatch": hash_mismatch, "error_class": None}
+    except Exception as exc:
         logger.warning("Failed to process document", s3_key=key, exc_info=True)
-        return {"status": "error", "hash_mismatch": hash_mismatch}
+        return {
+            "status": "error",
+            "hash_mismatch": hash_mismatch,
+            "error_class": type(exc).__name__,
+        }
 
 
 def run_reingest_from_prefix(
@@ -4183,6 +4315,8 @@ def run_reingest_from_prefix(
     bust_llm_cache: bool = False,
     parse_timeout: float = 60.0,
     skip_judge_prepass: bool = False,
+    s3_key_list: list[str] | None = None,
+    write_failed_manifest: str | None = None,
 ) -> dict[str, Any]:
     """Scan S3 by key prefix and ingest documents not in the DB.
 
@@ -4236,13 +4370,37 @@ def run_reingest_from_prefix(
         misbehaves; in normal operation it closes the chronological
         resolver-race class (#4397) and should always run.  Always
         implicitly skipped under ``dry_run=True``.
+    s3_key_list:
+        Optional list of full S3 keys (e.g.
+        ``ca/orange/superior_court/raw/<sha>.pdf``) to restrict the run to.
+        When non-empty, the keys listed under ``prefix`` are intersected
+        with this list: only keys that appear in *both* the S3 listing and
+        ``s3_key_list`` are processed (S3-listing order preserved).
+        Requested keys not found under the prefix are dropped with a warning.
+        The intersection is applied *before* the ``limit`` truncation and
+        *before* court discovery / the judge pre-pass, so every downstream
+        step operates on the narrowed set.  When ``None`` or empty, the full
+        prefix is processed (behavior unchanged).  Combining ``--prefix`` +
+        ``--s3-key-list`` + ``--bust-llm-cache`` is the surgical path for
+        re-extracting a hand-picked set of already-split parent PDFs: DB-row
+        mode skips split-child rows via the ``is_split_child_id`` guard to
+        avoid the #2416 exponential explosion (see #4049), so the prefix path
+        is the only avenue once a parent has been split — and this filter
+        keeps that path from rescanning the entire prefix (see #3855).
+    write_failed_manifest:
+        Optional ``s3://bucket/key`` destination.  When set and at least one
+        key failed, the failed keys are written (one per line, trailing
+        newline) to that S3 object so a retry can be scoped via
+        ``--s3-key-list``.  No-op when ``None`` or when there are no
+        failures.  See #4619.
 
     Returns
     -------
     dict with keys: ``total_keys``, ``processed``, ``errors``, ``skipped``,
-    ``hash_mismatch_warnings``, ``wall_time_seconds``, and (when the judge
-    pre-pass ran) ``judge_prepass_docs_scanned``,
-    ``judge_prepass_judges_seeded``, ``judge_prepass_judges_skipped_invalid``.
+    ``hash_mismatch_warnings``, ``wall_time_seconds``, ``error_ratio``,
+    ``top_error_class``, ``failed_keys``, and (when the judge pre-pass ran)
+    ``judge_prepass_docs_scanned``, ``judge_prepass_judges_seeded``,
+    ``judge_prepass_judges_skipped_invalid``.
     """
     bucket = os.environ.get(
         "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
@@ -4265,6 +4423,40 @@ def run_reingest_from_prefix(
             "errors": 0,
             "skipped": 0,
         }
+
+    # Step 1b: Narrow to the --s3-key-list intersection (#3855/#4049).
+    # Applied before --limit truncation and before court discovery / the
+    # judge pre-pass so every downstream step sees the narrowed set.
+    if s3_key_list:
+        requested = set(s3_key_list)
+        matched = [key for key in keys if key in requested]
+        missing = requested - set(matched)
+        logger.info(
+            "Filtered prefix keys by --s3-key-list",
+            requested=len(requested),
+            matched=len(matched),
+            missing=len(missing),
+        )
+        if missing:
+            logger.warning(
+                "Some --s3-key-list keys were not found under the prefix",
+                missing_count=len(missing),
+                prefix=prefix,
+            )
+        keys = matched
+        if not keys:
+            logger.warning(
+                "No --s3-key-list keys matched under prefix",
+                prefix=prefix,
+            )
+            return {
+                "total_keys": 0,
+                "processed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "hash_mismatch_warnings": 0,
+                "wall_time_seconds": 0.0,
+            }
 
     if limit is not None:
         total_available = len(keys)
@@ -4343,6 +4535,8 @@ def run_reingest_from_prefix(
     errors = 0
     skipped = 0
     hash_mismatch_warnings = 0
+    failed_keys: list[str] = []
+    error_classes: Counter[str] = Counter()
 
     logger.info(
         "Processing documents from S3",
@@ -4383,6 +4577,11 @@ def run_reingest_from_prefix(
                     skipped += 1
                 else:
                     errors += 1
+                    failed_keys.append(key)
+                    if isinstance(result, dict):
+                        error_classes[result.get("error_class") or "unknown"] += 1
+                    else:
+                        error_classes["unknown"] += 1
                 total_done = processed + errors + skipped
                 if processed > 0 and processed % 50 == 0:
                     elapsed = time.monotonic() - t_start
@@ -4405,9 +4604,24 @@ def run_reingest_from_prefix(
                     )
             except Exception as exc:
                 errors += 1
+                failed_keys.append(key)
+                error_classes[type(exc).__name__] += 1
                 logger.error("Failed to process", key=key, error=str(exc))
 
     wall_time = round(time.monotonic() - t_start, 2)
+
+    # Partial-failure surfacing (#4619).  Denominator is the full key set so
+    # the ratio reflects fraction-of-attempted, and the WARNING names the
+    # dominant failure class (e.g. BrokenProcessPool OOM-kills).
+    error_ratio = _emit_partial_failure_warning(
+        errors=errors,
+        total=len(keys),
+        error_classes=error_classes,
+        context="reingest",
+    )
+    top_error_class: str | None = None
+    if error_classes:
+        top_error_class = error_classes.most_common(1)[0][0]
 
     stats: dict[str, Any] = {
         "total_keys": len(keys),
@@ -4416,6 +4630,9 @@ def run_reingest_from_prefix(
         "skipped": skipped,
         "hash_mismatch_warnings": hash_mismatch_warnings,
         "wall_time_seconds": wall_time,
+        "error_ratio": error_ratio,
+        "top_error_class": top_error_class,
+        "failed_keys": failed_keys,
     }
     if prepass_stats is not None:
         stats["judge_prepass_docs_scanned"] = prepass_stats["docs_scanned"]
@@ -4424,10 +4641,24 @@ def run_reingest_from_prefix(
             "judges_skipped_invalid"
         ]
 
+    # Spread the stats into the completion log but report ``failed_keys`` as a
+    # count rather than dumping the full list (which can be hundreds of keys).
+    log_stats = {k: v for k, v in stats.items() if k != "failed_keys"}
     logger.info(
         "Prefix reingest complete",
-        **stats,
+        failed_key_count=len(failed_keys),
+        **log_stats,
     )
+
+    if write_failed_manifest and failed_keys:
+        manifest_bucket, manifest_key = _parse_s3_uri(write_failed_manifest)
+        body = ("\n".join(failed_keys) + "\n").encode("utf-8")
+        s3_client.put_object(Bucket=manifest_bucket, Key=manifest_key, Body=body)
+        logger.info(
+            "Wrote failed-keys manifest",
+            manifest_uri=write_failed_manifest,
+            failed_key_count=len(failed_keys),
+        )
 
     if hash_mismatch_warnings > 0:
         logger.warning(
@@ -4809,6 +5040,17 @@ def run_reingest(
         "llm_api_calls": tracker.api_calls,
         "estimated_cost_usd": round(estimated_cost_usd, 4),
     }
+    # Partial-failure surfacing (#4619).  The DB-row path has no per-key
+    # error-class detail, so pass ``error_classes=None``.  Denominator guards
+    # against divide-by-zero (e.g. a 0-document run).
+    db_total = total_processed + total_failed
+    error_ratio = _emit_partial_failure_warning(
+        errors=total_failed,
+        total=db_total,
+        error_classes=None,
+        context="reingest",
+    )
+    result["error_ratio"] = error_ratio
     if before_metrics is not None:
         result["quality_before"] = before_metrics
     if after_metrics is not None:
@@ -4818,6 +5060,82 @@ def run_reingest(
     if prepass_stats is not None:
         result["judge_prepass"] = prepass_stats
     return result
+
+
+# Default partial-failure exit-gate threshold applied automatically to
+# ``--bust-llm-cache`` prefix reingests when the operator does not pass an
+# explicit ``--max-error-ratio`` and does not opt out via
+# ``--no-fail-on-errors`` (#4624).  A cache-bust prefix reingest is the exact
+# path that recreated the #3855 incident (Orange residual OOM-killed 167/768
+# PDFs, exited 0).  ``--bust-llm-cache`` runs re-extract every key through the
+# LLM, so a non-trivial error fraction is always a signal that the run
+# silently lost data — failing loud by default closes the "operator forgot
+# --max-error-ratio" gap that is the same root cause as the original
+# incident.  0.10 (10%) is deliberately permissive: it does not trip on the
+# occasional single-key transcription error in a small prefix, but it does
+# catch the bulk-OOM / bulk-timeout failure mode #3855 produced.
+_DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO = 0.10
+
+
+def _resolve_effective_max_error_ratio(
+    *,
+    explicit_max_error_ratio: float | None,
+    no_fail_on_errors: bool,
+    prefix: str | None,
+    bust_llm_cache: bool,
+) -> float | None:
+    """Decide the effective partial-failure exit threshold for this run (#4624).
+
+    Resolution order (first match wins):
+
+    1.  ``--no-fail-on-errors`` → return ``None`` (explicit opt-out).  The run
+        exits 0 on partial failure exactly like every pre-#4619 caller.  This
+        is the escape hatch for the rare run where partial failure is expected
+        (e.g. a known-bad prefix being drained best-effort).
+    2.  An explicit ``--max-error-ratio`` → return it verbatim (operator chose
+        their own threshold; their choice always wins, including ``0.0`` for
+        a fail-on-any-error run or a deliberately high ceiling).
+    3.  A ``--bust-llm-cache`` **prefix** reingest with no explicit threshold →
+        return :data:`_DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO`.  This is the
+        new default-on gate: the cache-bust prefix path that recreated #3855
+        now fails loud unless the operator opts out.
+    4.  Anything else (standard DB-row mode, non-cache-bust prefix runs) →
+        return ``None``, preserving the existing opt-in exit-code contract so
+        no existing caller's exit behavior changes (#4619).
+
+    Returning ``None`` means :func:`_enforce_max_error_ratio` is a no-op and
+    the run exits 0 regardless of error ratio — the backward-compatible path.
+    """
+    if no_fail_on_errors:
+        return None
+    if explicit_max_error_ratio is not None:
+        return explicit_max_error_ratio
+    if prefix and bust_llm_cache:
+        return _DEFAULT_CACHE_BUST_PREFIX_MAX_ERROR_RATIO
+    return None
+
+
+def _enforce_max_error_ratio(max_error_ratio: float | None, error_ratio: float) -> None:
+    """Exit non-zero when ``error_ratio`` strictly exceeds the threshold.
+
+    No-op when ``max_error_ratio`` is ``None`` (no gate is in effect for this
+    run — neither an explicit ``--max-error-ratio`` nor the #4624 cache-bust
+    prefix default applied).  This preserves the ECS-oneshot exit-code contract
+    for existing callers, which exit 0 on partial failure.  Only a set
+    threshold that is strictly exceeded triggers ``sys.exit(1)``; all-success
+    and below-threshold both return.  See #4619 and #4624.
+    """
+    if max_error_ratio is None:
+        return
+    if error_ratio > max_error_ratio:
+        logger.warning(
+            "Error ratio %.4f exceeds --max-error-ratio %.4f — failing run",
+            error_ratio,
+            max_error_ratio,
+            error_ratio=round(error_ratio, 4),
+            max_error_ratio=max_error_ratio,
+        )
+        sys.exit(1)
 
 
 def main() -> None:
@@ -4992,7 +5310,13 @@ def main() -> None:
             "Combine with --bust-llm-cache to re-extract already-split "
             "documents (the only path once parent PDFs have produced "
             "split-child rows; DB-row mode skips them to avoid #2416). "
-            "See #4049."
+            "See #4049.  Combine with --s3-key-list to narrow the scan to a "
+            "hand-picked subset of keys under the prefix instead of the whole "
+            "prefix (#3855).  With --bust-llm-cache, the run fails loud by "
+            "default when more than 10% of keys error (#4624) — pass "
+            "--max-error-ratio to set your own threshold or --no-fail-on-errors "
+            "to opt out — and --write-failed-manifest to capture the failed "
+            "keys for a scoped retry (#4619)."
         ),
     )
     parser.add_argument(
@@ -5029,15 +5353,23 @@ def main() -> None:
         default=None,
         dest="s3_key_list",
         help=(
-            "Path to a file listing S3 keys (one per line) to restrict the "
-            "reingest to.  Blank lines and lines starting with '#' are "
+            "File listing S3 keys (one per line) to restrict the reingest to. "
+            "Accepts a container-local path OR an s3://bucket/key URI; the "
+            "s3:// form lets this surgical path run from ECS, where companion "
+            "files cannot be staged into the task — upload the keylist with "
+            "'aws s3 cp keys.txt s3://bucket/keylists/<name>.txt' and pass the "
+            "URI (#4606).  Blank lines and lines starting with '#' are "
             "ignored.  Adds an AND d.s3_key = ANY(...) clause to the document "
             "query.  Useful for surgical backfills against a hand-picked set "
             "of SHAs — e.g. #3659 (re-resolve cross-references on the 13 SC "
             "PDFs whose cached LLM payload predates #3655) — where county-wide "
             "rescope would over-shoot 10-100x and --date-from/--date-to clamp "
             "to whole days only.  Combine with --bust-llm-cache to force "
-            "fresh LLM extraction on those keys."
+            "fresh LLM extraction on those keys.  Can be combined with "
+            "--prefix: in prefix mode the listed keys are intersected with "
+            "the keys found under the prefix (#3855), the surgical path for "
+            "re-extracting already-split parent PDFs that DB-row mode skips "
+            "(#4049)."
         ),
     )
     parser.add_argument(
@@ -5070,6 +5402,46 @@ def main() -> None:
             "class (#4397) and should always run.  Always implicitly "
             "skipped under --dry-run because the pre-pass writes real "
             "judge rows."
+        ),
+    )
+    parser.add_argument(
+        "--max-error-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Fail the process (exit non-zero) when the observed error ratio "
+            "strictly exceeds this fraction (0.0-1.0, e.g. 0.05 for 5%%).  "
+            "The error ratio is errors/total_keys in --prefix mode and "
+            "total_failed/(total_processed+total_failed) in standard mode.  "
+            "When unset (default), the exit code is unchanged — all-success "
+            "and partial-failure both exit 0 — preserving the ECS-oneshot "
+            "exit-code contract for existing callers.  Only the presence of "
+            "this flag changes exit behavior.  See #4619."
+        ),
+    )
+    parser.add_argument(
+        "--no-fail-on-errors",
+        action="store_true",
+        dest="no_fail_on_errors",
+        help=(
+            "Opt out of the partial-failure exit gate entirely, even for "
+            "--bust-llm-cache prefix reingests where the gate is on by default "
+            "(#4624).  The run exits 0 on partial failure exactly like every "
+            "pre-#4619 caller.  Reserved for the rare run where partial "
+            "failure is expected (e.g. a known-bad prefix being drained "
+            "best-effort).  Overrides --max-error-ratio when both are passed."
+        ),
+    )
+    parser.add_argument(
+        "--write-failed-manifest",
+        type=str,
+        default=None,
+        dest="write_failed_manifest",
+        help=(
+            "An s3://bucket/key destination.  In --prefix mode, when at least "
+            "one key fails, the failed keys are written (one per line) to this "
+            "S3 object so a retry can be scoped via --s3-key-list.  No-op when "
+            "there are no failures or in standard (DB-row) mode.  See #4619."
         ),
     )
     args = parser.parse_args()
@@ -5110,6 +5482,8 @@ def main() -> None:
             bust_llm_cache=args.bust_llm_cache,
             parse_timeout=args.parse_timeout,
             skip_judge_prepass=args.skip_judge_prepass,
+            s3_key_list=s3_key_list_values,
+            write_failed_manifest=args.write_failed_manifest,
         )
         logger.info(
             "Prefix reingest complete",
@@ -5118,6 +5492,15 @@ def main() -> None:
             errors=stats["errors"],
             skipped=stats["skipped"],
             judge_prepass_judges_seeded=stats.get("judge_prepass_judges_seeded"),
+        )
+        effective_max_error_ratio = _resolve_effective_max_error_ratio(
+            explicit_max_error_ratio=args.max_error_ratio,
+            no_fail_on_errors=args.no_fail_on_errors,
+            prefix=args.prefix,
+            bust_llm_cache=args.bust_llm_cache,
+        )
+        _enforce_max_error_ratio(
+            effective_max_error_ratio, stats.get("error_ratio", 0.0)
         )
         return
 
@@ -5166,6 +5549,18 @@ def main() -> None:
         llm_api_calls=stats.get("llm_api_calls", 0),
         estimated_cost_usd=stats.get("estimated_cost_usd", 0),
     )
+    # Standard (DB-row) mode is not a prefix run, so the #4624 cache-bust
+    # prefix default never applies here — the resolver returns the explicit
+    # --max-error-ratio (or None) unchanged, preserving the #4619 opt-in
+    # contract.  Routing through the shared resolver keeps both call sites
+    # honoring --no-fail-on-errors identically.
+    effective_max_error_ratio = _resolve_effective_max_error_ratio(
+        explicit_max_error_ratio=args.max_error_ratio,
+        no_fail_on_errors=args.no_fail_on_errors,
+        prefix=args.prefix,
+        bust_llm_cache=args.bust_llm_cache,
+    )
+    _enforce_max_error_ratio(effective_max_error_ratio, stats.get("error_ratio", 0.0))
 
 
 if __name__ == "__main__":

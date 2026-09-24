@@ -96,6 +96,7 @@ Consult these docs before making changes in their domain:
 | `docs/agent/gh-to-mcp-migration.md` | Full tool-by-tool `gh` → `mcp__github__*` mapping, including the known gaps |
 | `docs/agent/aws-api-access.md` | When to use the AWS MCP servers vs the `aws` CLI vs `scripts/ecs-*.sh` — MCP-first for ECS/CloudWatch reads, scripts for launch-and-stream, CLI for writes/S3/secrets |
 | `docs/agent/aws-to-mcp-migration.md` | Full tool-by-tool `aws` → `mcp__awslabs_*` mapping, including the known gaps |
+| `docs/agent/aws-account-suspension-recovery.md` | Bringing dev back after an AWS account suspension — wedged ECS schedulers, terminal-state RDS restore, verification order |
 | `docs/agent/spec-authoring.md` | Authoring or restructuring a spec/design doc — Today vs. Direction split rules |
 
 ## Starting a New Session
@@ -150,6 +151,22 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 - **Root Cause Over Symptoms** (triage, spotcheck, investigation). Before filing a symptom-level ticket, look one level deeper. File one root-cause issue, not three symptom issues.
 - **Investigations go to root cause.** When asked to investigate — or when you autonomously decide to — take it all the way down. Build a chain of verified evidence (code read, log line, query result, git history), not supposition. Hold multiple hypotheses in parallel and disprove them with evidence; don't anchor on the first plausible one. Stop only when the chain bottoms out in something concrete.
 - **Instrument before you guess.** When a failure's root cause isn't obvious, the first move is to make the failure self-diagnosing — add structured logging, capture the raw state the process actually saw, re-trigger — not to patch the top hypothesis. See docs/agent/investigation-patterns.md for the full pattern.
+
+## Human Alerts
+
+A human alert is anything that interrupts the operator: Telegram, push notification, email. **Interrupting the human is the most expensive channel we have — spend it only when the interruption changes what they do in the next few minutes.** An alert nobody can act on trains the operator to ignore the channel, which costs us the one alert that mattered.
+
+Every human-facing alert MUST pass all three tests. An alert that fails any of them goes to a dashboard or a GitHub issue instead:
+
+1. **Clear CTA.** The message names the specific action the operator should take. "Data quality degraded" is not a CTA; "Fresno scraper has captured 0 records for 24h — check the court site for a layout change" is.
+2. **Quickly resolvable.** The operator can act on it now, from their phone or a laptop, and reach a resolution. If it needs a multi-hour investigation, file an issue and let the dispatcher pick it up.
+3. **At most once per day, per alert class.** Not once per run. An hourly check that alerts on a condition persisting for a week must send one message, not 168. Deduplicate on the condition, not the schedule tick.
+
+**Conditions that auto-resolve are never human alerts.** Transient dips (zero rulings for one run, a field-completeness wobble, an ingest-rate drop) belong on `/admin/data-quality`. Only persistent, human-unblockable conditions justify a notification.
+
+**Default to the dashboard.** New monitoring starts dashboard-only or issue-only. Promote it to a human alert only after it has demonstrated it meets all three tests — not on the assumption that it will.
+
+**Currently disabled pending retrofit (2026-09-18).** These sent non-actionable Telegram alerts, three of them hourly: `Data Quality Check`, `Short-Unsubstantive Ruling Check`, `API Error Check`, `S3 Orphan-Rate Regression Guard`, `CC Dual-Run Diff`. **Do not re-enable them as part of an unrelated recovery** — their Telegram steps must be brought in line with the three tests first (or dropped in favour of the dashboard). `Scraper Zero-Record Streak Check` stays enabled: capture failure is irrecoverable, so it has a real CTA and fires at most daily.
 
 ## PR Workflow
 

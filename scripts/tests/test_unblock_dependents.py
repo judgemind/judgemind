@@ -180,5 +180,87 @@ class TestStripBlockedLines(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class TestWasBlockedByMarker(unittest.TestCase):
+    """Tests for the Was-blocked-by provenance marker (issue #4610)."""
+
+    def test_appends_marker_with_resolved_blockers(self) -> None:
+        body = "## Problem\n\nSome text\n\n## Dependencies\n\nBlocked by #4282\nBlocked by #4297\n"
+        result = strip_blocked_lines(
+            body,
+            was_blocked_by=["4282", "4297"],
+            unblock_date="2026-05-08",
+        )
+        self.assertNotIn("Blocked by #4282", result)
+        self.assertNotIn("Blocked by #4297", result)
+        self.assertIn(
+            "Was-blocked-by: #4282, #4297 (all closed-completed 2026-05-08; auto-unblocked)",
+            result,
+        )
+
+    def test_marker_accepts_int_blockers(self) -> None:
+        body = "## Dependencies\n\nBlocked by #4282\n"
+        result = strip_blocked_lines(
+            body, was_blocked_by=[4282], unblock_date="2026-05-08"
+        )
+        self.assertIn(
+            "Was-blocked-by: #4282 (all closed-completed 2026-05-08; auto-unblocked)",
+            result,
+        )
+
+    def test_marker_strips_hash_prefix_in_input(self) -> None:
+        body = "## Dependencies\n\nBlocked by #4282\n"
+        result = strip_blocked_lines(
+            body, was_blocked_by=["#4282"], unblock_date="2026-05-08"
+        )
+        self.assertIn(
+            "Was-blocked-by: #4282 (all closed-completed 2026-05-08; auto-unblocked)",
+            result,
+        )
+        # No doubled hash.
+        self.assertNotIn("##4282", result)
+
+    def test_backward_compat_no_marker_without_args(self) -> None:
+        """Calling with only body == old behavior (no marker appended)."""
+        body = "## Problem\n\nSome text\n\n## Dependencies\n\nBlocked by #42\n"
+        result = strip_blocked_lines(body)
+        self.assertNotIn("Was-blocked-by", result)
+
+    def test_marker_idempotent_when_called_twice(self) -> None:
+        body = "## Problem\n\nSome text\n\n## Dependencies\n\nBlocked by #4282\n"
+        first = strip_blocked_lines(
+            body, was_blocked_by=["4282"], unblock_date="2026-05-08"
+        )
+        # Re-running with the same args must not duplicate the marker.
+        second = strip_blocked_lines(
+            first, was_blocked_by=["4282"], unblock_date="2026-05-08"
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(second.count("Was-blocked-by:"), 1)
+
+    def test_marker_not_stripped_by_subsequent_call(self) -> None:
+        """A subsequent plain strip must leave the Was-blocked-by marker in place."""
+        body = "## Dependencies\n\nBlocked by #4282\n"
+        first = strip_blocked_lines(
+            body, was_blocked_by=["4282"], unblock_date="2026-05-08"
+        )
+        # Plain strip (no marker args) — must NOT remove the marker line.
+        second = strip_blocked_lines(first)
+        self.assertIn("Was-blocked-by: #4282", second)
+
+    def test_empty_blocker_list_appends_nothing(self) -> None:
+        body = "## Problem\n\nSome text\n"
+        result = strip_blocked_lines(body, was_blocked_by=[])
+        self.assertNotIn("Was-blocked-by", result)
+        self.assertEqual(result, body.rstrip("\n"))
+
+    def test_marker_uses_default_utc_date_when_unspecified(self) -> None:
+        body = "## Dependencies\n\nBlocked by #4282\n"
+        result = strip_blocked_lines(body, was_blocked_by=["4282"])
+        self.assertRegex(
+            result,
+            r"Was-blocked-by: #4282 \(all closed-completed \d{4}-\d{2}-\d{2}; auto-unblocked\)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

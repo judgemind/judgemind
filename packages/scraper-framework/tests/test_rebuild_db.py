@@ -947,7 +947,7 @@ class TestDeleteOpensearchDocsForCounty:
         mock_client.indices.exists.return_value = True
         mock_client.delete_by_query.return_value = {"deleted": 42}
 
-        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client):
             result = rebuild_db.delete_opensearch_docs_for_county("http://os", "Contra Costa")
 
         assert result == 42
@@ -963,56 +963,27 @@ class TestDeleteOpensearchDocsForCounty:
         mock_client = MagicMock()
         mock_client.indices.exists.return_value = False
 
-        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client):
             result = rebuild_db.delete_opensearch_docs_for_county("http://os", "Contra Costa")
 
         assert result == 0
         mock_client.delete_by_query.assert_not_called()
 
-    def test_uses_basic_auth_when_credentials_set(self) -> None:
-        """OPENSEARCH_USERNAME/PASSWORD env vars feed http_auth tuple."""
+    def test_delegates_client_construction_to_helper(self) -> None:
+        """Client construction (auth selection) is delegated to make_opensearch_client.
+
+        Auth-branch behavior (SigV4 / basic-auth / no-auth) is unit-tested in
+        test_opensearch_client.py; here we just confirm the helper is used with
+        the OpenSearch URL.  See #4040.
+        """
         mock_client = MagicMock()
         mock_client.indices.exists.return_value = True
         mock_client.delete_by_query.return_value = {"deleted": 0}
 
-        with (
-            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
-            patch.dict(
-                os.environ,
-                {
-                    "OPENSEARCH_USERNAME": "admin",
-                    "OPENSEARCH_PASSWORD": "s3cret",
-                },
-                clear=False,
-            ),
-        ):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client) as mock_helper:
             rebuild_db.delete_opensearch_docs_for_county("http://os", "Ventura")
 
-        kwargs = mock_ctor.call_args.kwargs
-        assert kwargs["hosts"] == ["http://os"]
-        assert kwargs["timeout"] == 30
-        assert kwargs["max_retries"] == 3
-        assert kwargs["retry_on_timeout"] is True
-        assert kwargs["http_auth"] == ("admin", "s3cret")
-
-    def test_no_auth_when_credentials_unset(self) -> None:
-        """Missing env vars → http_auth not passed to the client ctor."""
-        mock_client = MagicMock()
-        mock_client.indices.exists.return_value = True
-        mock_client.delete_by_query.return_value = {"deleted": 0}
-
-        env = {k: v for k, v in os.environ.items()}
-        env.pop("OPENSEARCH_USERNAME", None)
-        env.pop("OPENSEARCH_PASSWORD", None)
-
-        with (
-            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
-            patch.dict(os.environ, env, clear=True),
-        ):
-            rebuild_db.delete_opensearch_docs_for_county("http://os", "Ventura")
-
-        kwargs = mock_ctor.call_args.kwargs
-        assert "http_auth" not in kwargs
+        mock_helper.assert_called_once_with("http://os")
 
 
 class TestMainPerCountyResetDispatch:
@@ -2894,7 +2865,7 @@ class TestDeleteOpensearchDocsForCourt:
         mock_client.indices.exists.return_value = True
         mock_client.delete_by_query.return_value = {"deleted": 17}
 
-        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client):
             result = rebuild_db.delete_opensearch_docs_for_court(
                 "http://os", "ca", "Orange", "Superior Court"
             )
@@ -2922,7 +2893,7 @@ class TestDeleteOpensearchDocsForCourt:
         mock_client = MagicMock()
         mock_client.indices.exists.return_value = False
 
-        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client):
             result = rebuild_db.delete_opensearch_docs_for_court(
                 "http://os", "ca", "Orange", "Superior Court"
             )
@@ -2930,54 +2901,23 @@ class TestDeleteOpensearchDocsForCourt:
         assert result == 0
         mock_client.delete_by_query.assert_not_called()
 
-    def test_uses_basic_auth_when_credentials_set(self) -> None:
-        """OPENSEARCH_USERNAME/PASSWORD env vars feed http_auth tuple."""
+    def test_delegates_client_construction_to_helper(self) -> None:
+        """Client construction (auth selection) is delegated to make_opensearch_client.
+
+        Auth-branch behavior (SigV4 / basic-auth / no-auth) is unit-tested in
+        test_opensearch_client.py; here we just confirm the helper is used with
+        the OpenSearch URL.  See #4040.
+        """
         mock_client = MagicMock()
         mock_client.indices.exists.return_value = True
         mock_client.delete_by_query.return_value = {"deleted": 0}
 
-        with (
-            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
-            patch.dict(
-                os.environ,
-                {
-                    "OPENSEARCH_USERNAME": "admin",
-                    "OPENSEARCH_PASSWORD": "s3cret",
-                },
-                clear=False,
-            ),
-        ):
+        with patch("rebuild_db.make_opensearch_client", return_value=mock_client) as mock_helper:
             rebuild_db.delete_opensearch_docs_for_court(
                 "http://os", "ca", "Orange", "Superior Court"
             )
 
-        kwargs = mock_ctor.call_args.kwargs
-        assert kwargs["hosts"] == ["http://os"]
-        assert kwargs["timeout"] == 30
-        assert kwargs["max_retries"] == 3
-        assert kwargs["retry_on_timeout"] is True
-        assert kwargs["http_auth"] == ("admin", "s3cret")
-
-    def test_no_auth_when_credentials_unset(self) -> None:
-        """Missing env vars → http_auth not passed to the client ctor."""
-        mock_client = MagicMock()
-        mock_client.indices.exists.return_value = True
-        mock_client.delete_by_query.return_value = {"deleted": 0}
-
-        env = {k: v for k, v in os.environ.items()}
-        env.pop("OPENSEARCH_USERNAME", None)
-        env.pop("OPENSEARCH_PASSWORD", None)
-
-        with (
-            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
-            patch.dict(os.environ, env, clear=True),
-        ):
-            rebuild_db.delete_opensearch_docs_for_court(
-                "http://os", "ca", "Orange", "Superior Court"
-            )
-
-        kwargs = mock_ctor.call_args.kwargs
-        assert "http_auth" not in kwargs
+        mock_helper.assert_called_once_with("http://os")
 
 
 class TestResetDerivedTablesForCourt:

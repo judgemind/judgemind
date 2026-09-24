@@ -630,6 +630,22 @@ Best practices:
 | Fix wrong **identity-anchor** fields (`judge_id`, `case_id`) on existing rulings | `rebuild_db.py --reset --county <name>` | Identity anchors use preserve-first `COALESCE(rulings.col, EXCLUDED.col)` semantics in `insert_ruling` (#2475) — a plain rebuild (no `--reset`) cannot replace an existing wrong `judge_id` or `case_id` with a corrected one. `--reset` truncates the county's `derived.*` rows first so the next ingest writes the corrected anchors freshly. Correctable facts (`hearing_date`, `outcome`, `motion_type`, `department`, `ruling_text`, `ruling_text_html`, `summary`) use incoming-wins semantics and update without `--reset`. See `packages/scraper-framework/src/ingestion/db.py::insert_ruling` for the full column classification. (#3732, #4284) |
 | Full database rebuild from scratch | `rebuild_db.py --reset` | `--reset` is opt-in and truncates derived tables before re-processing everything from S3. |
 
+**Partial-failure exit gate (#4624).** A `--bust-llm-cache` **prefix** reingest
+fails loud by default — it exits non-zero when more than 10% of keys error, so
+a run that silently lost data (the #3855 Orange residual OOM-killed 167/768
+PDFs and exited 0) surfaces as a non-zero exit instead of a false success. The
+gate is on automatically for the cache-bust prefix path:
+
+```
+scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+```
+
+Override the threshold with `--max-error-ratio 0.05` (your value always wins),
+or opt out with `--no-fail-on-errors` for a run where partial failure is
+expected. Standard (DB-row) mode and non-cache-bust prefix runs keep the
+pre-#4619 opt-in behavior — pass `--max-error-ratio` explicitly there if you
+want the gate. See #4619 and #4624.
+
 ### One-off / permanent script convention
 
 Every top-level `scripts/*.py` file (excluding the `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories) must carry exactly one of these headers in the first 50 lines:

@@ -268,7 +268,7 @@ You can use the full toolset of a `/task` agent or the operator's dispatcher ses
 
 - **Bash** — `git`, `gh`, `aws`, `psql` (via `scripts/dev-db-query.sh`), any other shell command. Set `timeout: 1200000` on long-running commands per `CLAUDE.md`.
 - **Edit / Write / Read / Glob / Grep** — full filesystem access. Edit files in the failed agent's worktree (when present), write helpers to `{worktree}/tmp/diagnoser/`, read PR diffs, etc. Note: the v3 diagnoser runs in its own ECS task; it does not have the failed agent's worktree on disk by default. Use `git fetch origin pull/<PR>/head:adopt-<PR>` to materialize the agent's branch when you need to inspect or patch it.
-- **Agent (sub-skill invocation)** — call `/ralph`, `/tdd`, `/audit`, etc. when judgment requires. Sub-skills run with their own normal contracts.
+- **Agent (sub-skill invocation)** — call `/ralph`, `/audit`, etc. when judgment requires. Sub-skills run with their own normal contracts.
 - **MCP servers** — `github`, `awslabs_cloudwatch-mcp-server`, `awslabs_ecs-mcp-server`, `plugin:telegram` (read/notify only — see Telegram Integration in `CLAUDE.md`).
 - **gh / git / aws CLI** — full operator-tier authority. You may commit and push to the failed agent's branch, file new issues, edit issue/PR bodies, add/remove labels, post comments (via `scripts/gh-comment-with-retry.sh` for `--body-file` posts so the 504-after-success failure mode #4478 is handled transparently), close issues. AWS reads (CloudWatch logs, ECS describe-tasks) plus same writes the launcher already has on the dev account.
 

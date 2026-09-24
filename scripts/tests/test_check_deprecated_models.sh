@@ -163,6 +163,18 @@ printf '%s\n' 'claude-3-5-haiku-latest' > "$TMPDIR_TEST/node_modules/some-pkg/in
 assert_passes "node_modules directory is excluded"
 reset_tmpdir
 
+# ─── Test 20b: .venv-scripts should be excluded (#4597) ──────────────────
+# scripts/gemini-review.sh creates a `.venv-scripts` venv in the worktree
+# root. Its bundled third-party packages (e.g. the `anthropic` SDK's own
+# deprecation table) reference deprecated model IDs and must NOT trip the
+# guard. `.venv-scripts` is in REPO_WALK_EXCLUSIONS, so a deprecated string
+# under a `.venv-scripts/` dir is excluded the same way `.venv` is.
+mkdir -p "$TMPDIR_TEST/.venv-scripts/lib/python3.12/site-packages/anthropic"
+printf '%s\n' 'DEPRECATED = "claude-3-sonnet-20240229"' \
+    > "$TMPDIR_TEST/.venv-scripts/lib/python3.12/site-packages/anthropic/_deprecations.py"
+assert_passes ".venv-scripts directory is excluded (#4597)"
+reset_tmpdir
+
 # ─── Test 21: No self-match on ci.yml step name ──────────────────────────
 # The step name in .github/workflows/ci.yml that runs this guard must
 # not itself contain a deprecated model identifier — otherwise the

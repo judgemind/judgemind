@@ -42,6 +42,7 @@
 #   * check-shipped-pr.sh          — needs an issue number argument
 #   * check-issue-plan-blocked.sh  — needs an issue number argument
 #   * check-issue-companion-closed.sh — needs an issue number argument
+#   * check-issue-was-blocked-by.sh — needs an issue number argument
 #   * check-near-duplicate-issue.sh — needs an issue number argument
 #   * check-blocked-issues.sh      — scans live GitHub issues
 #   * check-task-recovery.sh       — needs a worktree path argument
@@ -142,6 +143,7 @@ SKIP_LIST=(
     "check-shipped-pr.sh"
     "check-issue-plan-blocked.sh"
     "check-issue-companion-closed.sh"
+    "check-issue-was-blocked-by.sh"
     "check-near-duplicate-issue.sh"
     "check-blocked-issues.sh"
     "check-task-recovery.sh"
@@ -373,6 +375,101 @@ is_requires_argument_failure() {
         "$log_file" 2>/dev/null
 }
 
+# emit_indented_capped <log_file> -> prints the last MAX_TAIL_LINES lines of
+# the log to stderr, each indented by four spaces, with any line longer than
+# MAX_LINE_BYTES truncated and a "…[truncated <N> bytes]" marker appended.
+#
+# Why this exists (#4602)
+# ───────────────────────
+# The previous formatting path was ``tail -n 20 "$log" | sed 's/^/    /'``.
+# When a guard produces a large match block — many matches and/or a single
+# pathologically long line (a noisy new guard, a real multi-file violation,
+# or a false positive like the ``.venv-scripts`` walk that #4597 fixed) —
+# piping that output through BSD ``sed``'s substitute engine can trip the
+# macOS libc assertion ``Assertion failed: (advance > 0), function
+# substitute, file process.c`` and abort with ``Abort trap: 6`` (SIGABRT,
+# exit 134). That turns a plain guard failure (exit 1) into a SIGABRT that
+# makes the failure look catastrophic and unreadable.
+#
+# The hardening: do the indentation with ``awk`` (which does not share BSD
+# sed's ``substitute`` codepath) and bound each emitted line's length so no
+# arbitrarily long / arbitrarily-encoded guard output ever reaches a
+# substitution engine unbounded. ``awk`` reads line by line and we cap the
+# emitted substring with ``substr``, so per-line work stays bounded
+# regardless of guard output size.
+#
+# For the common small-match case (≤ MAX_TAIL_LINES short lines), the output
+# is byte-identical to the old ``sed 's/^/    /'`` path: each line is
+# prefixed with exactly four spaces and nothing is truncated.
+#
+# Multibyte safety (#4608)
+# ────────────────────────
+# Both BSD awk (macOS, the target env) and gawk (Linux CI) treat ``substr``
+# and ``length`` as byte operations regardless of locale. A naive
+# ``substr($0, 1, max)`` can therefore slice through the middle of a UTF-8
+# multibyte sequence, leaving a dangling partial byte before the ``…``
+# marker. We trim any trailing *incomplete* sequence after the byte cut so
+# the emitted prefix is always valid UTF-8, and the marker honestly reports
+# the count in **bytes** (which is what ``length`` counts). ``ord[]`` is a
+# byte→ordinal map built once in BEGIN; both awks populate it because
+# ``sprintf("%c", i)`` yields a one-byte string for 0..255.
+MAX_TAIL_LINES=20
+MAX_LINE_BYTES=2000
+emit_indented_capped() {
+    local log_file="$1"
+    tail -n "$MAX_TAIL_LINES" "$log_file" 2>/dev/null | awk -v max="$MAX_LINE_BYTES" '
+        BEGIN {
+            for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+        }
+        {
+            if (length($0) > max) {
+                prefix = substr($0, 1, max)
+                # Walk backward from the byte cut, dropping any trailing
+                # incomplete UTF-8 sequence so we never emit a partial
+                # codepoint. Continuation bytes are 0x80-0xBF; lead bytes
+                # are >= 0xC0 with a declared sequence length.
+                k = length(prefix)
+                while (k > 0) {
+                    o = ord[substr(prefix, k, 1)]
+                    if (o >= 128 && o < 192) {
+                        # Trailing continuation byte: provisionally drop it,
+                        # keep walking back to find its lead byte.
+                        k--
+                        continue
+                    }
+                    if (o >= 192) {
+                        # Lead byte. Declared length: 2 (0xC0-0xDF),
+                        # 3 (0xE0-0xEF), 4 (0xF0-0xF7).
+                        if (o >= 240) seqlen = 4
+                        else if (o >= 224) seqlen = 3
+                        else seqlen = 2
+                        # Two cases at the lead byte:
+                        #  * Incomplete sequence — its declared length runs
+                        #    past the bytes captured. Drop the lead byte too
+                        #    (keep k-1) so we never emit a partial codepoint.
+                        #  * Complete sequence — it fit entirely within the
+                        #    cap (ended at or before the cut). Restore k to the
+                        #    full prefix length so the whole character is kept;
+                        #    otherwise k still points at the sequence start and
+                        #    the trailing substr would chop its tail, emitting a
+                        #    lone dangling lead byte.
+                        if (k + seqlen - 1 > length(prefix)) {
+                            k--
+                        } else {
+                            k = length(prefix)
+                        }
+                    }
+                    break
+                }
+                prefix = substr(prefix, 1, k)
+                printf "    %s…[truncated %d bytes]\n", prefix, length($0) - length(prefix)
+            } else {
+                printf "    %s\n", $0
+            }
+        }
+    ' >&2
+}
+
 for path in "${runnable[@]}"; do
     name="$(basename "$path")"
     log_file="${TMPDIR:-/tmp}/run-ci-guards-${name//\//_}.log"
@@ -403,8 +500,11 @@ for path in "${runnable[@]}"; do
         fi
         echo "" >&2
         echo "  FAILED: $name (exit $rc)" >&2
-        echo "  Last 20 lines of output:" >&2
-        tail -n 20 "$log_file" | sed 's/^/    /' >&2
+        echo "  Last $MAX_TAIL_LINES lines of output:" >&2
+        # Indent + length-cap via awk, not ``sed 's/^/    /'`` — a large or
+        # pathologically long guard match block fed to BSD sed's substitute
+        # engine can abort with ``Abort trap: 6`` (#4602).
+        emit_indented_capped "$log_file"
         echo "  Full log: $log_file" >&2
     fi
 done

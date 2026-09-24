@@ -162,7 +162,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > Then implement the task using TDD:
 > 1. Read the task and feedback files.
 > 2. Examine existing code and test patterns in the relevant packages.
-> 3. If this is iteration 1, write failing tests first, then implement. If this is iteration 2+, focus on addressing the reviewer's feedback — read the existing implementation, apply the requested changes, and re-run tests.
+> 3. If this is iteration 1, write failing tests first AND run them to confirm they fail before writing any implementation. If a new test passes on its first run, it isn't exercising the new behavior — fix the test, don't pivot to writing implementation against it. Then implement. If this is iteration 2+, focus on addressing the reviewer's feedback — read the existing implementation, apply the requested changes, and re-run tests.
 > 4. **Derive touched packages and run the full test suite for each.**
 >    - Run `python3 {worktree}/scripts/ralph_touched_packages.py {worktree}` and write the output to `{worktree}/tmp/ralph/touched-packages.txt`.
 >    - Run `python3 {worktree}/scripts/ralph_touched_packages.py --ts {worktree}` to get the list of touched TypeScript packages.
@@ -192,6 +192,8 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > - No `$()` command substitution. No heredocs. No `python3 -c`. No quoted strings with `&&` or `;`.
 > - Do not commit, push, or create PRs. Only implement and verify locally.
 > - Follow existing code patterns. Type hints on all Python function signatures. Strict TypeScript mode.
+> - **Don't over-engineer.** Implement the minimum that satisfies the tests and acceptance criteria. If three lines work, don't write a framework. No speculative abstractions for hypothetical future requirements.
+> - **Don't silently relax existing tests to get green.** Default to fixing the implementation, not the test. If you genuinely need to change or delete an existing test (because the AC explicitly changes the asserted behavior, or the test was wrong), do so AND name each modified/deleted test plus the reason in `acceptance-check.txt` so the reviewer can adjudicate. The bug pattern is editing a test without flagging it — not the edit itself.
 > - **Do not use `run_in_background` on any command.** Run all commands (test suites, lint, format checks) in the foreground and wait for their results before proceeding. You are a subagent — backgrounding causes notifications to surface in the wrong context.
 
 #### Non-testable worker prompt
@@ -231,6 +233,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > - All work happens in `{worktree}`. All temp files go in `{worktree}/tmp/`.
 > - No `$()` command substitution. No heredocs. No `python3 -c`. No quoted strings with `&&` or `;`.
 > - Do not commit, push, or create PRs. Only implement and verify locally.
+> - **Don't over-engineer.** Implement the minimum that satisfies the plan's "What will change" section and the acceptance criteria. If three lines work, don't write a framework. No speculative abstractions for hypothetical future requirements.
 > - **Do not write tests for non-testable changes.** If the plan's "What will change" section genuinely requires a test (e.g., you're tightening a docstring that the plan author misclassified as docs when it actually affects runtime behavior), write "STUCK" with an explanation — the plan author should re-classify rather than ralph silently mixing testable and non-testable work.
 > - **Do not use `run_in_background` on any command.** Run all commands in the foreground and wait for their results before proceeding. You are a subagent — backgrounding causes notifications to surface in the wrong context.
 
@@ -252,6 +255,12 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 **Pre-generate diff and changed files before launching reviewers.** This must happen once, before any reviewer starts. Run these two commands sequentially (as separate Bash tool calls):
 
 1. Generate `diff.txt`:
+
+   First, make untracked (new) files visible to `git diff` with an intent-to-add. Without this, both `git diff` and `git diff --cached` omit untracked files, so any new file a task created (new scripts, modules, or test files — the common case) is absent from the diff the reviewers read, and they return a spurious "implementation missing" REVISE (see #4616; recurrence #4610 / PR #4615). `add -N` records intent-to-add only — it does **not** stage file content — so it does not interfere with the worker's later explicit staging in `/task` A.3:
+   ```
+   git -C {worktree} add -N .
+   ```
+   Then write the unstaged diff (now including the new-file content via the intent-to-add markers):
    ```
    git -C {worktree} diff > {worktree}/tmp/ralph/diff.txt
    ```
@@ -313,7 +322,7 @@ Run this sub-step only when `## Testable: no`.
 Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running Claude reviewer for iteration N (non-testable)`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-reviewer (N)"`
 
-**Pre-generate diff and changed files before launching the reviewer.** Same procedure as 2b — write `{worktree}/tmp/ralph/diff.txt` and `{worktree}/tmp/ralph/changed_files.txt`.
+**Pre-generate diff and changed files before launching the reviewer.** Same procedure as 2b — write `{worktree}/tmp/ralph/diff.txt` and `{worktree}/tmp/ralph/changed_files.txt`. In particular, run `git -C {worktree} add -N .` (intent-to-add for untracked files) **before** the `git diff` calls so new (untracked) files appear in `diff.txt`; otherwise the reviewer sees a diff missing any new-file content and returns a spurious "implementation missing" REVISE (see #4616).
 
 **Skip the two Gemini reviews** — they are code-review-oriented and add no signal on docs / db_migration / dx_tooling / no_deployed_component diffs. The non-testable branch accepts a single Claude review.
 

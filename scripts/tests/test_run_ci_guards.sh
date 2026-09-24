@@ -38,6 +38,15 @@
 #       stderr does NOT trigger the SKIP_LIST hint (#4534).
 #  14.  Requires-argument hint covers argparse "the following arguments
 #       are required" shape (#4534).
+#  15.  Requires-argument hint includes Option C rename remediation (#4558).
+#  16.  Large guard match block does not crash the formatting path with
+#       Abort trap: 6 — umbrella exits 1, output intact (#4602).
+#  17.  Small-match formatting keeps the four-space indent unchanged (#4602).
+#  18.  Over-long line truncated with prefix preserved + marker (#4602).
+#  19.  Multibyte UTF-8 truncation never splits mid-codepoint; marker
+#       label reads "bytes" not "chars" (#4608).
+#  19b. Complete multibyte sequence ending exactly at the byte cap is kept
+#       whole (not chopped to a dangling lead byte) (#4608).
 #
 # Run:
 #   scripts/tests/test_run_ci_guards.sh
@@ -493,6 +502,206 @@ elif ! echo "$out_buf" | grep -q "code-standards.md"; then
     report_fail "expected code-standards.md cross-reference (#4558)" "$out_buf"
 else
     report_pass "requires-argument hint includes Option C rename remediation (#4558)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 16: large guard match block does not crash the formatting path
+#               with Abort trap: 6 (#4602). A failing guard that emits a
+#               large block — many lines plus a single pathologically long
+#               line — used to be piped through ``sed 's/^/    /'``, which on
+#               macOS BSD sed can abort with ``Assertion failed: (advance >
+#               0), function substitute, file process.c`` / ``Abort trap:
+#               6`` (SIGABRT, exit 134). The hardened awk path must keep the
+#               umbrella's exit at the normal guard-failure code (1) and
+#               leave the output intact and readable.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 16] large guard match block — no Abort trap, exit 1 (#4602)"
+synth_scripts="$(seed_synthetic_scripts s16)"
+# Guard emits 50 lines, one of which is a single 500k-char line — a "large
+# match block" of exactly the shape the issue describes (a noisy guard / real
+# multi-file violation / false positive walk).
+cat > "$synth_scripts/check-bigblock.sh" <<'SH'
+#!/usr/bin/env bash
+for i in $(seq 1 49); do
+    echo "violation at packages/foo/bar_$i.py:$i"
+done
+# One pathologically long single line (no embedded newlines).
+python3 -c 'print("x" * 500000)'
+exit 1
+SH
+chmod +x "$synth_scripts/check-bigblock.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -eq 134 ] || [ "$rc_buf" -ge 128 ]; then
+    report_fail "umbrella aborted with signal $((rc_buf - 128)) (rc=$rc_buf) on large match block (#4602)" "$out_buf"
+elif [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 (normal guard-failure) on large match block, got $rc_buf (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -qi "Abort trap"; then
+    report_fail "output contains 'Abort trap' — formatting path crashed (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "FAILED: check-bigblock.sh"; then
+    report_fail "expected 'FAILED: check-bigblock.sh' — output should be intact (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "truncated"; then
+    report_fail "expected '…[truncated N chars]' marker on the over-long line (#4602)" "$out_buf"
+else
+    report_pass "large guard match block does not crash; exits 1 with intact output (#4602)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 17: small-match formatting is byte-identical to the old
+#               ``sed 's/^/    /'`` path (#4602). The hardening must not
+#               regress the common small-failure output — each emitted line
+#               keeps exactly the four-space indent and is not truncated.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 17] small-match formatting unchanged — four-space indent (#4602)"
+synth_scripts="$(seed_synthetic_scripts s17)"
+cat > "$synth_scripts/check-smallfail.sh" <<'SH'
+#!/usr/bin/env bash
+echo "deliberate failure line one"
+echo "deliberate failure line two"
+exit 1
+SH
+chmod +x "$synth_scripts/check-smallfail.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 on small failing guard, got $rc_buf (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "^    deliberate failure line one$"; then
+    report_fail "expected four-space-indented 'deliberate failure line one' (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "^    deliberate failure line two$"; then
+    report_fail "expected four-space-indented 'deliberate failure line two' (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -q "truncated"; then
+    report_fail "small lines should NOT be truncated (#4602)" "$out_buf"
+else
+    report_pass "small-match output keeps four-space indent, no truncation (#4602)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 18: over-long-line truncation preserves the line prefix and
+#               appends the char-count marker (#4602). Confirms the bounded
+#               formatting still surfaces the start of a huge match line so
+#               the operator can see what failed.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 18] over-long line truncated with prefix preserved (#4602)"
+synth_scripts="$(seed_synthetic_scripts s18)"
+cat > "$synth_scripts/check-longline.sh" <<'SH'
+#!/usr/bin/env bash
+python3 -c 'print("BEGINMARKER" + "y" * 300000 + "ENDMARKER")'
+exit 1
+SH
+chmod +x "$synth_scripts/check-longline.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 on long-line guard, got $rc_buf (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "BEGINMARKER"; then
+    report_fail "expected the start-of-line 'BEGINMARKER' to survive truncation (#4602)" "$out_buf"
+elif echo "$out_buf" | grep -q "ENDMARKER"; then
+    report_fail "expected the far end 'ENDMARKER' to be truncated away (#4602)" "$out_buf"
+elif ! echo "$out_buf" | grep -qE "truncated [0-9]+ bytes"; then
+    report_fail "expected '…[truncated N bytes]' marker after the prefix (#4602)" "$out_buf"
+else
+    report_pass "over-long line truncated, prefix preserved, marker appended (#4602)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 19: multibyte-safe truncation (#4608). BSD/gawk substr() and
+#               length() operate on BYTES, so a naive substr($0, 1, 2000)
+#               can slice through the middle of a UTF-8 multibyte sequence,
+#               emitting a dangling partial byte before the marker. The
+#               hardened awk path must trim any trailing incomplete sequence
+#               so the emitted prefix is always valid UTF-8, and the marker
+#               must honestly say "bytes" (which is what is counted).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 19] multibyte truncation never splits mid-codepoint (#4608)"
+synth_scripts="$(seed_synthetic_scripts s19)"
+# Emit 1999 ASCII 'x' followed by a long run of 3-byte '…' (U+2026). The
+# byte cap is MAX_LINE_BYTES=2000, so byte 2000 lands on the FIRST byte of
+# the first '…' sequence — a naive byte-truncation would emit that lone lead
+# byte (an incomplete sequence) right before the marker.
+cat > "$synth_scripts/check-mbtrunc.sh" <<'SH'
+#!/usr/bin/env bash
+python3 -c 'import sys; sys.stdout.buffer.write(b"x" * 1999 + ("…" * 100).encode("utf-8") + b"\n")'
+exit 1
+SH
+chmod +x "$synth_scripts/check-mbtrunc.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ge 128 ]; then
+    report_fail "umbrella aborted with signal $((rc_buf - 128)) (rc=$rc_buf) on multibyte block (#4608)" "$out_buf"
+elif [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 (normal guard-failure) on multibyte block, got $rc_buf (#4608)" "$out_buf"
+elif ! echo "$out_buf" | grep -qE "truncated [0-9]+ bytes"; then
+    report_fail "expected '…[truncated N bytes]' marker (label must read 'bytes') (#4608)" "$out_buf"
+else
+    # Extract the emitted guard-content prefix: take the output line carrying
+    # the truncation marker, cut everything from the literal '[truncated'
+    # onward, then strip the leading four-space indent. The remaining bytes
+    # are exactly what the runner emitted as the truncated prefix (it may end
+    # in the U+2026 marker ellipsis, which is itself valid UTF-8). If the
+    # runner left a dangling partial UTF-8 sequence, .decode('utf-8') fails.
+    #
+    # The extraction MUST be binary-safe: when the runner emitted a dangling
+    # partial byte, a locale-aware grep/sed can silently drop or mangle the
+    # line (returning an empty prefix that "decodes" as valid empty UTF-8 — a
+    # false pass). We run the whole pipeline under LC_ALL=C so grep/sed/awk
+    # operate on raw bytes, capture the marker line to a file, and use
+    # grep -a to force text mode on otherwise-binary content.
+    mkdir -p "$REPO_ROOT/tmp"
+    raw_file="$REPO_ROOT/tmp/test-mbtrunc-raw-$$"
+    prefix_file="$REPO_ROOT/tmp/test-mbtrunc-prefix-$$"
+    printf '%s\n' "$out_buf" > "$raw_file"
+    LC_ALL=C grep -a '\[truncated' "$raw_file" | LC_ALL=C head -n1 \
+        | LC_ALL=C sed 's/…\[truncated.*//' | LC_ALL=C sed 's/^    //' \
+        | LC_ALL=C tr -d '\n' > "$prefix_file"
+    if python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' < "$prefix_file"; then
+        report_pass "multibyte truncation emits valid UTF-8 prefix; marker reads 'bytes' (#4608)"
+    else
+        report_fail "emitted truncated prefix is not valid UTF-8 — split mid-codepoint (#4608)" "$out_buf"
+    fi
+    rm -f "$raw_file" "$prefix_file"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 19b: complete-sequence-at-boundary (#4608). The companion to
+#               scenario 19. Here a COMPLETE 3-byte '…' (U+2026) ends EXACTLY
+#               at the byte cap (its three bytes occupy positions 1998/1999/
+#               2000). The backward-walk must KEEP that complete sequence
+#               whole; a naive walk that stops at the lead byte without
+#               restoring k chops the trailing two bytes and emits a lone
+#               dangling lead byte (invalid UTF-8) — the exact defect the
+#               codepoint-aware truncation is meant to prevent.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 19b] complete multibyte sequence at the cap is kept whole (#4608)"
+synth_scripts="$(seed_synthetic_scripts s19b)"
+# 1997 ASCII 'x' + one 3-byte '…' (bytes 1998,1999,2000 — a complete sequence
+# ending exactly at the cap) + 20 more chars of filler so the total exceeds
+# MAX_LINE_BYTES=2000 and truncation actually fires.
+cat > "$synth_scripts/check-mbtrunc-complete.sh" <<'SH'
+#!/usr/bin/env bash
+python3 -c 'import sys; sys.stdout.buffer.write(b"x" * 1997 + "…".encode("utf-8") + b"z" * 20 + b"\n")'
+exit 1
+SH
+chmod +x "$synth_scripts/check-mbtrunc-complete.sh"
+run_synth "$synth_scripts"
+if [ "$rc_buf" -ge 128 ]; then
+    report_fail "umbrella aborted with signal $((rc_buf - 128)) (rc=$rc_buf) on complete-at-cap block (#4608)" "$out_buf"
+elif [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 (normal guard-failure) on complete-at-cap block, got $rc_buf (#4608)" "$out_buf"
+elif ! echo "$out_buf" | grep -qE "truncated [0-9]+ bytes"; then
+    report_fail "expected '…[truncated N bytes]' marker (label must read 'bytes') (#4608)" "$out_buf"
+else
+    # Same binary-safe extraction as scenario 19. If the awk walk chopped the
+    # complete '…' at the cap, the prefix ends in a lone 0xE2 lead byte and
+    # .decode('utf-8') fails.
+    mkdir -p "$REPO_ROOT/tmp"
+    raw_file="$REPO_ROOT/tmp/test-mbtrunc-complete-raw-$$"
+    prefix_file="$REPO_ROOT/tmp/test-mbtrunc-complete-prefix-$$"
+    printf '%s\n' "$out_buf" > "$raw_file"
+    LC_ALL=C grep -a '\[truncated' "$raw_file" | LC_ALL=C head -n1 \
+        | LC_ALL=C sed 's/…\[truncated.*//' | LC_ALL=C sed 's/^    //' \
+        | LC_ALL=C tr -d '\n' > "$prefix_file"
+    if python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' < "$prefix_file"; then
+        report_pass "complete multibyte sequence at cap kept whole; valid UTF-8 prefix (#4608)"
+    else
+        report_fail "complete-at-cap sequence was chopped — dangling lead byte, invalid UTF-8 (#4608)" "$out_buf"
+    fi
+    rm -f "$raw_file" "$prefix_file"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

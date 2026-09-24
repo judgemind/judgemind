@@ -332,11 +332,13 @@ preflight_rate_budget() {
 REPO_WALK_EXCLUSIONS=(
     .git
     .venv
+    .venv-scripts
     node_modules
     __pycache__
     .next
     .claude
     .vite
+    .terraform
     tmp
     dist
     build

@@ -46,7 +46,7 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -419,6 +419,297 @@ class TestCircuitBreaker:
             if "UPDATE dispatcher.config" in e[0]
         ]
         assert updates == []
+
+
+# --------------------------------------------------------------------------
+# Diagnoser circuit breaker — Telegram alert + auto-recovery (#4586)
+# --------------------------------------------------------------------------
+
+
+def _make_daemon_with_notify_script(
+    tmp_path: Path,
+) -> tuple[daemon.DispatcherDaemon, _FakeConnection, _CapturingLogHandler, Path]:
+    """Make a daemon whose ``baseline_repo_root`` holds a notify-telegram.sh stub.
+
+    The send method short-circuits if the script path does not exist on
+    disk, so we write a stub (never executed — subprocess.run is mocked
+    in the tests that exercise the send path).
+    """
+    handler = _CapturingLogHandler()
+    logger = logging.getLogger(f"dispatcher.test.phase3d.notify.{id(tmp_path)}")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    conn = _FakeConnection()
+    cfg = daemon.DaemonConfig(
+        database_url="postgres://fake",
+        version_sha="deadbee",
+        host="test-host",
+        pid=9999,
+        github_repo="judgemind/judgemind",
+        dispatcher_service_name="judgemind-dispatcher-test",
+        baseline_repo_root=str(tmp_path),
+    )
+    d = daemon.DispatcherDaemon(cfg, logger)
+    d._conn = conn  # type: ignore[assignment]
+    d._run_id = "test-run-id"
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    notify = scripts_dir / "notify-telegram.sh"
+    notify.write_text("#!/bin/sh\n")
+    notify.chmod(0o755)
+
+    return d, conn, handler, notify
+
+
+class TestDiagnoserBreakerTelegramAlert:
+    """#4586 Option 2: the breaker fires a Telegram alert when it trips."""
+
+    def test_trip_invokes_notify_telegram(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """The canonical regression test: when the breaker flips, the
+        ``notify-telegram.sh`` helper is invoked with --message-file.
+
+        This is the AC's required assertion (``-k notify``)."""
+        d, conn, handler, notify = _make_daemon_with_notify_script(tmp_path)
+        # 10 total, 4 failed → 0.40 > 0.30 threshold → trip.
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),  # threshold read
+            (4, 10),  # COUNT aggregation: failed_n, total_n
+            ("86400",),  # recovery-window read (for the rendered message)
+        ]
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        tripped = d._check_diagnoser_circuit_breaker()
+
+        assert tripped is True
+        # notify-telegram.sh was invoked exactly once with --message-file.
+        assert len(calls) == 1
+        assert str(notify) in calls[0]
+        assert "--message-file" in calls[0]
+        # Exit-0 maps to the "sent" INFO event (reuses #3061 mapping).
+        assert handler.events("diagnoser_circuit_breaker_telegram_sent")
+
+    def test_no_trip_does_not_invoke_notify(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Healthy fallback rate → no trip → no Telegram alert."""
+        d, conn, _handler, _notify = _make_daemon_with_notify_script(tmp_path)
+        # 10 total, 3 failed → 0.30 == threshold → no trip.
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),
+            (3, 10),
+        ]
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        tripped = d._check_diagnoser_circuit_breaker()
+
+        assert tripped is False
+        assert calls == []
+
+    def test_trip_records_tripped_at_timestamp(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """On trip, the breaker UPSERTs ``diagnoser_breaker_tripped_at``."""
+        d, conn, _handler, _notify = _make_daemon_with_notify_script(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),
+            (4, 10),
+            ("86400",),  # recovery-window read for the message
+        ]
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: MagicMock(returncode=0, stdout="", stderr=""),
+        )
+        d._check_diagnoser_circuit_breaker()
+
+        upserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.config" in e[0]
+            and e[1][0] == daemon.DIAGNOSER_BREAKER_TRIPPED_AT_KEY
+        ]
+        assert len(upserts) == 1
+
+    def test_telegram_failure_does_not_undo_trip(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """A non-zero notify exit is logged as a warning; trip still stands."""
+        d, conn, handler, _notify = _make_daemon_with_notify_script(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),
+            (4, 10),
+            ("86400",),
+        ]
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: MagicMock(returncode=2, stdout="", stderr="boom"),
+        )
+        tripped = d._check_diagnoser_circuit_breaker()
+        assert tripped is True
+        # Exit 2 → all_send_failed warning (reuses #3061 mapping), not "sent".
+        assert handler.events("diagnoser_circuit_breaker_telegram_all_send_failed")
+        assert not handler.events("diagnoser_circuit_breaker_telegram_sent")
+
+    def test_missing_script_skips_send(self, tmp_path: Path) -> None:
+        """No notify-telegram.sh on disk → skip event, no crash."""
+        # _make_daemon has no baseline_repo_root + no stub script, so the
+        # send path short-circuits with the skipped event.
+        d, conn, handler = _make_daemon(tmp_path)
+        d._cfg.baseline_repo_root = str(tmp_path)  # type: ignore[attr-defined]
+        d._send_diagnoser_breaker_telegram_alert(
+            fallback_rate=0.4,
+            threshold=0.3,
+            total_diagnoses=10,
+            failed_diagnoses=4,
+        )
+        assert handler.events("diagnoser_circuit_breaker_telegram_skipped_no_script")
+
+
+class TestDiagnoserBreakerAutoRecover:
+    """#4586 Option 1: time-bounded auto-recovery re-enables the diagnoser."""
+
+    def test_hot_path_when_enabled(self, tmp_path: Path) -> None:
+        """Diagnoser already enabled → no-op, no UPDATE."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [("true",)]  # _diagnoser_enabled read
+        recovered = d._check_diagnoser_breaker_auto_recover()
+        assert recovered is False
+        updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+        ]
+        assert updates == []
+
+    def test_no_recovery_when_no_tripped_at(self, tmp_path: Path) -> None:
+        """Diagnoser disabled but no trip timestamp → leave to operator."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("false",),  # _diagnoser_enabled → disabled
+            (None,),  # _read_diagnoser_breaker_tripped_at → no row value
+        ]
+        recovered = d._check_diagnoser_breaker_auto_recover()
+        assert recovered is False
+
+    def test_no_recovery_before_window_elapsed(self, tmp_path: Path) -> None:
+        """Window not yet elapsed → stay tripped."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        conn.cursor_instance.fetch_queue = [
+            ("false",),  # disabled
+            (json.dumps(recent),),  # tripped 1h ago
+            ("86400",),  # recovery window = 24h
+        ]
+        recovered = d._check_diagnoser_breaker_auto_recover()
+        assert recovered is False
+        updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+        ]
+        assert updates == []
+
+    def test_recovers_after_window_elapsed(self, tmp_path: Path) -> None:
+        """Window elapsed → re-enable diagnoser + clear trip timestamp."""
+        d, conn, handler = _make_daemon(tmp_path)
+        stale = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+        conn.cursor_instance.fetch_queue = [
+            ("false",),  # disabled
+            (json.dumps(stale),),  # tripped 25h ago
+            ("86400",),  # recovery window = 24h → elapsed
+        ]
+        recovered = d._check_diagnoser_breaker_auto_recover()
+        assert recovered is True
+        # Two UPDATEs: re-enable diagnoser_enabled, clear tripped_at.
+        updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+        ]
+        assert len(updates) == 2
+        enable_update = [u for u in updates if u[1] == ("diagnoser_enabled",)]
+        clear_update = [
+            u for u in updates if u[1] == (daemon.DIAGNOSER_BREAKER_TRIPPED_AT_KEY,)
+        ]
+        assert len(enable_update) == 1
+        assert "value = 'true'" in enable_update[0][0]
+        assert len(clear_update) == 1
+        assert handler.events("diagnoser_circuit_breaker_auto_recovered")
+
+    def test_recovery_window_default_on_malformed(self, tmp_path: Path) -> None:
+        """Malformed window config → 24h default."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [("not-an-int",)]
+        assert (
+            d._diagnoser_breaker_recovery_window_seconds()
+            == daemon.DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        )
+
+    def test_recovery_window_default_on_nonpositive(self, tmp_path: Path) -> None:
+        """Non-positive window would auto-recover immediately → coerce to default."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [("0",)]
+        assert (
+            d._diagnoser_breaker_recovery_window_seconds()
+            == daemon.DEFAULT_DIAGNOSER_BREAKER_RECOVERY_WINDOW_SECONDS
+        )
+
+    def test_read_tripped_at_returns_none_on_malformed(self, tmp_path: Path) -> None:
+        """Unparseable timestamp → None (no auto-recovery owed)."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(json.dumps("not-a-timestamp"),)]
+        assert d._read_diagnoser_breaker_tripped_at() is None
+
+
+class TestMigration65DiagnoserBreakerRecovery:
+    """Migration 65 seeds ``diagnoser_breaker_recovery_window_seconds``."""
+
+    def _migration_path(self) -> Path:
+        repo_root = Path(__file__).resolve().parents[3]
+        return (
+            repo_root
+            / "packages"
+            / "api"
+            / "migrations"
+            / "65_dispatcher-diagnoser-breaker-recovery.sql"
+        )
+
+    def test_migration_file_present(self) -> None:
+        assert self._migration_path().exists()
+
+    def test_migration_seeds_recovery_window(self) -> None:
+        sql = self._migration_path().read_text(encoding="utf-8")
+        assert "diagnoser_breaker_recovery_window_seconds" in sql
+        assert "INSERT INTO dispatcher.config" in sql
+        assert "'86400'" in sql
+        assert "ON CONFLICT" in sql
+
+    def test_migration_has_down_migration(self) -> None:
+        sql = self._migration_path().read_text(encoding="utf-8")
+        assert "Down Migration" in sql
+        assert "DELETE FROM dispatcher.config" in sql
 
 
 # --------------------------------------------------------------------------

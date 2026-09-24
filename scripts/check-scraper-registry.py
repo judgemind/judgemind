@@ -24,6 +24,19 @@ import re
 import sys
 from pathlib import Path
 
+# Scraper modules intentionally kept in the tree but NOT wired into
+# ``_build_registry()``. Each entry must carry a rationale so the guard
+# stays honest — leaving a module unregistered silently produces zero data,
+# which is exactly what this check exists to catch. A module belongs here
+# only when it has been deliberately retired (not merely forgotten).
+RETIRED_MODULES: set[str] = {
+    # CourtListener federal-opinions scraper retired per #4571 / #4474 — its
+    # envelopes drove dev ElastiCache OOM and wedged the dispatcher. The
+    # module + its test stay in tree so the scraper can be re-enabled later,
+    # but it is intentionally de-registered from the runner for now.
+    "courts.federal.courtlistener",
+}
+
 
 def find_repo_root() -> Path:
     """Walk up from the script's location to find the repository root."""
@@ -121,7 +134,11 @@ def main() -> int:
             print(f"  {status}: {mod}")
         print()
 
-    unregistered = [mod for mod in scraper_modules if mod not in registered_modules]
+    unregistered = [
+        mod
+        for mod in scraper_modules
+        if mod not in registered_modules and mod not in RETIRED_MODULES
+    ]
 
     if unregistered:
         print(

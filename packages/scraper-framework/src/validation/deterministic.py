@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
+from framework.title_heuristics import has_uninformative_party_title
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -288,36 +290,48 @@ def check_unknown_and_null_title_fail(
     case_number: str | None,
     case_title: str | None,
 ) -> DeterministicRuleResult:
-    """Reject rulings with BOTH a synthetic UNKNOWN- case_number AND a null/empty title.
+    """Reject rulings with a synthetic UNKNOWN- case_number AND an uninformative title.
 
-    This is a narrow, high-confidence rejection rule (#2571).  When both the
-    case number and the case title are missing after all extraction and
+    This is a narrow, high-confidence rejection rule (#2571, extended #4628).
+    When the case number is missing (synthetic ``UNKNOWN-`` prefix) AND the
+    case title carries no real party information after all extraction and
     enrichment paths have run, the ruling is almost certainly an orphaned
     fragment of a bad LLM split — for example, a multi-Issue MSJ/MSA ruling
     that was over-split into per-Issue fragments, each of which lacks case
     metadata because that only appears at the top of the parent entry.
 
+    A title is treated as *uninformative* (equivalent to a null title) when it
+    is null/empty/whitespace OR a **role-literal** placeholder
+    (``Plaintiffs v. Defendant`` — the LLM emitted the role word instead of a
+    real party name, on either side of ``v.``) OR a **bracketed** LLM
+    placeholder (``... v. [Defendant not specified]``).  Before #4628 those
+    role-literal / bracketed titles were treated as real titles, so junk rows
+    like Santa Clara's ``UNKNOWN-<uuid>`` + ``Plaintiffs v. Defendant`` slipped
+    past this gate and reached ``derived.rulings``.
+
     Storing such fragments pollutes the DB with UNKNOWN-prefixed cases and
     wrong motion types.  This rule returns ``fail`` (not ``flag``) so the
     caller skips the DB write entirely, ensuring that the 3-way extraction
-    failure (UNKNOWN case_number + NULL title + wrong motion_type) described
-    in #2571 cannot reach ``derived.rulings``.
+    failure (UNKNOWN case_number + uninformative title + wrong motion_type)
+    described in #2571 cannot reach ``derived.rulings``.
 
-    The sibling rule ``check_case_number_not_unknown`` keeps its ``flag``
-    behaviour for rulings that have a title but no case_number — those can
-    still be healed later by cross-case title lookup and are safer to keep.
+    A REAL title (``Smith v. Jones``) with an UNKNOWN- case_number still passes
+    this rule — the real party names give a heal-by-title path, and the sibling
+    rule ``check_case_number_not_unknown`` keeps its ``flag`` behaviour for
+    those.  A real (non-UNKNOWN) case_number also always passes, even paired
+    with a role-literal title, so genuine pseudonym cases are preserved.
     """
     has_unknown_case_number = case_number is not None and case_number.startswith("UNKNOWN-")
-    has_empty_title = case_title is None or not case_title.strip()
 
-    if has_unknown_case_number and has_empty_title:
+    if has_unknown_case_number and has_uninformative_party_title(case_title):
         return DeterministicRuleResult(
             rule="unknown_and_null_title_fail",
             result="fail",
             reason=(
                 "case_number starts with 'UNKNOWN-' AND case_title is "
-                "null/empty — ruling is almost certainly a bad-split "
-                "fragment (see #2571); rejecting to protect DB integrity"
+                "null/empty/role-literal/placeholder — ruling is almost "
+                "certainly a bad-split fragment (see #2571, #4628); "
+                "rejecting to protect DB integrity"
             ),
         )
     return DeterministicRuleResult(rule="unknown_and_null_title_fail", result="pass")

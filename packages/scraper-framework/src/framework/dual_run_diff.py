@@ -78,6 +78,33 @@ class DiffRow:
     flag: FlagType = "equal"
 
 
+@dataclass
+class TotalCoverageSignal:
+    """Dominant "captured nothing at all" signal across a single date's diff.
+
+    Distinguishes a **total-coverage failure** (portal captured zero documents
+    while the retired scraper captured some) from the per-department gaps that
+    ``compute_per_department_diff`` surfaces. The total-zero case is usually a
+    fetch / judge-discovery breakage rather than a per-department format gap —
+    see issue #4600.
+
+    Attributes:
+        portal_total_zero: ``True`` **only when** the portal total is 0 **and**
+            the retired total is > 0 (i.e. the portal captured nothing while
+            the retired scraper captured something).
+        retired_total: Sum of ``count_a`` across all diff rows.
+        portal_total: Sum of ``count_b`` across all diff rows.
+        headline: When ``portal_total_zero`` is ``True``, a message naming the
+            "total-coverage failure" and pointing at the fetch / discovery
+            layer. Empty string ``""`` when the signal does not fire.
+    """
+
+    portal_total_zero: bool
+    retired_total: int
+    portal_total: int
+    headline: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Scraper ID constants
 # ---------------------------------------------------------------------------
@@ -170,6 +197,44 @@ def compute_per_department_diff(
 
 
 # ---------------------------------------------------------------------------
+# Total-coverage signal
+# ---------------------------------------------------------------------------
+
+
+def compute_total_coverage_signal(diff_rows: list[DiffRow]) -> TotalCoverageSignal:
+    """Compute the dominant total-coverage signal from a date's diff rows.
+
+    Args:
+        diff_rows: Output from :func:`compute_per_department_diff`.
+
+    Returns:
+        A :class:`TotalCoverageSignal`. ``portal_total_zero`` is ``True`` only
+        when the portal captured nothing (``portal_total == 0``) while the
+        retired scraper captured something (``retired_total > 0``) — the
+        "captured nothing at all" case, which points at a fetch / judge-discovery
+        failure rather than a per-department gap.
+    """
+    retired_total = sum(r.count_a for r in diff_rows)
+    portal_total = sum(r.count_b for r in diff_rows)
+    portal_total_zero = portal_total == 0 and retired_total > 0
+
+    headline = ""
+    if portal_total_zero:
+        headline = (
+            f"Portal captured 0 of {retired_total} rulings the retired scraper "
+            "captured — likely a total-coverage failure (judge discovery / fetch), "
+            "not a per-department gap."
+        )
+
+    return TotalCoverageSignal(
+        portal_total_zero=portal_total_zero,
+        retired_total=retired_total,
+        portal_total=portal_total,
+        headline=headline,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Human-readable summary
 # ---------------------------------------------------------------------------
 
@@ -191,11 +256,22 @@ def format_summary(diff_rows: list[DiffRow]) -> str:
     mismatch = [r for r in diff_rows if r.flag == "mismatch"]
     equal = [r for r in diff_rows if r.flag == "equal"]
 
-    lines: list[str] = [
-        f"CC dual-run diff: {len(diff_rows)} department(s) compared.",
-        f"  equal={len(equal)}, mismatch={len(mismatch)}, "
-        f"missing_portal={len(missing)}, new_portal_coverage={len(new_cov)}",
-    ]
+    lines: list[str] = []
+
+    # When the portal captured nothing at all, lead with the dominant
+    # total-coverage-failure headline ABOVE the per-department rendering.
+    signal = compute_total_coverage_signal(diff_rows)
+    if signal.portal_total_zero:
+        lines.append(f"TOTAL-COVERAGE FAILURE: {signal.headline}")
+        lines.append("")
+
+    lines.extend(
+        [
+            f"CC dual-run diff: {len(diff_rows)} department(s) compared.",
+            f"  equal={len(equal)}, mismatch={len(mismatch)}, "
+            f"missing_portal={len(missing)}, new_portal_coverage={len(new_cov)}",
+        ]
+    )
 
     if missing:
         lines.append("")

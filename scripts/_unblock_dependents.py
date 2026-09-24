@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 
 def gh(*args: str) -> str | None:
@@ -32,15 +33,35 @@ def gh_json(*args: str) -> dict | list | None:
     return json.loads(out)
 
 
-def strip_blocked_lines(body: str) -> str:
+def strip_blocked_lines(
+    body: str,
+    was_blocked_by: list[str | int] | None = None,
+    unblock_date: str | None = None,
+) -> str:
     """Remove 'Blocked by #N' lines and empty '## Dependencies' sections.
 
     Accepts both the canonical ``Blocked by #N`` form and the colon variant
     ``Blocked by: #N`` so that issues written in either style are cleaned up.
+
+    When ``was_blocked_by`` is a non-empty list of blocker numbers (strings or
+    ints), a single durable provenance marker is appended at the end of the body
+    so the only in-body signal that the issue was waiting on a now-shipped
+    structural fix survives the strip (see issue #4610). The marker format is::
+
+        Was-blocked-by: #4282, #4297, #4370 (all closed-completed YYYY-MM-DD; auto-unblocked)
+
+    ``YYYY-MM-DD`` is ``unblock_date`` if provided, else today's UTC date. If the
+    body already contains a ``Was-blocked-by:`` line, no second one is added
+    (idempotency). When ``was_blocked_by`` is None/empty, behaviour is unchanged
+    (no marker) — preserving backward compatibility with callers that pass only
+    ``body``.
     """
     lines = body.splitlines()
 
-    # Remove all "Blocked by #N" / "Blocked by: #N" lines (colon is optional)
+    # Remove all "Blocked by #N" / "Blocked by: #N" lines (colon is optional).
+    # The ``Blocked by:?`` form (no leading "Was-") never matches a
+    # ``Was-blocked-by:`` marker because re.match anchors at the line start and
+    # the literal "Was-" prefix is not skipped by ``\s*``.
     lines = [line for line in lines if not re.match(r"\s*Blocked by:?\s+#\d+", line)]
 
     # Remove empty "## Dependencies" section
@@ -64,7 +85,25 @@ def strip_blocked_lines(body: str) -> str:
     while result and not result[-1].strip():
         result.pop()
 
-    return "\n".join(result)
+    stripped = "\n".join(result)
+
+    # Append the durable provenance marker (idempotent).
+    if was_blocked_by:
+        already = any(
+            re.match(r"\s*Was-blocked-by:", line) for line in stripped.splitlines()
+        )
+        if not already:
+            date = unblock_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            nums = ", ".join(f"#{str(b).lstrip('#')}" for b in was_blocked_by)
+            marker = (
+                f"Was-blocked-by: {nums} (all closed-completed {date}; auto-unblocked)"
+            )
+            if stripped:
+                stripped = f"{stripped}\n\n{marker}"
+            else:
+                stripped = marker
+
+    return stripped
 
 
 def main() -> None:
@@ -115,7 +154,7 @@ def main() -> None:
 
         print("  All blockers resolved!")
 
-        updated_body = strip_blocked_lines(body)
+        updated_body = strip_blocked_lines(body, was_blocked_by=blockers)
 
         if dry_run:
             print("  [DRY RUN] Would update body (removed Blocked by lines)")

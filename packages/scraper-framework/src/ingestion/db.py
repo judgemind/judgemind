@@ -1452,7 +1452,8 @@ def _maybe_arbitrate(
         INSERT INTO judge_aliases
             (judge_id, raw_name, source, confidence, is_verified)
         VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
-        ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+        ON CONFLICT (judge_id, lower(raw_name), source)
+            WHERE source IS NOT NULL DO NOTHING
         """,
         (judge_id, roster_normalized, confidence),
     )
@@ -1462,7 +1463,8 @@ def _maybe_arbitrate(
         INSERT INTO judge_aliases
             (judge_id, raw_name, source, confidence, is_verified)
         VALUES (%s::uuid, %s, %s, 1.0, FALSE)
-        ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+        ON CONFLICT (judge_id, lower(raw_name), source)
+            WHERE source IS NOT NULL DO NOTHING
         """,
         (judge_id, raw_name, source),
     )
@@ -1773,7 +1775,8 @@ def resolve_judge(
                 """
                 INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
                 VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
-                ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+                ON CONFLICT (judge_id, lower(raw_name), source)
+            WHERE source IS NOT NULL DO NOTHING
                 """,
                 (judge_id, pending_roster_alias, pending_roster_alias_confidence),
             )

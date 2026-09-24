@@ -42,6 +42,7 @@ from bs4 import BeautifulSoup
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.browser import apply_stealth as _apply_stealth
 from framework.events import EventBus
+from framework.proxy_health import diagnose_and_log_proxy_auth
 from framework.storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
@@ -741,6 +742,11 @@ class SDTentativeRulingsScraper(BaseScraper):
             "Failed to solve Cloudflare challenge after all retries",
             max_retries=CF_MAX_RETRIES,
         )
+        # The all-retries failure surfaced only as opaque Chromium timeouts.
+        # When a proxy is configured, run a stdlib probe through the SAME proxy
+        # so a Bright Data 407 credential rejection is logged distinctly (#4638).
+        if self._proxy_url:
+            await asyncio.to_thread(diagnose_and_log_proxy_auth, self._log, self._proxy_url)
         return False
 
     async def _poll_cf_clearance(self, context: Any) -> bool:

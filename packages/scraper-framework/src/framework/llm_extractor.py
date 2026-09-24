@@ -47,6 +47,12 @@ from .llm_schema import (
     FieldConfidence,
 )
 from .llm_utils import parse_llm_json, strip_llm_json_fences
+from .title_heuristics import (
+    BRACKETED_PLACEHOLDER_TITLE_RE as _BRACKETED_PLACEHOLDER_TITLE_RE,
+)
+from .title_heuristics import (
+    is_role_literal_title as _is_role_literal_title,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -136,34 +142,24 @@ _SB_CASE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches a case_title that is a role-literal placeholder: the LLM emitted the
-# role word ("Plaintiff", "Defendant", "Petitioner", "Respondent") as the party
-# name instead of the real name from the ruling body.  Both singular and plural
-# forms are covered.  See #2565.
+# Matches a case_title whose LEFT segment is a role-literal placeholder: the LLM
+# emitted the role word ("Plaintiff", "Defendant", "Petitioner", "Respondent") as
+# the party name instead of the real name from the ruling body.  Both singular and
+# plural forms are covered.  Left-anchored only — kept for back-compat and as the
+# left-side building block of :func:`_is_role_literal_title`, which extends
+# detection to a role-literal placeholder on EITHER side of ``v.`` (#4618).
+# See #2565.
 _ROLE_LITERAL_TITLE_RE = re.compile(
     r"^\s*(?:Plaintiff|Defendant|Petitioner|Respondent)s?\s+v[s]?\.?\s",
     re.IGNORECASE,
 )
 
-# Matches a case_title that contains an LLM-hallucinated bracketed placeholder
-# for a party name, e.g. "Ezra Arce v. [Defendant not specified]" or
-# "[Plaintiff name unknown] v. Smith".  The bracket must contain a role word
-# (plaintiff/defendant/petitioner/respondent/party/name/case) followed by a
-# qualifier (not specified, unknown, missing, not listed, not provided, tbd).
-# No anchor — the bracket can appear anywhere in the title.  See #3988.
-#
-# Explicit non-match envelope (do NOT widen without product confirmation — #4002):
-#   - Role-only:        [DEFENDANT], [Defendant 1]  — no qualifier word present
-#   - Qualifier-only:   [TBD], [Insert defendant here]  — no leading role word
-#   - Possessives:      [defendant's name]  — possessive breaks the role-word token
-#   - Ordinals:         [Defendant 1]  — digit suffix is not a qualifier keyword
-#   - Free-form:        [Name to be determined]  — "Name" alone is not a role word
-#                       used in this position; qualifier phrase not in the allowlist
-_BRACKETED_PLACEHOLDER_TITLE_RE = re.compile(
-    r"\[(?:plaintiff|defendant|petitioner|respondent|party|name|case)[^\]]*"
-    r"(?:not specified|unknown|missing|not listed|not provided|tbd)[^\]]*\]",
-    re.IGNORECASE,
-)
+# The role-literal / bracketed-placeholder title primitives (``_is_role_literal_title``
+# and ``_BRACKETED_PLACEHOLDER_TITLE_RE``) now live in the shared, dependency-light
+# :mod:`framework.title_heuristics` module and are re-imported at the top of this
+# file under their historical underscore-prefixed names (#4628).  Note:
+# ``_ROLE_LITERAL_TITLE_RE`` above is a SEPARATE left-anchored legacy symbol and
+# stays defined locally.
 
 # ---------------------------------------------------------------------------
 # LLM result cache
@@ -1416,13 +1412,15 @@ def _rebuild_title_from_parties(
     title: str | None,
     parties: list,
 ) -> str | None:
-    """Rebuild a role-literal ``case_title`` from ``extracted_parties`` (#2565).
+    """Rebuild a role-literal ``case_title`` from ``extracted_parties`` (#2565, #4618).
 
-    If *title* matches ``_ROLE_LITERAL_TITLE_RE`` (e.g. ``"Plaintiff v. Defendant"``),
-    attempt to reconstruct ``"<first-plaintiff> v. <first-defendant>"`` from
-    *parties*.  Returns ``None`` when the title does not match the pattern or
-    when the required parties are not available (so the caller can leave the
-    field unchanged or emit a warning).
+    If *title* is role-literal per :func:`_is_role_literal_title` — a role word on
+    EITHER side of ``v.``, e.g. ``"Plaintiff v. Defendant"`` or
+    ``"Acme Corp v. Defendants"`` — or matches
+    ``_BRACKETED_PLACEHOLDER_TITLE_RE``, attempt to reconstruct
+    ``"<first-plaintiff> v. <first-defendant>"`` from *parties*.  Returns ``None``
+    when the title is not a placeholder or when the required parties are not
+    available (so the caller can leave the field unchanged or emit a warning).
 
     Parameters
     ----------
@@ -1440,14 +1438,16 @@ def _rebuild_title_from_parties(
         parties are insufficient to rebuild.
     """
     if not title or not (
-        _ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title)
+        _is_role_literal_title(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title)
     ):
         return None
 
     # Determine which role pair to look for.  Petitions use petitioner/respondent;
-    # everything else uses plaintiff/defendant.
+    # everything else uses plaintiff/defendant.  With right-side placeholders the
+    # role word may be on the right (e.g. ``"<RealName> v. Respondents"``), so a
+    # petitioner/respondent token on EITHER side selects that pair (#4618).
     title_lower = title.lower().strip()
-    if title_lower.startswith("petitioner"):
+    if "petitioner" in title_lower or "respondent" in title_lower:
         plaintiff_roles = {"petitioner"}
         defendant_roles = {"respondent"}
     else:
@@ -2145,8 +2145,9 @@ def _drop_short_unsubstantive_rulings(
 # case_number instead of the real one.
 #
 # Drop condition (all three must hold):
-#   * ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
-#     ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
+#   * ``_is_role_literal_title`` is True for ``extracted_case_title`` (role word
+#     on EITHER side of ``v.`` — #4618), OR ``_BRACKETED_PLACEHOLDER_TITLE_RE``
+#     matches anywhere in the title
 #   * ``extracted_case_number`` is None or empty string
 #   * ``entry_number`` is None
 #
@@ -2168,8 +2169,10 @@ def _drop_role_literal_orphan_rulings(
        ``extracted_case_title``, and ``entry_number`` (a stub
        cross-reference text like "Ctrl Click on Line N …").
     2. A **body-section orphan** with empty ``extracted_case_number``,
-       a role-literal title like ``"Plaintiff v. FCA"`` (matching
-       ``_ROLE_LITERAL_TITLE_RE``), and no ``entry_number``.
+       a role-literal title like ``"Plaintiff v. FCA"`` or
+       ``"Acme Corp v. Defendants"`` (detected by
+       :func:`_is_role_literal_title` on either side of ``v.`` — #4618), and
+       no ``entry_number``.
 
     The orphan is an artefact of multi-page PDF parsing — the ruling body
     starts on a fresh page without a proper case header, so the LLM
@@ -2180,7 +2183,8 @@ def _drop_role_literal_orphan_rulings(
     Rules:
 
     - A ruling is dropped when ALL THREE conditions hold:
-      1. ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
+      1. ``_is_role_literal_title`` is True for ``extracted_case_title`` (role
+         word on either side of ``v.`` — #4618), OR
          ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
       2. ``extracted_case_number`` is None or empty
       3. ``entry_number`` is None
@@ -2196,7 +2200,7 @@ def _drop_role_literal_orphan_rulings(
         has_case_number = bool(ruling.extracted_case_number)
         has_entry_number = ruling.entry_number is not None
         if (
-            (_ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title))
+            (_is_role_literal_title(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title))
             and not has_case_number
             and not has_entry_number
         ):
@@ -2232,28 +2236,43 @@ def _drop_role_literal_orphan_rulings(
 # structurally not portable to the PDF cache-hit path.
 
 
-def _apply_pdf_cache_hit_filters(
-    rulings: list[ExtractedRuling],
-    *,
-    content_key: str,
-) -> list[ExtractedRuling]:
-    """Re-apply post-processing filters on the PDF cache-hit path (#2513).
+def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[ExtractedRuling]:
+    """Run the shared PDF post-processing filter tail (#4625).
 
-    Mirrors the subset of filters in :func:`_join_page_rows` that operate
-    purely on the final ``ExtractedRuling[]`` list.  Order matches
-    ``_join_page_rows`` so the cache-hit output is equivalent to what a
-    fresh extraction would produce.
+    This is the single source of truth for the filter sequence that BOTH PDF
+    paths run AFTER cross-reference resolution: the fresh-extract path
+    (:func:`_join_page_rows`, cache miss) and the cache-hit path
+    (:func:`_apply_pdf_cache_hit_filters`, ``rebuild_db.py``).  Keeping it in
+    one place guarantees the same input PDF yields identical
+    ``derived.rulings`` output whether or not the Gemini LLM cache is warm —
+    the fully-rebuildable ``derived.*`` contract requires rebuild == capture.
 
-    Cross-reference resolution (#3608) runs first so stub rulings that carry
-    ``entry_number`` are resolved before the drop/dedup filters discard them,
-    mirroring the filter ordering in the fresh-extract path.
+    Cross-reference resolution (#2317/#3857/#3608) is intentionally NOT part of
+    this helper: the fresh path passes entry_number/case_number index maps it
+    builds while joining page rows, whereas the cache-hit path has no maps.
+    Each caller therefore invokes ``_resolve_cross_references`` itself and then
+    delegates the remaining tail here.
 
-    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
-    filters dropped rows — useful for observing the effect of filter
-    widening in production without re-running LLM calls.
+    The filter order is significant — see the inline notes for the rationale:
+
+    - ``_drop_role_literal_orphan_rulings`` (#3663): drop SC body-section
+      orphans BEFORE the calendar-listing filter so the orphan's long
+      ruling_text does not confuse the calendar-only heuristic.
+    - ``_drop_calendar_listing_rulings`` (#2446) / ``_drop_short_unsubstantive_rulings``
+      (#2645): drop OC calendar-only / empty-cell noise rows; both run after
+      cross-reference resolution so legitimate shared text is not misclassified.
+    - ``_truncate_concatenated_case_titles`` (#2562) / ``_truncate_repeated_name_tails``:
+      run BEFORE dedup so the truncated title is a more accurate dedup signal.
+    - ``_deduplicate_ruling_texts`` (#2096): null out duplicate ruling_text.
+    - ``_filter_citation_artifacts`` (#2448): drop RJN citation artifacts.
+    - County sanitizers (Riverside #2565/#3898, San Bernardino) plus the
+      county-agnostic ``_drop_riverside_no_tentative_ruling_stubs`` (#3715):
+      the two case-number-gated sanitizers are no-ops on non-SB / non-Riverside
+      case numbers and idempotent, so running them on the PDF path is safe for
+      every county; the stub-dropper IS county-agnostic and drops bare
+      "No tentative ruling." stubs (< 200 chars, no cross_reference_source) on
+      every county including Orange.
     """
-    original_count = len(rulings)
-    rulings = _resolve_cross_references(rulings)
     rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
@@ -2261,6 +2280,44 @@ def _apply_pdf_cache_hit_filters(
     rulings = _truncate_repeated_name_tails(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _filter_citation_artifacts(rulings)
+    rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
+    rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+    return rulings
+
+
+def _apply_pdf_cache_hit_filters(
+    rulings: list[ExtractedRuling],
+    *,
+    content_key: str,
+) -> list[ExtractedRuling]:
+    """Re-apply post-processing filters on the PDF cache-hit path (#2513).
+
+    Runs the identical filter tail as the fresh-extract path via the shared
+    :func:`_apply_pdf_post_join_filters` helper (#4625), so the cache-hit
+    output is equivalent to what a fresh extraction would produce.
+
+    Cross-reference resolution (#3608) runs first so stub rulings that carry
+    ``entry_number`` are resolved before the drop/dedup filters discard them,
+    mirroring the filter ordering in the fresh-extract path.
+
+    The county sanitizers (Riverside + San Bernardino) run at the end of the
+    shared tail (#4028).  Per ``extraction_config.py``, RIVERSIDE and SAN
+    BERNARDINO are ``ExtractionMethod.LLM`` (the text path), and only ORANGE is
+    ``ExtractionMethod.MULTIMODAL`` (the PDF path that reaches this function) —
+    so SB/Riverside tentative rulings never actually flow through here.  The two
+    case-number-gated sanitizers run on the PDF path purely for symmetry and
+    idempotency (they are no-ops on Orange case numbers); the county-agnostic
+    ``_drop_riverside_no_tentative_ruling_stubs`` DOES apply to Orange and drops
+    bare "No tentative ruling." stubs.
+
+    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
+    filters dropped rows — useful for observing the effect of filter
+    widening in production without re-running LLM calls.
+    """
+    original_count = len(rulings)
+    rulings = _resolve_cross_references(rulings)
+    rulings = _apply_pdf_post_join_filters(rulings)
     if len(rulings) != original_count:
         logger.info(
             "llm_extractor.cache_hit_filters_dropped",
@@ -4528,54 +4585,15 @@ def _join_page_rows(
         rulings, entry_number_to_index or None, case_number_to_index
     )
 
-    # Post-processing: drop SC body-section orphans (#3663).
-    # SC multi-page PDFs produce a body-section row with an empty
-    # case_number, role-literal title ("Plaintiff v. FCA"), and no
-    # entry_number.  Must run AFTER cross-reference resolution so any
-    # calendar row that WAS resolved keeps its real ruling_text, and the
-    # orphan — which has no entry_number and thus was never a cross-ref
-    # target — is discarded.  Run BEFORE the calendar-listing filter so the
-    # orphan's long ruling_text doesn't confuse the calendar-only heuristic.
-    rulings = _drop_role_literal_orphan_rulings(rulings)
-
-    # Post-processing: drop calendar-listing-only rows (#2446).
-    # Orange County department calendar PDFs sometimes list cases with only
-    # the motion-type heading or "OFF-CALENDAR" marker in place of an actual
-    # tentative ruling body.  These rows are not substantive rulings.  Run
-    # this AFTER cross-reference resolution so legitimate shared text is
-    # not accidentally classified as calendar-only.
-    rulings = _drop_calendar_listing_rulings(rulings)
-
-    # Post-processing: drop short-unsubstantive rulings that slipped
-    # through the pattern-based calendar-listing filter (#2645).  Catches
-    # empty-cell OC calendar rows where the LLM filled ruling_text with
-    # noise (case caption fragment, motion label without disposition)
-    # instead of a real tentative ruling body.  Must run AFTER the
-    # pattern-based filter so pattern-matched rows log under their specific
-    # marker, and AFTER cross-reference resolution so shared text isn't
-    # misclassified as unsubstantive.
-    rulings = _drop_short_unsubstantive_rulings(rulings)
-
-    # Post-processing: truncate concatenated case titles (#2562).
-    # Santa Clara multi-case PDFs sometimes produce an ``extracted_case_title``
-    # that fuses adjacent calendar lines ("Smith v. Jones Doe v. Roe").  Run
-    # this BEFORE ``_deduplicate_ruling_texts`` because the truncated title
-    # is a more accurate signal for downstream dedup heuristics and for the
-    # deterministic flag rule ``check_no_multiple_adversarial_patterns`` in
-    # the worker's validation step.
-    rulings = _truncate_concatenated_case_titles(rulings)
-    rulings = _truncate_repeated_name_tails(rulings)
-
-    # Post-processing: deduplicate identical ruling texts (#2096).
-    # The LLM sometimes produces the same ruling text for multiple cases
-    # in the same PDF.  Keep only the first occurrence; null out duplicates.
-    rulings = _deduplicate_ruling_texts(rulings)
-
-    # Post-processing: remove citation artifacts (#2448).
-    # When a PDF contains a Request for Judicial Notice citing many other
-    # courts' orders, the LLM may return each citation as a separate ruling.
-    # Filter those out using title+length heuristics.
-    rulings = _filter_citation_artifacts(rulings)
+    # Post-processing: run the shared PDF filter tail (#4625).  This is the
+    # SAME sequence applied on the cache-hit path by
+    # ``_apply_pdf_cache_hit_filters``, so a fresh extraction and a rebuild
+    # cache hit produce identical ``ExtractedRuling[]`` output.  The helper
+    # docstring documents each filter's ordering rationale (orphan drop ->
+    # calendar-listing -> short-unsubstantive -> title truncation -> dedup ->
+    # citation-artifact -> county sanitizers + the county-agnostic
+    # no-tentative-ruling stub dropper).
+    rulings = _apply_pdf_post_join_filters(rulings)
 
     return rulings
 
