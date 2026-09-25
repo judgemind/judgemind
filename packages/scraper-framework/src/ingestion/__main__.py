@@ -31,7 +31,12 @@ from framework.logging import configure_structlog
 from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
 
-from .worker import InfrastructureError, IngestionWorker
+from .worker import (
+    DEFAULT_BLOCK_MS,
+    InfrastructureError,
+    IngestionWorker,
+    redis_socket_timeout_for_block,
+)
 
 # Early-flush print before structlog is configured so that any pre-logging
 # failures (import errors, configure_structlog crash) are visible in CloudWatch
@@ -66,7 +71,14 @@ def main() -> None:
     max_retries = int(os.environ.get("MAX_RETRIES", "3"))
 
     try:
-        redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
+        # socket_timeout must outlast the XREADGROUP BLOCK interval: redis-py 8
+        # defaults it to 5s (== DEFAULT_BLOCK_MS), which made every idle poll
+        # raise "Timeout reading from socket" at ERROR level (#4705).
+        redis_client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=False,
+            socket_timeout=redis_socket_timeout_for_block(DEFAULT_BLOCK_MS),
+        )
         redis_client.ping()  # Fail fast on bad URL
 
         # SigV4-preferred client with local-dev basic-auth fallback; keeps the
