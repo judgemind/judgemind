@@ -9,12 +9,15 @@
 
 FROM python:3.12-slim AS base
 
-# System deps required by Playwright Chromium and lxml
+# System deps required by Playwright Chromium and lxml.
+# libnss3-tools provides `certutil`, used by framework/proxy_tls.py to build a
+# private per-browser NSS DB trusting the Bright Data root for proxied Chromium
+# only (#4668). Remove it together with proxy_tls.py.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
         libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
-        libxml2 libxslt1.1 \
+        libxml2 libxslt1.1 libnss3-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for runtime security

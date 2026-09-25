@@ -30,6 +30,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from framework.proxy_tls import proxied_ssl_context
+
 # Short, honest User-Agent so the request is not obviously a bare urllib client.
 _USER_AGENT = "judgemind-proxy-health/1.0"
 
@@ -78,10 +80,16 @@ def classify_proxy_error(error_text: str) -> ProxyAuthStatus:
 
 
 def _default_opener_factory(proxy_url: str | None) -> urllib.request.OpenerDirector:
-    """Build a real urllib opener, routing through ``proxy_url`` when set."""
+    """Build a real urllib opener, routing through ``proxy_url`` when set.
+
+    Proxied openers verify TLS against certifi + the Bright Data root
+    (:func:`framework.proxy_tls.proxied_ssl_context`, #4668); the direct opener
+    keeps urllib's default verification unchanged.
+    """
     if proxy_url:
         handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        return urllib.request.build_opener(handler)
+        https_handler = urllib.request.HTTPSHandler(context=proxied_ssl_context(proxy_url))
+        return urllib.request.build_opener(handler, https_handler)
     return urllib.request.build_opener()
 
 

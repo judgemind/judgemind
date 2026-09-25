@@ -14,6 +14,7 @@ license = "Apache-2.0"
 dependencies = [
     "charset-normalizer>=3.0",
     "httpx>=0.27",
+    "certifi>=2024.2.2",  # proxied TLS context = certifi + Bright Data root (#4668); already an httpx dep
     "playwright>=1.42",
     "playwright-stealth>=2.0,<3.0",
     "patchright>=1.58,<2.0",

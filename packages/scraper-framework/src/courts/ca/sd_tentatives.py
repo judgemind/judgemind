@@ -41,8 +41,10 @@ from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.browser import apply_stealth as _apply_stealth
+from framework.browser import playwright_proxy_settings
 from framework.events import EventBus
 from framework.proxy_health import diagnose_and_log_proxy_auth
+from framework.proxy_tls import chromium_proxy_tls_launch_kwargs
 from framework.storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
@@ -600,7 +602,9 @@ class SDTentativeRulingsScraper(BaseScraper):
             }
 
             if self._proxy_url:
-                launch_kwargs["proxy"] = {"server": self._proxy_url}
+                launch_kwargs["proxy"] = playwright_proxy_settings(self._proxy_url)
+                # Proxy-only trust of the Bright Data CA (#4668).
+                launch_kwargs.update(chromium_proxy_tls_launch_kwargs(self._proxy_url))
 
             browser = await pw.chromium.launch(**launch_kwargs)
 

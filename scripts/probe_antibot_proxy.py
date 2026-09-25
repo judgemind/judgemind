@@ -79,7 +79,9 @@ class CheckResult:
 
 def _egress_to_check(name: str, result: EgressProbeResult) -> CheckResult:
     detail = result.detail
-    if result.body:
+    if result.body and name in (DIRECT_EGRESS, PROXIED_NEUTRAL):
+        # Only the neutral target (api.ipify.org) returns the egress IP; court
+        # pages return full HTML, which would flood the table.
         detail = f"egress_ip={result.body}"
     return CheckResult(
         name=name,
