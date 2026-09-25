@@ -142,7 +142,7 @@ if [[ "$PKG_TYPE" == "python" ]]; then
     if "$DIFF_COVER" "$COV_FILE" \
             --compare-branch=origin/main \
             --fail-under="$FAIL_UNDER" \
-            --diff-range-notation='..'; then
+            --diff-range-notation='...'; then
         echo "" >&2
         echo "PASSED: Diff coverage >= ${FAIL_UNDER}% for $PACKAGE" >&2
         exit 0
@@ -209,7 +209,7 @@ if [[ "$PKG_TYPE" == "typescript" ]]; then
     if "$DIFF_COVER" "$COV_FILE" \
             --compare-branch=origin/main \
             --fail-under="$FAIL_UNDER" \
-            --diff-range-notation='..'; then
+            --diff-range-notation='...'; then
         echo "" >&2
         echo "PASSED: Diff coverage >= ${FAIL_UNDER}% for $PACKAGE" >&2
         exit 0

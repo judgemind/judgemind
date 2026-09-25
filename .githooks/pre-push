@@ -321,6 +321,9 @@ python_pkg_checks() {
     # not in them, and this gate skipped without a word whenever the venv
     # lacked it — so the >= 90% diff-coverage rule was never enforced
     # locally. A missing diff-cover is now a failure with a Fix: block.
+    #
+    # '...' diffs from merge-base(origin/main, HEAD), so main commits
+    # fetched after this branch was cut are not counted as its lines (#4764).
     local diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
     if [ -f "$cov_file" ] && [ ! -x "$diff_cover_cmd" ]; then
         echo "" >&2
@@ -339,7 +342,7 @@ python_pkg_checks() {
         if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                 --compare-branch=origin/main \
                 --fail-under=90 \
-                --diff-range-notation='..'; then
+                --diff-range-notation='...'; then
             echo "  New/changed lines have < 90% test coverage." >&2
             echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
             echo "  to see exactly which lines need tests." >&2
@@ -425,7 +428,7 @@ ts_pkg_checks() {
         if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                 --compare-branch=origin/main \
                 --fail-under=90 \
-                --diff-range-notation='..'; then
+                --diff-range-notation='...'; then
             echo "  New/changed lines have < 90% test coverage." >&2
             echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
             echo "  to see exactly which lines need tests." >&2

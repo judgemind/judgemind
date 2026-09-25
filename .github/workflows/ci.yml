@@ -704,8 +704,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+      # diff-cover: scripts/tests/test_diff_cover_range_notation.py runs
+      # the real binary against a scratch repo (#4764).
       - name: Install test dependencies
-        run: pip install pytest pytest-xdist boto3 -e packages/judgemind-config
+        run: pip install pytest pytest-xdist boto3 diff-cover -e packages/judgemind-config
       - name: Install Node.js test dependencies
         run: npm install --no-save graphql@^16.8
       - name: Test
@@ -1048,6 +1050,15 @@ jobs:
         run: find coverage-artifacts/ -type f 2>/dev/null || echo "No artifacts"
 
       # --- Diff coverage checks (new/changed lines must be >= 90% covered) ---
+      #
+      # The '...' range notation diffs from merge-base(origin/main, HEAD).
+      # HEAD is refs/pull/N/merge, computed when the event fired; the
+      # fetch-depth: 0 checkout above fetches origin/main as it is when
+      # this job runs, which can be later. The two-dot '..' notation
+      # diffed those trees directly, so commits that landed on main
+      # mid-run were counted as the PR's lines (#4764). '...' needs the
+      # merge-base, so keep fetch-depth: 0. Regression test:
+      # scripts/tests/test_diff_cover_range_notation.py.
 
       - name: Diff coverage — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
@@ -1061,7 +1072,7 @@ jobs:
             if [ -f "$f" ]; then COV_FILES="$COV_FILES $f"; fi
           done
           if [ -n "$COV_FILES" ]; then
-            diff-cover $COV_FILES --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+            diff-cover $COV_FILES --compare-branch=origin/main --fail-under=90 --diff-range-notation='...'
           else
             echo "No coverage artifact for scraper-framework — skipping diff-cover"
           fi
@@ -1071,7 +1082,7 @@ jobs:
         run: |
           COV_FILE="coverage-artifacts/coverage-nlp/coverage.xml"
           if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='...'
           else
             echo "No coverage artifact for nlp-pipeline — skipping diff-cover"
           fi
@@ -1081,7 +1092,7 @@ jobs:
         run: |
           COV_FILE="coverage-artifacts/coverage-api/lcov.info"
           if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='...'
           else
             echo "No coverage artifact for api — skipping diff-cover"
           fi
@@ -1091,7 +1102,7 @@ jobs:
         run: |
           COV_FILE="coverage-artifacts/coverage-web/lcov.info"
           if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='...'
           else
             echo "No coverage artifact for web — skipping diff-cover"
           fi
