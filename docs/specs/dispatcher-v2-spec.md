@@ -3,6 +3,7 @@
 **Status:** Draft — for adversarial review
 **Author:** Claude + Drew (2026-04-17 session)
 **Replaces:** `.claude/skills/dispatcher/SKILL.md` (LLM-driven laptop dispatcher)
+**Current state (2026-09):** The v2 daemon (`judgemind-dispatcher-dev`) exists but is scaled to 0. So is the v3 launcher (`judgemind-dispatcher-v3-dev`). `desired_count = 0` on `module "dispatcher_daemon"` in `infra/terraform/environments/dev/main.tf` (#4668) keeps v2 off, and that Terraform pin is the on/off switch. The daemon was stopped because the agent-runner Anthropic API key ran out of credit. Autonomous work runs v1-only today: in-session `/dispatcher` and `/task` on session auth, which is this spec's §16 rollback path. The rest of this spec describes the daemon's design as it runs when re-enabled.
 
 ---
 
@@ -504,7 +505,7 @@ Any new escalation path added later MUST extend the table in (A) with its own is
 
 Terraform module `infra/terraform/modules/dispatcher-daemon/`:
 
-- ECS Fargate service, 1 replica, `desiredCount=1`.
+- ECS Fargate service, 1 replica, `desiredCount=1` when running. Today dev pins it to `desired_count = 0` (see the Current state note at the top of this spec).
 - Task definition: 1 vCPU, 2GB RAM. Room for 5 concurrent `claude -p` subprocesses + git operations.
 - Image: new `Dockerfile.dispatcher` based on the existing scraper-framework image; adds Claude Code CLI via the official install script.
 - Secrets (via Secrets Manager → env):

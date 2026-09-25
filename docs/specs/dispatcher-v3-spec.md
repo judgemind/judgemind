@@ -2,7 +2,8 @@
 
 **Status:** Draft / design
 **Authors:** Claude + Drew (2026-04-29 architecture review, revised 2026-04-30 after adversarial review)
-**Authority:** v2 (`docs/specs/dispatcher-v2-spec.md`) remains authoritative in production. v3 is a greenfield replacement, built alongside, cut over via a single config flip.
+**Current state (2026-09):** Both the v2 daemon (`judgemind-dispatcher-dev`) and the v3 launcher (`judgemind-dispatcher-v3-dev`) exist but are scaled to 0. `desired_count = 0` on `module "dispatcher_daemon"` and `module "dispatcher_v3_service"` in `infra/terraform/environments/dev/main.tf` (#4668) keeps them off; that Terraform pin is the on/off switch. They were stopped because the agent-runner Anthropic API key ran out of credit. Autonomous work runs v1-only: in-session `/dispatcher` and `/task` on session auth.
+**Relationship to v2:** v3 is a greenfield replacement for v2 (`docs/specs/dispatcher-v2-spec.md`), built alongside it. §8 (cohabitation) and §9 (cutover ramp) describe how the two run together once they are re-enabled. While both are scaled to 0, neither one is authoritative.
 
 ---
 
@@ -290,6 +291,8 @@ One image. Three task definitions (launcher, task-runner, diagnoser) all baked f
 If any of these turn out to be load-bearing in operation, we add them back as targeted features — not as a unifying architecture.
 
 ## 8. Cohabitation with v2 — parallel operation
+
+> **Current state:** neither daemon is running. Both are scaled to 0 by the `desired_count = 0` pin in `infra/terraform/environments/dev/main.tf` (#4668), and work runs v1-only through in-session `/dispatcher` + `/task`. The rest of this section describes the cohabitation design. It applies again once the operator restores `desired_count`, with v2 authoritative and v3 alongside.
 
 v2 and v3 run **in parallel** during v3's bringup. v2 is the proven workhorse and keeps shipping at full cap; v3 ramps from cap=1 alongside v2, proving itself on a fraction of the queue while v2 carries the rest. This preserves throughput during the ramp (vs a single-flag flip that would sacrifice 95% of greens/24h while v3 climbs from cap=1) and gives a continuous rollback knob (set v3 cap=0 at any time; v2 keeps running).
 

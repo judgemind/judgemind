@@ -117,7 +117,9 @@ The full skill catalog is injected at session start as the `available-skills` sy
 
 ### Dispatcher-internal phase skills
 
-Two dispatcher implementations cohabit: v2's daemon decomposes tasks into per-phase subagents (`/task-v2-*`, `/dispatcher-*`, `/diagnose-failure`), while v3 runs `/task` end-to-end via its `task-runner` ECS task-def, F-fn launcher, `scheduled_skill_runner`, and `diagnoser_runner` — v2 remains authoritative in production; v3 runs alongside. Operators do not invoke either set of internal components directly; full specs: `docs/specs/dispatcher-v2-spec.md` and `docs/specs/dispatcher-v3-spec.md` (§8 cohabitation).
+Two daemon dispatchers exist, and both are scaled to 0. The v2 daemon (`judgemind-dispatcher-dev`) splits each task into per-phase subagents (`/task-v2-*`, `/dispatcher-*`, `/diagnose-failure`). The v3 launcher (`judgemind-dispatcher-v3-dev`) runs `/task` end-to-end through its `task-runner` ECS task-def, F-fn launcher, `scheduled_skill_runner`, and `diagnoser_runner`. The switch for both is `desired_count = 0` on `module "dispatcher_daemon"` and `module "dispatcher_v3_service"` in `infra/terraform/environments/dev/main.tf` (#4668), set because the agent-runner Anthropic API key ran out of credit. Autonomous work runs v1-only today: in-session `/dispatcher` and `/task` on session auth. No daemon picks up `agent/ready` issues, so nothing is claimed unless an operator runs `/dispatcher` or `/task`. Operators do not invoke either daemon's internal components directly. Full specs: `docs/specs/dispatcher-v2-spec.md` and `docs/specs/dispatcher-v3-spec.md` (§8 cohabitation).
+
+*Future direction:* when the operator restores `desired_count` in Terraform, v2 is authoritative and v3 runs alongside it, following the ramp in `docs/specs/dispatcher-v3-spec.md` §9.
 
 ### Worktree setup
 
