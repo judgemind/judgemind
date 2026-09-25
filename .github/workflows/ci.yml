@@ -281,6 +281,7 @@ jobs:
           # individually slower.
           - shard: 1
             test-paths: >-
+              tests/courts/test_ca_hearing_date_body_fallthrough.py
               tests/courts/test_cc_tentatives.py
               tests/courts/test_cc_dept_judges.py
               tests/courts/test_fresno_tentatives.py
