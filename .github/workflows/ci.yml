@@ -155,6 +155,10 @@ jobs:
               - 'packages/api/migrations/**'
               - 'packages/api/src/data-access/schema.sql'
               - '.github/workflows/ci.yml'
+              # Edits to the drift checker itself must run schema-drift-check
+              # against a real postgres container, not just the mocked
+              # scripts/tests/test_check_schema_drift.sh (#4663).
+              - 'scripts/check_schema_drift.sh'
             hooks:
               - '.claude/hooks/**'
               # Also trigger when the preflight-hook-test job itself changes,
