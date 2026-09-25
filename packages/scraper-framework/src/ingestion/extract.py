@@ -2297,55 +2297,83 @@ def _find_name_start_before_vs(text: str) -> int | None:
 # Hearing date extraction
 # ---------------------------------------------------------------------------
 
-# Common date formats found in California tentative rulings.
-# Ordered by specificity — "Month DD, YYYY" first (most common in court PDFs),
-# then numeric formats.
-_HEARING_DATE_PATTERNS: list[tuple[re.Pattern[str], list[str]]] = [
-    # "February 24, 2026" or "February 24 2026" (with or without comma)
-    (
-        re.compile(
-            r"(?:January|February|March|April|May|June|July|August"
-            r"|September|October|November|December)"
-            r"\s+\d{1,2},?\s+\d{4}",
-            re.IGNORECASE,
-        ),
-        ["%B %d, %Y", "%B %d %Y"],
+# Every pattern is anchored to a hearing-date *label* from a real California
+# court header.  An unlabelled date anywhere in the text is never taken: ruling
+# bodies are full of dates that are not the hearing date (dates of birth,
+# discovery service dates, trust formation dates, "effective January 2, 2024"
+# boilerplate), and the old unanchored "first Month DD, YYYY anywhere" pattern
+# returned them — the same fall-through shape as #4667 (#4682).  When no label
+# matches, the function returns ``None`` so the caller leaves the field empty
+# (or lets the LLM fill it) instead of guessing.
+_HD_MONTH = (
+    r"(?:January|February|March|April|May|June|July|August"
+    r"|September|October|November|December)"
+)
+# The captured date: "February 24, 2026" / "February 24 2026" / "03/04/2026" / "03/04/26".
+# SB multi-day headers ("TENTATIVE RULING FOR MARCH 3 & 4, 2026") resolve to
+# the first day — the ``& 4`` part is stripped before parsing.
+_HD_MULTI_DAY_RE = re.compile(r"\s*(?:&|and)\s*\d{1,2}(?=,?\s+\d{4})", re.IGNORECASE)
+_HD_DATE = (
+    rf"(?P<date>{_HD_MONTH}\s+\d{{1,2}}(?:\s*(?:&|and)\s*\d{{1,2}})?,?\s+\d{{4}}"
+    r"|\d{1,2}/\d{1,2}/(?:\d{4}|\d{2})\b)"
+)
+# Whitespace and/or short HTML tags between a label and its value
+# (LA HTML: "<b> Hearing Date: </b>  August 4, 2026").
+_HD_GAP = r"(?:\s|<[^<>]{0,40}>)*"
+# Optional weekday before the date (OC: "Date: Monday, September 28, 2026").
+_HD_WEEKDAY = r"(?:(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day,?\s+)?"
+_HD_VALUE = rf"{_HD_GAP}{_HD_WEEKDAY}{_HD_DATE}"
+
+# Ordered by specificity; the first label (in this order) whose value parses wins.
+_HEARING_DATE_PATTERNS: list[re.Pattern[str]] = [
+    # "Hearing Date: May 28, 2026" (LA, SD, SF family, Fresno per-ruling),
+    # "Hearing Date and Time: September 24, 2026" (OC), "HEARING DATE: 09/23/2026" (CC).
+    re.compile(rf"\bHearing\s+Date(?:\s+and\s+Time)?\s*:{_HD_VALUE}", re.IGNORECASE),
+    # "Tentative Rulings for March 9, 2026" (Riverside, Fresno, SB),
+    # "TENTATIVE RULING(S) FOR ..." (SB), "No Tentative Rulings March 2, 2026" (Riverside),
+    # "TENTATIVE RULINGS\nSeptember 24, 2026" (OC, SB).
+    re.compile(
+        rf"\b(?:No\s+)?Tentative\s+Rulings?(?:\(s\))?(?:\s+for)?{_HD_VALUE}",
+        re.IGNORECASE,
     ),
-    # "Date: 03/04/26" or "Date: 03/04/2026"
-    (
-        re.compile(
-            r"Date:\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-            re.IGNORECASE,
-        ),
-        ["%m/%d/%Y", "%m/%d/%y"],
-    ),
-    # Standalone MM/DD/YYYY or MM/DD/YY (less anchored — try last)
-    (
-        re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b"),
-        ["%m/%d/%Y"],
+    # "COURT CALENDAR FOR MARCH 16, 2026" (CC probate),
+    # "CIVIL CALENDAR For Friday, 03/13/2026" (SD calendar).
+    re.compile(rf"\b(?:COURT|CIVIL)\s+CALENDAR\s+FOR{_HD_VALUE}", re.IGNORECASE),
+    # A bare "Date:" label at the start of a line (OC header "Date: June 25, 2026",
+    # "Date: 03/04/26").  Line-anchored so "Filing Date:" / "Service Date:" in a
+    # ruling body don't count.
+    re.compile(
+        rf"^[ \t]*(?:<[^<>]{{0,40}}>[ \t]*)*Date\s*:{_HD_VALUE}",
+        re.IGNORECASE | re.MULTILINE,
     ),
 ]
 
+_HD_FORMATS = ("%B %d, %Y", "%B %d %Y", "%m/%d/%Y", "%m/%d/%y")
+
 
 def extract_hearing_date(ruling_text: str) -> date | None:
-    """Extract a hearing date from ruling text using common date patterns.
+    """Extract a hearing date from a labelled header in ruling text.
 
-    Returns the first successfully parsed date, or ``None`` if no pattern
-    matches.  This is a fallback for when scrapers do not populate
-    ``hearing_date`` in the event payload.
+    Only dates that follow a hearing-date label (``Hearing Date:``,
+    ``Tentative Rulings for``, ``COURT CALENDAR FOR``, a line-leading
+    ``Date:``, ...) are considered.  Returns ``None`` when no label matches
+    rather than falling through to the first date in the body (#4682).
+
+    This is a fallback for when scrapers do not populate ``hearing_date`` in
+    the event payload (worker regex fallback, San Bernardino, rebuild_db HTML
+    events, reingest_from_s3).
     """
-    for pattern, formats in _HEARING_DATE_PATTERNS:
-        m = pattern.search(ruling_text)
-        if not m:
-            continue
-        # Use capture group if present, otherwise full match
-        raw = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
-        raw = " ".join(raw.split())  # normalize whitespace
-        for fmt in formats:
-            try:
-                return datetime.strptime(raw, fmt).date()
-            except ValueError:
-                continue
+    if not ruling_text:
+        return None
+    for pattern in _HEARING_DATE_PATTERNS:
+        for m in pattern.finditer(ruling_text):
+            raw = _HD_MULTI_DAY_RE.sub("", m.group("date"))
+            raw = " ".join(raw.split())  # normalize whitespace
+            for fmt in _HD_FORMATS:
+                try:
+                    return datetime.strptime(raw, fmt).date()
+                except ValueError:
+                    continue
     return None
 
 

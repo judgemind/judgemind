@@ -78,11 +78,17 @@ def _oc_fl_judge_name_from_match(m: re.Match) -> str:
     return f"{first} {last}"
 
 
-# Hearing date from PDF text: "Date: December 5, 2025"
+# Hearing date from the PDF header, which reads
+#   "TENTATIVE RULINGS\nDate: December 5, 2025"
+# Anchored to the line-leading "Date:" label and confined to that line: an
+# unanchored search returned the first long-form date anywhere in the ruling
+# bodies (a date of birth, a service date), and placeholder PDFs print "Date:"
+# with no value — those must yield None, not a body date (#4682, #4667 class).
 _HEARING_DATE_RE = re.compile(
-    r"(?:January|February|March|April|May|June|July|August|September"
-    r"|October|November|December)\s+\d{1,2},?\s+\d{4}",
-    re.IGNORECASE,
+    r"^[ \t]*Date:[ \t]*(?:(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day,?[ \t]+)?"
+    r"(?P<date>(?:January|February|March|April|May|June|July|August|September"
+    r"|October|November|December)[ \t]+\d{1,2},?[ \t]+\d{4})",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Case number: 2-digit year + "D" + 6 digits (e.g. "25D006297")
@@ -103,11 +109,14 @@ _OUTCOME_RE = re.compile(
 
 
 def _oc_fl_hearing_date_from_text(text: str) -> datetime | None:
-    """Extract the first date (Month DD, YYYY) from OC Family Law PDF text."""
+    """Extract the header ``Date:`` value (Month DD, YYYY) from OC Family Law PDF text.
+
+    Returns None when the header has no date, rather than a body date.
+    """
     m = _HEARING_DATE_RE.search(text)
     if not m:
         return None
-    raw = " ".join(m.group(0).split())
+    raw = " ".join(m.group("date").split())
     for fmt in ("%B %d, %Y", "%B %d %Y"):
         try:
             return datetime.strptime(raw, fmt)
