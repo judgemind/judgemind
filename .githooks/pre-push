@@ -10,17 +10,65 @@
 #
 # Ref: https://github.com/judgemind/judgemind/issues/81
 # Ref: https://github.com/judgemind/judgemind/issues/378
+#
+# Speed (#4708)
+# ─────────────
+# The hook must finish well inside the Bash tool's 10-minute ceiling,
+# otherwise the agent harness backgrounds `git push`. Three things keep
+# it fast without weakening any gate:
+#
+#   1. Independent stages run concurrently. The CI guard umbrella and
+#      each touched package's lint -> test -> coverage chain run as
+#      background jobs. The small path-gated checks run in the
+#      foreground meanwhile. Each job's output is buffered and replayed
+#      in a fixed order once every job has finished, so the log stays
+#      readable. Stages inside one package stay sequential, because the
+#      coverage gates read the coverage.xml that pytest writes.
+#   2. scripts/run-ci-guards.sh runs its ~90 guards in parallel.
+#   3. pytest runs under pytest-xdist (-n auto) for packages whose suites
+#      CI already runs under xdist (PREPUSH_XDIST_PKGS). pytest-cov
+#      combines worker coverage, so coverage.xml is the same as a serial
+#      run (verified line-for-line for scraper-framework in #4708).
+#
+# Every check records its wall time, and the hook prints a timing
+# summary at the end so the next slowdown shows where the time went.
+#
+# Knobs (environment):
+#   PREPUSH_XDIST_PKGS    space-separated packages that get `-n auto`
+#                         (default: scraper-framework). Set to "" to force
+#                         serial pytest everywhere.
+#   PREPUSH_PYTEST_WORKERS  xdist worker count (default: auto).
+#   PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT  seconds before pytest dumps the
+#                         stack of a stuck test (default: 300).
+#   PREPUSH_SERIAL=1      run every stage in the foreground, in order
+#                         (debugging aid; same gates, slower).
+#   CI_GUARDS_JOBS        guard concurrency for scripts/run-ci-guards.sh.
 
 set -uo pipefail
+
+HOOK_START=$(date +%s)
+PREPUSH_JOB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/prepush-jobs.XXXXXX")
+trap 'rm -rf "$PREPUSH_JOB_DIR"' EXIT
+PREPUSH_TIMINGS="$PREPUSH_JOB_DIR/timings.tsv"
+: > "$PREPUSH_TIMINGS"
+
+# Per-checkout log directory. Before #4708 every checkout wrote to the
+# same /tmp/prepush-<pkg>-<check>.log, so two worktrees pushing at once
+# overwrote each other's logs and "Full log:" could point at another
+# agent's output. Git runs the hook from the top of the working tree, so
+# $PWD names this checkout.
+PREPUSH_LOG_DIR="${PREPUSH_LOG_DIR:-/tmp/prepush-logs-$(basename "$PWD")}"
+mkdir -p "$PREPUSH_LOG_DIR"
 
 # -------------------------------------------------------------------
 # run_check <pkg> <check-name> <cmd> [args...]
 #
 # Runs the given command, teeing combined stdout+stderr into a log file
-# at /tmp/prepush-<pkg_sanitized>-<check_sanitized>.log.
+# at $PREPUSH_LOG_DIR/prepush-<pkg_sanitized>-<check_sanitized>.log.
 # On non-zero exit, prints the last 20 lines of the log plus the log path
 # to stderr, then returns the command's exit code so the caller can
-# increment failures.
+# increment failures. Records the check's wall time for the timing
+# summary (#4708).
 # -------------------------------------------------------------------
 run_check() {
     local pkg="$1"
@@ -30,10 +78,13 @@ run_check() {
     pkg_safe="${pkg//\//_}"
     check_safe="${check_name//\//_}"
     check_safe="${check_safe// /-}"
-    log_file="/tmp/prepush-${pkg_safe}-${check_safe}.log"
+    log_file="$PREPUSH_LOG_DIR/prepush-${pkg_safe}-${check_safe}.log"
 
-    local rc=0
+    local rc=0 start end
+    start=$(date +%s)
     "$@" > "$log_file" 2>&1 || rc=$?
+    end=$(date +%s)
+    printf '%s\t%s\t%s\t%s\n' "$((end - start))" "$pkg" "$check_name" "$rc" >> "$PREPUSH_TIMINGS"
 
     if [ "$rc" -ne 0 ]; then
         echo "" >&2
@@ -43,6 +94,339 @@ run_check() {
         echo "  Full log: $log_file" >&2
     fi
     return "$rc"
+}
+
+# -------------------------------------------------------------------
+# in_list <item> <space-separated list> — exact-word membership test.
+# Pure bash: no subprocess per changed file, and no substring matches
+# ("api" must not match "api-foo").
+# -------------------------------------------------------------------
+in_list() {
+    case " $2 " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# -------------------------------------------------------------------
+# Background jobs (#4708)
+#
+# start_job <name> <function> [args...]
+#   Runs <function> in a background subshell with its own `failures`
+#   counter. stdout+stderr go to a buffer file; the failure count goes
+#   to <name>.failures when the function returns.
+#
+# wait_jobs
+#   Waits for every job in start order, replays each buffer to stderr
+#   and adds its failure count to the global `failures`. A job that dies
+#   without writing its count counts as one failure, so a crash can
+#   never pass the gate.
+#
+# PREPUSH_SERIAL=1 runs the function in the foreground instead.
+# -------------------------------------------------------------------
+job_names=""
+job_pids=""
+job_seq=0
+
+# Background jobs in a non-interactive shell ignore SIGINT, so a Ctrl-C
+# (or the harness killing `git push`) would leave pytest and the guards
+# running and loading the machine. On INT/TERM, signal the whole process
+# group (the hook, its jobs and their children) and stop.
+on_abort() {
+    trap - INT TERM
+    echo "" >&2
+    echo "pre-push: interrupted — stopping background checks" >&2
+    kill -TERM 0 2>/dev/null
+    exit 130
+}
+trap on_abort INT TERM
+
+start_job() {
+    local name="$1"
+    shift
+    job_seq=$((job_seq + 1))
+    name="${job_seq}-${name//\//_}"
+    if [ "${PREPUSH_SERIAL:-0}" = "1" ]; then
+        "$@"
+        return 0
+    fi
+    (
+        failures=0
+        "$@"
+        echo "$failures" > "$PREPUSH_JOB_DIR/$name.failures"
+    ) > "$PREPUSH_JOB_DIR/$name.out" 2>&1 &
+    job_names="$job_names $name"
+    job_pids="$job_pids $!"
+}
+
+wait_jobs() {
+    local name pid n
+    set -- $job_pids
+    for name in $job_names; do
+        pid="$1"
+        shift
+        wait "$pid" 2>/dev/null || true
+        cat "$PREPUSH_JOB_DIR/$name.out" >&2 2>/dev/null || true
+        n=""
+        if [ -f "$PREPUSH_JOB_DIR/$name.failures" ]; then
+            read -r n < "$PREPUSH_JOB_DIR/$name.failures" || true
+        fi
+        case "$n" in
+            ''|*[!0-9]*)
+                echo "  FAILED: pre-push job '$name' exited without reporting a result" >&2
+                n=1
+                ;;
+        esac
+        failures=$((failures + n))
+    done
+    job_names=""
+    job_pids=""
+}
+
+# -------------------------------------------------------------------
+# print_timing_summary — slowest checks first, plus total hook wall time.
+# -------------------------------------------------------------------
+print_timing_summary() {
+    local total=$(( $(date +%s) - HOOK_START ))
+    echo "" >&2
+    echo "pre-push: timing summary (total wall time ${total}s; checks overlap):" >&2
+    if [ -s "$PREPUSH_TIMINGS" ]; then
+        sort -t "$(printf '\t')" -k1,1nr "$PREPUSH_TIMINGS" | head -n 15 \
+            | awk -F '\t' '{ printf "    %5ss  %-22s %s%s\n", $1, $2, $3, ($4 == "0" ? "" : "  (FAILED)") }' >&2
+    else
+        echo "    (no checks ran)" >&2
+    fi
+}
+
+# -------------------------------------------------------------------
+# python_pkg_checks <pkg> <has_code: true|false>
+#
+# ruff check + ruff format for one Python package, then (code changes
+# only) pytest, the coverage floor and diff coverage. Sequential inside
+# the package: the coverage gates read the coverage.xml pytest writes.
+# -------------------------------------------------------------------
+python_pkg_checks() {
+    local pkg="$1"
+    local has_code="$2"
+    local pkg_dir pkg_key
+    # infra/* packages use pkg as-is, packages/* are prefixed.
+    if [[ "$pkg" == infra/* ]]; then
+        pkg_dir="$pkg"
+        pkg_key="$pkg"
+    else
+        pkg_dir="packages/$pkg"
+        pkg_key="packages/$pkg"
+    fi
+    echo "pre-push: checking Python package '$pkg'..." >&2
+
+    # Prefer the package's own venv ruff, fall back to global
+    local ruff_cmd=""
+    if [ -x "$pkg_dir/.venv/bin/ruff" ]; then
+        ruff_cmd="$pkg_dir/.venv/bin/ruff"
+    elif command -v ruff &>/dev/null; then
+        ruff_cmd="ruff"
+    else
+        echo "  WARNING: ruff not found for $pkg — skipping lint/format checks" >&2
+        echo "  Install with: pip install ruff" >&2
+    fi
+
+    if [ -n "$ruff_cmd" ]; then
+        # Determine check directories (src/ and tests/ if they exist)
+        local check_dirs=""
+        [ -d "$pkg_dir/src" ] && check_dirs="$check_dirs $pkg_dir/src"
+        [ -d "$pkg_dir/tests" ] && check_dirs="$check_dirs $pkg_dir/tests"
+        if [ -z "$check_dirs" ]; then
+            check_dirs="$pkg_dir"
+        fi
+
+        # ruff check (lint)
+        if ! run_check "$pkg" "ruff check" $ruff_cmd check $check_dirs; then
+            echo "  Fix with: $ruff_cmd check --fix $check_dirs && $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+
+        # ruff format --check
+        if ! run_check "$pkg" "ruff format" $ruff_cmd format --check $check_dirs; then
+            echo "  Fix with: $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # Tests and coverage gates run for code changes only.
+    [ "$has_code" = true ] || return 0
+
+    if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
+        echo "pre-push: running tests for Python package '$pkg'..." >&2
+        # pytest-testmon must not run alongside pytest-cov: both drive
+        # coverage.py, and testmon's measurement suppresses pytest-cov's,
+        # so coverage.xml would reflect only module-level imports.
+        # (.testmondata is still built by ralph iterations; it just must
+        # not be active here.)
+        #
+        # pytest-xdist is safe with pytest-cov: pytest-cov collects each
+        # worker's data and combines it on the controller. #4708 ran the
+        # scraper-framework suite both ways and got identical
+        # coverage.xml (same covered-line set in all 102 files). An older
+        # comment here claimed xdist dropped worker coverage; that was
+        # not true for the pinned pytest-cov. xdist is enabled only for
+        # packages CI already runs with `-n auto` (so the suite is known
+        # to be xdist-safe) and only when xdist is in the package venv.
+        local xdist_flag="" p d
+        for p in ${PREPUSH_XDIST_PKGS-scraper-framework}; do
+            if [ "$p" = "$pkg" ]; then
+                for d in "$pkg_dir"/.venv/lib/python*/site-packages/xdist; do
+                    if [ -d "$d" ]; then
+                        xdist_flag="-n ${PREPUSH_PYTEST_WORKERS:-auto}"
+                    fi
+                done
+            fi
+        done
+        # faulthandler_timeout dumps the stack of any test that runs
+        # longer than the limit (it does not kill it), so a hung test
+        # names itself in the log instead of silently eating the push.
+        local fh_timeout="${PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT:-300}"
+        if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag -o faulthandler_timeout=$fh_timeout tests/ -x -q --tb=line"; then
+            echo "  Run: cd $pkg_dir && ./.venv/bin/pytest tests/ -v --tb=short" >&2
+            failures=$((failures + 1))
+        fi
+        # pytest-cov writes coverage.xml relative to CWD. Running pytest
+        # with CWD = pkg_dir ensures coverage.xml lands in pkg_dir, where
+        # the coverage floor check below expects it.
+    else
+        echo "  WARNING: pytest not found for $pkg — skipping tests" >&2
+        echo "  Install with: $pkg_dir/.venv/bin/pip install -e '.[dev]'" >&2
+    fi
+
+    # Coverage floor check (after tests generate coverage.xml)
+    local cov_file="$pkg_dir/coverage.xml"
+    local baselines_file="coverage-baselines.json"
+    if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+        echo "pre-push: checking coverage floor for '$pkg'..." >&2
+        if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
+                --package "$pkg_key" \
+                --coverage-file "$cov_file" \
+                --baselines-file "$baselines_file" \
+                --source-dir "$pkg_dir/src" \
+                --source-dir "$pkg_dir/tests" \
+                --dry-run; then
+            echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+            echo "  Add tests to restore coverage before pushing." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # Diff coverage check (after tests generate coverage.xml)
+    local diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
+    if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
+        echo "pre-push: checking diff coverage for '$pkg'..." >&2
+        if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
+                --compare-branch=origin/main \
+                --fail-under=90 \
+                --diff-range-notation='..'; then
+            echo "  New/changed lines have < 90% test coverage." >&2
+            echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+            echo "  to see exactly which lines need tests." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------
+# ts_pkg_checks <pkg> <lint: true|false> <has_code: true|false>
+#
+# npm run lint for one TypeScript package, then (code changes only)
+# npm test, the coverage floor and diff coverage.
+# -------------------------------------------------------------------
+ts_pkg_checks() {
+    local pkg="$1"
+    local do_lint="$2"
+    local has_code="$3"
+    local pkg_dir="packages/$pkg"
+
+    if [ "$do_lint" = true ]; then
+        echo "pre-push: checking TypeScript package '$pkg'..." >&2
+        if [ -f "$pkg_dir/package.json" ]; then
+            # Check if npm run lint is available
+            if (cd "$pkg_dir" && npm run lint --if-present 2>&1) | grep -q "Missing script"; then
+                echo "  No lint script found for $pkg — skipping" >&2
+            else
+                if ! run_check "$pkg" "npm run lint" bash -c "cd $(printf '%q' "$pkg_dir") && npm run lint"; then
+                    echo "  Fix lint issues in $pkg_dir before pushing." >&2
+                    failures=$((failures + 1))
+                fi
+            fi
+        fi
+    fi
+
+    [ "$has_code" = true ] || return 0
+    [ -f "$pkg_dir/package.json" ] || return 0
+
+    # Check if a test script exists in package.json
+    if ! grep -q '"test"' "$pkg_dir/package.json" 2>/dev/null; then
+        echo "  No test script found for $pkg — skipping tests" >&2
+        return 0
+    fi
+
+    echo "pre-push: running tests for TypeScript package '$pkg'..." >&2
+    if ! run_check "$pkg" "npm test" bash -c "cd $(printf '%q' "$pkg_dir") && npm test"; then
+        echo "  Run: cd $pkg_dir && npm test" >&2
+        failures=$((failures + 1))
+    fi
+
+    # Coverage floor check (after tests generate lcov.info)
+    local cov_file="$pkg_dir/coverage/lcov.info"
+    local baselines_file="coverage-baselines.json"
+    if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+        echo "pre-push: checking coverage floor for '$pkg'..." >&2
+        if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
+                --package "packages/$pkg" \
+                --coverage-file "$cov_file" \
+                --baselines-file "$baselines_file" \
+                --source-dir "$pkg_dir/src" \
+                --source-dir "$pkg_dir/tests" \
+                --dry-run; then
+            echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+            echo "  Add tests to restore coverage before pushing." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # Diff coverage check. Try to find diff-cover from any available venv.
+    local diff_cover_cmd="" venv_dir
+    if command -v diff-cover &>/dev/null; then
+        diff_cover_cmd="diff-cover"
+    else
+        for venv_dir in packages/*/.venv infra/*/.venv; do
+            if [ -x "$venv_dir/bin/diff-cover" ]; then
+                diff_cover_cmd="$venv_dir/bin/diff-cover"
+                break
+            fi
+        done
+    fi
+    if [ -f "$cov_file" ] && [ -n "$diff_cover_cmd" ]; then
+        echo "pre-push: checking diff coverage for '$pkg'..." >&2
+        if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
+                --compare-branch=origin/main \
+                --fail-under=90 \
+                --diff-range-notation='..'; then
+            echo "  New/changed lines have < 90% test coverage." >&2
+            echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+            echo "  to see exactly which lines need tests." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------
+# ci_guard_umbrella — scripts/run-ci-guards.sh (see the block comment at
+# its launch site below).
+# -------------------------------------------------------------------
+ci_guard_umbrella() {
+    if ! run_check "_" "scripts/run-ci-guards.sh" scripts/run-ci-guards.sh; then
+        echo "  One or more CI guards failed. See the failure list above." >&2
+        echo "  Bypass: SKIP_CI_GUARDS=1 git push (CI still runs every guard)." >&2
+        failures=$((failures + 1))
+    fi
 }
 
 # -------------------------------------------------------------------
@@ -70,6 +454,40 @@ remote="$1"
 failures=0
 push_ref=""
 push_is_new_branch=false
+changed_files=""
+
+# -------------------------------------------------------------------
+# CI guard umbrella — run every scripts/check-*.{sh,py} guard locally
+# -------------------------------------------------------------------
+# Mirrors the dozen+ ``scripts/check-*`` jobs in ``.github/workflows/ci.yml``
+# so a guard failure is caught locally before the network round-trip.
+# Self-maintaining: dropping a new ``scripts/check-foo.sh`` into the tree
+# makes it pick up automatically (no umbrella-script edit required).
+#
+# It reads only the working tree and runs regardless of what changed, so
+# it starts first, as a background job, and overlaps everything below
+# (#4708). Its output is replayed after all jobs finish.
+#
+# Bypass with ``SKIP_CI_GUARDS=1 git push`` for the rare case an operator
+# needs to push partial work knowing one guard will fail. The bypass is
+# noisy on stderr so it's hard to miss. CI will still run every guard.
+#
+# See issue #4332 (motivating retro: PR #4325 / sql-column-check) and
+# scripts/run-ci-guards.sh for the discovery rules and skip list.
+if [ -x scripts/run-ci-guards.sh ]; then
+    if [ "${SKIP_CI_GUARDS:-0}" = "1" ]; then
+        echo "" >&2
+        echo "WARNING: SKIP_CI_GUARDS=1 — bypassing scripts/run-ci-guards.sh." >&2
+        echo "         CI will still run every guard. Use only when you" >&2
+        echo "         intentionally want to push partial work knowing one" >&2
+        echo "         or more guards will fail." >&2
+    else
+        echo "pre-push: running CI guard umbrella (scripts/run-ci-guards.sh)..." >&2
+        start_job "ci-guards" ci_guard_umbrella
+    fi
+else
+    echo "  WARNING: scripts/run-ci-guards.sh not found or not executable — skipping" >&2
+fi
 
 while read -r local_ref local_sha remote_ref remote_sha; do
     # Track the ref and whether it's new for the PR check at the end
@@ -122,12 +540,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         if [[ "$file" =~ ^packages/([^/]+)/ ]]; then
             pkg="${BASH_REMATCH[1]}"
             if [ -f "packages/$pkg/pyproject.toml" ]; then
-                if ! echo "$changed_python_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                if ! in_list "$pkg" "$changed_python_pkgs"; then
                     changed_python_pkgs="$changed_python_pkgs $pkg"
                 fi
                 # Check if this is a code file (src/ or tests/ .py files)
                 if [[ "$file" =~ ^packages/[^/]+/(src|tests)/.+\.py$ ]]; then
-                    if ! echo "$python_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                    if ! in_list "$pkg" "$python_pkgs_with_code"; then
                         python_pkgs_with_code="$python_pkgs_with_code $pkg"
                     fi
                 fi
@@ -141,13 +559,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                         || [[ "$file" =~ ^packages/[^/]+/src/data-access/schema\.sql$ ]]; then
                     : # non-lintable — skip changed_ts_pkgs accumulation
                 else
-                    if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                    if ! in_list "$pkg" "$changed_ts_pkgs"; then
                         changed_ts_pkgs="$changed_ts_pkgs $pkg"
                     fi
                 fi
                 # Check if this is a code file (.ts, .tsx, .js, .jsx in src/ or tests/)
                 if [[ "$file" =~ ^packages/[^/]+/(src|tests|__tests__|lib)/.+\.(ts|tsx|js|jsx)$ ]]; then
-                    if ! echo "$ts_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                    if ! in_list "$pkg" "$ts_pkgs_with_code"; then
                         ts_pkgs_with_code="$ts_pkgs_with_code $pkg"
                     fi
                 fi
@@ -160,12 +578,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             if [ -f "infra/$infra_pkg/pyproject.toml" ]; then
                 # Use infra/<dir> as the "package" identifier to avoid collisions
                 pkg_id="infra/$infra_pkg"
-                if ! echo "$changed_python_pkgs" | grep -qF "$pkg_id" 2>/dev/null; then
+                if ! in_list "$pkg_id" "$changed_python_pkgs"; then
                     changed_python_pkgs="$changed_python_pkgs $pkg_id"
                 fi
                 # Check if this is a code file (.py in any subdirectory or root)
                 if [[ "$file" =~ \.py$ ]]; then
-                    if ! echo "$python_pkgs_with_code" | grep -qF "$pkg_id" 2>/dev/null; then
+                    if ! in_list "$pkg_id" "$python_pkgs_with_code"; then
                         python_pkgs_with_code="$python_pkgs_with_code $pkg_id"
                     fi
                 fi
@@ -179,244 +597,38 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     done <<< "$changed_files"
 
     # ---------------------------------------------------------------
-    # Run checks for Python packages
+    # Per-package checks (#4708): one background job per touched
+    # package. Inside a job the stages stay sequential (lint, format,
+    # tests, coverage floor, diff coverage); across packages, and
+    # alongside the CI guard umbrella, they run concurrently. See
+    # python_pkg_checks / ts_pkg_checks above.
     # ---------------------------------------------------------------
     for pkg in $changed_python_pkgs; do
-        # Determine package directory: infra/* packages use pkg as-is,
-        # packages/* packages are prefixed with "packages/"
-        if [[ "$pkg" == infra/* ]]; then
-            pkg_dir="$pkg"
-        else
-            pkg_dir="packages/$pkg"
+        has_code=false
+        if in_list "$pkg" "$python_pkgs_with_code"; then
+            has_code=true
         fi
-        echo "pre-push: checking Python package '$pkg'..." >&2
-
-        # Prefer the package's own venv ruff, fall back to global
-        if [ -x "$pkg_dir/.venv/bin/ruff" ]; then
-            ruff_cmd="$pkg_dir/.venv/bin/ruff"
-        elif command -v ruff &>/dev/null; then
-            ruff_cmd="ruff"
-        else
-            echo "  WARNING: ruff not found for $pkg — skipping lint/format checks" >&2
-            echo "  Install with: pip install ruff" >&2
-            continue
-        fi
-
-        # Determine check directories (src/ and tests/ if they exist)
-        check_dirs=""
-        [ -d "$pkg_dir/src" ] && check_dirs="$check_dirs $pkg_dir/src"
-        [ -d "$pkg_dir/tests" ] && check_dirs="$check_dirs $pkg_dir/tests"
-        if [ -z "$check_dirs" ]; then
-            check_dirs="$pkg_dir"
-        fi
-
-        # ruff check (lint)
-        if ! run_check "$pkg" "ruff check" $ruff_cmd check $check_dirs; then
-            echo "  Fix with: $ruff_cmd check --fix $check_dirs && $ruff_cmd format $check_dirs" >&2
-            failures=$((failures + 1))
-        fi
-
-        # ruff format --check
-        if ! run_check "$pkg" "ruff format" $ruff_cmd format --check $check_dirs; then
-            echo "  Fix with: $ruff_cmd format $check_dirs" >&2
-            failures=$((failures + 1))
-        fi
+        start_job "py-$pkg" python_pkg_checks "$pkg" "$has_code"
     done
 
-    # ---------------------------------------------------------------
-    # Run tests for Python packages (code changes only)
-    # ---------------------------------------------------------------
-    for pkg in $python_pkgs_with_code; do
-        if [[ "$pkg" == infra/* ]]; then
-            pkg_dir="$pkg"
-        else
-            pkg_dir="packages/$pkg"
-        fi
-
-        if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
-            echo "pre-push: running tests for Python package '$pkg'..." >&2
-            # pytest-testmon and pytest-xdist both interfere with pytest-cov:
-            # - testmon + pytest-cov: both use coverage.py simultaneously;
-            #   testmon's internal measurement suppresses pytest-cov's, so
-            #   coverage.xml reflects only module-level imports (~22% for
-            #   scraper-framework) rather than the full suite (~96%).
-            # - xdist + pytest-cov: worker coverage is not forwarded to the
-            #   controller by default; coverage.xml only reflects the
-            #   coordinator process (~25% for scraper-framework).
-            # Running the full suite serially without either flag produces
-            # correct coverage and is required for the floor check to pass.
-            # (pytest-testmon is still used to build/update .testmondata so
-            # subsequent ralph iterations benefit from selective re-runs —
-            # it just must not run at the same time as pytest-cov.)
-            testmon_flag=""
-            xdist_flag=""
-            if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $testmon_flag $xdist_flag tests/ -x -q --tb=line"; then
-                echo "  Run: cd $pkg_dir && ./.venv/bin/pytest tests/ -v --tb=short" >&2
-                failures=$((failures + 1))
-            fi
-            # pytest-cov writes coverage.xml relative to CWD. Running pytest
-            # with CWD = pkg_dir ensures coverage.xml lands in pkg_dir, where
-            # the coverage floor check below expects it.
-        else
-            echo "  WARNING: pytest not found for $pkg — skipping tests" >&2
-            echo "  Install with: $pkg_dir/.venv/bin/pip install -e '.[dev]'" >&2
-        fi
-    done
-
-    # ---------------------------------------------------------------
-    # Coverage floor check for Python packages (after tests generate coverage.xml)
-    # ---------------------------------------------------------------
-    for pkg in $python_pkgs_with_code; do
-        if [[ "$pkg" == infra/* ]]; then
-            pkg_dir="$pkg"
-            pkg_key="$pkg"
-        else
-            pkg_dir="packages/$pkg"
-            pkg_key="packages/$pkg"
-        fi
-
-        cov_file="$pkg_dir/coverage.xml"
-        baselines_file="coverage-baselines.json"
-        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
-            echo "pre-push: checking coverage floor for '$pkg'..." >&2
-            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
-                    --package "$pkg_key" \
-                    --coverage-file "$cov_file" \
-                    --baselines-file "$baselines_file" \
-                    --source-dir "$pkg_dir/src" \
-                    --source-dir "$pkg_dir/tests" \
-                    --dry-run; then
-                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
-                echo "  Add tests to restore coverage before pushing." >&2
-                failures=$((failures + 1))
-            fi
-        fi
-    done
-
-    # ---------------------------------------------------------------
-    # Diff coverage check for Python packages (after tests generate coverage.xml)
-    # ---------------------------------------------------------------
-    for pkg in $python_pkgs_with_code; do
-        if [[ "$pkg" == infra/* ]]; then
-            pkg_dir="$pkg"
-        else
-            pkg_dir="packages/$pkg"
-        fi
-
-        cov_file="$pkg_dir/coverage.xml"
-        diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
-        if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
-            echo "pre-push: checking diff coverage for '$pkg'..." >&2
-            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
-                    --compare-branch=origin/main \
-                    --fail-under=90 \
-                    --diff-range-notation='..'; then
-                echo "  New/changed lines have < 90% test coverage." >&2
-                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
-                echo "  to see exactly which lines need tests." >&2
-                failures=$((failures + 1))
-            fi
-        fi
-    done
-
-    # ---------------------------------------------------------------
-    # Run checks for TypeScript packages
-    # ---------------------------------------------------------------
-    for pkg in $changed_ts_pkgs; do
-        pkg_dir="packages/$pkg"
-        echo "pre-push: checking TypeScript package '$pkg'..." >&2
-
-        if [ ! -f "$pkg_dir/package.json" ]; then
-            continue
-        fi
-
-        # Check if npm run lint is available
-        if (cd "$pkg_dir" && npm run lint --if-present 2>&1) | grep -q "Missing script"; then
-            echo "  No lint script found for $pkg — skipping" >&2
-        else
-            if ! run_check "$pkg" "npm run lint" bash -c "cd $(printf '%q' "$pkg_dir") && npm run lint"; then
-                echo "  Fix lint issues in $pkg_dir before pushing." >&2
-                failures=$((failures + 1))
-            fi
-        fi
-    done
-
-    # ---------------------------------------------------------------
-    # Run tests for TypeScript packages (code changes only)
-    # ---------------------------------------------------------------
+    # A package can have code changes without being in changed_ts_pkgs
+    # (e.g. only non-lintable files alongside), so walk the union.
+    ts_pkgs_all="$changed_ts_pkgs"
     for pkg in $ts_pkgs_with_code; do
-        pkg_dir="packages/$pkg"
-
-        if [ ! -f "$pkg_dir/package.json" ]; then
-            continue
-        fi
-
-        # Check if a test script exists in package.json
-        if ! grep -q '"test"' "$pkg_dir/package.json" 2>/dev/null; then
-            echo "  No test script found for $pkg — skipping tests" >&2
-            continue
-        fi
-
-        echo "pre-push: running tests for TypeScript package '$pkg'..." >&2
-        if ! run_check "$pkg" "npm test" bash -c "cd $(printf '%q' "$pkg_dir") && npm test"; then
-            echo "  Run: cd $pkg_dir && npm test" >&2
-            failures=$((failures + 1))
+        if ! in_list "$pkg" "$ts_pkgs_all"; then
+            ts_pkgs_all="$ts_pkgs_all $pkg"
         fi
     done
-
-    # ---------------------------------------------------------------
-    # Coverage floor check for TypeScript packages (after tests generate lcov.info)
-    # ---------------------------------------------------------------
-    for pkg in $ts_pkgs_with_code; do
-        pkg_dir="packages/$pkg"
-        cov_file="$pkg_dir/coverage/lcov.info"
-        baselines_file="coverage-baselines.json"
-        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
-            echo "pre-push: checking coverage floor for '$pkg'..." >&2
-            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
-                    --package "packages/$pkg" \
-                    --coverage-file "$cov_file" \
-                    --baselines-file "$baselines_file" \
-                    --source-dir "$pkg_dir/src" \
-                    --source-dir "$pkg_dir/tests" \
-                    --dry-run; then
-                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
-                echo "  Add tests to restore coverage before pushing." >&2
-                failures=$((failures + 1))
-            fi
+    for pkg in $ts_pkgs_all; do
+        do_lint=false
+        has_code=false
+        if in_list "$pkg" "$changed_ts_pkgs"; then
+            do_lint=true
         fi
-    done
-
-    # ---------------------------------------------------------------
-    # Diff coverage check for TypeScript packages (after tests generate lcov.info)
-    # ---------------------------------------------------------------
-    for pkg in $ts_pkgs_with_code; do
-        pkg_dir="packages/$pkg"
-        cov_file="$pkg_dir/coverage/lcov.info"
-        # Try to find diff-cover from any available Python venv
-        diff_cover_cmd=""
-        if command -v diff-cover &>/dev/null; then
-            diff_cover_cmd="diff-cover"
-        else
-            for venv_dir in packages/*/.venv infra/*/.venv; do
-                if [ -x "$venv_dir/bin/diff-cover" ]; then
-                    diff_cover_cmd="$venv_dir/bin/diff-cover"
-                    break
-                fi
-            done
+        if in_list "$pkg" "$ts_pkgs_with_code"; then
+            has_code=true
         fi
-        if [ -f "$cov_file" ] && [ -n "$diff_cover_cmd" ]; then
-            echo "pre-push: checking diff coverage for '$pkg'..." >&2
-            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
-                    --compare-branch=origin/main \
-                    --fail-under=90 \
-                    --diff-range-notation='..'; then
-                echo "  New/changed lines have < 90% test coverage." >&2
-                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
-                echo "  to see exactly which lines need tests." >&2
-                failures=$((failures + 1))
-            fi
-        fi
+        start_job "ts-$pkg" ts_pkg_checks "$pkg" "$do_lint" "$has_code"
     done
 
     # ---------------------------------------------------------------
@@ -959,37 +1171,9 @@ if [ -n "$changed_watch_files" ]; then
 fi
 
 # -------------------------------------------------------------------
-# CI guard umbrella — run every scripts/check-*.{sh,py} guard locally
+# Collect background jobs (CI guard umbrella + per-package checks)
 # -------------------------------------------------------------------
-# Mirrors the dozen+ ``scripts/check-*`` jobs in ``.github/workflows/ci.yml``
-# so a guard failure is caught locally before the network round-trip.
-# Self-maintaining: dropping a new ``scripts/check-foo.sh`` into the tree
-# makes it pick up automatically (no umbrella-script edit required).
-#
-# Bypass with ``SKIP_CI_GUARDS=1 git push`` for the rare case an operator
-# needs to push partial work knowing one guard will fail. The bypass is
-# noisy on stderr so it's hard to miss. CI will still run every guard.
-#
-# See issue #4332 (motivating retro: PR #4325 / sql-column-check) and
-# scripts/run-ci-guards.sh for the discovery rules and skip list.
-if [ -x scripts/run-ci-guards.sh ]; then
-    if [ "${SKIP_CI_GUARDS:-0}" = "1" ]; then
-        echo "" >&2
-        echo "WARNING: SKIP_CI_GUARDS=1 — bypassing scripts/run-ci-guards.sh." >&2
-        echo "         CI will still run every guard. Use only when you" >&2
-        echo "         intentionally want to push partial work knowing one" >&2
-        echo "         or more guards will fail." >&2
-    else
-        echo "pre-push: running CI guard umbrella (scripts/run-ci-guards.sh)..." >&2
-        if ! run_check "_" "scripts/run-ci-guards.sh" scripts/run-ci-guards.sh; then
-            echo "  One or more CI guards failed. See the failure list above." >&2
-            echo "  Bypass: SKIP_CI_GUARDS=1 git push (CI still runs every guard)." >&2
-            failures=$((failures + 1))
-        fi
-    fi
-else
-    echo "  WARNING: scripts/run-ci-guards.sh not found or not executable — skipping" >&2
-fi
+wait_jobs
 
 # -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
@@ -1029,6 +1213,8 @@ fi
 # -------------------------------------------------------------------
 # Report results
 # -------------------------------------------------------------------
+print_timing_summary
+
 if [ "$failures" -gt 0 ]; then
     echo "" >&2
     echo "====================================================================" >&2

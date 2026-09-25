@@ -408,9 +408,12 @@ class TestExtractJudgeName:
         text = (paragraph * ((100 * 1024) // len(paragraph) + 1))[: 100 * 1024]
         assert len(text) >= 100 * 1024
 
-        start = time.perf_counter()
+        # CPU time, not wall time (#4708): a quadratic regex blowup shows up
+        # as CPU, while wall time also counts scheduler waits and flaked
+        # under a loaded laptop running pytest-xdist.
+        start = time.process_time()
         result = extract_judge_name(text)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        elapsed_ms = (time.process_time() - start) * 1000.0
 
         assert result is None, "Synthetic federal text contains no LA judge"
         assert elapsed_ms < 100.0, (
@@ -437,9 +440,12 @@ class TestExtractJudgeName:
         text = (paragraph * ((100 * 1024) // len(paragraph) + 1))[: 100 * 1024]
         text += "\nWilliam A. Crowfoot Judge of the Superior Court\n"
 
-        start = time.perf_counter()
+        # CPU time, not wall time (#4708): a quadratic regex blowup shows up
+        # as CPU, while wall time also counts scheduler waits and flaked
+        # under a loaded laptop running pytest-xdist.
+        start = time.process_time()
         result = extract_judge_name(text)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        elapsed_ms = (time.process_time() - start) * 1000.0
 
         assert result == "William A. Crowfoot"
         assert elapsed_ms < 100.0, (

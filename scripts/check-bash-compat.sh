@@ -242,8 +242,9 @@ violations=0
 # associative.
 report_lines=()
 
+# Drop allow-listed files (matched by path suffix) up front.
+scan_files=()
 for file in "${sh_files[@]}"; do
-    # Skip allow-listed files by path suffix.
     skip=false
     for excl in "${EXCLUDE_FILES[@]}"; do
         if [[ "$file" == *"$excl" ]]; then
@@ -251,45 +252,50 @@ for file in "${sh_files[@]}"; do
             break
         fi
     done
-    if "$skip"; then
+    if ! "$skip"; then
+        scan_files+=("$file")
+    fi
+done
+
+# One grep per pattern across every file (#4708). The old loop ran one
+# grep per file per pattern: ~300 files x 12 patterns = ~3,700 process
+# spawns, which took 7-18s on a macOS laptop and was the slowest guard
+# in scripts/run-ci-guards.sh. ``-H`` makes grep print
+# ``file:lineno:content`` even when only one file is scanned.
+idx=0
+while (( idx < ${#PATTERN_REGEXES[@]} )); do
+    label="${PATTERN_LABELS[$idx]}"
+    regex="${PATTERN_REGEXES[$idx]}"
+
+    matches=""
+    if [ "${#scan_files[@]}" -gt 0 ]; then
+        matches=$(grep -nHE "$regex" "${scan_files[@]}" 2>/dev/null || true)
+    fi
+    if [[ -z "$matches" ]]; then
+        idx=$((idx + 1))
         continue
     fi
 
-    # Walk each pattern.
-    idx=0
-    while (( idx < ${#PATTERN_REGEXES[@]} )); do
-        label="${PATTERN_LABELS[$idx]}"
-        regex="${PATTERN_REGEXES[$idx]}"
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        file="${m%%:*}"
+        rest="${m#*:}"
+        lineno="${rest%%:*}"
+        content="${rest#*:}"
 
-        # grep -nE emits ``lineno:content``. The leading filename is
-        # added by grep's ``-H`` when multiple files are provided; here
-        # we pass a single file and prepend the filename ourselves to
-        # keep the output format consistent.
-        matches=$(grep -nE "$regex" "$file" 2>/dev/null || true)
-        if [[ -z "$matches" ]]; then
-            idx=$((idx + 1))
+        # Skip comment lines — the first non-whitespace character
+        # is ``#``. This lets this script, peer check scripts, and
+        # test fixtures discuss the forbidden tokens in prose.
+        if [[ "$content" =~ ^[[:space:]]*# ]]; then
             continue
         fi
 
-        while IFS= read -r m; do
-            [[ -z "$m" ]] && continue
-            lineno="${m%%:*}"
-            content="${m#*:}"
+        report_lines+=("  [$label]")
+        report_lines+=("    $file:$lineno: $content")
+        violations=$((violations + 1))
+    done <<< "$matches"
 
-            # Skip comment lines — the first non-whitespace character
-            # is ``#``. This lets this script, peer check scripts, and
-            # test fixtures discuss the forbidden tokens in prose.
-            if [[ "$content" =~ ^[[:space:]]*# ]]; then
-                continue
-            fi
-
-            report_lines+=("  [$label]")
-            report_lines+=("    $file:$lineno: $content")
-            violations=$((violations + 1))
-        done <<< "$matches"
-
-        idx=$((idx + 1))
-    done
+    idx=$((idx + 1))
 done
 
 if (( violations > 0 )); then
