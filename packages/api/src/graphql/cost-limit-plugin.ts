@@ -1,5 +1,5 @@
 /**
- * Apollo Server v4 plugin enforcing the per-query cost cap from #4003,
+ * Apollo Server plugin enforcing the per-query cost cap from #4003,
  * and emitting the structured `graphql.cost` log line with a per-field
  * cost breakdown (issue #4101).
  *
@@ -89,13 +89,33 @@ export function costLimitPlugin(
           const { schema, document, operationName, request } = ctx;
           if (!schema || !document) return;
           const variables = request.variables ?? {};
-          const cost = getComplexity({
-            schema,
-            query: document,
-            variables,
-            operationName: operationName ?? undefined,
-            estimators: [judgemindEstimator],
-          });
+          let cost: number;
+          try {
+            cost = getComplexity({
+              schema,
+              query: document,
+              variables,
+              operationName: operationName ?? undefined,
+              estimators: [judgemindEstimator],
+            });
+          } catch (err) {
+            // `getComplexity` coerces the request variables and throws the
+            // first coercion error as a GraphQLError. This hook runs before
+            // Apollo's own variable coercion, so an unhandled throw here
+            // would surface as a 500 for what is a client input error.
+            // Re-throw as BAD_USER_INPUT with a 400 status, matching what
+            // Apollo Server 5 returns for variable-coercion errors
+            // (`status400ForVariableCoercionErrors`, #4694). The request
+            // still fails closed: nothing executes without a cost check.
+            // Match by name rather than `instanceof` because the library
+            // runs in graphql's CJS realm (see import note above).
+            if (err instanceof Error && err.name === 'GraphQLError') {
+              throw new GraphQLError(err.message, {
+                extensions: { code: 'BAD_USER_INPUT', http: { status: 400 } },
+              });
+            }
+            throw err;
+          }
           if (onCost) {
             // Compute the breakdown alongside the cap value. Both
             // walkers traverse the document during the same
@@ -125,7 +145,7 @@ export function costLimitPlugin(
                   complexityLimitExceeded: true,
                   actualCost: cost,
                   maximumCost,
-                  // Apollo Server v4 reads `extensions.http` off thrown
+                  // Apollo Server (v4 and v5) reads `extensions.http` off thrown
                   // GraphQLErrors and merges it into the response status
                   // (`errorNormalize.js` → `requestPipeline.js`'s
                   // `sendErrorResponse`). Without this, an error thrown
