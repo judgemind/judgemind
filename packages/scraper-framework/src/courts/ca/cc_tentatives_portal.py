@@ -63,6 +63,14 @@ Detail page format (current portal, #4598):
   <div class="field--name-body"> container for archived/older pages (which
   predate the jcc-body__main-text restructure).
 
+  Many rulings are posted inline: the Tentative Ruling section holds the
+  ruling paragraphs and no PDF link.  Those are captured from the detail
+  page alone (#4749).  The page names no department, so an inline ruling's
+  department stays empty; a judge-to-department lookup is not used because
+  judges move between departments and the lookup would be wrong for past
+  rulings.  A page with neither a PDF link nor ruling text is not a ruling
+  page and counts as a blocked fetch (#4735).
+
 Case number formats (matches the retired scraper):
   Civil:    C + 2-digit year + hyphen + 5 digits  (C24-02490)
   Limited:  L + 2-digit year + hyphen + 5 digits  (L23-06679)
@@ -488,9 +496,12 @@ class CCTentativesPortalScraper(BaseScraper):
     Fetch strategy:
     1. Fetch the form page to discover current judge IDs from the dropdown.
     2. For each judge, fetch the listing page (filtered by judge ID).
-    3. For each listing row, fetch the detail page and download the linked PDF.
+    3. For each listing row, fetch the detail page and download the linked
+       PDF, if any.  Inline rulings with no PDF link are captured from the
+       detail page alone (#4749).
     4. Filter test entries (slug matches ^test, or case number invalid).
-    5. Construct one CapturedDocument per valid ruling, with PDF as raw content.
+    5. Construct one CapturedDocument per valid ruling, with a JSON envelope
+       (listing row, detail HTML, and PDF bytes when present) as raw content.
     """
 
     def fetch_documents(self) -> list[CapturedDocument]:
@@ -622,8 +633,7 @@ class CCTentativesPortalScraper(BaseScraper):
                             judge_id=judge_id,
                             judge_name_dropdown=judge_name_dropdown,
                         )
-                        if doc is not None:
-                            docs.append(doc)
+                        docs.append(doc)
                         tally.ok()
                     except _UnexpectedDetailPageError as blocked_exc:
                         tally.blocked(str(blocked_exc))
@@ -656,8 +666,8 @@ class CCTentativesPortalScraper(BaseScraper):
         row: dict,
         judge_id: str,
         judge_name_dropdown: str,
-    ) -> CapturedDocument | None:
-        """Fetch the detail page and PDF for a single listing row.
+    ) -> CapturedDocument:
+        """Fetch the detail page, and the PDF when there is one, for a listing row.
 
         Builds a JSON envelope as ``raw_content`` so that
         ``parse_document`` can populate every structured field from
@@ -675,8 +685,8 @@ class CCTentativesPortalScraper(BaseScraper):
             judge_name_dropdown: The judge's display name from the dropdown.
 
         Returns:
-            A populated CapturedDocument, or None when the ruling is posted
-            inline with no PDF link.
+            A populated CapturedDocument.  A ruling posted inline with no
+            PDF link is captured from the detail page alone (#4749).
 
         Raises:
             _UnexpectedDetailPageError: the page has neither a PDF link nor ruling
@@ -694,26 +704,14 @@ class CCTentativesPortalScraper(BaseScraper):
         detail = _parse_detail_page(detail_html_text)
 
         pdf_url = detail.get("pdf_url")
-        if not pdf_url:
-            if not detail.get("ruling_text"):
-                # Neither a PDF link nor ruling text: this is not a ruling
-                # detail page (block page, layout change). The caller
-                # records it as blocked, not as a successful fetch (#4735).
-                raise _UnexpectedDetailPageError(
-                    "detail page has no PDF link or ruling text",
-                    body_prefix=detail_html_text[:200],
-                )
-            # The portal posts some rulings inline with no PDF link. The
-            # page loaded as expected, but this scraper only captures
-            # PDF-backed rulings, so the inline ruling is skipped.
-            self._log.warning("cc_portal.no_pdf_url", slug=slug, detail_url=detail_url)
-            return None
-
-        # Download PDF
-        time.sleep(self.config.request_delay_seconds)
-        pdf_response = client.get(pdf_url)
-        pdf_response.raise_for_status()
-        pdf_bytes = pdf_response.content
+        if not pdf_url and not detail.get("ruling_text"):
+            # Neither a PDF link nor ruling text: this is not a ruling
+            # detail page (block page, layout change). The caller records
+            # it as blocked, not as a successful fetch (#4735).
+            raise _UnexpectedDetailPageError(
+                "detail page has no PDF link or ruling text",
+                body_prefix=detail_html_text[:200],
+            )
 
         # Build the JSON envelope (#4133 — Option A from the issue).  This
         # is the single source of truth for every structured field,
@@ -721,14 +719,24 @@ class CCTentativesPortalScraper(BaseScraper):
         # detail HTML bytes are base64-encoded so the envelope is valid
         # UTF-8 / valid JSON; ``json.dumps(default=str)`` handles the
         # ``hearing_date`` datetime in the row dict.
-        envelope = {
+        envelope: dict[str, Any] = {
             "row": row,
             "detail_html_b64": base64.b64encode(detail_html_bytes).decode("ascii"),
             "pdf_url": pdf_url,
-            "pdf_bytes_b64": base64.b64encode(pdf_bytes).decode("ascii"),
-            "judge_id": judge_id,
-            "judge_name_dropdown": judge_name_dropdown,
         }
+        if pdf_url:
+            time.sleep(self.config.request_delay_seconds)
+            pdf_response = client.get(pdf_url)
+            pdf_response.raise_for_status()
+            envelope["pdf_bytes_b64"] = base64.b64encode(pdf_response.content).decode("ascii")
+        else:
+            # The portal posts some rulings inline on the detail page with
+            # no PDF link.  The byte-exact detail HTML in the envelope IS
+            # the raw ruling, so capture it rather than drop it (#4749).
+            # The envelope carries ``pdf_url: null`` and no PDF bytes.
+            self._log.info("cc_portal.inline_ruling", slug=slug, detail_url=detail_url)
+        envelope["judge_id"] = judge_id
+        envelope["judge_name_dropdown"] = judge_name_dropdown
         envelope_bytes = json.dumps(envelope, default=str).encode("utf-8")
 
         # ``ContentFormat.TEXT`` so the reingest text-extractor decodes
@@ -763,6 +771,10 @@ class CCTentativesPortalScraper(BaseScraper):
         ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
         ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
         ``"judge_id": <str>, "judge_name_dropdown": <str>}``
+
+        For an inline ruling with no PDF link, ``pdf_url`` is null and
+        ``pdf_bytes_b64`` is absent (#4749).  The ruling text comes from
+        the detail HTML either way.
 
         Args:
             doc: The document to populate.
@@ -856,6 +868,9 @@ class CCTentativesPortalScraper(BaseScraper):
         ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
         ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
         ``"judge_id": <str>, "judge_name_dropdown": <str>}``
+
+        Inline rulings (#4749) have ``"pdf_url": null`` and no
+        ``pdf_bytes_b64``.
 
         Tolerates ``raw_content`` that is not valid JSON or is missing
         the expected ``row`` key — pre-#4133 captures archived raw PDF
