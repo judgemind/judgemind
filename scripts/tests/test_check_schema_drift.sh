@@ -63,23 +63,31 @@ if [[ ! -x "$TARGET" ]]; then
     exit 1
 fi
 
-# ── Test 1: source contains `seq 1 90` and the 90s error message ──────────
+# ── Test 1: 90s default ceiling; error message reports real elapsed time ──
 #
-# Static check — guards the AC's first verify line directly without
-# exercising docker at all.
+# Static checks. #4159 bumped the ceiling to 90s; #4663 made the error
+# message report the actual elapsed time instead of a hardcoded "90" (the
+# old message claimed "within 90 seconds" after only ~1.4s).
 
-if grep -q 'seq 1 90' "$TARGET"; then
-    pass "wait loop iterates 90 times (seq 1 90 present)"
+if grep -q 'SCHEMA_DRIFT_PG_WAIT_SECS:-90' "$TARGET"; then
+    pass "wait loop default ceiling is 90s"
 else
-    fail "wait loop iterates 90 times (seq 1 90 present)" \
-        "expected 'seq 1 90' in $TARGET"
+    fail "wait loop default ceiling is 90s" \
+        "expected 'SCHEMA_DRIFT_PG_WAIT_SECS:-90' in $TARGET"
 fi
 
 if grep -q 'postgres failed to start within 90 seconds' "$TARGET"; then
-    pass "error message reads 'within 90 seconds'"
+    fail "error message does not hardcode '90 seconds' (#4663)" \
+        "found hardcoded 'within 90 seconds' in $TARGET"
 else
-    fail "error message reads 'within 90 seconds'" \
-        "expected 'postgres failed to start within 90 seconds' in $TARGET"
+    pass "error message does not hardcode '90 seconds' (#4663)"
+fi
+
+if grep -q 'postgres failed to start within ${elapsed} seconds' "$TARGET"; then
+    pass "error message names the elapsed-time variable (#4663)"
+else
+    fail "error message names the elapsed-time variable (#4663)" \
+        "expected 'postgres failed to start within \${elapsed} seconds' in $TARGET"
 fi
 
 if grep -q 'seq 1 30' "$TARGET"; then
@@ -181,6 +189,115 @@ if [[ "$output" == *"is not running"* ]] || [[ "$output" == *"exited unexpectedl
 else
     fail "broken postgres → useful error message mentions container exit" \
         "expected 'not running' or 'exited unexpectedly' in output, got: $output"
+fi
+
+# ── Mock docker #2: scripted pg_isready sequence (#4663) ──────────────────
+#
+# The official postgres image's entrypoint runs initdb, starts a TEMPORARY
+# server, stops it, then starts the real server. A readiness probe can see
+# success → failure (restart window) → success. The mock replays a
+# per-call script of pg_isready results from $MOCK_PG_SEQ (space-separated
+# 0/1 exit codes; the last entry repeats forever) and tracks the call
+# count in $MOCK_STATE_DIR. Every other docker invocation succeeds; psql
+# calls drain stdin so the script's `echo ... | psql` pipelines never
+# SIGPIPE under `set -o pipefail`.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MOCK_STATE_DIR=$(mktemp -d)
+register_temp_dir "$MOCK_STATE_DIR"
+export MOCK_STATE_DIR
+
+cat > "$MOCK_BIN_DIR/docker" << 'MOCKDOCKER'
+#!/usr/bin/env bash
+# Mock for the scripted-readiness test cases (Tests 3 and 4).
+case "$1" in
+    run)
+        echo "fake-container-id"
+        exit 0
+        ;;
+    exec)
+        if [[ " $* " == *" pg_isready "* ]]; then
+            count_file="$MOCK_STATE_DIR/pg_isready_calls"
+            n=0
+            [[ -f "$count_file" ]] && n=$(cat "$count_file")
+            echo $((n + 1)) > "$count_file"
+            read -r -a seq <<< "$MOCK_PG_SEQ"
+            idx=$n
+            if (( idx >= ${#seq[@]} )); then
+                idx=$(( ${#seq[@]} - 1 ))
+            fi
+            exit "${seq[$idx]}"
+        fi
+        if [[ " $* " == *" psql "* ]]; then
+            cat > /dev/null
+        fi
+        if [[ " $* " == *" pg_dump "* ]]; then
+            # Non-empty, identical dumps → the schema diff passes (an empty
+            # dump would make the script's `grep -v` filter exit 1).
+            echo "CREATE TABLE mock_table (id integer);"
+        fi
+        exit 0
+        ;;
+    inspect)
+        echo "true"
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+MOCKDOCKER
+chmod +x "$MOCK_BIN_DIR/docker"
+
+# ── Test 3: readiness flaps across the init restart → no false failure ────
+#
+# Regression test for #4663 (PR #4569, run 36066310129): the old loop broke
+# on the FIRST pg_isready success (the temporary init server), and the
+# one-shot post-loop check then landed in the restart window and failed
+# with "within 90 seconds" after ~1.4s. Sequence: ready (temp server),
+# not ready (restart), then ready forever (real server). The script must
+# tolerate the flap and proceed.
+
+rm -f "$MOCK_STATE_DIR/pg_isready_calls"
+exit_code=0
+output=$(cd "$REPO_ROOT" && MOCK_PG_SEQ="0 1 0" "$TARGET" --ci < /dev/null 2>&1) || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "readiness flap (ready → restart → ready) → script exits 0"
+else
+    fail "readiness flap (ready → restart → ready) → script exits 0" \
+        "exit=$exit_code output: $output"
+fi
+
+if [[ "$output" == *"failed to start"* ]]; then
+    fail "readiness flap → no 'failed to start' error" "output: $output"
+else
+    pass "readiness flap → no 'failed to start' error"
+fi
+
+# ── Test 4: never ready (but running) → error reports real elapsed time ───
+#
+# With a 3s ceiling (via SCHEMA_DRIFT_PG_WAIT_SECS) and a probe that never
+# succeeds, the script must exit non-zero and report the real elapsed
+# seconds, not a hardcoded ceiling.
+
+rm -f "$MOCK_STATE_DIR/pg_isready_calls"
+exit_code=0
+start=$SECONDS
+output=$(cd "$REPO_ROOT" && MOCK_PG_SEQ="1" SCHEMA_DRIFT_PG_WAIT_SECS=3 "$TARGET" --ci < /dev/null 2>&1) || exit_code=$?
+elapsed=$((SECONDS - start))
+
+if [[ "$exit_code" -ne 0 ]]; then
+    pass "never ready → script exits non-zero"
+else
+    fail "never ready → script exits non-zero" "expected non-zero exit, got 0"
+fi
+
+if [[ "$output" =~ "ERROR: postgres failed to start within "([0-9]+)" seconds" ]] \
+    && (( BASH_REMATCH[1] >= 3 && BASH_REMATCH[1] <= elapsed + 1 )); then
+    pass "never ready → error reports real elapsed time (${BASH_REMATCH[1]}s)"
+else
+    fail "never ready → error reports real elapsed time" \
+        "expected 'failed to start within <3..$((elapsed + 1))> seconds', got: $output"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────
