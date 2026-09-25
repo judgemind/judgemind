@@ -21,24 +21,51 @@ Replace `{env}` with `dev`, `staging`, or `production`.
 
 ## Trigger a Manual Scraper Run
 
-Run all registered scrapers:
+### Preferred: `scripts/run-scraper.sh`
+
+Use the wrapper. It builds the correct command override and copies the
+network configuration from the `judgemind-scraper-{env}` schedule, so it
+cannot launch with the wrong subnets or security group:
 
 ```bash
-aws ecs run-task \
-  --cluster judgemind-dev \
-  --task-definition judgemind-scraper-dev \
-  --launch-type FARGATE \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["<PRIVATE_SUBNET_ID>"],
-      "securityGroups": ["<SCRAPER_SG_ID>"],
-      "assignPublicIp": "DISABLED"
-    }
-  }' \
-  --region us-west-2
+scripts/run-scraper.sh ca-la-tentatives-appellate            # one scraper, streams logs until exit
+scripts/run-scraper.sh ca-la-tentatives-civil ca-oc-tentatives  # several scrapers in one task
+scripts/run-scraper.sh --detach ca-sd-pipeline                # launch and print the task ARN
+scripts/run-scraper.sh --dry-run ca-la-tentatives-civil       # show the resolved run-task arguments
 ```
 
-Run a single scraper by passing overrides:
+The script exits with the container's exit code. Pass `--env <env>` for a
+non-dev environment. See `scripts/run-scraper.sh --help` for all options.
+
+### Raw `aws ecs run-task`
+
+Use this only when the wrapper is not available.
+
+**1. Get the scraper network configuration from the schedule.** Copy it from
+the `judgemind-scraper-dev` EventBridge schedule, which is what the
+twice-daily scheduled runs use. No `terraform init` is needed:
+
+```bash
+aws scheduler get-schedule --name judgemind-scraper-dev --region us-west-2 \
+  --query "Target.EcsParameters.NetworkConfiguration.awsvpcConfiguration.[join(',', Subnets), join(',', SecurityGroups)]" \
+  --output text
+# subnet-aaa,subnet-bbb    sg-ccc
+```
+
+> **Use the scraper security group, not another service's.** Other services'
+> security groups (for example the ingestion-worker SG) lack the
+> residential-proxy egress rule (`scraper_proxy_egress` in
+> `infra/terraform/modules/compute/main.tf`) that the proxied scrapers
+> (`ca-sd-*`, `ca-sf-*`) need. A scraper launched with them fails with network
+> timeouts that look like a court-site outage, not a configuration error.
+
+**2. Launch the task.** The scraper image has `ENTRYPOINT ["python", "-m"]`
+and `CMD ["framework"]` (`packages/scraper-framework/Dockerfile`). A command
+override replaces `CMD`, so it must start with `"framework"`. An override of
+`["<scraper-id>"]` runs `python -m <scraper-id>`, which exits 1 with
+`No module named <scraper-id>`.
+
+Run a single scraper (substitute the IDs from step 1):
 
 ```bash
 aws ecs run-task \
@@ -48,33 +75,22 @@ aws ecs run-task \
   --overrides '{
     "containerOverrides": [{
       "name": "scraper",
-      "command": ["ca-la-tentatives-civil"]
+      "command": ["framework", "ca-la-tentatives-civil"]
     }]
   }' \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["<PRIVATE_SUBNET_ID>"],
-      "securityGroups": ["<SCRAPER_SG_ID>"],
-      "assignPublicIp": "DISABLED"
-    }
-  }' \
+  --network-configuration 'awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[sg-ccc],assignPublicIp=DISABLED}' \
   --region us-west-2
 ```
 
-Retrieve subnet and security group IDs from Terraform outputs:
-
-```bash
-cd infra/terraform/environments/dev
-terraform output private_subnet_ids
-terraform output scraper_security_group_id
-```
+To run every registered scraper, drop the `--overrides` argument. The default
+`CMD ["framework"]` runs them all.
 
 ### Registered Scraper IDs
 
 Authoritative source: `_REGISTRY` in
 `packages/scraper-framework/src/framework/runner.py`. Pass any of these as a
-positional argument to `python -m framework.runner <id> [<id> ...]` to run
-a subset.
+positional argument to `python -m framework <id> [<id> ...]` (or
+`scripts/run-scraper.sh <id> [<id> ...]`) to run a subset.
 
 | ID                                | Court / source                                    |
 | --------------------------------- | ------------------------------------------------- |
