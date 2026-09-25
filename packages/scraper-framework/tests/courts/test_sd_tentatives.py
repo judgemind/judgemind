@@ -10,6 +10,7 @@ Fixture files:
   sd_roa_no_ruling.html         — ROA page with no tentative ruling
   sd_roa_search_results.html    — SmartSearch results page with case link
   sd_roa_cloudflare_challenge.html — Cloudflare challenge page
+  sd_roa_rate_limit_block.html  — Court WAF "rate limiting" block page (live capture, #4673)
 """
 
 from __future__ import annotations
@@ -28,9 +29,12 @@ from courts.ca.sd_tentatives import (
     _apply_stealth,
     _sd_llm_enabled,
     _sd_llm_extract,
+    classify_portal_page,
+    cloudflare_challenge_type,
     default_config,
     has_cf_clearance,
     is_cloudflare_challenge,
+    is_rate_limit_block,
     parse_case_details,
     parse_case_header,
     parse_motion_type,
@@ -40,6 +44,7 @@ from courts.ca.sd_tentatives import (
     parse_search_results,
     parse_tentative_ruling,
 )
+from framework.base import ScraperPreconditionFailure
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig
 
 pytestmark = pytest.mark.regression
@@ -698,6 +703,8 @@ def _make_mock_page(
     page.content = AsyncMock(side_effect=content_sequence)
     page.wait_for_url = AsyncMock()
     page.evaluate = AsyncMock()
+    # page.on() is synchronous in Playwright's async API.
+    page.on = MagicMock()
 
     # Set up context with cookies support for cf_clearance checks
     context = AsyncMock()
@@ -813,7 +820,7 @@ class TestFetchDocumentsWithMockedPlaywright:
         assert len(docs) == 0
 
     def test_fetch_cloudflare_challenge_blocks(self) -> None:
-        """Cloudflare challenge is not solved after all retries — returns empty."""
+        """Cloudflare challenge not solved after all retries: raises, not [] (#4673)."""
         cf_html = _load_html("sd_roa_cloudflare_challenge.html")
 
         # Need enough cf_html entries for all retry attempts.
@@ -840,13 +847,15 @@ class TestFetchDocumentsWithMockedPlaywright:
             ),
             patch("courts.ca.sd_tentatives.CF_CHALLENGE_TIMEOUT", 0.1),
             patch("courts.ca.sd_tentatives.CF_POLL_INTERVAL", 0.05),
+            patch("courts.ca.sd_tentatives.CF_RETRY_PAUSE", 0.0),
+            pytest.raises(ScraperPreconditionFailure, match="challenge type=managed"),
         ):
-            docs = scraper.fetch_documents()
+            scraper.fetch_documents()
 
-        assert len(docs) == 0
+        browser.close.assert_awaited_once()
 
     def test_fetch_cloudflare_rechallenge_on_search(self) -> None:
-        """CF challenge resolved initially but re-triggered on search."""
+        """CF resolved initially but re-triggered on the only search: raises."""
         portal_html = "<html><body>Portal</body></html>"
         cf_html = _load_html("sd_roa_cloudflare_challenge.html")
 
@@ -863,16 +872,17 @@ class TestFetchDocumentsWithMockedPlaywright:
         config = _make_config()
         scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
 
-        with patch(
-            "playwright.async_api.async_playwright",
-            return_value=mock_pw_ctx,
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            pytest.raises(ScraperPreconditionFailure, match="all 1 SD portal case lookups"),
         ):
-            docs = scraper.fetch_documents()
-
-        assert len(docs) == 0
+            scraper.fetch_documents()
 
     def test_fetch_cloudflare_rechallenge_on_detail(self) -> None:
-        """CF re-triggered on case detail page."""
+        """CF re-triggered on the only case detail page: raises."""
         portal_html = "<html><body>Portal</body></html>"
         search_html = _load_html("sd_roa_search_results.html")
         cf_html = _load_html("sd_roa_cloudflare_challenge.html")
@@ -890,13 +900,14 @@ class TestFetchDocumentsWithMockedPlaywright:
         config = _make_config()
         scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
 
-        with patch(
-            "playwright.async_api.async_playwright",
-            return_value=mock_pw_ctx,
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            pytest.raises(ScraperPreconditionFailure, match="all 1 SD portal case lookups"),
         ):
-            docs = scraper.fetch_documents()
-
-        assert len(docs) == 0
+            scraper.fetch_documents()
 
     def test_fetch_multiple_cases(self) -> None:
         """Multiple cases: one with ruling, one without."""
@@ -1019,6 +1030,7 @@ class TestFetchDocumentsWithMockedPlaywright:
 
         # First search raises, second succeeds
         page = AsyncMock()
+        page.on = MagicMock()
         page.wait_for_url = AsyncMock()
         call_count = 0
 
@@ -1075,10 +1087,11 @@ class TestFetchDocumentsWithMockedPlaywright:
         assert docs[0].case_number == "24CU016153C"
 
     def test_fetch_browser_close_on_exception(self) -> None:
-        """Browser is closed even if an exception occurs."""
+        """Browser is closed even when the portal never loads (and the run fails)."""
         portal_html = "<html><body>Portal</body></html>"
 
         page = AsyncMock()
+        page.on = MagicMock()
         page.goto = AsyncMock(side_effect=RuntimeError("Fatal error"))
         page.content = AsyncMock(return_value=portal_html)
         page.wait_for_url = AsyncMock()
@@ -1094,11 +1107,14 @@ class TestFetchDocumentsWithMockedPlaywright:
         config = _make_config()
         scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
 
-        with patch(
-            "playwright.async_api.async_playwright",
-            return_value=mock_pw_ctx,
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            patch("courts.ca.sd_tentatives.CF_RETRY_PAUSE", 0.0),
+            pytest.raises(ScraperPreconditionFailure),
         ):
-            # Should not raise — error handled gracefully
             scraper.fetch_documents()
 
         # Browser should have been closed
@@ -1338,6 +1354,226 @@ class TestFetchDocumentsWithMockedPlaywright:
         context_call = browser.new_context.call_args
         ua = context_call.kwargs.get("user_agent", "")
         assert "Chrome/131" in ua
+
+
+# ---------------------------------------------------------------------------
+# Anti-bot diagnosis and loud failures (#4673)
+# ---------------------------------------------------------------------------
+
+_INTERACTIVE_CHALLENGE = (
+    "<html><head><title>Just a moment...</title></head><body>"
+    "<script>(function(){window._cf_chl_opt = {cvId: '3',cZone: 'odyroa.sdcourt.ca.gov',"
+    "cType: 'interactive',cRay: 'a407a998589e12be'};}());</script></body></html>"
+)
+
+
+def _pw_ctx_for(page: AsyncMock) -> tuple[AsyncMock, AsyncMock]:
+    """Return (async_playwright() context manager mock, browser mock) for *page*."""
+    browser = _make_mock_browser(page)
+    mock_pw = AsyncMock()
+    mock_pw.chromium.launch = AsyncMock(return_value=browser)
+    mock_pw_ctx = AsyncMock()
+    mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+    mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+    return mock_pw_ctx, browser
+
+
+def _brd_response(code: str = "policy_20130") -> MagicMock:
+    """A Playwright response that the Bright Data proxy refused."""
+    response = MagicMock()
+    response.status = 402
+    response.url = "https://odyroa.sdcourt.ca.gov/cdn-cgi/challenge-platform/h/b/fo/x"
+    response.request.method = "POST"
+    response.headers = {
+        "x-brd-err-code": code,
+        "x-brd-error": "Residential Failed (bad_endpoint): POST requests are not allowed.",
+    }
+    return response
+
+
+class TestPageClassification:
+    def test_rate_limit_block_fixture(self) -> None:
+        html = _load_html("sd_roa_rate_limit_block.html")
+        assert is_rate_limit_block(html)
+        # The block page embeds the challenge-platform script, so the plain
+        # challenge check matches it too; classification must prefer the block.
+        assert is_cloudflare_challenge(html)
+        assert classify_portal_page(html) == "rate_limit_block"
+
+    def test_challenge_classified(self) -> None:
+        html = _load_html("sd_roa_cloudflare_challenge.html")
+        assert classify_portal_page(html) == "challenge"
+
+    def test_ok_page_classified(self) -> None:
+        assert classify_portal_page(_load_html("sd_roa_search_results.html")) == "ok"
+
+    def test_challenge_type_single_quotes(self) -> None:
+        assert cloudflare_challenge_type(_INTERACTIVE_CHALLENGE) == "interactive"
+
+    def test_challenge_type_double_quotes(self) -> None:
+        html = _load_html("sd_roa_cloudflare_challenge.html")
+        assert cloudflare_challenge_type(html) == "managed"
+
+    def test_challenge_type_absent(self) -> None:
+        assert cloudflare_challenge_type("<html>Portal</html>") is None
+
+
+class TestLoudAntiBotFailures:
+    def test_run_reports_failure_when_solve_cloudflare_false(self) -> None:
+        """AC #2: run() reports success=False when _solve_cloudflare returns False."""
+        page = _make_mock_page(["<html>unused</html>"])
+        mock_pw_ctx, browser = _pw_ctx_for(page)
+        config = ScraperConfig(
+            scraper_id="ca-sd-tentatives-test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            target_urls=[PORTAL_BASE_URL],
+            request_delay_seconds=0.0,
+            max_retries=1,
+        )
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            patch.object(
+                SDTentativeRulingsScraper,
+                "_solve_cloudflare",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert health.error_message is not None
+        assert "anti-bot check not passed" in health.error_message
+        browser.close.assert_awaited_once()
+
+    def test_rate_limit_block_at_portal_fails_without_polling(self) -> None:
+        block = _load_html("sd_roa_rate_limit_block.html")
+        page = _make_mock_page([block] * 5, cf_clearance=True)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["24CU016153C"])
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            patch("courts.ca.sd_tentatives.CF_RETRY_PAUSE", 0.0),
+            pytest.raises(ScraperPreconditionFailure, match="exceeded our rate limiting"),
+        ):
+            scraper.fetch_documents()
+
+        # A cf_clearance cookie must not count as "solved" on a block page.
+        page.context.cookies.assert_not_awaited()
+        assert page.goto.await_count == 3  # one per attempt, then give up
+
+    def test_proxy_policy_block_is_named_and_stops_retries(self) -> None:
+        page = _make_mock_page([_INTERACTIVE_CHALLENGE] * 6)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(
+            _make_config(),
+            case_numbers=["24CU016153C"],
+            proxy_url="http://user:pw@proxy:8080",
+        )
+
+        async def goto(*args: object, **kwargs: object) -> None:
+            # Simulate the challenge's POST being refused by the proxy.
+            handler = page.on.call_args.args[1]
+            handler(_brd_response())
+
+        page.goto = AsyncMock(side_effect=goto)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            patch("courts.ca.sd_tentatives.chromium_proxy_tls_launch_kwargs", return_value={}),
+            patch("courts.ca.sd_tentatives.diagnose_and_log_proxy_auth"),
+            patch("courts.ca.sd_tentatives.CF_CHALLENGE_TIMEOUT", 0.05),
+            patch("courts.ca.sd_tentatives.CF_POLL_INTERVAL", 0.05),
+            patch("courts.ca.sd_tentatives.CF_RETRY_PAUSE", 0.0),
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "x-brd-err-code=policy_20130" in message
+        assert "POST" in message
+        assert "challenge type=interactive" in message
+        # Retrying through a proxy that refuses the challenge POST is pointless.
+        assert page.goto.await_count == 1
+        page.on.assert_called_once()
+        assert page.on.call_args.args[0] == "response"
+
+    def test_response_listener_ignores_normal_and_counts_repeats(self) -> None:
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["X"])
+        normal = MagicMock()
+        normal.headers = {"server": "cloudflare"}
+        scraper._on_response(normal)
+        assert scraper._proxy_blocks == {}
+
+        scraper._on_response(_brd_response())
+        scraper._on_response(_brd_response())
+        assert scraper._proxy_blocks["policy_20130"]["count"] == 2
+        assert scraper._proxy_blocks["policy_20130"]["method"] == "POST"
+
+    def test_response_listener_never_raises(self) -> None:
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["X"])
+        broken = MagicMock()
+        type(broken).headers = property(lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+        scraper._on_response(broken)  # must not raise
+        assert scraper._proxy_blocks == {}
+
+    def test_consecutive_blocked_lookups_abort_and_fail(self) -> None:
+        portal = "<html><body>Portal</body></html>"
+        block = _load_html("sd_roa_rate_limit_block.html")
+        page = _make_mock_page([portal] + [block] * 20)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(8)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure, match="all 5 SD portal case lookups"),
+        ):
+            scraper.fetch_documents()
+
+        # 1 portal load + 5 blocked searches, then stop hammering the portal.
+        assert page.goto.await_count == 6
+
+    def test_partial_capture_kept_when_later_lookups_blocked(self) -> None:
+        portal = "<html><body>Portal</body></html>"
+        search = _load_html("sd_roa_search_results.html")
+        detail = _load_html("sd_roa_case_detail.html")
+        block = _load_html("sd_roa_rate_limit_block.html")
+        page = _make_mock_page([portal, search, detail] + [block] * 10)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = ["24CU016153C"] + [f"24CU0000{i:02d}C" for i in range(8)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        # 1 portal + (search + detail) + 5 blocked searches before aborting.
+        assert page.goto.await_count == 8
+
+    def test_blocked_streak_resets_after_success(self) -> None:
+        portal = "<html><body>Portal</body></html>"
+        search = _load_html("sd_roa_search_results.html")
+        no_ruling = _load_html("sd_roa_no_ruling.html")
+        block = _load_html("sd_roa_rate_limit_block.html")
+        seq = [portal] + [block] * 4 + [search, no_ruling] + [block] * 4
+        page = _make_mock_page(seq)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(9)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            docs = scraper.fetch_documents()
+
+        # 8 of 9 lookups blocked, but never 5 in a row and one lookup got through:
+        # a genuine "no ruling" result, not an outage.
+        assert docs == []
+        assert page.goto.await_count == 1 + 4 + 2 + 4
 
 
 # ---------------------------------------------------------------------------
