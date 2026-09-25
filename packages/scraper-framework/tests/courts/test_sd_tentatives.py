@@ -683,6 +683,10 @@ class TestDefaultConfig:
 # ---------------------------------------------------------------------------
 
 
+# A SmartSearch page with no results: the lookup completes with no ruling.
+_EMPTY_SEARCH_HTML = "<html><body><div>No results</div></body></html>"
+
+
 def _make_mock_page(
     content_sequence: list[str],
     cf_clearance: bool = False,
@@ -1278,7 +1282,7 @@ class TestFetchDocumentsWithMockedPlaywright:
     def test_chromium_launch_args_include_stealth_flags(self) -> None:
         """Browser is launched with anti-detection flags."""
         portal_html = "<html><body>Portal</body></html>"
-        page = _make_mock_page([portal_html])
+        page = _make_mock_page([portal_html, _EMPTY_SEARCH_HTML])
         browser = _make_mock_browser(page)
 
         mock_pw = AsyncMock()
@@ -1306,7 +1310,7 @@ class TestFetchDocumentsWithMockedPlaywright:
     def test_context_has_locale_and_timezone(self) -> None:
         """Browser context is created with locale and timezone for realism."""
         portal_html = "<html><body>Portal</body></html>"
-        page = _make_mock_page([portal_html])
+        page = _make_mock_page([portal_html, _EMPTY_SEARCH_HTML])
         browser = _make_mock_browser(page)
 
         mock_pw = AsyncMock()
@@ -1332,7 +1336,7 @@ class TestFetchDocumentsWithMockedPlaywright:
     def test_user_agent_is_recent_chrome(self) -> None:
         """User-Agent string uses a recent Chrome version (not 120)."""
         portal_html = "<html><body>Portal</body></html>"
-        page = _make_mock_page([portal_html])
+        page = _make_mock_page([portal_html, _EMPTY_SEARCH_HTML])
         browser = _make_mock_browser(page)
 
         mock_pw = AsyncMock()
@@ -1574,6 +1578,168 @@ class TestLoudAntiBotFailures:
         # a genuine "no ruling" result, not an outage.
         assert docs == []
         assert page.goto.await_count == 1 + 4 + 2 + 4
+
+
+def _goto_raising_on_search(
+    error: str = "net::ERR_TIMED_OUT", raise_on: set[int] | None = None
+) -> AsyncMock:
+    """``page.goto`` mock: the portal load succeeds, SmartSearch lookups raise.
+
+    *raise_on* is the set of 0-based SmartSearch lookup indexes that raise; when
+    ``None`` every lookup raises. Other gotos (portal, detail) succeed.
+    """
+    lookups = 0
+
+    async def goto(url: str, **kwargs: object) -> None:
+        nonlocal lookups
+        if "SmartSearch" not in url:
+            return
+        index = lookups
+        lookups += 1
+        if raise_on is None or index in raise_on:
+            raise RuntimeError(error)
+
+    return AsyncMock(side_effect=goto)
+
+
+class TestLookupExceptionsFailLoudly:
+    """Ordinary lookup exceptions count toward the loud-failure gate (#4687)."""
+
+    def test_every_lookup_raising_fails_fetch(self) -> None:
+        """AC #1: every SmartSearch goto raises after a clean portal load."""
+        page = _make_mock_page(["<html><body>Portal</body></html>"])
+        page.goto = _goto_raising_on_search()
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(6)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "net::ERR_TIMED_OUT" in message
+        assert "all 5 SD portal case lookups failed" in message
+        # 1 portal load + 5 failed lookups, then stop instead of 130 slow timeouts.
+        assert page.goto.await_count == 6
+
+    def test_every_lookup_raising_reports_run_failure(self) -> None:
+        """AC #1: run() returns success=False when every lookup raises."""
+        page = _make_mock_page(["<html><body>Portal</body></html>"])
+        page.goto = _goto_raising_on_search()
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        config = ScraperConfig(
+            scraper_id="ca-sd-tentatives-test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            target_urls=[PORTAL_BASE_URL],
+            request_delay_seconds=0.0,
+            max_retries=1,
+        )
+        cases = [f"24CU0000{i:02d}C" for i in range(6)]
+        scraper = SDTentativeRulingsScraper(config, case_numbers=cases)
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert health.error_message is not None
+        assert "net::ERR_TIMED_OUT" in health.error_message
+
+    def test_all_lookups_raising_below_abort_threshold_fails(self) -> None:
+        """Fewer lookups than the abort streak, all raising: still a failure."""
+        page = _make_mock_page(["<html><body>Portal</body></html>"])
+        page.goto = _goto_raising_on_search("net::ERR_TUNNEL_CONNECTION_FAILED")
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = ["24CU000001C", "24CU000002C"]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure, match="ERR_TUNNEL_CONNECTION_FAILED"),
+        ):
+            scraper.fetch_documents()
+
+        assert page.goto.await_count == 3
+
+    def test_mixed_blocked_and_failed_lookups_fail(self) -> None:
+        """AC #2: alternating block pages and goto exceptions across 6 cases."""
+        portal = "<html><body>Portal</body></html>"
+        block = _load_html("sd_roa_rate_limit_block.html")
+        # Even lookups get a block page, odd lookups raise.
+        page = _make_mock_page([portal] + [block] * 6)
+        page.goto = _goto_raising_on_search(raise_on={1, 3, 5})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(6)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "3 blocked" in message
+        assert "2 raised errors" in message
+        assert "exceeded our rate limiting" in message
+        assert "net::ERR_TIMED_OUT" in message
+        # An exception must not reset the streak: abort after 5 unsuccessful.
+        assert page.goto.await_count == 6
+
+    def test_mixed_blocked_and_failed_below_threshold_fails(self) -> None:
+        """Blocked + failed == attempted with no streak abort still fails."""
+        portal = "<html><body>Portal</body></html>"
+        block = _load_html("sd_roa_rate_limit_block.html")
+        page = _make_mock_page([portal, block])
+        page.goto = _goto_raising_on_search(raise_on={1})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(
+            _make_config(), case_numbers=["24CU000001C", "24CU000002C"]
+        )
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure, match="1 blocked, 1 raised errors"),
+        ):
+            scraper.fetch_documents()
+
+    def test_exception_then_genuine_empty_result_succeeds(self) -> None:
+        """AC #3: one lookup raising and one clean "no results" lookup is not an outage."""
+        portal = "<html><body>Portal</body></html>"
+        empty_search = "<html><body><div>No results</div></body></html>"
+        page = _make_mock_page([portal, empty_search])
+        page.goto = _goto_raising_on_search(raise_on={0})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(
+            _make_config(), case_numbers=["24CU000001C", "24CU000002C"]
+        )
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            docs = scraper.fetch_documents()
+
+        assert docs == []
+        assert page.goto.await_count == 3
+
+    def test_failure_streak_resets_after_clean_lookup(self) -> None:
+        """4 failures, a clean lookup, then 4 more failures: no abort, no failure."""
+        portal = "<html><body>Portal</body></html>"
+        empty_search = "<html><body><div>No results</div></body></html>"
+        page = _make_mock_page([portal, empty_search])
+        page.goto = _goto_raising_on_search(raise_on={0, 1, 2, 3, 5, 6, 7, 8})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(9)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            docs = scraper.fetch_documents()
+
+        assert docs == []
+        assert page.goto.await_count == 1 + 9
 
 
 # ---------------------------------------------------------------------------

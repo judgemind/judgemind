@@ -86,8 +86,11 @@ CF_POLL_INTERVAL = 2.0
 # Seconds to pause between Cloudflare solve attempts.
 CF_RETRY_PAUSE = 3.0
 
-# Stop querying the portal after this many consecutive case lookups come back
-# blocked (challenge or rate-limit page). More requests only extend the block.
+# Stop querying the portal after this many consecutive case lookups are
+# unsuccessful: blocked (challenge or rate-limit page) or raising an error such
+# as a navigation timeout or a dead proxy (#4687). More requests only extend a
+# block, and a dead proxy would otherwise drive every remaining lookup into a
+# slow timeout.
 MAX_CONSECUTIVE_BLOCKED_LOOKUPS = 5
 
 # Text of the SD court's Cloudflare WAF block page (#4673). It is a block, not a
@@ -711,15 +714,19 @@ class SDTentativeRulingsScraper(BaseScraper):
         """Async implementation of the fetch loop.
 
         Raises :class:`ScraperPreconditionFailure` when the portal session cannot
-        be established (Cloudflare not passed) or when every case lookup is
-        blocked. Otherwise ``run()`` would record ``status=success`` with 0
-        records and hide the outage (#4673).
+        be established (Cloudflare not passed) or when no case lookup succeeds
+        because each one was blocked or raised (timeout, dead proxy, parse
+        error). Otherwise ``run()`` would record ``status=success`` with 0
+        records and hide the outage (#4673, #4687). A lookup that completes
+        and finds no ruling is a genuine empty result, not a failure.
         """
         from playwright.async_api import async_playwright
 
         docs: list[CapturedDocument] = []
         attempted = 0
         blocked = 0
+        failed = 0
+        last_error: str | None = None
         self._reset_diagnostics()
 
         async with async_playwright() as pw:
@@ -779,8 +786,11 @@ class SDTentativeRulingsScraper(BaseScraper):
                     )
                     raise ScraperPreconditionFailure(message)
 
-                # Step 2: For each case, search and extract ruling
-                consecutive_blocked = 0
+                # Step 2: For each case, search and extract ruling.
+                # A lookup is unsuccessful when it is blocked or raises. Only a
+                # lookup that completes (ruling found or genuinely none) resets
+                # the streak (#4687).
+                consecutive_unsuccessful = 0
                 for i, case_number in enumerate(self._case_numbers):
                     if i > 0:
                         await asyncio.sleep(self.config.request_delay_seconds)
@@ -788,28 +798,35 @@ class SDTentativeRulingsScraper(BaseScraper):
                     attempted += 1
                     try:
                         doc = await self._fetch_case_ruling(page, case_number)
-                        if doc is not None:
-                            docs.append(doc)
                     except _LookupBlocked:
                         blocked += 1
-                        consecutive_blocked += 1
-                        if consecutive_blocked >= MAX_CONSECUTIVE_BLOCKED_LOOKUPS:
-                            self._log.error(
-                                "sd.lookups_aborted_blocked",
-                                consecutive_blocked=consecutive_blocked,
-                                attempted=attempted,
-                                remaining=len(self._case_numbers) - attempted,
-                                **self._anti_bot_summary(),
-                            )
-                            break
-                        continue
                     except Exception as exc:
+                        failed += 1
+                        last_error = f"{type(exc).__name__}: {exc}"[:300]
                         self._log.error(
                             "Failed to fetch case ruling",
                             case_number=case_number,
                             error=str(exc),
                         )
-                    consecutive_blocked = 0
+                    else:
+                        consecutive_unsuccessful = 0
+                        if doc is not None:
+                            docs.append(doc)
+                        continue
+
+                    consecutive_unsuccessful += 1
+                    if consecutive_unsuccessful >= MAX_CONSECUTIVE_BLOCKED_LOOKUPS:
+                        self._log.error(
+                            "sd.lookups_aborted",
+                            consecutive_unsuccessful=consecutive_unsuccessful,
+                            attempted=attempted,
+                            blocked=blocked,
+                            failed=failed,
+                            last_error=last_error,
+                            remaining=len(self._case_numbers) - attempted,
+                            **self._anti_bot_summary(),
+                        )
+                        break
 
             finally:
                 await browser.close()
@@ -819,19 +836,35 @@ class SDTentativeRulingsScraper(BaseScraper):
             total_cases=len(self._case_numbers),
             attempted=attempted,
             blocked=blocked,
+            failed=failed,
             rulings_found=len(docs),
         )
 
-        # Every lookup was blocked and nothing was captured: this is an
-        # outage, not "no rulings today". Keep partial captures otherwise.
-        if not docs and attempted > 0 and blocked == attempted:
-            message = (
+        # Every lookup was blocked or raised and nothing was captured: this is
+        # an outage, not "no rulings today". Keep partial captures otherwise.
+        if not docs and attempted > 0 and blocked + failed == attempted:
+            raise ScraperPreconditionFailure(
+                self._lookup_failure_message(attempted, blocked, failed, last_error)
+            )
+
+        return docs
+
+    def _lookup_failure_message(
+        self, attempted: int, blocked: int, failed: int, last_error: str | None
+    ) -> str:
+        """One-line reason for a run where no case lookup succeeded (#4673, #4687)."""
+        if not failed:
+            return (
                 f"all {attempted} SD portal case lookups were blocked; "
                 + self._cloudflare_failure_message()
             )
-            raise ScraperPreconditionFailure(message)
-
-        return docs
+        message = (
+            f"all {attempted} SD portal case lookups failed "
+            f"({blocked} blocked, {failed} raised errors); last error: {last_error}"
+        )
+        if blocked:
+            message += "; " + self._cloudflare_failure_message()
+        return message
 
     async def _solve_cloudflare(self, page: Any) -> bool:
         """Navigate to the portal and wait for Cloudflare challenge to resolve.
