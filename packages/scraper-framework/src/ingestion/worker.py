@@ -1134,6 +1134,14 @@ CONSUMER_NAME = f"ingestion-{socket.gethostname()}-{os.getpid()}"
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_BLOCK_MS = 5000
+# Headroom between the XREADGROUP BLOCK interval and the client's socket read
+# timeout.  redis-py 8 changed DEFAULT_SOCKET_TIMEOUT from None (wait forever)
+# to 5s — equal to DEFAULT_BLOCK_MS — so every idle poll raised
+# ``TimeoutError: Timeout reading from socket`` and the consumer loop logged it
+# at ERROR about every 5s (#4705).  The margin covers network/ElastiCache
+# latency on the server's empty reply; a server silent past block + margin is a
+# genuine hang and still raises.
+REDIS_SOCKET_TIMEOUT_MARGIN_S = 10.0
 DEFAULT_MAX_RETRIES = 3
 # Number of consecutive empty poll cycles between heartbeat log messages.
 # At the default block timeout of 5 seconds, 60 cycles ≈ 5 minutes.
@@ -1151,6 +1159,37 @@ PENDING_RECLAIM_MIN_IDLE_MS = 30_000
 # How often (in empty-poll cycles) to attempt PEL reclamation during the
 # main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
 PENDING_RECLAIM_INTERVAL = 12
+
+
+def redis_socket_timeout_for_block(block_ms: int) -> float:
+    """Return a Redis client socket read timeout that outlasts an XREADGROUP block.
+
+    The consumer's Redis client must be built with this (see
+    ``ingestion.__main__``); otherwise an idle ``BLOCK`` poll hits the client
+    read timeout before the server's empty reply arrives (#4705).
+    """
+    return block_ms / 1000 + REDIS_SOCKET_TIMEOUT_MARGIN_S
+
+
+_UNKNOWN = object()
+
+
+def _client_socket_timeout(redis_client: Any) -> float | None | object:
+    """Best-effort read of a redis-py client's configured socket_timeout.
+
+    Returns the sentinel ``_UNKNOWN`` when the client does not expose real
+    connection kwargs (e.g. a test double).
+    """
+    try:
+        kwargs = redis_client.connection_pool.connection_kwargs
+    except AttributeError:
+        return _UNKNOWN
+    if not isinstance(kwargs, dict):
+        return _UNKNOWN
+    value = kwargs.get("socket_timeout", _UNKNOWN)
+    if value is None or isinstance(value, int | float):
+        return value
+    return _UNKNOWN
 
 
 def apply_case_title_cleanup(
@@ -2110,6 +2149,7 @@ class IngestionWorker:
         is missing — this causes a non-zero exit so ECS can restart the task.
         """
         self.health_check()
+        self._warn_if_socket_timeout_below_block(block_ms)
         self._ensure_consumer_group()
         self._cleanup_stale_consumers()
 
@@ -2151,6 +2191,27 @@ class IngestionWorker:
                     logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
         finally:
             self.close()
+
+    def _warn_if_socket_timeout_below_block(self, block_ms: int) -> None:
+        """Warn once at startup if idle XREADGROUP polls would time out client-side.
+
+        A client socket_timeout at or below the BLOCK interval turns every idle
+        poll into ``TimeoutError: Timeout reading from socket`` logged at ERROR
+        by the consumer loop (#4705).  Build the client with
+        ``socket_timeout=redis_socket_timeout_for_block(block_ms)``.
+        """
+        socket_timeout = _client_socket_timeout(self._redis)
+        if socket_timeout is _UNKNOWN or socket_timeout is None:
+            return
+        if socket_timeout <= block_ms / 1000:  # type: ignore[operator]
+            logger.warning(
+                "Redis client socket_timeout (%ss) <= XREADGROUP block (%dms): every "
+                "idle poll will hit the client read timeout and log an error. Build the client "
+                "with socket_timeout=redis_socket_timeout_for_block(block_ms). See #4705.",
+                socket_timeout,
+                block_ms,
+                extra={"socket_timeout": socket_timeout, "block_ms": block_ms},
+            )
 
     def process_event(self, event_data: dict[str, Any]) -> None:
         """Process a single deserialized event dict.
