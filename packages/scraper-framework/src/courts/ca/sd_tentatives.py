@@ -65,6 +65,7 @@ from framework.base import ScraperPreconditionFailure
 from framework.browser import apply_stealth as _apply_stealth
 from framework.browser import playwright_proxy_settings
 from framework.events import EventBus
+from framework.fetch_tally import FetchTally
 from framework.proxy_health import diagnose_and_log_proxy_auth
 from framework.proxy_tls import chromium_proxy_tls_launch_kwargs
 from framework.storage import S3Archiver
@@ -750,10 +751,7 @@ class SDTentativeRulingsScraper(BaseScraper):
         from playwright.async_api import async_playwright
 
         docs: list[CapturedDocument] = []
-        attempted = 0
-        blocked = 0
-        failed = 0
-        last_error: str | None = None
+        tally = FetchTally("SD portal case lookups")
         self._reset_diagnostics()
 
         async with async_playwright() as pw:
@@ -825,14 +823,13 @@ class SDTentativeRulingsScraper(BaseScraper):
                     if i > 0:
                         await asyncio.sleep(self.config.request_delay_seconds)
 
-                    attempted += 1
+                    tally.attempt()
                     try:
                         doc = await self._fetch_case_ruling(page, case_number)
-                    except _LookupBlocked:
-                        blocked += 1
+                    except _LookupBlocked as blocked_exc:
+                        tally.blocked(str(blocked_exc))
                     except Exception as exc:
-                        failed += 1
-                        last_error = f"{type(exc).__name__}: {exc}"[:300]
+                        tally.failed(exc)
                         self._log.error(
                             "Failed to fetch case ruling",
                             case_number=case_number,
@@ -849,11 +846,8 @@ class SDTentativeRulingsScraper(BaseScraper):
                         self._log.error(
                             "sd.lookups_aborted",
                             consecutive_unsuccessful=consecutive_unsuccessful,
-                            attempted=attempted,
-                            blocked=blocked,
-                            failed=failed,
-                            last_error=last_error,
-                            remaining=len(self._case_numbers) - attempted,
+                            remaining=len(self._case_numbers) - tally.n_attempted,
+                            **tally.log_fields(),
                             **self._anti_bot_summary(),
                         )
                         break
@@ -864,35 +858,30 @@ class SDTentativeRulingsScraper(BaseScraper):
         self._log.info(
             "ROA fetch complete",
             total_cases=len(self._case_numbers),
-            attempted=attempted,
-            blocked=blocked,
-            failed=failed,
             rulings_found=len(docs),
+            **tally.log_fields(),
         )
 
         # Every lookup was blocked or raised and nothing was captured: this is
         # an outage, not "no rulings today". Keep partial captures otherwise.
-        if not docs and attempted > 0 and blocked + failed == attempted:
-            raise ScraperPreconditionFailure(
-                self._lookup_failure_message(attempted, blocked, failed, last_error)
-            )
+        # Shared gate: framework.fetch_tally (#4693).
+        tally.raise_if_all_failed(docs, message=self._lookup_failure_message(tally))
 
         return docs
 
-    def _lookup_failure_message(
-        self, attempted: int, blocked: int, failed: int, last_error: str | None
-    ) -> str:
+    def _lookup_failure_message(self, tally: FetchTally) -> str:
         """One-line reason for a run where no case lookup succeeded (#4673, #4687)."""
-        if not failed:
+        if not tally.n_failed:
             return (
-                f"all {attempted} SD portal case lookups were blocked; "
+                f"all {tally.n_attempted} SD portal case lookups were blocked; "
                 + self._cloudflare_failure_message()
             )
         message = (
-            f"all {attempted} SD portal case lookups failed "
-            f"({blocked} blocked, {failed} raised errors); last error: {last_error}"
+            f"all {tally.n_attempted} SD portal case lookups failed "
+            f"({tally.n_blocked} blocked, {tally.n_failed} raised errors); "
+            f"last error: {tally.last_error}"
         )
-        if blocked:
+        if tally.n_blocked:
             message += "; " + self._cloudflare_failure_message()
         return message
 

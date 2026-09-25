@@ -298,8 +298,10 @@ class TestPipelineEndToEnd:
 
     @respx.mock
     def test_phase1_failure_reports_health(self) -> None:
-        """If Phase 1 fails, the pipeline still returns a health event."""
+        """If every Phase 1 calendar fetch fails, the pipeline records a
+        failed run with the reason, not success/0 (#4693)."""
         config = _make_config()
+        config.max_retries = 1
         scraper = SDPipelineScraper(config, day_numbers=[1])
 
         # All calendar pages return 500
@@ -308,11 +310,10 @@ class TestPipelineEndToEnd:
         respx.get(f"{CALENDAR_BASE_URL}/F_EVCAL1.html").mock(return_value=httpx.Response(500))
         respx.get(f"{CALENDAR_BASE_URL}/F_BVCAL1.html").mock(return_value=httpx.Response(500))
 
-        # Phase 1 handles errors gracefully and returns empty docs
-        # so the pipeline should succeed with 0 records
         health = scraper.run()
-        assert health.success is True
+        assert health.success is False
         assert health.records_captured == 0
+        assert "all 4 SD calendar page fetches failed" in (health.error_message or "")
 
     def test_phase2_anti_bot_failure_fails_the_run(self) -> None:
         """Phase 2 portal failure is recorded as a failed run, not success/0 (#4673)."""

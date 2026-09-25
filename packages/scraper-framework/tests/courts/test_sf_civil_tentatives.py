@@ -42,6 +42,7 @@ from courts.ca.sf_civil_tentatives import (
 )
 from courts.ca.sf_civil_tentatives import default_config as sf_civil_default_config
 from framework import ContentFormat
+from framework.base import ScraperPreconditionFailure
 
 # Fake session ID for tests — bypasses Playwright session acquisition.
 TEST_SESSION_ID = "AABBCCDD1122334455667788AABBCCDD11223344"
@@ -672,7 +673,8 @@ class TestSFCivilScraperRun:
 
     @respx.mock
     def test_handles_redirect_gracefully(self) -> None:
-        """Redirect during REST fetch should be handled gracefully."""
+        """A redirect on every RulingID means the session is dead: the fetch
+        raises instead of returning [] (#4693)."""
         respx.get(url__startswith=CIVIL_REST_BASE).mock(
             return_value=httpx.Response(
                 302,
@@ -687,31 +689,50 @@ class TestSFCivilScraperRun:
             session_id=TEST_SESSION_ID,
         )
 
-        docs = scraper.fetch_documents()
-        assert docs == []
+        with pytest.raises(ScraperPreconditionFailure, match="were blocked.*redirect 302"):
+            scraper.fetch_documents()
+
+    @respx.mock
+    def test_redirect_on_some_ruling_ids_is_skipped(self) -> None:
+        """A redirect on one RulingID is skipped; the others still count."""
+        calls = 0
+
+        def side_effect(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(302, headers={"Location": "https://x.test/captcha"})
+            return httpx.Response(200, text='{"result": [0, ""]}')
+
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(side_effect=side_effect)
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        assert scraper.fetch_documents() == []
 
     @respx.mock
     def test_handles_http_error_gracefully(self) -> None:
-        """HTTP errors per-RulingID are logged but don't crash the run.
-
-        The scraper catches per-RulingID errors and continues to the next.
-        The overall run succeeds with 0 records (no unhandled exception).
-        """
+        """HTTP errors on every RulingID fail the run instead of recording
+        success/0 (#4693). Per-RulingID errors are still caught, so one bad
+        RulingID does not lose the others."""
         respx.get(url__startswith=CIVIL_REST_BASE).mock(
             return_value=httpx.Response(500),
         )
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
+        config.max_retries = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=TEST_SESSION_ID,
         )
 
         health = scraper.run()
-        # Per-RulingID errors are caught — the run itself succeeds
-        assert health.success is True
+        assert health.success is False
         assert health.records_captured == 0
+        assert "SF civil RulingID requests failed" in (health.error_message or "")
 
     @respx.mock
     def test_handles_empty_results(self) -> None:
@@ -751,21 +772,24 @@ class TestSFCivilScraperRun:
 
     @respx.mock
     def test_handles_session_expiry(self) -> None:
-        """Session expiry (result=[−1]) should be handled gracefully."""
+        """Session expiry (result=[−1]) on every RulingID fails the run with
+        the reason instead of recording success/0 (#4693)."""
         respx.get(url__startswith=CIVIL_REST_BASE).mock(
             return_value=httpx.Response(200, text='{"result": [-1]}'),
         )
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
+        config.max_retries = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=TEST_SESSION_ID,
         )
 
         health = scraper.run()
-        assert health.success is True
+        assert health.success is False
         assert health.records_captured == 0
+        assert "session expired" in (health.error_message or "")
 
     @respx.mock
     def test_content_format_is_html(self) -> None:

@@ -269,6 +269,8 @@ Rules every scraper author and reviewer must follow. These apply to new scrapers
 
 **Precondition failures must raise.** If `fetch_documents` has a prerequisite step (session acquisition, auth, proxy handshake) that, when it fails, prevents fetching any documents, it MUST call `self._require_precondition(...)` (which raises `ScraperPreconditionFailure`). Returning `[]` would be recorded as a successful zero-records run by `BaseScraper.run()` and mask silent outages — see #2620.
 
+**All-items-failed must raise.** A fetch loop that catches and logs each item's exception (one bad PDF must not lose the rest) MUST count outcomes with `framework.fetch_tally.FetchTally` and call `tally.raise_if_all_failed(docs)` before returning. When nothing was captured and every attempt raised or was blocked, the run is recorded as `success=False` with the counts and last error in `error_message`. A fetch that completes and finds nothing stays a success — see #4693.
+
 Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.
 
 ## 3.4 Application Layer

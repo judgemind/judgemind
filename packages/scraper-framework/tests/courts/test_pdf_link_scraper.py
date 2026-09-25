@@ -377,6 +377,30 @@ def test_oc_run_continues_when_pdf_fails() -> None:
     assert health.records_captured == 32  # 33 - 1 failed
 
 
+@respx.mock
+def test_oc_run_fails_when_every_pdf_fetch_fails() -> None:
+    """Every PDF GET raised: the run is a failure, not success/0 (#4693).
+
+    Covers every PdfLinkScraper subclass that inherits fetch_documents
+    (OC civil, OC probate, OC family law, SB, SF, and the Fresno/Riverside
+    overrides that call super().fetch_documents()).
+    """
+    html = _load_html("oc_civil_page.html")
+
+    respx.get(OC_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(503))
+
+    config = oc_default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = OCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 33 PDF fetches failed" in (health.error_message or "")
+    assert "503" in (health.error_message or "")
+
+
 # ---------------------------------------------------------------------------
 # Full Riverside scraper run — mocked HTTP
 # ---------------------------------------------------------------------------

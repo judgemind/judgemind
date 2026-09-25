@@ -88,6 +88,8 @@ import structlog
 from bs4 import BeautifulSoup, Tag
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.base import ScraperPreconditionFailure
+from framework.fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -488,8 +490,13 @@ class CCTentativesPortalScraper(BaseScraper):
 
         Returns:
             List of CapturedDocument objects, one per valid ruling found.
-            Returns [] on empty listings or missing dropdown; per-row
-            exceptions are caught, logged, and skipped.
+            Returns [] on empty listings; per-row exceptions are caught,
+            logged, and skipped.
+
+        Raises:
+            ScraperPreconditionFailure: when the form page cannot be fetched,
+                the judge dropdown is missing, or every listing/detail fetch
+                failed and nothing was captured (#4693).
         """
         docs: list[CapturedDocument] = []
 
@@ -505,14 +512,26 @@ class CCTentativesPortalScraper(BaseScraper):
                 form_response.raise_for_status()
             except Exception as exc:
                 self._log.error("cc_portal.form_fetch_failed", error=str(exc))
-                return []
+                # Nothing can be fetched without the form: fail the run
+                # instead of recording success/0 (#4693).
+                raise ScraperPreconditionFailure(
+                    f"CC portal form fetch failed: {type(exc).__name__}: {exc}"
+                ) from exc
 
             judges = _parse_judge_dropdown(form_response.text)
             if not judges:
                 self._log.error("cc_portal.no_judges_found", url=FORM_URL)
-                return []
+                # A page with no judge dropdown is a layout change or an
+                # access-denied page, never a quiet day (#4591, #4693).
+                self._require_precondition(
+                    False, f"CC portal judge dropdown not found at {FORM_URL}"
+                )
 
             self._log.info("cc_portal.judges_found", count=len(judges))
+
+            # Listing and detail-page fetches. A run where every one of them
+            # raises must fail, not record success/0 (#4693).
+            tally = FetchTally("CC portal listing and ruling fetches")
 
             # Step 2: Iterate each judge
             for judge_id, judge_name_dropdown in judges:
@@ -530,6 +549,7 @@ class CCTentativesPortalScraper(BaseScraper):
                     )
                     listing_response.raise_for_status()
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "cc_portal.listing_fetch_failed",
                         judge_id=judge_id,
@@ -539,12 +559,14 @@ class CCTentativesPortalScraper(BaseScraper):
 
                 rows = _parse_listing_table(listing_response.text)
                 if not rows:
+                    tally.ok()  # the listing loaded and is genuinely empty
                     self._log.info(
                         "cc_portal.empty_listing",
                         judge_id=judge_id,
                         judge_name=judge_name_dropdown,
                     )
                     continue
+                attempts_before_rows = tally.n_attempted
 
                 self._log.info(
                     "cc_portal.listing_rows",
@@ -579,7 +601,9 @@ class CCTentativesPortalScraper(BaseScraper):
                         )
                         if doc is not None:
                             docs.append(doc)
+                        tally.ok()
                     except Exception as exc:
+                        tally.failed(exc)
                         self._log.error(
                             "cc_portal.row_fetch_failed",
                             slug=slug,
@@ -587,6 +611,12 @@ class CCTentativesPortalScraper(BaseScraper):
                             error=str(exc),
                         )
 
+                if tally.n_attempted == attempts_before_rows:
+                    # Every row was a filtered test entry; the listing itself
+                    # loaded fine.
+                    tally.ok()
+
+        tally.raise_if_all_failed(docs)
         return docs
 
     def _fetch_single_ruling(

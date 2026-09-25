@@ -527,6 +527,21 @@ class TestSDCalendarScraper:
         assert docs == []
 
     @respx.mock
+    def test_run_fails_when_every_calendar_page_fails(self) -> None:
+        """Every calendar-page GET raised: failure, not success/0 (#4693)."""
+        config = _make_config()
+        config.max_retries = 1
+        scraper = SDCalendarScraper(config, day_numbers=[1])
+
+        respx.get(url__regex=r"/calendar/").mock(return_value=httpx.Response(500))
+
+        health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert "all 4 SD calendar page fetches failed" in (health.error_message or "")
+
+    @respx.mock
     def test_multiple_day_numbers(self) -> None:
         config = _make_config()
         scraper = SDCalendarScraper(config, day_numbers=[1, 2])

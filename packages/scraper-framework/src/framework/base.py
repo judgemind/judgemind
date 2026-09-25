@@ -65,6 +65,12 @@ class BaseScraper(abc.ABC):
         documents, call ``self._require_precondition(cond, msg)`` instead of
         returning ``[]``.  Returning ``[]`` would be recorded by ``run()`` as a
         successful zero-records run and mask silent outages — see #2620.
+
+    Per-item fetch loops:
+        A loop that catches and logs each item's exception must count the
+        outcomes with :class:`framework.fetch_tally.FetchTally` and call
+        ``tally.raise_if_all_failed(docs)`` before returning, so that a run
+        where every item failed is recorded as a failure (#4693).
     """
 
     def __init__(

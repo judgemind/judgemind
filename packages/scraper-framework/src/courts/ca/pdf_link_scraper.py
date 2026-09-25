@@ -32,6 +32,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -136,6 +137,8 @@ class PdfLinkScraper(BaseScraper):
     def fetch_documents(self) -> list[CapturedDocument]:
         pc = self._pdf_config
         docs = []
+        # A run where every PDF GET raises must fail, not record success/0 (#4693).
+        tally = FetchTally("PDF fetches")
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
@@ -187,6 +190,7 @@ class PdfLinkScraper(BaseScraper):
                     continue
 
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     doc = self._fetch_one_pdf(client, href, link_text)
 
@@ -215,6 +219,7 @@ class PdfLinkScraper(BaseScraper):
                         url=href,
                     )
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch PDF",
                         url=href,
@@ -222,6 +227,7 @@ class PdfLinkScraper(BaseScraper):
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
