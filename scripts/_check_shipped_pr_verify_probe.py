@@ -48,6 +48,25 @@
 #        ``git log -S <test_name>`` against the test files identified
 #        by collection.
 #
+# FAIL-SAFE GUARDS (issue #4666):
+#   A grep hit / collected test proves only that the target EXISTS — which
+#   is equally true of unfixed code. On #4661 (an open p1 data-loss bug)
+#   the AC's ``grep -n "capture_timestamp" scripts/rebuild_db.py`` matched
+#   the buggy line itself, and an unscoped pickaxe fallback credited PR
+#   #4324, which predated the issue and never touched rebuild_db.py. The
+#   probe therefore defaults to "no match" unless there is evidence of the
+#   fix:
+#     - The issue's ``createdAt`` must be known, and the resolved PR's
+#       squash-merge commit must post-date it.
+#     - PR resolution is scoped to the grep-matched / test-collected files.
+#       There is no unscoped fallback.
+#     - Grep clauses fire only when the AC prose after the backticked
+#       command is empty or a bare-existence phrase ("returns a match").
+#       Qualitative / negative prose ("sourced from X, not Y", "no
+#       matches") is skipped — a hit can't confirm it.
+#     - Pytest clauses with negative prose ("no longer collects") are
+#       skipped.
+#
 # DELIBERATELY UNSUPPORTED — script-execution clauses
 # (``Verify: ./scripts/foo.sh ...`` / ``Verify: bash scripts/foo.sh``):
 #   The issue's original proposal called for a third shape — "run the
@@ -107,6 +126,7 @@ import re
 import shlex
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # ─── Verify clause extraction ──────────────────────────────────────────────
@@ -138,16 +158,22 @@ VERIFY_LINE_RE = re.compile(
 # non-greedy match — ``Verify: `grep x y` returns a match; adding `--z`
 # breaks it`` returns ``grep x y``, NOT ``grep x y` returns a match;
 # adding `--z`` (which the greedy version would emit).
-INLINE_BACKTICK_RE = re.compile(r"^`([^`]+)`")
+INLINE_BACKTICK_RE = re.compile(r"^`([^`]+)`(.*)$")
 
 
-def _extract_verify_clauses(body: str) -> list[str]:
-    """Yield raw Verify clause command strings from ``body``.
+def _extract_verify_entries(body: str) -> list[tuple[str, str]]:
+    """Return ``(command, prose)`` pairs for every Verify clause in ``body``.
 
-    Each returned string is the post-``Verify:`` portion of the line,
-    with leading/trailing whitespace and surrounding backticks stripped.
+    ``command`` is the post-``Verify:`` portion of the line, with
+    leading/trailing whitespace and surrounding backticks stripped.
     Bullet markers, bold-emphasis wrappers, and indentation are consumed
     by ``VERIFY_LINE_RE``; only the actual command remains.
+
+    ``prose`` is the text trailing a backtick-wrapped command (e.g.
+    ``returns a match`` in ``Verify: `grep x y` returns a match``) — the
+    AC author's statement of what the command's output must look like.
+    For un-backticked clauses the command and prose can't be separated,
+    so ``prose`` is empty (#4666).
 
     Multi-clause lines (rare — most AC authors use one clause per line)
     are not split here. The grep/pytest/script classifiers each parse
@@ -163,7 +189,7 @@ def _extract_verify_clauses(body: str) -> list[str]:
     closer). The regex consumes both forms by making the trailing
     ``**`` optional.
     """
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     for line in body.splitlines():
         m = VERIFY_LINE_RE.match(line)
         if not m:
@@ -182,12 +208,70 @@ def _extract_verify_clauses(body: str) -> list[str]:
         # any post-backtick prose appended (e.g. ``Verify: `grep x y`
         # returns a match`` — the ``returns a match`` is informational
         # narrative, not part of the command).
+        prose = ""
         bt = INLINE_BACKTICK_RE.match(raw)
         if bt:
+            prose = bt.group(2).strip()
             raw = bt.group(1).strip()
         if raw:
-            out.append(raw)
+            out.append((raw, prose))
     return out
+
+
+def _extract_verify_clauses(body: str) -> list[str]:
+    """Return just the Verify clause command strings from ``body``."""
+    return [cmd for cmd, _ in _extract_verify_entries(body)]
+
+
+# ─── Assertion-strength gate (#4666) ───────────────────────────────────────
+#
+# A grep hit proves only that the pattern EXISTS. It confirms an AC only
+# when the AC asserts nothing more than existence ("returns a match").
+# For negative assertions ("not X", "no matches", "no longer ...") or
+# qualitative ones ("shows it sourced from S3, not datetime.now") a bare
+# hit cannot tell the fixed state from the bug — on #4661 the grep hit
+# the buggy line itself. So a grep clause only fires when its trailing
+# prose is empty or a bare-existence phrase.
+
+_BARE_EXISTENCE_RE = re.compile(
+    r"""^(?:
+        (?:returns?|shows?|finds?|has|have|yields?|prints?|lists?|produces?|gives?|outputs?)
+        \s+(?:at\s+least\s+one|one\s+or\s+more|a|an|some|>=\s*1|≥\s*1|1\+)?\s*
+        (?:match(?:es)?|hits?|results?|lines?|output|occurrences?)
+      | match(?:es)?
+      | finds?\s+(?:it|them|the\s+\w+)
+      | is\s+non-?empty
+      | exits?\s+0
+      | succeeds
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Negation / negative-outcome markers. Used for pytest clauses (where the
+# existing "collection exists" semantics tolerate prose like "passes") to
+# reject ACs that assert the test must NOT be collected.
+_NEGATION_RE = re.compile(
+    r"\b(?:not|no|never|none|nothing|zero|without|absent|instead|rather)\b|n't\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_prose(prose: str) -> str:
+    """Strip surrounding punctuation / separators from AC prose."""
+    return prose.strip().strip(" \t.;:,—–-()").strip()
+
+
+def _prose_is_bare_existence(prose: str) -> bool:
+    """True when ``prose`` asserts nothing beyond "the command has output"."""
+    norm = _normalize_prose(prose)
+    if not norm:
+        return True
+    return bool(_BARE_EXISTENCE_RE.match(norm))
+
+
+def _prose_is_negative(prose: str) -> bool:
+    """True when ``prose`` contains a negation / negative-outcome marker."""
+    return bool(_NEGATION_RE.search(prose))
 
 
 # ─── Clause classifiers ────────────────────────────────────────────────────
@@ -313,47 +397,101 @@ def _extract_pytest_k_expr(argv: list[str]) -> str | None:
     return None
 
 
+def _parse_iso8601(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` suffix allowed); None if invalid.
+
+    Naive timestamps are treated as UTC so comparisons never raise.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def _resolve_pr_for_pattern(
-    repo_root: Path, pattern: str, path: str | None, *, timeout_sec: int
-) -> int | None:
-    """Find the most-recent squash-merge PR that introduced ``pattern``.
+    repo_root: Path, pattern: str, paths: list[str], *, timeout_sec: int
+) -> tuple[int, datetime | None] | None:
+    """Find the most-recent squash-merge PR that changed ``pattern`` in ``paths``.
 
     Uses ``git log -S <pattern>`` (the "pickaxe" search) to find commits
-    where the count of occurrences of ``pattern`` changed. Optionally
-    constrains to a path. Returns the PR number parsed from the most
-    recent matching commit's subject line (the ``(#N)`` token), or None
-    when no candidate is found.
+    where the count of occurrences of ``pattern`` changed, constrained to
+    ``paths``. Returns ``(pr_number, commit_date)`` parsed from the most
+    recent matching commit (the subject's trailing ``(#N)`` token and the
+    committer date — for a squash-merge, the merge time), or None when no
+    candidate is found.
+
+    ``paths`` is REQUIRED and non-empty (#4666). There is deliberately no
+    unscoped fallback: on #4661 the scoped search found no PR-tagged
+    commit, and the unscoped fallback credited PR #4324, which never
+    touched the grep-matched file. A PR that didn't change the pattern in
+    the matched file is not evidence of anything.
 
     The pickaxe search is exact-string by default; we don't pass ``-G``
     (regex) because AC patterns are typically string literals (frozenset
     names, function names, magic strings).
     """
-    cmd = ["git", "log", "-S", pattern, "--oneline", "--max-count=10"]
-    if path:
-        cmd.extend(["--", path])
+    if not paths:
+        return None
+    cmd = [
+        "git",
+        "log",
+        "-S",
+        pattern,
+        "--format=%cI%x09%s",
+        "--max-count=10",
+        "--",
+        *paths,
+    ]
     proc = _run(cmd, cwd=repo_root, timeout_sec=timeout_sec)
     if proc.returncode != 0:
         return None
-    # Each line is ``<sha> <subject>``. Walk in newest-first order (git
-    # log default) and return the FIRST line whose subject ends in
-    # ``(#N)`` — that's the squash-merge PR.
+    # Each line is ``<committer-date>\t<subject>``. Walk in newest-first
+    # order (git log default) and return the FIRST line whose subject
+    # ends in ``(#N)`` — that's the squash-merge PR.
     for line in proc.stdout.splitlines():
+        date_str, _, subject = line.partition("\t")
         # Match the LAST ``(#N)`` token on the subject — handles both
         # the conventional ``feat(x): foo (#1234)`` and the chained
         # ``fix(ci): squash (#2837) (#3170)`` shape (#4214 lesson —
         # always pick the trailing token, never the first).
-        m = re.search(r"\(#(\d+)\)\s*$", line)
+        m = re.search(r"\(#(\d+)\)\s*$", subject)
         if m:
-            return int(m.group(1))
+            return (int(m.group(1)), _parse_iso8601(date_str))
     return None
 
 
+def _merged_after_issue(
+    commit_date: datetime | None, issue_created_at: datetime | None
+) -> bool:
+    """Date-ordering guard (#4666): the PR must post-date the issue.
+
+    A PR merged before the issue was filed cannot have fixed it — the
+    grep/test target already existed when the issue was written, i.e. it
+    describes the pre-fix state. Unknown dates on either side are
+    ambiguous and default to False ("not shipped").
+    """
+    if commit_date is None or issue_created_at is None:
+        return False
+    return commit_date >= issue_created_at
+
+
 def _probe_grep(
-    argv: list[str], *, repo_root: Path, timeout_sec: int
+    argv: list[str],
+    *,
+    repo_root: Path,
+    timeout_sec: int,
+    issue_created_at: datetime | None,
 ) -> tuple[int, str] | None:
     """Run a grep clause against ``repo_root`` and resolve the PR on match.
 
-    Returns (pr_number, canonical_clause) on hit, None on miss.
+    Returns (pr_number, canonical_clause) on hit, None on miss. The
+    resolved PR must have changed the pattern in a grep-matched file AND
+    have merged after the issue was filed (#4666).
     """
     pattern = _extract_grep_pattern(argv)
     if not pattern:
@@ -383,27 +521,18 @@ def _probe_grep(
     proc = _run(grep_cmd, cwd=repo_root, timeout_sec=timeout_sec)
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
-    # Found at least one match — resolve the introducing PR. Prefer the
-    # first matching path as the PR-resolution scope (constrains the
-    # pickaxe search to the relevant subtree). When multiple paths match,
-    # pick the first one's parent directory as the scope.
-    first_match_line = proc.stdout.strip().splitlines()[0]
-    # ``grep -ln`` output: ``<path>:<linenum>:<text>`` — but ``-l`` mode
-    # emits just ``<path>``. Combined with -n, the format is the full
-    # ``<path>:<line>:<match>``. Take the path portion (everything before
-    # the first colon) as the scope hint.
-    scope_path = (
-        first_match_line.split(":", 1)[0]
-        if ":" in first_match_line
-        else first_match_line
+    # Found at least one match — resolve the introducing PR, scoped to
+    # the matched files only (``-l`` mode emits one path per line). No
+    # unscoped fallback (#4666): a PR that never changed the pattern in a
+    # matched file cannot be the one that shipped it.
+    matched_files = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    resolved = _resolve_pr_for_pattern(
+        repo_root, pattern, matched_files, timeout_sec=timeout_sec
     )
-    pr = _resolve_pr_for_pattern(
-        repo_root, pattern, scope_path, timeout_sec=timeout_sec
-    )
-    if pr is None:
-        # Fallback: pickaxe search without path constraint.
-        pr = _resolve_pr_for_pattern(repo_root, pattern, None, timeout_sec=timeout_sec)
-    if pr is None:
+    if resolved is None:
+        return None
+    pr, commit_date = resolved
+    if not _merged_after_issue(commit_date, issue_created_at):
         return None
     canonical = f"grep {shlex.quote(pattern)} " + " ".join(
         shlex.quote(p) for p in paths
@@ -412,7 +541,11 @@ def _probe_grep(
 
 
 def _probe_pytest(
-    argv: list[str], *, repo_root: Path, timeout_sec: int
+    argv: list[str],
+    *,
+    repo_root: Path,
+    timeout_sec: int,
+    issue_created_at: datetime | None,
 ) -> tuple[int, str] | None:
     """Run a pytest clause in --collect-only mode against ``repo_root``.
 
@@ -448,13 +581,16 @@ def _probe_pytest(
     ]
     if not test_lines:
         return None
-    # Resolve the PR via pickaxe search on the test name. Constrain to
-    # the first collected test's file for tighter PR resolution.
-    test_path = test_lines[0].split("::", 1)[0]
-    pr = _resolve_pr_for_pattern(repo_root, expr, test_path, timeout_sec=timeout_sec)
-    if pr is None:
-        pr = _resolve_pr_for_pattern(repo_root, expr, None, timeout_sec=timeout_sec)
-    if pr is None:
+    # Resolve the PR via pickaxe search on the test name, scoped to the
+    # collected tests' files (no unscoped fallback — #4666).
+    test_paths = sorted({line.split("::", 1)[0] for line in test_lines})
+    resolved = _resolve_pr_for_pattern(
+        repo_root, expr, test_paths, timeout_sec=timeout_sec
+    )
+    if resolved is None:
+        return None
+    pr, commit_date = resolved
+    if not _merged_after_issue(commit_date, issue_created_at):
         return None
     canonical = f"pytest --collect-only -q -k {shlex.quote(expr)}"
     return (pr, canonical)
@@ -463,24 +599,58 @@ def _probe_pytest(
 # ─── Main entrypoint ───────────────────────────────────────────────────────
 
 
-def probe(body: str, *, repo_root: Path, timeout_sec: int) -> tuple[int, str] | None:
+def probe(
+    body: str,
+    *,
+    repo_root: Path,
+    timeout_sec: int,
+    issue_created_at: str | None,
+) -> tuple[int, str] | None:
     """Run all Verify clauses in ``body`` against the worktree.
 
     Returns the FIRST hit as (pr_number, canonical_clause), or None when
     no clause matches. Clauses are evaluated in source order so the AC
     author's first verify line takes precedence — that's typically the
     most direct expression of "what the AC actually pins."
+
+    Fail-safe (#4666): a hit only proves the grep/test target exists,
+    which is also true of the unfixed code. So the probe returns None
+    (→ "not shipped") unless there is evidence of the fix:
+      - the issue's ``createdAt`` is known and the resolved PR merged
+        after it (a PR that predates the issue cannot have fixed it);
+      - the PR changed the pattern in a matched file (no unscoped
+        pickaxe fallback);
+      - grep clauses assert only existence (qualitative / negative AC
+        prose like "sourced from X, not Y" can't be confirmed by a hit);
+      - pytest clauses carry no negative prose.
     """
-    for clause in _extract_verify_clauses(body):
+    created_at = _parse_iso8601(issue_created_at)
+    if created_at is None:
+        return None
+    for clause, prose in _extract_verify_entries(body):
         cls = _classify_clause(clause)
         if cls is None:
             continue
         shape, argv = cls
         result: tuple[int, str] | None = None
         if shape == "grep":
-            result = _probe_grep(argv, repo_root=repo_root, timeout_sec=timeout_sec)
+            if not _prose_is_bare_existence(prose):
+                continue
+            result = _probe_grep(
+                argv,
+                repo_root=repo_root,
+                timeout_sec=timeout_sec,
+                issue_created_at=created_at,
+            )
         elif shape == "pytest":
-            result = _probe_pytest(argv, repo_root=repo_root, timeout_sec=timeout_sec)
+            if _prose_is_negative(prose):
+                continue
+            result = _probe_pytest(
+                argv,
+                repo_root=repo_root,
+                timeout_sec=timeout_sec,
+                issue_created_at=created_at,
+            )
         if result is not None:
             return result
     return None
@@ -522,7 +692,13 @@ def main() -> int:
     except ValueError:
         timeout_sec = 30
     repo_root = _resolve_repo_root()
-    hit = probe(body, repo_root=repo_root, timeout_sec=timeout_sec)
+    created_at = data.get("createdAt")
+    hit = probe(
+        body,
+        repo_root=repo_root,
+        timeout_sec=timeout_sec,
+        issue_created_at=created_at if isinstance(created_at, str) else None,
+    )
     if hit is None:
         return 1
     pr, clause = hit
