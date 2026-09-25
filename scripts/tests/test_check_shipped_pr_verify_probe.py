@@ -35,6 +35,7 @@ a package).
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -336,14 +337,39 @@ def _git_init_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _git_commit(repo: Path, *, message: str, files: dict[str, str]) -> None:
-    """Write ``files`` and commit them with ``message``."""
+def _git_commit(
+    repo: Path,
+    *,
+    message: str,
+    files: dict[str, str],
+    date: str | None = None,
+) -> None:
+    """Write ``files`` and commit them with ``message``.
+
+    ``date`` (ISO-8601) pins both author and committer date so tests can
+    place a commit before or after an issue's ``createdAt`` (#4666).
+    """
     for rel_path, content in files.items():
         full = repo / rel_path
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
         subprocess.run(["git", "add", rel_path], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", message], cwd=repo, check=True)
+    env = None
+    if date is not None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_DATE": date,
+            "GIT_COMMITTER_DATE": date,
+        }
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", message], cwd=repo, check=True, env=env
+    )
+
+
+# An issue createdAt comfortably before any "now"-dated fixture commit, so
+# the date-ordering guard (#4666) accepts fixture commits made without an
+# explicit ``date``.
+EARLY_CREATED_AT = "2020-01-01T00:00:00Z"
 
 
 def test_probe_grep_clause_e2e(probe_module, tmp_path):
@@ -369,7 +395,9 @@ def test_probe_grep_clause_e2e(probe_module, tmp_path):
         '  **Verify:** `grep "ALLOWED_CLAUDE_FLAGS" scripts/dispatcher/tests/`'
         " returns a match.\n"
     )
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is not None
     pr_num, clause = hit
     assert pr_num == 3215
@@ -385,7 +413,9 @@ def test_probe_grep_clause_no_match_returns_none(probe_module, tmp_path):
         files={"scripts/foo.sh": "echo hello\n"},
     )
     body = "  Verify: grep ABSENT_TOKEN scripts/foo.sh\n"
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is None
 
 
@@ -410,7 +440,9 @@ def test_probe_pytest_clause_e2e(probe_module, tmp_path):
         "- [ ] Test exists.\n"
         "  Verify: pytest -k test_phase_constants_cover_all_declared_phases\n"
     )
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=30)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=30, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is not None
     pr_num, clause = hit
     assert pr_num == 3253
@@ -429,7 +461,9 @@ def test_probe_pytest_clause_no_match_returns_none(probe_module, tmp_path):
         },
     )
     body = "  Verify: pytest -k test_absent_test_name_definitely_not_present\n"
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is None
 
 
@@ -457,7 +491,9 @@ def test_probe_script_clause_drops_silently(probe_module, tmp_path):
         files={"scripts/foo-helper.sh": "#!/usr/bin/env bash\necho hi\n"},
     )
     body = "  Verify: ./scripts/foo-helper.sh exits 0\n"
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is None
 
 
@@ -478,7 +514,9 @@ def test_probe_first_clause_wins(probe_module, tmp_path):
         "- [ ] B.\n"
         "  Verify: grep SECOND_TOKEN_HERE scripts/b.sh\n"
     )
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is not None
     pr_num, clause = hit
     # Either clause would resolve to PR #100 (single commit), so we
@@ -508,14 +546,18 @@ def test_probe_unsupported_clause_silently_skipped(probe_module, tmp_path):
         "- [ ] C.\n"
         "  Verify: reviewer confirms on read-through\n"
     )
-    hit = probe_module.probe(body, repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is None
 
 
 def test_probe_empty_body_returns_none(probe_module, tmp_path):
     """Empty body → no clauses → no match."""
     repo = _git_init_repo(tmp_path)
-    hit = probe_module.probe("", repo_root=repo, timeout_sec=15)
+    hit = probe_module.probe(
+        "", repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
     assert hit is None
 
 
@@ -535,7 +577,7 @@ def test_main_emits_shipped_line_on_match(probe_module, tmp_path, monkeypatch, c
 
     issue_json = (
         '{"body": "- [ ] Foo.\\n  Verify: grep WIDGET_TOKEN scripts/helper.sh\\n", '
-        '"title": "feat: foo"}'
+        '"title": "feat: foo", "createdAt": "2020-01-01T00:00:00Z"}'
     )
     monkeypatch.setattr(
         sys,
@@ -591,3 +633,263 @@ def test_main_returns_1_on_empty_body(probe_module, monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO('{"body": "", "title": "x"}'))
     rc = probe_module.main()
     assert rc == 1
+
+
+# ─── Fail-safe guards (#4666) ─────────────────────────────────────────────
+#
+# Regression for #4666: on issue #4661 (an open p1 data-loss bug) the probe
+# reported ``shipped: PR #4324`` because the AC's grep
+# (``grep -n "capture_timestamp" scripts/rebuild_db.py``) matched the BUGGY
+# line itself, and the unscoped pickaxe fallback then attributed the hit to
+# an unrelated earlier PR that never touched rebuild_db.py. A grep hit alone
+# cannot tell "the grep target exists" from "the fix exists", so the probe
+# must require evidence of the fix and default to "not shipped".
+
+# The literal #4661 body (trimmed to the load-bearing sections). The AC's
+# Verify prose is a qualitative/negative assertion ("sourced from ..., not
+# `datetime.now`") that a bare grep hit cannot confirm.
+ISSUE_4661_BODY = (
+    "## Summary\n\n"
+    "`scripts/rebuild_db.py` stamps every rebuilt document with "
+    "`capture_timestamp = datetime.now(UTC)` (`scripts/rebuild_db.py:310`) "
+    "instead of the document's original capture time.\n\n"
+    "## Acceptance criteria\n\n"
+    "1. `rebuild_db.py` no longer sets `capture_timestamp` to `now()`.\n"
+    '   - Verify: `grep -n "capture_timestamp" scripts/rebuild_db.py` shows it '
+    "sourced from S3/capture metadata, not `datetime.now`.\n"
+    "2. Regression test covers a document older than 180 days surviving a "
+    "rebuild.\n"
+    "   - Verify: the new test fails on the pre-fix code and passes after.\n"
+)
+ISSUE_4661_CREATED_AT = "2026-09-24T21:57:13Z"
+
+# Pre-fix rebuild_db.py content: the buggy line is what the grep matches.
+BUGGY_REBUILD_DB = (
+    "from datetime import UTC, datetime\n\n"
+    "def build_event(key):\n"
+    '    return {"key": key, "capture_timestamp": datetime.now(UTC).isoformat()}\n'
+)
+
+
+def _build_4661_fixture(tmp_path: Path) -> Path:
+    """Reproduce the #4661 / #4324 repo state.
+
+    - rebuild_db.py (with the buggy ``capture_timestamp`` line) was added by
+      a commit with NO ``(#N)`` squash-merge token, so the path-scoped
+      pickaxe finds no PR.
+    - PR #4324 (merged months before #4661 was filed) touched a DIFFERENT
+      file that also mentions ``capture_timestamp`` — the unscoped pickaxe
+      fallback picked it up and attributed the issue to it.
+    """
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="feat(schema): regenerate schema.sql, add rebuild",
+        files={"scripts/rebuild_db.py": BUGGY_REBUILD_DB},
+        date="2026-03-28T16:38:52-07:00",
+    )
+    _git_commit(
+        repo,
+        message="fix(ingestion): unrelated capture_timestamp plumbing (#4324)",
+        files={
+            "packages/scraper-framework/src/ingestion/other.py": (
+                "capture_timestamp = None\n"
+            )
+        },
+        date="2026-05-09T12:00:00-07:00",
+    )
+    return repo
+
+
+def test_4661_shape_does_not_report_shipped(probe_module, tmp_path):
+    """#4661 body + #4324 fixture → probe must miss (AC1 of #4666)."""
+    repo = _build_4661_fixture(tmp_path)
+    hit = probe_module.probe(
+        ISSUE_4661_BODY,
+        repo_root=repo,
+        timeout_sec=15,
+        issue_created_at=ISSUE_4661_CREATED_AT,
+    )
+    assert hit is None
+
+
+def test_4661_main_exits_1(probe_module, tmp_path, monkeypatch, capsys):
+    """The CLI on the #4661 shape exits 1 with empty stdout."""
+    import io
+    import json
+
+    repo = _build_4661_fixture(tmp_path)
+    monkeypatch.setenv("CHECK_SHIPPED_VERIFY_REPO_ROOT", str(repo))
+    monkeypatch.setenv("CHECK_SHIPPED_VERIFY_TIMEOUT_SEC", "15")
+    issue_json = json.dumps(
+        {
+            "body": ISSUE_4661_BODY,
+            "title": "fix(ingestion): rebuild_db.py stamps capture_timestamp=now",
+            "createdAt": ISSUE_4661_CREATED_AT,
+        }
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(issue_json))
+    assert probe_module.main() == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_pr_resolution_is_scoped_to_matched_files(probe_module, tmp_path):
+    """No unscoped pickaxe fallback: a PR that never touched the grep-matched
+    file cannot be credited with it, even with a bare-existence Verify line
+    and a post-issue merge date."""
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="initial import without PR token",
+        files={"scripts/target.py": "WIDGET_TOKEN = 1\n"},
+    )
+    _git_commit(
+        repo,
+        message="unrelated (#777)",
+        files={"scripts/elsewhere.py": "WIDGET_TOKEN = 2\n"},
+    )
+    body = "  Verify: `grep WIDGET_TOKEN scripts/target.py` returns a match\n"
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
+    assert hit is None
+
+
+def test_pr_merged_before_issue_created_does_not_match(probe_module, tmp_path):
+    """Date-ordering guard: the introducing PR predates the issue → miss.
+
+    A PR merged before the issue existed cannot have fixed it — the grep
+    target was already present when the issue was filed (i.e. the grep
+    matches the pre-fix state).
+    """
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="add widget (#100)",
+        files={"scripts/widget.py": "WIDGET_TOKEN = 1\n"},
+        date="2026-01-01T00:00:00Z",
+    )
+    body = "  Verify: `grep WIDGET_TOKEN scripts/widget.py` returns a match\n"
+    hit = probe_module.probe(
+        body,
+        repo_root=repo,
+        timeout_sec=15,
+        issue_created_at="2026-02-01T00:00:00Z",
+    )
+    assert hit is None
+
+
+def test_pr_merged_after_issue_created_matches(probe_module, tmp_path):
+    """Sanity: a post-issue PR with a bare-existence Verify line still fires."""
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="add widget (#200)",
+        files={"scripts/widget.py": "WIDGET_TOKEN = 1\n"},
+        date="2026-03-01T00:00:00Z",
+    )
+    body = "  Verify: `grep WIDGET_TOKEN scripts/widget.py` returns a match\n"
+    hit = probe_module.probe(
+        body,
+        repo_root=repo,
+        timeout_sec=15,
+        issue_created_at="2026-02-01T00:00:00Z",
+    )
+    assert hit is not None
+    assert hit[0] == 200
+
+
+def test_missing_created_at_defaults_to_not_shipped(probe_module, tmp_path):
+    """No issue createdAt → the date guard can't be applied → miss (fail safe)."""
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="add widget (#200)",
+        files={"scripts/widget.py": "WIDGET_TOKEN = 1\n"},
+    )
+    body = "  Verify: `grep WIDGET_TOKEN scripts/widget.py` returns a match\n"
+    for created_at in (None, "", "not-a-date"):
+        hit = probe_module.probe(
+            body, repo_root=repo, timeout_sec=15, issue_created_at=created_at
+        )
+        assert hit is None
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "shows it sourced from S3/capture metadata, not `datetime.now`.",
+        "returns no matches",
+        "no longer matches",
+        "returns nothing",
+        "shows the new helper is used instead of the old one",
+        "shows only the fixed call site",
+    ],
+)
+def test_grep_with_qualitative_or_negative_prose_is_skipped(
+    probe_module, tmp_path, prose
+):
+    """A grep whose AC prose asserts more than "a match exists" is skipped.
+
+    A bare hit cannot distinguish the fixed state from the bug for
+    negative ("not X", "no matches") or qualitative ("shows it sourced
+    from ...") assertions — even when the PR post-dates the issue.
+    """
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="add widget (#200)",
+        files={"scripts/widget.py": "WIDGET_TOKEN = 1\n"},
+    )
+    body = f"  Verify: `grep WIDGET_TOKEN scripts/widget.py` {prose}\n"
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=15, issue_created_at=EARLY_CREATED_AT
+    )
+    assert hit is None
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "",
+        "returns a match.",
+        "returns a match",
+        "returns at least one match",
+        "has a hit",
+        "matches",
+        "finds it",
+        "is non-empty",
+        "exits 0",
+    ],
+)
+def test_prose_is_bare_existence_accepts(probe_module, prose):
+    """Bare-existence phrasings are the only ones a grep hit can confirm."""
+    assert probe_module._prose_is_bare_existence(prose)
+
+
+def test_pytest_with_negative_prose_is_skipped(probe_module, tmp_path):
+    """``pytest -k X`` whose prose says it must NOT collect is skipped."""
+    repo = _git_init_repo(tmp_path)
+    _git_commit(
+        repo,
+        message="test: add legacy test (#300)",
+        files={"tests/test_legacy.py": "def test_legacy_path():\n    assert True\n"},
+    )
+    body = "  Verify: `pytest -k test_legacy_path` no longer collects anything\n"
+    hit = probe_module.probe(
+        body, repo_root=repo, timeout_sec=30, issue_created_at=EARLY_CREATED_AT
+    )
+    assert hit is None
+
+
+def test_extract_verify_entries_keeps_prose(probe_module):
+    """The entry extractor returns (command, trailing prose) pairs."""
+    body = (
+        '  - Verify: `grep -n "capture_timestamp" scripts/rebuild_db.py` shows it '
+        "sourced from S3, not `datetime.now`.\n"
+        "  Verify: grep foo bar/\n"
+    )
+    entries = probe_module._extract_verify_entries(body)
+    assert entries[0][0] == 'grep -n "capture_timestamp" scripts/rebuild_db.py'
+    assert "not `datetime.now`" in entries[0][1]
+    assert entries[1] == ("grep foo bar/", "")

@@ -19,12 +19,15 @@
 #   2. **Verify-clause content probe (#4472).** Before falling through to
 #      the path-overlap channel, run the AC's literal Verify: clauses
 #      against the worktree via _check_shipped_pr_verify_probe.py. The
-#      probe supports three shapes — `grep <pattern> <path>` (read-only,
-#      executed verbatim), `pytest -k <test>` (rewritten to
-#      --collect-only for safety), and `./scripts/<probe>.sh` (NOT
-#      executed; checks file existence + git log). On match, the probe
-#      resolves the introducing PR via `git log -S` and emits a
-#      `shipped:` line, short-circuiting the path-overlap pipeline.
+#      probe supports two shapes — `grep <pattern> <path>` (read-only,
+#      executed verbatim) and `pytest -k <test>` (rewritten to
+#      --collect-only for safety). On match, the probe resolves the
+#      introducing PR via `git log -S` scoped to the matched files and
+#      emits a `shipped:` line, short-circuiting the path-overlap
+#      pipeline. The probe fails safe (#4666): it only fires when the PR
+#      merged after the issue's createdAt, changed the pattern in a
+#      matched file, and the AC prose asserts bare existence — a grep hit
+#      alone can't tell the fixed state from the bug (#4661 ↔ #4324).
 #      This catches the canonical pre-#3994 zombie shape where the AC
 #      pins a content invariant (frozenset name, magic string, test
 #      name) and the actual PR uses a different filename than the

@@ -1596,6 +1596,82 @@ fi
 export CHECK_SHIPPED_VERIFY_DISABLE=1
 export CHECK_SHIPPED_LINEAGE_DISABLE=1
 
+# ─── Test 35: #4661 ↔ PR #4324 Verify-clause false positive → exit 1 (#4666) ─
+#
+# Regression for #4666. Issue #4661 (an OPEN p1 data-loss bug) carried
+#   Verify: `grep -n "capture_timestamp" scripts/rebuild_db.py` shows it
+#           sourced from S3/capture metadata, not `datetime.now`.
+# Pre-fix, the verify-channel ran the grep, got a hit on the BUGGY line
+# itself (`"capture_timestamp": datetime.now(UTC).isoformat()`), found no
+# `(#N)` commit when pickaxe-scoped to rebuild_db.py, then fell back to an
+# UNSCOPED pickaxe and credited PR #4324 — which merged months before the
+# issue was filed and never touched rebuild_db.py. Output was:
+#   shipped: PR #4324 matches issue #4661 via Verify-clause probe ... (exit 0)
+# Post-fix the probe requires evidence of the fix (bare-existence prose,
+# PR scoped to the grep-matched file, PR merged after the issue) and
+# defaults to not-shipped.
+#
+# The verify-channel runs against a fixture git repo reproducing the
+# pre-fix state (CHECK_SHIPPED_VERIFY_REPO_ROOT), not the live worktree —
+# main has since shipped the real #4661 fix (#4664).
+unset CHECK_SHIPPED_VERIFY_DISABLE
+FIXTURE_4661=$(mktemp -d)
+register_temp_dir "$FIXTURE_4661"
+git -C "$FIXTURE_4661" init --quiet --initial-branch=main .
+git -C "$FIXTURE_4661" config user.email test@example.com
+git -C "$FIXTURE_4661" config user.name "Test Author"
+git -C "$FIXTURE_4661" config commit.gpgsign false
+mkdir -p "$FIXTURE_4661/scripts" "$FIXTURE_4661/packages/ingestion"
+printf '%s\n' 'from datetime import UTC, datetime' '' 'def build_event(key):' \
+    '    return {"key": key, "capture_timestamp": datetime.now(UTC).isoformat()}' \
+    > "$FIXTURE_4661/scripts/rebuild_db.py"
+git -C "$FIXTURE_4661" add scripts/rebuild_db.py
+GIT_AUTHOR_DATE=2026-03-28T16:38:52-07:00 GIT_COMMITTER_DATE=2026-03-28T16:38:52-07:00 \
+    git -C "$FIXTURE_4661" commit --quiet -m "feat(schema): regenerate schema.sql, add rebuild"
+printf '%s\n' 'capture_timestamp = None' > "$FIXTURE_4661/packages/ingestion/other.py"
+git -C "$FIXTURE_4661" add packages/ingestion/other.py
+GIT_AUTHOR_DATE=2026-05-09T12:00:00-07:00 GIT_COMMITTER_DATE=2026-05-09T12:00:00-07:00 \
+    git -C "$FIXTURE_4661" commit --quiet -m "fix(ingestion): unrelated capture_timestamp plumbing (#4324)"
+
+cat > "$MOCK_GH" << 'MOCKGH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    issue)
+        if [[ "${2:-}" == "view" ]]; then
+            # Issue #4661 body — trimmed to the summary + AC sections.
+            cat << 'JSON'
+{"body": "## Summary\n\n`scripts/rebuild_db.py` stamps every rebuilt document with `capture_timestamp = datetime.now(UTC)` (`scripts/rebuild_db.py:310`) instead of the document's original capture time.\n\n## Acceptance criteria\n\n1. `rebuild_db.py` no longer sets `capture_timestamp` to `now()`.\n   - Verify: `grep -n \"capture_timestamp\" scripts/rebuild_db.py` shows it sourced from S3/capture metadata, not `datetime.now`.\n2. Regression test covers a document older than 180 days surviving a rebuild.\n   - Verify: the new test fails on the pre-fix code and passes after.\n", "title": "fix(ingestion): rebuild_db.py stamps capture_timestamp=now, silently dropping rulings >180 days old", "createdAt": "2026-09-24T21:57:13Z"}
+JSON
+            exit 0
+        fi
+        ;;
+    api)
+        echo "fix(ingestion): unrelated capture_timestamp plumbing (#4324)"
+        exit 0
+        ;;
+    pr)
+        if [[ "${2:-}" == "view" ]]; then
+            cat << 'JSON'
+{"baseRefName": "main", "body": "", "files": [{"path": "packages/ingestion/other.py", "additions": 1, "deletions": 1, "changeType": "MODIFIED"}], "mergedAt": "2026-05-09T19:00:00Z", "number": 4324, "title": "fix(ingestion): unrelated capture_timestamp plumbing"}
+JSON
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+MOCKGH
+chmod +x "$MOCK_GH"
+
+exit_code=0
+output=$(CHECK_SHIPPED_VERIFY_REPO_ROOT="$FIXTURE_4661" "$WRAPPER" 4661 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"not-shipped:"* && "$output" != *"4324"* ]]; then
+    pass "#4661 ↔ PR #4324 Verify-clause false positive reports not-shipped (regression #4666)"
+else
+    fail "#4661 ↔ PR #4324 Verify-clause false positive reports not-shipped (regression #4666)" "exit=$exit_code output=$output"
+fi
+
+export CHECK_SHIPPED_VERIFY_DISABLE=1
+
 # Restore PATH for cleanup
 export PATH="$ORIG_PATH_SAVE"
 
