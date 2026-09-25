@@ -2215,6 +2215,132 @@ def _drop_role_literal_orphan_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: re-attach fused-tail case numbers (#4714)
+# ---------------------------------------------------------------------------
+#
+# OC PDFs print the case number in the left column, usually BELOW the case
+# caption ("4  Gelt Oasis Exchange, LLC vs. Monroe / 30-2026-01542409-CL-UD").
+# The LLM often returns a case_info with a second "v." caption after that
+# number: a repeat of the row's own caption, a case cited in the ruling body,
+# or a role-literal placeholder.  ``_split_fused_case_info`` (#2500) assumes
+# a case number between two captions belongs to the SECOND caption, so it
+# emits:
+#
+#   [i]   entry=4,    case_number=None,            ruling_text=<the ruling>
+#   [i+1] entry=None, case_number="2026-01542409", ruling_text=None
+#
+# Row i is then stored under an ``UNKNOWN-<id>`` case, and row i+1 is dropped
+# by the worker's ``ruling_text_not_empty`` rule on every run (the
+# ``data_quality.ruling_empty_text_dropped`` noise in #4714).  This helper
+# copies the case number back to row i.  It runs on the shared PDF filter tail,
+# so cached extractions are corrected without re-calling the LLM.
+
+# OC case numbers carry a "30-" court prefix that the case-number regex does
+# not capture, so the caption before the split keeps a dangling " 30"
+# ("Gelt Oasis Exchange, LLC vs. Monroe 30").
+_TRAILING_OC_COURT_PREFIX_RE = re.compile(r"\s+30-?\s*$")
+
+
+def _is_fused_tail(ruling: ExtractedRuling) -> bool:
+    """True for a textless, entry-less row: the tail of a fused-row split."""
+    return ruling.entry_number is None and not (ruling.ruling_text or "").strip()
+
+
+def _case_number_cited_in_text(case_number: str, text: str) -> bool:
+    """True when the case number's sequence digits appear in ``text``.
+
+    Matches on the last hyphen-separated segment ("01542409" for
+    "2026-01542409"), so the number is found however the body writes it
+    ("30-2026-01542409-CL-UD-CJC", "2026-01542409", "Case No. 26-01542409").
+    """
+    sequence = case_number.rsplit("-", 1)[-1]
+    if len(sequence) < 5:
+        sequence = case_number
+    return sequence in text
+
+
+def _reattach_fused_tail_case_numbers(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Copy a fused-tail row's case number back to the ruling row before it (#4714).
+
+    For each ruling ``P`` that has ruling text but no case number, look at the
+    run of fused-tail rows that immediately follows it (no ``entry_number``, no
+    ruling text).  When exactly one distinct case number appears in that run,
+    and no other ruling with text already holds that number, the number is
+    copied to ``P``.
+
+    Rows are never dropped or edited apart from ``P``, so split document IDs
+    do not shift.  The tail row keeps its number.  Clearing it would let
+    ``_drop_role_literal_orphan_rulings`` drop the tail on the next cache-hit
+    pass, which would shift split IDs between the fresh run and later reads.
+    Tail rows have no text, and the worker skips them before dispatch.  Once
+    ``P`` has the number, a second pass changes nothing: the helper is
+    idempotent.
+
+    The helper does not re-attach when:
+
+    - ``P`` already has a case number.  The tail's number is then a sibling or
+      cited case (e.g. "the related action, case no. 2026-01573506").
+    - The run holds two or more distinct case numbers, as in a
+      consolidation ruling that cites both case numbers.  Guessing would risk
+      linking the ruling to the wrong case.
+    - The number already belongs to another ruling with text in the document.
+    - The number appears inside ``P``'s own ruling text.  The LLM then likely
+      took it from the body, where rulings cite related actions ("the
+      related action, Ama Investors v. Pro Motorcars, Case No.
+      2023-01322592").  In a 1,139-extraction dev cache sample, about half
+      of these cited numbers belonged to a different case.  Numbers taken
+      from the case-number column never appear in the transcribed body.
+    """
+    numbers_with_text = {
+        r.extracted_case_number
+        for r in rulings
+        if r.extracted_case_number and (r.ruling_text or "").strip()
+    }
+    result = list(rulings)
+    i = 0
+    while i < len(result):
+        parent = result[i]
+        j = i + 1
+        while j < len(result) and _is_fused_tail(result[j]):
+            j += 1
+        tail_indices = range(i + 1, j)
+        if tail_indices and not parent.extracted_case_number and (parent.ruling_text or "").strip():
+            tail_numbers = {
+                result[k].extracted_case_number
+                for k in tail_indices
+                if result[k].extracted_case_number
+            }
+            if len(tail_numbers) == 1:
+                case_number = next(iter(tail_numbers))
+                if _case_number_cited_in_text(case_number, parent.ruling_text or ""):
+                    logger.info(
+                        "llm_extractor.fused_tail_case_number_cited_in_body",
+                        case_number=case_number,
+                        entry_number=parent.entry_number,
+                        case_title=parent.extracted_case_title,
+                    )
+                elif case_number not in numbers_with_text:
+                    updates: dict[str, object] = {"extracted_case_number": case_number}
+                    title = parent.extracted_case_title
+                    if title and _TRAILING_OC_COURT_PREFIX_RE.search(title):
+                        updates["extracted_case_title"] = (
+                            _TRAILING_OC_COURT_PREFIX_RE.sub("", title) or title
+                        )
+                    result[i] = parent.model_copy(update=updates)
+                    numbers_with_text.add(case_number)
+                    logger.info(
+                        "llm_extractor.fused_tail_case_number_reattached",
+                        case_number=case_number,
+                        entry_number=parent.entry_number,
+                        case_title=result[i].extracted_case_title,
+                    )
+        i = j if j > i + 1 else i + 1
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cache-hit filter re-application (#2513)
 # ---------------------------------------------------------------------------
 #
@@ -2272,6 +2398,10 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
       every county; the stub-dropper IS county-agnostic and drops bare
       "No tentative ruling." stubs (< 200 chars, no cross_reference_source) on
       every county including Orange.
+    - ``_reattach_fused_tail_case_numbers`` (#4714): runs LAST, after every
+      row-dropping filter, so the rows it reads are the rows that ship.  It
+      only copies a case number onto a ruling row and never drops a row, so
+      split document IDs stay stable and a second pass is a no-op.
     """
     rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
@@ -2283,6 +2413,7 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
     rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
     rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
     rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+    rulings = _reattach_fused_tail_case_numbers(rulings)
     return rulings
 
 
