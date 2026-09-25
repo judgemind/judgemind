@@ -1572,6 +1572,127 @@ class IngestionWorker:
                 return None
         return self._multimodal_extractors.get(cache_key)
 
+    def _unwrap_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a CC portal JSON envelope into ruling text and fields (#4753).
+
+        The CC portal scraper archives a JSON envelope (listing row, detail
+        HTML, and the linked PDF when there is one) as ``text`` content.  Two
+        kinds of event need the envelope unwrapped here:
+
+        * **Live PDF-only capture.**  The detail page has only a PDF link, so
+          the event has empty ``ruling_text`` and ``extra[RULING_TEXT_IN_PDF]``.
+          The envelope is read back from S3 and its PDF transcribed.
+        * **rebuild_db / prefix-mode reingest.**  The event's ``ruling_text``
+          is the raw envelope JSON.  The scraper's fields fill whatever the
+          event lacks, and the ruling text becomes the inline detail text or
+          the transcribed PDF, never the JSON.
+
+        The PDF is the whole department calendar, so only this case's
+        item(s) are kept (``transcribe_envelope_pdf``).  The PDF bytes are not
+        passed on as ``raw_pdf_bytes``: that would send the whole calendar to
+        the multimodal splitter and store every other case's ruling here.
+
+        Returns ``event_data`` unchanged (the same object) for every other
+        event, and when unwrapping raises (malformed envelope), so the event
+        still goes through the normal path instead of being dropped.
+        """
+        try:
+            return self._resolve_cc_portal_envelope(event_data)
+        except Exception as exc:
+            logger.warning(
+                "CC portal envelope unwrap failed — processing the event as-is",
+                extra={
+                    "document_id": event_data.get("document_id"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "telemetry_event": "cc_portal_envelope_unwrap_failed",
+                },
+            )
+            return event_data
+
+    def _resolve_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
+        """Body of :meth:`_unwrap_cc_portal_envelope` (which adds the error guard)."""
+        if event_data.get("content_format") not in ("text", "txt"):
+            return event_data
+        if event_data.get("_split_processed") or event_data.get("_llm_extracted"):
+            return event_data
+
+        from courts.ca import cc_tentatives_portal as portal
+
+        document_id = event_data.get("document_id", "")
+        ruling_text = event_data.get("ruling_text")
+        updates: dict[str, Any] = {}
+
+        envelope = portal.load_envelope(ruling_text) if ruling_text else None
+        if envelope is not None:
+            # rebuild / prefix reingest: the event text IS the envelope.
+            fields = portal.envelope_fields(envelope)
+            updates = {
+                name: value
+                for name, value in fields.items()
+                if name != "ruling_text" and value and not event_data.get(name)
+            }
+            updates["ruling_text"] = fields.get("ruling_text") or ""
+        else:
+            extra = event_data.get("extra")
+            if ruling_text or not (
+                isinstance(extra, dict) and extra.get(portal.RULING_TEXT_IN_PDF)
+            ):
+                return event_data
+            raw = self._fetch_archived_bytes(
+                event_data.get("s3_key"), event_data.get("s3_bucket"), document_id
+            )
+            envelope = portal.load_envelope(raw)
+            if envelope is None:
+                logger.warning(
+                    "CC portal envelope could not be read — PDF-only ruling left untranscribed",
+                    extra={
+                        "document_id": document_id,
+                        "s3_key": event_data.get("s3_key"),
+                        "telemetry_event": "cc_portal_envelope_unreadable",
+                    },
+                )
+                return event_data
+
+        result = portal.transcribe_envelope_pdf(envelope, extract_text_from_pdf)
+        if result.text:
+            updates["ruling_text"] = result.text
+        if result.outcome not in ("no_pdf", "inline_ruling"):
+            log = logger.info if result.text else logger.warning
+            log(
+                "CC portal envelope PDF transcription: %s",
+                result.outcome,
+                extra={
+                    "document_id": document_id,
+                    "case_number": (envelope.get("row") or {}).get("case_number"),
+                    "outcome": result.outcome,
+                    "ruling_text_length": len(result.text or ""),
+                    "telemetry_event": "cc_portal_envelope_pdf_transcription",
+                },
+            )
+        if not updates:
+            return event_data
+        return {**event_data, **updates}
+
+    def _fetch_archived_bytes(
+        self,
+        s3_key: str | None,
+        s3_bucket: str | None,
+        document_id: str,
+    ) -> bytes | None:
+        """Read an archived raw document from S3; None when missing or on error."""
+        if not s3_key:
+            return None
+        bucket = s3_bucket or self._archive_bucket
+        try:
+            response = self._s3_client.get_object(Bucket=bucket, Key=s3_key)
+            return response["Body"].read()
+        except Exception as exc:
+            logger.warning(
+                "Failed to read archived document from S3",
+                extra={"document_id": document_id, "s3_key": s3_key, "error": str(exc)},
+            )
+            return None
+
     def _fetch_raw_pdf_from_s3(
         self,
         s3_key: str | None,
@@ -2276,6 +2397,12 @@ class IngestionWorker:
         ``return`` from this method counts as an exit and triggers the
         outer wrapper's ``timing.emit()`` exactly once.
         """
+        # CC portal JSON envelopes (#4753): transcribe a PDF-only ruling and
+        # unwrap an envelope carried as the event text (rebuild / prefix
+        # reingest) before any field is read.
+        with timing.phase("parse_document_ms"):
+            event_data = self._unwrap_cc_portal_envelope(event_data)
+
         document_id: str = event_data["document_id"]
         state: str = event_data["state"]
         county: str = event_data["county"]

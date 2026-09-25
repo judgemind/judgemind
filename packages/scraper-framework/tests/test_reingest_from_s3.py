@@ -4386,6 +4386,56 @@ class TestReparsePdfDocuments:
         assert len(result["ruling_text"]) > 100
         assert "%PDF" not in result["ruling_text"]
 
+    def test_cc_portal_pdf_only_envelope_reparse_transcribes_case_section(self) -> None:
+        """A CC portal PDF-only envelope reingests with the case's PDF text (#4753).
+
+        parse_document leaves ruling_text empty (transcription is deferred),
+        so without the scraper's deferred_ruling_text hook the ruling text
+        would fall back to the raw JSON envelope.
+        """
+        import base64
+
+        portal_dir = os.path.join(self._FIXTURES_DIR, "cc_portal")
+        with open(os.path.join(portal_dir, "18_022825.pdf"), "rb") as f:
+            pdf_bytes = f.read()
+        with open(os.path.join(portal_dir, "detail_c22-01081_pdf_only.html"), "rb") as f:
+            detail_bytes = f.read()
+        envelope = {
+            "row": {
+                "slug": "c22-01081",
+                "detail_url": "https://contracosta.courts.ca.gov/tentative-ruling/c22-01081",
+                "case_number": "C22-01081",
+                "case_title": "WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND",
+                "case_type": "Civil",
+                "motion_type": "HEARING ON MOTION IN RE:  JUDGMENT ON THE PLEADINGS",
+                "hearing_date": "2025-03-10 21:21:20+00:00",
+            },
+            "detail_html_b64": base64.b64encode(detail_bytes).decode("ascii"),
+            "pdf_url": "https://contracosta.courts.ca.gov/system/files/general/18_022825.pdf",
+            "pdf_bytes_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+            "judge_id": "276",
+            "judge_name_dropdown": "DANIELLE K DOUGLAS",
+        }
+        raw = json.dumps(envelope).encode("utf-8")
+        doc_meta = self._make_pdf_doc_meta("ca-cc-tentatives-portal", "Contra Costa", "txt")
+
+        result = reingest._reparse_document(raw, "ca-cc-tentatives-portal", doc_meta)
+
+        text = result["ruling_text"]
+        assert text.startswith("1. 9:00 AM CASE NUMBER: C22-01081")
+        assert "Defendant’s MJOP is sustained without leave to amend." in text
+        assert "C22-01706" not in text
+        assert "detail_html_b64" not in text
+        assert result["case_number"] == "C22-01081"
+
+        # A case missing from the calendar PDF gets empty text, never the
+        # raw envelope JSON.
+        envelope["row"]["case_number"] = "C99-99999"
+        raw = json.dumps(envelope).encode("utf-8")
+        result = reingest._reparse_document(raw, "ca-cc-tentatives-portal", doc_meta)
+        assert "detail_html_b64" not in (result["ruling_text"] or "")
+        assert "pdf_bytes_b64" not in (result["ruling_text"] or "")
+
     def test_non_pdf_scraper_still_works(self) -> None:
         """LA (non-PDF) scraper still works with HTML content."""
         html = b"<html><body>Motion is GRANTED. Judge Smith presiding.</body></html>"

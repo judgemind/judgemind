@@ -22,6 +22,7 @@ Fixtures in tests/fixtures/cc_portal/:
 from __future__ import annotations
 
 import base64
+import functools
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ from courts.ca.cc_tentatives_portal import (
     BASE_URL,
     FORM_URL,
     LISTING_URL,
+    RULING_TEXT_IN_PDF,
     CCTentativesPortalScraper,
     _cc_dept_from_filename,
     _coerce_hearing_date,
@@ -43,6 +45,10 @@ from courts.ca.cc_tentatives_portal import (
     _parse_detail_page,
     _parse_judge_dropdown,
     _parse_listing_table,
+    envelope_fields,
+    load_envelope,
+    ruling_text_from_pdf_text,
+    transcribe_envelope_pdf,
 )
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
 from framework import ContentFormat, ScraperConfig
@@ -1352,3 +1358,311 @@ def test_run_succeeds_when_every_listing_is_genuinely_empty() -> None:
 
     assert health.success is True
     assert health.records_captured == 0
+
+
+# ---------------------------------------------------------------------------
+# PDF-only rulings: the ruling lives only in the linked PDF (#4753)
+# ---------------------------------------------------------------------------
+#
+# Fixtures (real portal capture, dev S3 key
+# ca/contra_costa/superior_court/raw/0d4d4e8d...e888e7.txt, document
+# 4c0d8d33-0f79-5bf6-be44-149a1d8137b9):
+#   18_022825.pdf                  — the Dept 18 calendar PDF for 02/28/2025,
+#                                    20 calendar items, C22-01081 is item 1
+#   detail_c22-01081_pdf_only.html — the detail page trimmed to its ruling
+#                                    markup: a PDF link and no inline text
+
+_PDF_ONLY_PDF_URL = f"{BASE_URL}/system/files/general/18_022825.pdf"
+
+_PDF_ONLY_LISTING = (
+    "<html><body><table><tbody><tr>"
+    '<td><time datetime="2025-03-10T21:21:20Z">Mon, 03/10/2025</time></td>'
+    '<td><a href="/tentative-ruling/c22-01081">C22-01081</a>'
+    "<p>WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND</p>"
+    "Civil<p>HEARING ON MOTION IN RE:  JUDGMENT ON THE PLEADINGS</p></td>"
+    "</tr></tbody></table></body></html>"
+)
+
+_DOUGLAS_ONLY_FORM = (
+    '<html><body><form><select name="field_judge_target_id">'
+    '<option value="All">- Any -</option>'
+    '<option value="276">DANIELLE K DOUGLAS</option>'
+    "</select></form></body></html>"
+)
+
+
+@functools.cache
+def _pdf_only_pdf_text() -> str:
+    """pdfplumber text of the 28-page fixture, extracted once per session."""
+    from ingestion.llm_extract import extract_text_from_pdf
+
+    text = extract_text_from_pdf(_load_bytes("18_022825.pdf"))
+    assert text
+    return text
+
+
+def _pdf_only_envelope() -> dict:
+    return json.loads(
+        _build_envelope_bytes(
+            detail_html=_load_bytes("detail_c22-01081_pdf_only.html"),
+            pdf_bytes=_load_bytes("18_022825.pdf"),
+            pdf_url=_PDF_ONLY_PDF_URL,
+            case_number="C22-01081",
+            case_title="WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND",
+            motion_type="HEARING ON MOTION IN RE:  JUDGMENT ON THE PLEADINGS",
+            slug="c22-01081",
+            judge_id="276",
+            judge_name_dropdown="DANIELLE K DOUGLAS",
+            hearing_date_iso="2025-03-10 21:21:20+00:00",
+        )
+    )
+
+
+def _assert_is_c22_01081_section(text: str | None) -> None:
+    """The text is the C22-01081 item of the calendar, and nothing else."""
+    assert text is not None
+    assert text.startswith("1. 9:00 AM CASE NUMBER: C22-01081")
+    assert "CASE NAME: WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND" in text
+    assert "Before the Court is Defendant City of Richmond" in text
+    assert text.rstrip().endswith("Defendant’s MJOP is sustained without leave to amend.")
+    # No other calendar item leaks in.
+    assert "C22-01706" not in text
+    assert "JOHN DEERE FINANCIAL" not in text
+
+
+def test_pdf_only_fixture_is_a_multi_case_department_calendar() -> None:
+    """The portal links the whole department calendar, not a per-case PDF."""
+    text = _pdf_only_pdf_text()
+    assert "DEPARTMENT 18" in text
+    assert "1. 9:00 AM CASE NUMBER: C22-01081" in text
+    assert "2. 9:00 AM CASE NUMBER: C22-01706" in text
+
+
+def test_pdf_only_detail_page_has_pdf_link_and_no_inline_text() -> None:
+    detail = _parse_detail_page(_load_html("detail_c22-01081_pdf_only.html"))
+    assert detail["pdf_url"] == _PDF_ONLY_PDF_URL
+    assert detail["ruling_text"] is None
+    assert detail["judge_name"] == "DANIELLE K DOUGLAS"
+
+
+@respx.mock
+def test_fetch_documents_pdf_only_archives_pdf_and_defers_transcription() -> None:
+    """Capture archives the PDF inside the envelope and does not transcribe it.
+
+    Transcription is deferred to the ingestion worker (archive-first:
+    nothing between fetch and archive runs pdfplumber), and the document
+    is flagged so the worker knows the ruling is in the envelope's PDF.
+    """
+    pdf_bytes = _load_bytes("18_022825.pdf")
+    detail_bytes = _load_bytes("detail_c22-01081_pdf_only.html")
+    respx.get(LISTING_URL, params={"field_judge_target_id": "276"}).mock(
+        return_value=httpx.Response(200, text=_PDF_ONLY_LISTING)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_DOUGLAS_ONLY_FORM))
+    respx.get(f"{BASE_URL}/tentative-ruling/c22-01081").mock(
+        return_value=httpx.Response(200, content=detail_bytes)
+    )
+    respx.get(_PDF_ONLY_PDF_URL).mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = portal_default_config().model_copy(update={"request_delay_seconds": 0.0})
+    docs = CCTentativesPortalScraper(config=config).fetch_documents()
+
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.content_format == ContentFormat.TEXT
+    payload = json.loads(doc.raw_content)
+    assert base64.b64decode(payload["pdf_bytes_b64"]) == pdf_bytes
+    assert base64.b64decode(payload["detail_html_b64"]) == detail_bytes
+    assert doc.ruling_text is None
+    assert doc.extra[RULING_TEXT_IN_PDF] is True
+    assert doc.case_number == "C22-01081"
+    assert doc.department == "18"
+    assert doc.judge_name == "DANIELLE K DOUGLAS"
+
+
+def test_pdf_only_scraper_defers_pdf_transcription() -> None:
+    assert CCTentativesPortalScraper.defers_pdf_transcription is True
+
+
+def test_pdf_only_flag_not_set_for_pdf_plus_inline_envelope() -> None:
+    """Only a PDF-only envelope is flagged; otherwise the inline text is the ruling."""
+    pdf_plus_inline = make_reingest_cap_doc(
+        raw_content=_build_envelope_bytes(
+            detail_html=_load_bytes("detail_l24-04564.html"), pdf_bytes=b"%PDF-1.4 x"
+        ),
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=_CC_SOURCE_URL,
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
+    parsed = _make_reingest_scraper().parse_document(pdf_plus_inline)
+    assert parsed.ruling_text
+    assert RULING_TEXT_IN_PDF not in parsed.extra
+
+
+def test_pdf_only_parse_document_leaves_ruling_text_empty() -> None:
+    """parse_document runs before archive on the live path, so it never
+    transcribes the PDF; it only flags the document (#4753)."""
+    doc = make_reingest_cap_doc(
+        raw_content=json.dumps(_pdf_only_envelope()).encode("utf-8"),
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=f"{BASE_URL}/tentative-ruling/c22-01081",
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
+    parsed = _make_reingest_scraper().parse_document(doc)
+    assert parsed.ruling_text is None
+    assert parsed.extra[RULING_TEXT_IN_PDF] is True
+    assert parsed.case_number == "C22-01081"
+
+
+def test_pdf_only_ruling_text_from_pdf_text_narrows_to_the_case() -> None:
+    _assert_is_c22_01081_section(ruling_text_from_pdf_text(_pdf_only_pdf_text(), "C22-01081"))
+
+
+def test_pdf_only_ruling_text_from_pdf_text_matches_case_insensitively() -> None:
+    _assert_is_c22_01081_section(ruling_text_from_pdf_text(_pdf_only_pdf_text(), " c22-01081 "))
+
+
+def test_pdf_only_ruling_text_from_pdf_text_joins_every_item_for_the_case() -> None:
+    """A case with two calendar items (two motions) keeps both, in order."""
+    text = (
+        "SUPERIOR COURT HEADER\n"
+        "6. 9:00 AM CASE NUMBER: C23-00634\nCASE NAME: A VS. B\nfirst motion ruling\n"
+        "7. 9:00 AM CASE NUMBER: C23-00634\nCASE NAME: A VS. B\nsecond motion ruling\n"
+        "8. 9:00 AM CASE NUMBER: C23-01109\nCASE NAME: C VS. D\nother case\n"
+    )
+    result = ruling_text_from_pdf_text(text, "C23-00634")
+    assert result is not None
+    assert result.index("first motion ruling") < result.index("second motion ruling")
+    assert "other case" not in result
+    assert "SUPERIOR COURT HEADER" not in result
+
+
+def test_pdf_only_ruling_text_from_pdf_text_last_item_runs_to_end() -> None:
+    text = (
+        "1. 9:00 AM CASE NUMBER: C22-00001\nfirst\n"
+        "2. 10:30 AM CASE NUMBER: C22-00002\nlast item text\n"
+    )
+    assert ruling_text_from_pdf_text(text, "C22-00002") == (
+        "2. 10:30 AM CASE NUMBER: C22-00002\nlast item text"
+    )
+
+
+@pytest.mark.parametrize("case_number", ["C99-99999", "", None])
+def test_pdf_only_ruling_text_from_pdf_text_missing_case_returns_none(
+    case_number: str | None,
+) -> None:
+    """A case that is not in the calendar yields None, never another case's text."""
+    assert ruling_text_from_pdf_text(_pdf_only_pdf_text(), case_number) is None
+
+
+def test_pdf_only_transcribe_envelope_pdf_returns_case_section() -> None:
+    from ingestion.llm_extract import extract_text_from_pdf
+
+    result = transcribe_envelope_pdf(_pdf_only_envelope(), extract_text_from_pdf)
+    assert result.outcome == "transcribed"
+    _assert_is_c22_01081_section(result.text)
+
+
+def test_pdf_only_transcribe_envelope_pdf_skips_inline_and_no_pdf_envelopes() -> None:
+    """PDF-plus-inline and inline-only envelopes are left to the detail text."""
+    extractor_calls: list[bytes] = []
+
+    def extractor(pdf: bytes) -> str | None:
+        extractor_calls.append(pdf)
+        return "should not be used"
+
+    pdf_plus_inline = json.loads(
+        _build_envelope_bytes(
+            detail_html=_load_bytes("detail_l24-04564.html"), pdf_bytes=b"%PDF-1.4 x"
+        )
+    )
+    result = transcribe_envelope_pdf(pdf_plus_inline, extractor)
+    assert (result.text, result.outcome) == (None, "inline_ruling")
+
+    no_pdf = {**pdf_plus_inline, "pdf_url": None}
+    del no_pdf["pdf_bytes_b64"]
+    result = transcribe_envelope_pdf(no_pdf, extractor)
+    assert (result.text, result.outcome) == (None, "no_pdf")
+    assert extractor_calls == []
+
+
+def test_pdf_only_transcribe_envelope_pdf_reports_empty_text_and_missing_case() -> None:
+    envelope = _pdf_only_envelope()
+
+    result = transcribe_envelope_pdf(envelope, lambda _pdf: None)
+    assert (result.text, result.outcome) == (None, "pdf_text_empty")
+
+    other_case = {**envelope, "row": {**envelope["row"], "case_number": "C99-99999"}}
+    result = transcribe_envelope_pdf(other_case, lambda _pdf: _pdf_only_pdf_text())
+    assert (result.text, result.outcome) == (None, "case_not_found")
+
+    bad_b64 = {**envelope, "pdf_bytes_b64": "not base64!!"}
+    result = transcribe_envelope_pdf(bad_b64, lambda _pdf: "x")
+    assert (result.text, result.outcome) == (None, "no_pdf")
+
+
+def test_pdf_only_deferred_ruling_text_on_reingest() -> None:
+    """The reingest path asks the scraper for the deferred transcription."""
+    from ingestion.llm_extract import extract_text_from_pdf
+
+    raw = json.dumps(_pdf_only_envelope()).encode("utf-8")
+    text = _make_reingest_scraper().deferred_ruling_text(raw, extract_text_from_pdf)
+    _assert_is_c22_01081_section(text)
+
+
+def test_pdf_only_deferred_ruling_text_none_for_non_envelope_content() -> None:
+    scraper = _make_reingest_scraper()
+    assert scraper.deferred_ruling_text(b"%PDF-1.4 raw", lambda _pdf: "x") is None
+    assert scraper.deferred_ruling_text(b"", lambda _pdf: "x") is None
+
+
+def test_pdf_only_deferred_ruling_text_empty_string_when_case_not_in_pdf() -> None:
+    """An envelope with no usable text returns "" (not None), so reingest
+    never falls back to storing the envelope JSON as ruling text."""
+    envelope = _pdf_only_envelope()
+    other_case = {**envelope, "row": {**envelope["row"], "case_number": "C99-99999"}}
+    raw = json.dumps(other_case).encode("utf-8")
+    text = _make_reingest_scraper().deferred_ruling_text(raw, lambda _pdf: _pdf_only_pdf_text())
+    assert text == ""
+
+
+def test_pdf_only_ruling_text_from_pdf_text_non_string_case_number() -> None:
+    assert ruling_text_from_pdf_text("1. 9:00 AM CASE NUMBER: 12345\nbody\n", 12345) == (
+        "1. 9:00 AM CASE NUMBER: 12345\nbody"
+    )
+
+
+def test_pdf_only_load_envelope_accepts_bytes_and_str_and_rejects_others() -> None:
+    raw = json.dumps(_pdf_only_envelope())
+    assert load_envelope(raw)["row"]["case_number"] == "C22-01081"
+    assert load_envelope(raw.encode("utf-8"))["row"]["case_number"] == "C22-01081"
+    assert load_envelope("  \n" + raw)["row"]["case_number"] == "C22-01081"
+    assert load_envelope(None) is None
+    assert load_envelope("") is None
+    assert load_envelope("<html>not json</html>") is None
+    assert load_envelope("{not json") is None
+    assert load_envelope('{"row": "not a dict", "detail_html_b64": ""}') is None
+    assert load_envelope('{"row": {}}') is None
+    assert load_envelope("[1, 2]") is None
+    assert load_envelope(b"\xff\xfe{") is None
+
+
+def test_pdf_only_envelope_fields_match_parse_document() -> None:
+    """envelope_fields gives the worker the fields parse_document sets."""
+    fields = envelope_fields(_pdf_only_envelope())
+    assert fields["case_number"] == "C22-01081"
+    assert fields["case_title"] == "WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND"
+    assert fields["motion_type"] == "HEARING ON MOTION IN RE:  JUDGMENT ON THE PLEADINGS"
+    assert fields["hearing_date"] == "2025-03-10T21:21:20+00:00"
+    assert fields["judge_name"] == "DANIELLE K DOUGLAS"
+    assert fields["department"] == "18"
+    assert fields["courthouse"]
+    assert fields["source_url"] == f"{BASE_URL}/tentative-ruling/c22-01081"
+    assert fields["ruling_text"] is None
+    assert fields["ruling_text_html"] is None

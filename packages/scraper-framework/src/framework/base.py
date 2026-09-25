@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
@@ -79,10 +80,29 @@ class BaseScraper(abc.ABC):
         ``defers_pdf_transcription = True``.  This turns off the capture-time
         "possible image-only PDF" warning.  For such a scraper an empty
         ``ruling_text`` says nothing about the PDF's text layer, so the warning
-        fired for every document (#4714).
+        fired for every document (#4714).  A scraper whose deferred text the
+        reingest path cannot recover from ``raw_content`` alone (e.g. a PDF
+        wrapped in the CC portal's JSON envelope) also overrides
+        ``deferred_ruling_text`` (#4753).
     """
 
     defers_pdf_transcription: bool = False
+
+    def deferred_ruling_text(
+        self,
+        raw_content: bytes,
+        extract_pdf_text: Callable[[bytes], str | None],
+    ) -> str | None:
+        """Return ruling text that transcription after capture would produce.
+
+        Called by reingest when ``parse_document`` leaves ``ruling_text``
+        empty.  ``extract_pdf_text`` is the caller's PDF text extractor.
+        Returns the text; ``""`` when the scraper recognises the content but
+        it yields no ruling text (reingest then stores empty text instead of
+        the raw content); None when the scraper has nothing to add.
+        Default: None (nothing deferred beyond what reingest already does).
+        """
+        return None
 
     def __init__(
         self,
