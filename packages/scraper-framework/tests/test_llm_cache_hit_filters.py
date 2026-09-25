@@ -29,6 +29,7 @@ from framework.llm_extractor import (
     _apply_pdf_post_join_filters,
     _apply_text_cache_hit_filters,
     _join_page_rows,
+    _PageExtraction,
 )
 from framework.llm_schema import EXTRACTION_SYSTEM_PROMPT, ExtractedParty, ExtractedRuling
 
@@ -1010,7 +1011,11 @@ class TestPdfPathFilterSymmetry:
                 "framework.llm_extractor._render_pdf_pages",
                 return_value=[(b"img", "image/png")],
             ),
-            patch.object(fresh_extractor, "_extract_single_page", return_value=page_rows),
+            patch.object(
+                fresh_extractor,
+                "_extract_single_page",
+                return_value=_PageExtraction(status="ok", rows=page_rows),
+            ),
         ):
             fresh_rulings = fresh_extractor.extract_from_pdf(b"pdf-bytes-content")
 
