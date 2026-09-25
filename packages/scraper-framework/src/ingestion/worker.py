@@ -1657,6 +1657,17 @@ class IngestionWorker:
         if result.text:
             updates["ruling_text"] = result.text
         if result.outcome not in ("no_pdf", "inline_ruling"):
+            # The hearing date printed in the calendar PDF's preamble wins
+            # over whatever the event carries (the capture-time filename
+            # date, or the listing time on events captured before #4762).
+            # No header date: the event's date stands; never a body date.
+            event_hearing_date = event_data.get("hearing_date")
+            if result.hearing_date is not None:
+                updates["hearing_date"] = result.hearing_date.date().isoformat()
+                hearing_date_source = "pdf_header"
+            else:
+                hearing_date_source = "event"
+            final_hearing_date = _parse_date(updates.get("hearing_date") or event_hearing_date)
             log = logger.info if result.text else logger.warning
             log(
                 "CC portal envelope PDF transcription: %s",
@@ -1666,6 +1677,9 @@ class IngestionWorker:
                     "case_number": (envelope.get("row") or {}).get("case_number"),
                     "outcome": result.outcome,
                     "ruling_text_length": len(result.text or ""),
+                    "hearing_date": final_hearing_date.isoformat() if final_hearing_date else None,
+                    "hearing_date_source": hearing_date_source,
+                    "event_hearing_date": event_hearing_date,
                     "telemetry_event": "cc_portal_envelope_pdf_transcription",
                 },
             )

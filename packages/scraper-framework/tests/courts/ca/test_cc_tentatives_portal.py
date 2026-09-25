@@ -45,6 +45,7 @@ from courts.ca.cc_tentatives_portal import (
     _parse_detail_page,
     _parse_judge_dropdown,
     _parse_listing_table,
+    calendar_hearing_date,
     envelope_fields,
     load_envelope,
     ruling_text_from_pdf_text,
@@ -1659,10 +1660,126 @@ def test_pdf_only_envelope_fields_match_parse_document() -> None:
     assert fields["case_number"] == "C22-01081"
     assert fields["case_title"] == "WINEHAVEN LEGACY LLC VS. CITY OF RICHMOND"
     assert fields["motion_type"] == "HEARING ON MOTION IN RE:  JUDGMENT ON THE PLEADINGS"
-    assert fields["hearing_date"] == "2025-03-10T21:21:20+00:00"
+    # The calendar date from the PDF filename, not the listing time (#4762).
+    assert fields["hearing_date"] == "2025-02-28T00:00:00"
     assert fields["judge_name"] == "DANIELLE K DOUGLAS"
     assert fields["department"] == "18"
     assert fields["courthouse"]
     assert fields["source_url"] == f"{BASE_URL}/tentative-ruling/c22-01081"
     assert fields["ruling_text"] is None
     assert fields["ruling_text_html"] is None
+
+
+# ---------------------------------------------------------------------------
+# PDF-only rulings: hearing_date is the calendar PDF's date (#4762)
+# ---------------------------------------------------------------------------
+#
+# The listing row's <time datetime> for a PDF-only ruling is a posting /
+# update time, not the hearing date: C22-01081 lists 2025-03-10 14:21 but its
+# calendar PDF 18_022825.pdf is headed "HEARING DATE: 02/28/2025".  Across
+# the 340 portal envelopes in dev S3 the listing date disagreed with the
+# calendar date on all 223 PDF-only envelopes, and agreed on all 111
+# PDF-plus-inline ones.
+
+
+def test_pdf_only_calendar_hearing_date_from_fixture_header() -> None:
+    """The real Dept 18 calendar: the preamble's HEARING DATE is 02/28/2025."""
+    assert calendar_hearing_date(_pdf_only_pdf_text()) == datetime(2025, 2, 28)
+
+
+def test_pdf_only_calendar_hearing_date_unpadded_header() -> None:
+    """Dept 39's calendar (39_030525.pdf, MSN23-2201) prints 3/5/2025."""
+    text = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\nMARTINEZ, CA\n"
+        "DEPARTMENT 39\nHEARING DATE: 3/5/2025\n"
+        "1. 9:00 AM CASE NUMBER: MSN23-2201\nCASE NAME: A VS B\nruling\n"
+    )
+    assert calendar_hearing_date(text) == datetime(2025, 3, 5)
+
+
+def test_pdf_only_calendar_hearing_date_ignores_body_dates() -> None:
+    """Only the preamble counts: a HEARING DATE inside a calendar item is a
+    body date (e.g. a continued hearing) and is never used (#4667/#4682)."""
+    text = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\nDEPARTMENT 18\n"
+        "1. 9:00 AM CASE NUMBER: C22-01081\n"
+        "The matter is continued. NEW HEARING DATE: 04/01/2025\n"
+        "Served on March 3, 2025.\n"
+    )
+    assert calendar_hearing_date(text) is None
+
+
+def test_pdf_only_calendar_hearing_date_none_without_calendar_items() -> None:
+    """No calendar item headers: there is no preamble to read, so None."""
+    assert calendar_hearing_date("HEARING DATE: 02/28/2025\nsome prose") is None
+    assert calendar_hearing_date("") is None
+
+
+def test_pdf_only_transcribe_envelope_pdf_reports_calendar_hearing_date() -> None:
+    from ingestion.llm_extract import extract_text_from_pdf
+
+    result = transcribe_envelope_pdf(_pdf_only_envelope(), extract_text_from_pdf)
+    assert result.outcome == "transcribed"
+    assert result.hearing_date == datetime(2025, 2, 28)
+
+
+def test_pdf_only_transcribe_envelope_pdf_no_hearing_date_when_not_transcribed() -> None:
+    envelope = _pdf_only_envelope()
+    assert transcribe_envelope_pdf(envelope, lambda _pdf: None).hearing_date is None
+    no_pdf = {**envelope, "pdf_bytes_b64": "not base64!!"}
+    assert transcribe_envelope_pdf(no_pdf, lambda _pdf: "x").hearing_date is None
+
+
+def test_pdf_only_parse_document_hearing_date_is_calendar_date_not_listing_time() -> None:
+    """Reingest DB-row / live capture: C22-01081 gets 2025-02-28, not 2025-03-10."""
+    doc = make_reingest_cap_doc(
+        raw_content=json.dumps(_pdf_only_envelope()).encode("utf-8"),
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=f"{BASE_URL}/tentative-ruling/c22-01081",
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
+    parsed = _make_reingest_scraper().parse_document(doc)
+    assert parsed.hearing_date == datetime(2025, 2, 28)
+
+
+@respx.mock
+def test_fetch_documents_pdf_only_hearing_date_is_calendar_date() -> None:
+    respx.get(LISTING_URL, params={"field_judge_target_id": "276"}).mock(
+        return_value=httpx.Response(200, text=_PDF_ONLY_LISTING)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_DOUGLAS_ONLY_FORM))
+    respx.get(f"{BASE_URL}/tentative-ruling/c22-01081").mock(
+        return_value=httpx.Response(200, content=_load_bytes("detail_c22-01081_pdf_only.html"))
+    )
+    respx.get(_PDF_ONLY_PDF_URL).mock(
+        return_value=httpx.Response(200, content=_load_bytes("18_022825.pdf"))
+    )
+    config = portal_default_config().model_copy(update={"request_delay_seconds": 0.0})
+    docs = CCTentativesPortalScraper(config=config).fetch_documents()
+    assert len(docs) == 1
+    assert docs[0].hearing_date == datetime(2025, 2, 28)
+
+
+def test_pdf_only_hearing_date_none_when_pdf_filename_has_no_date() -> None:
+    """A PDF-only ruling never falls back to the listing time: with no date
+    in the filename the capture-time date is None and the worker takes the
+    PDF header date after transcription."""
+    envelope = _pdf_only_envelope()
+    envelope["pdf_url"] = f"{BASE_URL}/system/files/general/calendar-dept18.pdf"
+    assert envelope_fields(envelope)["hearing_date"] is None
+
+
+def test_pdf_plus_inline_hearing_date_stays_listing_date() -> None:
+    """A page with inline text keeps the listing date (it matched the PDF
+    header on all 111 PDF-plus-inline envelopes in dev S3)."""
+    envelope = json.loads(
+        _build_envelope_bytes(
+            detail_html=_load_bytes("detail_l24-04564.html"),
+            pdf_bytes=b"%PDF-1.4 x",
+            pdf_url=f"{BASE_URL}/system/files/general/16_013025.pdf",
+        )
+    )
+    assert envelope_fields(envelope)["hearing_date"] == "2025-01-29T16:31:00+00:00"

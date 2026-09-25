@@ -80,6 +80,13 @@ Detail page format (current portal, #4598):
   and keeps only this case's item(s) of the calendar (#4753).  See
   ``transcribe_envelope_pdf``.
 
+  Hearing date: for a PDF-only ruling the listing row's <time datetime> is a
+  posting/update time, not the hearing date (#4762), so it is not used.  The
+  capture takes the calendar date from the PDF filename (``18_022825.pdf``)
+  and the worker replaces it with the ``HEARING DATE:`` printed in the PDF's
+  preamble (``calendar_hearing_date``).  Inline and PDF-plus-inline rulings
+  keep the listing date, which is the detail page's "Hearing Date / Time".
+
 Case number formats (matches the retired scraper):
   Civil:    C + 2-digit year + hyphen + 5 digits  (C24-02490)
   Limited:  L + 2-digit year + hyphen + 5 digits  (L23-06679)
@@ -107,6 +114,7 @@ import httpx
 import structlog
 from bs4 import BeautifulSoup, Tag
 
+from courts.ca.cc_tentatives import _cc_hearing_date_from_filename, _cc_hearing_date_from_pdf
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 from framework.base import ScraperPreconditionFailure
 from framework.fetch_tally import FetchTally
@@ -590,9 +598,38 @@ def ruling_text_from_pdf_text(pdf_text: str, case_number: str | None) -> str | N
     return "\n\n".join(sections) or None
 
 
+def calendar_hearing_date(pdf_text: str) -> datetime | None:
+    """Return the hearing date printed in a calendar PDF's preamble (#4762).
+
+    The department calendar opens with a preamble (court, DEPARTMENT,
+    JUDICIAL OFFICER, ``HEARING DATE: 02/28/2025``) before the first
+    calendar item.  Only that preamble is read, with the header-anchored
+    ``_cc_hearing_date_from_pdf`` parser.  Dates inside calendar items
+    (continuances, service dates) are never used (#4667/#4682).
+
+    Returns None when the text has no calendar item (so no preamble) or
+    the preamble has no hearing-date header.
+    """
+    first_item = _PDF_ITEM_HEADER_RE.search(pdf_text)
+    if first_item is None:
+        return None
+    return _cc_hearing_date_from_pdf(pdf_text[: first_item.start()])
+
+
+def _pdf_only_filename_hearing_date(pdf_url: str | None) -> datetime | None:
+    """Calendar date encoded in the PDF filename (``18_022825.pdf`` -> 2025-02-28)."""
+    if not pdf_url:
+        return None
+    return _cc_hearing_date_from_filename(pdf_url.rsplit("/", 1)[-1])
+
+
 @dataclass(frozen=True)
 class EnvelopePdfTranscription:
     """Result of :func:`transcribe_envelope_pdf`.
+
+    ``hearing_date`` is the calendar PDF's printed hearing date
+    (:func:`calendar_hearing_date`) whenever the PDF text was extracted,
+    else None.
 
     ``outcome`` is one of:
 
@@ -606,6 +643,7 @@ class EnvelopePdfTranscription:
 
     text: str | None
     outcome: str
+    hearing_date: datetime | None = None
 
 
 def transcribe_envelope_pdf(
@@ -628,11 +666,12 @@ def transcribe_envelope_pdf(
     pdf_text = extract_pdf_text(pdf_bytes)
     if not pdf_text or not pdf_text.strip():
         return EnvelopePdfTranscription(None, "pdf_text_empty")
+    hearing_date = calendar_hearing_date(pdf_text)
     row = envelope.get("row") or {}
     text = ruling_text_from_pdf_text(pdf_text, row.get("case_number"))
     if text is None:
-        return EnvelopePdfTranscription(None, "case_not_found")
-    return EnvelopePdfTranscription(text, "transcribed")
+        return EnvelopePdfTranscription(None, "case_not_found", hearing_date)
+    return EnvelopePdfTranscription(text, "transcribed", hearing_date)
 
 
 def envelope_fields(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -756,6 +795,14 @@ def _populate_doc_from_envelope(doc: CapturedDocument, envelope: dict[str, Any])
     # PDF-only ruling: the worker transcribes the envelope's PDF (#4753).
     if not doc.ruling_text and envelope.get("pdf_bytes_b64"):
         doc.extra[RULING_TEXT_IN_PDF] = True
+        # The listing time of a PDF-only ruling is a posting/update time,
+        # not the hearing date (C22-01081: listed 03/10/2025, calendar PDF
+        # 18_022825.pdf is headed "HEARING DATE: 02/28/2025"; #4762).  Use
+        # the calendar date from the PDF filename here, without transcribing
+        # (archive-first).  The worker replaces it with the PDF's printed
+        # header date after transcription.  Never the listing time: None
+        # when the filename has no date.
+        doc.hearing_date = _pdf_only_filename_hearing_date(pdf_url)
     else:
         doc.extra.pop(RULING_TEXT_IN_PDF, None)
 

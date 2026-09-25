@@ -221,6 +221,20 @@ def test_cc_hearing_date_from_pdf_invalid_civil_date() -> None:
     assert _cc_hearing_date_from_pdf("HEARING DATE: 99/99/9999") is None
 
 
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        # Real Dept 39 calendar PDF 39_030525.pdf (MSN23-2201) prints the
+        # date without zero padding (#4762).
+        ("HEARING DATE: 3/5/2025", datetime(2025, 3, 5)),
+        ("HEARING DATE: 03/5/2025", datetime(2025, 3, 5)),
+        ("HEARING DATE: 12/1/2025", datetime(2025, 12, 1)),
+    ],
+)
+def test_cc_hearing_date_from_pdf_unpadded_civil_date(header: str, expected: datetime) -> None:
+    assert _cc_hearing_date_from_pdf(f"DEPARTMENT 39\n{header}\n") == expected
+
+
 def test_cc_hearing_date_from_pdf_no_date() -> None:
     """Text with no date patterns at all returns None."""
     assert _cc_hearing_date_from_pdf("No date information here.") is None
