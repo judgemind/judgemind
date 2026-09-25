@@ -22,7 +22,7 @@ from __future__ import annotations
 import io
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -184,6 +184,11 @@ def _recent_hearing() -> datetime:
     )
 
 
+# A capture the evening before C22-01081's 02/28/2025 hearing, so the
+# deterministic date-range rule accepts the calendar date (#4762).
+_CALENDAR_CAPTURE_TS = "2025-02-28T02:00:00+00:00"
+
+
 def test_live_path_worker_transcribes_pdf_only_portal_ruling() -> None:
     payload, archived = _capture(_recent_hearing())
 
@@ -192,6 +197,9 @@ def test_live_path_worker_transcribes_pdf_only_portal_ruling() -> None:
     assert payload["content_format"] == "text"
     assert payload["s3_key"] == _S3_KEY
     assert not payload["ruling_text"]
+    # The hearing date is the calendar's 02/28/2025, not the listing time.
+    assert payload["hearing_date"].startswith("2025-02-28")
+    payload["capture_timestamp"] = _CALENDAR_CAPTURE_TS
 
     worker = _worker({_S3_KEY: archived})
     mock_ins = _process(worker, payload)
@@ -201,6 +209,7 @@ def test_live_path_worker_transcribes_pdf_only_portal_ruling() -> None:
     assert kwargs["scraper_id"] == "ca-cc-tentatives-portal"
     assert kwargs["s3_key"] == _S3_KEY
     assert mock_ins.case_number == "C22-01081"
+    assert kwargs["hearing_date"] == date(2025, 2, 28)
     _assert_c22_01081_section(kwargs["ruling_text"])
 
 
@@ -268,7 +277,8 @@ def test_rebuild_path_worker_unwraps_pdf_only_envelope() -> None:
     # department reassignment table).
     assert kwargs["department"]
     assert kwargs["source_url"] == f"{BASE_URL}/tentative-ruling/c22-01081"
-    assert kwargs["hearing_date"] == _recent_hearing().date()
+    # The calendar PDF's date, not the listing time (#4762).
+    assert kwargs["hearing_date"] == date(2025, 2, 28)
     _assert_c22_01081_section(kwargs["ruling_text"])
     assert '"detail_html_b64"' not in kwargs["ruling_text"]
     # Nothing to fetch: the envelope was in the event.
@@ -382,3 +392,66 @@ def test_live_path_pdf_plus_inline_ruling_is_untouched() -> None:
     mock_ins.assert_called_once()
     assert mock_ins.call_args.kwargs["ruling_text"] == payload["ruling_text"]
     worker._s3_client.get_object.assert_not_called()
+
+
+def _transcription_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "telemetry_event", None) == "cc_portal_envelope_pdf_transcription"
+    ]
+
+
+def _pdf_text() -> str:
+    from ingestion.llm_extract import extract_text_from_pdf
+
+    text = extract_text_from_pdf(_PDF.read_bytes())
+    assert text
+    return text
+
+
+def test_pdf_header_date_overrides_listing_time_on_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An event that still carries the listing time (captured before #4762)
+    is stored under the calendar PDF's header date, and the worker logs it."""
+    payload, archived = _capture(_recent_hearing())
+    payload["hearing_date"] = "2025-03-10T21:21:20+00:00"
+    payload["capture_timestamp"] = _CALENDAR_CAPTURE_TS
+
+    worker = _worker({_S3_KEY: archived})
+    with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+        mock_ins = _process(worker, payload)
+
+    mock_ins.assert_called_once()
+    assert mock_ins.call_args.kwargs["hearing_date"] == date(2025, 2, 28)
+    logs = _transcription_logs(caplog)
+    assert len(logs) == 1
+    assert logs[0].hearing_date == "2025-02-28"
+    assert logs[0].hearing_date_source == "pdf_header"
+    assert logs[0].event_hearing_date == "2025-03-10T21:21:20+00:00"
+
+
+def test_pdf_without_header_date_keeps_event_date(caplog: pytest.LogCaptureFixture) -> None:
+    """No header date in the PDF preamble: the event's date stands.  The
+    worker never takes a date from the calendar items' bodies."""
+    payload, archived = _capture(_recent_hearing())
+    payload["capture_timestamp"] = _CALENDAR_CAPTURE_TS
+    headerless = "\n".join(
+        line for line in _pdf_text().splitlines() if not line.startswith("HEARING DATE:")
+    )
+
+    worker = _worker({_S3_KEY: archived})
+    with (
+        patch("ingestion.worker.extract_text_from_pdf", return_value=headerless),
+        caplog.at_level(logging.INFO, logger="ingestion.worker"),
+    ):
+        mock_ins = _process(worker, payload)
+
+    mock_ins.assert_called_once()
+    # 2025-02-28 here is the capture-time date from the PDF filename.
+    assert mock_ins.call_args.kwargs["hearing_date"] == date(2025, 2, 28)
+    logs = _transcription_logs(caplog)
+    assert len(logs) == 1
+    assert logs[0].hearing_date == "2025-02-28"
+    assert logs[0].hearing_date_source == "event"

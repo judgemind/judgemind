@@ -97,9 +97,11 @@ _JUDICIAL_OFFICER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Hearing date from PDF header: "HEARING DATE: 03/11/2026"
+# Hearing date from PDF header: "HEARING DATE: 03/11/2026".  Some departments
+# print the month and day without zero padding ("HEARING DATE: 3/5/2025",
+# Dept 39, #4762).
 _HEARING_DATE_PDF_RE = re.compile(
-    r"HEARING DATE:\s*(?P<date>\d{2}/\d{2}/\d{4})",
+    r"HEARING DATE:\s*(?P<date>\d{1,2}/\d{1,2}/\d{4})",
     re.IGNORECASE,
 )
 
