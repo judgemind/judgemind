@@ -4,7 +4,7 @@ Agent-facing reference for the S3-backed LLM extraction cache used by `LlmExtrac
 
 ## What the LLM cache stores
 
-The cache stores **post-filter `ExtractedRuling[]` JSON** — not the raw model response and not per-page row lists. The value written is what `_join_page_rows` + post-processing returns: fully joined, filtered `ExtractedRuling` objects.
+The document-level cache entry stores **post-filter `ExtractedRuling[]` JSON** — not the raw model response and not per-page row lists. (The multimodal PDF path also keeps per-page raw responses; see §Per-page entries below.) The value written is what `_join_page_rows` + post-processing returns: fully joined, filtered `ExtractedRuling` objects.
 
 **S3 key format:**
 
@@ -17,6 +17,32 @@ llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_hash}.json
 - `{content_hash}` — SHA-256 of the raw document content (PDF bytes or text) **plus** any scraper-provided metadata (`judge_name`, `department`, `hearing_date`). Metadata is included because the LLM output may differ when metadata changes even for identical document content.
 
 Local development reads are served from `S3_CACHE_DIR` via `CachedS3Client` (fast disk reads). On ECS, reads and writes go directly to S3. The cache is shared across environments.
+
+### Per-page entries (multimodal PDF path, #4716)
+
+`extract_from_pdf` sends one page image per LLM call. Alongside the document-level entry above, it caches each page that succeeded:
+
+```
+llm-cache/{provider}-{model}/prompt-{prompt_hash}/pages/{page_hash}.json   →   {"raw_text": "<LLM response>"}
+```
+
+- `{page_hash}` — SHA-256 of the rendered page PNG bytes plus the same scraper metadata as the document key. The per-page user message depends on that metadata.
+- The **raw LLM response** is stored, not parsed rows. A page-cache hit re-runs `_parse_page_rows`, so parser fixes apply to page-cached pages without a bust. If the stored text no longer parses, the entry is treated as a miss.
+- Page entries are read only when the document-level entry misses. `--bust-llm-cache` skips page reads too, but pages are still written.
+
+### What gets cached and what does not (PDF path)
+
+`_extract_single_page` returns a status for each page:
+
+| Page status | Meaning | Page entry written? | Blocks document entry? |
+|---|---|---|---|
+| `ok` | API call succeeded and the response parsed as a JSON object/array. **Zero rows is still `ok`**: boilerplate/header-only pages are a valid result. | Yes | No |
+| `parse_error` | Response did not parse, even after one retry with `PAGE_JSON_RETRY_NUDGE` appended to the user message. | No | Yes |
+| `api_error` | API call failed after `max_retries`. | No | Yes |
+
+The document-level entry is written only when **every** page is `ok` and the join produced at least one ruling. A document with a failed page is never cached as complete, because that would permanently serve a partial ruling set (#3517). Its `ok` pages are page-cached, so the next run re-sends only the failed pages. Failures are never cached as "empty".
+
+Each PDF extraction logs `llm_extractor.pdf_pages_summary` with `total_pages`, `page_cache_hits`, `llm_pages` and `failed_pages`. Use it to see why a document missed the document-level cache. `llm_extractor.page_parse_retry` and `llm_extractor.page_parse_exhausted` record the JSON retry.
 
 ## What re-runs on cache hit and what does NOT
 
@@ -43,7 +69,7 @@ Pass `--bust-llm-cache` to `scripts/reingest_from_s3.py` (#2424) when any of the
 |---|---|
 | Prompt text (`EXTRACTION_SYSTEM_PROMPT` or county-specific prompts) | The prompt hash changes, so old entries are unreachable — but only for new documents. Existing documents need bust to get new LLM output. |
 | LLM provider or model | The `{provider}-{model}` prefix changes — same issue. |
-| Logic inside `_extract_chunk_with_retry` or `_parse_page_rows` | These run before the cache write; cached entries store their output. |
+| Logic inside `_extract_chunk_with_retry` or `_parse_page_rows` | These run before the document-level cache write, and that entry stores their output. (Per-page entries store the raw response and are re-parsed on hit, but they are only consulted when the document-level entry misses.) |
 | Any pre-join filter (`_resolve_cross_references`, `_propagate_document_fields`, or other functions needing per-page row state) | These are not re-applied on cache hit (see above). |
 
 **Cache writes always happen** even when `--bust-llm-cache` is set, so subsequent runs without the flag benefit from the fresh results immediately.

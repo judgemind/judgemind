@@ -31,6 +31,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal, NamedTuple
 
 import anthropic
 import structlog
@@ -235,6 +236,73 @@ class _LlmCache:
             )
         except Exception as exc:
             logger.warning("llm_cache.write_failed", error=str(exc))
+
+    # -- Per-page entries (#4716) ------------------------------------------
+    #
+    # Multimodal PDF extraction sends one page image per LLM call.  Each page
+    # whose response parsed as valid JSON is cached individually under
+    # ``.../prompt-{hash}/pages/{page_key}.json`` as ``{"raw_text": ...}``.
+    # The raw response (not the parsed rows) is stored so that fixes to
+    # ``_parse_page_rows`` take effect on a page-cache hit without a bust.
+    # Pages that failed (API error / unparseable JSON) are never written, so
+    # a later run re-sends only those pages.
+
+    def get_page(self, prompt: str, page_key: str) -> str | None:
+        """Return the cached raw LLM response for one PDF page, or None."""
+        try:
+            response = self._s3.get_object(
+                Bucket=self._bucket, Key=self._key(prompt, f"pages/{page_key}")
+            )
+            entry = json.loads(response["Body"].read())
+        except Exception:
+            return None
+        if isinstance(entry, dict) and isinstance(entry.get("raw_text"), str):
+            return entry["raw_text"]
+        return None
+
+    def put_page(self, prompt: str, page_key: str, raw_text: str) -> None:
+        """Cache the raw LLM response for one successfully parsed PDF page."""
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=self._key(prompt, f"pages/{page_key}"),
+                Body=json.dumps({"raw_text": raw_text}).encode(),
+                ContentType="application/json",
+            )
+        except Exception as exc:
+            logger.warning("llm_cache.page_write_failed", error=str(exc))
+
+
+PageStatus = Literal["ok", "parse_error", "api_error"]
+
+
+class _PageExtraction(NamedTuple):
+    """Outcome of extracting one PDF page (#4716).
+
+    ``status`` distinguishes a complete result from a failure:
+
+    * ``"ok"`` — the API call succeeded and the response parsed as JSON.
+      ``rows`` may be empty: a boilerplate-only page is a valid result.
+    * ``"parse_error"`` — the response did not parse, even after the
+      stricter-JSON retry.  ``raw_text`` holds the last response.
+    * ``"api_error"`` — the API call failed after all retries.
+
+    Only ``"ok"`` pages are cacheable.
+    """
+
+    status: PageStatus
+    rows: list[dict]
+    raw_text: str | None = None
+
+
+# Appended to the per-page user message when a page's first response did not
+# parse as JSON (#4716).  The retry is bounded to one extra call per page.
+PAGE_JSON_RETRY_NUDGE = (
+    "Your previous response for this page was not valid JSON. Respond with "
+    "ONLY a single valid JSON object in the required format: no prose, no "
+    'markdown. If the page has no rulings, return {"page_header": null, '
+    '"rulings": []}.'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2838,6 +2906,8 @@ class LlmExtractor:
         self._provider = provider
         self._model = model or self._PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_HAIKU_MODEL)
         self._max_retries = max_retries
+        # Extra calls per PDF page when the response is not valid JSON (#4716).
+        self._max_page_parse_retries = 1
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._max_output_tokens = max_output_tokens
@@ -3087,33 +3157,59 @@ class LlmExtractor:
 
         usage = TokenUsage()
 
-        # Per-page extraction: one LLM call per page.
+        # Per-page extraction: one LLM call per page.  Pages that parsed on a
+        # previous run are served from the per-page cache (#4716), so a
+        # document with one persistently failing page only re-sends that page.
         all_rows: list[dict] = []
-        any_page_failed = False
+        failed_pages: list[int] = []
+        page_cache_hits = 0
         for page_idx, (img_bytes, media_type) in enumerate(page_images):
-            page_rows = self._extract_single_page(
-                img_bytes,
-                media_type,
-                metadata=metadata,
-                usage=usage,
-                page_index=page_idx,
-                document_id=document_id,
-            )
-            if page_rows:
-                all_rows.extend(page_rows)
+            page_key = _content_hash_for_cache(img_bytes, metadata)
+            page = None
+            if self._cache is not None and not effective_bust:
+                page = self._cached_page(page_key, page_idx)
+            if page is not None:
+                page_cache_hits += 1
             else:
-                # A page returned no rows — either the page is genuinely empty
-                # or the LLM call failed after retries.  Track this so we skip
-                # the cache write below: caching a partial result would poison
-                # subsequent reads with an incomplete ruling set (#3517).
-                any_page_failed = True
+                page = self._extract_single_page(
+                    img_bytes,
+                    media_type,
+                    metadata=metadata,
+                    usage=usage,
+                    page_index=page_idx,
+                    document_id=document_id,
+                )
+                if page.status == "ok" and page.raw_text is not None and self._cache is not None:
+                    self._cache.put_page(PDF_PER_PAGE_PROMPT, page_key, page.raw_text)
+
+            if page.status == "ok":
+                # Zero rows with status "ok" is a complete result: the page
+                # parsed and simply carries no rulings (boilerplate / header
+                # pages are explicitly allowed by PDF_PER_PAGE_PROMPT).
+                all_rows.extend(page.rows)
+            else:
+                # The API call failed or the response never parsed.  This is
+                # NOT an empty page: the result is partial and must not be
+                # cached at document level (#3517).
+                failed_pages.append(page_idx)
                 logger.warning(
                     "llm_extractor.page_partial_failure",
                     page_index=page_idx,
                     total_pages=len(page_images),
+                    status=page.status,
+                    document_id=document_id,
                 )
 
         self._log_usage(usage)
+        logger.info(
+            "llm_extractor.pdf_pages_summary",
+            document_id=document_id,
+            content_key=content_key[:12],
+            total_pages=len(page_images),
+            page_cache_hits=page_cache_hits,
+            llm_pages=len(page_images) - page_cache_hits,
+            failed_pages=failed_pages,
+        )
 
         if not all_rows:
             logger.warning("llm_extractor.no_rows_extracted", page_count=len(page_images))
@@ -3122,13 +3218,13 @@ class LlmExtractor:
         # Join rows into cases and convert to ExtractedRuling objects.
         rulings = _join_page_rows(all_rows, metadata=metadata)
 
-        # Write to cache ONLY if all pages succeeded.  If any page returned []
-        # (throttling, timeout, or API failure after retries), the result is
-        # partial and must NOT be cached — caching a partial result causes
-        # subsequent reads to serve the incomplete ruling set permanently,
-        # producing UNKNOWN-prefixed rulings for cases that do have a case
-        # number on the skipped page (#3517).
-        if self._cache is not None and rulings and not any_page_failed:
+        # Write the document-level entry ONLY if every page ended "ok".  A
+        # page that failed (API error, or JSON that did not parse even after
+        # the retry) makes the result partial; caching it would serve the
+        # incomplete ruling set permanently, producing UNKNOWN-prefixed
+        # rulings for cases whose case number is on the missing page (#3517).
+        # Valid zero-row pages do not block the write (#4716).
+        if self._cache is not None and rulings and not failed_pages:
             self._cache.put(
                 PDF_PER_PAGE_PROMPT,
                 content_key,
@@ -3466,18 +3562,80 @@ class LlmExtractor:
         usage: TokenUsage,
         page_index: int = 0,
         document_id: str | None = None,
-    ) -> list[dict]:
-        """Send a single page image to the LLM and return extracted table rows.
+    ) -> _PageExtraction:
+        """Send a single page image to the LLM and return its extraction outcome.
 
-        Uses the ``PDF_PER_PAGE_PROMPT`` to extract rows from OC-style
-        three-column table PDFs.  Each row is a dict with keys
-        ``entry_number``, ``case_info``, and ``ruling_text``.
+        Uses the ``PDF_PER_PAGE_PROMPT`` to extract rows.  Each row is a dict
+        with keys ``entry_number``, ``case_info``, and ``ruling_text``.
 
-        Returns an empty list if the API call fails or the page has no rows.
+        Returns a :class:`_PageExtraction` whose ``status`` separates a
+        complete result (``"ok"``, possibly with zero rows) from a failure
+        (``"api_error"`` / ``"parse_error"``) so the caller can decide what
+        is cacheable (#4716).  A response that does not parse as JSON is
+        retried once with :data:`PAGE_JSON_RETRY_NUDGE` appended to the user
+        message before the page is reported as ``"parse_error"``.
+        """
+        text_message = self._build_user_message_for_page(metadata)
+        raw_text: str | None = None
+        for parse_attempt in range(1 + self._max_page_parse_retries):
+            message = text_message
+            if parse_attempt > 0:
+                message = f"{text_message}\n\n{PAGE_JSON_RETRY_NUDGE}"
+                logger.warning(
+                    "llm_extractor.page_parse_retry",
+                    page_index=page_index,
+                    document_id=document_id,
+                    parse_attempt=parse_attempt,
+                )
+            raw_text = self._call_page_llm(
+                img_bytes,
+                media_type,
+                message,
+                usage=usage,
+                page_index=page_index,
+                document_id=document_id,
+            )
+            if raw_text is None:
+                return _PageExtraction(status="api_error", rows=[])
+            ok, rows = _parse_page_rows_with_status(raw_text, page_index)
+            if ok:
+                return _PageExtraction(status="ok", rows=rows, raw_text=raw_text)
+
+        logger.error(
+            "llm_extractor.page_parse_exhausted",
+            page_index=page_index,
+            document_id=document_id,
+            raw_preview=(raw_text or "")[:200],
+        )
+        return _PageExtraction(status="parse_error", rows=[], raw_text=raw_text)
+
+    def _cached_page(self, page_key: str, page_index: int) -> _PageExtraction | None:
+        """Return a page-cache hit re-parsed with the current parser, or None."""
+        assert self._cache is not None
+        raw_text = self._cache.get_page(PDF_PER_PAGE_PROMPT, page_key)
+        if not isinstance(raw_text, str):
+            return None
+        ok, rows = _parse_page_rows_with_status(raw_text, page_index)
+        if not ok:
+            return None
+        return _PageExtraction(status="ok", rows=rows, raw_text=raw_text)
+
+    def _call_page_llm(
+        self,
+        img_bytes: bytes,
+        media_type: str,
+        text_message: str,
+        *,
+        usage: TokenUsage,
+        page_index: int,
+        document_id: str | None,
+    ) -> str | None:
+        """Call the multimodal LLM for one page with API-level retries.
+
+        Returns the raw response text, or ``None`` when every attempt failed.
         """
         from ingestion.llm_providers import call_llm_with_images
 
-        text_message = self._build_user_message_for_page(metadata)
         delay = self._base_delay
 
         for attempt in range(1, self._max_retries + 1):
@@ -3536,13 +3694,13 @@ class LlmExtractor:
                         chunk_len=image_len,
                         chunk_kind="image",
                     )
-                    return []
+                    return None
 
                 usage.input_tokens += response.input_tokens
                 usage.output_tokens += response.output_tokens
                 usage.api_calls += 1
 
-                return _parse_page_rows(response.text, page_index)
+                return response.text
 
             except Exception:  # noqa: BLE001
                 if attempt < self._max_retries:
@@ -3563,9 +3721,9 @@ class LlmExtractor:
                     page_index=page_index,
                     exc_info=True,
                 )
-                return []
+                return None
 
-        return []  # pragma: no cover — defensive
+        return None  # pragma: no cover — defensive
 
     # ------------------------------------------------------------------
     # Internal: message building
@@ -3920,6 +4078,15 @@ def _force_split(text: str, max_chars: int) -> list[str]:
 
 
 def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
+    """Parse a per-page LLM response into row dicts (rows only).
+
+    Thin wrapper over :func:`_parse_page_rows_with_status` for callers that
+    do not need to distinguish a valid empty page from a parse failure.
+    """
+    return _parse_page_rows_with_status(raw_text, page_index)[1]
+
+
+def _parse_page_rows_with_status(raw_text: str, page_index: int) -> tuple[bool, list[dict]]:
     """Parse LLM response for a single page into a list of row dicts.
 
     Each row has ``entry_number`` (int or None), ``case_info`` (str),
@@ -3932,6 +4099,11 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     compatibility with ``_join_page_rows``.
 
     Also extracts ``page_header`` metadata if present.
+
+    Returns ``(ok, rows)``.  ``ok`` is ``True`` when the response parsed as
+    a JSON object or array — including a valid page with zero rows — and
+    ``False`` when it could not be parsed (or parsed to a bare scalar), so
+    the caller can retry instead of treating the page as empty (#4716).
     """
     cleaned = strip_llm_json_fences(raw_text)
 
@@ -3970,7 +4142,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
                 page_index=page_index,
                 raw_preview=raw_text[:200],
             )
-            return []
+            return False, []
 
     # Handle both list and dict responses.
     page_header: dict | None = None
@@ -3982,7 +4154,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     elif isinstance(parsed, list):
         rows_raw = parsed
     else:
-        return []
+        return False, []
 
     rows: list[dict] = []
 
@@ -4073,7 +4245,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
             }
         )
 
-    return rows
+    return True, rows
 
 
 def _is_new_case(row: dict) -> bool:
