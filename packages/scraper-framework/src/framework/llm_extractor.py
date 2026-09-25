@@ -2240,6 +2240,12 @@ def _drop_role_literal_orphan_rulings(
 # ("Gelt Oasis Exchange, LLC vs. Monroe 30").
 _TRAILING_OC_COURT_PREFIX_RE = re.compile(r"\s+30-?\s*$")
 
+# Normalized OC civil case number: a 2- or 4-digit year and a 7-8 digit
+# sequence ("2026-01542409", "24-1394670").  Re-attachment only fires for this
+# shape.  The left-column layout it corrects is OC's, and other counties' fused
+# rows ("A v. B 24-12345 C v. D") can really mean "the number belongs to C".
+_OC_CASE_NUMBER_SHAPE_RE = re.compile(r"^\d{2}(?:\d{2})?-\d{7,8}$")
+
 
 def _is_fused_tail(ruling: ExtractedRuling) -> bool:
     """True for a textless, entry-less row: the tail of a fused-row split."""
@@ -2247,16 +2253,13 @@ def _is_fused_tail(ruling: ExtractedRuling) -> bool:
 
 
 def _case_number_cited_in_text(case_number: str, text: str) -> bool:
-    """True when the case number's sequence digits appear in ``text``.
+    """True when an OC case number's sequence digits appear in ``text``.
 
-    Matches on the last hyphen-separated segment ("01542409" for
-    "2026-01542409"), so the number is found however the body writes it
+    Matches on the sequence after the year ("01542409" for "2026-01542409"),
+    so the number is found however the body writes it
     ("30-2026-01542409-CL-UD-CJC", "2026-01542409", "Case No. 26-01542409").
     """
-    sequence = case_number.rsplit("-", 1)[-1]
-    if len(sequence) < 5:
-        sequence = case_number
-    return sequence in text
+    return case_number.rsplit("-", 1)[-1] in text
 
 
 def _reattach_fused_tail_case_numbers(
@@ -2280,6 +2283,9 @@ def _reattach_fused_tail_case_numbers(
 
     The helper does not re-attach when:
 
+    - The number is not OC-shaped (``_OC_CASE_NUMBER_SHAPE_RE``).  The
+      caption-then-number column layout is OC's.  In other layouts a
+      fused row's number can belong to the second caption.
     - ``P`` already has a case number.  The tail's number is then a sibling or
       cited case (e.g. "the related action, case no. 2026-01573506").
     - The run holds two or more distinct case numbers, as in a
@@ -2312,8 +2318,8 @@ def _reattach_fused_tail_case_numbers(
                 for k in tail_indices
                 if result[k].extracted_case_number
             }
-            if len(tail_numbers) == 1:
-                case_number = next(iter(tail_numbers))
+            case_number = next(iter(tail_numbers)) if len(tail_numbers) == 1 else None
+            if case_number and _OC_CASE_NUMBER_SHAPE_RE.match(case_number):
                 if _case_number_cited_in_text(case_number, parent.ruling_text or ""):
                     logger.info(
                         "llm_extractor.fused_tail_case_number_cited_in_body",

@@ -208,14 +208,25 @@ def test_reattach_skips_number_cited_in_ruling_body() -> None:
     assert out[1].extracted_case_number == "2023-01322592"
 
 
-def test_reattach_skips_unhyphenated_number_cited_in_body() -> None:
-    """Numbers with a short final segment ("N25-2112") are matched whole."""
+@pytest.mark.parametrize("case_number", ["24-12345", "N25-2112", "26CV484550", "CVRI2401570"])
+def test_reattach_only_for_oc_shaped_numbers(case_number: str) -> None:
+    """Other counties' fused rows may really mean "the number belongs to the second caption"."""
     rows = [
-        _ruling(text="See the related action, Case No. N25-2112.", entry=1),
-        _ruling(text=None, case_number="N25-2112"),
+        _ruling(text="The motion is GRANTED.", entry=1),
+        _ruling(text=None, case_number=case_number),
     ]
     out = _reattach_fused_tail_case_numbers(rows)
     assert out[0].extracted_case_number is None
+
+
+@pytest.mark.parametrize("case_number", ["2026-01542409", "24-1394670", "2024-1432624"])
+def test_reattach_accepts_oc_number_shapes(case_number: str) -> None:
+    rows = [
+        _ruling(text="The motion is GRANTED.", entry=1),
+        _ruling(text=None, case_number=case_number),
+    ]
+    out = _reattach_fused_tail_case_numbers(rows)
+    assert out[0].extracted_case_number == case_number
 
 
 def test_reattach_skips_number_already_held_by_another_ruling() -> None:
