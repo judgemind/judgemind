@@ -1267,8 +1267,25 @@ def _reparse_document(
             if doc_meta.get("case_number"):
                 cap_doc.case_number = doc_meta["case_number"]
             parsed = scraper.parse_document(cap_doc)
-            ruling = parsed.ruling_text or text
-            extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
+            deferred_hook = getattr(scraper, "deferred_ruling_text", None)
+            deferred: object = None
+            if not parsed.ruling_text and callable(deferred_hook):
+                # Transcription the scraper deferred past capture, e.g. the
+                # PDF inside a CC portal envelope (#4753).  Uses the same
+                # subprocess-isolated PDF extractor as ``text`` above.
+                deferred = deferred_hook(
+                    raw_content,
+                    lambda pdf: _extract_text_from_content(pdf, "pdf", pdf_timeout=pdf_timeout),
+                )
+                if isinstance(deferred, str) and deferred:
+                    parsed.ruling_text = deferred
+            if isinstance(deferred, str):
+                # The scraper owns this content: "" means no ruling text, and
+                # the raw content (e.g. envelope JSON) must not stand in.
+                extracted["ruling_text"] = (parsed.ruling_text or "").replace("\x00", "")
+            else:
+                ruling = parsed.ruling_text or text
+                extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
             # Symmetric DB-seed merge for doc-level judge_name and department

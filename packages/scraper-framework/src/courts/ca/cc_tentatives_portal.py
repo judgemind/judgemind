@@ -71,6 +71,15 @@ Detail page format (current portal, #4598):
   rulings.  A page with neither a PDF link nor ruling text is not a ruling
   page and counts as a blocked fetch (#4735).
 
+  Other rulings are posted only as a PDF: the Tentative Ruling section holds
+  just the PDF link.  That PDF is the whole department calendar for the day
+  (e.g. 20 calendar items), not a per-case document.  The scraper archives it
+  in the envelope and does NOT transcribe it — nothing between fetch and
+  archive runs pdfplumber.  It flags the document with
+  ``extra[RULING_TEXT_IN_PDF]`` and the ingestion worker transcribes the PDF
+  and keeps only this case's item(s) of the calendar (#4753).  See
+  ``transcribe_envelope_pdf``.
+
 Case number formats (matches the retired scraper):
   Civil:    C + 2-digit year + hyphen + 5 digits  (C24-02490)
   Limited:  L + 2-digit year + hyphen + 5 digits  (L23-06679)
@@ -84,9 +93,12 @@ Phase 1 implementation: #2609
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import re
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin
@@ -105,9 +117,23 @@ logger = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+SCRAPER_ID = "ca-cc-tentatives-portal"
+
 BASE_URL = "https://contracosta.courts.ca.gov"
 FORM_URL = f"{BASE_URL}/tentative-rulings"
 LISTING_URL = f"{BASE_URL}/tentative-rulings"
+
+# ``doc.extra`` flag: the ruling is only in the envelope's PDF, so the
+# document is captured with no ruling text and the ingestion worker
+# transcribes the PDF (#4753).
+RULING_TEXT_IN_PDF = "ruling_text_in_pdf"
+
+# Calendar item header in a CC department calendar PDF, e.g.
+# "1. 9:00 AM CASE NUMBER: C22-01081".  Each item runs to the next header.
+_PDF_ITEM_HEADER_RE = re.compile(
+    r"^[ \t]*\d+\.[ \t]+\d{1,2}:\d{2}[ \t]*[AP]\.?M\.?[ \t]+CASE NUMBER:[ \t]*(?P<case_number>\S+)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Case number pattern — matches civil, limited, probate, and misc formats.
 # Anchored with ^ and $ so partial matches are rejected (e.g. "badnumber").
@@ -483,6 +509,258 @@ class _UnexpectedDetailPageError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Envelope helpers shared by the scraper, the ingestion worker, and reingest
+# ---------------------------------------------------------------------------
+
+
+def load_envelope(raw: bytes | str | None) -> dict[str, Any] | None:
+    """Decode a portal JSON envelope, or return None if ``raw`` is not one.
+
+    Cheap on non-envelope content: anything that does not start with ``{``
+    is rejected before JSON parsing, so the worker can call this on every
+    text event.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not raw.lstrip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload.get("row"), dict) or "detail_html_b64" not in payload:
+        return None
+    return payload
+
+
+def _decode_detail_html(envelope: dict[str, Any]) -> tuple[bytes, str]:
+    """Return the envelope's detail HTML as (bytes, text); empty on bad base64."""
+    detail_html_b64 = envelope.get("detail_html_b64") or ""
+    if not detail_html_b64:
+        return b"", ""
+    try:
+        detail_html_bytes = base64.b64decode(detail_html_b64)
+    except (ValueError, TypeError):
+        return b"", ""
+    return detail_html_bytes, detail_html_bytes.decode("utf-8", errors="replace")
+
+
+def _envelope_pdf_bytes(envelope: dict[str, Any]) -> bytes | None:
+    """Return the envelope's PDF bytes, or None when absent or not valid base64."""
+    pdf_b64 = envelope.get("pdf_bytes_b64")
+    if not pdf_b64 or not isinstance(pdf_b64, str):
+        return None
+    try:
+        return base64.b64decode(pdf_b64, validate=True) or None
+    except (binascii.Error, ValueError):
+        return None
+
+
+def ruling_text_from_pdf_text(pdf_text: str, case_number: str | None) -> str | None:
+    """Return the calendar item(s) for ``case_number`` from a calendar PDF's text.
+
+    The portal links the whole department calendar PDF, so its text holds
+    every case heard that day.  Each item starts with a header like
+    ``1. 9:00 AM CASE NUMBER: C22-01081`` and runs to the next header.  A
+    case with several items (e.g. two motions) keeps all of them, in order.
+
+    Returns None when the case has no item in the text.  Never falls back
+    to the whole calendar: that would store every other case's ruling
+    under this case.
+    """
+    wanted = str(case_number or "").strip().upper()
+    if not wanted:
+        return None
+    headers = list(_PDF_ITEM_HEADER_RE.finditer(pdf_text))
+    sections: list[str] = []
+    for i, header in enumerate(headers):
+        if header.group("case_number").upper() != wanted:
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(pdf_text)
+        section = pdf_text[header.start() : end].strip()
+        if section:
+            sections.append(section)
+    return "\n\n".join(sections) or None
+
+
+@dataclass(frozen=True)
+class EnvelopePdfTranscription:
+    """Result of :func:`transcribe_envelope_pdf`.
+
+    ``outcome`` is one of:
+
+    * ``"transcribed"`` — ``text`` holds this case's item(s) of the PDF.
+    * ``"no_pdf"`` — the envelope has no (valid) PDF bytes.
+    * ``"inline_ruling"`` — the detail page has ruling text, which is the
+      ruling; the PDF is not needed.
+    * ``"pdf_text_empty"`` — the PDF yielded no text.
+    * ``"case_not_found"`` — the PDF text has no item for this case.
+    """
+
+    text: str | None
+    outcome: str
+
+
+def transcribe_envelope_pdf(
+    envelope: dict[str, Any],
+    extract_pdf_text: Callable[[bytes], str | None],
+) -> EnvelopePdfTranscription:
+    """Transcribe a PDF-only envelope's PDF and keep this case's item(s).
+
+    Runs only for PDF-only rulings (PDF bytes present, no inline ruling
+    text).  ``extract_pdf_text`` is the caller's PDF extraction path: the
+    worker passes ``ingestion.llm_extract.extract_text_from_pdf``; reingest
+    passes its subprocess-isolated extractor.
+    """
+    pdf_bytes = _envelope_pdf_bytes(envelope)
+    if pdf_bytes is None:
+        return EnvelopePdfTranscription(None, "no_pdf")
+    _, detail_html_text = _decode_detail_html(envelope)
+    if detail_html_text and _parse_detail_page(detail_html_text).get("ruling_text"):
+        return EnvelopePdfTranscription(None, "inline_ruling")
+    pdf_text = extract_pdf_text(pdf_bytes)
+    if not pdf_text or not pdf_text.strip():
+        return EnvelopePdfTranscription(None, "pdf_text_empty")
+    row = envelope.get("row") or {}
+    text = ruling_text_from_pdf_text(pdf_text, row.get("case_number"))
+    if text is None:
+        return EnvelopePdfTranscription(None, "case_not_found")
+    return EnvelopePdfTranscription(text, "transcribed")
+
+
+def envelope_fields(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Return the document.captured fields the scraper derives from an envelope.
+
+    Used by the ingestion worker when an event carries the raw envelope as
+    its text (rebuild_db / prefix-mode reingest), so those events get the
+    same fields as a live capture.  ``hearing_date`` is an ISO-8601 string,
+    as in the event payload.  ``ruling_text`` is the inline text, or None for
+    a PDF-only ruling.
+    """
+    row = envelope.get("row") or {}
+    doc = CapturedDocument(
+        scraper_id=SCRAPER_ID,
+        state="CA",
+        county="Contra Costa",
+        court="Superior Court",
+        source_url=row.get("detail_url") or "",
+        capture_timestamp=datetime.now(UTC),
+        content_format=ContentFormat.TEXT,
+        raw_content=b"",
+        content_hash="",
+    )
+    _populate_doc_from_envelope(doc, envelope)
+    return {
+        "case_number": doc.case_number,
+        "case_title": doc.case_title,
+        "motion_type": doc.motion_type,
+        "hearing_date": doc.hearing_date.isoformat() if doc.hearing_date else None,
+        "ruling_text": doc.ruling_text,
+        "ruling_text_html": doc.ruling_text_html,
+        "judge_name": doc.judge_name,
+        "department": doc.department,
+        "courthouse": doc.courthouse,
+        "source_url": doc.source_url or None,
+    }
+
+
+def _populate_doc_from_envelope(doc: CapturedDocument, envelope: dict[str, Any]) -> None:
+    """Populate structured fields on ``doc`` from a CC-portal JSON envelope.
+
+    Single source of truth for the field mapping shared by the live capture
+    path (``_fetch_single_ruling``), the reingest path (``parse_document``),
+    and the worker's rebuild-event path (``envelope_fields``).  Mutates
+    ``doc`` in place.  Mirrors the #3986 ``_populate_from_envelope`` shape
+    used by the ``CourtListenerScraper``.
+
+    The envelope shape is:
+
+    ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
+    ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
+    ``"judge_id": <str>, "judge_name_dropdown": <str>}``
+
+    For an inline ruling with no PDF link, ``pdf_url`` is null and
+    ``pdf_bytes_b64`` is absent (#4749).  The ruling text comes from the
+    detail HTML.  For a PDF-only ruling the detail page has no ruling text:
+    ``ruling_text`` stays empty and ``extra[RULING_TEXT_IN_PDF]`` is set so
+    the worker transcribes the PDF (#4753).
+    """
+    row = envelope.get("row") or {}
+    if not isinstance(row, dict):
+        row = {}
+
+    pdf_url = envelope.get("pdf_url")
+    judge_name_dropdown = envelope.get("judge_name_dropdown") or ""
+
+    # Decode the detail HTML so we can re-derive ruling_text /
+    # ruling_text_html / aside-judge_name without a network call.
+    detail_html_bytes, detail_html_text = _decode_detail_html(envelope)
+    detail = _parse_detail_page(detail_html_text) if detail_html_text else {}
+
+    # --- Listing-row-derived fields ---
+    doc.case_number = row.get("case_number")
+    doc.case_title = row.get("case_title")
+    doc.motion_type = row.get("motion_type")
+
+    # ``hearing_date`` may be a datetime (live path) or an ISO-8601
+    # string (reingest path — json.dumps(default=str) wrote it that
+    # way).  Coerce to datetime so the schema gets a consistent type.
+    doc.hearing_date = _coerce_hearing_date(row.get("hearing_date"))
+
+    # --- Detail-page-derived fields ---
+    doc.ruling_text = detail.get("ruling_text")
+    doc.ruling_text_html = detail.get("ruling_text_html")
+
+    # Judge name: prefer aside (most specific), fall back to dropdown name.
+    judge_name_aside = detail.get("judge_name")
+    doc.judge_name = judge_name_aside or judge_name_dropdown or None
+
+    # --- PDF-URL-derived fields ---
+    # Department from PDF filename (16_012925.pdf -> "16").  Courthouse
+    # from CC's per-department mapping (cc_tentatives._cc_courthouse).
+    dept = _cc_dept_from_filename(pdf_url)
+    if dept:
+        doc.department = dept
+        from courts.ca.cc_tentatives import _cc_courthouse
+
+        courthouse = _cc_courthouse(dept)
+        if courthouse:
+            doc.courthouse = courthouse
+
+    # --- Secondary artifacts in extra ---
+    # Keep the same shape as the pre-#4133 version so downstream
+    # consumers (S3 archival, the worker, tests) see no change.
+    # ``detail_html`` stays in ``extra`` as bytes for backwards
+    # compatibility with code that reads it (currently only tests).
+    pdf_filename: str | None = None
+    if pdf_url and "/" in pdf_url:
+        pdf_filename = pdf_url.rsplit("/", 1)[-1]
+    elif pdf_url:
+        pdf_filename = pdf_url
+
+    doc.extra["detail_html"] = detail_html_bytes
+    doc.extra["detail_url"] = row.get("detail_url") or doc.source_url
+    doc.extra["pdf_url"] = pdf_url
+    doc.extra["pdf_filename"] = pdf_filename
+    doc.extra["slug"] = row.get("slug")
+    doc.extra["case_type"] = row.get("case_type")
+    doc.extra["judge_id"] = envelope.get("judge_id")
+
+    # PDF-only ruling: the worker transcribes the envelope's PDF (#4753).
+    if not doc.ruling_text and envelope.get("pdf_bytes_b64"):
+        doc.extra[RULING_TEXT_IN_PDF] = True
+    else:
+        doc.extra.pop(RULING_TEXT_IN_PDF, None)
+
+
+# ---------------------------------------------------------------------------
 # Scraper class
 # ---------------------------------------------------------------------------
 
@@ -503,6 +781,11 @@ class CCTentativesPortalScraper(BaseScraper):
     5. Construct one CapturedDocument per valid ruling, with a JSON envelope
        (listing row, detail HTML, and PDF bytes when present) as raw content.
     """
+
+    # A PDF-only ruling is captured with empty ruling_text; the ingestion
+    # worker transcribes the envelope's PDF (#4753).  Same contract as OC
+    # (#4714).
+    defers_pdf_transcription = True
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch ruling documents from the new Contra Costa portal.
@@ -760,96 +1043,30 @@ class CCTentativesPortalScraper(BaseScraper):
     ) -> None:
         """Populate structured fields on ``doc`` from a CC-portal JSON envelope.
 
-        Single source of truth for the field-mapping logic shared by the
-        live capture path (``_fetch_single_ruling``) and the reingest
-        path (``parse_document``).  Mutates ``doc`` in place.  Mirrors
-        the #3986 ``_populate_from_envelope`` shape used by the
-        ``CourtListenerScraper``.
-
-        The envelope shape is:
-
-        ``{"row": <listing-row dict>, "detail_html_b64": <base64-HTML>,``
-        ``"pdf_url": <str>, "pdf_bytes_b64": <base64-PDF>,``
-        ``"judge_id": <str>, "judge_name_dropdown": <str>}``
-
-        For an inline ruling with no PDF link, ``pdf_url`` is null and
-        ``pdf_bytes_b64`` is absent (#4749).  The ruling text comes from
-        the detail HTML either way.
-
-        Args:
-            doc: The document to populate.
-            envelope: The decoded JSON envelope dict.
+        Thin wrapper over :func:`_populate_doc_from_envelope`, which holds
+        the field mapping and documents the envelope shape.
         """
-        row = envelope.get("row") or {}
-        if not isinstance(row, dict):
-            row = {}
+        _populate_doc_from_envelope(doc, envelope)
 
-        pdf_url = envelope.get("pdf_url")
-        judge_name_dropdown = envelope.get("judge_name_dropdown") or ""
+    def deferred_ruling_text(
+        self,
+        raw_content: bytes,
+        extract_pdf_text: Callable[[bytes], str | None],
+    ) -> str | None:
+        """Transcribe a PDF-only envelope for reingest (#4753).
 
-        # Decode the detail HTML so we can re-derive ruling_text /
-        # ruling_text_html / aside-judge_name without a network call.
-        detail_html_b64 = envelope.get("detail_html_b64") or ""
-        detail_html_bytes = b""
-        detail_html_text = ""
-        if detail_html_b64:
-            try:
-                detail_html_bytes = base64.b64decode(detail_html_b64)
-                detail_html_text = detail_html_bytes.decode("utf-8", errors="replace")
-            except (ValueError, TypeError):
-                detail_html_bytes = b""
-                detail_html_text = ""
-        detail = _parse_detail_page(detail_html_text) if detail_html_text else {}
-
-        # --- Listing-row-derived fields ---
-        doc.case_number = row.get("case_number")
-        doc.case_title = row.get("case_title")
-        doc.motion_type = row.get("motion_type")
-
-        # ``hearing_date`` may be a datetime (live path) or an ISO-8601
-        # string (reingest path — json.dumps(default=str) wrote it that
-        # way).  Coerce to datetime so the schema gets a consistent type.
-        hearing_date_raw = row.get("hearing_date")
-        doc.hearing_date = _coerce_hearing_date(hearing_date_raw)
-
-        # --- Detail-page-derived fields ---
-        doc.ruling_text = detail.get("ruling_text")
-        doc.ruling_text_html = detail.get("ruling_text_html")
-
-        # Judge name: prefer aside (most specific), fall back to dropdown name.
-        judge_name_aside = detail.get("judge_name")
-        doc.judge_name = judge_name_aside or judge_name_dropdown or None
-
-        # --- PDF-URL-derived fields ---
-        # Department from PDF filename (16_012925.pdf -> "16").  Courthouse
-        # from CC's per-department mapping (cc_tentatives._cc_courthouse).
-        dept = _cc_dept_from_filename(pdf_url)
-        if dept:
-            doc.department = dept
-            from courts.ca.cc_tentatives import _cc_courthouse
-
-            courthouse = _cc_courthouse(dept)
-            if courthouse:
-                doc.courthouse = courthouse
-
-        # --- Secondary artifacts in extra ---
-        # Keep the same shape as the pre-#4133 version so downstream
-        # consumers (S3 archival, the worker, tests) see no change.
-        # ``detail_html`` stays in ``extra`` as bytes for backwards
-        # compatibility with code that reads it (currently only tests).
-        pdf_filename: str | None = None
-        if pdf_url and "/" in pdf_url:
-            pdf_filename = pdf_url.rsplit("/", 1)[-1]
-        elif pdf_url:
-            pdf_filename = pdf_url
-
-        doc.extra["detail_html"] = detail_html_bytes
-        doc.extra["detail_url"] = row.get("detail_url") or doc.source_url
-        doc.extra["pdf_url"] = pdf_url
-        doc.extra["pdf_filename"] = pdf_filename
-        doc.extra["slug"] = row.get("slug")
-        doc.extra["case_type"] = row.get("case_type")
-        doc.extra["judge_id"] = envelope.get("judge_id")
+        ``parse_document`` never transcribes the PDF, because on the live
+        path it runs before the archive write.  The reingest path calls this
+        after ``parse_document`` leaves ``ruling_text`` empty.  Returns this
+        case's item(s) of the calendar PDF; ``""`` when ``raw_content`` is an
+        envelope but yields no text (case not in the PDF, empty PDF text), so
+        reingest never stores the envelope JSON as ruling text; None when
+        ``raw_content`` is not an envelope.
+        """
+        envelope = load_envelope(raw_content)
+        if envelope is None:
+            return None
+        return transcribe_envelope_pdf(envelope, extract_pdf_text).text or ""
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Parse structured fields from ``doc.raw_content``.
@@ -957,7 +1174,7 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
     from datetime import time as dtime
 
     return ScraperConfig(
-        scraper_id="ca-cc-tentatives-portal",
+        scraper_id=SCRAPER_ID,
         state="CA",
         county="Contra Costa",
         court="Superior Court",
