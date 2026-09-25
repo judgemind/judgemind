@@ -1135,7 +1135,8 @@ def test_run_fails_when_every_detail_page_has_no_pdf_url_or_ruling() -> None:
 def test_detail_page_with_inline_ruling_but_no_pdf_url_is_not_blocked() -> None:
     """The live portal posts some rulings inline with no PDF link (e.g.
     C22-01746, checked 2026-09-25). That page loaded as expected, so it is
-    not a blocked fetch and the run stays green (#4735)."""
+    not a blocked fetch and the run stays green (#4735). Each inline ruling
+    is also captured, not dropped (#4749)."""
     _mock_two_devine_listings()
     respx.get(url__regex=r"/tentative-ruling/").mock(
         return_value=httpx.Response(200, text=_load_html("detail_c22-01746_no_pdf.html"))
@@ -1144,6 +1145,174 @@ def test_detail_page_with_inline_ruling_but_no_pdf_url_is_not_blocked() -> None:
     health = CCTentativesPortalScraper(config=_run_config()).run()
 
     assert health.success is True
+    # 4 valid rows per Devine listing x 2 judges, every one an inline ruling.
+    assert health.records_captured == 8
+
+
+# ---------------------------------------------------------------------------
+# Inline rulings posted with no PDF link are captured (#4749)
+# ---------------------------------------------------------------------------
+
+_INLINE_C22_01746_TEXT = (
+    "Defendant Walnut Creek Presbyterian Church’s Motion for Summary Judgment "
+    "or Adjudication is continued to March 17, 2025 at 9:00 a.m.\n\n"
+    "On February 25, 2025, Plaintiffs filed an “Objection to Walnut Creek "
+    "Presbyterian Church’s Untimely Reply in Support of its Motion for Summary "
+    "Judgment” in which they argue they have been deprived of a sufficient "
+    "opportunity to review the reply before the March 3 hearing. The hearing on "
+    "the motion is continued to give plaintiffs additional time to review the reply."
+)
+
+_DEVINE_ONLY_FORM = (
+    '<html><body><form><select name="field_judge_target_id">'
+    '<option value="All">- Any -</option>'
+    '<option value="238">JOHN P DEVINE</option>'
+    "</select></form></body></html>"
+)
+
+_DEVINE_INLINE_LISTING = (
+    "<html><body><table><tbody><tr>"
+    '<td><time datetime="2025-03-25T16:00:00Z">Tue, 03/25/2025</time></td>'
+    '<td><a href="/tentative-ruling/c22-01746">C22-01746</a>'
+    "<p>JANE DOE VS. WALNUT CREEK PRESBYTERIAN CHURCH</p>"
+    "Civil<p>HEARING ON SUMMARY MOTION</p></td>"
+    "</tr></tbody></table></body></html>"
+)
+
+
+@respx.mock
+def test_fetch_documents_captures_inline_ruling_without_pdf() -> None:
+    """A detail page whose ruling is posted inline with no PDF link produces
+    a CapturedDocument whose ruling_text matches the page (#4749).
+
+    The raw document is the same JSON envelope as the PDF path, carrying
+    the byte-exact detail HTML, with ``pdf_url: null`` and no PDF bytes.
+    No PDF request is made.
+    """
+    detail_html_bytes = _load_bytes("detail_c22-01746_no_pdf.html")
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=_DEVINE_INLINE_LISTING)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_DEVINE_ONLY_FORM))
+    respx.get(f"{BASE_URL}/tentative-ruling/c22-01746").mock(
+        return_value=httpx.Response(200, content=detail_html_bytes)
+    )
+    pdf_route = respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(404))
+
+    config = portal_default_config().model_copy(update={"request_delay_seconds": 0.0})
+    docs = CCTentativesPortalScraper(config=config).fetch_documents()
+
+    assert len(docs) == 1
+    doc = docs[0]
+    assert pdf_route.call_count == 0
+
+    # Structured fields.
+    assert doc.ruling_text == _INLINE_C22_01746_TEXT
+    assert doc.ruling_text_html is not None
+    assert "Walnut Creek Presbyterian Church" in doc.ruling_text_html
+    assert doc.case_number == "C22-01746"
+    assert doc.case_title == "JANE DOE VS. WALNUT CREEK PRESBYTERIAN CHURCH"
+    assert doc.motion_type == "HEARING ON SUMMARY MOTION"
+    assert doc.hearing_date == datetime(2025, 3, 25, 16, 0, tzinfo=UTC)
+    assert doc.judge_name == "JOHN P DEVINE"
+    # The page names no department and there is no PDF filename to read one
+    # from. A judge-to-department lookup is not safe for past rulings
+    # because judges change departments, so the field stays empty.
+    assert doc.department is None
+    assert doc.source_url == f"{BASE_URL}/tentative-ruling/c22-01746"
+
+    # Archive-first: raw_content is the envelope with the byte-exact page.
+    assert doc.content_format == ContentFormat.TEXT
+    payload = json.loads(doc.raw_content)
+    assert payload["pdf_url"] is None
+    assert "pdf_bytes_b64" not in payload
+    assert base64.b64decode(payload["detail_html_b64"]) == detail_html_bytes
+    assert payload["row"]["case_number"] == "C22-01746"
+    assert payload["judge_id"] == "238"
+
+    assert doc.extra["pdf_url"] is None
+    assert doc.extra["pdf_filename"] is None
+    assert doc.extra["detail_html"] == detail_html_bytes
+    assert doc.extra["slug"] == "c22-01746"
+
+
+@respx.mock
+def test_run_archives_inline_ruling_with_sha256_content_hash() -> None:
+    """run() hashes and archives the inline envelope like any other capture
+    (#4749): content_hash is the SHA-256 of raw_content and the archiver
+    receives the document."""
+    import hashlib
+    from unittest.mock import MagicMock
+
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=_DEVINE_INLINE_LISTING)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_DEVINE_ONLY_FORM))
+    respx.get(f"{BASE_URL}/tentative-ruling/c22-01746").mock(
+        return_value=httpx.Response(200, content=_load_bytes("detail_c22-01746_no_pdf.html"))
+    )
+
+    archiver = MagicMock()
+    archiver.archive.return_value = "ca/contra_costa/superior_court/raw/x.txt"
+    archiver.bucket = "test-bucket"
+    scraper = CCTentativesPortalScraper(config=_run_config(), archiver=archiver)
+
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 1
+    archiver.archive.assert_called_once()
+    archived = archiver.archive.call_args.args[0]
+    assert archived.content_hash == hashlib.sha256(archived.raw_content).hexdigest()
+    assert archived.ruling_text == _INLINE_C22_01746_TEXT
+
+
+def test_parse_document_reingest_inline_no_pdf_envelope_round_trips() -> None:
+    """Reingest of a no-PDF envelope round-trips the structured fields (#4749).
+
+    The envelope carries ``pdf_url: null`` and no ``pdf_bytes_b64``; the
+    ruling text is re-derived from the embedded detail HTML alone.
+    """
+    detail_html = _load_bytes("detail_c22-01746_no_pdf.html")
+    envelope = {
+        "row": {
+            "slug": "c22-01746",
+            "detail_url": f"{BASE_URL}/tentative-ruling/c22-01746",
+            "case_number": "C22-01746",
+            "case_title": "JANE DOE VS. WALNUT CREEK PRESBYTERIAN CHURCH",
+            "case_type": "Civil",
+            "motion_type": "HEARING ON SUMMARY MOTION",
+            "hearing_date": "2025-03-25 16:00:00+00:00",
+        },
+        "detail_html_b64": base64.b64encode(detail_html).decode("ascii"),
+        "pdf_url": None,
+        "judge_id": "238",
+        "judge_name_dropdown": "JOHN P DEVINE",
+    }
+    doc = make_reingest_cap_doc(
+        raw_content=json.dumps(envelope).encode("utf-8"),
+        scraper_id=_CC_SCRAPER_ID,
+        state=_CC_STATE,
+        county=_CC_COUNTY,
+        court=_CC_COURT,
+        source_url=f"{BASE_URL}/tentative-ruling/c22-01746",
+        capture_timestamp=_CC_CAPTURE_TS,
+    )
+
+    parsed = _make_reingest_scraper().parse_document(doc)
+
+    assert parsed.ruling_text == _INLINE_C22_01746_TEXT
+    assert parsed.ruling_text_html is not None
+    assert parsed.case_number == "C22-01746"
+    assert parsed.case_title == "JANE DOE VS. WALNUT CREEK PRESBYTERIAN CHURCH"
+    assert parsed.motion_type == "HEARING ON SUMMARY MOTION"
+    assert parsed.hearing_date == datetime(2025, 3, 25, 16, 0, tzinfo=UTC)
+    assert parsed.judge_name == "JOHN P DEVINE"
+    assert parsed.department is None
+    assert parsed.courthouse is None
+    assert parsed.extra["pdf_url"] is None
+    assert parsed.extra["pdf_filename"] is None
+    assert parsed.extra["slug"] == "c22-01746"
 
 
 @respx.mock
