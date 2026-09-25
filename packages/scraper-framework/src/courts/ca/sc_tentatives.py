@@ -25,7 +25,8 @@ PDF structure (all departments):
            "COUNTY OF SANTA CLARA"
            "Department N"
            "Honorable Firstname Lastname, Presiding"
-  Date:    "DATE: Month DD, YYYY" or "Month DD, YYYY" (standalone line)
+  Date:    "DATE: Month DD, YYYY", "DATE: MM/DD/YYYY" (dept 12, #4667),
+           or "Month DD, YYYY" (standalone header line)
   Cases:   "LINE N  CASENO  CaseTitle  MotionType" followed by ruling text
   Case numbers: DD{CV,PR}DDDDDD format (e.g. 24CV443183, 25PR199782)
 
@@ -77,12 +78,41 @@ _JUDGE_RE = re.compile(
 # Department number from PDF header: "Department 1", "Department 16"
 _DEPT_PDF_RE = re.compile(r"^Department\s+(?P<department>\d+)$", re.MULTILINE)
 
-# Hearing date from PDF: "DATE: March 3, 2026" or standalone "March 3, 2026"
-_DATE_RE = re.compile(
-    r"(?:DATE:\s*)?(?P<date>"
+# Hearing date from the PDF header.  Three header layouts are known:
+#   "DATE: March 3, 2026 TIME: 9:00 A.M."   (dept 1)
+#   "DATE: 09/23/2026 TIME: 9:00 A.M."      (dept 12, live since 2026-09 — #4667)
+#   "March 3, 2026" on its own line         (depts 6, 16)
+# The date MUST come from the header.  An earlier version made the "DATE:"
+# prefix optional and searched the whole document, so when the header switched
+# to the numeric form the regex silently matched the first long-form date in
+# the ruling bodies instead (a claimant's DOB -> 1972-09-13, a discovery
+# service date -> 2025-10-30), and every split ruling inherited it (#4667).
+# Full month names plus the abbreviations seen in live headers
+# ("DATE: Sept. 21, 2026" — dept 2 probate).
+_LONG_FORM_DATE = (
     r"(?:January|February|March|April|May|June|July|August|September"
-    r"|October|November|December)\s+\d{1,2},?\s+\d{4})",
+    r"|October|November|December"
+    r"|(?:Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?)"
+    r"\s+\d{1,2},?\s+\d{4}"
 )
+_NUMERIC_DATE = r"\d{1,2}[/-]\d{1,2}[/-](?:\d{4}|\d{2})(?!\d)"
+
+# Labelled header date — "DATE: <numeric or long-form>".  Searched anywhere
+# because the label itself is the anchor (it repeats on every page header).
+# Case-sensitive on purpose: every observed header uses upper-case "DATE:",
+# while ruling prose uses "Hearing date:" / "Filing Date:" for other dates.
+_DATE_LABEL_RE = re.compile(
+    rf"\bDATE:\s*(?P<date>{_NUMERIC_DATE}|{_LONG_FORM_DATE})",
+)
+
+# Unlabelled header date — a long-form date alone on its own line.  Only
+# searched within the first ``_HEADER_REGION_CHARS`` characters so a date that
+# happens to wrap onto its own line inside a ruling body cannot match.
+_STANDALONE_DATE_RE = re.compile(
+    rf"^[ \t]*(?P<date>{_LONG_FORM_DATE})[ \t]*$",
+    re.MULTILINE,
+)
+_HEADER_REGION_CHARS = 1500
 
 # Case number: 2-digit year prefix + CV or PR + 6 digits (e.g. 24CV443183, 25PR199782)
 _CASE_NUMBER_RE = re.compile(r"\b\d{2}(?:CV|PR)\d{6}\b", re.IGNORECASE)
@@ -296,22 +326,105 @@ def parse_department(text: str) -> str | None:
     return None
 
 
-def parse_hearing_date(text: str) -> Any:
-    """Extract the first hearing date from PDF text.
+def _parse_header_date(raw: str) -> Any:
+    """Parse a numeric (``09/23/2026``, ``9-3-26``) or long-form date string."""
+    from datetime import datetime
 
-    Returns a datetime object or None.
+    raw = " ".join(raw.split())
+    numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})", raw)
+    if numeric:
+        month, day, year = (int(g) for g in numeric.groups())
+        if year < 100:
+            year += 2000
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+    long_form = re.fullmatch(r"([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})", raw)
+    if long_form:
+        month_num = _MONTH_PREFIXES.get(long_form.group(1)[:3].lower())
+        if month_num is None:
+            return None
+        try:
+            return datetime(int(long_form.group(3)), month_num, int(long_form.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+_MONTH_PREFIXES = {
+    name: i
+    for i, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+# Header year-typo correction window (#4667).  A header whose date is more
+# than ``_HEADER_DATE_MAX_DRIFT_DAYS`` from capture, but whose month/day lands
+# within ``_HEADER_YEAR_TYPO_WINDOW_DAYS`` of capture once the year is swapped
+# for the capture year (or its neighbour at a Dec/Jan boundary), is treated
+# as a stale-year typo — e.g. dept 16 publishing "DATE: 9/16/2025" on the
+# 2026-09-16 calendar.
+_HEADER_DATE_MAX_DRIFT_DAYS = 180
+_HEADER_YEAR_TYPO_WINDOW_DAYS = 45
+
+
+def correct_header_year_typo(hearing_date: Any, captured_at: Any) -> Any:
+    """Return *hearing_date* with a stale header year corrected, if applicable.
+
+    Only the year is ever changed, and only when the original value is
+    implausibly far from *captured_at* while the same month/day in an
+    adjacent year is close to it.  Otherwise *hearing_date* is returned
+    unchanged.
     """
     from datetime import datetime
 
-    m = _DATE_RE.search(text)
-    if not m:
-        return None
-    raw = " ".join(m.group("date").split())
-    for fmt in ("%B %d, %Y", "%B %d %Y"):
+    if hearing_date is None or captured_at is None:
+        return hearing_date
+    hd = hearing_date if isinstance(hearing_date, datetime) else None
+    if hd is None:
+        return hearing_date
+    cap = captured_at.replace(tzinfo=None) if isinstance(captured_at, datetime) else None
+    if cap is None:
+        return hearing_date
+    if abs((hd - cap).days) <= _HEADER_DATE_MAX_DRIFT_DAYS:
+        return hearing_date
+    if abs(hd.year - cap.year) > 1:
+        # Not a stale-year typo (e.g. a DOB) — leave it for validation.
+        return hearing_date
+    best: Any = None
+    for year in (cap.year, cap.year - 1, cap.year + 1):
         try:
-            return datetime.strptime(raw, fmt)
-        except ValueError:
+            candidate = hd.replace(year=year)
+        except ValueError:  # Feb 29 in a non-leap year
             continue
+        drift = abs((candidate - cap).days)
+        if drift <= _HEADER_YEAR_TYPO_WINDOW_DAYS and (
+            best is None or drift < abs((best - cap).days)
+        ):
+            best = candidate
+    return best if best is not None else hearing_date
+
+
+def parse_hearing_date(text: str) -> Any:
+    """Extract the hearing date from the PDF header.
+
+    Tries, in order: a ``DATE:``-labelled date (numeric or long-form), then a
+    long-form date alone on its own line within the header region.  Returns
+    ``None`` rather than guessing from ruling-body prose, so the downstream
+    LLM enrichment can fill the field instead (#4667).
+
+    Returns a datetime object or None.
+    """
+    for m in _DATE_LABEL_RE.finditer(text):
+        parsed = _parse_header_date(m.group("date"))
+        if parsed is not None:
+            return parsed
+    for m in _STANDALONE_DATE_RE.finditer(text[:_HEADER_REGION_CHARS]):
+        parsed = _parse_header_date(m.group("date"))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -1053,7 +1166,16 @@ class SCTentativeRulingsScraper(BaseScraper):
 
             # Extract hearing date
             if not doc.hearing_date:
-                doc.hearing_date = parse_hearing_date(text)
+                header_date = parse_hearing_date(text)
+                corrected = correct_header_year_typo(header_date, doc.capture_timestamp)
+                if corrected != header_date:
+                    self._log.warning(
+                        "Corrected stale year in SC PDF header date",
+                        header_date=str(header_date),
+                        corrected=str(corrected),
+                        document_id=doc.document_id,
+                    )
+                doc.hearing_date = corrected
 
             # Refine judge name from PDF text if not set from landing page
             pdf_judge = parse_judge_name(text)

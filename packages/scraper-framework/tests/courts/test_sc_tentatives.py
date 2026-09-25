@@ -12,7 +12,7 @@ Fixtures captured from live site 2026-03-07:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -239,6 +239,179 @@ def test_sc_hearing_date_dept16() -> None:
 def test_sc_hearing_date_none_for_empty() -> None:
     assert parse_hearing_date("") is None
     assert parse_hearing_date("No date here") is None
+
+
+# Regression for #4667: Dept 12 PDFs switched to a numeric header
+# ("DATE: 09/23/2026").  The old long-form-only regex skipped the header and
+# matched the first long-form date anywhere in the ruling bodies, which was a
+# claimant's date of birth (1972-09-13) or a discovery service date
+# (2025-10-30).  Every split ruling inherited that value and the 180-day
+# deterministic rule dropped them all.
+
+
+def test_issue_4667_numeric_header_date_beats_body_dob() -> None:
+    text = (FIXTURES / "sc_dept12_numeric_date_dob_4667.txt").read_text()
+    assert parse_hearing_date(text) == datetime(2026, 9, 23)
+
+
+def test_issue_4667_numeric_header_date_beats_body_service_date() -> None:
+    text = (FIXTURES / "sc_dept12_numeric_date_service_4667.txt").read_text()
+    assert parse_hearing_date(text) == datetime(2026, 9, 18)
+
+
+def test_issue_4667_body_only_long_form_date_is_not_a_hearing_date() -> None:
+    """A long-form date buried in ruling prose must never be returned."""
+    text = (
+        "SUPERIOR COURT, STATE OF CALIFORNIA\n"
+        "Department 12\n"
+        "The brief assigns him the claimant's date of birth\n"
+        "(September 13, 1972).\n"
+    )
+    assert parse_hearing_date(text) is None
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("DATE: 09/23/2026 TIME: 9:00 A.M.", datetime(2026, 9, 23)),
+        ("DATE: 9/3/2026 TIME: 9:00 A.M.", datetime(2026, 9, 3)),
+        ("DATE: 09/23/26 TIME: 9:00 A.M.", datetime(2026, 9, 23)),
+        ("DATE: September 23, 2026 TIME: 9:00 A.M.", datetime(2026, 9, 23)),
+        ("DATE: 09-23-2026", datetime(2026, 9, 23)),
+    ],
+)
+def test_issue_4667_date_label_formats(line: str, expected: datetime) -> None:
+    assert parse_hearing_date(f"Department 12\n{line}\nbody text\n") == expected
+
+
+def test_issue_4667_invalid_numeric_header_returns_none() -> None:
+    assert parse_hearing_date("DATE: 13/45/2026 TIME: 9:00 A.M.\n") is None
+    assert parse_hearing_date("DATE: February 30, 2026\n") is None
+
+
+def test_issue_4667_abbreviated_month_header() -> None:
+    """Dept 2 probate publishes "DATE: Sept. 21, 2026"."""
+    text = (
+        "PROBATE LAW AND MOTION TENTATIVE RULINGS\n"
+        "DATE: Sept. 21, 2026 TIME: 10:00 A.M.\n"
+        "The decedent died on September 9, 2024.\n"
+    )
+    assert parse_hearing_date(text) == datetime(2026, 9, 21)
+
+
+def test_issue_4667_blank_header_date_returns_none() -> None:
+    """A blank header ("DATE: , 2026") must not fall through to body dates."""
+    text = (
+        "DATE: , 2026 TIME: 10:00 A.M.\n"
+        "The petition was filed August 27, 2026.\n"
+        "Hearing date: 10/30/2025. Filing Date: October 1, 2025.\n"
+    )
+    assert parse_hearing_date(text) is None
+
+
+def test_issue_4667_standalone_date_outside_header_region_ignored() -> None:
+    text = "Department 6\n" + ("filler text line\n" * 200) + "March 3, 2026\n"
+    assert parse_hearing_date(text) is None
+
+
+@pytest.mark.parametrize(
+    ("header", "captured", "expected"),
+    [
+        # Dept 16 published "DATE: 9/16/2025" on the 2026-09-16 calendar.
+        (datetime(2025, 9, 16), datetime(2026, 9, 15, 1, 43), datetime(2026, 9, 16)),
+        # Dec/Jan boundary: stale year on a January calendar captured in Dec.
+        (datetime(2025, 1, 5), datetime(2025, 12, 30), datetime(2026, 1, 5)),
+        # Plausible dates are left alone.
+        (datetime(2026, 9, 23), datetime(2026, 9, 24), datetime(2026, 9, 23)),
+        # Far-off dates that aren't a one-year typo are left for validation.
+        (datetime(1972, 9, 13), datetime(2026, 9, 24), datetime(1972, 9, 13)),
+        (datetime(2025, 3, 1), datetime(2026, 9, 24), datetime(2025, 3, 1)),
+        # Feb 29 cannot move to a non-leap year.
+        (datetime(2024, 2, 29), datetime(2025, 2, 27), datetime(2024, 2, 29)),
+        (None, datetime(2026, 9, 24), None),
+    ],
+)
+def test_issue_4667_correct_header_year_typo(
+    header: datetime | None, captured: datetime, expected: datetime | None
+) -> None:
+    from courts.ca.sc_tentatives import correct_header_year_typo
+
+    assert correct_header_year_typo(header, captured) == expected
+
+
+def test_issue_4667_correct_header_year_typo_tolerates_tz_and_none() -> None:
+    from datetime import date
+
+    from courts.ca.sc_tentatives import correct_header_year_typo
+
+    captured = datetime(2026, 9, 15, tzinfo=UTC)
+    assert correct_header_year_typo(datetime(2025, 9, 16), captured) == datetime(2026, 9, 16)
+    assert correct_header_year_typo(datetime(2025, 9, 16), None) == datetime(2025, 9, 16)
+    assert correct_header_year_typo(date(2025, 9, 16), captured) == date(2025, 9, 16)
+    assert correct_header_year_typo(datetime(2025, 9, 16), "x") == datetime(2025, 9, 16)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "captured", "expected"),
+    [
+        (
+            "sc_dept12_numeric_date_dob_4667.txt",
+            datetime(2026, 9, 24, 1, 43),
+            datetime(2026, 9, 23),
+        ),
+        (
+            "sc_dept12_numeric_date_service_4667.txt",
+            datetime(2026, 9, 18, 1, 43),
+            datetime(2026, 9, 18),
+        ),
+    ],
+)
+def test_issue_4667_parse_document_uses_header_date(
+    monkeypatch: pytest.MonkeyPatch, fixture: str, captured: datetime, expected: datetime
+) -> None:
+    """End to end through parse_document: the doc-level hearing_date every
+    split ruling inherits must be the header date, not a body date."""
+    import courts.ca.sc_tentatives as sc_mod
+    from framework import CapturedDocument, ContentFormat
+
+    text = (FIXTURES / fixture).read_text()
+    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw: text)
+    scraper = SCTentativeRulingsScraper(config=sc_default_config())
+    doc = CapturedDocument(
+        scraper_id="ca-sc-tentatives-civil",
+        state="CA",
+        county="Santa Clara",
+        court="Superior Court",
+        source_url="https://example.com/dept-12-wed.pdf",
+        capture_timestamp=captured,
+        content_format=ContentFormat.PDF,
+        raw_content=b"%PDF-1.4",
+        content_hash="",
+    )
+    assert scraper.parse_document(doc).hearing_date == expected
+
+
+def test_issue_4667_parse_document_corrects_header_year_typo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import courts.ca.sc_tentatives as sc_mod
+    from framework import CapturedDocument, ContentFormat
+
+    text = "Department 16\nDATE: 9/16/2025 TIME: 9:00 A.M. and 9:01 A.M\nbody\n"
+    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw: text)
+    scraper = SCTentativeRulingsScraper(config=sc_default_config())
+    doc = CapturedDocument(
+        scraper_id="ca-sc-tentatives-civil",
+        state="CA",
+        county="Santa Clara",
+        court="Superior Court",
+        source_url="https://example.com/dept-16-wed.pdf",
+        capture_timestamp=datetime(2026, 9, 15, 1, 43),
+        content_format=ContentFormat.PDF,
+        raw_content=b"%PDF-1.4",
+        content_hash="",
+    )
+    assert scraper.parse_document(doc).hearing_date == datetime(2026, 9, 16)
 
 
 # ---------------------------------------------------------------------------
