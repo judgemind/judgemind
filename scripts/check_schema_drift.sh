@@ -35,28 +35,51 @@ if [[ "${1:-}" == "--ci" ]]; then
     # the same image, IO contention, etc. — and a `--failed` rerun virtually
     # always passes once the image is warm and the host is idle. 90s is the
     # ceiling for *transient* slowness; a genuinely-broken container exits
-    # via the inner `docker inspect` short-circuit below.
+    # via the inner `docker inspect` short-circuit below. The ceiling is
+    # overridable via SCHEMA_DRIFT_PG_WAIT_SECS (used by the tests).
+    #
+    # Init-restart race (#4663): the postgres image's entrypoint runs
+    # initdb, starts a TEMPORARY server, stops it, then starts the real
+    # server. Breaking on the first pg_isready success could catch the
+    # temporary server, after which the next command landed in the
+    # restart window and failed. Two defenses:
+    #   1. Probe over TCP (-h 127.0.0.1). The entrypoint starts the
+    #      temporary server with listen_addresses='' (unix socket only),
+    #      so a TCP probe only succeeds against the real server.
+    #   2. Require PG_READY_STREAK consecutive successes ~1s apart, so a
+    #      single lucky probe can't end the wait.
     #
     # Fast-fail short-circuit (#4159): if the container has stopped running
     # (exited / OOM-killed / failed to start at all because of a bad env
-    # var like `POSTGRES_PASSWORD=`), break out of the loop immediately
-    # rather than burn the full 90s polling a dead container. The outer
-    # `pg_isready` check below then surfaces the real error.
-    for i in $(seq 1 90); do
-        if docker exec "$CONTAINER" pg_isready -U judgemind -q 2>/dev/null; then
-            break
-        fi
-        if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]]; then
-            echo "ERROR: postgres container '$CONTAINER' is not running (exited unexpectedly)"
-            echo "Container logs:"
-            docker logs "$CONTAINER" 2>&1 | tail -20 || true
-            docker rm -f "$CONTAINER" > /dev/null 2>&1
-            exit 1
+    # var like `POSTGRES_PASSWORD=`), exit immediately rather than burn the
+    # full ceiling polling a dead container.
+    PG_WAIT_SECS="${SCHEMA_DRIFT_PG_WAIT_SECS:-90}"
+    PG_READY_STREAK=3
+    wait_start=$SECONDS
+    streak=0
+    while (( SECONDS - wait_start < PG_WAIT_SECS )); do
+        if docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -U judgemind -q 2>/dev/null; then
+            streak=$((streak + 1))
+            if (( streak >= PG_READY_STREAK )); then
+                break
+            fi
+        else
+            streak=0
+            if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]]; then
+                echo "ERROR: postgres container '$CONTAINER' is not running (exited unexpectedly)"
+                echo "Container logs:"
+                docker logs "$CONTAINER" 2>&1 | tail -20 || true
+                docker rm -f "$CONTAINER" > /dev/null 2>&1
+                exit 1
+            fi
         fi
         sleep 1
     done
-    if ! docker exec "$CONTAINER" pg_isready -U judgemind -q 2>/dev/null; then
-        echo "ERROR: postgres failed to start within 90 seconds"
+    if (( streak < PG_READY_STREAK )); then
+        elapsed=$((SECONDS - wait_start))
+        echo "ERROR: postgres failed to start within ${elapsed} seconds (ceiling ${PG_WAIT_SECS}s)"
+        echo "Container logs:"
+        docker logs "$CONTAINER" 2>&1 | tail -20 || true
         docker rm -f "$CONTAINER" > /dev/null 2>&1
         exit 1
     fi
