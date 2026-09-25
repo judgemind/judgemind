@@ -11,27 +11,31 @@ version = "0.1.0"
 description = "Court data scraping framework for Judgemind"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+# Every runtime dependency carries an upper bound at the next major above the
+# version the image resolves (next minor for 0.x). A major bump is a deliberate
+# PR with tests. Enforced by scripts/check-dependency-upper-bounds.py; policy in
+# docs/agent/code-standards.md §Dependency version bounds (#4756, after #4705).
 dependencies = [
-    "charset-normalizer>=3.0",
-    "httpx>=0.27",
+    "charset-normalizer>=3.0,<4",
+    "httpx>=0.27,<0.29",
     "certifi>=2024.2.2",  # proxied TLS context = certifi + Bright Data root (#4668); already an httpx dep
-    "playwright>=1.42",
+    "playwright>=1.42,<2",
     "playwright-stealth>=2.0,<3.0",
     "patchright>=1.58,<2.0",
-    "beautifulsoup4>=4.12",
-    "lxml>=5.1",
-    "pdfplumber>=0.11",
-    "pymupdf>=1.24",
-    "redis>=5.0",
-    "boto3>=1.34",
-    "pydantic>=2.6",
-    "structlog>=24.1",
-    "opensearch-py>=2.4",
-    "psycopg[binary]>=3.1",
-    "anthropic>=0.40",
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5.1,<7",
+    "pdfplumber>=0.11,<0.12",
+    "pymupdf>=1.24,<2",
+    "redis>=5.0,<9",
+    "boto3>=1.34,<2",
+    "pydantic>=2.6,<3",
+    "structlog>=24.1,<27",
+    "opensearch-py>=2.4,<4",
+    "psycopg[binary]>=3.1,<4",
+    "anthropic>=0.40,<2",
     "google-genai>=1.0,<2.0",
-    "rapidfuzz>=3.0",
-    "croniter>=2.0",
+    "rapidfuzz>=3.0,<4",
+    "croniter>=2.0,<7",
     "judgemind-config",
 ]
 
@@ -48,6 +52,9 @@ dev = [
     "moto[s3]>=5.0",     # AWS mocking
     "opensearch-py>=2.4", # OpenSearch client for indexer tests
 ]
+
+[tool.judgemind.dependency-bounds.unbounded-ok]
+certifi = "Mozilla CA bundle, calendar-versioned; must keep tracking upstream root-store updates"
 
 [tool.ruff]
 target-version = "py312"

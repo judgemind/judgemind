@@ -12,6 +12,24 @@ Agent-facing reference for code style, testing, and the local checks that must p
 - Dependencies managed via `pyproject.toml`.
 - Async where appropriate (httpx for HTTP, playwright for browser automation).
 
+### Dependency version bounds
+
+Every entry in `[project].dependencies` of every `packages/*/pyproject.toml` has an upper bound. Images are built with a fresh `pip install`, so a floor-only spec (`redis>=5.0`) pulls whatever major version is newest on the day of the build. That is how redis-py 8.x reached dev: its default `socket_timeout` changed from `None` to 5 seconds, and the ingestion worker's `XREADGROUP BLOCK 5000` loop started failing on every idle poll with no code change in the repo (#4705, PR #4751).
+
+- **Shape.** Set the bound at the next major above the version a fresh install resolves today: `redis>=5.0,<9` when 8.x resolves. For `0.x` packages the minor version is the breaking one, so bound at the next minor: `httpx>=0.27,<0.29` when 0.28 resolves. Keep floors as they are. Don't pin exact versions (`==`). Bounded ranges still take minor and patch updates.
+- **Exemptions.** Local monorepo siblings (`judgemind-config`) are exempt automatically because they install from the same commit. A PyPI dependency that has to track upstream goes in the package's own pyproject with a reason, for example certifi, whose CA bundle must keep taking root-store updates:
+  ```toml
+  [tool.judgemind.dependency-bounds.unbounded-ok]
+  certifi = "Mozilla CA bundle, calendar-versioned; must keep tracking upstream root-store updates"
+  ```
+- **Scope.** Only runtime dependencies are checked. `[project.optional-dependencies]` (dev tooling) doesn't ship in images.
+- **Bumping a major.** Do it on purpose, in its own PR:
+  1. Read the upstream changelog for the new major and list any changes to defaults or behavior that affect our call sites. Changed defaults are the risky kind: #4705 was one.
+  2. Raise the bound (`redis>=5.0,<10`), run `scripts/install-package-venv.sh <pkg>`, and run the package's full test suite.
+  3. Add or update a test for any changed default the code depends on. #4751 added one for the Redis socket timeout.
+  4. Merge only after the image build and the dev deploy are green, and check the affected service's logs after the deploy.
+- **Enforcement.** `scripts/check-dependency-upper-bounds.py` runs in CI (`dependency-upper-bounds-check`) and in the pre-push guard umbrella. When a dependency has no bound, the error includes a `Fix:` block with the bounded spec, computed from the version installed in `packages/<pkg>/.venv`.
+
 ### Python scripts (`scripts/*.py`)
 
 Scripts that import non-stdlib modules must declare their venv with a `# venv:` header comment in the first 10 lines:

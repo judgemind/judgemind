@@ -77,6 +77,7 @@ LOCAL_ONLY: tuple[str, ...] = (
     "check-oneshot-repo-paths.sh",
     "check_oneshot_repo_paths.py",  # this file (AST-walk replacement)
     "check-duplicate-functions.py",
+    "check-dependency-upper-bounds.py",  # CI + pre-push guard (#4756)
     "check-sql-conflicts.py",
     "check-deprecated-models.sh",
     "check-hardcoded-models.sh",
