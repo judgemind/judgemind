@@ -368,8 +368,11 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.sd_calendar import default_config as sd_cal_config
     from courts.ca.sd_pipeline import SDPipelineScraper
     from courts.ca.sd_pipeline import default_config as sd_pipeline_config
-    from courts.ca.sd_tentatives import SDTentativeRulingsScraper
-    from courts.ca.sd_tentatives import default_config as sd_config
+
+    # courts.ca.sd_tentatives (SD Phase 2) is deliberately NOT registered
+    # standalone (#4679). It needs case numbers, and only ca-sd-pipeline
+    # supplies them (from Phase 1). Run standalone it always recorded
+    # success with 0 records.
     from courts.ca.sf_civil_tentatives import SFCivilTentativeRulingsScraper
     from courts.ca.sf_civil_tentatives import default_config as sf_civil_config
     from courts.ca.sf_tentatives import SFTentativeRulingsScraper
@@ -397,7 +400,6 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-sc-tentatives", SCTentativeRulingsScraper, sc_config),
             ("ca-sd-calendar", SDCalendarScraper, sd_cal_config),
             ("ca-sd-pipeline", SDPipelineScraper, sd_pipeline_config),
-            ("ca-sd-tentatives", SDTentativeRulingsScraper, sd_config),
             ("ca-sf-tentatives-civil", SFCivilTentativeRulingsScraper, sf_civil_config),
             ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
             ("ca-ventura-tentatives", VenturaTentativeRulingsScraper, ventura_config),

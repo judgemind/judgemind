@@ -35,6 +35,12 @@ RETIRED_MODULES: set[str] = {
     # module + its test stay in tree so the scraper can be re-enabled later,
     # but it is intentionally de-registered from the runner for now.
     "courts.federal.courtlistener",
+    # San Diego Phase 2 (ROA tentative rulings) retired as a standalone
+    # scraper per #4679. It only works when given case numbers, which
+    # ca-sd-pipeline (courts.ca.sd_pipeline) supplies from Phase 1 and passes
+    # in itself. Registered standalone, it ran with no input and recorded
+    # success with 0 records on every run.
+    "courts.ca.sd_tentatives",
 }
 
 

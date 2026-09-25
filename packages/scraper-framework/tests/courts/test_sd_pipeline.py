@@ -430,9 +430,25 @@ class TestRunnerRegistration:
         ids = get_scraper_ids()
         assert "ca-sd-pipeline" in ids
 
-    def test_sd_tentatives_still_registered(self) -> None:
-        """Phase 2 standalone scraper should remain registered."""
+    def test_sd_tentatives_not_registered_standalone(self) -> None:
+        """Phase 2 must only run inside ca-sd-pipeline (#4679).
+
+        Run standalone, the runner builds it with no case numbers, so every
+        scheduled run skipped the ROA fetch and recorded success with 0
+        records. Only the pipeline supplies case numbers, so the standalone
+        registry entry is gone.
+        """
         from framework.runner import get_scraper_ids
 
         ids = get_scraper_ids()
-        assert "ca-sd-tentatives" in ids
+        assert "ca-sd-tentatives" not in ids
+
+    def test_phase2_config_keeps_sd_tentatives_scraper_id(self) -> None:
+        """Pipeline Phase 2 still captures under the ca-sd-tentatives id.
+
+        Extraction config and reingest auto-discovery key on this id, so
+        de-registering the standalone entry must not change it.
+        """
+        from courts.ca.sd_tentatives import default_config
+
+        assert default_config().scraper_id == "ca-sd-tentatives"
