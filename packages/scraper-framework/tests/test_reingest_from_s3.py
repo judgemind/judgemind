@@ -13456,6 +13456,61 @@ class TestReingestDeterministicValidationFail:
         assert "ruling_text references" in insert_kwargs["result"].reason
         assert insert_kwargs["result"].model == "deterministic"
 
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_validation_result_county_scraper_id_s3_key_on_fail(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """#4706: the reingest fail row carries the source document's
+        county / scraper_id / s3_key."""
+        row = _make_document_row(
+            s3_key="ca/los_angeles/superior_court/raw/abc.html",
+            scraper_id="ca-la-tentatives-civil",
+        )
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "motion is granted",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_run_det.return_value = _make_det_result(
+            overall="fail",
+            reasons=["ruling_text references a different case"],
+        )
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        mock_insert_val.assert_called_once()
+        insert_kwargs = mock_insert_val.call_args.kwargs
+        assert insert_kwargs["county"] == "Los Angeles"
+        assert insert_kwargs["scraper_id"] == "ca-la-tentatives-civil"
+        assert insert_kwargs["s3_key"] == "ca/los_angeles/superior_court/raw/abc.html"
+
 
 class TestReingestDeterministicValidationFlag:
     """#2424: deterministic validation flag → write DB + log row."""

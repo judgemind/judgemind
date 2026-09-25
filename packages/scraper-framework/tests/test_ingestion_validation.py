@@ -588,3 +588,86 @@ def test_validation_fail_rollback_error_still_returns(
     os_mock.index.assert_not_called()
     # rollback was attempted (and failed — but the defensive except swallowed it)
     mock_conn.rollback.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# #4706: validation_results rows carry county / scraper_id / s3_key
+# ---------------------------------------------------------------------------
+
+
+def _assert_attribution(call: object, event: dict) -> None:
+    kwargs = call.kwargs  # type: ignore[attr-defined]
+    assert kwargs["county"] == event["county"]
+    assert kwargs["scraper_id"] == event["scraper_id"]
+    assert kwargs["s3_key"] == event["s3_key"]
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.validate_document")
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_validation_result_county_on_pass_path(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_validate: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """The pass-path validation row carries the event's attribution (#4706)."""
+    mock_validate.return_value = ValidationResult(
+        result="pass",
+        reason=None,
+        model="test-model",
+        input_tokens=100,
+        output_tokens=20,
+        latency_ms=50,
+    )
+    worker, _ = _make_worker(validation_enabled=True)
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+
+    event = _make_event()
+    worker.process_event(event)
+
+    mock_insert_validation.assert_called_once()
+    _assert_attribution(mock_insert_validation.call_args, event)
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.IngestionWorker._file_validation_issue")
+@patch("ingestion.worker.validate_document")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_validation_result_county_on_llm_fail_path(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_validate: MagicMock,
+    mock_file_issue: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """The LLM-fail row (no ruling write) carries the event's attribution (#4706)."""
+    mock_validate.return_value = ValidationResult(
+        result="fail",
+        reason="Wrong case content assigned",
+        model="test-model",
+        input_tokens=100,
+        output_tokens=30,
+        latency_ms=75,
+    )
+    worker, _ = _make_worker(validation_enabled=True)
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    event = _make_event()
+    worker.process_event(event)
+
+    mock_insert_validation.assert_called_once()
+    assert mock_insert_validation.call_args.kwargs["result"].result == "fail"
+    _assert_attribution(mock_insert_validation.call_args, event)

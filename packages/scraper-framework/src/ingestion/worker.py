@@ -3322,6 +3322,9 @@ class IngestionWorker:
                     document_id=document_id,
                     ruling_id=None,
                     result=det_validation_result,
+                    county=county,
+                    scraper_id=scraper_id,
+                    s3_key=s3_key,
                 )
                 conn.commit()
             except Exception as exc:
@@ -3355,6 +3358,9 @@ class IngestionWorker:
                     document_id=document_id,
                     ruling_id=None,
                     result=det_validation_result,
+                    county=county,
+                    scraper_id=scraper_id,
+                    s3_key=s3_key,
                 )
                 conn.commit()
             except Exception as exc:
@@ -3463,6 +3469,9 @@ class IngestionWorker:
                         document_id=document_id,
                         ruling_id=None,
                         result=validation_result,
+                        county=county,
+                        scraper_id=scraper_id,
+                        s3_key=s3_key,
                     )
                     conn.commit()
                 except Exception as exc:
@@ -3780,6 +3789,9 @@ class IngestionWorker:
                     document_id=document_id,
                     ruling_id=None,
                     result=validation_result,
+                    county=county,
+                    scraper_id=scraper_id,
+                    s3_key=s3_key,
                 )
 
             conn.commit()
@@ -4484,6 +4496,9 @@ class IngestionWorker:
                         output_tokens=0,
                         latency_ms=0,
                     ),
+                    county=county,
+                    scraper_id=event_data.get("scraper_id"),
+                    s3_key=event_data.get("s3_key"),
                 )
                 conn.commit()
             except Exception as exc:
@@ -4551,6 +4566,9 @@ class IngestionWorker:
                             output_tokens=0,
                             latency_ms=0,
                         ),
+                        county=county,
+                        scraper_id=event_data.get("scraper_id"),
+                        s3_key=event_data.get("s3_key"),
                     )
                     conn.commit()
                 except Exception as exc:

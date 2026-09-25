@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from ingestion.worker import IngestionWorker
 
 # ---------------------------------------------------------------------------
@@ -1702,3 +1704,146 @@ def test_all_null_metadata_guard_survives_telemetry_db_failure(
 
     # Primary guard behaviour still holds: no ruling row written.
     mock_insert_doc_ruling.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #4706: every validation_results row carries county / scraper_id / s3_key
+# ---------------------------------------------------------------------------
+
+
+def _assert_all_calls_attributed(mock_insert_validation: MagicMock, event: dict) -> None:
+    assert mock_insert_validation.call_args_list, "expected validation_results inserts"
+    for c in mock_insert_validation.call_args_list:
+        assert c.kwargs["county"] == event["county"], c
+        assert c.kwargs["scraper_id"] == event["scraper_id"], c
+        assert c.kwargs["s3_key"] == event["s3_key"], c
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_validation_result_county_on_deterministic_fail(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """A deterministic FAIL writes no document row, so the validation row
+    must carry the attribution itself (#4706)."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    event = _make_event(
+        county="Contra Costa",
+        scraper_id="ca-contra-costa-tentatives",
+        s3_key="ca/contra_costa/superior_court/raw/deadbeef.json",
+        ruling_text="<html><body><div>ruling</div></body></html>",
+    )
+    worker.process_event(event)
+
+    mock_insert_validation.assert_called_once()
+    assert mock_insert_validation.call_args.kwargs["result"].result == "fail"
+    _assert_all_calls_attributed(mock_insert_validation, event)
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_validation_result_county_on_deterministic_flag(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Deterministic flag rows carry the attribution (#4706)."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        county="Fresno",
+        scraper_id="ca-fresno-tentatives",
+        s3_key="ca/fresno/superior_court/raw/cafe.html",
+        case_title="Alpha v. Beta; Gamma v. Delta; Epsilon v. Zeta; Eta v. Theta; Iota v. Kappa",
+    )
+    worker.process_event(event)
+
+    assert any(c.kwargs["result"].result == "flag" for c in mock_insert_validation.call_args_list)
+    _assert_all_calls_attributed(mock_insert_validation, event)
+
+
+@pytest.mark.parametrize("scenario", ["duplicate_lengths", "cross_case"])
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_validation_result_county_on_split_document_flags(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+    scenario: str,
+) -> None:
+    """Document-level split flags (#2350 duplicate lengths, #2371 cross-case)
+    are written from ``_llm_split_document``; they carry the parent event's
+    attribution so split-child uuid5 ids can be traced to the raw (#4706)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)] * 3
+    mock_cur.rowcount = 1
+
+    if scenario == "duplicate_lengths":
+        texts = ["The motion is GRANTED." * 10] * 3
+        case_numbers = [f"23STCV1234{i}" for i in range(3)]
+    else:
+        texts = [
+            "Case 23STCV10000: the motion is granted.",
+            "See ruling in 23STCV10000 for prior order details.",
+        ]
+        case_numbers = ["23STCV10000", "23STCV20000"]
+
+    converted = [
+        ConvertedRuling(
+            document_id=f"split-uuid-{i}",
+            original_document_id="parent-uuid-1",
+            split_index=i,
+            split_count=len(texts),
+            is_multi=True,
+            ruling_text=text,
+            case_number=case_numbers[i],
+            case_title=f"Smith{i} v. Jones{i}",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Motion for Summary Judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        )
+        for i, text in enumerate(texts)
+    ]
+
+    event = _make_event(ruling_text="Full document text here " * 20)
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * len(texts))
+            worker._framework_extractor = extractor_mock
+            worker.process_event(event)
+
+    assert any(
+        c.kwargs["result"].model == "deterministic" and c.kwargs["result"].result == "flag"
+        for c in mock_insert_validation.call_args_list
+    )
+    _assert_all_calls_attributed(mock_insert_validation, event)
