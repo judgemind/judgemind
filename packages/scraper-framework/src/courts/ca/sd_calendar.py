@@ -312,6 +312,27 @@ def parse_calendar_page(html: str) -> list[CalendarHearing]:
     return hearings
 
 
+def _empty_calendar_block_reason(html: str) -> str | None:
+    """Explain why a page with no parsed hearings is not a quiet day.
+
+    Returns ``None`` for a genuinely empty calendar day. The live empty page
+    (e.g. F_EVCAL5 on 2026-09-25) keeps the "CIVIL CALENDAR For <date>"
+    header and has no department sections, just "No Events for Today".
+    Anything else with zero hearings is a block page or a layout change
+    (#4748):
+
+    - no calendar header: not a civil calendar page at all;
+    - department sections present but no hearing rows parsed: the table
+      markup changed under the parser.
+    """
+    if not is_sd_calendar_html(html):
+        return "response is not a civil calendar page (no CIVIL CALENDAR header)"
+    soup = BeautifulSoup(html, "lxml")
+    if soup.find("div", class_="department") is not None:
+        return "calendar page has departments but no hearing rows parsed"
+    return None
+
+
 def _case_numbers_match(stored: str, row: str) -> bool:
     """Return True if the stored case number matches the calendar row's case number.
 
@@ -541,6 +562,17 @@ class SDCalendarScraper(BaseScraper):
                     hearings = parse_calendar_page(html)
 
                     if len(hearings) == 0:
+                        block_reason = _empty_calendar_block_reason(html)
+                        if block_reason is not None:
+                            tally.blocked(block_reason)
+                            self._log.error(
+                                "sd_calendar.unexpected_page",
+                                division=division_name,
+                                url=url,
+                                reason=block_reason,
+                                body_prefix=html[:200],
+                            )
+                            continue
                         self._log.warning(
                             "Skipping empty calendar page",
                             division=division_name,

@@ -1582,3 +1582,60 @@ class TestRebuildSanDiegoExtractionOverride:
 
         assert "rebuild-ca-san_diego" in _SCRAPER_CONFIGS
         assert _SCRAPER_CONFIGS["rebuild-ca-san_diego"].method == ExtractionMethod.NONE
+
+
+# ---------------------------------------------------------------------------
+# Unexpected-shape 200 pages are not successful fetches (#4748)
+# ---------------------------------------------------------------------------
+
+_BLOCK_PAGE = "<html><body><h1>Access denied</h1><p>Request blocked.</p></body></html>"
+
+
+@respx.mock
+def test_run_fails_when_every_calendar_page_is_a_block_page() -> None:
+    """A 200 that is not a civil calendar page (block page, error page) is a
+    blocked fetch, not an empty calendar. When every page looks like that,
+    the run fails instead of recording success/0 (#4748)."""
+    scraper = SDCalendarScraper(_make_config(), day_numbers=[1])
+    respx.get(url__regex=r"/calendar/").mock(return_value=httpx.Response(200, text=_BLOCK_PAGE))
+
+    health = scraper.run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 4 SD calendar page fetches were blocked" in message
+    assert "not a civil calendar page" in message
+
+
+@respx.mock
+def test_run_fails_when_every_calendar_page_has_departments_but_no_rows() -> None:
+    """Department sections with no parseable hearing rows mean the table
+    layout changed. A genuinely empty day has no department sections at all
+    ("No Events for Today"), so this is blocked, not empty (#4748)."""
+    layout_changed = _load_html("sd_calendar_central.html").replace(
+        'class="tables"', 'class="calendar-table"'
+    )
+    assert 'class="department"' in layout_changed
+    scraper = SDCalendarScraper(_make_config(), day_numbers=[1])
+    respx.get(url__regex=r"/calendar/").mock(return_value=httpx.Response(200, text=layout_changed))
+
+    health = scraper.run()
+
+    assert health.success is False
+    assert "departments but no hearing rows" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_succeeds_when_every_calendar_page_is_genuinely_empty() -> None:
+    """The live empty-day page (F_EVCAL5, 2026-09-25) is a quiet day, not an
+    outage: the run stays green with 0 records (#4748)."""
+    empty_html = _load_html("sd_calendar_empty_live_4748.html")
+    assert parse_calendar_page(empty_html) == []
+    scraper = SDCalendarScraper(_make_config(), day_numbers=[1])
+    respx.get(url__regex=r"/calendar/").mock(return_value=httpx.Response(200, text=empty_html))
+
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0

@@ -1234,12 +1234,25 @@ class LATentativeRulingsScraper(BaseScraper):
                             context="stale_viewstate",
                         )
                         continue
+                    if not _is_ruling_page(ruling_html):
+                        tally.blocked(_NOT_A_RULING_PAGE_REASON)
+                        self._log.error(
+                            "la.unexpected_post_response",
+                            courthouse=opt.courthouse,
+                            dept=opt.department,
+                            body_prefix=ruling_html[:200],
+                        )
+                        continue
 
                     # LLM extraction path: send full HTML to LLM,
                     # get back structured rulings with all fields.
+                    # An empty list is treated like a failure and falls
+                    # through to the regex path: the page is a ruling page,
+                    # so "no rulings" from the LLM is an extraction miss,
+                    # not an empty department (#4748).
                     if use_llm:
                         llm_rulings = _llm_extract_rulings(ruling_html)
-                        if llm_rulings is not None:
+                        if llm_rulings:
                             for ruling in llm_rulings:
                                 doc = self._make_base_doc(
                                     source_url=CIVIL_URL,
@@ -1420,6 +1433,15 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
                             dept=opt.department,
                             date=str(opt.hearing_date),
                             context="stale_viewstate",
+                        )
+                        continue
+                    if not _is_ruling_page(ruling_html):
+                        tally.blocked(_NOT_A_RULING_PAGE_REASON)
+                        self._log.error(
+                            "la_appellate.unexpected_post_response",
+                            dept=opt.department,
+                            date=str(opt.hearing_date),
+                            body_prefix=ruling_html[:200],
                         )
                         continue
 
@@ -1668,6 +1690,23 @@ def _is_stale_viewstate_response(html: str) -> bool:
     no div#speechSynthesis and is ~8KB of boilerplate error HTML.
     """
     return _LA_ERROR_MARKER in html
+
+
+_SPEECH_DIV_RE = re.compile(r"""<div[^>]*\bid\s*=\s*["']?speechSynthesis\b""", re.IGNORECASE)
+
+# Block reason recorded when a POST response is not a ruling page.
+_NOT_A_RULING_PAGE_REASON = "POST response is not a ruling page (no div#speechSynthesis)"
+
+
+def _is_ruling_page(html: str) -> bool:
+    """Return True if *html* is a ruling response (it has div#speechSynthesis).
+
+    Every ruling POST response carries the ``speechSynthesis`` div, including
+    the department-header-only page that lists no cases (a genuinely empty
+    department, #422). A 200 without it that is not the stale-ViewState page
+    is a block page or a layout change, not an empty department (#4748).
+    """
+    return _SPEECH_DIV_RE.search(html) is not None
 
 
 def _is_dept_header_boilerplate(html: str) -> bool:

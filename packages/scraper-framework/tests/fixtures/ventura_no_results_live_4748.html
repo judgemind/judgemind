@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Live capture of the POST /CaseInquiry/TentativeRulings response for
+     SearchFromDate=9/27/2026 (a Sunday) on 2026-09-25 (#4748): a genuinely
+     empty date. Trimmed: <script>/<style>/<link> blocks removed, token value
+     shortened. -->
+<meta charset="utf-8">
+<title>Tentative Rulings and Probate Notes Search</title>
+</head>
+<body>
+<div id="mainContainer">
+<main>
+<div id="mainContentWrap">
+<h1 style="margin:2em 0 0 0;font-size:1.25rem;">Tentative Rulings and Probate Notes Search</h1>
+<form action="/CaseInquiry/TentativeRulings" id="searchform" method="post">    <div id="searchformcontainer" style="margin-top:3.5em;">
+        <label for="SearchCaseNumber">Case Number:</label>
+        <input id="SearchCaseNumber" maxlength="20" name="SearchCaseNumber" type="text" value="" />
+        <label for="SearchFromDate">Hearing Date: </label>
+        <input class="text-box single-line" id="SearchFromDate" name="SearchFromDate" type="text" value="9/27/2026" />
+        <div id="formbuttons">
+            <span><input type="submit" value="Search" id="btnSubmit" /></span>
+            <span><input type="button" value="Reset" id="btnReset" /></span>
+        </div>
+    </div>
+<input name="__RequestVerificationToken" type="hidden" value="CfDJ8GOP8yT5pN9Ljgj1_trimmed" /></form>
+
+<div id="resultscontainer">
+            <h2 class="noresults">No results found</h2>
+</div>
+
+<div class="cleaner"></div>
+</div>
+</main>
+</div>
+</body>
+</html>

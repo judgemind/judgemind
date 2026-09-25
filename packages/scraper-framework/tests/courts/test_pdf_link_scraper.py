@@ -31,6 +31,7 @@ from courts.ca.oc_tentatives import (
 from courts.ca.pdf_link_scraper import (
     _extract_pdf_links,
     _extract_pdf_text,
+    looks_like_pdf,
 )
 from courts.ca.riverside_tentatives import (
     BASE_URL as RIV_BASE_URL,
@@ -399,6 +400,68 @@ def test_oc_run_fails_when_every_pdf_fetch_fails() -> None:
     assert health.records_captured == 0
     assert "all 33 PDF fetches failed" in (health.error_message or "")
     assert "503" in (health.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# A 200 body at a PDF URL that is not a PDF is blocked (#4748)
+# ---------------------------------------------------------------------------
+
+
+def test_looks_like_pdf() -> None:
+    assert looks_like_pdf(_load_bytes("oc_apkarian_c25.pdf"))
+    assert looks_like_pdf(b"%PDF-1.7\n...")
+    # The PDF spec lets the header sit anywhere in the first 1024 bytes.
+    assert looks_like_pdf(b"\r\n  %PDF-1.4\n...")
+    assert not looks_like_pdf(b"<html><body>Access denied</body></html>")
+    assert not looks_like_pdf(b"")
+    assert not looks_like_pdf(b" " * 2000 + b"%PDF-1.4")
+
+
+@respx.mock
+def test_oc_run_fails_when_every_pdf_url_returns_html() -> None:
+    """An HTML block page served at every PDF URL is not archived as a PDF
+    and counted OK: each fetch is blocked, so the run fails (#4748)."""
+    html = _load_html("oc_civil_page.html")
+    respx.get(OC_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, text="<html><body><h1>Access denied</h1></body></html>")
+    )
+
+    config = oc_default_config()
+    config.request_delay_seconds = 0
+    health = OCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 33 PDF fetches were blocked" in message
+    assert "not a PDF" in message
+
+
+@respx.mock
+def test_oc_run_skips_non_pdf_bodies_but_keeps_real_pdfs() -> None:
+    """One non-PDF body among real PDFs is dropped; the rest are captured (#4748)."""
+    html = _load_html("oc_civil_page.html")
+    pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
+    respx.get(OC_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+    calls = 0
+
+    def pdf_side_effect(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, text="<html>Service Unavailable</html>")
+        return httpx.Response(200, content=pdf_bytes)
+
+    respx.get(url__regex=r"\.pdf$").mock(side_effect=pdf_side_effect)
+
+    config = oc_default_config()
+    config.request_delay_seconds = 0
+    health = OCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is True
+    assert health.records_captured == 32
 
 
 # ---------------------------------------------------------------------------
