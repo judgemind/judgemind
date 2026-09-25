@@ -1328,6 +1328,59 @@ class TestNonExhaustionExceptionsReraise:
             assert child["ruling_text"] == fake_rulings[idx].ruling_text
 
 
+class TestScPdfSplitHeaderHearingDate:
+    """#4667: prefix-mode reingest / rebuild events carry no hearing_date, so
+    the SC split must derive it from the PDF header rather than leaving each
+    child to guess from its own body text (which yielded dates of birth and
+    discovery service dates)."""
+
+    _HEADER = (
+        "SUPERIOR COURT, STATE OF CALIFORNIA\n"
+        "COUNTY OF SANTA CLARA\n"
+        "Department 12\n"
+        "DATE: 09/23/2026 TIME: 9:00 A.M. and 9:01 A.M.\n"
+    )
+
+    def _run(self, **overrides: object) -> list[dict]:
+        from ingestion.worker import _try_sc_pdf_split
+
+        captured: list[dict] = []
+        event = _make_sc_event(**overrides)
+        with patch("courts.ca.sc_tentatives._split_rulings", return_value=_make_fake_sc_rulings()):
+            assert _try_sc_pdf_split(
+                event, event["document_id"], event["ruling_text"], captured.append
+            )
+        return captured
+
+    def test_issue_4667_split_children_get_header_date_when_event_has_none(self) -> None:
+        children = self._run(
+            hearing_date=None,
+            capture_timestamp="2026-09-24T01:43:00+00:00",
+            ruling_text=self._HEADER + "claimant's date of birth (September 13, 1972).\n",
+        )
+        assert [c["hearing_date"] for c in children] == ["2026-09-23"] * 3
+
+    def test_issue_4667_split_header_date_year_typo_corrected(self) -> None:
+        children = self._run(
+            hearing_date=None,
+            capture_timestamp="2026-09-15T01:43:00Z",
+            ruling_text="Department 16\nDATE: 9/16/2025 TIME: 9:00 A.M.\nbody\n",
+        )
+        assert [c["hearing_date"] for c in children] == ["2026-09-16"] * 3
+
+    def test_issue_4667_scraper_hearing_date_still_wins(self) -> None:
+        children = self._run(hearing_date="2026-09-22", ruling_text=self._HEADER)
+        assert [c["hearing_date"] for c in children] == ["2026-09-22"] * 3
+
+    def test_issue_4667_no_header_date_leaves_none(self) -> None:
+        children = self._run(
+            hearing_date=None,
+            capture_timestamp=None,
+            ruling_text="Department 12\nThe hearing on August 27, 2026.\n",
+        )
+        assert [c["hearing_date"] for c in children] == [None] * 3
+
+
 # ---------------------------------------------------------------------------
 # San Francisco family-law PDF splitter — _try_sf_pdf_split (#4304)
 # ---------------------------------------------------------------------------

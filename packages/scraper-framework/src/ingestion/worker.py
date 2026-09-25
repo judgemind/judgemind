@@ -887,9 +887,28 @@ def _try_sc_pdf_split(
 
     # Lazy import to avoid a circular dependency between the worker and
     # the courts package at module load time.
-    from courts.ca.sc_tentatives import _split_rulings
+    from courts.ca.sc_tentatives import (
+        _split_rulings,
+        correct_header_year_typo,
+        parse_hearing_date,
+    )
 
     split_rulings = _split_rulings(ruling_text, pdf_bytes=raw_pdf_bytes)
+
+    # Doc-level hearing date for every child (#4667).  Live scraper events
+    # already carry it (``SCTentativeRulingsScraper.parse_document``), but
+    # prefix-mode reingest and ``rebuild_db`` build events straight from S3
+    # with no hearing_date.  Without this, each child fell back to per-entry
+    # LLM/regex extraction on its own body text — which has no header — and
+    # picked up dates of birth, service dates, etc.  Derive it from the PDF
+    # header with the same parser the scraper uses.
+    doc_hearing_date: Any = event_data.get("hearing_date")
+    if not doc_hearing_date:
+        header_date = parse_hearing_date(ruling_text)
+        captured_at = _parse_datetime(event_data.get("capture_timestamp"))
+        header_date = correct_header_year_typo(header_date, captured_at)
+        if header_date is not None:
+            doc_hearing_date = header_date.date().isoformat()
     if not split_rulings:
         # No ``Line N`` boundaries found — fall through to LLM.
         logger.info(
@@ -967,7 +986,7 @@ def _try_sc_pdf_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": hearing_date_value or doc_hearing_date,
         }
         try:
             dispatch(split_event)
