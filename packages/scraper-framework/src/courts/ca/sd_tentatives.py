@@ -602,6 +602,20 @@ class _LookupBlocked(Exception):  # noqa: N818
     """A case lookup got a challenge or block page instead of portal content."""
 
 
+_PORTAL_ERROR_MAX_CHARS = 200
+
+
+def _first_line_error(exc: BaseException) -> str:
+    """``Type: first line`` of *exc*, truncated for a one-line run error (#4680).
+
+    Playwright errors append a multi-line ``Call log:``; only the first line
+    (``Page.goto: net::ERR_TIMED_OUT at ...``) is useful in a run summary.
+    """
+    lines = str(exc).strip().splitlines()
+    text = f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
+    return text[:_PORTAL_ERROR_MAX_CHARS]
+
+
 class SDTentativeRulingsScraper(BaseScraper):
     """San Diego County Odyssey ROA tentative rulings — Phase 2.
 
@@ -646,6 +660,10 @@ class SDTentativeRulingsScraper(BaseScraper):
         self._saw_rate_limit_block = False
         # Bright Data proxy refusals, keyed by x-brd-err-code.
         self._proxy_blocks: dict[str, dict[str, Any]] = {}
+        # First line of the last exception raised while loading the portal
+        # (e.g. ``Page.goto: net::ERR_TIMED_OUT`` from a dead proxy), so a
+        # session that never got past navigation names its cause (#4680).
+        self._portal_last_error: str | None = None
 
     def _on_response(self, response: Any) -> None:
         """Record requests that the Bright Data proxy refused (``x-brd-err-code``).
@@ -681,6 +699,7 @@ class SDTentativeRulingsScraper(BaseScraper):
             "rate_limit_block": self._saw_rate_limit_block,
             "proxy_block_codes": sorted(self._proxy_blocks),
             "proxy": bool(self._proxy_url),
+            "portal_last_error": self._portal_last_error,
         }
 
     def _cloudflare_failure_message(self) -> str:
@@ -695,6 +714,8 @@ class SDTentativeRulingsScraper(BaseScraper):
             parts.append("court WAF served its 'exceeded our rate limiting' block page")
         if self._challenge_type:
             parts.append(f"Cloudflare challenge type={self._challenge_type}")
+        if self._portal_last_error:
+            parts.append(f"last error: {self._portal_last_error}")
         detail = "; ".join(parts) or "no further detail"
         return f"SD portal anti-bot check not passed: {detail}"
 
@@ -791,6 +812,9 @@ class SDTentativeRulingsScraper(BaseScraper):
                         **self._anti_bot_summary(),
                     )
                     raise ScraperPreconditionFailure(message)
+                # An error on an earlier attempt that later passed does not
+                # explain any later lookup failure (#4680).
+                self._portal_last_error = None
 
                 # Step 2: For each case, search and extract ruling.
                 # A lookup is unsuccessful when it is blocked or raises. Only a
@@ -970,6 +994,7 @@ class SDTentativeRulingsScraper(BaseScraper):
                     break
 
             except Exception as exc:
+                self._portal_last_error = _first_line_error(exc)
                 self._log.warning(
                     "Error during Cloudflare challenge attempt",
                     attempt=attempt,
