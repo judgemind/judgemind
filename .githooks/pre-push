@@ -315,9 +315,26 @@ python_pkg_checks() {
         fi
     fi
 
-    # Diff coverage check (after tests generate coverage.xml)
+    # Diff coverage check (after tests generate coverage.xml).
+    #
+    # diff-cover comes from the package's [dev] extras. Before #4719 it was
+    # not in them, and this gate skipped without a word whenever the venv
+    # lacked it — so the >= 90% diff-coverage rule was never enforced
+    # locally. A missing diff-cover is now a failure with a Fix: block.
     local diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
-    if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
+    if [ -f "$cov_file" ] && [ ! -x "$diff_cover_cmd" ]; then
+        echo "" >&2
+        echo "  FAILED: diff-cover not found for $pkg at $diff_cover_cmd" >&2
+        echo "  The >= 90% diff-coverage gate cannot run. diff-cover is in the" >&2
+        echo "  package's [dev] extras (#4719); this venv predates that." >&2
+        echo "  Fix:" >&2
+        if [[ "$pkg" == infra/* ]]; then
+            echo "    $pkg_dir/.venv/bin/pip install diff-cover" >&2
+        else
+            echo "    scripts/install-package-venv.sh $pkg" >&2
+        fi
+        failures=$((failures + 1))
+    elif [ -f "$cov_file" ]; then
         echo "pre-push: checking diff coverage for '$pkg'..." >&2
         if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                 --compare-branch=origin/main \

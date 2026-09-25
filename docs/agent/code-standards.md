@@ -316,7 +316,7 @@ Even with unique issue-number markers, a 3-way git merge can silently discard on
 
 ### Coverage gates (enforced in CI)
 
-- **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
+- **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript). `.githooks/pre-push` runs the same gate locally for every Python package with code changes, using `packages/<pkg>/.venv/bin/diff-cover` from the package's `[dev]` extras. If that binary is missing, the push fails with a `Fix:` block. Re-run `scripts/install-package-venv.sh <pkg>` to install it (#4719).
 - **Coverage floor ratchet:** overall package coverage must not decrease below the baseline in `coverage-baselines.json`. The floor only goes up — when coverage increases, update the baselines with `scripts/update-coverage-baselines.py`.
 - Pre-push only enforces the floor when `coverage/lcov.info` (or `coverage.xml`) is newer than every source file under `src/` and `tests/`. A scoped `npm test -- --coverage <files>` produces a stale-relative-to-source report; pre-push detects this and emits a warning instead of failing — re-run the full coverage command before pushing.
 

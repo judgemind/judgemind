@@ -45,6 +45,8 @@
 #  34. a job that dies without reporting a result fails the push (#4708)
 #  35. xdist gated by PREPUSH_XDIST_PKGS + venv; timing summary printed (#4708)
 #  36. default check-log dir is per checkout, not a shared /tmp path (#4708)
+#  37. missing diff-cover fails the push with a Fix: block, not a silent skip (#4719)
+#  38. every packages/*/pyproject.toml lists diff-cover in [dev] (#4719)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -733,6 +735,10 @@ echo "sentinel-coverage-2548" > coverage.xml
 exit 0
 PYTEST
 chmod +x "$WORK/packages/testpkg/.venv/bin/pytest"
+
+# Stub diff-cover: passes. A missing diff-cover fails the push (#4719).
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/packages/testpkg/.venv/bin/diff-cover"
+chmod +x "$WORK/packages/testpkg/.venv/bin/diff-cover"
 
 git -C "$WORK" add packages/testpkg
 git -C "$WORK" commit --quiet -m "feat: add testpkg"
@@ -1469,18 +1475,20 @@ fi
 # the scenario exercises the hook's wiring, not real ruff/pytest.
 # ───────────────────────────────────────────────────────────────────────
 
-# seed_stub_venv <ruff_rc> <pytest_rc> [diff_cover_rc]
-# Writes stub ruff / pytest (and optionally diff-cover) into
-# packages/testpkg/.venv/bin. The pytest stub records its argv to
-# pytest-args.txt and writes a coverage.xml so the coverage gates run.
+# seed_stub_venv <ruff_rc> <pytest_rc> [diff_cover_rc|none]
+# Writes stub ruff / pytest / diff-cover into packages/testpkg/.venv/bin.
+# The pytest stub records its argv to pytest-args.txt and writes a
+# coverage.xml so the coverage gates run. diff-cover defaults to a
+# passing stub (a missing diff-cover fails the push, #4719); pass
+# "none" to leave it out.
 seed_stub_venv() {
-    local ruff_rc="$1" pytest_rc="$2" diff_cover_rc="${3-}"
+    local ruff_rc="$1" pytest_rc="$2" diff_cover_rc="${3-0}"
     local bin="$WORK/packages/testpkg/.venv/bin"
     mkdir -p "$bin"
     printf '#!/usr/bin/env bash\necho "stub ruff $*"\nexit %s\n' "$ruff_rc" > "$bin/ruff"
     printf '#!/usr/bin/env bash\necho "$*" > pytest-args.txt\necho "<coverage/>" > coverage.xml\necho "stub pytest failure marker"\nexit %s\n' "$pytest_rc" > "$bin/pytest"
     chmod +x "$bin/ruff" "$bin/pytest"
-    if [ -n "$diff_cover_rc" ]; then
+    if [ "$diff_cover_rc" != "none" ]; then
         printf '#!/usr/bin/env bash\necho "stub diff-cover: 42%% < 90%%"\nexit %s\n' "$diff_cover_rc" > "$bin/diff-cover"
         chmod +x "$bin/diff-cover"
     fi
@@ -1629,6 +1637,39 @@ else
     report_pass "default log dir is per checkout (#4708)"
 fi
 rm -rf /tmp/prepush-logs-work
+
+echo "[scenario 37] missing diff-cover fails the push with a Fix: block (#4719)"
+init_workspace
+commit_testpkg_code feature-no-diff-cover
+seed_stub_venv 0 0 none
+run_hook "refs/heads/feature-no-diff-cover $feat_sha refs/heads/feature-no-diff-cover $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a missing diff-cover to fail the push, not skip silently (#4719)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: diff-cover not found for testpkg"; then
+    report_fail "expected 'FAILED: diff-cover not found for testpkg' (#4719)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a 'Fix:' block (#4719)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/install-package-venv.sh testpkg"; then
+    report_fail "expected copy-pasteable 'scripts/install-package-venv.sh testpkg' in the Fix block (#4719)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "pre-push: 1 check(s) failed"; then
+    report_fail "expected exactly one failure counted (#4719)" "$hook_out"
+else
+    report_pass "missing diff-cover fails the push with a Fix: block (#4719)"
+fi
+
+echo "[scenario 38] every gated Python package lists diff-cover in its [dev] extras (#4719)"
+missing_pkgs=""
+for pyproj in "$REPO_ROOT"/packages/*/pyproject.toml; do
+    # The [dev] list runs from 'dev = [' to the first line that is just ']'.
+    if ! awk '/^dev = \[/{f=1; next} f && /^\]/{f=0} f' "$pyproj" | grep -q '"diff-cover'; then
+        missing_pkgs="$missing_pkgs $(basename "$(dirname "$pyproj")")"
+    fi
+done
+if [ -n "$missing_pkgs" ]; then
+    report_fail "diff-cover missing from [dev] extras of:$missing_pkgs — the pre-push diff-coverage gate would fail on a fresh venv (#4719)"
+else
+    report_pass "every packages/*/pyproject.toml lists diff-cover in [dev] (#4719)"
+fi
 
 # ───────────────────────────────────────────────────────────────────────
 # Summary
