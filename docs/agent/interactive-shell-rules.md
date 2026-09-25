@@ -51,7 +51,7 @@ The script uses Python's `shutil.copy2()` internally, which bypasses the platfor
 
 `git stash` stores refs in `$GIT_DIR/refs/stash`, which is a single per-clone stack shared across every worktree. A bare `git stash pop` in worktree A can silently apply a stash created by worktree B — your edits get overwritten and another agent's WIP lands in your diff. (Incident: #2749.)
 
-Always pop by explicit ref: run `git stash list` first, confirm `stash@{0}`'s subject contains your current branch, then `git stash pop stash@{0}`. Better yet, avoid stash entirely — use a throwaway commit (`git commit -am "WIP"`, do the thing, `git reset --soft HEAD~1`), which has no shared global state. The preflight hook blocks bare `pop` and `apply`.
+Always pop by explicit ref: run `git stash list` first, confirm `stash@{0}`'s subject contains your current branch, then `git stash pop stash@{0}` (or `git stash apply <sha>` with the stash commit's SHA — also an explicit ref, #4683). Better yet, avoid stash entirely — use a throwaway commit (`git commit -am "WIP"`, do the thing, `git reset --soft HEAD~1`), which has no shared global state. The preflight hook blocks bare `pop` and `apply`.
 
 ---
 
