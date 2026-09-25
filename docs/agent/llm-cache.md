@@ -27,7 +27,7 @@ llm-cache/{provider}-{model}/prompt-{prompt_hash}/pages/{page_hash}.json   →  
 ```
 
 - `{page_hash}` — SHA-256 of the rendered page PNG bytes plus the same scraper metadata as the document key. The per-page user message depends on that metadata.
-- The **raw LLM response** is stored, not parsed rows. A page-cache hit re-runs `_parse_page_rows`, so parser fixes apply to page-cached pages without a bust. If the stored text no longer parses, the entry is treated as a miss.
+- The **raw LLM response** is stored, not parsed rows. A page-cache hit re-runs `_parse_page_rows`, so parser fixes apply to page-cached pages without a bust. If the stored text no longer parses — including valid JSON of the wrong shape, or text that makes the parser raise (#4738) — the entry is treated as a miss: the page is re-extracted and its entry overwritten.
 - Page entries are read only when the document-level entry misses. `--bust-llm-cache` skips page reads too, but pages are still written.
 
 ### What gets cached and what does not (PDF path)
@@ -36,13 +36,15 @@ llm-cache/{provider}-{model}/prompt-{prompt_hash}/pages/{page_hash}.json   →  
 
 | Page status | Meaning | Page entry written? | Blocks document entry? |
 |---|---|---|---|
-| `ok` | API call succeeded and the response parsed as a JSON object/array. **Zero rows is still `ok`**: boilerplate/header-only pages are a valid result. | Yes | No |
-| `parse_error` | Response did not parse, even after one retry with `PAGE_JSON_RETRY_NUDGE` appended to the user message. | No | Yes |
+| `ok` | API call succeeded and the response parsed as a JSON object/array of the expected shape. **Zero rows is still `ok`**: boilerplate/header-only pages (`{"page_header": ..., "rulings": []}`) are a valid result. | Yes | No |
+| `parse_error` | Response did not parse, even after one retry with `PAGE_JSON_RETRY_NUDGE` appended to the user message. Valid JSON of the wrong shape also counts (#4738): a bare scalar, a `rulings`/`rows`/`entries` value that is null or not a list, a non-empty array with no row objects, or an object with no row array that is not itself a row. So does any exception raised by the parser. | No | Yes |
 | `api_error` | API call failed after `max_retries`. | No | Yes |
+
+A page's parse problems never propagate as exceptions: they stay local to the page, and the other pages' rulings are still returned (#4738). An array that mixes row objects with junk (`null`, strings) keeps its row objects and is `ok`.
 
 The document-level entry is written only when **every** page is `ok` and the join produced at least one ruling. A document with a failed page is never cached as complete, because that would permanently serve a partial ruling set (#3517). Its `ok` pages are page-cached, so the next run re-sends only the failed pages. Failures are never cached as "empty".
 
-Each PDF extraction logs `llm_extractor.pdf_pages_summary` with `total_pages`, `page_cache_hits`, `llm_pages` and `failed_pages`. Use it to see why a document missed the document-level cache. `llm_extractor.page_parse_retry` and `llm_extractor.page_parse_exhausted` record the JSON retry.
+Each PDF extraction logs `llm_extractor.pdf_pages_summary` with `total_pages`, `page_cache_hits`, `llm_pages` and `failed_pages`. Use it to see why a document missed the document-level cache. `llm_extractor.page_parse_retry` and `llm_extractor.page_parse_exhausted` record the JSON retry. `llm_extractor.page_shape_error` (with a `shape` field) records a valid-JSON response of the wrong shape, and `llm_extractor.page_parse_exception` records a parser exception (`source` is `llm` or `cache`).
 
 ## What re-runs on cache hit and what does NOT
 

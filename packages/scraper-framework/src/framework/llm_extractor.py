@@ -283,7 +283,8 @@ class _PageExtraction(NamedTuple):
 
     * ``"ok"`` — the API call succeeded and the response parsed as JSON.
       ``rows`` may be empty: a boilerplate-only page is a valid result.
-    * ``"parse_error"`` — the response did not parse, even after the
+    * ``"parse_error"`` — the response did not parse (or parsed to the
+      wrong shape, or the parser raised — #4738), even after the
       stricter-JSON retry.  ``raw_text`` holds the last response.
     * ``"api_error"`` — the API call failed after all retries.
 
@@ -296,10 +297,12 @@ class _PageExtraction(NamedTuple):
 
 
 # Appended to the per-page user message when a page's first response did not
-# parse as JSON (#4716).  The retry is bounded to one extra call per page.
+# parse as JSON (#4716) or parsed to the wrong shape, e.g. a null or non-list
+# "rulings" (#4738).  The retry is bounded to one extra call per page.
 PAGE_JSON_RETRY_NUDGE = (
-    "Your previous response for this page was not valid JSON. Respond with "
-    "ONLY a single valid JSON object in the required format: no prose, no "
+    "Your previous response for this page was not valid JSON in the required "
+    "format. Respond with ONLY a single valid JSON object in the required "
+    'format, where "rulings" is always an array of objects: no prose, no '
     'markdown. If the page has no rulings, return {"page_header": null, '
     '"rulings": []}.'
 )
@@ -3167,7 +3170,7 @@ class LlmExtractor:
             page_key = _content_hash_for_cache(img_bytes, metadata)
             page = None
             if self._cache is not None and not effective_bust:
-                page = self._cached_page(page_key, page_idx)
+                page = self._cached_page(page_key, page_idx, document_id)
             if page is not None:
                 page_cache_hits += 1
             else:
@@ -3571,9 +3574,11 @@ class LlmExtractor:
         Returns a :class:`_PageExtraction` whose ``status`` separates a
         complete result (``"ok"``, possibly with zero rows) from a failure
         (``"api_error"`` / ``"parse_error"``) so the caller can decide what
-        is cacheable (#4716).  A response that does not parse as JSON is
-        retried once with :data:`PAGE_JSON_RETRY_NUDGE` appended to the user
-        message before the page is reported as ``"parse_error"``.
+        is cacheable (#4716).  A response that does not parse as JSON, parses
+        to the wrong shape, or makes the parser raise (#4738) is retried once
+        with :data:`PAGE_JSON_RETRY_NUDGE` appended to the user message before
+        the page is reported as ``"parse_error"``.  Parse problems never
+        propagate as exceptions: they stay local to the page.
         """
         text_message = self._build_user_message_for_page(metadata)
         raw_text: str | None = None
@@ -3597,7 +3602,9 @@ class LlmExtractor:
             )
             if raw_text is None:
                 return _PageExtraction(status="api_error", rows=[])
-            ok, rows = _parse_page_rows_with_status(raw_text, page_index)
+            ok, rows = _parse_page_rows_guarded(
+                raw_text, page_index, document_id=document_id, source="llm"
+            )
             if ok:
                 return _PageExtraction(status="ok", rows=rows, raw_text=raw_text)
 
@@ -3609,13 +3616,22 @@ class LlmExtractor:
         )
         return _PageExtraction(status="parse_error", rows=[], raw_text=raw_text)
 
-    def _cached_page(self, page_key: str, page_index: int) -> _PageExtraction | None:
-        """Return a page-cache hit re-parsed with the current parser, or None."""
+    def _cached_page(
+        self, page_key: str, page_index: int, document_id: str | None = None
+    ) -> _PageExtraction | None:
+        """Return a page-cache hit re-parsed with the current parser, or None.
+
+        An entry that no longer parses — including one that is valid JSON of
+        the wrong shape, or that makes the parser raise — is a miss, so the
+        page is re-extracted and its entry overwritten (#4738).
+        """
         assert self._cache is not None
         raw_text = self._cache.get_page(PDF_PER_PAGE_PROMPT, page_key)
         if not isinstance(raw_text, str):
             return None
-        ok, rows = _parse_page_rows_with_status(raw_text, page_index)
+        ok, rows = _parse_page_rows_guarded(
+            raw_text, page_index, document_id=document_id, source="cache"
+        )
         if not ok:
             return None
         return _PageExtraction(status="ok", rows=rows, raw_text=raw_text)
@@ -4086,6 +4102,48 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     return _parse_page_rows_with_status(raw_text, page_index)[1]
 
 
+def _parse_page_rows_guarded(
+    raw_text: str, page_index: int, *, document_id: str | None = None, source: str
+) -> tuple[bool, list[dict]]:
+    """Parse a page response; any parser exception is a page parse failure.
+
+    Page parsing runs outside the API-retry block (#4716), so an exception
+    here would otherwise escape ``extract_from_pdf`` and abort the whole
+    document (#4738).  ``source`` is ``"llm"`` or ``"cache"`` for the log.
+    """
+    try:
+        return _parse_page_rows_with_status(raw_text, page_index)
+    except Exception as exc:
+        logger.error(
+            "llm_extractor.page_parse_exception",
+            page_index=page_index,
+            document_id=document_id,
+            source=source,
+            error=f"{type(exc).__name__}: {exc}",
+            raw_preview=raw_text[:200],
+        )
+        return False, []
+
+
+# Keys under which a per-page response may carry its row array, in priority
+# order, and the fields that mark a bare object as a single legacy row.
+_PAGE_ROW_LIST_KEYS = ("rulings", "rows", "entries")
+_PAGE_ROW_FIELDS = frozenset(
+    {"entry_number", "case_info", "case_number", "case_title", "ruling_text"}
+)
+
+
+def _page_shape_error(page_index: int, raw_text: str, shape: str) -> tuple[bool, list[dict]]:
+    """Log a valid-JSON-but-wrong-shape page response and report it unparsed."""
+    logger.warning(
+        "llm_extractor.page_shape_error",
+        page_index=page_index,
+        shape=shape,
+        raw_preview=raw_text[:200],
+    )
+    return False, []
+
+
 def _parse_page_rows_with_status(raw_text: str, page_index: int) -> tuple[bool, list[dict]]:
     """Parse LLM response for a single page into a list of row dicts.
 
@@ -4101,9 +4159,13 @@ def _parse_page_rows_with_status(raw_text: str, page_index: int) -> tuple[bool, 
     Also extracts ``page_header`` metadata if present.
 
     Returns ``(ok, rows)``.  ``ok`` is ``True`` when the response parsed as
-    a JSON object or array — including a valid page with zero rows — and
-    ``False`` when it could not be parsed (or parsed to a bare scalar), so
-    the caller can retry instead of treating the page as empty (#4716).
+    a JSON object or array of the expected shape — including a valid page
+    with zero rows — and ``False`` when it could not be parsed, so the caller
+    can retry instead of treating the page as empty (#4716).  Valid JSON of
+    the wrong shape is also ``False`` (#4738): a bare scalar, a row array
+    (``rulings`` / ``rows`` / ``entries``) that is null or not a list, a
+    non-empty array with no row objects, or an object with no row array
+    that is not itself a row.
     """
     cleaned = strip_llm_json_fences(raw_text)
 
@@ -4144,17 +4206,40 @@ def _parse_page_rows_with_status(raw_text: str, page_index: int) -> tuple[bool, 
             )
             return False, []
 
-    # Handle both list and dict responses.
+    # Handle both list and dict responses.  Any shape other than the ones
+    # below is a parse failure, NOT an empty page: the caller retries it and
+    # never caches it (#4738).  Before this check, ``{"rulings": null}`` made
+    # the ``for item in rows_raw`` loop raise TypeError out of
+    # ``extract_from_pdf``, losing every ruling in the document.
     page_header: dict | None = None
+    rows_raw: object
     if isinstance(parsed, dict):
         # Extract page_header if present.
         page_header = parsed.get("page_header")
-        # Get the rulings array.
-        rows_raw = parsed.get("rulings", parsed.get("rows", parsed.get("entries", [parsed])))
+        # Get the rulings array.  The first of the keys that is present wins,
+        # even when its value is null or not a list.
+        list_key = next((k for k in _PAGE_ROW_LIST_KEYS if k in parsed), None)
+        if list_key is not None:
+            rows_raw = parsed[list_key]
+        elif _PAGE_ROW_FIELDS.intersection(parsed):
+            # Legacy: a bare row object stands for a single-row page.
+            rows_raw = [parsed]
+        else:
+            # No rulings array and not a row: e.g. ``{}`` or a header-only
+            # ``{"page_header": {...}}`` that omitted ``"rulings": []``.
+            return _page_shape_error(page_index, raw_text, "missing_rulings_key")
     elif isinstance(parsed, list):
         rows_raw = parsed
     else:
-        return False, []
+        return _page_shape_error(page_index, raw_text, "scalar")
+
+    if not isinstance(rows_raw, list):
+        return _page_shape_error(page_index, raw_text, f"rulings_{type(rows_raw).__name__}")
+    if rows_raw and not any(isinstance(item, dict) for item in rows_raw):
+        # A non-empty array with no row objects at all is garbage, not an
+        # empty page.  A mixed array keeps its dict rows (non-dicts are
+        # skipped below).
+        return _page_shape_error(page_index, raw_text, "no_row_objects")
 
     rows: list[dict] = []
 
