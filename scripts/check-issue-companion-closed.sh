@@ -25,21 +25,23 @@
 #   4. Hand the body and the resolved state map to
 #      `_check_issue_companion_closed_inspect.py`. The helper:
 #        a. Splits the body into blank-line-delimited paragraph chunks.
-#        b. For each chunk, finds `#N` references and tests for
-#           companion-framing keywords (when, after, until, once, removed
-#           when, blocked on, blocked by, depends on) in the SAME chunk.
+#        b. For each chunk, finds `#N` references framed by an ADJACENT
+#           companion keyword (when, after, until, once, removed when,
+#           blocked on, blocked by, depends on): the keyword precedes the
+#           cite in the same clause, within a few words (#4685).
 #        c. If any companion-framed `#N` resolves to a `state == closed`
 #           AND `stateReason == COMPLETED` sibling, emits
 #           `companion-closed:<N>` (exit 0).
 #        d. Otherwise emits `clear:<reason>` (exit 1).
 #
-# Why per-paragraph framing: bare hashtags like "see #4408 for context"
-# or "Closes #4408" are not companion framing; they're informational
-# links. A paragraph-scoped check captures the canonical worked example
-# ("This is a temporary caveat that should be removed when the
-# structural fix in #4408 lands.") while avoiding false-fires on
-# unrelated cites elsewhere in the body. See issue #4557 §"Proposed
-# change" for the framing list.
+# Why keyword-adjacent framing: bare hashtags like "see #4408 for
+# context" or "Closes #4408" are not companion framing, and neither are
+# incident narratives that merely share a paragraph with a framing word
+# ("This happened during #4661 verification. Right after the deploy..."
+# — the #4665 false positive, #4685). The adjacency check captures the
+# canonical worked example ("should be removed when the structural fix
+# in #4408 lands.") while failing safe to "not done" otherwise. See
+# issue #4557 §"Proposed change" for the framing list.
 #
 # Why closed-AS-COMPLETED only: a `not_planned` close (operator decided
 # the work isn't needed) does NOT obsolete the dependent issue — it
