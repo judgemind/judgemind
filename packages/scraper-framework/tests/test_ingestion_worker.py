@@ -1472,6 +1472,92 @@ class TestScPdfSplitHeaderHearingDate:
         assert [c["hearing_date"] for c in children] == [None] * 3
 
 
+def _make_cc_prefix_event(**overrides: object) -> dict:
+    """Return a Contra Costa legacy-PDF event as prefix-mode reingest /
+    rebuild_db build it: no source_url, no hearing_date (#4769)."""
+    base: dict = {
+        "document_id": "aaaaaaaa-0000-0000-0000-000000004769",
+        "scraper_id": "reingest-ca-contra_costa",
+        "state": "CA",
+        "county": "Contra Costa",
+        "court": "Superior Court",
+        "source_url": "",
+        "content_format": "pdf",
+        "content_hash": "cc4769",
+        "s3_key": None,
+        "s3_bucket": "judgemind-document-archive-dev",
+        "ruling_text": "",
+        "hearing_date": None,
+        "capture_timestamp": "2026-04-09T13:16:10+00:00",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestCcHeaderHearingDate:
+    """#4769: Contra Costa events from prefix-mode reingest / rebuild_db carry
+    no hearing_date and no source_url (so no filename date).  The live scraper
+    hands the LLM the header date as authoritative metadata; without it, the
+    rebuilt split children were left with NULL or body-text dates (138 dev
+    rulings).  The worker must derive the date from the ``HEARING DATE:``
+    header before the split, and never fall back to a body date."""
+
+    _HEADER = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "MARTINEZ, CA\n"
+        "DEPARTMENT 10\n"
+        "JUDICIAL OFFICER: JULIA CAMPINS\n"
+        "HEARING DATE: 04/09/2026\n"
+    )
+    _BODY = "The hearing is continued to May 4, 2026 at 9:00 a.m.\n"
+
+    def _split_input(self, **overrides: object) -> dict:
+        worker, _ = _make_worker()
+        seen: list[dict] = []
+
+        def fake_split(event_data: dict, *_a: object, **_k: object) -> bool:
+            seen.append(event_data)
+            return True
+
+        worker._llm_split_document = fake_split  # type: ignore[method-assign]
+        worker.process_event(_make_cc_prefix_event(**overrides))
+        assert len(seen) == 1
+        return seen[0]
+
+    def test_issue_4769_process_event_sets_header_date_before_llm_split(self) -> None:
+        event = self._split_input(ruling_text=self._HEADER + self._BODY)
+        assert event["hearing_date"] == "2026-04-09"
+
+    def test_issue_4769_unpadded_header_date(self) -> None:
+        event = self._split_input(
+            ruling_text=self._HEADER.replace("04/09/2026", "3/5/2026") + self._BODY
+        )
+        assert event["hearing_date"] == "2026-03-05"
+
+    def test_issue_4769_probate_calendar_header(self) -> None:
+        event = self._split_input(
+            ruling_text="COURT CALENDAR FOR MARCH 16, 2026\nN25-2307 IN THE MATTER OF: X\n"
+        )
+        assert event["hearing_date"] == "2026-03-16"
+
+    def test_issue_4769_scraper_hearing_date_still_wins(self) -> None:
+        event = self._split_input(hearing_date="2026-04-10", ruling_text=self._HEADER)
+        assert event["hearing_date"] == "2026-04-10"
+
+    def test_issue_4769_body_date_not_hearing_date(self) -> None:
+        event = self._split_input(ruling_text="DEPARTMENT 10\n" + self._BODY)
+        assert event["hearing_date"] is None
+
+    def test_issue_4769_header_helper_gates_county_and_format(self) -> None:
+        from ingestion.worker import _cc_header_hearing_date
+
+        text = self._HEADER
+        assert _cc_header_hearing_date(_make_cc_prefix_event(county="Orange"), text) is None
+        assert _cc_header_hearing_date(_make_cc_prefix_event(content_format="txt"), text) is None
+        assert _cc_header_hearing_date(_make_cc_prefix_event(), "") is None
+        assert _cc_header_hearing_date(_make_cc_prefix_event(), text) == "2026-04-09"
+
+
 # ---------------------------------------------------------------------------
 # San Francisco family-law PDF splitter — _try_sf_pdf_split (#4304)
 # ---------------------------------------------------------------------------
