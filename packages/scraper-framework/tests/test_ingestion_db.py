@@ -3388,9 +3388,10 @@ class TestDeleteStaleSplitChildren:
         )
         assert result == 1
 
-        # Should have executed queries: SELECT stale, DELETE alert_events,
+        # Should have executed queries: SELECT stale, 2x UPDATE alert_events
+        # (detach, #4700), UPDATE documents.previous_version_id,
         # DELETE validation_results, DELETE rulings, DELETE documents
-        assert cur.execute.call_count == 5
+        assert cur.execute.call_count == 7
 
     def test_no_stale_children_returns_zero(self) -> None:
         """Should return 0 and not delete when no stale children found."""
@@ -3435,7 +3436,7 @@ class TestDeleteStaleSplitChildren:
         cur.execute.assert_not_called()
 
     def test_cascades_to_dependent_tables(self) -> None:
-        """Should delete from alert_events, validation_results, rulings before documents."""
+        """Detaches alert_events, then deletes validation_results, rulings, documents."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         stale_id = "cccccccc-5555-5555-5555-cccccccccccc"
@@ -3449,12 +3450,137 @@ class TestDeleteStaleSplitChildren:
         )
 
         # Extract SQL from execute calls (after the SELECT)
-        sql_calls = [call[0][0].strip() for call in cur.execute.call_args_list[1:]]
-        assert len(sql_calls) == 4
-        assert "alert_events" in sql_calls[0]
-        assert "validation_results" in sql_calls[1]
-        assert "rulings" in sql_calls[2]
-        assert "DELETE FROM documents" in sql_calls[3]
+        sql_calls = [" ".join(call[0][0].split()) for call in cur.execute.call_args_list[1:]]
+        assert len(sql_calls) == 6
+        assert sql_calls[0].startswith("UPDATE alert_events SET ruling_id = NULL")
+        assert sql_calls[1].startswith("UPDATE alert_events SET document_id")
+        assert sql_calls[2].startswith("UPDATE documents SET previous_version_id = NULL")
+        assert "DELETE FROM validation_results" in sql_calls[3]
+        assert "DELETE FROM rulings" in sql_calls[4]
+        assert "DELETE FROM documents" in sql_calls[5]
+
+    def test_split_set_change_never_deletes_alert_events(self) -> None:
+        """#4700: ``public.alert_events`` is authoritative user state.  Stale
+        split children detach their alerts instead of deleting them."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [("cccccccc-5555-5555-5555-cccccccccccc",)]
+        cur.rowcount = 1
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[],
+        )
+
+        for call in cur.execute.call_args_list:
+            assert "DELETE FROM alert_events" not in call[0][0]
+
+    def test_split_set_change_repoints_alerts_at_parent(self) -> None:
+        """Alerts on a removed child are re-pointed at the stable parent
+        document id (NULL when the parent is itself being removed)."""
+        parent = "dddddddd-5555-5555-5555-dddddddddddd"
+        stale = "cccccccc-5555-5555-5555-cccccccccccc"
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [(stale,)]
+        cur.rowcount = 1
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[],
+            parent_document_id=parent,
+        )
+        repoint = cur.execute.call_args_list[2]
+        assert "UPDATE alert_events SET document_id" in " ".join(repoint[0][0].split())
+        assert repoint[0][1] == (parent, [stale])
+
+        # Parent itself stale (e.g. an earlier single-ruling parent row):
+        # the alert cannot point at a row being deleted, so it goes NULL.
+        conn2 = _mock_conn()
+        cur2 = conn2.cursor.return_value.__enter__.return_value
+        cur2.fetchall.return_value = [(stale,), (parent,)]
+        cur2.rowcount = 2
+        delete_stale_split_children(
+            conn2,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[],
+            parent_document_id=parent,
+        )
+        assert cur2.execute.call_args_list[2][0][1] == (None, [stale, parent])
+
+    def test_split_set_change_reports_deleted_ids(self) -> None:
+        """The caller can collect the removed ids (for OpenSearch cleanup)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        stale = "cccccccc-5555-5555-5555-cccccccccccc"
+        cur.fetchall.return_value = [(stale,)]
+        cur.rowcount = 1
+        out: list[str] = []
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[],
+            deleted_ids=out,
+        )
+        assert out == [stale]
+
+
+class TestSplitSetChangeRelinkCase:
+    """#4700: ``relink_case=True`` lets a re-derived case link win for a
+    reused split-child id (the default live path stays preserve-first)."""
+
+    def _call(self, conn: MagicMock, *, relink_case: bool) -> None:
+        insert_document_and_ruling(
+            conn,
+            document_id="eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
+            case_id="case-new",
+            court_id="court-1",
+            content_format="pdf",
+            content_hash="h",
+            s3_key="k",
+            s3_bucket="b",
+            source_url="",
+            scraper_id="reingest-ca-santa_clara",
+            captured_at=datetime(2026, 3, 1),
+            hearing_date=date(2026, 3, 5),
+            ruling_text="The motion is GRANTED.",
+            relink_case=relink_case,
+        )
+
+    def test_split_set_change_relink_overwrites_document_case_id(self) -> None:
+        conn = _mock_conn()
+        self._call(conn, relink_case=True)
+        assert "case_id = EXCLUDED.case_id" in _insert_document_sql(conn)
+
+    def test_split_set_change_relink_replaces_ruling_of_other_case(self) -> None:
+        """The old ruling row (linked to a different case) is removed, its
+        alerts detached (not deleted), before the fresh ruling insert."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        self._call(conn, relink_case=True)
+
+        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
+        detach = next(i for i, s in enumerate(sqls) if s.startswith("UPDATE alert_events"))
+        delete = next(i for i, s in enumerate(sqls) if s.startswith("DELETE FROM rulings"))
+        insert = next(i for i, s in enumerate(sqls) if "INSERT INTO rulings" in s)
+        assert detach < delete < insert
+        assert "case_id <> %s::uuid" in sqls[delete]
+        assert cur.execute.call_args_list[delete][0][1] == (
+            "eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
+            "case-new",
+        )
+        assert not any("DELETE FROM alert_events" in s for s in sqls)
+
+    def test_split_set_change_default_keeps_preserve_first(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        self._call(conn, relink_case=False)
+        assert "COALESCE(documents.case_id, EXCLUDED.case_id)" in _insert_document_sql(conn)
+        sqls = [c[0][0] for c in cur.execute.call_args_list]
+        assert not any("DELETE FROM rulings" in s for s in sqls)
 
 
 # ---------------------------------------------------------------------------

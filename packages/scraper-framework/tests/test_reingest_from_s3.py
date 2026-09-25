@@ -15720,3 +15720,226 @@ class TestCacheBustPrefixDefaultGateExit:
         argv = ["reingest_from_s3", "--county", "Fresno", "--bust-llm-cache"]
         with patch("sys.argv", argv):
             reingest.main()  # standard mode → opt-in contract → no SystemExit
+
+
+# ---------------------------------------------------------------------------
+# #4700 — prefix reingest after a split-set change
+# ---------------------------------------------------------------------------
+#
+# Prefix-mode reingest (``run_reingest_from_prefix`` ->
+# ``_process_prefix_document``) hands every S3 object to
+# ``IngestionWorker.process_event``.  When a splitter change alters a
+# document's split set (e.g. LLM split -> the deterministic Santa Clara
+# table-layout split, #4681/#4696), the worker must fully replace that
+# document's derived rows:
+#
+#   1. Surplus old children (indices the new split no longer produces) are
+#      removed on EVERY split path, not just the framework-LLM path.
+#   2. A reused child row (same ``make_split_document_id(parent, idx)``)
+#      takes the re-derived case link instead of keeping the old one.
+
+
+def _split_set_change_worker() -> Any:
+    from ingestion.worker import IngestionWorker
+
+    os_mock = MagicMock()
+    os_mock.indices.exists.return_value = False
+    worker = IngestionWorker(
+        redis_client=MagicMock(),
+        pg_dsn="postgresql://localhost/test",
+        opensearch_client=os_mock,
+        s3_client=MagicMock(),
+        archive_bucket="test-bucket",
+    )
+    worker._enrichment_client = None
+    return worker
+
+
+def _sc_prefix_event(content_hash: str = "b" * 64) -> dict[str, Any]:
+    parsed = {
+        "state": "ca",
+        "county": "santa_clara",
+        "court": "superior_court",
+        "content_hash": content_hash,
+        "ext": "pdf",
+    }
+    key = f"ca/santa_clara/superior_court/{content_hash}.pdf"
+    return reingest._build_prefix_event(key, b"%PDF-1.4 fake", parsed, "test-bucket")
+
+
+def _split_set_change_conn(case_id: str) -> MagicMock:
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.closed = False
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), (case_id,)] + [None] * 20
+    return mock_conn
+
+
+class TestSplitSetChange:
+    """#4700: a prefix reingest after a split-set change replaces the
+    document's derived rows (surplus children removed, case links re-derived)."""
+
+    def test_split_set_change_deterministic_split_removes_surplus_children(self) -> None:
+        """The deterministic Santa Clara split path cleans stale children
+        BEFORE dispatching the first child, with exactly the new child ids."""
+        from courts.ca.sc_tentatives import SplitRuling
+
+        worker = _split_set_change_worker()
+        event = _sc_prefix_event()
+        parent_id = event["document_id"]
+
+        new_split = [
+            SplitRuling(ruling_index=1, case_number="24CV000001", ruling_text="A granted."),
+            SplitRuling(ruling_index=2, case_number="24CV000002", ruling_text="B denied."),
+        ]
+        order: list[str] = []
+        calls: list[tuple[str, list[str], dict[str, Any]]] = []
+
+        def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+            order.append("cleanup")
+            calls.append((s3_key, list(valid_ids), kwargs))
+            return 8
+
+        def _fake_dispatch(ev: dict[str, Any]) -> None:
+            order.append(f"dispatch:{ev['_split_index']}")
+
+        with (
+            patch("courts.ca.sc_tentatives._split_rulings", return_value=new_split),
+            patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
+            patch("ingestion.worker.psycopg"),
+            patch.object(worker, "process_event", side_effect=_fake_dispatch),
+        ):
+            handled = worker._llm_split_document(
+                event,
+                parent_id,
+                "Line 1 ...",
+                "CA",
+                "Santa Clara",
+                raw_pdf_bytes=b"%PDF-1.4 fake",
+            )
+
+        assert handled is True
+        assert order == ["cleanup", "dispatch:0", "dispatch:1"]
+        assert len(calls) == 1
+        s3_key, valid_ids, kwargs = calls[0]
+        assert s3_key == event["s3_key"]
+        assert valid_ids == [
+            make_split_document_id(parent_id, 0),
+            make_split_document_id(parent_id, 1),
+        ]
+        # Alerts on removed children are re-pointed at the stable parent id.
+        assert kwargs.get("parent_document_id") == parent_id
+
+    def test_split_set_change_removed_children_leave_search_index(self) -> None:
+        """Removed children are dropped from OpenSearch too."""
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = _sc_prefix_event()
+
+        def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+            kwargs["deleted_ids"].extend(["stale-1", "stale-2"])
+            return 2
+
+        with (
+            patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
+            patch("ingestion.worker.psycopg"),
+        ):
+            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+
+        worker._indexer.delete_documents.assert_called_once_with(["stale-1", "stale-2"])
+
+    def test_split_set_change_cleanup_failure_rolls_back(self) -> None:
+        """A failed cleanup rolls the connection back so the child inserts
+        that follow do not run in an aborted transaction."""
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = _sc_prefix_event()
+
+        with (
+            patch("ingestion.worker.delete_stale_split_children", side_effect=RuntimeError("x")),
+            patch("ingestion.worker.psycopg") as mock_psycopg,
+        ):
+            conn = MagicMock()
+            conn.closed = False
+            mock_psycopg.connect.return_value = conn
+            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+
+        conn.rollback.assert_called_once()
+        worker._indexer.delete_documents.assert_not_called()
+
+    def test_split_set_change_split_child_ids(self) -> None:
+        """A single-case split (child id == parent id) keeps only the parent,
+        so every old v5 split child of the key is stale; a multi split keeps
+        exactly ``make_split_document_id(parent, 0..N-1)``."""
+        from ingestion.worker import split_child_ids_for_event
+
+        parent = "11111111-1111-5111-8111-111111111111"
+        single = {"document_id": parent, "_split_count": 1}
+        assert split_child_ids_for_event(single, parent) == [parent]
+
+        multi = {"document_id": make_split_document_id(parent, 0), "_split_count": 3}
+        assert split_child_ids_for_event(multi, parent) == [
+            make_split_document_id(parent, i) for i in range(3)
+        ]
+
+    def test_split_set_change_reused_child_relinks_case(self) -> None:
+        """A split child's DB write lets the re-derived case link win
+        (``relink_case=True``): a reused child id must not keep the old
+        case_id via the preserve-first COALESCE."""
+        worker = _split_set_change_worker()
+        event = _sc_prefix_event()
+        parent_id = event["document_id"]
+        child = {
+            **event,
+            "document_id": make_split_document_id(parent_id, 0),
+            "_original_document_id": parent_id,
+            "_split_processed": True,
+            "_llm_extracted": True,
+            "_split_index": 0,
+            "_split_count": 2,
+            "ruling_text": "The demurrer is SUSTAINED.",
+            "case_number": "24CV000001",
+            "case_title": "Alpha v. Beta",
+            "hearing_date": "2026-03-05",
+            "outcome": "sustained",
+            "motion_type": "demurrer",
+        }
+
+        with (
+            patch("ingestion.worker.psycopg") as mock_psycopg,
+            patch("ingestion.worker.resolve_judge", return_value=None),
+            patch("ingestion.worker.batch_upsert_parties"),
+            patch("ingestion.worker.insert_document_and_ruling", return_value=False) as mock_ins,
+        ):
+            mock_psycopg.connect.return_value = _split_set_change_conn("case-uuid-new")
+            worker.process_event(child)
+
+        mock_ins.assert_called_once()
+        assert mock_ins.call_args.kwargs.get("relink_case") is True
+
+    def test_split_set_change_unsplit_document_keeps_preserve_first(self) -> None:
+        """A regular (non-split) document keeps the live preserve-first
+        identity semantics: ``relink_case`` is only for split children."""
+        worker = _split_set_change_worker()
+        event = {
+            **_sc_prefix_event(),
+            "_llm_extracted": True,
+            "content_format": "html",
+            "ruling_text": "The motion is GRANTED.",
+            "case_number": "24CV000009",
+            "hearing_date": "2026-03-05",
+        }
+
+        with (
+            patch("ingestion.worker.psycopg") as mock_psycopg,
+            patch("ingestion.worker.resolve_judge", return_value=None),
+            patch("ingestion.worker.batch_upsert_parties"),
+            patch("ingestion.worker.insert_document_and_ruling", return_value=False) as mock_ins,
+        ):
+            mock_psycopg.connect.return_value = _split_set_change_conn("case-uuid-1")
+            worker.process_event(event)
+
+        mock_ins.assert_called_once()
+        assert mock_ins.call_args.kwargs.get("relink_case", False) is False

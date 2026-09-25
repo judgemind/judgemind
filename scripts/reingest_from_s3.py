@@ -70,6 +70,14 @@ For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
 --county <name>`` over reingest — rebuild walks S3 directly and does not
 touch existing ``cases.*`` rows when the split set changes across runs.
 
+Prefix mode (``--prefix`` / ``--s3-key-list``) runs each object through
+``IngestionWorker.process_event``, which fully replaces a split document's
+child rows when the split set changes (#4700): children the new split no
+longer produces are deleted (alerts detached, never deleted), and a reused
+child id takes the re-derived case link.  A splitter change therefore needs
+only a targeted prefix reingest of the affected keys, not ``rebuild_db.py
+--reset``.  Old ``cases`` rows that lose their last ruling are left in place.
+
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
 extraction logic, and pushes a synthetic DocumentCapturedEvent through the

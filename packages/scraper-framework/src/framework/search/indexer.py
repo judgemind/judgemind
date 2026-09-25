@@ -34,7 +34,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from opensearchpy import helpers
-from opensearchpy.exceptions import AuthorizationException, ConnectionTimeout, TransportError
+from opensearchpy.exceptions import (
+    AuthorizationException,
+    ConnectionTimeout,
+    NotFoundError,
+    TransportError,
+)
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
 
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
@@ -210,6 +215,32 @@ class IndexingConsumer:
             os_doc["court"],
         )
         return True
+
+    def delete_documents(self, document_ids: list[str]) -> int:
+        """Remove documents from the index by id, best-effort.
+
+        Used when stale split children are deleted from ``derived.documents``
+        (#4700) so search stops returning rulings that no longer exist.  A
+        missing id is not an error.  Any OpenSearch error is logged and
+        swallowed: the index is derivable from ``derived.*``, and the
+        Postgres cleanup must not fail because of it.
+
+        Returns the number of ids OpenSearch reported as deleted.
+        """
+        removed = 0
+        for document_id in document_ids:
+            try:
+                self._os.delete(index=self._index, id=document_id)
+                removed += 1
+            except NotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "OpenSearch delete skipped for stale document %s: %s",
+                    document_id,
+                    exc,
+                )
+        return removed
 
     def index_batch(self, events: list[dict[str, Any]]) -> int:
         """Index a batch of documents using the OpenSearch bulk API.

@@ -471,6 +471,7 @@ def insert_document(
     hearing_date: date | None,
     *,
     force_update: bool = False,
+    relink_case: bool = False,
 ) -> bool:
     """Upsert a document row using the scraper-assigned document_id as the PK.
 
@@ -514,6 +515,12 @@ def insert_document(
     unconditionally, so ``reingest_from_s3.py`` can deliberately re-route a
     document to a corrected case or replace a stuck hearing date after an
     extraction-logic fix.
+
+    **``relink_case=True`` — split children (#4700):** only ``case_id`` is
+    overwritten with ``EXCLUDED.case_id``; ``hearing_date`` keeps the default
+    semantics.  A split child's id is ``make_split_document_id(parent, idx)``,
+    which names a slot in the split, not a case.  When the split set changes,
+    the case at that slot is re-derived and must replace the old link.
     """
     # Map ContentFormat string to PostgreSQL document_format enum value
     format_map = {"html": "html", "pdf": "pdf", "docx": "docx", "text": "txt"}
@@ -535,6 +542,8 @@ def insert_document(
             "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)"
         )
         case_id_clause = "case_id = COALESCE(documents.case_id, EXCLUDED.case_id)"
+    if relink_case:
+        case_id_clause = "case_id = EXCLUDED.case_id"
 
     sql = f"""
         INSERT INTO documents (
@@ -2238,6 +2247,7 @@ def insert_document_and_ruling(
     summary_model: str | None = None,
     summary_generated_at: datetime | None = None,
     force_update: bool = False,
+    relink_case: bool = False,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
 
@@ -2270,9 +2280,35 @@ def insert_document_and_ruling(
       of ``force_update`` — we never erase a good ruling text just because a
       re-extraction happened to miss it.
 
+    ``relink_case`` (default False) is for split children, whose id names a
+    slot in the split rather than a case (#4700).  When set, a re-derived
+    case link wins: ``documents.case_id`` is overwritten, and an existing
+    ruling row for this document linked to a *different* case is removed
+    (its alerts detached, never deleted) so the ruling is re-inserted fresh
+    for the new case instead of carrying the old case's fields and text.
+    A ruling already on the same case is updated in place as usual.
+
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).
     """
+    if relink_case:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
+                "(SELECT id FROM rulings WHERE document_id = %s::uuid AND case_id <> %s::uuid)",
+                (document_id, case_id),
+            )
+            cur.execute(
+                "DELETE FROM rulings WHERE document_id = %s::uuid AND case_id <> %s::uuid",
+                (document_id, case_id),
+            )
+            removed = cur.rowcount
+            if isinstance(removed, int) and removed > 0:
+                logger.info(
+                    "insert_document_and_ruling: split child relinked to a new case",
+                    extra={"document_id": document_id, "case_id": case_id},
+                )
+
     is_new = insert_document(
         conn,
         document_id=document_id,
@@ -2287,6 +2323,7 @@ def insert_document_and_ruling(
         captured_at=captured_at,
         hearing_date=hearing_date,
         force_update=force_update,
+        relink_case=relink_case,
     )
 
     insert_ruling(
@@ -2314,13 +2351,18 @@ def delete_stale_split_children(
     conn: psycopg.Connection,
     s3_key: str,
     valid_document_ids: list[str],
+    *,
+    parent_document_id: str | None = None,
+    deleted_ids: list[str] | None = None,
 ) -> int:
     """Delete split-child document records that are no longer valid.
 
-    When a multi-case PDF is re-processed and the LLM extracts a different
-    number of rulings, old split-child documents beyond the new split count
-    become orphans.  This function proactively removes them before the new
-    split events are inserted.
+    When a multi-case PDF is re-processed and the split produces a different
+    set of rulings (a different LLM result, or a splitter change such as the
+    Santa Clara LLM split -> deterministic table split, #4700), old
+    split-child documents beyond the new split count become orphans.  The
+    worker calls this before dispatching the new split events, on every
+    split path.
 
     A document is eligible for deletion when:
       1. It shares the same ``s3_key`` as the document being re-processed.
@@ -2328,8 +2370,14 @@ def delete_stale_split_children(
       3. Its ``id`` is NOT in the ``valid_document_ids`` list (the new set
          of split IDs that will be created/upserted by this processing run).
 
-    Cascade-deletes dependent rows in: ``rulings``, ``alert_events``,
-    ``validation_results``.
+    Deletes dependent ``derived.*`` / telemetry rows in ``rulings`` and
+    ``validation_results``.  ``public.alert_events`` is authoritative user
+    state and its FKs to ``documents`` / ``rulings`` do not cascade, so
+    alerts are never deleted here (#4700): ``ruling_id`` is set to NULL and
+    ``document_id`` is re-pointed at ``parent_document_id`` (the stable
+    parent row, when it exists and is not itself being removed) or NULL.
+    The digest query LEFT JOINs ``rulings``, so a detached alert still
+    renders.
 
     Args:
         conn: Active database connection (caller manages transaction).
@@ -2337,6 +2385,10 @@ def delete_stale_split_children(
             children.
         valid_document_ids: The document IDs that will be created/upserted
             in this processing run.  These are NOT deleted.
+        parent_document_id: The split parent's document id.  Alerts on a
+            removed child are re-pointed here.
+        deleted_ids: Optional list the removed document ids are appended to,
+            so the caller can drop them from the search index.
 
     Returns:
         The number of document rows deleted.
@@ -2368,10 +2420,18 @@ def delete_stale_split_children(
     if not stale_ids:
         return 0
 
+    # Alerts on a removed child are re-pointed at the parent unless the
+    # parent row is itself stale (an earlier single-ruling run's parent row).
+    alert_target = (
+        parent_document_id if parent_document_id and parent_document_id not in stale_ids else None
+    )
+
     with conn.cursor() as cur:
-        # Cascade-delete dependent rows first.
+        _detach_alerts_from_documents(cur, stale_ids, alert_target)
+        # Old versions pointing at a removed row would block the DELETE.
         cur.execute(
-            "DELETE FROM alert_events WHERE document_id = ANY(%s::uuid[])",
+            "UPDATE documents SET previous_version_id = NULL "
+            "WHERE previous_version_id = ANY(%s::uuid[])",
             (stale_ids,),
         )
         cur.execute(
@@ -2389,12 +2449,42 @@ def delete_stale_split_children(
         )
         deleted = cur.rowcount
 
+    if deleted_ids is not None:
+        deleted_ids.extend(stale_ids)
+
     logger.info(
         "delete_stale_split_children: removed %d stale split-child document(s)",
         deleted,
         extra={"s3_key": s3_key, "stale_ids": stale_ids},
     )
     return deleted
+
+
+def _detach_alerts_from_documents(
+    cur: psycopg.Cursor,
+    document_ids: list[str],
+    repoint_document_id: str | None,
+) -> None:
+    """Detach ``public.alert_events`` from documents about to be removed.
+
+    ``alert_events.document_id`` / ``ruling_id`` reference ``documents`` /
+    ``rulings`` without ``ON DELETE CASCADE``.  Alerts are authoritative user
+    state (not rebuildable from S3), so a derived-row cleanup must never
+    delete them (#4700).  This sets ``ruling_id`` to NULL for alerts on the
+    documents' rulings, and points ``document_id`` at *repoint_document_id*
+    if that row exists, else NULL.
+    """
+    cur.execute(
+        "UPDATE alert_events SET ruling_id = NULL "
+        "WHERE ruling_id IN (SELECT id FROM rulings WHERE document_id = ANY(%s::uuid[]))",
+        (document_ids,),
+    )
+    cur.execute(
+        "UPDATE alert_events SET document_id = "
+        "(SELECT id FROM documents WHERE id = %s::uuid) "
+        "WHERE document_id = ANY(%s::uuid[])",
+        (repoint_document_id, document_ids),
+    )
 
 
 def normalize_party_name(raw_name: str) -> str:
