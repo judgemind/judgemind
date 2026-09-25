@@ -128,6 +128,11 @@ class SDPipelineScraper(BaseScraper):
         2. Extract and deduplicate case numbers from Phase 1 results.
         3. Run Phase 2 with those case numbers to fetch tentative rulings.
         4. Return Phase 2 documents.
+
+        Phase 2 raises ``ScraperPreconditionFailure`` when the ROA portal's
+        anti-bot layer blocks it. The exception propagates on purpose, so the
+        pipeline run is recorded as a failure instead of ``success`` with 0
+        records (#4673).
         """
         # Phase 1: enumerate calendar hearings
         phase1 = self._create_phase1_scraper(

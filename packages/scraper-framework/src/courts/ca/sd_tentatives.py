@@ -21,6 +21,21 @@ Cloudflare challenge:
   - Stealth mode required to pass JS challenge
   - Residential proxy may be needed for datacenter IPs
 
+Observed anti-bot responses (live probe, 2026-09-25, #4673):
+  - Through the Bright Data residential proxy, Chromium gets a Cloudflare
+    challenge page (``window._cf_chl_opt.cType == 'interactive'``). Solving it
+    needs POSTs to ``/cdn-cgi/challenge-platform/...``. The zone runs in
+    Bright Data's "immediate access (no KYC)" mode, which rejects every POST
+    with HTTP 402 and ``x-brd-err-code: policy_20130``, so no browser can solve
+    the challenge through this proxy until KYC is complete.
+  - Without the proxy (AWS NAT, and also residential IPs that were flagged
+    earlier), the court's Cloudflare WAF returns its own block page, "Your
+    access has exceeded our rate limiting for this application", even on the
+    first request.
+  Both conditions are now detected and logged by name, and the run is recorded
+  as a failure (``ScraperPreconditionFailure``) rather than ``success`` with 0
+  records.
+
 Investigation: #154
 Parent issue: #672
 Report: docs/investigations/san-diego-scraper-2026-03.md
@@ -40,6 +55,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.base import ScraperPreconditionFailure
 from framework.browser import apply_stealth as _apply_stealth
 from framework.browser import playwright_proxy_settings
 from framework.events import EventBus
@@ -66,6 +82,26 @@ CF_MAX_RETRIES = 3
 
 # Seconds between cf_clearance cookie poll checks during challenge resolution.
 CF_POLL_INTERVAL = 2.0
+
+# Seconds to pause between Cloudflare solve attempts.
+CF_RETRY_PAUSE = 3.0
+
+# Stop querying the portal after this many consecutive case lookups come back
+# blocked (challenge or rate-limit page). More requests only extend the block.
+MAX_CONSECUTIVE_BLOCKED_LOOKUPS = 5
+
+# Text of the SD court's Cloudflare WAF block page (#4673). It is a block, not a
+# challenge, and retrying from the same IP only extends it.
+_RATE_LIMIT_BLOCK_MARKER = "exceeded our rate limiting"
+
+# Cloudflare challenge type from the challenge page's inline ``_cf_chl_opt``
+# object, e.g. ``cType: 'interactive'`` or ``cType:"managed"``.
+_CF_CHALLENGE_TYPE_RE = re.compile(r"""cType\s*:\s*['"](?P<ctype>[A-Za-z_-]+)['"]""")
+
+# Response header that Bright Data sets when the proxy itself refuses a request,
+# e.g. ``policy_20130`` (POST not allowed in no-KYC mode).
+_BRD_ERR_CODE_HEADER = "x-brd-err-code"
+_BRD_ERR_MSG_HEADER = "x-brd-error"
 
 # ---------------------------------------------------------------------------
 # LLM extraction — feature flag and helpers (#2056)
@@ -286,6 +322,34 @@ def is_cloudflare_challenge(html: str) -> bool:
         "/cdn-cgi/challenge-platform/",
     ]
     return any(indicator in html for indicator in indicators)
+
+
+def is_rate_limit_block(html: str) -> bool:
+    """Return True if the HTML is the SD court's WAF "rate limiting" block page.
+
+    Check this before :func:`is_cloudflare_challenge`. The block page embeds
+    Cloudflare's ``/cdn-cgi/challenge-platform/`` bot-detection script, so the
+    challenge check also matches it.
+    """
+    return _RATE_LIMIT_BLOCK_MARKER in html
+
+
+def cloudflare_challenge_type(html: str) -> str | None:
+    """Return the Cloudflare challenge type (``cType``), e.g. ``"interactive"``.
+
+    Returns ``None`` when the page carries no ``_cf_chl_opt`` challenge config.
+    """
+    m = _CF_CHALLENGE_TYPE_RE.search(html)
+    return m.group("ctype") if m else None
+
+
+def classify_portal_page(html: str) -> str:
+    """Classify a portal page as ``rate_limit_block``, ``challenge`` or ``ok``."""
+    if is_rate_limit_block(html):
+        return "rate_limit_block"
+    if is_cloudflare_challenge(html):
+        return "challenge"
+    return "ok"
 
 
 async def has_cf_clearance(context: Any) -> bool:
@@ -525,6 +589,10 @@ def parse_search_results(html: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+class _LookupBlocked(Exception):  # noqa: N818
+    """A case lookup got a challenge or block page instead of portal content."""
+
+
 class SDTentativeRulingsScraper(BaseScraper):
     """San Diego County Odyssey ROA tentative rulings — Phase 2.
 
@@ -559,6 +627,67 @@ class SDTentativeRulingsScraper(BaseScraper):
         self._case_numbers = case_numbers or []
         self._proxy_url = proxy_url or os.environ.get("SD_PROXY_URL")
         self._headless = headless
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self) -> None:
+        """Reset the per-fetch anti-bot diagnostics (#4673)."""
+        # Last Cloudflare challenge type seen on the portal (cType), if any.
+        self._challenge_type: str | None = None
+        # Whether the court's WAF "rate limiting" block page was served.
+        self._saw_rate_limit_block = False
+        # Bright Data proxy refusals, keyed by x-brd-err-code.
+        self._proxy_blocks: dict[str, dict[str, Any]] = {}
+
+    def _on_response(self, response: Any) -> None:
+        """Record requests that the Bright Data proxy refused (``x-brd-err-code``).
+
+        A proxy refusal never reaches the court, so without this the only symptom
+        is a challenge that never solves. Logged once per error code.
+        """
+        try:
+            headers = response.headers or {}
+            code = headers.get(_BRD_ERR_CODE_HEADER)
+            if not code:
+                return
+            entry = self._proxy_blocks.get(code)
+            if entry is not None:
+                entry["count"] += 1
+                return
+            entry = {
+                "count": 1,
+                "status": response.status,
+                "method": response.request.method,
+                "url": str(response.url)[:120],
+                "error": str(headers.get(_BRD_ERR_MSG_HEADER, ""))[:300],
+            }
+            self._proxy_blocks[code] = entry
+            self._log.error("sd.proxy_policy_block", brd_err_code=code, **entry)
+        except Exception as exc:  # diagnostics must never break the fetch
+            self._log.debug("sd.proxy_block_listener_error", error=str(exc))
+
+    def _anti_bot_summary(self) -> dict[str, Any]:
+        """Structured summary of what blocked the portal, for logs and errors."""
+        return {
+            "challenge_type": self._challenge_type,
+            "rate_limit_block": self._saw_rate_limit_block,
+            "proxy_block_codes": sorted(self._proxy_blocks),
+            "proxy": bool(self._proxy_url),
+        }
+
+    def _cloudflare_failure_message(self) -> str:
+        """One-line reason for a failed portal session, stored as the run's error."""
+        parts: list[str] = []
+        for code, entry in sorted(self._proxy_blocks.items()):
+            parts.append(
+                f"proxy refused {entry['method']} requests "
+                f"(x-brd-err-code={code}, HTTP {entry['status']}): {entry['error']}"
+            )
+        if self._saw_rate_limit_block:
+            parts.append("court WAF served its 'exceeded our rate limiting' block page")
+        if self._challenge_type:
+            parts.append(f"Cloudflare challenge type={self._challenge_type}")
+        detail = "; ".join(parts) or "no further detail"
+        return f"SD portal anti-bot check not passed: {detail}"
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch tentative rulings for all case numbers via Playwright.
@@ -579,10 +708,19 @@ class SDTentativeRulingsScraper(BaseScraper):
         return asyncio.run(self._fetch_all())
 
     async def _fetch_all(self) -> list[CapturedDocument]:
-        """Async implementation of the fetch loop."""
+        """Async implementation of the fetch loop.
+
+        Raises :class:`ScraperPreconditionFailure` when the portal session cannot
+        be established (Cloudflare not passed) or when every case lookup is
+        blocked. Otherwise ``run()`` would record ``status=success`` with 0
+        records and hide the outage (#4673).
+        """
         from playwright.async_api import async_playwright
 
         docs: list[CapturedDocument] = []
+        attempted = 0
+        blocked = 0
+        self._reset_diagnostics()
 
         async with async_playwright() as pw:
             launch_kwargs: dict[str, Any] = {
@@ -623,6 +761,9 @@ class SDTentativeRulingsScraper(BaseScraper):
 
                 page = await context.new_page()
 
+                # Record requests the proxy itself refuses (#4673).
+                page.on("response", self._on_response)
+
                 # Apply stealth evasions (fingerprint masking, webdriver
                 # flag removal, etc.) to avoid Cloudflare bot detection.
                 await _apply_stealth(page)
@@ -630,24 +771,45 @@ class SDTentativeRulingsScraper(BaseScraper):
                 # Step 1: Navigate to portal and solve Cloudflare challenge
                 cf_solved = await self._solve_cloudflare(page)
                 if not cf_solved:
-                    self._log.error("Failed to solve Cloudflare challenge")
-                    return docs
+                    message = self._cloudflare_failure_message()
+                    self._log.error(
+                        "sd.cloudflare_unsolved",
+                        reason=message,
+                        **self._anti_bot_summary(),
+                    )
+                    raise ScraperPreconditionFailure(message)
 
                 # Step 2: For each case, search and extract ruling
+                consecutive_blocked = 0
                 for i, case_number in enumerate(self._case_numbers):
                     if i > 0:
                         await asyncio.sleep(self.config.request_delay_seconds)
 
+                    attempted += 1
                     try:
                         doc = await self._fetch_case_ruling(page, case_number)
                         if doc is not None:
                             docs.append(doc)
+                    except _LookupBlocked:
+                        blocked += 1
+                        consecutive_blocked += 1
+                        if consecutive_blocked >= MAX_CONSECUTIVE_BLOCKED_LOOKUPS:
+                            self._log.error(
+                                "sd.lookups_aborted_blocked",
+                                consecutive_blocked=consecutive_blocked,
+                                attempted=attempted,
+                                remaining=len(self._case_numbers) - attempted,
+                                **self._anti_bot_summary(),
+                            )
+                            break
+                        continue
                     except Exception as exc:
                         self._log.error(
                             "Failed to fetch case ruling",
                             case_number=case_number,
                             error=str(exc),
                         )
+                    consecutive_blocked = 0
 
             finally:
                 await browser.close()
@@ -655,8 +817,19 @@ class SDTentativeRulingsScraper(BaseScraper):
         self._log.info(
             "ROA fetch complete",
             total_cases=len(self._case_numbers),
+            attempted=attempted,
+            blocked=blocked,
             rulings_found=len(docs),
         )
+
+        # Every lookup was blocked and nothing was captured: this is an
+        # outage, not "no rulings today". Keep partial captures otherwise.
+        if not docs and attempted > 0 and blocked == attempted:
+            message = (
+                f"all {attempted} SD portal case lookups were blocked; "
+                + self._cloudflare_failure_message()
+            )
+            raise ScraperPreconditionFailure(message)
 
         return docs
 
@@ -691,13 +864,30 @@ class SDTentativeRulingsScraper(BaseScraper):
                     wait_until="commit",
                 )
 
-                # Check if we hit a Cloudflare challenge
+                # Check if we hit a Cloudflare challenge or the WAF block page
                 content = await page.content()
-                if not is_cloudflare_challenge(content):
+                kind = classify_portal_page(content)
+                if kind == "ok":
                     self._log.info("No Cloudflare challenge detected")
                     return True
+                if kind == "rate_limit_block":
+                    # A block, not a challenge: cf_clearance can't lift it.
+                    self._saw_rate_limit_block = True
+                    self._log.error(
+                        "sd.portal_rate_limit_block",
+                        attempt=attempt,
+                        stage="portal",
+                        proxy=bool(self._proxy_url),
+                    )
+                    if attempt < CF_MAX_RETRIES:
+                        await asyncio.sleep(CF_RETRY_PAUSE)
+                    continue
 
-                self._log.info("Cloudflare challenge detected, polling for cf_clearance cookie")
+                self._challenge_type = cloudflare_challenge_type(content) or self._challenge_type
+                self._log.info(
+                    "Cloudflare challenge detected, polling for cf_clearance cookie",
+                    challenge_type=self._challenge_type,
+                )
 
                 # Poll for cf_clearance cookie — the definitive signal that
                 # the challenge has been solved.  Cloudflare's JS executes
@@ -718,18 +908,27 @@ class SDTentativeRulingsScraper(BaseScraper):
                 # changed even without the cookie (some Cloudflare configs
                 # don't set cf_clearance).
                 content = await page.content()
-                if not is_cloudflare_challenge(content):
+                kind = classify_portal_page(content)
+                if kind == "ok":
                     self._log.info(
                         "Cloudflare challenge resolved (page content changed)",
                         attempt=attempt,
                     )
                     return True
+                if kind == "rate_limit_block":
+                    self._saw_rate_limit_block = True
 
                 self._log.warning(
                     "Cloudflare challenge not resolved on this attempt",
                     attempt=attempt,
                     timeout_seconds=CF_CHALLENGE_TIMEOUT,
+                    **self._anti_bot_summary(),
                 )
+
+                # The proxy refused the challenge's own requests: retrying
+                # through the same proxy cannot succeed.
+                if self._proxy_blocks:
+                    break
 
             except Exception as exc:
                 self._log.warning(
@@ -740,7 +939,7 @@ class SDTentativeRulingsScraper(BaseScraper):
 
             # Brief pause before retrying to let Cloudflare state settle
             if attempt < CF_MAX_RETRIES:
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(CF_RETRY_PAUSE)
 
         self._log.error(
             "Failed to solve Cloudflare challenge after all retries",
@@ -763,14 +962,36 @@ class SDTentativeRulingsScraper(BaseScraper):
         while elapsed < CF_CHALLENGE_TIMEOUT:
             if await has_cf_clearance(context):
                 return True
+            if self._proxy_blocks:
+                # The proxy refused the challenge's own requests (#4673), so
+                # the cookie can never arrive. Stop waiting.
+                return False
             await asyncio.sleep(CF_POLL_INTERVAL)
             elapsed += CF_POLL_INTERVAL
         return False
+
+    def _raise_if_blocked(self, html: str, case_number: str, stage: str) -> None:
+        """Raise :class:`_LookupBlocked` if *html* is a challenge or WAF block page."""
+        kind = classify_portal_page(html)
+        if kind == "ok":
+            return
+        if kind == "rate_limit_block":
+            self._saw_rate_limit_block = True
+            self._log.warning("sd.portal_rate_limit_block", case_number=case_number, stage=stage)
+        else:
+            self._challenge_type = cloudflare_challenge_type(html) or self._challenge_type
+            self._log.warning(
+                f"Cloudflare re-challenge during {stage}",
+                case_number=case_number,
+                challenge_type=self._challenge_type,
+            )
+        raise _LookupBlocked(kind)
 
     async def _fetch_case_ruling(self, page: Any, case_number: str) -> CapturedDocument | None:
         """Search for a case by number and extract the tentative ruling.
 
         Returns a CapturedDocument if a tentative ruling was found, None otherwise.
+        Raises :class:`_LookupBlocked` if the portal served a challenge or block page.
         """
         # Navigate to SmartSearch
         search_url = f"{SMART_SEARCH_URL}?searchString={case_number}"
@@ -778,11 +999,7 @@ class SDTentativeRulingsScraper(BaseScraper):
 
         await page.goto(search_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
         search_html = await page.content()
-
-        # Check for Cloudflare re-challenge
-        if is_cloudflare_challenge(search_html):
-            self._log.warning("Cloudflare re-challenge during search", case_number=case_number)
-            return None
+        self._raise_if_blocked(search_html, case_number, stage="search")
 
         # Parse search results to find the case detail link
         results = parse_search_results(search_html)
@@ -802,14 +1019,7 @@ class SDTentativeRulingsScraper(BaseScraper):
         await asyncio.sleep(1.0)  # Brief delay between search and detail page
         await page.goto(case_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
         detail_html = await page.content()
-
-        # Check for Cloudflare re-challenge
-        if is_cloudflare_challenge(detail_html):
-            self._log.warning(
-                "Cloudflare re-challenge on case detail",
-                case_number=case_number,
-            )
-            return None
+        self._raise_if_blocked(detail_html, case_number, stage="detail")
 
         # Parse the ROA page
         case_info = parse_roa_page(detail_html)

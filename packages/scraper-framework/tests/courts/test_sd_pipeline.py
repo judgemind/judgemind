@@ -24,6 +24,7 @@ from courts.ca.sd_pipeline import (
     SDPipelineScraper,
     default_config,
 )
+from framework.base import ScraperPreconditionFailure
 from framework.events import EventBus
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig
 from framework.storage import S3Archiver
@@ -312,6 +313,49 @@ class TestPipelineEndToEnd:
         health = scraper.run()
         assert health.success is True
         assert health.records_captured == 0
+
+    def test_phase2_anti_bot_failure_fails_the_run(self) -> None:
+        """Phase 2 portal failure is recorded as a failed run, not success/0 (#4673)."""
+        config = ScraperConfig(
+            scraper_id="ca-sd-pipeline-test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            target_urls=[CALENDAR_BASE_URL],
+            request_delay_seconds=0.0,
+            max_retries=1,
+        )
+        scraper = SDPipelineScraper(config, day_numbers=[1])
+
+        phase1 = MagicMock()
+        phase1.fetch_documents.return_value = [
+            CapturedDocument(
+                scraper_id="ca-sd-calendar",
+                state="CA",
+                county="San Diego",
+                court="Superior Court",
+                source_url=f"{CALENDAR_BASE_URL}/f_svcal1.html",
+                capture_timestamp=datetime(2026, 9, 25),
+                content_format=ContentFormat.HTML,
+                raw_content=b"<html></html>",
+                content_hash="",
+                case_number="24CU016153C",
+            )
+        ]
+        phase2 = MagicMock()
+        phase2.fetch_documents.side_effect = ScraperPreconditionFailure(
+            "SD portal anti-bot check not passed: proxy refused POST requests"
+        )
+
+        with (
+            patch.object(SDPipelineScraper, "_create_phase1_scraper", return_value=phase1),
+            patch.object(SDPipelineScraper, "_create_phase2_scraper", return_value=phase2),
+        ):
+            health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert "anti-bot check not passed" in (health.error_message or "")
 
 
 # ---------------------------------------------------------------------------
