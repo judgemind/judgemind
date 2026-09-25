@@ -1372,6 +1372,47 @@ class TestScPdfSplitHeaderHearingDate:
         children = self._run(hearing_date="2026-09-22", ruling_text=self._HEADER)
         assert [c["hearing_date"] for c in children] == ["2026-09-22"] * 3
 
+    def _process_event_split_input(self, **overrides: object) -> dict:
+        """Run ``process_event`` and return the event handed to the split
+        dispatcher (``_llm_split_document``), which fans out to both the
+        deterministic SC splitter and the LLM splitter."""
+        worker, _ = _make_worker()
+        seen: list[dict] = []
+
+        def fake_split(event_data: dict, *_a: object, **_k: object) -> bool:
+            seen.append(event_data)
+            return True
+
+        worker._llm_split_document = fake_split  # type: ignore[method-assign]
+        worker.process_event(_make_sc_event(s3_key=None, **overrides))
+        assert len(seen) == 1
+        return seen[0]
+
+    def test_issue_4667_process_event_sets_header_date_before_llm_split(self) -> None:
+        """Most Dept 12 PDFs don't match the deterministic splitter and go
+        through the LLM split — the header date must already be on the event."""
+        event = self._process_event_split_input(
+            hearing_date=None,
+            capture_timestamp="2026-09-24T01:43:00Z",
+            ruling_text=self._HEADER + "claimant's date of birth (September 13, 1972).\n",
+        )
+        assert event["hearing_date"] == "2026-09-23"
+
+    def test_issue_4667_process_event_keeps_scraper_date(self) -> None:
+        event = self._process_event_split_input(
+            hearing_date="2026-09-22", ruling_text=self._HEADER + "body\n"
+        )
+        assert event["hearing_date"] == "2026-09-22"
+
+    def test_issue_4667_header_helper_gates_county_and_format(self) -> None:
+        from ingestion.worker import _sc_header_hearing_date
+
+        text = self._HEADER
+        assert _sc_header_hearing_date(_make_sc_event(county="Orange"), text) is None
+        assert _sc_header_hearing_date(_make_sc_event(content_format="html"), text) is None
+        assert _sc_header_hearing_date(_make_sc_event(), "") is None
+        assert _sc_header_hearing_date(_make_sc_event(), text) == "2026-09-23"
+
     def test_issue_4667_no_header_date_leaves_none(self) -> None:
         children = self._run(
             hearing_date=None,

@@ -835,6 +835,33 @@ def _try_sf_pdf_split(
     return True
 
 
+def _sc_header_hearing_date(event_data: dict[str, Any], ruling_text: str) -> str | None:
+    """Return the Santa Clara PDF header hearing date as ``YYYY-MM-DD`` (#4667).
+
+    Live scraper events already carry ``hearing_date``
+    (``SCTentativeRulingsScraper.parse_document``), but prefix-mode reingest
+    and ``rebuild_db`` build events straight from S3 with none.  Without a
+    doc-level date, both the deterministic split and the LLM split leave each
+    child to guess from its own body text — which has no header — and they
+    picked up dates of birth, discovery service dates, etc.  This applies the
+    scraper's header parser (plus its stale-year correction) instead.
+
+    Returns ``None`` for non-Santa-Clara / non-PDF events or when the header
+    carries no parseable date.
+    """
+    if (event_data.get("county") or "").upper() != "SANTA CLARA":
+        return None
+    if event_data.get("content_format") != "pdf" or not ruling_text:
+        return None
+
+    from courts.ca.sc_tentatives import correct_header_year_typo, parse_hearing_date
+
+    header_date = parse_hearing_date(ruling_text)
+    captured_at = _parse_datetime(event_data.get("capture_timestamp"))
+    header_date = correct_header_year_typo(header_date, captured_at)
+    return header_date.date().isoformat() if header_date is not None else None
+
+
 def _try_sc_pdf_split(
     event_data: dict[str, Any],
     document_id: str,
@@ -887,28 +914,16 @@ def _try_sc_pdf_split(
 
     # Lazy import to avoid a circular dependency between the worker and
     # the courts package at module load time.
-    from courts.ca.sc_tentatives import (
-        _split_rulings,
-        correct_header_year_typo,
-        parse_hearing_date,
-    )
+    from courts.ca.sc_tentatives import _split_rulings
 
     split_rulings = _split_rulings(ruling_text, pdf_bytes=raw_pdf_bytes)
 
-    # Doc-level hearing date for every child (#4667).  Live scraper events
-    # already carry it (``SCTentativeRulingsScraper.parse_document``), but
-    # prefix-mode reingest and ``rebuild_db`` build events straight from S3
-    # with no hearing_date.  Without this, each child fell back to per-entry
-    # LLM/regex extraction on its own body text — which has no header — and
-    # picked up dates of birth, service dates, etc.  Derive it from the PDF
-    # header with the same parser the scraper uses.
-    doc_hearing_date: Any = event_data.get("hearing_date")
-    if not doc_hearing_date:
-        header_date = parse_hearing_date(ruling_text)
-        captured_at = _parse_datetime(event_data.get("capture_timestamp"))
-        header_date = correct_header_year_typo(header_date, captured_at)
-        if header_date is not None:
-            doc_hearing_date = header_date.date().isoformat()
+    # Doc-level hearing date for every child (#4667).  ``process_event``
+    # normally fills this already via ``_sc_header_hearing_date``; this is
+    # the same derivation for direct callers.
+    doc_hearing_date: Any = event_data.get("hearing_date") or _sc_header_hearing_date(
+        event_data, ruling_text
+    )
     if not split_rulings:
         # No ``Line N`` boundaries found — fall through to LLM.
         logger.info(
@@ -2292,6 +2307,16 @@ class IngestionWorker:
         # PDF-extracted text.
         if ruling_text != event_data.get("ruling_text"):
             event_data = {**event_data, "ruling_text": ruling_text}
+
+        # Santa Clara events from prefix-mode reingest / rebuild_db carry no
+        # hearing_date (the scraper's parse_document never ran).  Derive the
+        # doc-level date from the PDF header BEFORE any split so both the
+        # deterministic and the LLM split hand it to every child, instead of
+        # each child guessing from its own body text (#4667).
+        if not event_data.get("hearing_date") and not event_data.get("_split_processed"):
+            sc_header_date = _sc_header_hearing_date(event_data, ruling_text)
+            if sc_header_date:
+                event_data = {**event_data, "hearing_date": sc_header_date}
 
         # LLM extraction is the sole path for document splitting and
         # structured field extraction.  The legacy regex splitter framework
