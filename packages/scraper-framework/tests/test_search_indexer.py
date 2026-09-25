@@ -1093,3 +1093,26 @@ class TestTransientConnectionErrors:
 
         with pytest.raises(ValueError, match="invalid bulk payload"):
             consumer.index_batch(events)
+
+
+class TestDeleteDocuments:
+    """#4700: stale split children are dropped from the index, best-effort."""
+
+    def test_deletes_each_id(self, consumer: IndexingConsumer, mock_opensearch: MagicMock) -> None:
+        assert consumer.delete_documents(["a", "b"]) == 2
+        ids = [c.kwargs["id"] for c in mock_opensearch.delete.call_args_list]
+        assert ids == ["a", "b"]
+
+    def test_missing_id_is_not_an_error(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        from opensearchpy.exceptions import NotFoundError
+
+        mock_opensearch.delete.side_effect = [NotFoundError(404, "not_found", {}), None]
+        assert consumer.delete_documents(["gone", "b"]) == 1
+
+    def test_errors_are_swallowed(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        mock_opensearch.delete.side_effect = OSConnectionError("N/A", "boom", Exception())
+        assert consumer.delete_documents(["a"]) == 0

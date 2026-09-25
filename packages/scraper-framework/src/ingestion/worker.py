@@ -178,6 +178,22 @@ def _markdown_to_html(text: str) -> str:
     return "\n".join(html_parts)
 
 
+def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: str) -> list[str]:
+    """Return every document id the split that produced *split_event* writes.
+
+    All split paths build their child events the same way: a single-case
+    split reuses the parent id, and a multi-case split uses
+    ``make_split_document_id(parent, 0..N-1)`` with ``N = _split_count``.
+    Any other split-child row for the same S3 key is stale (#4700).
+    """
+    from .split_ids import make_split_document_id
+
+    if split_event.get("document_id") == parent_document_id:
+        return [parent_document_id]
+    count = int(split_event.get("_split_count") or 1)
+    return [make_split_document_id(parent_document_id, idx) for idx in range(count)]
+
+
 def _try_sd_calendar_split(
     event_data: dict[str, Any],
     document_id: str,
@@ -3512,6 +3528,10 @@ class IngestionWorker:
                 summary=summary,
                 summary_model=summary_model,
                 summary_generated_at=summary_generated_at,
+                # A split child's id names a slot in the split, not a case:
+                # when the split set changes, the re-derived case wins
+                # (#4700).  Non-split documents stay preserve-first.
+                relink_case=bool(is_split),
             )
 
             # 5. Link case to judge
@@ -3570,6 +3590,60 @@ class IngestionWorker:
     # LLM extraction path (#1473, #1475)
     # ------------------------------------------------------------------
 
+    def _cleanup_stale_split_children(
+        self,
+        event_data: dict[str, Any],
+        document_id: str,
+        valid_ids: list[str],
+    ) -> None:
+        """Remove this S3 key's split-child rows that the new split no longer
+        writes, and drop them from the search index (#2295, #4700).
+
+        Best-effort: a failure is logged and processing continues, since the
+        new children are still written correctly.
+        """
+        s3_key = event_data.get("s3_key")
+        if not s3_key:
+            return
+        removed: list[str] = []
+        try:
+            conn = self._get_connection()
+            deleted = delete_stale_split_children(
+                conn,
+                s3_key,
+                valid_ids,
+                parent_document_id=document_id,
+                deleted_ids=removed,
+            )
+            if deleted:
+                conn.commit()
+                logger.info(
+                    "Cleaned up %d stale split-child document(s)",
+                    deleted,
+                    extra={
+                        "document_id": document_id,
+                        "s3_key": s3_key,
+                        "new_split_count": len(valid_ids),
+                        "stale_ids": removed,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to clean up stale split children — continuing",
+                extra={
+                    "document_id": document_id,
+                    "s3_key": s3_key,
+                    "error": str(exc),
+                },
+            )
+            try:
+                self._get_connection().rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if removed:
+            self._indexer.delete_documents(removed)
+
     def _llm_split_document(
         self,
         event_data: dict[str, Any],
@@ -3624,6 +3698,25 @@ class IngestionWorker:
         if not ruling_text and not raw_pdf_bytes:
             return False
 
+        # Every deterministic splitter below dispatches its children through
+        # ``dispatch_child``.  Before the first child is written, remove the
+        # split-child rows of this S3 key that the new split no longer
+        # produces (#4700).  Doing it here covers every splitter, current and
+        # future; previously only the framework-LLM path below cleaned up, so
+        # an LLM split -> deterministic split change left surplus children.
+        cleaned = False
+
+        def dispatch_child(split_event: dict[str, Any]) -> None:
+            nonlocal cleaned
+            if not cleaned:
+                cleaned = True
+                self._cleanup_stale_split_children(
+                    event_data,
+                    document_id,
+                    split_child_ids_for_event(split_event, document_id),
+                )
+            self.process_event(split_event)
+
         # ------------------------------------------------------------------
         # San Diego calendar HTML deterministic split (#2447)
         # ------------------------------------------------------------------
@@ -3638,7 +3731,7 @@ class IngestionWorker:
         # This path is taken regardless of scraper_id so any future SD
         # calendar capture paths stay correct by default.
         if ruling_text and _try_sd_calendar_split(
-            event_data, document_id, ruling_text, self.process_event
+            event_data, document_id, ruling_text, dispatch_child
         ):
             return True
 
@@ -3655,9 +3748,7 @@ class IngestionWorker:
         # splitter correctly extracts case_number, hearing_date, department,
         # and parties from the HTML.  This path is taken regardless of
         # scraper_id so any future LA HTML capture paths stay correct.
-        if ruling_text and _try_la_html_split(
-            event_data, document_id, ruling_text, self.process_event
-        ):
+        if ruling_text and _try_la_html_split(event_data, document_id, ruling_text, dispatch_child):
             return True
 
         # ------------------------------------------------------------------
@@ -3671,7 +3762,7 @@ class IngestionWorker:
         # counties.  Single-ruling PDFs (``_split_rulings`` returns ``[]``)
         # fall through to the normal LLM path below.
         if ruling_text and _try_fresno_pdf_split(
-            event_data, document_id, ruling_text, self.process_event
+            event_data, document_id, ruling_text, dispatch_child
         ):
             return True
 
@@ -3693,7 +3784,7 @@ class IngestionWorker:
         # entry LLM enrichment via ``_llm_enrich_fields`` (each entry
         # processed individually, so no cross-entry carry-forward window).
         if ruling_text and _try_riverside_pdf_split(
-            event_data, document_id, ruling_text, self.process_event
+            event_data, document_id, ruling_text, dispatch_child
         ):
             return True
 
@@ -3717,9 +3808,7 @@ class IngestionWorker:
         # / case_title — those are left to per-entry LLM enrichment via
         # ``_llm_enrich_fields`` (each entry processed individually, so no
         # cross-entry carry-forward window).
-        if ruling_text and _try_sf_pdf_split(
-            event_data, document_id, ruling_text, self.process_event
-        ):
+        if ruling_text and _try_sf_pdf_split(event_data, document_id, ruling_text, dispatch_child):
             return True
 
         # ------------------------------------------------------------------
@@ -3748,7 +3837,7 @@ class IngestionWorker:
             event_data,
             document_id,
             ruling_text,
-            self.process_event,
+            dispatch_child,
             raw_pdf_bytes=raw_pdf_bytes,
         ):
             return True
@@ -4114,32 +4203,19 @@ class IngestionWorker:
         # re-processed as a single ruling — all old UUID v5 split children
         # are cleaned up because the single-ruling's document_id is the
         # original UUID v4 ID, not a UUID v5 split ID.
-        s3_key = event_data.get("s3_key")
-        if s3_key:
-            valid_ids = [cr.document_id for cr in converted]
-            try:
-                conn = self._get_connection()
-                deleted = delete_stale_split_children(conn, s3_key, valid_ids)
-                if deleted:
-                    conn.commit()
-                    logger.info(
-                        "Cleaned up %d stale split-child document(s)",
-                        deleted,
-                        extra={
-                            "document_id": document_id,
-                            "s3_key": s3_key,
-                            "new_split_count": len(converted),
-                        },
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to clean up stale split children — continuing",
-                    extra={
-                        "document_id": document_id,
-                        "s3_key": s3_key,
-                        "error": str(exc),
-                    },
-                )
+        #
+        # Textless multimodal rows are skipped by the dispatch loop below
+        # (#4714) and never written, so a row left at their slot by an
+        # earlier run is stale too (#4700).
+        self._cleanup_stale_split_children(
+            event_data,
+            document_id,
+            [
+                cr.document_id
+                for cr in converted
+                if not (extraction_method == "multimodal" and not (cr.ruling_text or "").strip())
+            ],
+        )
 
         # ------------------------------------------------------------------
         # Document-level deterministic validation: duplicate ruling text
