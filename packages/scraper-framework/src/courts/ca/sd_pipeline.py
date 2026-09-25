@@ -140,6 +140,10 @@ class SDPipelineScraper(BaseScraper):
             event_bus=self._event_bus,
         )
         phase1_docs = phase1.fetch_documents()
+        # Sub-scrapers are called directly, not through run(), so a
+        # partial-failure mark (items skipped by a mid-run abort) must be
+        # carried over to this pipeline's run (#4734).
+        self._inherit_partial_failure(phase1)
 
         # Extract unique case numbers from motion hearings
         seen: set[str] = set()
@@ -167,6 +171,7 @@ class SDPipelineScraper(BaseScraper):
             event_bus=self._event_bus,
         )
         phase2_docs = phase2.fetch_documents()
+        self._inherit_partial_failure(phase2)
 
         self._log.info(
             "Phase 2 complete",
@@ -175,6 +180,12 @@ class SDPipelineScraper(BaseScraper):
         )
 
         return phase2_docs
+
+    def _inherit_partial_failure(self, phase: BaseScraper) -> None:
+        """Carry a sub-scraper's partial-failure mark over to this run (#4734)."""
+        message = getattr(phase, "_partial_failure", None)
+        if isinstance(message, str):
+            self._mark_partial_failure(message)
 
     def _get_phase2_parser(self) -> BaseScraper:
         """Lazily create and cache a Phase 2 scraper instance for parsing.

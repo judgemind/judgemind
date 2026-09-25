@@ -9,9 +9,12 @@ must stay a success.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
+
 import pytest
 
-from framework import BaseScraper, CapturedDocument, ScraperConfig
+from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.base import ScraperPreconditionFailure
 from framework.fetch_tally import FetchTally
 
@@ -131,8 +134,71 @@ class TestFetchTally:
             "succeeded": 1,
             "blocked": 0,
             "failed": 1,
+            "skipped": 0,
             "last_error": "RuntimeError: boom",
         }
+
+
+class TestFetchTallyAbort:
+    """An early abort that skips items is never a green run (#4734)."""
+
+    def _aborted_after_success(self) -> FetchTally:
+        tally = FetchTally("case lookups")
+        tally.attempt()  # ok
+        for _ in range(3):
+            tally.attempt()
+            tally.failed(TimeoutError("timed out"))
+        tally.attempt()
+        tally.blocked("block page")
+        tally.abort("4 consecutive lookups failed", remaining=7)
+        return tally
+
+    def test_abort_counts_and_message(self) -> None:
+        tally = self._aborted_after_success()
+        assert tally.aborted
+        assert tally.n_skipped == 7
+        assert tally.log_fields()["skipped"] == 7
+        msg = tally.abort_message()
+        assert "case lookups aborted after 5 of 12, 7 skipped" in msg
+        assert "(1 succeeded, 1 blocked, 3 raised errors)" in msg
+        assert "4 consecutive lookups failed" in msg
+        assert "TimeoutError: timed out" in msg
+        assert "block page" in msg
+        assert tally.partial_failure_message() == msg
+
+    def test_abort_with_no_docs_raises_despite_successes(self) -> None:
+        tally = self._aborted_after_success()
+        assert not tally.all_failed
+        with pytest.raises(ScraperPreconditionFailure, match="aborted after 5 of 12"):
+            tally.raise_if_all_failed([])
+
+    def test_abort_with_docs_does_not_raise(self) -> None:
+        tally = self._aborted_after_success()
+        tally.raise_if_all_failed(["doc"])  # partial failure, reported by run()
+
+    def test_all_failed_abort_keeps_custom_message_and_names_skipped(self) -> None:
+        tally = FetchTally("lookups")
+        for _ in range(5):
+            tally.failed(RuntimeError("x"))
+        tally.abort("streak", remaining=3)
+        with pytest.raises(ScraperPreconditionFailure) as ei:
+            tally.raise_if_all_failed([], message="custom diagnosis")
+        assert str(ei.value) == "custom diagnosis; 3 more skipped after abort"
+
+    def test_abort_with_nothing_remaining_is_not_a_failure(self) -> None:
+        tally = FetchTally("lookups")
+        tally.attempt()
+        tally.failed(RuntimeError("x"))
+        tally.attempt()
+        tally.abort("streak", remaining=0)
+        assert not tally.aborted
+        assert tally.partial_failure_message() is None
+        tally.raise_if_all_failed([])
+
+    def test_no_abort_has_no_partial_failure(self) -> None:
+        tally = FetchTally("lookups")
+        tally.attempt()
+        assert tally.partial_failure_message() is None
 
 
 class _AllFailScraper(BaseScraper):
@@ -185,3 +251,71 @@ class TestFetchTallyRunIntegration:
         assert health.success is True
         assert health.records_captured == 0
         assert health.error_message is None
+
+
+class _AbortingScraper(BaseScraper):
+    """Captures *ok* docs, then aborts with *skipped* items left (#4734)."""
+
+    def __init__(self, config: ScraperConfig, ok: int, skipped: int) -> None:
+        super().__init__(config)
+        self.ok = ok
+        self.skipped = skipped
+
+    def fetch_documents(self) -> list[CapturedDocument]:
+        docs: list[CapturedDocument] = []
+        tally = FetchTally("items")
+        for i in range(self.ok):
+            tally.attempt()
+            docs.append(
+                CapturedDocument(
+                    scraper_id=self.config.scraper_id,
+                    state=self.config.state,
+                    county=self.config.county,
+                    court=self.config.court,
+                    source_url=f"https://example.test/{i}",
+                    capture_timestamp=datetime.now(UTC),
+                    content_format=ContentFormat.PDF,
+                    raw_content=f"%PDF ruling {i}".encode(),
+                    content_hash="",
+                )
+            )
+        tally.attempt()
+        tally.failed(TimeoutError("timed out"))
+        tally.abort("breaker tripped", remaining=self.skipped)
+        tally.raise_if_all_failed(docs)
+        self._mark_partial_failure(tally.partial_failure_message())
+        return docs
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        return doc
+
+
+class TestPartialFailureRunIntegration:
+    def test_abort_with_docs_archives_then_fails_run(self) -> None:
+        archiver = MagicMock()
+        archiver.archive.return_value = "ca/x/key.pdf"
+        archiver.bucket = "bucket"
+        scraper = _AbortingScraper(_config(), ok=2, skipped=4)
+        scraper._archiver = archiver
+
+        health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 2
+        assert archiver.archive.call_count == 2
+        assert health.error_message is not None
+        assert "items aborted after 3 of 7, 4 skipped" in health.error_message
+        assert "breaker tripped" in health.error_message
+
+    def test_partial_failure_resets_between_runs(self) -> None:
+        scraper = _AbortingScraper(_config(), ok=1, skipped=2)
+        assert scraper.run().success is False
+        scraper.skipped = 0
+        health = scraper.run()
+        assert health.success is True
+        assert health.error_message is None
+
+    def test_mark_partial_failure_none_is_noop(self) -> None:
+        scraper = _AbortingScraper(_config(), ok=1, skipped=0)
+        scraper._mark_partial_failure(None)
+        assert scraper._partial_failure is None

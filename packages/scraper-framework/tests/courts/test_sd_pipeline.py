@@ -358,6 +358,65 @@ class TestPipelineEndToEnd:
         assert health.records_captured == 0
         assert "anti-bot check not passed" in (health.error_message or "")
 
+    def test_phase2_mid_run_abort_fails_run_and_archives_captures(self) -> None:
+        """Phase 2 captured docs, then aborted with cases left (#4734).
+
+        The pipeline calls Phase 2's fetch_documents directly, so Phase 2's
+        partial-failure mark must reach the pipeline's own run(): the docs
+        are archived and the run is recorded as failed.
+        """
+        config = ScraperConfig(
+            scraper_id="ca-sd-pipeline-test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            target_urls=[CALENDAR_BASE_URL],
+            request_delay_seconds=0.0,
+            max_retries=1,
+        )
+        archiver = MagicMock()
+        archiver.archive.return_value = "ca/san-diego/key.html"
+        archiver.bucket = "test-bucket"
+        scraper = SDPipelineScraper(config, archiver=archiver, day_numbers=[1])
+
+        def _doc(case_number: str) -> CapturedDocument:
+            return CapturedDocument(
+                scraper_id="ca-sd-tentatives",
+                state="CA",
+                county="San Diego",
+                court="Superior Court",
+                source_url=f"https://odyroa.sdcourt.ca.gov/{case_number}",
+                capture_timestamp=datetime(2026, 9, 25),
+                content_format=ContentFormat.PDF,
+                raw_content=f"%PDF {case_number}".encode(),
+                content_hash="",
+                case_number=case_number,
+            )
+
+        phase1 = MagicMock()
+        phase1.fetch_documents.return_value = [_doc("24CU000001C"), _doc("24CU000002C")]
+        phase1._partial_failure = None
+        phase2 = MagicMock()
+        abort = "SD portal case lookups aborted after 7 of 130, 123 skipped"
+
+        def phase2_fetch() -> list[CapturedDocument]:
+            phase2._partial_failure = abort
+            return [_doc("24CU000001C"), _doc("24CU000002C")]
+
+        phase2.fetch_documents.side_effect = phase2_fetch
+
+        with (
+            patch.object(SDPipelineScraper, "_create_phase1_scraper", return_value=phase1),
+            patch.object(SDPipelineScraper, "_create_phase2_scraper", return_value=phase2),
+            patch.object(SDPipelineScraper, "parse_document", side_effect=lambda d: d),
+        ):
+            health = scraper.run()
+
+        assert health.success is False
+        assert health.error_message == abort
+        assert health.records_captured == 2
+        assert archiver.archive.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # parse_document delegation

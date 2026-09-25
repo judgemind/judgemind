@@ -843,10 +843,16 @@ class SDTentativeRulingsScraper(BaseScraper):
 
                     consecutive_unsuccessful += 1
                     if consecutive_unsuccessful >= MAX_CONSECUTIVE_BLOCKED_LOOKUPS:
+                        # Stop hammering the portal, but the skipped cases
+                        # make this run a failure, not a success (#4734).
+                        tally.abort(
+                            f"{consecutive_unsuccessful} consecutive lookups blocked or failed",
+                            remaining=len(self._case_numbers) - tally.n_attempted,
+                        )
                         self._log.error(
                             "sd.lookups_aborted",
                             consecutive_unsuccessful=consecutive_unsuccessful,
-                            remaining=len(self._case_numbers) - tally.n_attempted,
+                            remaining=tally.n_skipped,
                             **tally.log_fields(),
                             **self._anti_bot_summary(),
                         )
@@ -862,10 +868,13 @@ class SDTentativeRulingsScraper(BaseScraper):
             **tally.log_fields(),
         )
 
-        # Every lookup was blocked or raised and nothing was captured: this is
-        # an outage, not "no rulings today". Keep partial captures otherwise.
-        # Shared gate: framework.fetch_tally (#4693).
+        # Every lookup was blocked or raised, or the streak aborted the loop,
+        # and nothing was captured: this is an outage, not "no rulings today".
+        # Shared gate: framework.fetch_tally (#4693, #4734).
         tally.raise_if_all_failed(docs, message=self._lookup_failure_message(tally))
+        # Captured docs plus skipped cases: return the docs so run() archives
+        # them, and record the run as failed (#4734).
+        self._mark_partial_failure(tally.partial_failure_message())
 
         return docs
 

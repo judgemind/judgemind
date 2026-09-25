@@ -1743,6 +1743,97 @@ class TestLookupExceptionsFailLoudly:
         assert page.goto.await_count == 1 + 9
 
 
+class TestMidRunAbortFailsLoudly:
+    """A streak abort that skips remaining lookups is never a green run (#4734).
+
+    Before #4734 the loop ``break`` after 5 unsuccessful lookups in a row, and
+    the run stayed ``success=True`` whenever an earlier lookup had succeeded.
+    Every case after the abort was silently skipped, and SD tentatives are
+    gone from the portal within days.
+    """
+
+    def _run_config(self) -> ScraperConfig:
+        return ScraperConfig(
+            scraper_id="ca-sd-tentatives-test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            target_urls=[PORTAL_BASE_URL],
+            request_delay_seconds=0.0,
+            max_retries=1,
+        )
+
+    def test_abort_after_clean_lookups_fails_run_and_keeps_captures(self) -> None:
+        """AC #1 + #2: 2 clean lookups, 5 raising, 3 left -> failed run, 2 archived."""
+        portal = "<html><body>Portal</body></html>"
+        search = _load_html("sd_roa_search_results.html")
+        detail = _load_html("sd_roa_case_detail.html")
+        page = _make_mock_page([portal, search, detail, search, detail])
+        # Lookups 0 and 1 succeed; lookups 2-6 raise; 7-9 are never attempted.
+        page.goto = _goto_raising_on_search(raise_on={2, 3, 4, 5, 6})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = ["24CU016153C", "24CU016153C"] + [f"24CU0000{i:02d}C" for i in range(8)]
+        archiver = MagicMock()
+        archiver.archive.return_value = "ca/san-diego/key.html"
+        archiver.bucket = "test-bucket"
+        scraper = SDTentativeRulingsScraper(self._run_config(), case_numbers=cases)
+        scraper._archiver = archiver
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            patch("framework.base.inline_css", side_effect=lambda raw, **kw: raw),
+        ):
+            health = scraper.run()
+
+        assert health.success is False
+        assert health.error_message is not None
+        assert "aborted" in health.error_message
+        assert "3 skipped" in health.error_message
+        assert "net::ERR_TIMED_OUT" in health.error_message
+        # The captures from the clean lookups are archived, not discarded.
+        assert health.records_captured == 2
+        assert archiver.archive.call_count == 2
+        # 1 portal + 2 x (search + detail) + 5 raising searches, then stop.
+        assert page.goto.await_count == 1 + 4 + 5
+
+    def test_abort_with_no_captures_raises_even_after_clean_lookup(self) -> None:
+        """AC #1: a clean "no ruling" lookup, then 5 raising, cases left -> raise."""
+        portal = "<html><body>Portal</body></html>"
+        empty_search = "<html><body><div>No results</div></body></html>"
+        page = _make_mock_page([portal, empty_search])
+        page.goto = _goto_raising_on_search(raise_on={1, 2, 3, 4, 5})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(9)]
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=cases)
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "aborted after 6 of 9" in message
+        assert "3 skipped" in message
+        assert "net::ERR_TIMED_OUT" in message
+
+    def test_streak_on_last_case_is_not_an_abort(self) -> None:
+        """Hitting the streak on the final case skips nothing: keep success."""
+        portal = "<html><body>Portal</body></html>"
+        empty_search = "<html><body><div>No results</div></body></html>"
+        page = _make_mock_page([portal, empty_search])
+        page.goto = _goto_raising_on_search(raise_on={1, 2, 3, 4, 5})
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        cases = [f"24CU0000{i:02d}C" for i in range(6)]
+        scraper = SDTentativeRulingsScraper(self._run_config(), case_numbers=cases)
+
+        with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
+            health = scraper.run()
+
+        assert health.success is True
+        assert health.error_message is None
+
+
 def _cf_timeouts() -> Any:
     """Patch the Cloudflare retry timings down so retry loops finish instantly."""
     return (
