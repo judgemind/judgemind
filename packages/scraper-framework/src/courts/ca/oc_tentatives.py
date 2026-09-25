@@ -159,6 +159,11 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
 
         return doc
 
+    # parse_document() leaves ruling_text empty on purpose; the worker
+    # transcribes the PDF.  Suppresses the capture-time image-only warning,
+    # which fired for every OC PDF (#4714).
+    defers_pdf_transcription = True
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """No-op: field extraction is handled by the multimodal LLM pipeline.
 

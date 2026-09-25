@@ -3964,6 +3964,27 @@ class IngestionWorker:
                         "zero_ruling_extraction telemetry write failed",
                         exc_info=True,
                     )
+            # A multimodal PDF with zero rulings and no text to fall back on
+            # (e.g. an OC calendar that lists cases but posts no tentatives)
+            # has nothing to store (#4714).  The single-document fallback
+            # would only fail ``ruling_text_not_empty`` and emit a
+            # ``data_quality.ruling_empty_text_dropped`` event on every run.
+            # The ``zero_ruling_extraction`` warning above is the signal for
+            # this document.
+            if (
+                extraction_method == "multimodal"
+                and extracted_rulings is not None
+                and not (ruling_text or "").strip()
+            ):
+                logger.info(
+                    "llm_split.zero_rulings_no_text_skipped",
+                    extra={
+                        "document_id": document_id,
+                        "s3_key": event_data.get("s3_key"),
+                        "county": county,
+                    },
+                )
+                return True
             return False
 
         logger.info(
@@ -4247,6 +4268,31 @@ class IngestionWorker:
         # same ruling (once here and once in the split recursion).
 
         for cr in converted:
+            # Multimodal rows with no ruling body are not rulings (#4714).
+            # The per-page prompt returns ``ruling_text=""`` for calendar
+            # rows with an empty tentative cell, and the fused-row splitter
+            # (#2500) emits textless tail rows that carry only a caption or
+            # case number.  Dispatching them only produced a
+            # ``data_quality.ruling_empty_text_dropped`` failure for the same
+            # rows on every run.  Skip them here with their own event, so
+            # that telemetry still means "a ruling lost its text".  Split
+            # IDs are unchanged because indices come from the full list.
+            if extraction_method == "multimodal" and not (cr.ruling_text or "").strip():
+                entry_number = extracted_rulings[cr.split_index].entry_number
+                logger.info(
+                    "llm_split.textless_row_skipped",
+                    extra={
+                        "document_id": document_id,
+                        "split_document_id": cr.document_id,
+                        "row_class": "fused_tail" if entry_number is None else "empty_cell",
+                        "entry_number": entry_number,
+                        "case_number": cr.case_number,
+                        "case_title": cr.case_title,
+                        "county": county,
+                    },
+                )
+                continue
+
             # For multimodal-extracted PDFs, ruling_text is markdown.
             # Convert to HTML for ruling_text_html, strip for plain text.
             ruling_text_for_event = cr.ruling_text

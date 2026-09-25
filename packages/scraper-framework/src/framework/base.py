@@ -71,7 +71,18 @@ class BaseScraper(abc.ABC):
         outcomes with :class:`framework.fetch_tally.FetchTally` and call
         ``tally.raise_if_all_failed(docs)`` before returning, so that a run
         where every item failed is recorded as a failure (#4693).
+
+    Deferred PDF transcription:
+        A scraper whose ``parse_document`` intentionally leaves ``ruling_text``
+        empty for PDFs, because the ingestion worker transcribes them
+        downstream (e.g. the OC multimodal LLM path), sets
+        ``defers_pdf_transcription = True``.  This turns off the capture-time
+        "possible image-only PDF" warning.  For such a scraper an empty
+        ``ruling_text`` says nothing about the PDF's text layer, so the warning
+        fired for every document (#4714).
     """
+
+    defers_pdf_transcription: bool = False
 
     def __init__(
         self,
@@ -310,8 +321,14 @@ class BaseScraper(abc.ABC):
         doc = self.parse_document(doc)
 
         # Warn when a non-empty PDF yields no extracted text — likely an
-        # image-only PDF that pdfplumber cannot OCR (#1335).
-        if doc.content_format == ContentFormat.PDF and doc.raw_content and not doc.ruling_text:
+        # image-only PDF that pdfplumber cannot OCR (#1335).  Skipped for
+        # scrapers that defer transcription to the worker (#4714).
+        if (
+            doc.content_format == ContentFormat.PDF
+            and doc.raw_content
+            and not doc.ruling_text
+            and not self.defers_pdf_transcription
+        ):
             self._log.warning(
                 "PDF text extraction returned empty — possible image-only PDF",
                 source_url=doc.source_url,
