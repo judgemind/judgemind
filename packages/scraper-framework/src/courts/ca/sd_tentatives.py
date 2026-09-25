@@ -11,6 +11,12 @@ This scraper:
 4. Extracts tentative ruling content and structured fields
 5. Archives raw HTML to S3
 
+This scraper runs only inside ``ca-sd-pipeline`` (``sd_pipeline.py``), which
+passes it the Phase 1 case numbers. It is not registered in the runner on its
+own (#4679): with no case numbers it has nothing to fetch. Its
+``default_config`` stays because the pipeline builds Phase 2 with it, and
+documents it captures carry the ``ca-sd-tentatives`` scraper ID.
+
 Verified against fixtures based on Tyler Odyssey ROA standard patterns.
   Portal: https://odyroa.sdcourt.ca.gov/portal/
   SmartSearch: https://odyroa.sdcourt.ca.gov/portal/Home/SmartSearch?searchString={caseNumber}

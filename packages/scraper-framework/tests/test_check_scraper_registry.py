@@ -156,7 +156,6 @@ class TestFindRegisteredModules:
             "courts.ca.sc_tentatives",
             "courts.ca.sd_calendar",
             "courts.ca.sd_pipeline",
-            "courts.ca.sd_tentatives",
             "courts.ca.sf_tentatives",
             "courts.ca.ventura_tentatives",
         }
@@ -167,6 +166,10 @@ class TestFindRegisteredModules:
         # registered import, and the guard tolerates it via RETIRED_MODULES.
         assert "courts.federal.courtlistener" not in registered
         assert "courts.federal.courtlistener" in check_registry.RETIRED_MODULES
+        # The standalone SD Phase 2 entry was retired per #4679 — it only runs
+        # inside ca-sd-pipeline, which imports it itself.
+        assert "courts.ca.sd_tentatives" not in registered
+        assert "courts.ca.sd_tentatives" in check_registry.RETIRED_MODULES
 
     def test_with_synthetic_runner(self, tmp_path: Path) -> None:
         """Parses imports from a synthetic runner.py file."""

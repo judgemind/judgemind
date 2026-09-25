@@ -91,12 +91,15 @@ a subset.
 | `ca-sb-tentatives`                | San Bernardino civil tentative rulings            |
 | `ca-sc-tentatives`                | Santa Clara civil tentative rulings               |
 | `ca-sd-calendar`                  | San Diego civil calendar (Phase 1)                |
-| `ca-sd-pipeline`                  | San Diego ROA pipeline driver (Phase 2)           |
-| `ca-sd-tentatives`                | San Diego ROA tentative rulings (Phase 2)         |
+| `ca-sd-pipeline`                  | San Diego ROA tentative rulings (Phase 1 + 2)     |
 | `ca-sf-tentatives-civil`          | San Francisco civil tentative rulings             |
 | `ca-sf-tentatives-family-law`     | San Francisco family law tentative rulings        |
 | `ca-ventura-tentatives`           | Ventura tentative rulings                         |
 | `federal-courtlistener-opinions`  | CourtListener federal opinions feed               |
+
+`ca-sd-tentatives` (San Diego Phase 2) is not a registered scraper. It needs
+case numbers, which only `ca-sd-pipeline` supplies, so it runs inside that
+pipeline. Documents it captures still carry the `ca-sd-tentatives` scraper ID.
 
 ---
 
