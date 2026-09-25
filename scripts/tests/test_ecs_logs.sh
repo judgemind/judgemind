@@ -77,6 +77,24 @@ if [[ "${1:-}" == "logs" ]]; then
     shift
     case "${1:-}" in
         describe-log-streams)
+            # MOCK_EXACT_PREFIX_STREAM: returned only when queried with that
+            # exact --log-stream-name-prefix (emulates a stream that is not
+            # on the first alphabetical page of a bare-prefix listing).
+            _prefix=""
+            _args=("$@")
+            for ((_i = 0; _i < ${#_args[@]}; _i++)); do
+                if [[ "${_args[$_i]}" == "--log-stream-name-prefix" ]]; then
+                    _prefix="${_args[$((_i + 1))]:-}"
+                fi
+            done
+            if [[ -n "${MOCK_EXACT_PREFIX_STREAM:-}" ]]; then
+                if [[ "$_prefix" == "$MOCK_EXACT_PREFIX_STREAM" ]]; then
+                    echo "$MOCK_EXACT_PREFIX_STREAM"
+                else
+                    echo "None"
+                fi
+                exit 0
+            fi
             # Return the configured streams
             if [[ -n "${MOCK_STREAMS:-}" ]]; then
                 echo "$MOCK_STREAMS"
@@ -177,6 +195,23 @@ test_healthy_stream_selected() {
         pass "healthy top stream is selected"
     else
         fail "healthy top stream is selected" "got: $output"
+    fi
+}
+
+# --task finds a oneshot stream via the exact oneshot/oneshot/<task-id>
+# prefix, not a bare-prefix page that misses late-sorting IDs (#4723).
+test_oneshot_task_found_by_exact_prefix() {
+    local tmpdir output
+    tmpdir=$(setup_mock_aws)
+    output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        MOCK_EXACT_PREFIX_STREAM="oneshot/oneshot/f585c2568b50450699e715cae36a4e98" \
+        "$ECS_LOGS" /ecs/test-group --task f585c2568b50450699e715cae36a4e98 --lines 1 2>&1
+    ) || true
+    if echo "$output" | grep -q "oneshot/oneshot/f585c2568b50450699e715cae36a4e98"; then
+        pass "--task finds oneshot stream via exact task prefix"
+    else
+        fail "--task finds oneshot stream via exact task prefix" "got: $output"
     fi
 }
 
@@ -318,6 +353,7 @@ test_no_streams() {
 
 test_no_args
 test_help
+test_oneshot_task_found_by_exact_prefix
 test_unknown_option
 test_healthy_stream_selected
 test_stale_stream_fallback
