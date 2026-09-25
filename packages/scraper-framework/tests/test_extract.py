@@ -1038,7 +1038,7 @@ class TestExtractHearingDate:
 
     def test_month_day_year_no_comma(self) -> None:
         """'Month DD YYYY' without comma."""
-        text = "March 5 2026 hearing on motion"
+        text = "Tentative Rulings for March 5 2026\nhearing on motion"
         assert extract_hearing_date(text) == date(2026, 3, 5)
 
     def test_date_colon_mm_dd_yyyy(self) -> None:
@@ -1051,14 +1051,14 @@ class TestExtractHearingDate:
         text = "Date: 03/04/26\nCourtroom B"
         assert extract_hearing_date(text) == date(2026, 3, 4)
 
-    def test_standalone_mm_dd_yyyy(self) -> None:
-        """Standalone 'MM/DD/YYYY' without label."""
+    def test_standalone_mm_dd_yyyy_body_date_not_hearing_date(self) -> None:
+        """An unlabelled 'MM/DD/YYYY' is not taken as the hearing date (#4682)."""
         text = "Hearing on 01/15/2026 for motion to compel"
-        assert extract_hearing_date(text) == date(2026, 1, 15)
+        assert extract_hearing_date(text) is None
 
     def test_case_insensitive_month(self) -> None:
         """Month name matching is case-insensitive."""
-        text = "hearing on JANUARY 10, 2026 in department 3"
+        text = "hearing date: JANUARY 10, 2026 in department 3"
         assert extract_hearing_date(text) == date(2026, 1, 10)
 
     def test_no_match(self) -> None:
@@ -1081,8 +1081,12 @@ class TestExtractHearingDate:
 
     def test_december_31(self) -> None:
         """End of year date."""
-        text = "December 31, 2025 ruling"
+        text = "COURT CALENDAR FOR December 31, 2025\nruling"
         assert extract_hearing_date(text) == date(2025, 12, 31)
+
+    def test_unlabelled_long_form_body_date_not_hearing_date(self) -> None:
+        """A long-form date with no hearing-date label returns None (#4682)."""
+        assert extract_hearing_date("December 31, 2025 ruling") is None
 
 
 # ---------------------------------------------------------------------------

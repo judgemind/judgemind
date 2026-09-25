@@ -77,7 +77,7 @@ def test_oc_fl_hearing_date_standard() -> None:
 
 
 def test_oc_fl_hearing_date_no_comma() -> None:
-    text = "February 24 2026\nSome text"
+    text = "Date: February 24 2026\nSome text"
     assert _oc_fl_hearing_date_from_text(text) == datetime(2026, 2, 24)
 
 
