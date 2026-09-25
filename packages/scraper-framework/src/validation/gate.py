@@ -250,6 +250,9 @@ def insert_validation_result(
     document_id: str,
     ruling_id: str | None,
     result: ValidationResult,
+    county: str | None,
+    scraper_id: str | None,
+    s3_key: str | None,
 ) -> None:
     """Insert a validation result into the validation_results table.
 
@@ -263,14 +266,22 @@ def insert_validation_result(
         The ruling ID, if available.
     result : ValidationResult
         The validation outcome to log.
+    county, scraper_id, s3_key : str | None
+        Source attribution from the capture event (#4706). A FAIL never
+        writes a ``derived.documents`` row and split-child ids are uuid5
+        values, so these columns are the only way to group failures by
+        county or trace a row back to its raw S3 capture. They are
+        keyword-required (no default) so a new call site cannot silently
+        drop attribution; pass ``None`` explicitly when it is unknown.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO validation_results
                 (document_id, ruling_id, result, reason, model,
-                 input_tokens, output_tokens, latency_ms)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 input_tokens, output_tokens, latency_ms,
+                 county, scraper_id, s3_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 document_id,
@@ -281,6 +292,9 @@ def insert_validation_result(
                 result.input_tokens,
                 result.output_tokens,
                 result.latency_ms,
+                county or None,
+                scraper_id or None,
+                s3_key or None,
             ),
         )
 

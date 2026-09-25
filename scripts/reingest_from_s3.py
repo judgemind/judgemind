@@ -3420,6 +3420,9 @@ def reingest_batch(
                                     document_id=effective_doc_id,
                                     ruling_id=None,
                                     result=det_validation_result,
+                                    county=doc_meta.get("county"),
+                                    scraper_id=doc_meta.get("scraper_id"),
+                                    s3_key=doc_meta.get("s3_key"),
                                 )
                         except Exception as exc:
                             logger.warning(

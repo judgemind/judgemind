@@ -330,6 +330,9 @@ class TestInsertValidationResult:
             document_id="doc-123",
             ruling_id=None,
             result=result,
+            county=None,
+            scraper_id=None,
+            s3_key=None,
         )
 
         mock_cur.execute.assert_called_once()
@@ -366,6 +369,9 @@ class TestInsertValidationResult:
             document_id="doc-456",
             ruling_id="ruling-789",
             result=result,
+            county="Los Angeles",
+            scraper_id="",
+            s3_key=None,
         )
 
         call_args = mock_cur.execute.call_args
@@ -374,6 +380,67 @@ class TestInsertValidationResult:
         assert params[1] == "ruling-789"
         assert params[2] == "flag"
         assert params[3] == "Case title mismatch"
+        # Empty-string scraper_id (the worker's missing-key default) is
+        # stored as NULL, not '' (#4706).
+        assert params[-3:] == ("Los Angeles", None, None)
+
+    def test_insert_validation_result_county_scraper_id_s3_key(self) -> None:
+        """#4706: attribution columns are written so FAIL rows (no
+        derived.documents row) and split children can be grouped by county
+        and traced to their raw S3 capture."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = ValidationResult(
+            result="fail",
+            reason="hearing_date exceeds 180-day threshold",
+            model="deterministic",
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+        )
+
+        insert_validation_result(
+            mock_conn,
+            document_id="doc-1",
+            ruling_id=None,
+            result=result,
+            county="Contra Costa",
+            scraper_id="ca-contra-costa-tentatives",
+            s3_key="ca/contra_costa/superior_court/raw/abc.json",
+        )
+
+        sql, params = mock_cur.execute.call_args[0]
+        column_list = sql.split("(", 1)[1].split(")", 1)[0]
+        columns = [c.strip() for c in column_list.split(",")]
+        assert columns[-3:] == ["county", "scraper_id", "s3_key"]
+        assert len(params) == len(columns)
+        assert params[-3:] == (
+            "Contra Costa",
+            "ca-contra-costa-tentatives",
+            "ca/contra_costa/superior_court/raw/abc.json",
+        )
+
+    def test_insert_validation_result_county_requires_attribution_kwargs(self) -> None:
+        """#4706: attribution is keyword-required so a new call site cannot
+        silently drop it; callers with no attribution pass None explicitly."""
+        result = ValidationResult(
+            result="pass",
+            reason=None,
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+        )
+        with pytest.raises(TypeError):
+            insert_validation_result(  # type: ignore[call-arg]
+                MagicMock(),
+                document_id="doc-1",
+                ruling_id=None,
+                result=result,
+            )
 
 
 # ---------------------------------------------------------------------------
