@@ -602,8 +602,10 @@ _SC_RULING_ENTRY_RE = re.compile(
 # Within an entry, the structured per-case headers Santa Clara uses in the
 # expanded format.  These are deterministic enough to extract case_number
 # and case_title without involving the LLM.  Matching is case-insensitive.
+# A trailing note is allowed: ``Case No.: 21CV384705 (Consolidated with …)``
+# (#4696).
 _SC_CASE_NO_HEADER_RE = re.compile(
-    r"^Case\s+No\.?:\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\s*$",
+    r"^Case\s+No\.?:\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\b(?:\s+\([^\n]*)?\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -925,7 +927,7 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
 
 
 # ---------------------------------------------------------------------------
-# Dept-12 layout (#4681)
+# Table layout, first handled for Dept 12 (#4681, #4696)
 # ---------------------------------------------------------------------------
 #
 # Dept 12 (Judge Iravani-Sani) publishes a summary table headed
@@ -954,21 +956,31 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
 # RULING cell), and the ``Calendar Line`` bodies.  It emits one entry per
 # distinct case number.
 #
-# Other departments (10, 11, 13, 16, …) publish variants of the same table;
-# this splitter is gated to Dept 12 until those variants are validated
-# (see the #4681 follow-up).  Before #4681 Dept 12 PDFs fell through to the
-# whole-document LLM split, which produced ``UNKNOWN-`` case numbers.
+# Despite the ``dept12`` names, the layout is not Dept 12's alone (#4696): a
+# probe of all 381 dev-S3 raws found the header in 235 of them, across
+# depts 1, 2, 7, 8, 10, 11, 12, 13, 16, 19 and 22.  Their variants:
+#
+# * One row per motion, each repeating the case number (merged per case).
+# * Other cross-ref wording: ``Click LINE 3 or scroll down for ruling.``,
+#   ``Ctrl Click (or scroll down) on Line 5``, ``Click or scroll to line 1``,
+#   ``See Tentative Ruling on Line 2`` (``_SC_DEPT12_CROSSREF_RE``).
+# * Other body headings: ``Calendar Lines 3 through 8``, ``Calendar Lines
+#   4 – 5``, ``Calendar Line 8, 9, and 10``, ``Calendar Line 1 Calendar
+#   Lines 1-2``, and Dept 19's ``Line 1 (Calendar Lines 1-14)``
+#   (``_SC_DEPT12_BODY_RE``).
+# * Dept 2's ``Case No. 23PR194562 (lead case, consolidated with …)`` CASE #
+#   cells, and a ``TENTATIVE RULING`` last column in some Dept 1 PDFs.
+#
+# The splitter therefore runs whenever the header is present, in any
+# department.  Before #4681 / #4696 these PDFs went to format A (which split
+# on the table's ``LINE N`` rows and produced entries with no case number)
+# or to the whole-document LLM split; both produced ``UNKNOWN-`` case
+# numbers that the deterministic case-number rule then dropped.
 
-_SC_DEPT12_DEPARTMENTS = frozenset({"12"})
-
-# ``Department 12`` or ``Department 12 (Hon. Nahal Iravani-Sani)`` near the
-# top of the PDF.  Looser than ``_DEPT_PDF_RE`` (which requires the number to
-# end the line) because covering judges add their name after the number.
-_SC_DEPT12_DEPT_LINE_RE = re.compile(r"^Department\s+(?P<department>\d+)\b", re.MULTILINE)
-
-# The last column is ``RULING`` (``HEARING`` in some spring-2026 PDFs).
+# The last column is ``RULING`` (``HEARING`` in some spring-2026 PDFs,
+# ``TENTATIVE RULING`` in a few Dept 1 PDFs).
 _SC_DEPT12_HEADER_RE = re.compile(
-    r"LINE\s*#\s+CASE\s*#\s+CASE\s+TITLE\s+(?:RULING|HEARING)",
+    r"LINE\s*#\s+CASE\s*#\s+CASE\s+TITLE\s+(?:(?:TENTATIVE\s+)?RULING|HEARING)",
     re.IGNORECASE,
 )
 
@@ -980,15 +992,31 @@ _SC_DEPT12_CN_RE = re.compile(r"^\d{2}(?:CV|PR)\d{6}$", re.IGNORECASE)
 _SC_DEPT12_TEXT_ROW_RE = re.compile(
     r"^[ \t]*(?:(?:\d{1,2}:\d{2}|[-–]?[ \t]*LINES?[ \t]*\d{1,3}"
     r"(?:[ \t]*(?:-|&|,|and)[ \t]*(?:LINE[ \t]*)?\d{1,3})*)[ \t]+)*"
-    r"(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b",
+    # Not ``25PR200738)``: the tail of a ``(lead case, consolidated with …)``
+    # note wrapped onto its own line inside a CASE # cell (Dept 2).
+    r"(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b(?!\))",
     re.MULTILINE | re.IGNORECASE,
 )
 
-# Body-section boundary: ``Calendar Line 7`` / ``Calendar line 9 & 10`` /
-# ``Calendar Line 3 - 4`` / ``Calendar Line 6/7`` on its own line.
+# A CASE # cell that leads with its case number: ``24CV450440`` or Dept 2's
+# ``Case No. 23PR194562 (lead case, consolidated with 25PR200738)``.
+_SC_DEPT12_CN_CELL_RE = re.compile(
+    r"^(?:Case\s+No\.?:?\s*)?(?P<cn>\d{2}\s*-?\s*(?:CV|PR)\s*-?\s*\d{6})\b",
+    re.IGNORECASE,
+)
+
+# Body-section boundary, on its own line: ``Calendar Line 7`` /
+# ``Calendar line 9 & 10`` / ``Calendar Line 3 - 4`` / ``Calendar Line 6/7`` /
+# ``Calendar Lines 3 through 8`` / ``Calendar Lines 4 – 5`` /
+# ``Calendar Line 8, 9, and 10`` / ``Calendar line 1 – Tentative Ruling`` /
+# ``Calendar Line 1 Calendar Lines 1-2`` (pdfplumber doubles some headings),
+# or Dept 19's ``Line 1 (Calendar Lines 1-14)`` (#4696).  Only the first
+# number is captured; it is what the summary rows cross-reference.
 _SC_DEPT12_BODY_RE = re.compile(
-    r"^[ \t]*Calendar\s+Lines?\s+(?:Nos?\.?\s+)?(?P<first>\d{1,3})"
-    r"(?:[ \t]*(?:-|&|/|,|and)[ \t]*\d{1,3})*[ \t]*:?[ \t]*$",
+    r"^[ \t]*(?:Calendar\s+Lines?\s+(?:Nos?\.?\s+)?(?P<first>\d{1,3})\b"
+    r"(?:[ \t]*(?:[-–—&/,:]|and\b|through\b|thru\b|to\b|Calendar\b|Lines?\b|Nos?\.?"
+    r"|Tentative\b|Ruling\b|\d{1,3}\b))*"
+    r"|Line\s+(?P<paren>\d{1,3})[ \t]*\(Calendar\s+Lines?\s+[\d \t,&–—-]+\))[ \t]*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -1005,21 +1033,18 @@ _SC_DEPT12_BODY_CASE_NAME_RE = re.compile(
 )
 
 # Cross-references in a RULING cell: ``(or scroll down to) Line 7``,
-# ``See Line #1``, ``Click LINE 3``, ``Click on line 1``.
+# ``See Line #1``, ``Click LINE 3``, ``Click on line 1``,
+# ``Click (or scroll down) on Line 5``, ``Click or scroll to line 1``,
+# ``Click to Line 4``, ``See Tentative Ruling on Line 2`` — a ``click`` /
+# ``scroll`` / ``see`` followed, within the same sentence, by ``Line N``.
 _SC_DEPT12_CROSSREF_RE = re.compile(
-    r"(?:scroll\s+down\s+to\)?|\bSee|\bClick(?:\s+on)?)\s+Lines?\s+#?(?P<num>\d{1,3})",
+    r"\b(?:click|scroll|see)\b[^.\n]{0,40}?\bLines?\s+#?(?P<num>\d{1,3})",
     re.IGNORECASE,
 )
 
 
 def _normalize_case_number(raw: str) -> str:
     return re.sub(r"[\s-]", "", raw).upper()
-
-
-def _dept12_pdf_department(text: str) -> str | None:
-    """Department number from the PDF header (first 2000 chars)."""
-    m = _SC_DEPT12_DEPT_LINE_RE.search(text[:2000])
-    return m.group("department") if m else None
 
 
 def _one_char_apart(a: str, b: str) -> bool:
@@ -1053,10 +1078,19 @@ def _dept12_parse_row(row: list[str | None]) -> tuple[str, str | None, str, str]
     cells = [_dept12_cell(c) for c in row]
     label = _normalize_table_cell(row[0])
     for i in (1, 2):
-        if i < len(cells) and _SC_DEPT12_CN_RE.match(_normalize_case_number(cells[i])):
+        if i >= len(cells):
+            continue
+        cn: str | None = None
+        if _SC_DEPT12_CN_RE.match(_normalize_case_number(cells[i])):
+            cn = _normalize_case_number(cells[i])
+        elif i == 1 and (lead := _SC_DEPT12_CN_CELL_RE.match(cells[i])):
+            # Only column 1 may carry extra words after the case number;
+            # column 2 is the title when column 1 is a blank ditto cell.
+            cn = _normalize_case_number(lead.group("cn"))
+        if cn is not None:
             title = cells[i + 1] if i + 1 < len(cells) else ""
             ruling = "\n".join(c for c in cells[i + 2 :] if c)
-            return label, _normalize_case_number(cells[i]), title, ruling
+            return label, cn, title, ruling
     title = cells[2] if len(cells) > 2 else ""
     ruling = "\n".join(c for c in cells[3:] if c)
     return label, None, title, ruling
@@ -1182,7 +1216,7 @@ def _dept12_body_sections(text: str) -> list[_Dept12BodySection]:
             cn = _normalize_case_number(cn_match.group("cn") or cn_match.group("bare"))
         sections.append(
             _Dept12BodySection(
-                first_line=int(m.group("first")),
+                first_line=int(m.group("first") or m.group("paren")),
                 case_number=cn,
                 case_title=" ".join(name_match.group("title").split()) if name_match else None,
                 text=body,
@@ -1284,13 +1318,13 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRulin
     Three parsing paths cover the known SC layouts (see module docstring
     §A and §B, and the Dept-12 block comment above):
 
-    * **Dept 12** (#4681) — ``LINE # | CASE # | CASE TITLE | RULING``
-      summary table plus ``Calendar Line N`` bodies.  Tried first, only
-      when ``pdf_bytes`` is supplied, the header is present, and the PDF
-      header names a department in ``_SC_DEPT12_DEPARTMENTS``; its result
-      is used when it has >= 2 entries.
+    * **Table layout** (#4681, #4696) — ``LINE # | CASE # | CASE TITLE |
+      RULING`` summary table plus ``Calendar Line N`` bodies, published by
+      most departments.  Tried first, whenever ``pdf_bytes`` is supplied and
+      the header is present; its result is used whenever it is non-empty
+      (a single entry means a one-case calendar).
     * **Format A** — ``Line N`` boundary regex on the flattened pdfplumber
-      text.  Always tried first; succeeds for dept 16 and other
+      text.  Tried next; succeeds for dept 16 and other
       departments that print per-case body sections with bare ``Line N``
       headings.  When this path returns >= 2 entries, those are used
       verbatim.
@@ -1346,17 +1380,17 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRulin
     populate those fields via per-entry enrichment matches the Riverside
     pattern (#3649) and preserves correctness on single-ruling PDFs.
     """
-    # Dept-12 layout (#4681) runs first when its table header is present:
-    # its flattened text also contains bare ``LINE N`` lines (empty table
-    # rows), which format A would otherwise mistake for entry boundaries.
-    if (
-        pdf_bytes is not None
-        and _SC_DEPT12_HEADER_RE.search(text)
-        and _dept12_pdf_department(text) in _SC_DEPT12_DEPARTMENTS
-    ):
-        dept12 = _split_rulings_dept12(text, pdf_bytes)
-        if len(dept12) >= 2:
-            return dept12
+    # The ``LINE # | CASE # | CASE TITLE | RULING`` table layout (#4681,
+    # #4696) runs first whenever its header is present, in any department:
+    # its flattened text also contains ``LINE N`` lines (table rows), which
+    # format A would otherwise mistake for entry boundaries and split into
+    # entries with no case number (``UNKNOWN-`` downstream).  Its result is
+    # used even when it has a single entry: the table is then a one-case
+    # calendar, and the worker's single-ruling path is the right one.
+    if pdf_bytes is not None and _SC_DEPT12_HEADER_RE.search(text):
+        table = _split_rulings_dept12(text, pdf_bytes)
+        if table:
+            return table
 
     # Format A runs next.  When it produces a usable multi-entry
     # result, return it verbatim.
