@@ -236,6 +236,28 @@ class ParsedRuling:
     case_info_url: str | None
 
 
+def _api_result_list(json_text: str) -> list[Any] | None:
+    """Return the ``result`` list of a tr.dll REST response, or None.
+
+    The API always answers with a JSON object carrying a ``result`` list:
+    ``[0, ""]`` for no rulings, ``[-1]`` for an expired session, and
+    ``[count, "<html>"]`` otherwise. Anything else (a non-JSON body, JSON
+    that is not an object, an object without a ``result`` list) did not
+    come from the API, so the caller must not treat it as "no rulings"
+    (#4735).
+    """
+    try:
+        data = json.loads(json_text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result")
+    if not isinstance(result, list):
+        return None
+    return result
+
+
 def parse_api_response(json_text: str) -> list[ParsedRuling]:
     """Parse the tr.dll AJAX response into individual rulings.
 
@@ -253,6 +275,10 @@ def parse_api_response(json_text: str) -> list[ParsedRuling]:
         data = json.loads(json_text)
     except (json.JSONDecodeError, ValueError):
         logger.warning("sf_civil.invalid_json")
+        return []
+
+    if not isinstance(data, dict):
+        logger.warning("sf_civil.unexpected_body_type", body_type=type(data).__name__)
         return []
 
     result = data.get("result")
@@ -772,19 +798,30 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     )
                     continue
 
+                # A 200 whose body is not ``{"result": [...]}`` is not the
+                # API talking (Cloudflare interstitial, ASP error page served
+                # as 200). Counting it as an empty RulingID would make an
+                # outage look like a quiet day (#4735).
+                result = _api_result_list(response.text)
+                if result is None:
+                    tally.blocked("unexpected response: body is not a JSON result object")
+                    self._log.warning(
+                        "sf_civil.unexpected_response",
+                        ruling_id=ruling_id,
+                        department=department,
+                        content_type=response.headers.get("content-type", ""),
+                        body_prefix=response.text[:200],
+                    )
+                    continue
+
                 # Check for session expiry in response (-1 result)
-                try:
-                    data = json.loads(response.text)
-                    result = data.get("result", [])
-                    if isinstance(result, list) and result and result[0] == -1:
-                        tally.blocked("session expired during fetch (result -1)")
-                        self._log.warning(
-                            "Session expired during fetch",
-                            ruling_id=ruling_id,
-                        )
-                        continue
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                if result and result[0] == -1:
+                    tally.blocked("session expired during fetch (result -1)")
+                    self._log.warning(
+                        "Session expired during fetch",
+                        ruling_id=ruling_id,
+                    )
+                    continue
 
                 # Parse the response
                 rulings = parse_api_response(response.text)
