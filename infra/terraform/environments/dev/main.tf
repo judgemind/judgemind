@@ -263,7 +263,12 @@ module "dispatcher_daemon" {
   # path dormant (a defensive no-op guard in the daemon scheduler tick
   # re-enforces this on every tick). Never > 1 — the dispatcher is a
   # singleton and overlapping instances would double-spawn agents.
-  desired_count = 1
+  #
+  # Pinned to 0 (2026-09, #4668): the operator scaled the v2/v3 daemons to 0
+  # (depleted agent-runner Anthropic credit; v1-only in-session /task). This
+  # codifies that live state so the next dev auto-apply does not silently
+  # restart the daemon. Set back to 1 when the operator re-enables v2.
+  desired_count = 0
 
   # CPU + memory sized for ralph's in-container pre-push gate (#2962) and
   # anticipated cap>1 future state.
@@ -681,7 +686,12 @@ module "dispatcher_v3_service" {
   # Default desired_count=1 -- launcher is RUNNING but idle (cap=0
   # blocks claims). Operator can scale to 0 as a kill-switch
   # (rollback button per spec §9 step 4).
-  # desired_count = 1
+  #
+  # Pinned to 0 (2026-09, #4668): matches the operator's live kill-switch
+  # (depleted agent-runner Anthropic credit; v1-only in-session /task), so
+  # the next dev auto-apply does not silently restart the launcher. Remove
+  # this line to return to the default of 1 when v3 is re-enabled.
+  desired_count = 0
 }
 
 output "ecr_repository_url" {
