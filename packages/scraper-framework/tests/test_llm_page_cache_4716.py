@@ -32,6 +32,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import anthropic
+import pytest
 
 from framework.llm_extractor import (
     PAGE_JSON_RETRY_NUDGE,
@@ -450,3 +451,227 @@ class TestParsePageRowsWithStatus:
 
     def test_scalar_json_is_not_ok(self) -> None:
         assert _parse_page_rows_with_status("42", 0) == (False, [])
+
+
+# ---------------------------------------------------------------------------
+# #4738 — malformed page shapes are a page-level parse_error, never an abort
+# ---------------------------------------------------------------------------
+#
+# #4716 moved page parsing out of the API-retry ``try`` block.  A response
+# that is valid JSON but has the wrong shape (``{"rulings": null}``, a
+# non-list ``rulings``, ...) then raised ``TypeError`` straight out of
+# ``extract_from_pdf``, losing every ruling in the document for that run.
+
+MALFORMED_PAGE_BODIES = {
+    "rulings_null": json.dumps({"page_header": None, "rulings": None}),
+    "rulings_number": json.dumps({"rulings": 5}),
+    "rulings_string": json.dumps({"page_header": None, "rulings": "no rulings on this page"}),
+    "rulings_object": json.dumps({"rulings": {"entry_number": 1, "case_info": "x"}}),
+    "rows_null": json.dumps({"rows": None}),
+    "entries_number": json.dumps({"entries": 3}),
+    "missing_rulings_key": json.dumps({"page_header": {"department": "C25"}}),
+    "empty_object": "{}",
+    "list_of_non_dicts": json.dumps(["not a dict", 42, None]),
+    "rulings_list_of_non_dicts": json.dumps({"rulings": [None, "x"]}),
+}
+
+_MALFORMED_IDS = sorted(MALFORMED_PAGE_BODIES)
+
+
+def _mock_cache() -> MagicMock:
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_cache.get_page.return_value = None
+    return mock_cache
+
+
+class TestMalformedPageShape:
+    @pytest.mark.parametrize("name", _MALFORMED_IDS)
+    def test_parser_reports_malformed_shape_as_not_ok(self, name: str) -> None:
+        ok, rows = _parse_page_rows_with_status(MALFORMED_PAGE_BODIES[name], 0)
+        assert ok is False
+        assert rows == []
+
+    @pytest.mark.parametrize("name", _MALFORMED_IDS)
+    def test_malformed_page_does_not_abort_document(self, name: str) -> None:
+        body = MALFORMED_PAGE_BODIES[name]
+        mock_cache = _mock_cache()
+        ext = _make_extractor(mock_cache)
+
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=_by_image(
+                    {
+                        b"\x89PNG_page1": [PAGE1_JSON],
+                        b"\x89PNG_page2": [body, body],
+                        b"\x89PNG_page3": [PAGE3_JSON],
+                    }
+                ),
+            ) as mock_call,
+        ):
+            rulings = ext.extract_from_pdf(b"pdf-bytes")
+
+        # The other pages' rulings survive.
+        assert len(rulings) == 2
+        # The malformed page was retried once with the nudge ...
+        assert mock_call.call_count == 4
+        retry_kwargs = mock_call.call_args_list[2].kwargs
+        assert retry_kwargs["images"][0][0] == b"\x89PNG_page2"
+        assert PAGE_JSON_RETRY_NUDGE in retry_kwargs["text_message"]
+        # ... then marked failed: not cached as a page, and it blocks the
+        # document-level write so the next run retries it.
+        mock_cache.put.assert_not_called()
+        cached_raw = [c.args[2] for c in mock_cache.put_page.call_args_list]
+        assert cached_raw == [PAGE1_JSON, PAGE3_JSON]
+
+    @pytest.mark.parametrize("name", ["rulings_null", "rulings_number"])
+    def test_malformed_page_retry_succeeds_and_caches(self, name: str) -> None:
+        mock_cache = _mock_cache()
+        ext = _make_extractor(mock_cache)
+
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=_by_image(
+                    {
+                        b"\x89PNG_page1": [PAGE1_JSON],
+                        b"\x89PNG_page2": [MALFORMED_PAGE_BODIES[name], BOILERPLATE_PAGE_JSON],
+                        b"\x89PNG_page3": [PAGE3_JSON],
+                    }
+                ),
+            ) as mock_call,
+        ):
+            rulings = ext.extract_from_pdf(b"pdf-bytes")
+
+        assert mock_call.call_count == 4
+        assert len(rulings) == 2
+        mock_cache.put.assert_called_once()
+
+    def test_extract_single_page_reports_parse_error_for_null_rulings(self) -> None:
+        from framework.llm_extractor import TokenUsage
+
+        ext = _make_extractor(None)
+        body = MALFORMED_PAGE_BODIES["rulings_null"]
+        with patch(
+            "ingestion.llm_providers.call_llm_with_images",
+            side_effect=[_resp(body), _resp(body)],
+        ):
+            page = ext._extract_single_page(b"img", "image/png", usage=TokenUsage())
+
+        assert page.status == "parse_error"
+        assert page.rows == []
+
+    def test_unexpected_parser_exception_is_page_parse_error(self) -> None:
+        """Belt-and-braces: any parser exception stays page-local."""
+        mock_cache = _mock_cache()
+        ext = _make_extractor(mock_cache)
+        real_parse = _parse_page_rows_with_status
+        bad_raw = json.dumps({"rulings": [{"boom": True}]})
+
+        def _parse(raw_text: str, page_index: int) -> tuple[bool, list[dict]]:
+            if raw_text == bad_raw:
+                raise RuntimeError("parser bug")
+            return real_parse(raw_text, page_index)
+
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES),
+            patch("framework.llm_extractor._parse_page_rows_with_status", side_effect=_parse),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=_by_image(
+                    {
+                        b"\x89PNG_page1": [PAGE1_JSON],
+                        b"\x89PNG_page2": [bad_raw, bad_raw],
+                        b"\x89PNG_page3": [PAGE3_JSON],
+                    }
+                ),
+            ),
+        ):
+            rulings = ext.extract_from_pdf(b"pdf-bytes")
+
+        assert len(rulings) == 2
+        mock_cache.put.assert_not_called()
+        cached_raw = [c.args[2] for c in mock_cache.put_page.call_args_list]
+        assert cached_raw == [PAGE1_JSON, PAGE3_JSON]
+
+    @pytest.mark.parametrize("name", _MALFORMED_IDS)
+    def test_malformed_cached_page_is_a_miss_and_reextracted(self, name: str) -> None:
+        cache, s3 = _real_cache()
+        ext = _make_extractor(cache)
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES[:1]),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[_resp(EMPTY_PAGE_JSON), _resp(PAGE1_JSON)],
+            ) as mock_call,
+        ):
+            # Run 1 writes a page entry (no document entry: zero rulings).
+            # Replace it with a malformed-shape response, as an entry cached
+            # before #4738 could hold.
+            ext.extract_from_pdf(b"pdf-bytes")
+            page_key = next(k for k in s3.objects if "/pages/" in k)
+            s3.objects[page_key] = json.dumps({"raw_text": MALFORMED_PAGE_BODIES[name]}).encode()
+            rulings = ext.extract_from_pdf(b"pdf-bytes")
+
+        assert mock_call.call_count == 2
+        assert len(rulings) == 1
+        assert json.loads(s3.objects[page_key])["raw_text"] == PAGE1_JSON
+
+    def test_cached_page_parser_exception_is_a_miss(self) -> None:
+        cache, _ = _real_cache()
+        ext = _make_extractor(cache)
+        real_parse = _parse_page_rows_with_status
+        calls = {"n": 0}
+
+        def _parse(raw_text: str, page_index: int) -> tuple[bool, list[dict]]:
+            calls["n"] += 1
+            if calls["n"] == 1:  # the cache-hit re-parse
+                raise RuntimeError("parser bug")
+            return real_parse(raw_text, page_index)
+
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES[:1]),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[_resp(EMPTY_PAGE_JSON), _resp(PAGE1_JSON)],
+            ) as mock_call,
+        ):
+            ext.extract_from_pdf(b"pdf-bytes")
+            with patch("framework.llm_extractor._parse_page_rows_with_status", side_effect=_parse):
+                rulings = ext.extract_from_pdf(b"pdf-bytes")
+
+        assert mock_call.call_count == 2
+        assert len(rulings) == 1
+
+
+class TestWellFormedShapesStillParse:
+    """The #4738 shape checks must not reject the valid forms."""
+
+    def test_legacy_single_row_object_is_ok(self) -> None:
+        raw = json.dumps({"entry_number": 1, "case_info": "2024-00001 A v. B", "ruling_text": "t"})
+        ok, rows = _parse_page_rows_with_status(raw, 0)
+        assert ok is True
+        assert len(rows) == 1
+
+    def test_mixed_list_keeps_dict_rows(self) -> None:
+        raw = json.dumps([{"entry_number": 1, "case_info": "x", "ruling_text": "t"}, None, "junk"])
+        ok, rows = _parse_page_rows_with_status(raw, 0)
+        assert ok is True
+        assert len(rows) == 1
+
+    def test_header_only_page_with_empty_rulings_is_ok(self) -> None:
+        raw = json.dumps({"page_header": {"department": "C25"}, "rulings": []})
+        ok, rows = _parse_page_rows_with_status(raw, 0)
+        assert ok is True
+        assert len(rows) == 1  # the synthetic header row
+        assert rows[0]["entry_number"] is None
+
+    def test_rows_and_entries_keys_still_supported(self) -> None:
+        item = {"entry_number": 1, "case_info": "x", "ruling_text": "t"}
+        for key in ("rows", "entries"):
+            ok, rows = _parse_page_rows_with_status(json.dumps({key: [item]}), 0)
+            assert ok is True
+            assert len(rows) == 1
