@@ -278,6 +278,9 @@ def test_issue_4667_body_only_long_form_date_is_not_a_hearing_date() -> None:
         ("DATE: 09/23/26 TIME: 9:00 A.M.", datetime(2026, 9, 23)),
         ("DATE: September 23, 2026 TIME: 9:00 A.M.", datetime(2026, 9, 23)),
         ("DATE: 09-23-2026", datetime(2026, 9, 23)),
+        # Dept 2 probate, 2026-08-05 capture c6d6aca9: all-caps month.
+        ("DATE: AUGUST 5, 2026 TIME: 10:00 A.M.", datetime(2026, 8, 5)),
+        ("DATE: SEPT. 21, 2026 TIME: 10:00 A.M.", datetime(2026, 9, 21)),
     ],
 )
 def test_issue_4667_date_label_formats(line: str, expected: datetime) -> None:

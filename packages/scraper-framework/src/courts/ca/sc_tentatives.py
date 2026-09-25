@@ -88,9 +88,11 @@ _DEPT_PDF_RE = re.compile(r"^Department\s+(?P<department>\d+)$", re.MULTILINE)
 # the ruling bodies instead (a claimant's DOB -> 1972-09-13, a discovery
 # service date -> 2025-10-30), and every split ruling inherited it (#4667).
 # Full month names plus the abbreviations seen in live headers
-# ("DATE: Sept. 21, 2026" — dept 2 probate).
+# ("DATE: Sept. 21, 2026" — dept 2 probate).  Month names are matched
+# case-insensitively via a scoped ``(?i:...)`` group ("DATE: AUGUST 5, 2026"
+# — dept 2 probate) while the "DATE:" label itself stays case-sensitive.
 _LONG_FORM_DATE = (
-    r"(?:January|February|March|April|May|June|July|August|September"
+    r"(?i:January|February|March|April|May|June|July|August|September"
     r"|October|November|December"
     r"|(?:Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?)"
     r"\s+\d{1,2},?\s+\d{4}"
