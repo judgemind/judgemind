@@ -52,7 +52,7 @@ import CaseDetailPage from '../page';
 // ---------------------------------------------------------------------------
 
 async function renderPage(id: string) {
-  const jsx = await CaseDetailPage({ params: { id } });
+  const jsx = await CaseDetailPage({ params: Promise.resolve({ id }) });
   return render(jsx);
 }
 
@@ -85,7 +85,7 @@ describe('CaseDetailPage (SSR smoke)', () => {
       },
     });
 
-    const result = await CaseDetailPage({ params: { id: 'case-1' } });
+    const result = await CaseDetailPage({ params: Promise.resolve({ id: 'case-1' }) });
     // The page should return a valid React element (JSX)
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
@@ -106,7 +106,7 @@ describe('CaseDetailPage (SSR smoke)', () => {
       },
     });
 
-    const result = await CaseDetailPage({ params: { id: 'case-2' } });
+    const result = await CaseDetailPage({ params: Promise.resolve({ id: 'case-2' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
   });
@@ -117,7 +117,7 @@ describe('CaseDetailPage (SSR smoke)', () => {
     });
 
     await expect(
-      CaseDetailPage({ params: { id: 'nonexistent' } }),
+      CaseDetailPage({ params: Promise.resolve({ id: 'nonexistent' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
 
@@ -125,7 +125,7 @@ describe('CaseDetailPage (SSR smoke)', () => {
     mockQuery.mockRejectedValueOnce(new Error('Network error'));
 
     await expect(
-      CaseDetailPage({ params: { id: 'error-case' } }),
+      CaseDetailPage({ params: Promise.resolve({ id: 'error-case' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
 

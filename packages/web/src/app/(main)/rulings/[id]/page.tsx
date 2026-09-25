@@ -87,10 +87,10 @@ interface RulingData {
 }
 
 
-type Props = { params: { id: string } };
+type Props = { params: Promise<{ id: string }> };
 
 export default async function RulingDetailPage({ params }: Props) {
-  const { id } = params;
+  const { id } = await params;
 
   let rulingData: RulingData['ruling'] = null;
   try {

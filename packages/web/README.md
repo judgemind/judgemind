@@ -1,6 +1,6 @@
 # web
 
-Judgemind's web application. A Next.js 14 app that serves as the primary user interface for searching rulings, viewing judge analytics, and managing alerts. Communicates exclusively with the API's GraphQL endpoint.
+Judgemind's web application. A Next.js 15 app that serves as the primary user interface for searching rulings, viewing judge analytics, and managing alerts. Communicates exclusively with the API's GraphQL endpoint.
 
 ## Key Entry Points
 

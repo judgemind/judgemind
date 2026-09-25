@@ -107,7 +107,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const result = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
   });
@@ -135,7 +135,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const result = await RulingDetailPage({ params: { id: 'ruling-2' } });
+    const result = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-2' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
   });
@@ -146,7 +146,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
     });
 
     await expect(
-      RulingDetailPage({ params: { id: 'nonexistent' } }),
+      RulingDetailPage({ params: Promise.resolve({ id: 'nonexistent' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
 
@@ -154,7 +154,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
     mockQuery.mockRejectedValueOnce(new Error('Network error'));
 
     await expect(
-      RulingDetailPage({ params: { id: 'error-ruling' } }),
+      RulingDetailPage({ params: Promise.resolve({ id: 'error-ruling' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
 
@@ -168,7 +168,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const result = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
   });
@@ -190,7 +190,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
     });
 
     // Should NOT throw — the try/catch should handle the sanitization error
-    const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const result = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
   });
@@ -204,7 +204,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     const judgeLink = screen.getByText('Johnson, Robert M.').closest('a');
@@ -216,7 +216,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // Case number now has "Case " prefix in the subtitle
@@ -229,7 +229,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     const courtLink = screen.getByText('Los Angeles Superior Court').closest('a');
@@ -241,7 +241,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // "Los Angeles" as county is part of the court name "Los Angeles Superior Court",
@@ -265,7 +265,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // When court name doesn't contain the county, both should appear in the link
@@ -287,7 +287,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     const courtLink = screen.getByText('Superior Court, County of San Diego').closest('a');
@@ -301,7 +301,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // Hearing date should appear in the subtitle, not in the metadata card
@@ -317,7 +317,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // Department should appear as "Dept. 12" inline in the subtitle
@@ -339,7 +339,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // No "Dept." text should appear anywhere
@@ -358,7 +358,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // Department should still appear when judge and court are null
@@ -370,7 +370,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // No <dt> elements should exist — the standalone metadata card is removed
@@ -390,7 +390,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // No entity links should exist in the subtitle
@@ -408,7 +408,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     const badge = screen.getByTestId('case-type-badge');
@@ -429,7 +429,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     expect(screen.queryByTestId('case-type-badge')).not.toBeInTheDocument();
@@ -445,7 +445,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     expect(screen.queryByTestId('case-type-badge')).not.toBeInTheDocument();
@@ -460,7 +460,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     const partiesSection = screen.getByTestId('parties-section');
@@ -484,7 +484,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     expect(screen.queryByTestId('parties-section')).not.toBeInTheDocument();
@@ -500,7 +500,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     expect(screen.queryByTestId('parties-section')).not.toBeInTheDocument();
@@ -511,7 +511,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
       data: { ruling: FULL_RULING },
     });
 
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    const jsx = await RulingDetailPage({ params: Promise.resolve({ id: 'ruling-1' }) });
     render(jsx);
 
     // partyType "individual" should appear as "(Individual)" via formatLabel

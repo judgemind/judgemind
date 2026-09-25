@@ -41,7 +41,7 @@ export function Autocomplete({
   const [activeIndex, setActiveIndex] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
   const listboxRef = useRef<HTMLUListElement>(null);
-  const blurTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const blurTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const generatedId = useId();
   const listboxId = `${id ?? generatedId}-listbox`;
 
