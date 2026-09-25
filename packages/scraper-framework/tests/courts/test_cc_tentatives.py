@@ -546,9 +546,10 @@ def test_cc_fetch_pdf_text_extraction_failure() -> None:
     </body></html>"""
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
 
-    # Return invalid PDF content that will fail text extraction
+    # Return a corrupt PDF (right magic bytes, unparseable body) that will
+    # fail text extraction
     respx.route(method="GET", url__regex=r".*\.pdf$").mock(
-        return_value=httpx.Response(200, content=b"not-a-real-pdf-content")
+        return_value=httpx.Response(200, content=b"%PDF-1.4 corrupt-pdf-content")
     )
 
     docs = scraper.fetch_documents()
@@ -1692,6 +1693,95 @@ def test_cc_fetch_llm_disabled_uses_regex(mock_llm_enabled: MagicMock) -> None:
     assert len(docs) == 1
     assert docs[0].department == "14"
     assert docs[0].extra.get("_llm_extracted") is not True
+
+
+# ---------------------------------------------------------------------------
+# LLM returning nothing / non-PDF bodies are not OK-with-0-docs (#4748)
+# ---------------------------------------------------------------------------
+
+_CC_ONE_LINK_INDEX = (
+    "<html><body>"
+    '<a class="tentative-ruling" '
+    'href="TR\\Department 14 - Judge Athanasiou\\14_031026.pdf">Mar 10</a>'
+    "</body></html>"
+)
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings", return_value=[])
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_fetch_llm_empty_list_falls_back_to_single_doc(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """An LLM result of ``[]`` for a real ruling PDF is an extraction miss.
+    The PDF is still captured on the single-doc path instead of being
+    dropped and counted as an OK fetch with 0 docs (#4748)."""
+    scraper = CCTentativeRulingsScraper(cc_default_config())
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=_CC_ONE_LINK_INDEX))
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=_load_bytes("cc_dept14_031026.pdf"))
+    )
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    assert docs[0].department == "14"
+    assert docs[0].extra.get("_llm_extracted") is not True
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_fetch_all_phantom_rulings_falls_back_to_single_doc(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When the phantom guard drops every LLM ruling, the PDF is still
+    captured on the single-doc path, not dropped as OK/0 (#4748)."""
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="ZZ99-99999",
+            ruling_text="Phantom ruling.",
+            case_title="Nobody v. Nobody",
+            case_type="civil",
+            motion_type=None,
+            outcome=None,
+            parties=[],
+        )
+    ]
+    scraper = CCTentativeRulingsScraper(cc_default_config())
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=_CC_ONE_LINK_INDEX))
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=_load_bytes("cc_dept14_031026.pdf"))
+    )
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    assert docs[0].case_number != "ZZ99-99999"
+    assert docs[0].extra.get("_llm_extracted") is not True
+
+
+@respx.mock
+def test_cc_run_fails_when_every_pdf_url_returns_not_a_pdf() -> None:
+    """An HTML block page served at the PDF URL is blocked, not archived as
+    a PDF and counted OK (#4748)."""
+    config = cc_default_config()
+    config.request_delay_seconds = 0
+    scraper = CCTentativeRulingsScraper(config)
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=_CC_ONE_LINK_INDEX))
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, text="<html><body>Access denied</body></html>")
+    )
+
+    health = scraper.run()
+
+    assert health.success is False
+    message = health.error_message or ""
+    assert "all 1 CC PDF fetches were blocked" in message
+    assert "not a PDF" in message
 
 
 # ---------------------------------------------------------------------------

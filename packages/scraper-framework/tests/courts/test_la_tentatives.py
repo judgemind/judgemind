@@ -3756,6 +3756,93 @@ def test_appellate_run_fails_when_every_post_raises() -> None:
     assert "all 2 LA appellate ruling POSTs failed" in (health.error_message or "")
 
 
+# ---------------------------------------------------------------------------
+# Unexpected-shape 200 POST responses are not successful fetches (#4748)
+# ---------------------------------------------------------------------------
+
+_BLOCK_PAGE = "<html><body><h1>Access denied</h1><p>Request blocked.</p></body></html>"
+
+
+@respx.mock
+def test_run_fails_when_every_post_returns_a_block_page() -> None:
+    """A 200 POST response that is neither the stale-ViewState page nor a
+    ruling page (no div#speechSynthesis) is blocked, not an empty
+    department. When every POST looks like that, the run fails (#4748)."""
+    main_html = _load("la_main_page.html")
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=_BLOCK_PAGE))
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    health = LATentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 97 LA civil ruling POSTs were blocked" in message
+    assert "not a ruling page" in message
+
+
+@respx.mock
+def test_run_succeeds_when_every_post_is_a_dept_header_only_page() -> None:
+    """The department-header page (a real LA response with a
+    div#speechSynthesis but no case sections, #422) is a genuinely empty
+    department: the run stays green with 0 records (#4748)."""
+    main_html = _load("la_main_page.html")
+    header_html = _load("la_ruling_dept_header.html")
+    assert _split_cases_html(header_html) == []
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=header_html))
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    health = LATentativeRulingsScraper(config=config).run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+@respx.mock
+def test_llm_empty_list_falls_back_to_regex() -> None:
+    """An LLM result of ``[]`` for a ruling page that has case sections is
+    an extraction miss, not an empty department. The regex path captures
+    the cases instead of recording 0 docs as OK (#4748)."""
+    main_html = _load("la_main_page.html")
+    ruling_html = _load("la_ruling_pas_p.html")
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+    config = default_config()
+    config.request_delay_seconds = 0.0
+    scraper = LATentativeRulingsScraper(config)
+    with (
+        patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "true"}),
+        patch("courts.ca.la_tentatives._llm_extract_rulings", return_value=[]),
+    ):
+        docs = scraper.fetch_documents()
+
+    assert len(docs) > 0
+    assert all(d.extra.get("_llm_extracted") is not True for d in docs)
+
+
+@respx.mock
+def test_appellate_run_fails_when_every_post_returns_a_block_page() -> None:
+    """Appellate: a 200 POST response with no div#speechSynthesis is
+    blocked, so an all-block-page run fails (#4748)."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=_BLOCK_PAGE))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    health = LAAppellateTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    message = health.error_message or ""
+    assert "all 2 LA appellate ruling POSTs were blocked" in message
+    assert "not a ruling page" in message
+
+
 def test_appellate_scraper_registered_in_runner() -> None:
     """The appellate scraper is registered and discoverable via the runner."""
     from framework.runner import get_scraper_ids

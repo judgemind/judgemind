@@ -138,6 +138,18 @@ class SearchResult:
         self.doc_id = doc_id
 
 
+def is_no_results_page(html: str) -> bool:
+    """Return True if *html* is the court's "No results found" search page.
+
+    Live empty dates (checked 2026-09-25 for 9/25/2026 and 9/27/2026) render
+    ``<div id="resultscontainer"><h2 class="noresults">No results found</h2>``.
+    A page with no results table and no such marker is a block page or a
+    layout change, not an empty date (#4748).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    return soup.find(class_="noresults") is not None
+
+
 def parse_results_table(html: str) -> list[SearchResult]:
     """Parse the results table from the search response HTML.
 
@@ -451,8 +463,10 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         """POST a date search and process the results.
 
         Each result document is one ``ok()``/``failed()`` on *tally*; a search
-        that returns no results is one ``ok()`` (a genuinely empty date). A
-        failed search POST raises to the caller, which records it.
+        that returns the court's "No results found" page is one ``ok()`` (a
+        genuinely empty date), and a response with neither results nor that
+        marker is one ``blocked()`` (#4748). A failed search POST raises to
+        the caller, which records it.
         """
         if tally is None:
             tally = FetchTally()
@@ -468,7 +482,17 @@ class VenturaTentativeRulingsScraper(BaseScraper):
 
         docs: list[CapturedDocument] = []
         if not results:
-            tally.ok()
+            if is_no_results_page(response.text):
+                tally.ok()
+            else:
+                # No results table and no "No results found" marker: a block
+                # page or a layout change, not an empty date (#4748).
+                tally.blocked("search response is not a tentative-rulings search result")
+                self._log.error(
+                    "ventura.unexpected_search_response",
+                    date=date_str,
+                    body_prefix=response.text[:200],
+                )
         for result in results:
             time.sleep(self.config.request_delay_seconds)
             try:

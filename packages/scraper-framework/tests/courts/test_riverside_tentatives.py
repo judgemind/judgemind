@@ -877,8 +877,9 @@ def test_riv_parse_document_judge_fallback() -> None:
 def test_riv_fetch_documents_pdf_extraction_failure() -> None:
     """When PDF text extraction fails, the original doc is kept as-is."""
     html = _load_html("riv_page.html")
-    # Use invalid PDF content that will cause extraction to fail
-    bad_pdf = b"This is not a valid PDF"
+    # Use a corrupt PDF (right magic bytes, unparseable body) that will
+    # cause extraction to fail
+    bad_pdf = b"%PDF-1.4 This is not a valid PDF"
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
     respx.get(url__regex=r"\.pdf$").mock(

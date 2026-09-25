@@ -69,7 +69,12 @@ from framework.extraction_config import get_county_extraction_config
 from framework.fetch_tally import FetchTally
 from framework.llm_utils import parse_llm_json
 
-from .pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
+from .pdf_link_scraper import (
+    NOT_A_PDF_REASON,
+    PdfLinkScraper,
+    _extract_pdf_text,
+    looks_like_pdf,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -608,6 +613,16 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
                     pdf_content = pdf_response.content
 
+                    if not looks_like_pdf(pdf_content):
+                        tally.blocked(NOT_A_PDF_REASON)
+                        self._log.error(
+                            "cc.not_a_pdf",
+                            url=href,
+                            department=department,
+                            body_prefix=pdf_content[:200].decode("utf-8", "replace"),
+                        )
+                        continue
+
                     # Extract hearing date from filename
                     filename = href.rsplit("/", 1)[-1] if "/" in href else href
                     hearing_date = _cc_hearing_date_from_filename(filename)
@@ -646,6 +661,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                             # Hoist valid_cns computation once per PDF (#3798).
                             # Used by the phantom-ruling guard below.
                             valid_cns = _extract_calendar_header_case_numbers(text)
+                            docs_before_pdf = len(docs)
                             for ruling in llm_rulings:
                                 # Phantom-ruling guard (#3798): drop LLM rulings
                                 # whose case_number does not appear in a top-level
@@ -693,19 +709,32 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                                 if ruling.case_type:
                                     doc.extra["case_type"] = ruling.case_type
                                 docs.append(doc)
-                            self._log.debug(
-                                "LLM extracted rulings",
-                                dept=department,
-                                judge=effective_judge,
-                                cases=len(llm_rulings),
+                            if len(docs) > docs_before_pdf:
+                                self._log.debug(
+                                    "LLM extracted rulings",
+                                    dept=department,
+                                    judge=effective_judge,
+                                    cases=len(llm_rulings),
+                                )
+                                continue
+                            # The LLM returned no rulings, or the phantom
+                            # guard dropped all of them. A non-boilerplate
+                            # PDF holds rulings, so this is an extraction
+                            # miss: capture the PDF on the single-doc path
+                            # rather than drop it as an OK fetch (#4748).
+                            self._log.warning(
+                                "cc.llm_no_rulings_kept",
+                                department=department,
+                                judge=judge_name,
+                                llm_rulings=len(llm_rulings),
                             )
-                            continue
-                        # LLM failed — fall through to single-doc regex path
-                        self._log.warning(
-                            "LLM extraction failed, falling back to regex",
-                            department=department,
-                            judge=judge_name,
-                        )
+                        else:
+                            # LLM failed — fall through to single-doc regex path
+                            self._log.warning(
+                                "LLM extraction failed, falling back to regex",
+                                department=department,
+                                judge=judge_name,
+                            )
 
                     # Single-doc regex path (default, or LLM fallback)
                     doc = self._make_base_doc(

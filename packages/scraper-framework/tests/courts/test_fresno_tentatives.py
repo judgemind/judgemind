@@ -992,7 +992,7 @@ def test_fresno_fetch_documents_pdf_extraction_failure() -> None:
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
     # Return invalid PDF bytes to trigger extraction failure
     respx.get(url__regex=r"\.pdf").mock(
-        return_value=httpx.Response(200, content=b"not-a-valid-pdf")
+        return_value=httpx.Response(200, content=b"%PDF-1.4 not-a-valid-pdf")
     )
 
     config = fresno_default_config()
@@ -1022,7 +1022,9 @@ def test_fresno_fetch_documents_single_ruling_pdf() -> None:
     html = _load_html("fresno_index_page.html")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
-    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+    respx.get(url__regex=r"\.pdf").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
+    )
 
     single_ruling_text = (
         "(1) Tentative Ruling\n"
@@ -1075,7 +1077,9 @@ def test_fresno_fetch_documents_zero_rulings() -> None:
     html = _load_html("fresno_index_page.html")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
-    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+    respx.get(url__regex=r"\.pdf").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
+    )
 
     with patch(
         "courts.ca.fresno_tentatives._extract_pdf_text",
@@ -1204,7 +1208,9 @@ def test_fresno_fetch_documents_preserves_per_ruling_department() -> None:
     html = _load_html("fresno_index_page.html")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
-    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+    respx.get(url__regex=r"\.pdf").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
+    )
 
     # Simulate a mixed-department PDF: items from 403 and 501 in one file.
     # The filename encodes 403 but an individual ruling carries 501 — the
@@ -1260,7 +1266,9 @@ def test_fresno_fetch_documents_pre_split_children_are_unique_by_base_hash() -> 
     html = _load_html("fresno_index_page.html")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
-    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+    respx.get(url__regex=r"\.pdf").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
+    )
 
     split_text = (
         "(20) Tentative Ruling\n"

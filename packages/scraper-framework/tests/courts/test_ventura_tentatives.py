@@ -3,7 +3,8 @@
 Fixtures:
   ventura_search_page.html     — GET search page with anti-forgery token
   ventura_results_page.html    — POST results with 6 rows across 3 departments
-  ventura_no_results_page.html — POST results with no matching rulings
+  ventura_no_results_live_4748.html — live POST response for a date with no
+                                 rulings (9/27/2026, captured 2026-09-25)
 """
 
 from __future__ import annotations
@@ -156,7 +157,7 @@ def test_parse_results_table_event_types() -> None:
 
 
 def test_parse_results_table_no_results() -> None:
-    html = _load_html("ventura_no_results_page.html")
+    html = _load_html("ventura_no_results_live_4748.html")
     results = parse_results_table(html)
     assert len(results) == 0
 
@@ -347,7 +348,7 @@ def test_ventura_run_extracts_outcome_from_document() -> None:
 @respx.mock
 def test_ventura_run_no_results() -> None:
     search_html = _load_html("ventura_search_page.html")
-    no_results_html = _load_html("ventura_no_results_page.html")
+    no_results_html = _load_html("ventura_no_results_live_4748.html")
 
     respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
     respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=no_results_html))
@@ -668,7 +669,7 @@ def test_ventura_search_date_error_with_other_date_empty_succeeds() -> None:
     """One date's POST errors, another returns no results: the court was
     reachable and genuinely empty, so the run succeeds (#4693)."""
     search_html = _load_html("ventura_search_page.html")
-    no_results_html = _load_html("ventura_no_results_page.html")
+    no_results_html = _load_html("ventura_no_results_live_4748.html")
 
     respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
     respx.post(SEARCH_URL).mock(
@@ -708,6 +709,59 @@ def test_ventura_run_fails_when_every_document_fetch_fails() -> None:
     assert health.success is False
     assert health.records_captured == 0
     assert "Ventura date searches and document fetches failed" in (health.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# Unexpected-shape 200 search responses are not successful fetches (#4748)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_ventura_run_fails_when_every_search_returns_a_block_page() -> None:
+    """A 200 search response with no results table and no "No results found"
+    marker is a block page or layout change, not an empty date. When every
+    date search looks like that, the run fails (#4748)."""
+    search_html = _load_html("ventura_search_page.html")
+    block_page = "<html><body><h1>Access denied</h1><p>Request blocked.</p></body></html>"
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=block_page))
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 9, 25), datetime(2026, 9, 27)],
+    )
+    health = scraper.run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 2 Ventura date searches and document fetches were blocked" in message
+    assert "not a tentative-rulings search result" in message
+
+
+@respx.mock
+def test_ventura_run_succeeds_on_live_no_results_page() -> None:
+    """The live "No results found" page is a genuinely empty date: the run
+    stays green with 0 records (#4748)."""
+    search_html = _load_html("ventura_search_page.html")
+    no_results_html = _load_html("ventura_no_results_live_4748.html")
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=no_results_html))
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 9, 27)],
+    )
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0
 
 
 def test_ventura_parse_document_empty_content() -> None:

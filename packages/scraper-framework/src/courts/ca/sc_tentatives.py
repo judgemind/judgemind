@@ -56,6 +56,8 @@ from framework import (
 )
 from framework.fetch_tally import FetchTally
 
+from .pdf_link_scraper import NOT_A_PDF_REASON, looks_like_pdf
+
 logger = structlog.get_logger(__name__)
 
 LANDING_URL = "https://santaclara.courts.ca.gov/online-services/tentative-rulings"
@@ -266,6 +268,25 @@ def extract_departments(html: str, base_url: str = BASE_URL) -> list[DepartmentI
         departments.append(DepartmentInfo(department=dept, page_url=url, judge_name=judge))
 
     return departments
+
+
+_DEPT_PAGE_TITLE_RE = re.compile(
+    r"\b(?:Department|Dept\.?)\s*\S+\s+Tentative\s+Rulings\b", re.IGNORECASE
+)
+
+
+def _is_dept_page(html: str) -> bool:
+    """Return True if *html* is a department tentative-rulings page.
+
+    Every live department page (checked 2026-09-25, all 10 departments) has
+    an ``<h1>`` reading "Department N Tentative Rulings". A block page or an
+    error page does not, so a PDF-less response without it is not an empty
+    department (#4748).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    return any(
+        _DEPT_PAGE_TITLE_RE.search(h1.get_text(" ", strip=True)) for h1 in soup.find_all("h1")
+    )
 
 
 def extract_pdf_links_from_dept_page(html: str, base_url: str = BASE_URL) -> list[tuple[str, str]]:
@@ -1481,6 +1502,17 @@ class SCTentativeRulingsScraper(BaseScraper):
                         dept_info.judge_name = self._dir_mapping[dept_info.department]
 
             self._log.info("Found departments", count=len(departments))
+            if not departments:
+                # The landing page always lists the civil departments (10 on
+                # 2026-09-25). A 200 with none is a block page or a layout
+                # change, not a quiet day: without this the run makes zero
+                # attempts and records success/0 (#4748).
+                tally.blocked("landing page lists no departments")
+                self._log.error(
+                    "sc.unexpected_landing_page",
+                    url=LANDING_URL,
+                    body_prefix=response.text[:200],
+                )
 
             # Step 2: For each department, fetch the page and find PDF links
             for dept_info in departments:
@@ -1512,7 +1544,9 @@ class SCTentativeRulingsScraper(BaseScraper):
         ``failed()`` so the caller can record a department-page failure as a
         standalone ``failed()``. A department page that loads but
         lists no PDFs counts as one successful attempt (a genuinely empty
-        department). A failed department-page GET raises to the caller, which
+        department) when it is still a department tentative-rulings page, and
+        as blocked otherwise (#4748). A PDF URL that serves a non-PDF body is
+        blocked. A failed department-page GET raises to the caller, which
         records it as a failed attempt.
         """
         if tally is None:
@@ -1535,11 +1569,32 @@ class SCTentativeRulingsScraper(BaseScraper):
 
         docs: list[CapturedDocument] = []
         if not pdf_links:
-            tally.ok()
+            if _is_dept_page(response.text):
+                tally.ok()
+            else:
+                # A department page with no PDF links still carries its
+                # "Department N Tentative Rulings" title. A 200 without it
+                # is a block page or a layout change (#4748).
+                tally.blocked("department page is not a department tentative-rulings page")
+                self._log.error(
+                    "sc.unexpected_dept_page",
+                    department=dept_info.department,
+                    url=dept_info.page_url,
+                    body_prefix=response.text[:200],
+                )
         for href, link_text in pdf_links:
             time.sleep(self.config.request_delay_seconds)
             try:
                 doc = self._fetch_one_pdf(client, href, link_text, dept_info)
+                if not looks_like_pdf(doc.raw_content):
+                    tally.blocked(NOT_A_PDF_REASON)
+                    self._log.error(
+                        "sc.not_a_pdf",
+                        department=dept_info.department,
+                        url=href,
+                        body_prefix=doc.raw_content[:200].decode("utf-8", "replace"),
+                    )
+                    continue
                 docs.append(doc)
                 tally.ok()
                 self._log.debug(

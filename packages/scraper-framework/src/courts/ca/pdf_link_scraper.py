@@ -45,6 +45,24 @@ _NO_RULINGS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The PDF spec (ISO 32000-1 §7.5.2, Implementation Note 13) lets readers find
+# the "%PDF-" header anywhere in the first 1024 bytes.
+_PDF_MAGIC = b"%PDF-"
+_PDF_MAGIC_WINDOW = 1024
+
+# Block reason recorded on a FetchTally when a PDF URL serves something else.
+NOT_A_PDF_REASON = "PDF URL returned a body that is not a PDF (no %PDF- header)"
+
+
+def looks_like_pdf(content: bytes) -> bool:
+    """Return True if *content* carries a PDF header in its first 1024 bytes.
+
+    A 200 response at a PDF URL can be an HTML block page, an error page, or
+    a login redirect. Archiving that as ``ContentFormat.PDF`` stores garbage
+    and reports a green fetch (#4748).
+    """
+    return _PDF_MAGIC in content[:_PDF_MAGIC_WINDOW]
+
 
 @dataclass
 class PdfLinkConfig:
@@ -193,6 +211,16 @@ class PdfLinkScraper(BaseScraper):
                 tally.attempt()
                 try:
                     doc = self._fetch_one_pdf(client, href, link_text)
+
+                    if not looks_like_pdf(doc.raw_content):
+                        tally.blocked(NOT_A_PDF_REASON)
+                        self._log.error(
+                            "pdf_link.not_a_pdf",
+                            url=href,
+                            link_text=link_text,
+                            body_prefix=doc.raw_content[:200].decode("utf-8", "replace"),
+                        )
+                        continue
 
                     # Check for boilerplate before adding to results (#322).
                     # Extract text early so subclasses that override

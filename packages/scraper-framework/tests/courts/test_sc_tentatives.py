@@ -858,12 +858,18 @@ def test_sc_run_fails_when_every_pdf_fails() -> None:
 
 @respx.mock
 def test_sc_run_succeeds_when_dept_pages_have_no_pdfs() -> None:
-    """Department pages that load and list no PDFs are a genuine empty (#4693)."""
+    """Department pages that load and list no PDFs are a genuine empty (#4693).
+
+    The page is still a department tentative-rulings page (its title says
+    so); only the PDF links are gone (#4748).
+    """
     landing_html = _load_html("sc_landing_page.html")
+    dept_no_pdfs = _load_html("sc_dept1_page.html").replace(".pdf", ".html")
+    assert extract_pdf_links_from_dept_page(dept_no_pdfs) == []
 
     respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
     respx.get(url__regex=r"tentative-rulings/dep").mock(
-        return_value=httpx.Response(200, text="<html><body>No rulings</body></html>")
+        return_value=httpx.Response(200, text=dept_no_pdfs)
     )
 
     config = sc_default_config()
@@ -873,6 +879,74 @@ def test_sc_run_succeeds_when_dept_pages_have_no_pdfs() -> None:
 
     assert health.success is True
     assert health.records_captured == 0
+
+
+# ---------------------------------------------------------------------------
+# Unexpected-shape 200 pages are not successful fetches (#4748)
+# ---------------------------------------------------------------------------
+
+_BLOCK_PAGE = "<html><body><h1>Access denied</h1><p>Request blocked.</p></body></html>"
+
+
+@respx.mock
+def test_sc_run_fails_when_every_dept_page_is_a_block_page() -> None:
+    """A 200 department response that is not a department tentative-rulings
+    page and lists no PDFs is a block page, not an empty department (#4748)."""
+    landing_html = _load_html("sc_landing_page.html")
+
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+    respx.get(url__regex=r"tentative-rulings/dep").mock(
+        return_value=httpx.Response(200, text=_BLOCK_PAGE)
+    )
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 10 SC department page and PDF fetches were blocked" in message
+    assert "not a department tentative-rulings page" in message
+
+
+@respx.mock
+def test_sc_run_fails_when_landing_page_lists_no_departments() -> None:
+    """The landing page always lists the civil departments. A 200 with none
+    is a block page or layout change; the run must fail instead of making
+    zero attempts and recording success/0 (#4748)."""
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=_BLOCK_PAGE))
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert "landing page lists no departments" in (health.error_message or "")
+
+
+@respx.mock
+def test_sc_run_fails_when_every_pdf_url_returns_not_a_pdf() -> None:
+    """An HTML page served at a PDF URL is not a PDF. It is blocked, not
+    archived as a PDF and counted OK (#4748)."""
+    landing_html = _load_html("sc_landing_page.html")
+    dept1_html = _load_html("sc_dept1_page.html")
+
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+    respx.get(url__regex=r"tentative-rulings/dep").mock(
+        return_value=httpx.Response(200, text=dept1_html)
+    )
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, text=_BLOCK_PAGE))
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 20 SC department page and PDF fetches were blocked" in message
+    assert "not a PDF" in message
 
 
 # ---------------------------------------------------------------------------
