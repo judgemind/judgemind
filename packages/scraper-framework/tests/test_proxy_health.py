@@ -10,6 +10,7 @@ from structlog.testing import capture_logs
 from framework.proxy_health import (
     EgressProbeResult,
     ProxyAuthStatus,
+    _default_opener_factory,
     classify_proxy_error,
     diagnose_and_log_proxy_auth,
     probe_http_egress,
@@ -225,3 +226,39 @@ class TestDiagnoseAndLogProxyAuth:
         assert status is ProxyAuthStatus.NO_PROXY
         assert calls == []
         assert logs == []
+
+
+class TestDefaultOpenerFactoryTls:
+    """#4668: proxied probes verify against certifi + BD root; direct is unchanged."""
+
+    @staticmethod
+    def _https_handlers(opener: Any) -> list[Any]:
+        import urllib.request
+
+        return [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+
+    def test_proxied_opener_uses_brightdata_aware_context(self) -> None:
+        import ssl
+
+        opener = _default_opener_factory("http://u:p@brd.superproxy.io:44445")
+        handlers = self._https_handlers(opener)
+        assert len(handlers) == 1
+        ctx = handlers[0]._context
+        assert ctx.verify_mode is ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+        common_names = {
+            dict(item[0] for item in ca["subject"]).get("commonName") for ca in ctx.get_ca_certs()
+        }
+        assert "Bright Data Root CA" in common_names
+
+    def test_direct_opener_does_not_trust_brightdata_root(self) -> None:
+        opener = _default_opener_factory(None)
+        for handler in self._https_handlers(opener):
+            ctx = handler._context
+            if ctx is None:
+                continue
+            common_names = {
+                dict(item[0] for item in ca["subject"]).get("commonName")
+                for ca in ctx.get_ca_certs()
+            }
+            assert "Bright Data Root CA" not in common_names

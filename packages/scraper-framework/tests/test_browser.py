@@ -6,7 +6,44 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from framework.browser import apply_stealth
+from framework.browser import apply_stealth, playwright_proxy_settings
+
+
+class TestPlaywrightProxySettings:
+    """Playwright ignores creds embedded in proxy.server (#4668) — split them out."""
+
+    def test_splits_embedded_credentials(self) -> None:
+        assert playwright_proxy_settings(
+            "http://brd-customer-x-zone-res:s3cret@brd.superproxy.io:44445"
+        ) == {
+            "server": "http://brd.superproxy.io:44445",
+            "username": "brd-customer-x-zone-res",
+            "password": "s3cret",
+        }
+
+    def test_decodes_url_encoded_credentials(self) -> None:
+        settings = playwright_proxy_settings("http://us%40er:p%3Ass@proxy:8080")
+        assert settings["username"] == "us@er"
+        assert settings["password"] == "p:ss"
+
+    def test_no_credentials_passes_server_only(self) -> None:
+        assert playwright_proxy_settings("http://proxy:8080") == {"server": "http://proxy:8080"}
+
+    def test_no_port(self) -> None:
+        assert playwright_proxy_settings("http://proxy") == {"server": "http://proxy"}
+
+    def test_user_without_password(self) -> None:
+        assert playwright_proxy_settings("http://u@proxy:1") == {
+            "server": "http://proxy:1",
+            "username": "u",
+            "password": "",
+        }
+
+    def test_ipv6_host(self) -> None:
+        assert playwright_proxy_settings("http://[::1]:3128")["server"] == "http://[::1]:3128"
+
+    def test_unparseable_passthrough(self) -> None:
+        assert playwright_proxy_settings("proxy:8080") == {"server": "proxy:8080"}
 
 
 class TestApplyStealth:

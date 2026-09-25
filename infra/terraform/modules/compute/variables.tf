@@ -154,9 +154,9 @@ variable "proxy_secret_arn" {
 }
 
 variable "proxy_port" {
-  description = "TCP port used by the residential proxy. An egress rule is added to the scraper security group when proxy_secret_arn is set."
+  description = "TCP port used by the residential proxy. An egress rule is added to the scraper security group when proxy_secret_arn is set. Bright Data moved from 33335 to 44445 with its 2026 root CA (#4668); the port must match the proxy URL in the secret."
   type        = number
-  default     = 33335
+  default     = 44445
 }
 
 variable "ingestion_idle_threshold_seconds" {

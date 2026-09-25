@@ -953,19 +953,63 @@ class TestFetchDocumentsWithMockedPlaywright:
         scraper = SDTentativeRulingsScraper(
             config,
             case_numbers=["24CU016153C"],
-            proxy_url="http://proxy:8080",
+            proxy_url="http://user:pw@proxy:8080",
         )
 
-        with patch(
-            "playwright.async_api.async_playwright",
-            return_value=mock_pw_ctx,
+        tls_kwargs = {"env": {"HOME": "/tmp/bd-nss-home"}}
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            patch(
+                "courts.ca.sd_tentatives.chromium_proxy_tls_launch_kwargs",
+                return_value=tls_kwargs,
+            ) as tls_mock,
         ):
             docs = scraper.fetch_documents()
 
-        # Verify proxy was passed
+        # Verify proxy was passed with credentials split out (#4668) and the
+        # proxy-only Bright Data CA trust applied to the proxied browser.
         launch_call = mock_pw.chromium.launch.call_args
-        assert launch_call.kwargs.get("proxy") == {"server": "http://proxy:8080"}
+        assert launch_call.kwargs.get("proxy") == {
+            "server": "http://proxy:8080",
+            "username": "user",
+            "password": "pw",
+        }
+        tls_mock.assert_called_once_with("http://user:pw@proxy:8080")
+        assert launch_call.kwargs.get("env") == {"HOME": "/tmp/bd-nss-home"}
         assert len(docs) == 1
+
+    def test_fetch_without_proxy_skips_ca_trust(self) -> None:
+        """Non-proxied launches get neither a proxy nor the BD CA trust (#4668)."""
+        portal_html = "<html><body>Portal</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        page = _make_mock_page([portal_html, search_html, detail_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["24CU016153C"])
+        scraper._proxy_url = None
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            patch("courts.ca.sd_tentatives.chromium_proxy_tls_launch_kwargs") as tls_mock,
+        ):
+            scraper.fetch_documents()
+
+        launch_call = mock_pw.chromium.launch.call_args
+        assert "proxy" not in launch_call.kwargs
+        assert "env" not in launch_call.kwargs
+        tls_mock.assert_not_called()
 
     def test_fetch_case_exception_continues(self) -> None:
         """Exception on one case should not stop other cases."""

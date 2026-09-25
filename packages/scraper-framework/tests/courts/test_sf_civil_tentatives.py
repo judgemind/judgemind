@@ -1601,6 +1601,55 @@ class TestProxyPassedToLaunch:
         launch_call = mock_pw.chromium.launch.call_args
         assert launch_call.kwargs.get("proxy") == {"server": "http://proxy.example:33335"}
 
+    def test_proxied_launch_gets_split_creds_and_ca_trust(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#4668: creds split out of the URL; proxy-only BD CA trust merged in."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright()
+        scraper = SFCivilTentativeRulingsScraper(
+            config=sf_civil_default_config(),
+            proxy_url="http://u:p@brd.superproxy.io:44445",
+        )
+        tls_mock = unittest.mock.MagicMock(return_value={"env": {"HOME": "/tmp/nss"}})
+        monkeypatch.setattr(
+            "courts.ca.sf_civil_tentatives.chromium_proxy_tls_launch_kwargs", tls_mock
+        )
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        launch_call = mock_pw.chromium.launch.call_args
+        assert launch_call.kwargs.get("proxy") == {
+            "server": "http://brd.superproxy.io:44445",
+            "username": "u",
+            "password": "p",
+        }
+        assert launch_call.kwargs.get("env") == {"HOME": "/tmp/nss"}
+        tls_mock.assert_called_once_with("http://u:p@brd.superproxy.io:44445")
+
+    def test_unproxied_launch_skips_ca_trust(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#4668: no proxy -> no BD CA trust, no env override."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(SF_PROXY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv(SD_PROXY_URL_ENV_VAR, raising=False)
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright()
+        scraper = SFCivilTentativeRulingsScraper(config=sf_civil_default_config())
+        tls_mock = unittest.mock.MagicMock(return_value={"env": {"HOME": "/tmp/nss"}})
+        monkeypatch.setattr(
+            "courts.ca.sf_civil_tentatives.chromium_proxy_tls_launch_kwargs", tls_mock
+        )
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        assert "env" not in mock_pw.chromium.launch.call_args.kwargs
+        tls_mock.assert_not_called()
+
     def test_proxy_not_passed_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When _proxy_url is None, launch kwargs do not include 'proxy'."""
         import asyncio
