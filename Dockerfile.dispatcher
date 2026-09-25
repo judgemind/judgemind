@@ -308,9 +308,15 @@ RUN chmod +x /app/scripts/check-issue-author.sh \
 # (same as the operator-local hook). The helper is staged next to the
 # hook in ``/app/fargate-hooks/`` so a single stage-dir COPY pattern
 # keeps the daemon code simple.
+#
+# ``.claude/hooks/preflight_shared_checks.sh`` holds the 4 safety checks
+# themselves — both the Fargate and operator-local hooks source it, so
+# they cannot drift apart (#4703). The Fargate hook fails closed without
+# it, so it must be staged next to the hook too.
 # ---------------------------------------------------------------------------
 COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
 COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+COPY .claude/hooks/preflight_shared_checks.sh /app/fargate-hooks/preflight_shared_checks.sh
 RUN chmod +x /app/fargate-hooks/preflight-bash.sh \
     && chown -R dispatcher:dispatcher /app/fargate-hooks
 ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks

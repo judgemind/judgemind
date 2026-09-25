@@ -130,6 +130,16 @@ jobs:
               # any skill-file edit so the guard fires on PRs that
               # only touch .claude/skills/.
               - '.claude/skills/**'
+              # scripts/tests/test_preflight_bash_fargate.py -k parity
+              # asserts both preflight hooks share the checks in
+              # .claude/hooks/preflight_shared_checks.sh (#4703). A PR
+              # that edits only the operator hook, the library, or its
+              # cross-worktree helper must still run that guard.
+              - '.claude/hooks/preflight*'
+              # Dockerfile.dispatcher-v3 / -agent-runner stage the same
+              # Fargate hook files; the parity tests check their COPY lines.
+              - 'Dockerfile.dispatcher-v3'
+              - 'Dockerfile.dispatcher-agent-runner'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
@@ -2081,6 +2091,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      # .claude/hooks/*.py sits outside every package's ruff scope, so
+      # format drift went unnoticed (#4703). Gate it here.
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff format check (hook Python files)
+        run: ruff format --check .claude/hooks/
       - name: Run hook test suites
         run: |
           set -euo pipefail

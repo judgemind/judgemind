@@ -142,13 +142,16 @@ WORKDIR /app
 #      runs before spawning `claude -p /task-v2-plan`.
 #   4. `scripts/preflight.sh` + `scripts/preflight-bash-fargate.sh` —
 #      in-container ralph pre-push gate (matches Dockerfile.dispatcher's
-#      #2982 narrowing).
+#      #2982 narrowing), plus the two files that hook needs next to it:
+#      `preflight_cross_worktree.py` and `preflight_shared_checks.sh`
+#      (the safety checks both preflight hooks source, #4703).
 # ---------------------------------------------------------------------------
 COPY scripts/dispatcher/ /app/scripts/dispatcher/
 COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
 COPY scripts/preflight.sh /app/scripts/preflight.sh
 COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
 COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+COPY .claude/hooks/preflight_shared_checks.sh /app/fargate-hooks/preflight_shared_checks.sh
 RUN chmod +x /app/scripts/check-issue-author.sh \
     && chmod +x /app/fargate-hooks/preflight-bash.sh \
     && chmod +x /app/scripts/dispatcher/agent-runner-entrypoint.sh \

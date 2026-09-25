@@ -7175,6 +7175,12 @@ class DispatcherDaemon:
         var is unset, or the source files are missing, this is a no-op +
         warning — the operator-local hook stays in place, matching the local
         dev experience.
+
+        Three files are staged and copied: the hook itself, the
+        ``preflight_cross_worktree.py`` helper, and
+        ``preflight_shared_checks.sh`` — the safety checks both hooks
+        source (#4703). The hook is copied LAST so a partial copy never
+        leaves the Fargate hook in place without its library.
         """
         stage_dir_env = os.environ.get("DISPATCHER_FARGATE_HOOKS_DIR")
         if not stage_dir_env:
@@ -7192,7 +7198,8 @@ class DispatcherDaemon:
         stage_dir = Path(stage_dir_env)
         source_hook = stage_dir / "preflight-bash.sh"
         source_helper = stage_dir / "preflight_cross_worktree.py"
-        if not source_hook.exists() or not source_helper.exists():
+        source_lib = stage_dir / "preflight_shared_checks.sh"
+        if not all(p.exists() for p in (source_hook, source_helper, source_lib)):
             self._log.warning(
                 "daemon.fargate_hook_skip",
                 extra={
@@ -7208,6 +7215,7 @@ class DispatcherDaemon:
         hooks_dir = worktree_path / ".claude" / "hooks"
         target_hook = hooks_dir / "preflight-bash.sh"
         target_helper = hooks_dir / "preflight_cross_worktree.py"
+        target_lib = hooks_dir / "preflight_shared_checks.sh"
 
         # ``git worktree add`` always recreates the tracked ``.claude/hooks/``
         # tree, so the target paths will exist unless the branch being checked
@@ -7215,11 +7223,16 @@ class DispatcherDaemon:
         # divergence case without making the common case slower.
         hooks_dir.mkdir(parents=True, exist_ok=True)
 
+        # Hook last: until it lands, the operator-local hook stays active and
+        # still finds a library next to it.
         try:
-            shutil.copyfile(source_hook, target_hook)
-            shutil.copymode(source_hook, target_hook)
-            shutil.copyfile(source_helper, target_helper)
-            shutil.copymode(source_helper, target_helper)
+            for source, target in (
+                (source_helper, target_helper),
+                (source_lib, target_lib),
+                (source_hook, target_hook),
+            ):
+                shutil.copyfile(source, target)
+                shutil.copymode(source, target)
         except OSError as exc:
             self._log.warning(
                 "daemon.fargate_hook_copy_failed",
@@ -7240,7 +7253,7 @@ class DispatcherDaemon:
         # operator-local hook on merge). --skip-worktree is the correct tool
         # here: it's per-worktree (not per-clone like --assume-unchanged),
         # and git documents it as the "intentional local divergence" knob.
-        for target in (target_hook, target_helper):
+        for target in (target_hook, target_helper, target_lib):
             # Repo-relative path for the update-index call.
             rel = target.relative_to(worktree_path)
             # cold-path (#3089): local fs ``git update-index``,

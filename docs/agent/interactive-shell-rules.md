@@ -4,7 +4,7 @@
 
 Read this doc when you are running on an **operator laptop** (interactive Claude CLI session) and need to know which shell patterns the PreToolUse hook will block. These rules exist to prevent the CLI from stalling on permission prompts — a problem that does not exist in the Fargate dispatcher container.
 
-If you are on Fargate (inside `Dockerfile.dispatcher`), only the four safety-critical rules in §Fargate scope below apply. The six interactive-prompt-prevention rules in §Shell NEVERs are inert in-container.
+If you are on Fargate (inside `Dockerfile.dispatcher`, `-v3`, or `-agent-runner`), only the four safety-critical rules in §Fargate scope below apply. The six interactive-prompt-prevention rules in §Shell NEVERs are inert in-container.
 
 Cross-reference: `docs/agent/unattended-patterns.md` covers the broader set of permission-prompt workarounds (git, curl, secrets, `.claude/` writes, ECS, Telegram). This doc is the canonical home for the hook-enforced shell NEVERs.
 
@@ -74,5 +74,15 @@ Always pop by explicit ref: run `git stash list` first, confirm `stash@{0}`'s su
 - empty-quotes bypass
 
 The Fargate image swaps the preflight hook at worktree-creation time to `scripts/preflight-bash-fargate.sh`, which enforces only the four safety-critical rules. This swap is scoped to the Fargate image via `DISPATCHER_FARGATE_HOOKS_DIR` + per-worktree `git update-index --skip-worktree`. Operator laptops keep the full ruleset. See issue #2982.
+
+### Where each rule lives
+
+| Rules | Defined in | Runs on |
+|-------|-----------|---------|
+| The four safety-critical rules above | `.claude/hooks/preflight_shared_checks.sh` (one copy) | Operator laptops **and** Fargate |
+| The interactive-prompt-prevention rules (§Shell NEVERs), plus the timeout, `run_in_background`, and root-`infra/terraform` rules | `.claude/hooks/preflight-bash.sh` | Operator laptops only |
+| Diagnoser bright lines (`JUDGEMIND_DIAGNOSER_RUN=1`) | `.claude/hooks/preflight-bash.sh` | Operator-hook sessions only |
+
+Both hooks `source` `preflight_shared_checks.sh` and call its check functions; neither carries its own copy of a shared rule (#4703). To fix or widen a shared rule (e.g. the stash-check bypasses in #4741), edit the library once. Both environments pick it up. `pytest scripts/tests/test_preflight_bash_fargate.py -k parity` fails if a hook stops calling a shared check, re-inlines one, or the two hooks disagree on a shared-check command. The Fargate Dockerfiles stage the library in `/app/fargate-hooks/` next to the hook, and the swap copies it into the worktree. If a hook can't find the library, it blocks every Bash command instead of running without the safety rules.
 
 **Claim interlock note.** The `status/in-progress` label-only claim interlock (#2927, replacing the prior DB-row + label interlock #2866) is a workflow rule, not a shell rule — it applies in both environments.

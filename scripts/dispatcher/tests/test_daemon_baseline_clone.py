@@ -473,15 +473,18 @@ class TestInstallFargatePreflightHook:
     does not show up in ``git status`` / pre-push / PR diffs. Laptop
     sessions skip the swap — the operator-local hook stays in place."""
 
-    def _prepare_stage_dir(self, stage_dir: Path) -> tuple[Path, Path]:
+    def _prepare_stage_dir(self, stage_dir: Path) -> tuple[Path, Path, Path]:
         stage_dir.mkdir(parents=True, exist_ok=True)
         hook = stage_dir / "preflight-bash.sh"
         helper = stage_dir / "preflight_cross_worktree.py"
+        lib = stage_dir / "preflight_shared_checks.sh"
         hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         helper.write_text("# stub helper\n", encoding="utf-8")
+        lib.write_text("# stub shared checks (#4703)\n", encoding="utf-8")
         hook.chmod(0o755)
         helper.chmod(0o644)
-        return hook, helper
+        lib.chmod(0o644)
+        return hook, helper, lib
 
     def test_swaps_hook_and_marks_skip_worktree_in_fargate_mode(
         self, monkeypatch: Any, tmp_path: Path
@@ -489,7 +492,7 @@ class TestInstallFargatePreflightHook:
         baseline = tmp_path / "repo"
         (baseline / ".git").mkdir(parents=True)
         stage_dir = tmp_path / "fargate-hooks"
-        stage_hook, stage_helper = self._prepare_stage_dir(stage_dir)
+        stage_hook, stage_helper, stage_lib = self._prepare_stage_dir(stage_dir)
         monkeypatch.setenv("DISPATCHER_FARGATE_HOOKS_DIR", str(stage_dir))
         d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
 
@@ -533,15 +536,20 @@ class TestInstallFargatePreflightHook:
         assert (hooks_dir / "preflight_cross_worktree.py").read_text(
             encoding="utf-8"
         ) == stage_helper.read_text(encoding="utf-8")
-        # Both files marked skip-worktree so the divergence stays out of
-        # git status / pre-push / PR diffs.
+        # Shared-checks library the Fargate hook sources was copied (#4703).
+        assert (hooks_dir / "preflight_shared_checks.sh").read_text(
+            encoding="utf-8"
+        ) == stage_lib.read_text(encoding="utf-8")
+        # All three files marked skip-worktree so the divergence stays out
+        # of git status / pre-push / PR diffs.
         skip_worktree_calls = [
             c for c in captured if "update-index" in c and "--skip-worktree" in c
         ]
-        assert len(skip_worktree_calls) == 2
+        assert len(skip_worktree_calls) == 3
         skipped_paths = {c[-1] for c in skip_worktree_calls}
         assert ".claude/hooks/preflight-bash.sh" in skipped_paths
         assert ".claude/hooks/preflight_cross_worktree.py" in skipped_paths
+        assert ".claude/hooks/preflight_shared_checks.sh" in skipped_paths
         # Success event emitted.
         assert handler.events("fargate_hook_installed") != []
 
@@ -605,6 +613,37 @@ class TestInstallFargatePreflightHook:
 
         # Operator-local hook untouched.
         assert operator_hook.read_text(encoding="utf-8") == "# operator-local\n"
+        assert handler.events("fargate_hook_skip") != []
+
+    def test_noop_when_shared_checks_library_not_staged(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """#4703: the Fargate hook sources preflight_shared_checks.sh. An
+        image that stages the hook + helper but not the library must not
+        install the hook — it would fail closed on every Bash call. The
+        operator-local hook stays in place instead."""
+        baseline = tmp_path / "repo"
+        (baseline / ".git").mkdir(parents=True)
+        stage_dir = tmp_path / "fargate-hooks"
+        _hook, _helper, lib = self._prepare_stage_dir(stage_dir)
+        lib.unlink()
+        monkeypatch.setenv("DISPATCHER_FARGATE_HOOKS_DIR", str(stage_dir))
+        d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+
+        worktree_path = baseline.parent / "worktrees" / "agent-aabbccdd"
+        hooks_dir = worktree_path / ".claude" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        operator_hook = hooks_dir / "preflight-bash.sh"
+        operator_hook.write_text("# operator-local\n", encoding="utf-8")
+
+        def fake_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("subprocess must not run on no-op path")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._install_fargate_preflight_hook(worktree_path, "agent-aabbccdd")
+
+        assert operator_hook.read_text(encoding="utf-8") == "# operator-local\n"
+        assert not (hooks_dir / "preflight_cross_worktree.py").exists()
         assert handler.events("fargate_hook_skip") != []
 
     def test_not_called_in_legacy_mode(self, monkeypatch: Any, tmp_path: Path) -> None:

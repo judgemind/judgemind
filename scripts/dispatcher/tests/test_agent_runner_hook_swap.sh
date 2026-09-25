@@ -131,6 +131,14 @@ EOF
 # FARGATE_HELPER_MARKER
 EOF
 
+    # The shared safety-check library both hooks source (#4703).
+    cat > "$hooks_dir/preflight_shared_checks.sh" <<'EOF'
+# OPERATOR_LIB_MARKER
+EOF
+    cat > "$stage/preflight_shared_checks.sh" <<'EOF'
+# FARGATE_LIB_MARKER
+EOF
+
     # init a tiny git repo so update-index --skip-worktree has somewhere
     # to land; the helper must tolerate update-index failures, but the
     # happy path should succeed.
@@ -177,6 +185,22 @@ EOF
         return
     fi
     pass "swap copies Fargate helper over worktree helper"
+
+    # Assert: the shared-checks library is also swapped (#4703).
+    if ! grep -q "FARGATE_LIB_MARKER" "$hooks_dir/preflight_shared_checks.sh"; then
+        fail "swap copies shared-checks library over worktree library" \
+            "FARGATE_LIB_MARKER missing from $hooks_dir/preflight_shared_checks.sh"
+        return
+    fi
+    pass "swap copies shared-checks library over worktree library"
+
+    # Assert: the library divergence is hidden from git (skip-worktree).
+    if [[ -n "$(git -C "$repo" status --porcelain -- .claude/hooks/preflight_shared_checks.sh)" ]]; then
+        fail "swap marks shared-checks library skip-worktree" \
+            "git status still reports .claude/hooks/preflight_shared_checks.sh as modified"
+        return
+    fi
+    pass "swap marks shared-checks library skip-worktree"
 
     # Assert: the worktree hook is executable (chmod preserved).
     if [[ ! -x "$hooks_dir/preflight-bash.sh" ]]; then
@@ -370,6 +394,10 @@ EOF
 # FARGATE_HELPER_MARKER
 EOF
 
+    cat > "$stage/preflight_shared_checks.sh" <<'EOF'
+# FARGATE_LIB_MARKER
+EOF
+
     git -C "$repo" init -q --initial-branch main
     git -C "$repo" config user.email "test@example.com"
     git -C "$repo" config user.name "Test"
@@ -394,6 +422,105 @@ EOF
     pass "helper logs fargate_hook_installed event on success"
 }
 
+# ── Test 6: stage without the shared library skips the swap ──────────────
+#
+# #4703: the Fargate hook sources preflight_shared_checks.sh. An image that
+# stages the hook + helper but not the library must NOT install the hook —
+# the operator-laptop hook (which finds its own library) stays in place.
+
+run_skip_when_lib_missing_test() {
+    local tmp
+    tmp=$(mktemp -d)
+    TEMP_DIRS+=("$tmp")
+
+    local repo="$tmp/repo"
+    local hooks_dir="$repo/.claude/hooks"
+    local stage="$tmp/fargate-hooks"
+
+    mkdir -p "$hooks_dir"
+    mkdir -p "$stage"
+
+    printf '#!/usr/bin/env bash\n# OPERATOR_LIB_MISSING_MARKER\nexit 0\n' > "$hooks_dir/preflight-bash.sh"
+    printf '#!/usr/bin/env bash\n# FARGATE_VARIANT_MARKER\nexit 0\n' > "$stage/preflight-bash.sh"
+    printf '# FARGATE_HELPER_MARKER\n' > "$stage/preflight_cross_worktree.py"
+    # No $stage/preflight_shared_checks.sh.
+
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$HELPER"
+        export DISPATCHER_FARGATE_HOOKS_DIR="$stage"
+        export REPO_ROOT="$repo"
+        export AGENT_ID="test-agent"
+        install_fargate_preflight_hook >/dev/null 2>&1
+    )
+
+    if ! grep -q "OPERATOR_LIB_MISSING_MARKER" "$hooks_dir/preflight-bash.sh"; then
+        fail "swap is no-op when shared-checks library is not staged" \
+            "operator hook was replaced even though preflight_shared_checks.sh was not staged"
+        return
+    fi
+    pass "swap is no-op when shared-checks library is not staged"
+}
+
+# ── Test 7: the REAL staged files work after the swap ─────────────────────
+#
+# Stage the real scripts/preflight-bash-fargate.sh, the real library and
+# the real cross-worktree helper exactly as the Dockerfiles do, run the
+# swap into a worktree that has none of them, then feed the installed
+# hook a bare `git stash pop`. It must block (exit 2) — proving the
+# swapped-in hook finds the library next to itself — and allow an
+# explicit-ref pop.
+
+run_real_files_swap_blocks_stash_test() {
+    local tmp
+    tmp=$(mktemp -d)
+    TEMP_DIRS+=("$tmp")
+
+    local repo="$tmp/repo"
+    local hooks_dir="$repo/.claude/hooks"
+    local stage="$tmp/fargate-hooks"
+    local repo_hooks="$SCRIPT_DIR/../.claude/hooks"
+
+    mkdir -p "$hooks_dir"
+    mkdir -p "$stage"
+    cp "$SCRIPT_DIR/preflight-bash-fargate.sh" "$stage/preflight-bash.sh"
+    cp "$repo_hooks/preflight_shared_checks.sh" "$stage/preflight_shared_checks.sh"
+    cp "$repo_hooks/preflight_cross_worktree.py" "$stage/preflight_cross_worktree.py"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$hooks_dir/preflight-bash.sh"
+
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$HELPER"
+        export DISPATCHER_FARGATE_HOOKS_DIR="$stage"
+        export REPO_ROOT="$repo"
+        export AGENT_ID="test-agent"
+        install_fargate_preflight_hook >/dev/null 2>&1
+    )
+
+    local rc
+    rc=0
+    printf '%s' '{"tool_input":{"command":"git stash pop"}}' \
+        | bash "$hooks_dir/preflight-bash.sh" >/dev/null 2>&1 || rc=$?
+    if (( rc != 2 )); then
+        fail "swapped-in real Fargate hook blocks bare git stash pop" \
+            "expected exit 2, got $rc"
+        return
+    fi
+    pass "swapped-in real Fargate hook blocks bare git stash pop"
+
+    rc=0
+    printf '%s' '{"tool_input":{"command":"git stash pop stash@{0}"}}' \
+        | bash "$hooks_dir/preflight-bash.sh" >/dev/null 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        fail "swapped-in real Fargate hook allows explicit-ref stash pop" \
+            "expected exit 0, got $rc"
+        return
+    fi
+    pass "swapped-in real Fargate hook allows explicit-ref stash pop"
+}
+
 # ── Run tests ─────────────────────────────────────────────────────────────
 
 run_swap_marker_test
@@ -401,6 +528,8 @@ run_skip_when_unset_test
 run_skip_when_stage_missing_test
 run_entrypoint_invokes_swap_test
 run_helper_logs_installed_event_test
+run_skip_when_lib_missing_test
+run_real_files_swap_blocks_stash_test
 
 echo
 echo "Tests: $TESTS, Failures: $FAILURES"

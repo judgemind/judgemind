@@ -22,7 +22,9 @@ HOOK = os.path.join(SCRIPT_DIR, "agent-worktree-guard.sh")
 SYNTHETIC_REPO = "/fake/project/repo"
 SYNTHETIC_WORKTREE = f"{SYNTHETIC_REPO}/.claude/worktrees/agent-abc123"
 SYNTHETIC_WORKER = f"{SYNTHETIC_REPO}/.claude/worktrees/worker-3"
-SYNTHETIC_NESTED = f"{SYNTHETIC_REPO}/.claude/worktrees/agent-abc123/.claude/worktrees/agent-def456"
+SYNTHETIC_NESTED = (
+    f"{SYNTHETIC_REPO}/.claude/worktrees/agent-abc123/.claude/worktrees/agent-def456"
+)
 
 passed = 0
 failed = 0
@@ -233,9 +235,7 @@ def test_performance() -> None:
         )
     elapsed = time.monotonic() - start
     avg_ms = (elapsed / iterations) * 1000
-    assert avg_ms < 200, (
-        f"Average execution time {avg_ms:.1f}ms exceeds 200ms limit"
-    )
+    assert avg_ms < 200, f"Average execution time {avg_ms:.1f}ms exceeds 200ms limit"
 
 
 try:
@@ -248,7 +248,7 @@ except AssertionError as e:
 
 
 # --- Summary ---
-print(f"\n{'='*50}")
+print(f"\n{'=' * 50}")
 print(f"Results: {passed} passed, {failed} failed")
 if failed > 0:
     sys.exit(1)
