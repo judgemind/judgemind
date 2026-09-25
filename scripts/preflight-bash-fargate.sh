@@ -167,12 +167,30 @@ esac
 #     Detection:
 #       - Command (outside quoted strings) contains `git stash pop` or `git
 #         stash apply` — including `git -C <path> stash pop|apply`.
-#       - No positional argument matches `stash@{<digits>}`.
+#       - Each such invocation (its args up to the next `;`, `&`, `|`, `)` or
+#         newline) is checked independently. It is allowed only if one of
+#         its positional args is an explicit ref: `stash@{<digits>}`, or a
+#         full/abbreviated commit SHA (7-40 hex chars) (#4683).
 #       - Allow `git stash show`, `git stash list`, `git stash push`, `git
 #         stash drop` — these are not the affected verbs.
-if echo "$STRIPPED_COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+stash\s+(pop|apply)\b' ; then
-    if ! echo "$STRIPPED_COMMAND" | grep -qE 'stash@\{[0-9]+\}' ; then
-        echo "BLOCKED: Bare 'git stash pop' / 'git stash apply' is not allowed. The stash list is shared across all worktrees in this clone, so a bare pop can silently apply another agent's or another worktree's stash — reverting your edits and dumping their WIP into your worktree (see #2749). Run 'git stash list' first, confirm the stash's subject matches your current branch, then pop it by explicit ref: 'git stash pop stash@{N}'. Or use a throwaway commit instead (git commit -am 'WIP' / git reset --soft HEAD~1). See CLAUDE.md §Unattended Operation Patterns." >&2
+#     Kept in sync with check 12 in .claude/hooks/preflight-bash.sh.
+STASH_APPLY_RE='\bgit\b(\s+-C\s+\S+)?\s+stash\s+(pop|apply)\b'
+if echo "$STRIPPED_COMMAND" | grep -qE "$STASH_APPLY_RE" ; then
+    STASH_BARE=0
+    while IFS= read -r stash_invocation; do
+        stash_has_ref=0
+        # Drop everything through the pop/apply verb, then walk the args.
+        while IFS= read -r stash_arg; do
+            if printf '%s' "$stash_arg" | grep -qE '^(stash@\{[0-9]+\}|[0-9a-fA-F]{7,40})$' ; then
+                stash_has_ref=1
+            fi
+        done < <(printf '%s\n' "$stash_invocation" | sed -E 's/^.*[[:space:]]stash[[:space:]]+(pop|apply)//' | tr -s ' \t' '\n\n')
+        if [ "$stash_has_ref" -eq 0 ]; then
+            STASH_BARE=1
+        fi
+    done < <(printf '%s\n' "$STRIPPED_COMMAND" | grep -oE "${STASH_APPLY_RE}[^;&|)]*")
+    if [ "$STASH_BARE" -eq 1 ]; then
+        echo "BLOCKED: Bare 'git stash pop' / 'git stash apply' is not allowed. The stash list is shared across all worktrees in this clone, so a bare pop can silently apply another agent's or another worktree's stash — reverting your edits and dumping their WIP into your worktree (see #2749). Run 'git stash list' first, confirm the stash's subject matches your current branch, then pop it by explicit ref: 'git stash pop stash@{N}' or 'git stash apply <sha>'. Every pop/apply in the command needs its own ref. Or use a throwaway commit instead (git commit -am 'WIP' / git reset --soft HEAD~1). See CLAUDE.md §Unattended Operation Patterns." >&2
         exit 2
     fi
 fi

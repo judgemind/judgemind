@@ -199,6 +199,37 @@ class TestSafetyRulesKeepBlocking:
         result = run_hook("git stash apply stash@{2}")
         assert result.returncode == 0, result.stderr
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git stash apply 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+            "git stash pop 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+            "git stash apply 36f0f26",
+            "git -C /some/worktree stash apply 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+            "git stash apply --index 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+            "git stash apply stash@{0}; git stash drop stash@{0}",
+        ],
+    )
+    def test_git_stash_apply_with_explicit_sha_allowed(self, command: str) -> None:
+        """An explicit commit SHA is as unambiguous as stash@{N} (#4683)."""
+        result = run_hook(command)
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git stash apply mybranch",
+            "git stash apply abc12",
+            "git stash pop; git stash drop stash@{0}",
+            "git stash apply && git log stash@{0}",
+            "git stash apply stash@{1}; git stash pop",
+        ],
+    )
+    def test_git_stash_non_ref_or_bare_invocation_blocked(self, command: str) -> None:
+        """Every pop/apply invocation needs its own explicit ref (#4683)."""
+        result = run_hook(command)
+        assert result.returncode == 2, result.stderr
+
     def test_git_stash_list_allowed(self) -> None:
         result = run_hook("git stash list")
         assert result.returncode == 0, result.stderr

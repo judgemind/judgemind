@@ -830,6 +830,74 @@ run_test(
     0,
 )
 
+# Explicit commit SHA (full or abbreviated) — also an explicit ref, ALLOWED
+# (#4683). The worktree environment notes recommend capturing the stash's SHA
+# via `git stash list --format='%H %gs'` and restoring with
+# `git stash apply <sha>`; the hook previously blocked that exact form.
+run_test(
+    "'git stash apply <40-hex sha>' allowed (#4683 AC1)",
+    "git stash apply 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+    0,
+)
+run_test(
+    "'git stash apply <abbrev sha>' allowed (#4683)",
+    "git stash apply 36f0f26",
+    0,
+)
+run_test(
+    "'git stash pop <40-hex sha>' allowed (#4683)",
+    "git stash pop 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+    0,
+)
+run_test(
+    "'git -C /path stash apply <sha>' allowed (#4683)",
+    "git -C /some/worktree stash apply 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+    0,
+)
+run_test(
+    "'git stash apply --index <sha>' with flag + sha allowed (#4683)",
+    "git stash apply --index 36f0f2621a0b3c4d5e6f708192a3b4c5d6e7f809",
+    0,
+)
+run_test(
+    "'git stash apply <UPPERCASE sha>' allowed (#4683)",
+    "git stash apply 36F0F2621A0B",
+    0,
+)
+run_test(
+    "'git stash apply stash@{0}' then drop in same command allowed (#4683)",
+    "git stash apply stash@{0}; git stash drop stash@{0}",
+    0,
+)
+
+# Non-ref positional args, and a bare invocation whose only ref belongs to a
+# different stash subcommand, must still be BLOCKED (#4683).
+run_test(
+    "'git stash apply <non-hex word>' blocked (#4683)",
+    "git stash apply mybranch",
+    2,
+)
+run_test(
+    "'git stash apply <too-short hex>' blocked (#4683)",
+    "git stash apply abc12",
+    2,
+)
+run_test(
+    "bare 'git stash pop' followed by 'git stash drop stash@{0}' blocked (#4683)",
+    "git stash pop; git stash drop stash@{0}",
+    2,
+)
+run_test(
+    "bare 'git stash apply' with stash@{N} only in a later command blocked (#4683)",
+    "git stash apply && git log stash@{0}",
+    2,
+)
+run_test(
+    "second bare pop after an explicit-ref apply blocked (#4683)",
+    "git stash apply stash@{1}; git stash pop",
+    2,
+)
+
 # Non-pop/apply stash subcommands — should be ALLOWED even without a ref
 run_test(
     "'git stash list' allowed (not a pop/apply)",
