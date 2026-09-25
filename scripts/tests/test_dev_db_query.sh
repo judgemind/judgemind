@@ -677,6 +677,136 @@ test_exec_agent_probe_deadline_msg() {
     pass "exec_agent_probe_deadline_msg: exits non-zero with specific deadline message"
 }
 
+# ── Per-call timeout tests (#4665) ─────────────────────────────────────────
+
+# Mock aws where list-tasks returns an ARN and execute-command hangs "forever".
+# The hang is a `sleep` *child* of the mock (like session-manager-plugin under
+# the aws CLI) that inherits stdout, so the test also proves that the timeout
+# kills children. Otherwise the $(...) capture in dev-db-query.sh would stay
+# blocked on the open pipe.
+#
+# Args:
+#   $1 — "all"   : every execute-command call hangs (probe stalls)
+#        "query" : the readiness probe (bash -c 'true') succeeds, the real
+#                  query call hangs
+setup_mock_aws_exec_hang() {
+    local mode="$1"
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local mock_bin="$tmpdir/bin"
+    mkdir -p "$mock_bin"
+
+    cat > "$mock_bin/aws" << MOCK_AWS
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
+    echo "arn:aws:ecs:us-west-2:000000000000:task/fake-cluster/fake-hang-task"
+    exit 0
+fi
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
+    if [[ "$mode" == "query" && "\$*" == *"bash -c 'true'"* ]]; then
+        exit 0
+    fi
+    echo "Starting session with SessionId: ecs-execute-command-hang"
+    sleep 100000
+    exit 0
+fi
+echo "Mock aws: unexpected command: \$*" >&2
+exit 1
+MOCK_AWS
+    chmod +x "$mock_bin/aws"
+    echo "$mock_bin"
+}
+
+test_probe_hang_times_out_with_fallback_fix() {
+    # AC1 + AC2: a probe that never returns must not block past
+    # EXEC_AGENT_POLL_TIMEOUT_SECS + margin, and the error must name the
+    # scripts/ecs-run-task.sh fallback.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_exec_hang all)
+    local output rc=0 start end
+    start=$(date +%s)
+    output=$(EXEC_AGENT_POLL_TIMEOUT_SECS=2 EXEC_PROBE_TIMEOUT_SECS=2 \
+        run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+    end=$(date +%s)
+    local elapsed=$((end - start))
+
+    if [[ $rc -eq 0 ]]; then
+        fail "probe hang: must exit non-zero" "got: $output"
+        return
+    fi
+    # Deadline 2 s + per-probe floor 5 s + 5 s retry sleep + 2 s TERM→KILL
+    # grace + slack. Anything near this bound is a regression to "hangs".
+    if [[ $elapsed -gt 25 ]]; then
+        fail "probe hang: took ${elapsed}s, expected <= 25s" "got: $output"
+        return
+    fi
+    if [[ "$output" != *"stalled"* || "$output" != *"Fix:"* \
+        || "$output" != *"scripts/ecs-run-task.sh"* ]]; then
+        fail "probe hang: error must include Fix: block naming scripts/ecs-run-task.sh" \
+            "got: $output"
+        return
+    fi
+    if [[ "$output" == *"Running query on dev database"* ]]; then
+        fail "probe hang: must not proceed to the query" "got: $output"
+        return
+    fi
+    pass "probe hang: exits non-zero in ${elapsed}s with ecs-run-task.sh Fix block"
+}
+
+test_query_hang_times_out_with_fallback_fix() {
+    # The probe succeeds but the real query's SSM session stalls.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_exec_hang query)
+    local output rc=0 start end
+    start=$(date +%s)
+    output=$(EXEC_AGENT_POLL_TIMEOUT_SECS=10 EXEC_QUERY_TIMEOUT_SECS=2 \
+        run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+    end=$(date +%s)
+    local elapsed=$((end - start))
+
+    if [[ $rc -eq 0 ]]; then
+        fail "query hang: must exit non-zero" "got: $output"
+        return
+    fi
+    if [[ $elapsed -gt 15 ]]; then
+        fail "query hang: took ${elapsed}s, expected <= 15s" "got: $output"
+        return
+    fi
+    if [[ "$output" != *"did not finish within 2s"* || "$output" != *"Fix:"* \
+        || "$output" != *"scripts/ecs-run-task.sh"* ]]; then
+        fail "query hang: error must include timeout + Fix: block naming scripts/ecs-run-task.sh" \
+            "got: $output"
+        return
+    fi
+    pass "query hang: exits non-zero in ${elapsed}s with ecs-run-task.sh Fix block"
+}
+
+test_run_with_timeout_passthrough() {
+    # Unit test of the helper: stdout and non-timeout exit codes pass through
+    # unchanged, and a fast command is not delayed by the watchdog.
+    # shellcheck source=scripts/_ecs_exec_lib.sh
+    source "$SCRIPT_DIR/_ecs_exec_lib.sh"
+    local out rc=0 start end
+    start=$(date +%s)
+    out=$(ecs_exec_run_with_timeout 10 bash -c 'echo hello; exit 7') || rc=$?
+    end=$(date +%s)
+    if [[ "$out" != "hello" || $rc -ne 7 ]]; then
+        fail "run_with_timeout passthrough" "out=$out rc=$rc"
+        return
+    fi
+    if [[ $((end - start)) -gt 3 ]]; then
+        fail "run_with_timeout passthrough: fast command delayed $((end - start))s"
+        return
+    fi
+    rc=0
+    out=$(ecs_exec_run_with_timeout 1 bash -c 'echo partial; exec sleep 100000') || rc=$?
+    if [[ $rc -ne 124 || "$out" != "partial" ]]; then
+        fail "run_with_timeout timeout returns 124 with partial output" "out=$out rc=$rc"
+        return
+    fi
+    pass "run_with_timeout: passes through rc/stdout, returns 124 on timeout"
+}
+
 # ── Run all ────────────────────────────────────────────────────────────────
 
 test_no_args_shows_usage
@@ -701,6 +831,9 @@ test_polls_then_gives_up_with_clear_error
 test_exec_agent_probe_success
 test_exec_agent_probe_retries
 test_exec_agent_probe_deadline_msg
+test_probe_hang_times_out_with_fallback_fix
+test_query_hang_times_out_with_fallback_fix
+test_run_with_timeout_passthrough
 
 echo ""
 echo "────────────────────────────────────────────────"

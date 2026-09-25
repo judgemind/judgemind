@@ -21,6 +21,13 @@
 # so that only SELECT/EXPLAIN queries succeed. Use --rw to allow writes:
 #   scripts/dev-db-query.sh --rw "UPDATE rulings SET status = 'active' WHERE id = 1"
 #   scripts/dev-db-query.sh --rw --file path/to/update.sql
+#
+# Timeouts (#4665). Every `aws ecs execute-command` call has a hard per-call
+# timeout, so a wedged SSM session fails with a Fix: block pointing at the
+# scripts/ecs-run-task.sh one-off fallback instead of hanging:
+#   EXEC_PROBE_TIMEOUT_SECS       per readiness probe (default 30)
+#   EXEC_AGENT_POLL_TIMEOUT_SECS  overall readiness deadline (default 120)
+#   EXEC_QUERY_TIMEOUT_SECS       the query itself (default 300)
 
 set -euo pipefail
 
@@ -240,13 +247,29 @@ remote_script="/tmp/_dev_db_query_runner.py"
 # exit-1-when-all-lines-filtered behaviour. `grep -Ev` can legitimately
 # return 1 (every line matched) for e.g. an empty query result wrapped in
 # SSM banner/trailer, which is not an error from our perspective.
-aws_output=$(aws ecs execute-command \
+#
+# The call is bounded by EXEC_QUERY_TIMEOUT_SECS (default 300 s) so a stalled
+# SSM session fails loudly instead of hanging forever (#4665).
+EXEC_QUERY_TIMEOUT_SECS="${EXEC_QUERY_TIMEOUT_SECS:-300}"
+aws_rc=0
+aws_output=$(ecs_exec_run_with_timeout "$EXEC_QUERY_TIMEOUT_SECS" \
+    aws ecs execute-command \
     --cluster "$CLUSTER" \
     --task "$task_arn" \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag 1; sync; rm -f $remote_script; sleep 1'")
+    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag 1; sync; rm -f $remote_script; sleep 1'") \
+    || aws_rc=$?
+
+if [[ $aws_rc -eq $ECS_EXEC_TIMEOUT_RC ]]; then
+    echo "Error: query via ECS Exec did not finish within ${EXEC_QUERY_TIMEOUT_SECS}s (task $task_arn). The SSM session probably stalled; the query may or may not have run." >&2
+    ecs_exec_print_fallback_fix
+    exit 1
+fi
+if [[ $aws_rc -ne 0 ]]; then
+    exit "$aws_rc"
+fi
 
 # Strip the SSM plugin's bookkeeping lines, then print the rest. Matches
 # both "SessionId" and "sessionId" casings — the plugin currently emits
