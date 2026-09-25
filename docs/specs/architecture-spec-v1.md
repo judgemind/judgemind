@@ -271,6 +271,8 @@ Rules every scraper author and reviewer must follow. These apply to new scrapers
 
 **All-items-failed must raise.** A fetch loop that catches and logs each item's exception (one bad PDF must not lose the rest) MUST count outcomes with `framework.fetch_tally.FetchTally` and call `tally.raise_if_all_failed(docs)` before returning. When nothing was captured and every attempt raised or was blocked, the run is recorded as `success=False` with the counts and last error in `error_message`. A fetch that completes and finds nothing stays a success — see #4693.
 
+**Early aborts must fail the run.** A fetch loop that stops early with items left (a circuit breaker such as SD's 5-in-a-row lookup streak) MUST call `tally.abort(reason, remaining=N)`, then end the fetch with `tally.raise_if_all_failed(docs)` followed by `self._mark_partial_failure(tally.partial_failure_message())`. With no docs the gate raises. With docs, `BaseScraper.run()` archives them first and then records `success=False` with the abort counts in `error_message`, so partial captures are kept and skipped items are not hidden behind a green run. A composite scraper that calls another scraper's `fetch_documents` directly (`ca-sd-pipeline`) must carry the sub-scraper's mark over to its own run — see #4734.
+
 Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.
 
 ## 3.4 Application Layer

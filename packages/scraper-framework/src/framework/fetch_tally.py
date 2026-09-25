@@ -46,6 +46,21 @@ Semantics:
   one attempt was made, and none succeeded. A fetch that completes and finds
   nothing (a genuinely empty calendar) stays a success, and so does a run
   with nothing to attempt.
+- ``abort(reason, remaining=N)`` records that the loop stopped early with *N*
+  items never attempted (a circuit breaker, e.g. SD's 5-strike streak). An
+  abort that skips items is never a green run (#4734):
+
+  - with no docs, ``raise_if_all_failed`` raises even if some attempts
+    succeeded;
+  - with docs, raising would discard them (``BaseScraper.run()`` archives
+    only after ``fetch_documents`` returns), so the scraper passes
+    :meth:`partial_failure_message` to ``BaseScraper._mark_partial_failure``
+    instead. ``run()`` archives the docs, then records ``success=False``.
+
+  A scraper with a breaker ends its fetch with::
+
+      tally.raise_if_all_failed(docs)
+      self._mark_partial_failure(tally.partial_failure_message())
 
 The semantics match the hand-rolled SD ROA counters from #4673 and #4687,
 which were the first user.
@@ -88,6 +103,9 @@ class FetchTally:
         self.n_blocked = 0
         self.last_error: str | None = None
         self.last_block_reason: str | None = None
+        # Set by abort(): why the loop stopped and how many items it skipped.
+        self.abort_reason: str | None = None
+        self.n_skipped = 0
         self._open = False
 
     # ------------------------------------------------------------------
@@ -121,9 +139,19 @@ class FetchTally:
         self.n_blocked += 1
         self.last_block_reason = _describe(reason)
 
+    def abort(self, reason: str, *, remaining: int) -> None:
+        """Record that the loop stopped early with *remaining* items unattempted."""
+        self.abort_reason = _describe(reason)
+        self.n_skipped = max(remaining, 0)
+
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
+
+    @property
+    def aborted(self) -> bool:
+        """True when :meth:`abort` skipped at least one item."""
+        return self.abort_reason is not None and self.n_skipped > 0
 
     @property
     def n_ok(self) -> int:
@@ -141,6 +169,7 @@ class FetchTally:
             "succeeded": self.n_ok,
             "blocked": self.n_blocked,
             "failed": self.n_failed,
+            "skipped": self.n_skipped,
             "last_error": self.last_error or self.last_block_reason,
         }
 
@@ -160,16 +189,49 @@ class FetchTally:
             message += f"; last block reason: {self.last_block_reason}"
         return message
 
+    def abort_message(self) -> str:
+        """One-line reason for a run whose loop aborted with items left."""
+        total = self.n_attempted + self.n_skipped
+        message = (
+            f"{self.what} aborted after {self.n_attempted} of {total}, "
+            f"{self.n_skipped} skipped ({self.n_ok} succeeded, "
+            f"{self.n_blocked} blocked, {self.n_failed} raised errors): "
+            f"{self.abort_reason}"
+        )
+        if self.last_error:
+            message += f"; last error: {self.last_error}"
+        if self.last_block_reason:
+            message += f"; last block reason: {self.last_block_reason}"
+        return message
+
+    def partial_failure_message(self) -> str | None:
+        """:meth:`abort_message` when items were skipped, else ``None``.
+
+        Pass it to ``BaseScraper._mark_partial_failure`` so a run that
+        captured some docs but skipped others is recorded as failed after
+        the captured docs are archived.
+        """
+        return self.abort_message() if self.aborted else None
+
     # ------------------------------------------------------------------
     # Gate
     # ------------------------------------------------------------------
 
     def raise_if_all_failed(self, docs: Sized, *, message: str | None = None) -> None:
         """Raise :class:`ScraperPreconditionFailure` if nothing was captured
-        and every attempt failed or was blocked.
+        and either every attempt failed or the loop aborted with items left.
 
         *message* replaces the default :meth:`failure_message` when a scraper
-        has a more specific diagnosis (e.g. SD's anti-bot summary).
+        has a more specific diagnosis (e.g. SD's anti-bot summary). It applies
+        only to the all-failed case; an abort after some successes always
+        reports :meth:`abort_message`.
         """
-        if len(docs) == 0 and self.all_failed:
-            raise ScraperPreconditionFailure(message or self.failure_message())
+        if len(docs) != 0:
+            return
+        if self.all_failed:
+            text = message or self.failure_message()
+            if self.aborted:
+                text += f"; {self.n_skipped} more skipped after abort"
+            raise ScraperPreconditionFailure(text)
+        if self.aborted:
+            raise ScraperPreconditionFailure(self.abort_message())

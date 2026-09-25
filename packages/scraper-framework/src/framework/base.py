@@ -101,6 +101,9 @@ class BaseScraper(abc.ABC):
         # client across an entire scraper run avoids ~200 redundant TLS
         # handshakes per LA tentatives run (194 docs × 2 parses each).
         self._inline_css_client: httpx.Client | None = None
+        # Set by fetch_documents via _mark_partial_failure when the fetch
+        # returned docs but skipped items (#4734). Reset at the start of run().
+        self._partial_failure: str | None = None
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -139,6 +142,7 @@ class BaseScraper(abc.ABC):
         run_timestamp = datetime.now(UTC)
         records_captured = 0
         error_message: str | None = None
+        self._partial_failure = None
 
         try:
             try:
@@ -160,8 +164,19 @@ class BaseScraper(abc.ABC):
                             error=str(exc),
                         )
 
-                success = True
-                self._log.info("Run complete", records=records_captured)
+                if self._partial_failure:
+                    # The captured docs are archived above; the run is still
+                    # a failure because the fetch skipped items (#4734).
+                    success = False
+                    error_message = self._partial_failure
+                    self._log.error(
+                        "Run partially failed",
+                        records=records_captured,
+                        error=error_message,
+                    )
+                else:
+                    success = True
+                    self._log.info("Run complete", records=records_captured)
 
             except Exception as exc:
                 success = False
@@ -226,6 +241,21 @@ class BaseScraper(abc.ABC):
         """
         if not cond:
             raise ScraperPreconditionFailure(msg)
+
+    def _mark_partial_failure(self, message: str | None) -> None:
+        """Record that ``fetch_documents`` is returning docs but skipped items.
+
+        Raising in ``fetch_documents`` would discard the docs it already
+        captured, because ``run()`` archives only after the fetch returns.
+        Call this instead, just before returning: ``run()`` archives the docs,
+        then records ``success=False`` with *message* as ``error_message``.
+        ``None`` is a no-op, so callers can pass
+        ``FetchTally.partial_failure_message()`` directly.
+
+        Origin: #4734 (SD ROA mid-run abort recorded as success).
+        """
+        if message:
+            self._partial_failure = message
 
     def _process_document(self, doc: CapturedDocument) -> bool:
         """Inline CSS → hash → derive deterministic ID → parse → archive → emit.
