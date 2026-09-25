@@ -53,10 +53,10 @@ const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | '
   dismissed: 'destructive',
 };
 
-type Props = { params: { id: string } };
+type Props = { params: Promise<{ id: string }> };
 
 export default async function CaseDetailPage({ params }: Props) {
-  const { id } = params;
+  const { id } = await params;
 
   let caseData: CaseData['case'] = null;
   try {

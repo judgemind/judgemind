@@ -130,7 +130,7 @@ describe('JudgeDetailPage (SSR)', () => {
       assignments: [{ department: '12', caseType: 'civil', courthouse: 'Stanley Mosk Courthouse', firstSeen: '2024-01-01', lastSeen: '2026-03-01' }],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
 
@@ -146,7 +146,7 @@ describe('JudgeDetailPage (SSR)', () => {
   it('does not render badge for active judge', async () => {
     mockQuery.mockResolvedValueOnce(mockJudgeData({ isActive: true }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const activeBadge = findInTree(result, (n) => n.props?.children === 'Active');
     expect(activeBadge).toBeNull();
     const inactiveBadge = findInTree(result, (n) => n.props?.children === 'Inactive');
@@ -156,7 +156,7 @@ describe('JudgeDetailPage (SSR)', () => {
   it('renders inactive status Badge for inactive judge', async () => {
     mockQuery.mockResolvedValueOnce(mockJudgeData({ id: 'judge-2', canonicalName: 'Hon. John Doe', isActive: false }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-2' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-2' }) });
     const inactiveBadge = findInTree(result, (n) => n.props?.children === 'Inactive');
     expect(inactiveBadge).toBeTruthy();
   });
@@ -167,7 +167,7 @@ describe('JudgeDetailPage (SSR)', () => {
     });
 
     await expect(
-      JudgeDetailPage({ params: { id: 'nonexistent' } }),
+      JudgeDetailPage({ params: Promise.resolve({ id: 'nonexistent' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
     expect(mockNotFound).toHaveBeenCalled();
   });
@@ -176,7 +176,7 @@ describe('JudgeDetailPage (SSR)', () => {
     mockQuery.mockResolvedValueOnce(Promise.reject(new Error('Network error')));
 
     await expect(
-      JudgeDetailPage({ params: { id: 'error-judge' } }),
+      JudgeDetailPage({ params: Promise.resolve({ id: 'error-judge' }) }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
     expect(mockNotFound).toHaveBeenCalled();
   });
@@ -188,7 +188,7 @@ describe('JudgeDetailPage (SSR)', () => {
       court: { courtName: 'San Francisco Superior Court', county: 'San Francisco' },
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-3' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-3' }) });
     const courtParagraph = findInTree(result, (n) =>
       n.type === 'p' &&
       typeof n.props?.className === 'string' &&
@@ -202,7 +202,7 @@ describe('JudgeDetailPage (SSR)', () => {
       court: { courtName: 'Los Angeles Superior Court', county: 'Los Angeles' },
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     // Find the breadcrumb nav element
     const breadcrumb = findInTree(result, (n) =>
       n.type === 'nav' &&
@@ -231,7 +231,7 @@ describe('JudgeDetailPage (SSR)', () => {
       court: { courtName: 'Los Angeles Superior Court', county: 'Los Angeles' },
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     // No Card component should be present in the header area
     const card = findInTree(result, (n) =>
       typeof n.type === 'object' &&
@@ -254,7 +254,7 @@ describe('JudgeDetailPage (SSR)', () => {
       ],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const metadataEl = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'assignment-metadata',
     );
@@ -276,7 +276,7 @@ describe('JudgeDetailPage (SSR)', () => {
       ],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const previousSection = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'previously-section',
     );
@@ -299,7 +299,7 @@ describe('JudgeDetailPage (SSR)', () => {
       ],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const previousSection = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'previously-section',
     );
@@ -312,7 +312,7 @@ describe('JudgeDetailPage (SSR)', () => {
       assignments: [],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const previousSection = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'previously-section',
     );
@@ -326,7 +326,7 @@ describe('JudgeDetailPage (SSR)', () => {
       assignments: [],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const metadataEl = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'assignment-metadata',
     );
@@ -342,7 +342,7 @@ describe('JudgeDetailPage (SSR)', () => {
       assignments: [],
     }));
 
-    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    const result = await JudgeDetailPage({ params: Promise.resolve({ id: 'judge-1' }) });
     const metadataEl = findInTree(result, (n) =>
       n.props?.['data-testid'] === 'assignment-metadata',
     );

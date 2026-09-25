@@ -33,14 +33,14 @@ describe('GlobalError (root-level error boundary)', () => {
     expect(mockReset).toHaveBeenCalledOnce();
   });
 
+  // React 19 treats <html>/<head>/<body> as document singletons: they render
+  // onto the real document elements rather than inside RTL's container div,
+  // so these assertions query `document` instead of `container`.
   it('applies semantic token classes to the body', () => {
-    const { container } = render(
-      <GlobalError error={mockError} reset={mockReset} />,
-    );
-    const renderedBody = container.querySelector('body');
-    expect(renderedBody).not.toBeNull();
-    expect(renderedBody!.className).toContain('bg-background');
-    expect(renderedBody!.className).toContain('text-foreground');
+    render(<GlobalError error={mockError} reset={mockReset} />);
+    const renderedBody = document.body;
+    expect(renderedBody.className).toContain('bg-background');
+    expect(renderedBody.className).toContain('text-foreground');
   });
 
   it('applies semantic token classes to the card border', () => {
@@ -66,10 +66,8 @@ describe('GlobalError (root-level error boundary)', () => {
   });
 
   it('includes theme detection script in head', () => {
-    const { container } = render(
-      <GlobalError error={mockError} reset={mockReset} />,
-    );
-    const scripts = container.querySelectorAll('script');
+    render(<GlobalError error={mockError} reset={mockReset} />);
+    const scripts = document.head.querySelectorAll('script');
     const themeScript = Array.from(scripts).find((s) =>
       s.innerHTML.includes('prefers-color-scheme'),
     );
