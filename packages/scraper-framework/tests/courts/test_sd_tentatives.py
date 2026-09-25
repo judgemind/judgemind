@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1740,6 +1741,120 @@ class TestLookupExceptionsFailLoudly:
 
         assert docs == []
         assert page.goto.await_count == 1 + 9
+
+
+def _cf_timeouts() -> Any:
+    """Patch the Cloudflare retry timings down so retry loops finish instantly."""
+    return (
+        patch("courts.ca.sd_tentatives.CF_CHALLENGE_TIMEOUT", 0.05),
+        patch("courts.ca.sd_tentatives.CF_POLL_INTERVAL", 0.05),
+        patch("courts.ca.sd_tentatives.CF_RETRY_PAUSE", 0.0),
+    )
+
+
+class TestPortalNavigationErrorReported:
+    """A portal session that fails at navigation names the error (#4680)."""
+
+    def test_every_portal_goto_raising_names_last_error(self) -> None:
+        """AC #1: page.goto raises ERR_TIMED_OUT on every attempt."""
+        page = _make_mock_page(["<html><body>Portal</body></html>"])
+        page.goto = AsyncMock(side_effect=RuntimeError("net::ERR_TIMED_OUT"))
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["24CU016153C"])
+        scraper._log = MagicMock()
+        t1, t2, t3 = _cf_timeouts()
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            t1,
+            t2,
+            t3,
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "ERR_TIMED_OUT" in message
+        assert "last error: RuntimeError: net::ERR_TIMED_OUT" in message
+        assert "no further detail" not in message
+
+        # The structured log carries the same error as its own field.
+        unsolved = [
+            c for c in scraper._log.error.call_args_list if c.args[0] == "sd.cloudflare_unsolved"
+        ]
+        assert len(unsolved) == 1
+        assert unsolved[0].kwargs["portal_last_error"] == "RuntimeError: net::ERR_TIMED_OUT"
+        assert "ERR_TIMED_OUT" in unsolved[0].kwargs["reason"]
+
+    def test_playwright_multiline_error_keeps_first_line_truncated(self) -> None:
+        """Playwright appends a multi-line call log: keep only the first line."""
+        page = _make_mock_page(["<html><body>Portal</body></html>"])
+        first_line = "Page.goto: net::ERR_TIMED_OUT at https://roasearch/portal/ " + "x" * 400
+        error = first_line + "\nCall log:\n  - navigating to portal"
+        page.goto = AsyncMock(side_effect=RuntimeError(error))
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["24CU016153C"])
+        t1, t2, t3 = _cf_timeouts()
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            t1,
+            t2,
+            t3,
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "Page.goto: net::ERR_TIMED_OUT" in message
+        assert "Call log" not in message
+        assert "\n" not in message
+        assert scraper._portal_last_error is not None
+        assert len(scraper._portal_last_error) <= 200
+
+    def test_navigation_error_then_solved_is_not_reported_on_lookup_block(self) -> None:
+        """A portal error on an attempt that later succeeded is not the run's cause."""
+        portal = "<html><body>Portal</body></html>"
+        block = _load_html("sd_roa_rate_limit_block.html")
+        page = _make_mock_page([portal, block])
+        calls = 0
+
+        async def goto(url: str, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("net::ERR_TIMED_OUT")
+
+        page.goto = AsyncMock(side_effect=goto)
+        mock_pw_ctx, _ = _pw_ctx_for(page)
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["24CU016153C"])
+        t1, t2, t3 = _cf_timeouts()
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx),
+            t1,
+            t2,
+            t3,
+            pytest.raises(ScraperPreconditionFailure) as excinfo,
+        ):
+            scraper.fetch_documents()
+
+        message = str(excinfo.value)
+        assert "all 1 SD portal case lookups were blocked" in message
+        assert "ERR_TIMED_OUT" not in message
+
+    def test_first_line_error_with_empty_message_uses_type_name(self) -> None:
+        from courts.ca.sd_tentatives import _first_line_error
+
+        assert _first_line_error(TimeoutError()) == "TimeoutError"
+        assert _first_line_error(RuntimeError("a\nb")) == "RuntimeError: a"
+
+    def test_failure_message_without_navigation_error_unchanged(self) -> None:
+        scraper = SDTentativeRulingsScraper(_make_config(), case_numbers=["X"])
+        scraper._reset_diagnostics()
+        assert scraper._cloudflare_failure_message() == (
+            "SD portal anti-bot check not passed: no further detail"
+        )
 
 
 # ---------------------------------------------------------------------------
