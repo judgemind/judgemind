@@ -47,11 +47,15 @@
 #   --logs <task-arn>   Retrieve logs and status for a previously launched task.
 #                       Accepts a full task ARN.
 #   --dry-run           Show what would be done without running
-#   --timeout <secs>    Max seconds to wait for task completion (default: 1800).
+#   --timeout <secs>    Max seconds to wait for task completion.  Default:
+#                       1800, or --max-runtime + 600 when --max-runtime is
+#                       set (whichever is larger), so the client never gives
+#                       up before the server-side cap can fire (#4723).
 #                       This is a client-side wait: if the task does not stop
-#                       within this window the script exits but the task keeps
-#                       running on ECS (possibly for hours).  Use --max-runtime
-#                       to enforce a server-side lifetime cap inside the task.
+#                       within this window the script exits 124 and reports
+#                       "still running" — the task keeps running on ECS.
+#                       Re-attach with `scripts/ecs-wait-task.sh` (the ARN is
+#                       saved to tmp/last-ecs-task.arn) or `--logs <arn>`.
 #   --max-runtime <secs> Wrap the container command with `timeout` so the task
 #                       self-terminates after this many seconds even if the
 #                       Python script hangs or retry-loops.  Default: unset
@@ -61,6 +65,12 @@
 #                       runaway retry loop could exhaust shared resources
 #                       (e.g. dev DB connection slots).  See #2572.
 #   --help              Show this help message
+#
+# Exit codes (attached mode):
+#   <n>   the container's exit code once the task reaches STOPPED
+#   124   the wait timed out while the task was still running (NOT a task
+#         failure — the task keeps going; re-attach with ecs-wait-task.sh)
+#   1     launch/setup error
 #
 # Examples:
 #   scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
@@ -80,7 +90,14 @@ ENVIRONMENT="dev"
 DRY_RUN=false
 DETACH=false
 LOGS_TASK_ARN=""
-TIMEOUT=1800
+TIMEOUT=""          # empty = derive from --max-runtime (see resolve step)
+DEFAULT_TIMEOUT=1800
+# Headroom added to --max-runtime when deriving the wait timeout: covers
+# Fargate provisioning (PENDING can take several minutes), the 30s
+# --kill-after escalation, and CloudWatch/ECS status lag.
+MAX_RUNTIME_WAIT_HEADROOM=600
+# Poll interval for the wait loop; overridable so tests can run fast.
+POLL_INTERVAL="${ECS_RUN_TASK_POLL_INTERVAL:-10}"
 MAX_RUNTIME=""
 CPU_OVERRIDE=""
 MEMORY_OVERRIDE=""
@@ -96,6 +113,7 @@ ONESHOT_TASK_DEF_ARN=""
 S3_SCRIPT_KEY=""
 S3_BUCKET="judgemind-assets-dev"
 TMP_DIR=""
+TASK_STILL_RUNNING=false
 
 # ─── Parse options ───────────────────────────────────────────────────────────
 
@@ -146,7 +164,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -n 66 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 81 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -331,6 +349,30 @@ if [[ -n "$MAX_RUNTIME" ]]; then
     fi
 fi
 
+# ─── Resolve the client-side wait timeout ─────────────────────────────────
+# An explicit --timeout always wins.  Otherwise, when --max-runtime is set,
+# wait at least max-runtime + headroom so the client never declares the
+# task dead while the server-side cap has not yet fired (#4723: a 10800s
+# rebuild was reported "failed" at 1800s while still RUNNING).
+if [[ -n "$TIMEOUT" ]]; then
+    if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+        echo "Error: --timeout must be a non-negative integer (seconds), got: '${TIMEOUT}'" >&2
+        exit 1
+    fi
+    if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 && "$TIMEOUT" -lt "$MAX_RUNTIME" ]]; then
+        echo "WARNING: --timeout ${TIMEOUT}s is shorter than --max-runtime ${MAX_RUNTIME}s;" >&2
+        echo "  the wait may end while the task is still running (it will be reported as still running, not failed)." >&2
+    fi
+else
+    TIMEOUT="$DEFAULT_TIMEOUT"
+    if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
+        _derived=$(( MAX_RUNTIME + MAX_RUNTIME_WAIT_HEADROOM ))
+        if [[ "$_derived" -gt "$TIMEOUT" ]]; then
+            TIMEOUT="$_derived"
+        fi
+    fi
+fi
+
 # ─── Cleanup trap ────────────────────────────────────────────────────────────
 
 cleanup() {
@@ -345,12 +387,12 @@ cleanup() {
             --output text > /dev/null 2>&1 || true
     fi
 
-    if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" ]]; then
+    if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" && "$TASK_STILL_RUNNING" == "false" ]]; then
         echo "Cleaning up: removing script from S3..." >&2
         aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null 2>&1 || true
-    elif [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "true" ]]; then
-        echo "Detach mode: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download." >&2
+    elif [[ -n "$S3_SCRIPT_KEY" ]]; then
+        echo "Task not finished: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download." >&2
         echo "Clean it up manually after the task completes, or it will expire from bucket lifecycle rules." >&2
     fi
 
@@ -582,6 +624,9 @@ echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
 if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
     echo "Max runtime: ${MAX_RUNTIME}s (timeout --signal=TERM --kill-after=30)" >&2
 fi
+if [[ "$DETACH" == "false" ]]; then
+    echo "Wait timeout: ${TIMEOUT}s" >&2
+fi
 if [[ -n "$OVERRIDE_ROLE_ARN" ]]; then
     echo "Task role: ${ROLE_OVERRIDE} (override)" >&2
 fi
@@ -786,9 +831,10 @@ fi
 
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
-POLL_INTERVAL=10
 ELAPSED=0
 LAST_STATUS=""
+CURRENT_STATUS=""
+DESCRIBE_OUTPUT=""
 
 # Log streaming state
 LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
@@ -798,17 +844,23 @@ LOG_STREAMING=false
 LOG_EVENTS_EMITTED=false
 
 # find_log_stream — Locate the CloudWatch log stream for this task.
-# The stream name follows the pattern: oneshot/oneshot/<task-id>
+# The awslogs driver names the stream <awslogs-stream-prefix>/<container>/<task-id>;
+# the oneshot task def sets prefix "oneshot" and container "oneshot", so the
+# stream is exactly oneshot/oneshot/<task-id>.
+#
+# Query with the full task-specific prefix.  The log group holds thousands of
+# oneshot/oneshot/* streams; the previous "oneshot/oneshot/" prefix plus
+# --max-items 50 only ever saw the first 50 alphabetically, so any task whose
+# ID sorted later was never found (#4723).
 # Returns the stream name, or empty string if not found yet.
 find_log_stream() {
     aws logs describe-log-streams \
         --log-group-name "$LOG_GROUP" \
-        --log-stream-name-prefix "oneshot/oneshot/" \
-        --order-by LogStreamName \
-        --max-items 50 \
+        --log-stream-name-prefix "oneshot/oneshot/${TASK_ID}" \
         --region "$REGION" \
         --output text \
-        --query "logStreams[*].logStreamName" | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
+        --query "logStreams[*].logStreamName" 2>/dev/null \
+        | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
 }
 
 # stream_new_logs — Fetch and print any new log events since the last check.
@@ -869,24 +921,42 @@ print(data.get('nextForwardToken', ''))
         true
     }
 
+    # Only advance the token when the read returned events.  An empty read
+    # (e.g. before CloudWatch has ingested the first event — ingestion lags
+    # the event timestamp by several seconds) can hand back a forward token
+    # positioned past events that are still being ingested, silently dropping
+    # them (#4723: a task's first log line never appeared).  Re-reading from
+    # the previous position is always safe.
     if [[ -n "$messages" ]]; then
         echo "$messages"
         LOG_EVENTS_EMITTED=true
-    fi
-
-    if [[ -n "$new_token" ]]; then
-        LOG_NEXT_TOKEN="$new_token"
+        if [[ -n "$new_token" ]]; then
+            LOG_NEXT_TOKEN="$new_token"
+        fi
     fi
 }
 
 while [[ $ELAPSED -lt $TIMEOUT ]]; do
-    DESCRIBE_OUTPUT=$(aws ecs describe-tasks \
+    # A transient describe-tasks failure (throttle, network blip, expired
+    # creds mid-run) must not abort the wait under `set -e` — that would
+    # report a still-running task as failed.  Warn and retry next poll.
+    _describe=""
+    _status=""
+    if _describe=$(aws ecs describe-tasks \
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json)
-
-    CURRENT_STATUS=$(echo "$DESCRIBE_OUTPUT" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])")
+        --output json 2>/dev/null); then
+        _status=$(echo "$_describe" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])" 2>/dev/null) || _status=""
+    fi
+    if [[ -z "$_status" ]]; then
+        echo "WARNING: could not describe task (transient?); retrying in ${POLL_INTERVAL}s..." >&2
+        sleep "$POLL_INTERVAL"
+        ELAPSED=$((ELAPSED + POLL_INTERVAL))
+        continue
+    fi
+    DESCRIBE_OUTPUT="$_describe"
+    CURRENT_STATUS="$_status"
 
     if [[ "$CURRENT_STATUS" != "$LAST_STATUS" ]]; then
         echo "Status: ${CURRENT_STATUS}" >&2
@@ -903,8 +973,9 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
             echo "Log stream: ${LOG_STREAM_NAME}" >&2
             echo "─── Live Logs ───────────────────────────────────────────────────" >&2
             LOG_STREAMING=true
-        else
-            echo "Waiting for log stream to appear..." >&2
+        elif [[ "${_LOG_WAIT_NOTED:-false}" == "false" ]]; then
+            echo "Waiting for log stream oneshot/oneshot/${TASK_ID} to appear..." >&2
+            _LOG_WAIT_NOTED=true
         fi
     fi
 
@@ -945,12 +1016,22 @@ if [[ "$LOG_STREAMING" == "true" ]]; then
 fi
 
 if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
-    echo "Error: task did not complete within ${TIMEOUT}s." >&2
-    echo "Task ARN: ${TASK_ARN}" >&2
-    echo "Last status: ${CURRENT_STATUS}" >&2
-    echo "You can check logs manually:" >&2
-    echo "  scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-${ENVIRONMENT} --task ${TASK_ID}" >&2
-    exit 1
+    # The client-side wait expired, but the task has NOT failed — it is
+    # still running on ECS.  Report it as such (exit 124, distinct from a
+    # task failure) so callers don't retry or launch a second heavy job
+    # concurrently (#4723).  Keep the S3 script (cleanup trap checks
+    # TASK_STILL_RUNNING) and save the ARN for ecs-wait-task.sh.
+    TASK_STILL_RUNNING=true
+    if mkdir -p "${REPO_ROOT}/tmp" 2>/dev/null; then
+        printf '%s\n' "${TASK_ARN}" > "${REPO_ROOT}/tmp/last-ecs-task.arn" 2>/dev/null || true
+    fi
+    echo "" >&2
+    echo "Task still running (task ARN ${TASK_ARN}) — stopped waiting after ${TIMEOUT}s." >&2
+    echo "Last status: ${CURRENT_STATUS:-UNKNOWN}. This is NOT a task failure; do not relaunch." >&2
+    echo "To keep waiting:  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+    echo "Status + logs:    scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
+    echo "Tail logs:        scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
+    exit 124
 fi
 
 # ─── Step 7: Get exit code ───────────────────────────────────────────────────

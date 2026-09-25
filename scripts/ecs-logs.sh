@@ -138,8 +138,11 @@ find_stream() {
         # Fall back to LastEventTime ordering if prefix search fails.
         local match=""
 
-        # Try known prefixes first (handles oneshot tasks reliably)
-        for prefix in "oneshot/oneshot/" "ecs/" "ingestion-worker/" "scraper/"; do
+        # Try known prefixes first.  Oneshot streams are exactly
+        # oneshot/oneshot/<task-id>, so query that full prefix first: a bare
+        # "oneshot/oneshot/" prefix + --max-items only sees the first N of
+        # thousands of streams alphabetically and misses most tasks (#4723).
+        for prefix in "oneshot/oneshot/${TASK_FILTER}" "ecs/" "ingestion-worker/" "scraper/"; do
             local prefix_streams
             prefix_streams=$(aws logs describe-log-streams \
                 --log-group-name "$LOG_GROUP" \

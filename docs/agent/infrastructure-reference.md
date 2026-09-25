@@ -608,6 +608,8 @@ Best practices:
 
    `timeout` sends `SIGTERM` at the deadline, giving Python's atexit handlers and `psycopg` a chance to close connections cleanly, and escalates to `SIGKILL` 30 seconds later if the script ignores the signal.  The container then exits with the script's own exit code (on clean termination) or `137` (SIGKILL).  Requires coreutils, which is present in the `python:3.12-slim` base image used by the ingestion worker task definition.
 
+   The client-side wait follows `--max-runtime`: without an explicit `--timeout`, `ecs-run-task.sh` waits `max(1800, max-runtime + 600)` seconds. If the wait expires while the task is still running, the script exits `124` and prints `Task still running (task ARN …)`. That is not a task failure, so do not relaunch. Re-attach with `scripts/ecs-wait-task.sh`, which reads the ARN the script saved to `tmp/last-ecs-task.arn`, or run `scripts/ecs-run-task.sh --logs <arn>` (#4723).
+
 **When to use which.**  The in-script cap is always-on for `rebuild_db.py` and handles the specific pool-break-storm pattern surgically.  The lifetime cap is a blanket backstop for any oneshot that could hang for reasons the script doesn't know about (slow network, LLM API outage, stuck DB query).  Use both together for rebuilds on dev.
 
 **Manual stop runbook.**  If you spot a zombie oneshot already running (ECS task that has been `RUNNING` far longer than expected, or dev DB showing `rds_reserved` errors):
