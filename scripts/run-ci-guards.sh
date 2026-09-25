@@ -4,9 +4,10 @@
 # permanent: true
 #
 # Discovers every executable matching ``scripts/check-*.sh`` and
-# ``scripts/check-*.py`` and runs them in alphabetical order against the
-# local working tree. Wired into ``.githooks/pre-push`` so guard failures
-# surface locally before the CI round trip.
+# ``scripts/check-*.py`` and runs them (in parallel, reporting in
+# alphabetical order) against the local working tree. Wired into
+# ``.githooks/pre-push`` so guard failures surface locally before the CI
+# round trip.
 #
 # Why
 # ───
@@ -80,9 +81,14 @@
 # Usage
 # ─────
 #
-#   scripts/run-ci-guards.sh                    # run every applicable guard
+#   scripts/run-ci-guards.sh                    # run every applicable guard (in parallel)
 #   scripts/run-ci-guards.sh --list             # print the discovered guard list and exit
 #   SKIP_CI_GUARDS=1 scripts/run-ci-guards.sh   # bypass; emit a warning to stderr
+#   CI_GUARDS_JOBS=1 scripts/run-ci-guards.sh   # one guard at a time (default: CPU count)
+#
+# Guards run concurrently via ``xargs -P`` (#4708); failures are still
+# reported in alphabetical order, followed by a one-line timing summary
+# naming the slowest guards.
 #
 # Exit codes
 # ──────────
@@ -128,6 +134,50 @@ SELF_BASENAME="$(basename "${BASH_SOURCE[0]}")"
 if [ ! -d "$SCRIPTS_DIR" ]; then
     echo "ERROR: scripts/ directory not found under repo root $REPO_ROOT" >&2
     exit 2
+fi
+
+# Per-checkout guard logs. A shared ${TMPDIR}/run-ci-guards-<name>.log
+# let two worktrees running the umbrella at once overwrite each other's
+# logs (#4708). CI_GUARDS_LOG_DIR overrides.
+GUARD_LOG_DIR="${CI_GUARDS_LOG_DIR:-${TMPDIR:-/tmp}/run-ci-guards-$(basename "$REPO_ROOT")}"
+mkdir -p "$GUARD_LOG_DIR"
+
+# ────────────────────────────────────────────────────────────────────
+# --run-one <path> — internal worker mode (#4708)
+# ────────────────────────────────────────────────────────────────────
+# The main loop below fans guards out through ``xargs -P``, which
+# re-invokes this script once per guard with ``--run-one``. The worker
+# runs one guard from the repo root, writes its combined output to the
+# usual per-guard log, and records the exit code and wall seconds under
+# $CI_GUARDS_RESULT_DIR. It always exits 0 so xargs never aborts the
+# batch; the parent reads the recorded exit codes.
+if [ "${1:-}" = "--run-one" ]; then
+    path="${2:?--run-one requires a guard path}"
+    result_dir="${CI_GUARDS_RESULT_DIR:?--run-one requires CI_GUARDS_RESULT_DIR}"
+    name="$(basename "$path")"
+    log_file="$GUARD_LOG_DIR/run-ci-guards-${name//\//_}.log"
+    start=$(date +%s)
+    rc=0
+    # cd to repo root so guards using $(pwd) or relative paths see the
+    # expected working tree, matching how CI invokes them from
+    # `actions/checkout` at the repo root.
+    #
+    # .py files are invoked via python3 explicitly so guards that ship
+    # without a +x bit (the CI-canonical state for check-sql-columns.py
+    # and friends — CI calls them as ``python3 scripts/check-foo.py``)
+    # still run from this umbrella.
+    case "$name" in
+        check-*.py)
+            (cd "$REPO_ROOT" && python3 "$path") > "$log_file" 2>&1 < /dev/null || rc=$?
+            ;;
+        *)
+            (cd "$REPO_ROOT" && "$path") > "$log_file" 2>&1 < /dev/null || rc=$?
+            ;;
+    esac
+    end=$(date +%s)
+    echo "$rc" > "$result_dir/$name.rc"
+    echo "$((end - start))" > "$result_dir/$name.secs"
+    exit 0
 fi
 
 # ────────────────────────────────────────────────────────────────────
@@ -470,25 +520,49 @@ emit_indented_capped() {
     ' >&2
 }
 
+# ────────────────────────────────────────────────────────────────────
+# Fan out (#4708)
+# ────────────────────────────────────────────────────────────────────
+# Guards are independent read-only scans of the working tree, so they
+# run in parallel: ``xargs -P`` re-invokes this script in --run-one mode
+# once per guard. Serially the ~90 guards took ~80s on an idle 16-core
+# laptop and far longer under load. In parallel the wall time is roughly
+# the slowest guard. Results are reported below in the same alphabetical
+# order, with the same format, as the old serial loop.
+#
+# CI_GUARDS_JOBS sets the concurrency (default: CPU count). Use
+# CI_GUARDS_JOBS=1 to run one guard at a time.
+guard_jobs="${CI_GUARDS_JOBS:-}"
+if [ -z "$guard_jobs" ]; then
+    guard_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+fi
+case "$guard_jobs" in
+    ''|*[!0-9]*|0) guard_jobs=4 ;;
+esac
+
+CI_GUARDS_RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run-ci-guards-results.XXXXXX")"
+export CI_GUARDS_RESULT_DIR
+trap 'rm -rf "$CI_GUARDS_RESULT_DIR"' EXIT
+
+fanout_start=$(date +%s)
+printf '%s\0' "${runnable[@]}" \
+    | xargs -0 -n 1 -P "$guard_jobs" "$SCRIPT_DIR/$SELF_BASENAME" --run-one
+fanout_secs=$(( $(date +%s) - fanout_start ))
+
 for path in "${runnable[@]}"; do
     name="$(basename "$path")"
-    log_file="${TMPDIR:-/tmp}/run-ci-guards-${name//\//_}.log"
+    log_file="$GUARD_LOG_DIR/run-ci-guards-${name//\//_}.log"
 
-    # cd to repo root so guards using $(pwd) or relative paths see the
-    # expected working tree, matching how CI invokes them from
-    # `actions/checkout` at the repo root.
-    #
-    # .py files are invoked via python3 explicitly so guards that ship
-    # without a +x bit (the CI-canonical state for check-sql-columns.py
-    # and friends — CI calls them as ``python3 scripts/check-foo.py``)
-    # still run from this umbrella.
-    rc=0
-    case "$name" in
-        check-*.py)
-            (cd "$REPO_ROOT" && python3 "$path") > "$log_file" 2>&1 || rc=$?
-            ;;
-        *)
-            (cd "$REPO_ROOT" && "$path") > "$log_file" 2>&1 || rc=$?
+    rc=""
+    if [ -f "$CI_GUARDS_RESULT_DIR/$name.rc" ]; then
+        read -r rc < "$CI_GUARDS_RESULT_DIR/$name.rc" || true
+    fi
+    case "$rc" in
+        ''|*[!0-9]*)
+            # The worker never recorded a result (killed, or xargs gave
+            # up). Count it as a failure so a crash can't pass the gate.
+            echo "run-ci-guards: $name did not report a result" >> "$log_file"
+            rc=125
             ;;
     esac
 
@@ -508,6 +582,20 @@ for path in "${runnable[@]}"; do
         echo "  Full log: $log_file" >&2
     fi
 done
+
+# ────────────────────────────────────────────────────────────────────
+# Timing (#4708) — wall time plus the five slowest guards, so the next
+# slowdown names its cause instead of needing a bisect.
+# ────────────────────────────────────────────────────────────────────
+slowest="$(
+    for secs_file in "$CI_GUARDS_RESULT_DIR"/*.secs; do
+        [ -f "$secs_file" ] || continue
+        secs=""
+        read -r secs < "$secs_file" || true
+        printf '%s %s\n' "${secs:-0}" "$(basename "$secs_file" .secs)"
+    done | sort -rn | head -n 5 | awk '{ printf "%s%s (%ss)", (NR > 1 ? ", " : ""), $2, $1 }'
+)"
+echo "run-ci-guards: ${#runnable[@]} guard(s) took ${fanout_secs}s wall at ${guard_jobs} parallel; slowest: ${slowest:-n/a}" >&2
 
 # ────────────────────────────────────────────────────────────────────
 # Report

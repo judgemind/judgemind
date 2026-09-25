@@ -47,6 +47,12 @@
 #       label reads "bytes" not "chars" (#4608).
 #  19b. Complete multibyte sequence ending exactly at the byte cap is kept
 #       whole (not chopped to a dangling lead byte) (#4608).
+#  20.  Guards run in parallel (four 2s guards finish well under 8s) and
+#       a timing line names the slowest guards (#4708).
+#  21.  Failures from parallel guards are reported alphabetically with
+#       their real exit codes (#4708).
+#  22.  CI_GUARDS_JOBS=1 serial fallback still fails on a failing guard
+#       (#4708).
 #
 # Run:
 #   scripts/tests/test_run_ci_guards.sh
@@ -702,6 +708,78 @@ else
         report_fail "complete-at-cap sequence was chopped — dangling lead byte, invalid UTF-8 (#4608)" "$out_buf"
     fi
     rm -f "$raw_file" "$prefix_file"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 20 (#4708): guards run in parallel. Four guards that each
+# sleep 2s must finish in well under the 8s a serial loop would take.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 20] guards run in parallel (#4708)"
+synth_scripts="$(seed_synthetic_scripts s20)"
+for g in a b c d; do
+    printf '#!/usr/bin/env bash\nsleep 2\nexit 0\n' > "$synth_scripts/check-sleep-$g.sh"
+    chmod +x "$synth_scripts/check-sleep-$g.sh"
+done
+t0=$(date +%s)
+out_buf="$(CI_GUARDS_JOBS=4 "$synth_scripts/run-ci-guards.sh" 2>&1)" && rc_buf=0 || rc_buf=$?
+elapsed=$(( $(date +%s) - t0 ))
+if [ "$rc_buf" -ne 0 ]; then
+    report_fail "expected exit 0 with four passing guards, got $rc_buf" "$out_buf"
+elif [ "$elapsed" -ge 6 ]; then
+    report_fail "expected parallel run well under 8s serial time, took ${elapsed}s (#4708)" "$out_buf"
+elif ! echo "$out_buf" | grep -q "all 4 guard(s) passed"; then
+    report_fail "expected 'all 4 guard(s) passed'" "$out_buf"
+elif ! echo "$out_buf" | grep -qE "4 guard\(s\) took [0-9]+s wall at 4 parallel; slowest: check-sleep-"; then
+    report_fail "expected timing line naming the slowest guards (#4708)" "$out_buf"
+else
+    report_pass "four 2s guards finished in ${elapsed}s at CI_GUARDS_JOBS=4 (#4708)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 21 (#4708): failures from parallel guards are all reported,
+# in alphabetical order, whatever order they finish in.
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 21] parallel failures reported in alphabetical order (#4708)"
+synth_scripts="$(seed_synthetic_scripts s21)"
+# check-aaa finishes last, check-zzz first; both fail. check-mmm passes.
+printf '#!/usr/bin/env bash\nsleep 2\necho "aaa broke"\nexit 1\n' > "$synth_scripts/check-aaa.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$synth_scripts/check-mmm.sh"
+printf '#!/usr/bin/env bash\necho "zzz broke"\nexit 3\n' > "$synth_scripts/check-zzz.sh"
+chmod +x "$synth_scripts"/check-*.sh
+out_buf="$(CI_GUARDS_JOBS=3 "$synth_scripts/run-ci-guards.sh" 2>&1)" && rc_buf=0 || rc_buf=$?
+first_fail="$(echo "$out_buf" | grep -m1 "FAILED:" || true)"
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with two failing guards, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "run-ci-guards: 2 of 3 guard(s) failed"; then
+    report_fail "expected '2 of 3 guard(s) failed'" "$out_buf"
+elif ! echo "$first_fail" | grep -q "check-aaa.sh (exit 1)"; then
+    report_fail "expected check-aaa.sh reported first (alphabetical), got: $first_fail" "$out_buf"
+elif ! echo "$out_buf" | grep -q "FAILED: check-zzz.sh (exit 3)"; then
+    report_fail "expected check-zzz.sh with its real exit code" "$out_buf"
+elif ! echo "$out_buf" | grep -q "aaa broke" || ! echo "$out_buf" | grep -q "zzz broke"; then
+    report_fail "expected both guards' output tails" "$out_buf"
+else
+    report_pass "parallel failures reported alphabetically with real exit codes (#4708)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 22 (#4708): CI_GUARDS_JOBS=1 still runs every guard and fails
+# on a failing one (serial fallback).
+# ───────────────────────────────────────────────────────────────────────
+echo "[scenario 22] CI_GUARDS_JOBS=1 serial fallback (#4708)"
+synth_scripts="$(seed_synthetic_scripts s22)"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$synth_scripts/check-one.sh"
+printf 'import sys\nprint("py guard failed")\nsys.exit(1)\n' > "$synth_scripts/check-two.py"
+chmod +x "$synth_scripts/check-one.sh"
+out_buf="$(CI_GUARDS_JOBS=1 "$synth_scripts/run-ci-guards.sh" 2>&1)" && rc_buf=0 || rc_buf=$?
+if [ "$rc_buf" -ne 1 ]; then
+    report_fail "expected exit 1 with CI_GUARDS_JOBS=1 and a failing .py guard, got $rc_buf" "$out_buf"
+elif ! echo "$out_buf" | grep -q "FAILED: check-two.py (exit 1)"; then
+    report_fail "expected 'FAILED: check-two.py (exit 1)'" "$out_buf"
+elif ! echo "$out_buf" | grep -q "at 1 parallel"; then
+    report_fail "expected timing line to report 1 parallel job" "$out_buf"
+else
+    report_pass "CI_GUARDS_JOBS=1 runs guards one at a time and still fails (#4708)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

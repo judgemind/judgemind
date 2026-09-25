@@ -186,6 +186,8 @@ If unsure whether a perf pattern matters at current scale, add a `# TODO(perf):`
 
 **Every agent MUST run ALL applicable checks locally BEFORE pushing.** The `.githooks/pre-push` hook also runs them automatically.
 
+**Pre-push speed (#4708).** The hook runs its slow stages at the same time: the CI guard umbrella, and one job per touched package (lint, format, tests, coverage floor, diff coverage, in that order within the package). Each job's output is printed once all jobs finish. The umbrella runs its guards in parallel. scraper-framework's pytest runs with `-n auto`, the same as CI. The hook ends with a timing summary that lists the slowest checks. Check logs go to `/tmp/prepush-logs-<checkout-dir>/`, so two worktrees pushing at once don't overwrite each other's logs. Knobs: `PREPUSH_SERIAL=1` runs every stage in order, in the foreground (for debugging). `PREPUSH_XDIST_PKGS` lists the packages that get `-n auto`. `CI_GUARDS_JOBS` sets guard concurrency. None of these skip a gate.
+
 ### Python packages (from the package directory)
 
 ```

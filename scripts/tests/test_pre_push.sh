@@ -38,6 +38,13 @@
 #  27. scripts/*.py basicConfig rejected     bare logging.basicConfig in scripts/*.py -> hook fails (#4441)
 #  28. scripts/*.py basicConfig+extra= rejected  basicConfig + extra= without configure_structlog -> hook fails (#4441)
 #  29. docs-only push skips basicConfig gates  path filter — no overhead on pure docs pushes (#4441 AC2)
+#  30. pytest failure in a background package job fails the push (#4708)
+#  31. ruff format failure in a background package job fails the push (#4708)
+#  32. diff-coverage failure in a background package job fails the push (#4708)
+#  33. package + CI-guard failures from concurrent jobs are both counted (#4708)
+#  34. a job that dies without reporting a result fails the push (#4708)
+#  35. xdist gated by PREPUSH_XDIST_PKGS + venv; timing summary printed (#4708)
+#  36. default check-log dir is per checkout, not a shared /tmp path (#4708)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -58,6 +65,11 @@ fi
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+
+# The hook writes check logs to $PREPUSH_LOG_DIR (default: a per-checkout
+# /tmp/prepush-logs-<dir> directory, #4708). Pin it inside the scratch
+# dir so scenarios never read another run's logs.
+export PREPUSH_LOG_DIR="$TMPDIR/prepush-logs"
 
 REMOTE="$TMPDIR/remote.git"
 WORK="$TMPDIR/work"
@@ -486,7 +498,7 @@ fi
 #   - exit != 0
 #   - output contains "FAILED: ruff check for testpkg"
 #   - output contains "E999" or "SyntaxError" (ruff's syntax-error signal)
-#   - output contains "Full log: /tmp/prepush-testpkg-ruff-check.log"
+#   - output contains "Full log: $PREPUSH_LOG_DIR/prepush-testpkg-ruff-check.log"
 # This directly exercises AC1 (run_check tees combined output to a log and
 # prints the last 20 lines + log path on failure) without needing a real
 # ruff installation or pytest.
@@ -530,8 +542,8 @@ elif ! echo "$hook_out" | grep -q "FAILED: ruff check for testpkg"; then
     report_fail "expected 'FAILED: ruff check for testpkg' in output (#2973 AC1)" "$hook_out"
 elif ! echo "$hook_out" | grep -qE "E999|SyntaxError"; then
     report_fail "expected E999 or SyntaxError in output tail (#2973 AC1)" "$hook_out"
-elif ! echo "$hook_out" | grep -q "Full log: /tmp/prepush-testpkg-ruff-check.log"; then
-    report_fail "expected 'Full log: /tmp/prepush-testpkg-ruff-check.log' in output (#2973 AC1)" "$hook_out"
+elif ! echo "$hook_out" | grep -qF "Full log: $PREPUSH_LOG_DIR/prepush-testpkg-ruff-check.log"; then
+    report_fail "expected 'Full log: $PREPUSH_LOG_DIR/prepush-testpkg-ruff-check.log' in output (#2973 AC1)" "$hook_out"
 else
     report_pass "run_check helper surfaces ruff error tail and Full log path (#2973 AC1)"
 fi
@@ -1347,12 +1359,12 @@ PY
     run_hook "refs/heads/feature-bare-basicconfig $feat_sha refs/heads/feature-bare-basicconfig $ZERO_SHA"
 
     # The check's full violation list (including the file:line) goes to
-    # /tmp/prepush-_-scripts_check-no-logging-basicconfig.sh.log via
+    # $PREPUSH_LOG_DIR/prepush-_-scripts_check-no-logging-basicconfig.sh.log via
     # run_check; the hook's stderr only shows the last 20 lines of that
     # log, which on this guard is the multi-line "Fix:" suggestion block
     # (the violation list is pushed above the tail). Read the log
     # directly for the filename assertion.
-    log_file="/tmp/prepush-_-scripts_check-no-logging-basicconfig.sh.log"
+    log_file="$PREPUSH_LOG_DIR/prepush-_-scripts_check-no-logging-basicconfig.sh.log"
     if [ "$hook_rc" -eq 0 ]; then
         report_fail "expected hook to reject logging.basicConfig (#4441), exit was 0" "$hook_out"
     elif ! echo "$hook_out" | grep -q "FAILED: scripts/check-no-logging-basicconfig.sh"; then
@@ -1450,6 +1462,173 @@ elif echo "$hook_out" | grep -q "checking scripts/\*\.py for basicConfig + extra
 else
     report_pass "docs-only push skips both basicConfig gates (#4441 AC2)"
 fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 30-35 (#4708): per-package gates run as background jobs and
+# must still fail the push. Each seeds testpkg with stub venv tools so
+# the scenario exercises the hook's wiring, not real ruff/pytest.
+# ───────────────────────────────────────────────────────────────────────
+
+# seed_stub_venv <ruff_rc> <pytest_rc> [diff_cover_rc]
+# Writes stub ruff / pytest (and optionally diff-cover) into
+# packages/testpkg/.venv/bin. The pytest stub records its argv to
+# pytest-args.txt and writes a coverage.xml so the coverage gates run.
+seed_stub_venv() {
+    local ruff_rc="$1" pytest_rc="$2" diff_cover_rc="${3-}"
+    local bin="$WORK/packages/testpkg/.venv/bin"
+    mkdir -p "$bin"
+    printf '#!/usr/bin/env bash\necho "stub ruff $*"\nexit %s\n' "$ruff_rc" > "$bin/ruff"
+    printf '#!/usr/bin/env bash\necho "$*" > pytest-args.txt\necho "<coverage/>" > coverage.xml\necho "stub pytest failure marker"\nexit %s\n' "$pytest_rc" > "$bin/pytest"
+    chmod +x "$bin/ruff" "$bin/pytest"
+    if [ -n "$diff_cover_rc" ]; then
+        printf '#!/usr/bin/env bash\necho "stub diff-cover: 42%% < 90%%"\nexit %s\n' "$diff_cover_rc" > "$bin/diff-cover"
+        chmod +x "$bin/diff-cover"
+    fi
+}
+
+# commit_testpkg_code <branch> — commit testpkg with a src/ .py change so
+# the hook treats it as a code change (tests + coverage gates fire).
+commit_testpkg_code() {
+    git -C "$WORK" checkout --quiet -b "$1"
+    seed_testpkg
+    # Keep the stub venv out of the diff: it is local tooling, like a real .venv.
+    echo ".venv/" > "$WORK/packages/testpkg/.gitignore"
+    echo "pytest-args.txt" >> "$WORK/packages/testpkg/.gitignore"
+    echo "coverage.xml" >> "$WORK/packages/testpkg/.gitignore"
+    git -C "$WORK" add packages/testpkg
+    git -C "$WORK" commit --quiet -m "feat: add testpkg"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+echo "[scenario 30] failing pytest in a background package job fails the push (#4708)"
+init_workspace
+commit_testpkg_code feature-pytest-fail
+seed_stub_venv 0 1
+run_hook "refs/heads/feature-pytest-fail $feat_sha refs/heads/feature-pytest-fail $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to fail when pytest fails (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: pytest for testpkg"; then
+    report_fail "expected 'FAILED: pytest for testpkg' in replayed job output (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "stub pytest failure marker"; then
+    report_fail "expected pytest log tail in output (#4708)" "$hook_out"
+else
+    report_pass "failing pytest in a background job fails the push (#4708)"
+fi
+
+echo "[scenario 31] failing ruff format in a background package job fails the push (#4708)"
+init_workspace
+commit_testpkg_code feature-format-fail
+seed_stub_venv 0 0
+# ruff check passes, ruff format --check fails.
+printf '#!/usr/bin/env bash\nif [ "$1" = "format" ]; then echo "Would reformat: src/good.py"; exit 1; fi\nexit 0\n' \
+    > "$WORK/packages/testpkg/.venv/bin/ruff"
+run_hook "refs/heads/feature-format-fail $feat_sha refs/heads/feature-format-fail $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to fail when ruff format fails (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: ruff format for testpkg"; then
+    report_fail "expected 'FAILED: ruff format for testpkg' (#4708)" "$hook_out"
+else
+    report_pass "failing ruff format in a background job fails the push (#4708)"
+fi
+
+echo "[scenario 32] failing diff coverage in a background package job fails the push (#4708)"
+init_workspace
+commit_testpkg_code feature-diffcov-fail
+seed_stub_venv 0 0 1
+run_hook "refs/heads/feature-diffcov-fail $feat_sha refs/heads/feature-diffcov-fail $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to fail when diff coverage fails (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: diff coverage for testpkg"; then
+    report_fail "expected 'FAILED: diff coverage for testpkg' (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "< 90% test coverage"; then
+    report_fail "expected diff-coverage fix hint (#4708)" "$hook_out"
+else
+    report_pass "failing diff coverage in a background job fails the push (#4708)"
+fi
+
+echo "[scenario 33] package failure + CI-guard failure both counted (#4708)"
+init_workspace
+commit_testpkg_code feature-two-fail
+seed_stub_venv 0 1
+mkdir -p "$WORK/scripts"
+printf '#!/usr/bin/env bash\necho "STUB: simulated guard failure" >&2\nexit 1\n' > "$WORK/scripts/run-ci-guards.sh"
+chmod +x "$WORK/scripts/run-ci-guards.sh"
+run_hook "refs/heads/feature-two-fail $feat_sha refs/heads/feature-two-fail $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to fail with two failing jobs (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: scripts/run-ci-guards.sh"; then
+    report_fail "expected umbrella failure in output (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: pytest for testpkg"; then
+    report_fail "expected pytest failure in output (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "pre-push: 2 check(s) failed"; then
+    report_fail "expected both job failures counted ('2 check(s) failed') (#4708)" "$hook_out"
+else
+    report_pass "failures from concurrent jobs are all counted (#4708)"
+fi
+
+echo "[scenario 34] a job that dies without reporting counts as a failure (#4708)"
+init_workspace
+commit_testpkg_code feature-job-crash
+seed_stub_venv 0 0
+# The ruff stub's parent is the job subshell that runs the package
+# checks (run_check execs the command directly from it). Killing it
+# means no result file is written.
+cat > "$WORK/packages/testpkg/.venv/bin/ruff" <<'RUFF'
+#!/usr/bin/env bash
+kill -9 "$PPID" 2>/dev/null
+exit 0
+RUFF
+chmod +x "$WORK/packages/testpkg/.venv/bin/ruff"
+run_hook "refs/heads/feature-job-crash $feat_sha refs/heads/feature-job-crash $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a crashed job to fail the push (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "exited without reporting a result"; then
+    report_fail "expected 'exited without reporting a result' (#4708)" "$hook_out"
+else
+    report_pass "a crashed background job fails the push (#4708)"
+fi
+
+echo "[scenario 35] xdist only for PREPUSH_XDIST_PKGS with xdist installed; timing summary printed (#4708)"
+init_workspace
+commit_testpkg_code feature-xdist
+seed_stub_venv 0 0
+mkdir -p "$WORK/packages/testpkg/.venv/lib/python3.12/site-packages/xdist"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-xdist $feat_sha refs/heads/feature-xdist $ZERO_SHA" \
+    | PREPUSH_XDIST_PKGS=testpkg "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+args_with="$(cat "$WORK/packages/testpkg/pytest-args.txt" 2>/dev/null || true)"
+hook_out_default="$(cd "$WORK" && echo "refs/heads/feature-xdist $feat_sha refs/heads/feature-xdist $ZERO_SHA" \
+    | "$HOOK" origin "$REMOTE" 2>&1)" || true
+args_default="$(cat "$WORK/packages/testpkg/pytest-args.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected passing stubs to pass the hook (#4708)" "$hook_out"
+elif ! echo "$args_with" | grep -q -- "-n auto"; then
+    report_fail "expected '-n auto' for an allowlisted package with xdist (#4708); got: $args_with" "$hook_out"
+elif ! echo "$args_with" | grep -q -- "faulthandler_timeout=300"; then
+    report_fail "expected faulthandler_timeout=300 in pytest args (#4708); got: $args_with" "$hook_out"
+elif echo "$args_default" | grep -q -- "-n "; then
+    report_fail "expected serial pytest for a package not in PREPUSH_XDIST_PKGS (#4708); got: $args_default" "$hook_out_default"
+elif ! echo "$hook_out" | grep -q "pre-push: timing summary"; then
+    report_fail "expected a timing summary (#4708)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "[0-9]+s +testpkg +pytest"; then
+    report_fail "expected the pytest stage in the timing summary (#4708)" "$hook_out"
+else
+    report_pass "xdist gated by allowlist + venv; timing summary lists stages (#4708)"
+fi
+
+echo "[scenario 36] default log dir is per checkout, not shared /tmp (#4708)"
+init_workspace
+commit_testpkg_code feature-log-dir
+seed_stub_venv 1 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-log-dir $feat_sha refs/heads/feature-log-dir $ZERO_SHA" \
+    | env -u PREPUSH_LOG_DIR "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected failing ruff stub to fail the hook" "$hook_out"
+elif ! echo "$hook_out" | grep -q "Full log: /tmp/prepush-logs-work/prepush-testpkg-ruff-check.log"; then
+    report_fail "expected per-checkout default log dir /tmp/prepush-logs-work/ (#4708)" "$hook_out"
+else
+    report_pass "default log dir is per checkout (#4708)"
+fi
+rm -rf /tmp/prepush-logs-work
 
 # ───────────────────────────────────────────────────────────────────────
 # Summary
