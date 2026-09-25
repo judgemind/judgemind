@@ -923,12 +923,371 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
     return rulings
 
 
+# ---------------------------------------------------------------------------
+# Dept-12 layout (#4681)
+# ---------------------------------------------------------------------------
+#
+# Dept 12 (Judge Iravani-Sani) publishes a summary table headed
+# ``LINE # | CASE # | CASE TITLE | RULING`` — not the format-B
+# ``LINE | CASE NO. | CASE TITLE | TENTATIVE RULING`` header — followed by
+# long-form bodies headed ``Calendar Line N`` (or ``Calendar Line 2-5``,
+# ``Calendar line 9 & 10``, ``Calendar Line 6/7``) whose first lines carry
+# ``Case Name:`` / ``Case No.:`` (sometimes just a bare case number).  Table
+# rows either carry the ruling inline or say ``Please CTRL CLICK (or scroll
+# down to) Line(s) N``.  The PDF is hand-edited, so the layout drifts from
+# week to week.  Quirks seen in the dev-S3 raws:
+#
+# * The table continues onto later pages as separate pdfplumber tables with
+#   no header row; a ``9:01 | CASE # | …`` header can repeat for the second
+#   session; ``9:01`` / ``See next page`` divider rows separate sessions.
+# * ``||`` and ``“”`` are ditto marks (another motion on the case above).
+# * pdfplumber sometimes adds an empty column before CASE #, or misses the
+#   RULING column entirely (3-column tables).
+# * pdfplumber sometimes misses rows (e.g. a 9:01 block) that are present in
+#   the flattened text as ``LINE 1 24CV445865 Jimenez Motion to …``.
+# * The same case can appear on several LINEs (one per motion).
+#
+# The splitter therefore unions three sources, keyed by case number: the
+# pdfplumber table (clean titles and RULING cells), the summary rows in the
+# flattened text (completeness, and ruling text when the table has no
+# RULING cell), and the ``Calendar Line`` bodies.  It emits one entry per
+# distinct case number.
+#
+# Other departments (10, 11, 13, 16, …) publish variants of the same table;
+# this splitter is gated to Dept 12 until those variants are validated
+# (see the #4681 follow-up).  Before #4681 Dept 12 PDFs fell through to the
+# whole-document LLM split, which produced ``UNKNOWN-`` case numbers.
+
+_SC_DEPT12_DEPARTMENTS = frozenset({"12"})
+
+# ``Department 12`` or ``Department 12 (Hon. Nahal Iravani-Sani)`` near the
+# top of the PDF.  Looser than ``_DEPT_PDF_RE`` (which requires the number to
+# end the line) because covering judges add their name after the number.
+_SC_DEPT12_DEPT_LINE_RE = re.compile(r"^Department\s+(?P<department>\d+)\b", re.MULTILINE)
+
+# The last column is ``RULING`` (``HEARING`` in some spring-2026 PDFs).
+_SC_DEPT12_HEADER_RE = re.compile(
+    r"LINE\s*#\s+CASE\s*#\s+CASE\s+TITLE\s+(?:RULING|HEARING)",
+    re.IGNORECASE,
+)
+
+_SC_DEPT12_TIME_ONLY_RE = re.compile(r"^\d{1,2}:\d{2}$")
+_SC_DEPT12_CN_RE = re.compile(r"^\d{2}(?:CV|PR)\d{6}$", re.IGNORECASE)
+
+# A summary-table row in the flattened text: optional ``9:01`` / ``LINE 1`` /
+# ``LINES 3-5`` / ``LINE 8 & LINE 9`` labels, then the case number.
+_SC_DEPT12_TEXT_ROW_RE = re.compile(
+    r"^[ \t]*(?:(?:\d{1,2}:\d{2}|[-–]?[ \t]*LINES?[ \t]*\d{1,3}"
+    r"(?:[ \t]*(?:-|&|,|and)[ \t]*(?:LINE[ \t]*)?\d{1,3})*)[ \t]+)*"
+    r"(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Body-section boundary: ``Calendar Line 7`` / ``Calendar line 9 & 10`` /
+# ``Calendar Line 3 - 4`` / ``Calendar Line 6/7`` on its own line.
+_SC_DEPT12_BODY_RE = re.compile(
+    r"^[ \t]*Calendar\s+Lines?\s+(?:Nos?\.?\s+)?(?P<first>\d{1,3})"
+    r"(?:[ \t]*(?:-|&|/|,|and)[ \t]*\d{1,3})*[ \t]*:?[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# ``Case No.: 24CV450440`` / ``Case No. 26CV483739`` / ``Case No.: 26-CV-484120``
+# or a bare case number on its own line.
+_SC_DEPT12_BODY_CASE_NO_RE = re.compile(
+    r"^[ \t]*(?:Case\s+No\.?:?\s*(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b"
+    r"|(?P<bare>\d{2}-?(?:CV|PR)-?\d{6})[ \t]*$)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_SC_DEPT12_BODY_CASE_NAME_RE = re.compile(
+    r"^[ \t]*Case\s+Name:\s*(?P<title>[^\n]+)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Cross-references in a RULING cell: ``(or scroll down to) Line 7``,
+# ``See Line #1``, ``Click LINE 3``, ``Click on line 1``.
+_SC_DEPT12_CROSSREF_RE = re.compile(
+    r"(?:scroll\s+down\s+to\)?|\bSee|\bClick(?:\s+on)?)\s+Lines?\s+#?(?P<num>\d{1,3})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_case_number(raw: str) -> str:
+    return re.sub(r"[\s-]", "", raw).upper()
+
+
+def _dept12_pdf_department(text: str) -> str | None:
+    """Department number from the PDF header (first 2000 chars)."""
+    m = _SC_DEPT12_DEPT_LINE_RE.search(text[:2000])
+    return m.group("department") if m else None
+
+
+def _one_char_apart(a: str, b: str) -> bool:
+    return len(a) == len(b) and sum(x != y for x, y in zip(a, b, strict=True)) == 1
+
+
+def _dept12_cell(cell: str | None) -> str:
+    """Normalize a Dept 12 table cell; ditto marks (``||``, ``“”``) become empty."""
+    value = _normalize_table_cell(cell)
+    if re.fullmatch(r"[|\s\"“”″]*", value):
+        return ""
+    return value
+
+
+def _is_dept12_header_row(row: list[str | None]) -> bool:
+    """True for ``LINE # | CASE # | CASE TITLE [| RULING]`` (the first cell
+    may instead be a session time such as ``9:01``)."""
+    if len(row) < 3:
+        return False
+    cells = [_normalize_table_cell(c).upper() for c in row[:3]]
+    return cells[1] == "CASE #" and cells[2] == "CASE TITLE"
+
+
+def _dept12_parse_row(row: list[str | None]) -> tuple[str, str | None, str, str]:
+    """Return ``(label, case_number, title, ruling)`` for one table row.
+
+    CASE # is normally column 1, but pdfplumber sometimes inserts an empty
+    column before it, so columns 1-2 are searched.  TITLE is the cell after
+    CASE #; RULING is everything after TITLE.
+    """
+    cells = [_dept12_cell(c) for c in row]
+    label = _normalize_table_cell(row[0])
+    for i in (1, 2):
+        if i < len(cells) and _SC_DEPT12_CN_RE.match(_normalize_case_number(cells[i])):
+            title = cells[i + 1] if i + 1 < len(cells) else ""
+            ruling = "\n".join(c for c in cells[i + 2 :] if c)
+            return label, _normalize_case_number(cells[i]), title, ruling
+    title = cells[2] if len(cells) > 2 else ""
+    ruling = "\n".join(c for c in cells[3:] if c)
+    return label, None, title, ruling
+
+
+def _append_text(r: SplitRuling, extra: str, sep: str = "\n") -> None:
+    if extra:
+        r.ruling_text = f"{r.ruling_text}{sep}{extra}" if r.ruling_text else extra
+
+
+def _dept12_table_entries(pdf_bytes: bytes) -> dict[str, SplitRuling]:
+    """Parse the pdfplumber tables into ``{case_number: SplitRuling}`` (ordered).
+
+    Raises whatever pdfplumber raises; the caller handles it.
+    """
+    import io
+
+    entries: dict[str, SplitRuling] = {}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        in_table = False
+        current: SplitRuling | None = None
+        title_open = False
+        for page in pdf.pages:
+            for table in page.extract_tables() or []:
+                rows = [row for row in table if row and len(row) >= 3]
+                if not rows:
+                    continue
+                if any(_is_dept12_header_row(r) for r in rows):
+                    in_table = True
+                if not in_table:
+                    continue
+                # Tables after the header must look like calendar rows —
+                # skip text boxes inside the long-form rulings.
+                if not any(
+                    _is_dept12_header_row(r) or _dept12_parse_row(r)[1] is not None for r in rows
+                ):
+                    continue
+                for row in rows:
+                    if _is_dept12_header_row(row):
+                        current, title_open = None, False
+                        continue
+                    label, cn, title, ruling = _dept12_parse_row(row)
+                    if cn is not None:
+                        existing = entries.get(cn)
+                        if existing is None:
+                            current = SplitRuling(
+                                ruling_index=0,
+                                case_number=cn,
+                                ruling_text=ruling,
+                                case_title=title or None,
+                            )
+                            entries[cn] = current
+                            title_open = True
+                        else:
+                            current, title_open = existing, False
+                            if not current.case_title and title:
+                                current.case_title = title
+                            _append_text(current, ruling)
+                        continue
+                    if _SC_DEPT12_TIME_ONLY_RE.match(label) and not title:
+                        # Session divider (``9:01`` / ``See next page``).
+                        current, title_open = None, False
+                        continue
+                    if current is None:
+                        continue
+                    if title and title_open:
+                        current.case_title = (
+                            f"{current.case_title} {title}" if current.case_title else title
+                        )
+                    _append_text(current, ruling)
+    return entries
+
+
+def _dept12_text_rows(text: str) -> dict[str, str]:
+    """Summary rows in the flattened text: ``{case_number: row_text}`` (ordered).
+
+    Only the region between the table header and the first ``Calendar Line``
+    body is scanned.  A row's text runs to the next row (or the end of the
+    region); rows sharing a case number are concatenated.
+    """
+    header = _SC_DEPT12_HEADER_RE.search(text)
+    if not header:
+        return {}
+    first_body = _SC_DEPT12_BODY_RE.search(text, header.end())
+    region = text[header.end() : first_body.start() if first_body else len(text)]
+    matches = list(_SC_DEPT12_TEXT_ROW_RE.finditer(region))
+    rows: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(region)
+        segment = region[m.start() : end].strip()
+        cn = _normalize_case_number(m.group("cn"))
+        rows[cn] = f"{rows[cn]}\n{segment}" if cn in rows else segment
+    return rows
+
+
+class _Dept12BodySection:
+    __slots__ = ("first_line", "case_number", "case_title", "text")
+
+    def __init__(
+        self, first_line: int, case_number: str | None, case_title: str | None, text: str
+    ) -> None:
+        self.first_line = first_line
+        self.case_number = case_number
+        self.case_title = case_title
+        self.text = text
+
+
+def _dept12_body_sections(text: str) -> list[_Dept12BodySection]:
+    """Return the ``Calendar Line N`` long-form sections in document order."""
+    matches = list(_SC_DEPT12_BODY_RE.finditer(text))
+    sections: list[_Dept12BodySection] = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[m.start() : end].strip()
+        # Only the section's own header block identifies it — search the
+        # first few lines so a ``case no.`` cited deep in the ruling (e.g. a
+        # bankruptcy case) is not mistaken for the section's case number.
+        head = "\n".join(body.splitlines()[:6])
+        cn_match = _SC_DEPT12_BODY_CASE_NO_RE.search(head)
+        name_match = _SC_DEPT12_BODY_CASE_NAME_RE.search(head)
+        cn = None
+        if cn_match:
+            cn = _normalize_case_number(cn_match.group("cn") or cn_match.group("bare"))
+        sections.append(
+            _Dept12BodySection(
+                first_line=int(m.group("first")),
+                case_number=cn,
+                case_title=" ".join(name_match.group("title").split()) if name_match else None,
+                text=body,
+            )
+        )
+    return sections
+
+
+def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
+    """Attach each ``Calendar Line N`` body section to its ruling, in place.
+
+    A section attaches to the ruling with the same case number (from its
+    ``Case No.:`` line; a single mistyped digit is tolerated when exactly
+    one ruling matches that way), or — when the section has no case number — to the
+    ruling whose RULING cell cross-references the section's first line
+    number.  Each section attaches at most once.  A section with a case
+    number that matches no ruling becomes a new ruling (the table and the
+    summary rows both missed it).  A section's ``Case Name:`` replaces the
+    table's (often truncated / line-wrapped) CASE TITLE.
+    """
+    by_cn = {r.case_number: r for r in rulings}
+    has_body: set[int] = set()
+    refs = {
+        id(r): {int(m.group("num")) for m in _SC_DEPT12_CROSSREF_RE.finditer(r.ruling_text or "")}
+        for r in rulings
+    }
+    for s in _dept12_body_sections(text):
+        target: SplitRuling | None = None
+        if s.case_number is not None:
+            target = by_cn.get(s.case_number)
+            if target is None:
+                # One mistyped digit between the table and the body (e.g.
+                # table ``24CV469611``, body ``25CV469611``): the table's
+                # number wins when exactly one ruling is one digit away.
+                # Only rulings without a body yet qualify, so two real
+                # sequential case numbers each keep their own body.
+                near = [
+                    r
+                    for r in rulings
+                    if id(r) not in has_body and _one_char_apart(r.case_number or "", s.case_number)
+                ]
+                if len(near) == 1:
+                    target = near[0]
+            if target is None:
+                target = SplitRuling(ruling_index=0, case_number=s.case_number, ruling_text="")
+                rulings.append(target)
+                by_cn[s.case_number] = target
+        else:
+            target = next((r for r in rulings if s.first_line in refs.get(id(r), set())), None)
+        if target is None:
+            continue
+        _append_text(target, s.text, sep="\n\n")
+        has_body.add(id(target))
+        if s.case_title:
+            target.case_title = s.case_title
+
+
+def _split_rulings_dept12(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
+    """Dept-12 splitter — see the block comment above (#4681).
+
+    Returns one ``SplitRuling`` per distinct case number, in table order,
+    with ``ruling_index`` 1..N.  Entries that end up with no ruling text at
+    all are dropped (there is nothing to extract from them).  Returns ``[]``
+    on a pdfplumber error so the caller can fall back.
+    """
+    try:
+        entries = _dept12_table_entries(pdf_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dept12_table_parse_error", error=str(exc))
+        return []
+
+    rulings = list(entries.values())
+    text_rows = _dept12_text_rows(text)
+    for cn, row_text in text_rows.items():
+        if cn not in entries:
+            r = SplitRuling(ruling_index=0, case_number=cn, ruling_text=row_text)
+            entries[cn] = r
+            rulings.append(r)
+
+    _attach_dept12_bodies(rulings, text)
+
+    kept: list[SplitRuling] = []
+    for r in rulings:
+        if not r.ruling_text and r.case_number in text_rows:
+            # 3-column tables: pdfplumber missed the RULING column, so use
+            # the flattened summary row instead.
+            r.ruling_text = text_rows[r.case_number]
+        if not r.ruling_text:
+            logger.info("dept12_entry_without_text_dropped", case_number=r.case_number)
+            continue
+        r.ruling_index = len(kept) + 1
+        kept.append(r)
+    return kept
+
+
 def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRuling]:
     """Split Santa Clara multi-ruling PDF text into per-entry ``SplitRuling`` objects.
 
-    Two parsing paths cover the two known SC layouts (see module docstring
-    §A and §B):
+    Three parsing paths cover the known SC layouts (see module docstring
+    §A and §B, and the Dept-12 block comment above):
 
+    * **Dept 12** (#4681) — ``LINE # | CASE # | CASE TITLE | RULING``
+      summary table plus ``Calendar Line N`` bodies.  Tried first, only
+      when ``pdf_bytes`` is supplied, the header is present, and the PDF
+      header names a department in ``_SC_DEPT12_DEPARTMENTS``; its result
+      is used when it has >= 2 entries.
     * **Format A** — ``Line N`` boundary regex on the flattened pdfplumber
       text.  Always tried first; succeeds for dept 16 and other
       departments that print per-case body sections with bare ``Line N``
@@ -986,7 +1345,19 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRulin
     populate those fields via per-entry enrichment matches the Riverside
     pattern (#3649) and preserves correctness on single-ruling PDFs.
     """
-    # Format A always runs first.  When it produces a usable multi-entry
+    # Dept-12 layout (#4681) runs first when its table header is present:
+    # its flattened text also contains bare ``LINE N`` lines (empty table
+    # rows), which format A would otherwise mistake for entry boundaries.
+    if (
+        pdf_bytes is not None
+        and _SC_DEPT12_HEADER_RE.search(text)
+        and _dept12_pdf_department(text) in _SC_DEPT12_DEPARTMENTS
+    ):
+        dept12 = _split_rulings_dept12(text, pdf_bytes)
+        if len(dept12) >= 2:
+            return dept12
+
+    # Format A runs next.  When it produces a usable multi-entry
     # result, return it verbatim.
     format_a = _split_rulings_format_a(text)
     if len(format_a) >= 2:

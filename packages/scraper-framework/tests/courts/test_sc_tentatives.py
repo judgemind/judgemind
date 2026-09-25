@@ -12,6 +12,7 @@ Fixtures captured from live site 2026-03-07:
 
 from __future__ import annotations
 
+import functools
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1801,3 +1802,321 @@ class TestSantaClaraFormatBHelpers:
         # Ruling spans 4 lines starting "Defendant moves for a demurrer..."
         assert "demurrer" in (nicholas.ruling_text or "").lower()
         assert "GRANTED" in (nicholas.ruling_text or "")
+
+
+# ---------------------------------------------------------------------------
+# #4681 — Dept 12 layout ("LINE # | CASE # | CASE TITLE | RULING" summary
+# table + ``Calendar Line N`` long-form bodies).  Before #4681 neither the
+# format-A nor format-B splitter recognized it, so these PDFs fell through to
+# the whole-document LLM split, which emitted ``UNKNOWN-`` case numbers that
+# the deterministic case-number rule then dropped.
+#
+# Fixtures are real dev-S3 raws (Dept 12, Judge Iravani-Sani):
+#   sc_dept12_table_4681_a.pdf = d5ed63e7… (ditto ``||`` rows, 9:01 session
+#       rows merged into the page-2 table, ``Calendar Line 1-6`` body)
+#   sc_dept12_table_4681_b.pdf = 1547eb4e… (one table per page, ``LINES 3-5``,
+#       a repeated ``9:01 | CASE # | …`` header row mid-table)
+#   sc_dept12_table_4681_c.pdf = 4a70b4ad… (table on page 3 with no header
+#       row, ``See next page`` divider, hyphenated ``Case No.: 26-CV-484120``
+#       in the body, inline 9:01 ruling)
+# ---------------------------------------------------------------------------
+
+_DEPT12_EXPECTED_CASE_NUMBERS = {
+    "sc_dept12_table_4681_a.pdf": [
+        "24CV434341",  # Lines 1-6: Lee v. JP Builders (6 motions, one case)
+        "25CV459731",  # Line 7: JP Morgan Chase v. Krup
+        "26CV483739",  # Lines 8-9: Lucero v. Dao (line 9 is a ``||`` ditto)
+        "23CV425184",  # 9:01 Line 1: Apex Trans v. Transamerican Shipping
+        "23CV425156",  # 9:01 Lines 2-3: Vallejo v. Hansen (line 3 ditto)
+    ],
+    "sc_dept12_table_4681_b.pdf": [
+        "20CV366852",
+        "24CV440947",
+        "24CV445865",
+        "25CV467388",
+        "25CV477354",
+        "25CV480258",
+        "25CV481938",
+        "25CV464323",  # 9:01 Line 1, under a repeated header row
+    ],
+    "sc_dept12_table_4681_c.pdf": [
+        "24CV450440",
+        "25CV462214",
+        "25CV471073",
+        "25CV472390",
+        "25CV479287",
+        "26CV483739",
+        "26CV484120",
+        "26CV484360",  # Lines 8 & 9
+        "24CV443124",  # 9:01 Line 1 — on page 3, table has no header row
+    ],
+}
+
+
+@functools.cache
+def _dept12_split(name: str) -> tuple[SplitRuling, ...]:
+    # Cached: pdfplumber table extraction is slow and tests only read the result.
+    pdf_bytes = _load_bytes(name)
+    return tuple(_split_rulings(extract_pdf_text(pdf_bytes), pdf_bytes=pdf_bytes))
+
+
+class TestSantaClaraDept12Split:
+    """#4681: deterministic split of the Dept 12 summary-table layout."""
+
+    @pytest.mark.parametrize("fixture", sorted(_DEPT12_EXPECTED_CASE_NUMBERS))
+    def test_dept12_split_one_entry_per_case(self, fixture: str) -> None:
+        rulings = _dept12_split(fixture)
+        assert [r.case_number for r in rulings] == _DEPT12_EXPECTED_CASE_NUMBERS[fixture]
+        assert [r.ruling_index for r in rulings] == list(range(1, len(rulings) + 1))
+
+    @pytest.mark.parametrize("fixture", sorted(_DEPT12_EXPECTED_CASE_NUMBERS))
+    def test_dept12_split_every_entry_has_title_and_text(self, fixture: str) -> None:
+        for r in _dept12_split(fixture):
+            assert r.case_title, f"{r.case_number} has no case_title"
+            assert r.ruling_text and len(r.ruling_text) > 20, r.case_number
+
+    def test_dept12_split_appends_calendar_line_body(self) -> None:
+        """``Please CTRL CLICK (or scroll down to) Line 7`` rows get the
+        ``Calendar Line 7`` long-form body, including the hyphenated
+        ``Case No.: 26-CV-484120`` header — and no other entry gets it."""
+        rulings = _dept12_split("sc_dept12_table_4681_c.pdf")
+        by_cn = {r.case_number: r for r in rulings}
+        calderon = by_cn["26CV484120"]
+        assert "DEMURRER" in calderon.ruling_text
+        assert "Samuel Calderon Jr. v. Chadi Moussa" in calderon.ruling_text
+        others = [r for r in rulings if r.case_number != "26CV484120"]
+        assert all("Samuel Calderon Jr." not in r.ruling_text for r in others)
+
+    def test_dept12_split_prefers_body_case_name(self) -> None:
+        rulings = _dept12_split("sc_dept12_table_4681_c.pdf")
+        by_cn = {r.case_number: r for r in rulings}
+        assert by_cn["24CV450440"].case_title == "Rosa Salazar v. FCA USA, LLC et al."
+        # Inline 9:01 ruling has no body section — the table title is used.
+        assert by_cn["24CV443124"].case_title == "JESSIE v. ZANOTTO’s"
+
+    def test_dept12_split_inline_ruling_kept(self) -> None:
+        rulings = _dept12_split("sc_dept12_table_4681_c.pdf")
+        jessie = next(r for r in rulings if r.case_number == "24CV443124")
+        assert "The petition is DENIED" in jessie.ruling_text
+        # The "See next page" divider row must not leak into the 9:00 entry.
+        khokhar = next(r for r in rulings if r.case_number == "26CV484360")
+        assert "See next page" not in khokhar.ruling_text
+
+    def test_dept12_split_ditto_rows_stay_with_case(self) -> None:
+        """``||`` (ditto) rows are further motions on the case above; their
+        RULING text joins that case, and the ``||`` marker itself is not
+        treated as title or ruling text."""
+        rulings = _dept12_split("sc_dept12_table_4681_a.pdf")
+        lucero = next(r for r in rulings if r.case_number == "26CV483739")
+        assert "MOTION TO QUASH" in lucero.ruling_text
+        assert "Yen Lucero v. Ha Vu Le Dao" in lucero.ruling_text  # Calendar line 9 body
+        assert "||" not in lucero.ruling_text
+        assert "||" not in (lucero.case_title or "")
+        lee = next(r for r in rulings if r.case_number == "24CV434341")
+        # Lines 2-6 are continuation rows (empty CASE #) for the same case.
+        assert "Susan Lee’s Responses to Requests for Production" in lee.ruling_text
+
+    def test_dept12_split_skipped_without_pdf_bytes(self) -> None:
+        """Text-only callers keep the old behavior (no table parse)."""
+        text = extract_pdf_text(_load_bytes("sc_dept12_table_4681_c.pdf"))
+        assert len(_split_rulings(text)) < 2
+
+
+class TestSantaClaraDept12Helpers:
+    """#4681: unit tests for the Dept 12 table helpers."""
+
+    def test_dept12_header_row(self) -> None:
+        from courts.ca.sc_tentatives import _is_dept12_header_row
+
+        assert _is_dept12_header_row(["LINE #", "CASE #", "CASE TITLE", "RULING"])
+        assert _is_dept12_header_row(["9:01", "CASE #", "CASE TITLE", "RULING", None])
+        assert not _is_dept12_header_row(["LINE 1", "24CV450440", "x", "y"])
+        assert not _is_dept12_header_row(["LINE #", "CASE #"])
+
+    def test_dept12_body_sections_keyed_by_first_line_number(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_body_sections
+
+        body = "x" * 100
+        text = (
+            "LINE # CASE # CASE TITLE RULING\n"
+            f"Calendar Line 2-5\nCase No.: 24-CV-443682\n{body}\n"
+            f"Calendar line 9 & 10\nCase Name: A v. B\n{body}\n"
+            f"Calendar Line 6/7\n{body}\n"
+        )
+        sections = _dept12_body_sections(text)
+        assert [s.first_line for s in sections] == [2, 9, 6]
+        assert sections[0].case_number == "24CV443682"
+        assert sections[1].case_number is None
+        assert sections[1].case_title == "A v. B"
+
+    def test_dept12_body_with_other_case_number_not_attached(self) -> None:
+        """A cross-reference must not pull in a body whose ``Case No.``
+        belongs to a different case (e.g. a 9:01 ``Line 1`` pointing at the
+        9:00 ``Calendar Line 1``)."""
+        from courts.ca.sc_tentatives import _attach_dept12_bodies
+
+        body = "y" * 100
+        text = f"Calendar Line 1\nCase No.: 24CV000001\n{body}\n"
+        r = SplitRuling(
+            ruling_index=1,
+            case_number="25CV777777",
+            ruling_text="MOTION Please CTRL CLICK (or scroll down to) Line 1",
+        )
+        _attach_dept12_bodies([r], text)
+        assert body not in r.ruling_text
+
+    def test_dept12_body_attached_by_case_number_without_crossref(self) -> None:
+        from courts.ca.sc_tentatives import _attach_dept12_bodies
+
+        body = "z" * 100
+        text = f"Calendar Line 4\nCase Name: C v. D\nCase No.: 24CV000004\n{body}\n"
+        r = SplitRuling(ruling_index=1, case_number="24CV000004", ruling_text="MOTION")
+        _attach_dept12_bodies([r], text)
+        assert body in r.ruling_text
+        assert r.case_title == "C v. D"
+
+    def test_dept12_returns_empty_on_corrupt_pdf(self) -> None:
+        from courts.ca.sc_tentatives import _split_rulings_dept12
+
+        assert _split_rulings_dept12("LINE # CASE # CASE TITLE RULING", b"not a pdf") == []
+
+    def test_dept12_header_row_three_columns(self) -> None:
+        """pdfplumber sometimes misses the RULING column entirely."""
+        from courts.ca.sc_tentatives import _is_dept12_header_row
+
+        assert _is_dept12_header_row(["LINE #", "CASE #", "CASE TITLE"])
+
+    def test_dept12_parse_row_column_drift_and_dittos(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_parse_row
+
+        # Extra empty column before CASE #.
+        assert _dept12_parse_row(["Line 1", "", "24CV445865", "Jimenez v.\nHonda", "Motion"]) == (
+            "Line 1",
+            "24CV445865",
+            "Jimenez v. Honda",
+            "Motion",
+        )
+        # ``“”`` and ``||`` ditto marks are empty cells.
+        assert _dept12_parse_row(["LINE 3", "“”", "“”"]) == ("LINE 3", None, "", "")
+        assert _dept12_parse_row(["LINE 4", "||", "||", "||"]) == ("LINE 4", None, "", "")
+        # Hyphenated / split case numbers normalize.
+        assert _dept12_parse_row(["LINE 5", "26-CV-\n484120", "A v. B", "X"])[1] == "26CV484120"
+
+    def test_dept12_text_rows_scoped_to_summary_region(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_text_rows
+
+        text = (
+            "24CV000009 before the header is ignored\n"
+            "LINE # CASE # CASE TITLE RULING\n"
+            "LINE 1 24CV000001 Foo v. Bar MOTION\nruling one\n"
+            "9:01 -LINE 2 24-CV-000002 Baz v. Qux CLAIM\nruling two\n"
+            "LINE 3 24CV000001 Foo v. Bar SECOND MOTION\n"
+            "Calendar Line 1\n"
+            "24CV000003 cited in the body is ignored\n"
+        )
+        rows = _dept12_text_rows(text)
+        assert list(rows) == ["24CV000001", "24CV000002"]
+        assert "ruling one" in rows["24CV000001"]
+        assert "SECOND MOTION" in rows["24CV000001"]
+        assert "ruling two" in rows["24CV000002"]
+        assert _dept12_text_rows("no header here") == {}
+
+    def test_dept12_body_typo_attaches_to_nearest_case(self) -> None:
+        """Body ``25CV469611`` vs table ``24CV469611``: one digit apart and
+        unique, so the table's case wins instead of a phantom new entry."""
+        from courts.ca.sc_tentatives import _attach_dept12_bodies
+
+        body = "b" * 100
+        text = f"Calendar Line 13\nBurleson v. Ketamine Center\n25CV469611\n{body}\n"
+        rulings = [
+            SplitRuling(ruling_index=1, case_number="24CV469611", ruling_text="Motion"),
+            SplitRuling(ruling_index=2, case_number="24CV111111", ruling_text="Other"),
+        ]
+        _attach_dept12_bodies(rulings, text)
+        assert len(rulings) == 2
+        assert body in rulings[0].ruling_text
+
+    def test_dept12_body_typo_skips_case_that_already_has_body(self) -> None:
+        """Sequential real case numbers: ``24CV000001`` already has its own
+        body, so a body for ``24CV000002`` becomes a new entry."""
+        from courts.ca.sc_tentatives import _attach_dept12_bodies
+
+        text = (
+            "Calendar Line 1\nCase No.: 24CV000001\n" + "d" * 100 + "\n"
+            "Calendar Line 2\nCase No.: 24CV000002\n" + "e" * 100 + "\n"
+        )
+        rulings = [SplitRuling(ruling_index=1, case_number="24CV000001", ruling_text="x")]
+        _attach_dept12_bodies(rulings, text)
+        assert [r.case_number for r in rulings] == ["24CV000001", "24CV000002"]
+        assert "e" * 100 not in rulings[0].ruling_text
+
+    def test_dept12_body_for_unknown_case_becomes_entry(self) -> None:
+        from courts.ca.sc_tentatives import _attach_dept12_bodies
+
+        body = "c" * 100
+        text = f"Calendar Line Nos 1-2\nCase Name: E v. F\nCase No.: 24CV999999\n{body}\n"
+        rulings = [SplitRuling(ruling_index=1, case_number="24CV000001", ruling_text="x")]
+        _attach_dept12_bodies(rulings, text)
+        assert [r.case_number for r in rulings] == ["24CV000001", "24CV999999"]
+        assert rulings[1].case_title == "E v. F"
+        assert body in rulings[1].ruling_text
+
+    def test_dept12_split_drops_entries_without_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import courts.ca.sc_tentatives as sc
+
+        monkeypatch.setattr(
+            sc,
+            "_dept12_table_entries",
+            lambda _b: {
+                "24CV000001": SplitRuling(0, "24CV000001", "GRANTED", "A v. B"),
+                "24CV000002": SplitRuling(0, "24CV000002", "", "C v. D"),
+                "24CV000003": SplitRuling(0, "24CV000003", "DENIED", "E v. F"),
+            },
+        )
+        rulings = sc._split_rulings_dept12("no summary rows", b"")
+        assert [(r.ruling_index, r.case_number) for r in rulings] == [
+            (1, "24CV000001"),
+            (2, "24CV000003"),
+        ]
+
+    def test_dept12_split_uses_text_row_when_table_has_no_ruling_cell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import courts.ca.sc_tentatives as sc
+
+        monkeypatch.setattr(
+            sc,
+            "_dept12_table_entries",
+            lambda _b: {"24CV000001": SplitRuling(0, "24CV000001", "", "A v. B")},
+        )
+        text = (
+            "LINE # CASE # CASE TITLE RULING\n"
+            "LINE 1 24CV000001 A v. B MOTION TO STRIKE\nThe motion is GRANTED.\n"
+            "LINE 2 24CV000002 C v. D DEMURRER\nThe demurrer is OVERRULED.\n"
+        )
+        rulings = sc._split_rulings_dept12(text, b"")
+        assert [r.case_number for r in rulings] == ["24CV000001", "24CV000002"]
+        assert "GRANTED" in rulings[0].ruling_text
+        assert rulings[0].case_title == "A v. B"
+        assert "OVERRULED" in rulings[1].ruling_text
+
+    @pytest.mark.parametrize(
+        ("header", "expected_calls"),
+        [
+            ("Department 12\n", 1),
+            ("Department 12 (Hon. Nahal Iravani-Sani)\n", 1),
+            ("Department 10\n", 0),
+            ("", 0),
+        ],
+    )
+    def test_dept12_split_gated_to_department_12(
+        self, monkeypatch: pytest.MonkeyPatch, header: str, expected_calls: int
+    ) -> None:
+        """Other departments publish variants of the same table; they keep
+        the pre-#4681 path until those variants are validated."""
+        import courts.ca.sc_tentatives as sc
+
+        calls: list[str] = []
+        monkeypatch.setattr(sc, "_split_rulings_dept12", lambda t, b: calls.append(t) or [])
+        sc._split_rulings(header + "LINE # CASE # CASE TITLE RULING\n", pdf_bytes=b"%PDF")
+        assert len(calls) == expected_calls

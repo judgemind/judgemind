@@ -11,6 +11,7 @@ Verifies that:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1326,6 +1327,35 @@ class TestNonExhaustionExceptionsReraise:
             assert child["case_number"] == fake_rulings[idx].case_number
             assert child["case_title"] == fake_rulings[idx].case_title
             assert child["ruling_text"] == fake_rulings[idx].ruling_text
+
+
+class TestScPdfSplitDept12:
+    """#4681: a real Dept 12 PDF is split deterministically — one child per
+    case with a real case number — instead of falling through to the LLM
+    split that produced ``UNKNOWN-`` case numbers."""
+
+    def test_dept12_split_dispatches_one_child_per_case(self) -> None:
+        from courts.ca.sc_tentatives import extract_pdf_text
+        from ingestion.worker import _try_sc_pdf_split
+
+        pdf_bytes = (Path(__file__).parent / "fixtures" / "sc_dept12_table_4681_c.pdf").read_bytes()
+        event = _make_sc_event(
+            ruling_text=extract_pdf_text(pdf_bytes),
+            hearing_date=None,
+            capture_timestamp="2026-09-22T18:47:00+00:00",
+        )
+        captured: list[dict] = []
+        assert _try_sc_pdf_split(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            captured.append,
+            raw_pdf_bytes=pdf_bytes,
+        )
+        case_numbers = [c["case_number"] for c in captured]
+        assert len(case_numbers) == 9
+        assert not any(cn.startswith("UNKNOWN") for cn in case_numbers)
+        assert all(c["hearing_date"] == "2026-09-23" for c in captured)
 
 
 class TestScPdfSplitHeaderHearingDate:
