@@ -19,7 +19,7 @@
     "db:migrate:create": "node-pg-migrate create --migration-file-language sql --no-timestamp"
   },
   "dependencies": {
-    "@apollo/server": "^4.10",
+    "@apollo/server": "^5.5.1",
     "@aws-sdk/client-s3": "^3.1039.0",
     "@aws-sdk/client-ses": "^3.1039.0",
     "@aws-sdk/credential-provider-node": "^3.972.0",
@@ -28,8 +28,8 @@
     "bcrypt": "^6.0.0",
     "dataloader": "^2.2.3",
     "fastify": "^5.8",
-    "google-auth-library": "^9.15.1",
-    "graphql": "^16.8",
+    "google-auth-library": "^10.9.1",
+    "graphql": "^16.14.2",
     "graphql-depth-limit": "^1.1.0",
     "graphql-query-complexity": "^1.1.0",
     "jsonwebtoken": "^9.0",
