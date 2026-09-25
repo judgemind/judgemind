@@ -466,6 +466,14 @@ def _is_test_entry(slug: str, case_number: str | None) -> bool:
     return False
 
 
+class _UnexpectedDetailPageError(Exception):
+    """A detail-page 200 that is not a ruling page (no PDF link, no ruling text)."""
+
+    def __init__(self, reason: str, *, body_prefix: str = "") -> None:
+        super().__init__(reason)
+        self.body_prefix = body_prefix
+
+
 # ---------------------------------------------------------------------------
 # Scraper class
 # ---------------------------------------------------------------------------
@@ -558,6 +566,21 @@ class CCTentativesPortalScraper(BaseScraper):
                     continue
 
                 rows = _parse_listing_table(listing_response.text)
+                if not rows and not _parse_judge_dropdown(listing_response.text):
+                    # A genuinely empty listing still renders the judge
+                    # dropdown. A 200 with neither rows nor the dropdown is
+                    # a block page or a layout change, not a quiet day (#4735).
+                    tally.blocked(
+                        "listing page is not a tentative-rulings listing "
+                        "(no results table, no judge dropdown)"
+                    )
+                    self._log.error(
+                        "cc_portal.unexpected_listing_page",
+                        judge_id=judge_id,
+                        judge_name=judge_name_dropdown,
+                        body_prefix=listing_response.text[:200],
+                    )
+                    continue
                 if not rows:
                     tally.ok()  # the listing loaded and is genuinely empty
                     self._log.info(
@@ -602,6 +625,14 @@ class CCTentativesPortalScraper(BaseScraper):
                         if doc is not None:
                             docs.append(doc)
                         tally.ok()
+                    except _UnexpectedDetailPageError as blocked_exc:
+                        tally.blocked(str(blocked_exc))
+                        self._log.error(
+                            "cc_portal.unexpected_detail_page",
+                            slug=slug,
+                            detail_url=detail_url,
+                            body_prefix=blocked_exc.body_prefix,
+                        )
                     except Exception as exc:
                         tally.failed(exc)
                         self._log.error(
@@ -644,7 +675,12 @@ class CCTentativesPortalScraper(BaseScraper):
             judge_name_dropdown: The judge's display name from the dropdown.
 
         Returns:
-            A populated CapturedDocument, or None if fetching fails.
+            A populated CapturedDocument, or None when the ruling is posted
+            inline with no PDF link.
+
+        Raises:
+            _UnexpectedDetailPageError: the page has neither a PDF link nor ruling
+                text, so it is not a ruling detail page (#4735).
         """
         detail_url = row["detail_url"]
         slug = row["slug"]
@@ -659,6 +695,17 @@ class CCTentativesPortalScraper(BaseScraper):
 
         pdf_url = detail.get("pdf_url")
         if not pdf_url:
+            if not detail.get("ruling_text"):
+                # Neither a PDF link nor ruling text: this is not a ruling
+                # detail page (block page, layout change). The caller
+                # records it as blocked, not as a successful fetch (#4735).
+                raise _UnexpectedDetailPageError(
+                    "detail page has no PDF link or ruling text",
+                    body_prefix=detail_html_text[:200],
+                )
+            # The portal posts some rulings inline with no PDF link. The
+            # page loaded as expected, but this scraper only captures
+            # PDF-backed rulings, so the inline ruling is skipped.
             self._log.warning("cc_portal.no_pdf_url", slug=slug, detail_url=detail_url)
             return None
 

@@ -5,7 +5,9 @@ Fixtures in tests/fixtures/cc_portal/:
   listing_devine.html    — /tentative-rulings?field_judge_target_id=238 (7 rows, 3 test entries)
   listing_reyes.html     — /tentative-rulings?field_judge_target_id=245 (L24-04564)
   listing_weil.html      — /tentative-rulings?field_judge_target_id=280 (MSN23-2201)
-  listing_empty.html     — empty table / no-results page
+  listing_empty.html     — no-results page (judge dropdown, no results table)
+  detail_c22-01746_no_pdf.html — live detail page whose ruling is posted inline
+                           with no PDF link (#4735)
   detail_l24-04564.html  — detail page for L24-04564 (current jcc-body__main-text
                            structure: ruling content under an <h2>Tentative Ruling</h2>
                            heading inside <div class="jcc-body__main-text">, plus a
@@ -1083,6 +1085,97 @@ def test_run_succeeds_when_one_listing_is_empty_and_another_fails() -> None:
     )
     respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
         return_value=httpx.Response(200, text=_load_html("listing_empty.html"))
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+# ---------------------------------------------------------------------------
+# Unexpected response pages are not successful fetches (#4735)
+# ---------------------------------------------------------------------------
+
+_BLOCK_PAGE = "<html><body><h1>Access denied</h1><p>Request blocked.</p></body></html>"
+
+
+def _mock_two_devine_listings() -> None:
+    listing_html = _load_html("listing_devine.html")
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=listing_html)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=listing_html)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+
+@respx.mock
+def test_run_fails_when_every_detail_page_has_no_pdf_url_or_ruling() -> None:
+    """A 200 detail page with neither a PDF link nor ruling text is a block
+    page or a layout change. When every detail page looks like that, the run
+    fails instead of recording success/0 (#4735)."""
+    _mock_two_devine_listings()
+    respx.get(url__regex=r"/tentative-ruling/").mock(
+        return_value=httpx.Response(200, text=_BLOCK_PAGE)
+    )
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "all 8 CC portal listing and ruling fetches were blocked" in message
+    assert "no PDF link or ruling text" in message
+
+
+@respx.mock
+def test_detail_page_with_inline_ruling_but_no_pdf_url_is_not_blocked() -> None:
+    """The live portal posts some rulings inline with no PDF link (e.g.
+    C22-01746, checked 2026-09-25). That page loaded as expected, so it is
+    not a blocked fetch and the run stays green (#4735)."""
+    _mock_two_devine_listings()
+    respx.get(url__regex=r"/tentative-ruling/").mock(
+        return_value=httpx.Response(200, text=_load_html("detail_c22-01746_no_pdf.html"))
+    )
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is True
+
+
+@respx.mock
+def test_run_fails_when_every_listing_is_not_a_listing_page() -> None:
+    """A 200 listing response with no results table and no judge dropdown is
+    not the tentative-rulings page (a genuinely empty listing still renders
+    the dropdown). When every listing looks like that, the run fails (#4735)."""
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=_BLOCK_PAGE)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=_BLOCK_PAGE)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert "all 2 CC portal listing and ruling fetches were blocked" in (health.error_message or "")
+    assert "not a tentative-rulings listing" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_succeeds_when_every_listing_is_genuinely_empty() -> None:
+    """Empty listings that still render the judge dropdown are a quiet day,
+    not an outage (#4735)."""
+    empty_listing = _load_html("listing_empty.html")
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=empty_listing)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=empty_listing)
     )
     respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
 

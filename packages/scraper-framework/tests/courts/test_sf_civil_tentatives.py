@@ -180,6 +180,12 @@ class TestParseApiResponse:
         rulings = parse_api_response('{"other": "data"}')
         assert rulings == []
 
+    @pytest.mark.parametrize("body", ["[1,2]", '"text"', "null", "7"])
+    def test_handles_non_dict_json(self, body: str) -> None:
+        """Valid JSON that is not an object returns [] instead of raising
+        AttributeError on ``data.get`` (#4735)."""
+        assert parse_api_response(body) == []
+
     def test_second_ruling_case_number(self) -> None:
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
         rulings = parse_api_response(json_text)
@@ -754,7 +760,8 @@ class TestSFCivilScraperRun:
 
     @respx.mock
     def test_handles_non_json_response(self) -> None:
-        """Non-JSON response should be handled gracefully (no crash)."""
+        """A non-JSON 200 body (Cloudflare interstitial, ASP error page) on
+        every RulingID is an outage, not a quiet day: the run fails (#4735)."""
         respx.get(url__startswith=CIVIL_REST_BASE).mock(
             return_value=httpx.Response(200, text="<html>Not JSON</html>"),
         )
@@ -767,8 +774,56 @@ class TestSFCivilScraperRun:
         )
 
         health = scraper.run()
-        assert health.success is True
+        assert health.success is False
         assert health.records_captured == 0
+        assert "were blocked" in (health.error_message or "")
+        assert "unexpected response" in (health.error_message or "")
+
+    @pytest.mark.parametrize(
+        "body",
+        ["[1,2]", '"just a string"', "42", "null", '{"error": "denied"}', '{"result": "x"}'],
+    )
+    @respx.mock
+    def test_non_dict_or_wrong_shape_json_does_not_raise(self, body: str) -> None:
+        """Valid JSON of the wrong shape must not raise out of the loop
+        (a list body used to hit ``data.get`` -> AttributeError). Every
+        RulingID returning it fails the run as blocked (#4735)."""
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text=body),
+        )
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        with pytest.raises(ScraperPreconditionFailure, match="were blocked.*unexpected response"):
+            scraper.fetch_documents()
+
+    @respx.mock
+    def test_wrong_shape_json_on_one_ruling_id_keeps_other_docs(self) -> None:
+        """A list body on one RulingID is skipped; rulings already captured
+        for other RulingIDs are kept (#4735)."""
+        good = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        calls = 0
+
+        def side_effect(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return httpx.Response(200, text="[1,2]")
+            if calls == 1:
+                return httpx.Response(200, text=good)
+            return httpx.Response(200, text='{"result": [0, ""]}')
+
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(side_effect=side_effect)
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        docs = scraper.fetch_documents()
+        assert len(docs) > 0
+        assert calls > 2
 
     @respx.mock
     def test_handles_session_expiry(self) -> None:
