@@ -11,9 +11,9 @@
 # stateReason}}` from $SIBLING_STATES_JSON. Emits one of:
 #
 #   companion-closed:<N>     — at least one cited #N is `closed` AND
-#                              `stateReason == COMPLETED` AND appears in
-#                              a sentence/paragraph that uses companion
-#                              framing ("when #N", "after #N", "until
+#                              `stateReason == COMPLETED` AND is framed
+#                              by an adjacent companion keyword
+#                              ("when #N", "after #N", "until
 #                              #N", "once #N", "removed when #N",
 #                              "blocked on #N", "blocked by #N",
 #                              "depends on #N"). The first such match
@@ -29,15 +29,15 @@
 # Output: one line to stdout, exit 0 on success. Exit 1 on malformed
 # input.
 #
-# Why per-paragraph scoping (not whole-body): bare hashtags like
-# "see #4408 for context" or "Closes #4408" are not companion framing;
-# they're informational links. Scoping to the same paragraph as the
-# framing keyword AND a closed-completed sibling avoids those false
-# positives. A paragraph here is a blank-line-delimited chunk of the
-# body. Sentences inside the paragraph are scanned together — a
-# typical sentence ("This is a temporary caveat that should be
-# removed when the structural fix in #4408 lands.") fits in one
-# paragraph, so paragraph scoping is sufficient.
+# Why keyword-adjacent scoping (not whole-body or whole-paragraph): bare
+# hashtags like "see #4408 for context" or "Closes #4408" are not
+# companion framing; they're informational links. Incident narratives
+# ("This happened during #4661 verification. Right after the deploy,
+# ...") put a framing word in the same paragraph without it framing the
+# cite — paragraph scoping false-fired on exactly that (#4685). So a
+# keyword only frames a `#N` when it precedes the cite in the same
+# clause with at most MAX_GAP_WORDS words between them ("removed when
+# the structural fix in #4408 lands"). See `_companion_framed_cites`.
 
 from __future__ import annotations
 
@@ -99,9 +99,48 @@ def _cites_in_chunk(chunk: str) -> list[str]:
     return [m.group(1) for m in HASHTAG_REGEX.finditer(chunk)]
 
 
+# Adjacency rule (#4685): a keyword frames a `#N` only when it comes
+# BEFORE the cite, in the same clause, with at most MAX_GAP_WORDS words
+# between them. "removed when the structural fix in #4408 lands" has 4
+# words in the gap ("the structural fix in"); the #4665 incident
+# narrative ("during #4661 verification ... Right after the deploy")
+# puts the keyword after the cite, in another sentence, so it doesn't
+# count. When unsure, report "not framed" — a false negative only costs
+# a normal /task run, a false positive sends /task down verify-and-close.
+MAX_GAP_WORDS = 5
+
+# Anything in the keyword→cite gap that ends the clause: sentence/clause
+# punctuation, parentheses/brackets, or a line break that starts a new
+# markdown list item. A bare newline (hard-wrapped prose) is allowed.
+_GAP_BREAK_REGEX = re.compile(r"[,;.!?()\[\]]|\n\s*(?:[-*+]|\d+[.)])\s")
+
+
+def _companion_framed_cites(chunk: str) -> list[str]:
+    """Return the `#N` cites in the chunk that a companion keyword frames.
+
+    Cites are returned in document order, without duplicates.
+    """
+    keyword_ends = [m.end() for m in COMPANION_KEYWORD_REGEX.finditer(chunk)]
+    out: list[str] = []
+    for cite in HASHTAG_REGEX.finditer(chunk):
+        num = cite.group(1)
+        if num in out:
+            continue
+        for kw_end in keyword_ends:
+            if kw_end > cite.start():
+                break
+            gap = chunk[kw_end : cite.start()]
+            if _GAP_BREAK_REGEX.search(gap):
+                continue
+            if len(gap.split()) <= MAX_GAP_WORDS:
+                out.append(num)
+                break
+    return out
+
+
 def _has_companion_framing(chunk: str) -> bool:
-    """Return True if the chunk contains any companion-framing keyword."""
-    return COMPANION_KEYWORD_REGEX.search(chunk) is not None
+    """Return True if any `#N` in the chunk is framed by an adjacent keyword."""
+    return bool(_companion_framed_cites(chunk))
 
 
 def _is_closed_completed(state_info: object) -> bool:
@@ -148,9 +187,7 @@ def main() -> int:
         if not cites:
             continue
         all_cites.update(cites)
-        if not _has_companion_framing(chunk):
-            continue
-        for cite in cites:
+        for cite in _companion_framed_cites(chunk):
             if cite not in seen_companion:
                 seen_companion.add(cite)
                 companion_framed_cites_ordered.append(cite)

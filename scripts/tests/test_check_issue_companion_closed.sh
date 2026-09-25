@@ -231,6 +231,27 @@ else
     fail "AC #4: bare hashtag without framing → exit 1 with clear:no-companion" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
 fi
 
+# #4685 regression: incident-narrative cite (#4665 body shape). The word
+# "after" sits in the SAME paragraph as #4661 but in a different sentence
+# and after the cite — not companion framing. Must not fire.
+mkdir -p "$TEST_DIR/states_4665"
+cat > "$TEST_DIR/body_4665.txt" <<'BODY4665'
+## Problem
+
+This happened during #4661 verification on 2026-09-24/25. Right after the Deploy Scraper rollout, the new ingestion-worker task hung on startup.
+BODY4665
+echo '{"state":"closed","stateReason":"COMPLETED"}' > "$TEST_DIR/states_4665/4661.json"
+
+write_mock_gh "$TEST_DIR/body_4665.txt" "$TEST_DIR/states_4665"
+exit_code=0
+err="$TEST_DIR/r4665.err"
+output=$("$WRAPPER" 4665 2>"$err") || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"clear:"* && "$output" == *"no-companion"* ]]; then
+    pass "#4685 regression: #4665 incident-narrative cite → exit 1 with clear:no-companion"
+else
+    fail "#4685 regression: #4665 incident-narrative cite → exit 1 with clear:no-companion" "exit=$exit_code output='$output' stderr=$(tail -n 50 "$err" 2>/dev/null)"
+fi
+
 # Empty body → exit 1 with no-references
 mkdir -p "$TEST_DIR/states_empty"
 echo "" > "$TEST_DIR/body_empty.txt"

@@ -354,6 +354,83 @@ def test_main_picks_first_in_document_order(probe_module):
     assert stdout == "companion-closed:9999"
 
 
+# ─── #4685: keyword must be adjacent to the #N it frames ─────────────────
+
+
+# The #4665 body that false-fired: "after" is in the same paragraph as
+# #4661 but in a later sentence, framing the deploy — not the cite.
+BODY_4665 = (
+    "## Problem\n\n"
+    "This happened during #4661 verification on 2026-09-24/25. Right after "
+    "the Deploy Scraper rollout, the new ingestion-worker task hung on "
+    "startup.\n"
+)
+
+
+def test_main_4665_incident_narrative_does_not_fire(probe_module):
+    """#4685 regression: incident narrative cite is not companion framing."""
+    exit_code, stdout = _run_main(
+        probe_module,
+        BODY_4665,
+        {"4661": {"state": "closed", "stateReason": "COMPLETED"}},
+    )
+    assert exit_code == 0
+    assert stdout == "clear:no-companion"
+
+
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        # keyword after the cite
+        "This happened during #4661 verification. Right after the deploy.",
+        "Seen in #4661 after the deploy finished.",
+        # keyword before the cite but across a clause/sentence break
+        "After the deploy, #4661 regressed.",
+        "Fixed once. See #4661 for the history.",
+        "Blocked on infra (see #4661).",
+        "Blocked on this; #4661 is unrelated.",
+        # keyword before the cite but too far away
+        "When the deploy finished the new worker task hung during #4661 verification.",
+        # list items are separate clauses even without punctuation
+        "- wait until the deploy\n- #4661 regressed",
+    ],
+)
+def test_framing_requires_adjacent_keyword(probe_module, chunk):
+    """Keywords not immediately framing the cite do not count."""
+    assert probe_module._companion_framed_cites(chunk) == []
+    assert not probe_module._has_companion_framing(chunk)
+
+
+@pytest.mark.parametrize(
+    ("chunk", "expected"),
+    [
+        ("should be removed when the structural fix in #4408 lands", ["4408"]),
+        ("revert after PR #4408 merges", ["4408"]),
+        ("hard-wrapped: removed when the\nstructural fix in #4408 lands", ["4408"]),
+        ("Blocked by #1, and see #2 for context.", ["1"]),
+        ("see #2 for context; this depends on #1", ["1"]),
+    ],
+)
+def test_companion_framed_cites_adjacent(probe_module, chunk, expected):
+    """Only the cite(s) the keyword directly frames are returned."""
+    assert probe_module._companion_framed_cites(chunk) == expected
+
+
+def test_main_other_cite_in_framed_paragraph_does_not_fire(probe_module):
+    """A closed cite sharing a paragraph with framing for an OPEN cite doesn't fire."""
+    body = "Blocked on #100. Found during #200 verification.\n"
+    exit_code, stdout = _run_main(
+        probe_module,
+        body,
+        {
+            "100": {"state": "open", "stateReason": None},
+            "200": {"state": "closed", "stateReason": "COMPLETED"},
+        },
+    )
+    assert exit_code == 0
+    assert stdout == "clear:no-closed-completed"
+
+
 # Malformed SIBLING_STATES_JSON → exit 1
 def test_main_malformed_env_var(probe_module):
     """Malformed JSON in SIBLING_STATES_JSON returns exit 1."""

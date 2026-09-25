@@ -403,7 +403,7 @@ Exit codes:
 - **Exit 0 (`companion-closed:<N>` line on stdout) — the body cites a closed-completed companion in companion-framed context.** Do NOT proceed to Step 4b / A.1 / ralph. Pivot to the verify-and-close decision below.
 - **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, malformed JSON).** Fail-open: continue to Step 4b.
 
-**False-positive guard:** the check only fires when the cited sibling is `state == closed` AND `stateReason == COMPLETED`. A still-open sibling, or a closed-as-not-planned sibling (operator decided the work isn't needed), leaves the issue alone — the structural fix isn't coming, so the dependent issue's temporary-caveat work might still be needed. Bare cites without companion-framing keywords (`see #N for context`, `Closes #N`, `Parent: #N`) do not fire either — those are informational links, not obsoletion signals.
+**False-positive guard:** the check only fires when the cited sibling is `state == closed` AND `stateReason == COMPLETED`. A still-open sibling, or a closed-as-not-planned sibling (operator decided the work isn't needed), leaves the issue alone — the structural fix isn't coming, so the dependent issue's temporary-caveat work might still be needed. Bare cites without companion-framing keywords (`see #N for context`, `Closes #N`, `Parent: #N`) do not fire either — those are informational links, not obsoletion signals. The keyword must also be adjacent to the cite it frames (preceding it in the same clause, within a few words — "removed when the structural fix in #N lands"), so incident narratives like "This happened during #N verification. Right after the deploy, ..." do not fire (#4685).
 
 ##### 4a.4.1 — Verify-and-close pivot (only runs on exit 0)
 
