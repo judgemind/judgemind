@@ -156,8 +156,7 @@ def test_warning_format() -> None:
             f"got: {result.stdout!r}"
         )
         assert result.stdout.strip().endswith(f"Run: cd {real_tmp}"), (
-            f"Expected warning to end with 'Run: cd {real_tmp}', "
-            f"got: {result.stdout!r}"
+            f"Expected warning to end with 'Run: cd {real_tmp}', got: {result.stdout!r}"
         )
 
 
@@ -201,9 +200,14 @@ run_test("Drift detected — agent worktree", test_drift_detected_agent_worktree
 run_test("Drift detected — worker worktree", test_drift_detected_worker_worktree)
 run_test("Drift detected — subdirectory in worktree", test_drift_detected_subdirectory)
 run_test("Always exits zero", test_always_exits_zero)
-run_test("No drift — .claude/ without worktrees/", test_no_drift_claude_dir_without_worktrees)
+run_test(
+    "No drift — .claude/ without worktrees/", test_no_drift_claude_dir_without_worktrees
+)
 run_test("Warning format is correct", test_warning_format)
-run_test("No false positive — worktrees in other path", test_no_false_positive_worktrees_in_name)
+run_test(
+    "No false positive — worktrees in other path",
+    test_no_false_positive_worktrees_in_name,
+)
 run_test("Performance — under 100ms", test_performance)
 
 print(f"\n{'=' * 50}")

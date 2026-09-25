@@ -52,6 +52,7 @@ on:
       - "scripts/preflight.sh"
       - "scripts/preflight-bash-fargate.sh"
       - ".claude/hooks/preflight_cross_worktree.py"
+      - ".claude/hooks/preflight_shared_checks.sh"
       - ".github/workflows/deploy-agent-runner.yml"
   workflow_dispatch:
     inputs:

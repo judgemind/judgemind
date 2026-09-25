@@ -80,7 +80,9 @@ def test_whitespace_only_inbox_truncated() -> None:
         assert result.returncode == 0, f"Expected exit 0, got {result.returncode}"
         assert result.stdout == "", f"Expected no output, got: {result.stdout!r}"
         # File should be truncated to avoid repeated Python invocations
-        assert os.path.getsize(inbox) == 0, "Expected whitespace-only inbox to be truncated"
+        assert os.path.getsize(inbox) == 0, (
+            "Expected whitespace-only inbox to be truncated"
+        )
 
 
 def test_empty_json_array() -> None:
@@ -182,7 +184,9 @@ print("=" * 50)
 
 run_test("No inbox file — no output, exit 0", test_no_inbox_file)
 run_test("Empty inbox file — no output, exit 0", test_empty_inbox_file)
-run_test("Whitespace-only inbox — truncated, no output", test_whitespace_only_inbox_truncated)
+run_test(
+    "Whitespace-only inbox — truncated, no output", test_whitespace_only_inbox_truncated
+)
 run_test("Empty JSON array — no output, truncates", test_empty_json_array)
 run_test("Echoes messages with [dispatcher] prefix", test_echoes_messages)
 run_test("Truncates inbox after reading", test_truncates_after_reading)

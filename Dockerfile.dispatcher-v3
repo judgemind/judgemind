@@ -219,6 +219,9 @@ WORKDIR /app
 #      the narrowed Fargate hook for in-container subagents (#2982).
 #   4. `.claude/hooks/preflight_cross_worktree.py` — helper invoked by
 #      the Fargate hook's cross-worktree-write check.
+#   5. `.claude/hooks/preflight_shared_checks.sh` — the safety checks
+#      both preflight hooks source (#4703). The Fargate hook fails
+#      closed without it.
 #
 # We deliberately do NOT COPY the whole `scripts/` directory — most of
 # those scripts are operator-laptop helpers that don't need to ship in
@@ -235,6 +238,7 @@ COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
 COPY scripts/preflight.sh /app/scripts/preflight.sh
 COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
 COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+COPY .claude/hooks/preflight_shared_checks.sh /app/fargate-hooks/preflight_shared_checks.sh
 RUN chmod +x /app/scripts/check-issue-author.sh \
     && chmod +x /app/fargate-hooks/preflight-bash.sh \
     && chown -R dispatcher:dispatcher /app

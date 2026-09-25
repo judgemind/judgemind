@@ -61,7 +61,9 @@ def run_test(
         print(f"  PASS: {description}")
         passed += 1
     else:
-        print(f"  FAIL: {description} (expected exit={expect_exit}, got exit={result.returncode})")
+        print(
+            f"  FAIL: {description} (expected exit={expect_exit}, got exit={result.returncode})"
+        )
         if result.stderr:
             print(f"        stderr: {result.stderr.strip()}")
         failed += 1
@@ -71,7 +73,9 @@ def run_test(
 print("Check 0: Push to main/master")
 run_test("git push origin main blocked", "git push origin main", 2)
 run_test("git push -u origin main blocked", "git push -u origin main", 2)
-run_test("git push origin feature-branch allowed", "git push -u origin feature-branch", 0)
+run_test(
+    "git push origin feature-branch allowed", "git push -u origin feature-branch", 0
+)
 run_test("git add pre-push file allowed", "git add .githooks/pre-push", 0)
 
 # --- Check 1: $() command substitution ---
@@ -510,7 +514,8 @@ run_test(
     "git worktree add blocked inside nested worktree",
     "git worktree add ../agent-new-worktree new-branch",
     2,
-    cwd_override=SYNTHETIC_MAIN_REPO + "/.claude/worktrees/agent-abc123/.claude/worktrees/agent-def456",
+    cwd_override=SYNTHETIC_MAIN_REPO
+    + "/.claude/worktrees/agent-abc123/.claude/worktrees/agent-def456",
 )
 
 # Commands that SHOULD be allowed — git worktree add from main repo
@@ -966,7 +971,7 @@ run_test(
 )
 
 # --- Summary ---
-print(f"\n{'='*50}")
+print(f"\n{'=' * 50}")
 print(f"Results: {passed} passed, {failed} failed")
 if failed > 0:
     sys.exit(1)

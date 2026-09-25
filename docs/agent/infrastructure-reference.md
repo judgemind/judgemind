@@ -192,13 +192,14 @@ Skill files are read from the daemon's baseline clone at worktree-creation time 
 
 **Why `.claude/skills/**` is absent from the deploy trigger:**
 
-`.github/workflows/deploy-agent-runner.yml` has an explicit `paths:` filter. It deliberately **excludes** `.claude/skills/**` because skill files are not `COPY`'d into the image. Inspecting `Dockerfile.dispatcher-agent-runner` (the COPY block at lines 147–151) confirms only these paths land in the image:
+`.github/workflows/deploy-agent-runner.yml` has an explicit `paths:` filter. It deliberately **excludes** `.claude/skills/**` because skill files are not `COPY`'d into the image. Inspecting `Dockerfile.dispatcher-agent-runner` (the COPY block at lines 149–154) confirms only these paths land in the image:
 
 - `scripts/dispatcher/`
 - `scripts/check-issue-author.sh`
 - `scripts/preflight.sh`
 - `scripts/preflight-bash-fargate.sh`
 - `.claude/hooks/preflight_cross_worktree.py`
+- `.claude/hooks/preflight_shared_checks.sh` (the safety checks both preflight hooks source, #4703)
 
 **What DOES trigger an image rebuild:**
 

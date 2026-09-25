@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # agent_runner_install_fargate_hook.sh — Sourceable helper that swaps
 # the Fargate-narrowed preflight hook over the worktree's tracked
-# `.claude/hooks/preflight-bash.sh` and `.claude/hooks/preflight_cross_worktree.py`.
+# `.claude/hooks/preflight-bash.sh`, `.claude/hooks/preflight_cross_worktree.py`
+# and `.claude/hooks/preflight_shared_checks.sh`.
 #
 # Mirrors `daemon.py::_install_fargate_preflight_hook` (lines ~6224-6349)
 # verbatim — the daemon-side worktrees (subprocess execution mode) get
@@ -16,7 +17,8 @@
 # Contract — env vars read by `install_fargate_preflight_hook`:
 #
 #   DISPATCHER_FARGATE_HOOKS_DIR  — directory containing the staged
-#                                   `preflight-bash.sh` + `preflight_cross_worktree.py`.
+#                                   `preflight-bash.sh`, `preflight_cross_worktree.py`
+#                                   and `preflight_shared_checks.sh` (#4703).
 #                                   Set by `Dockerfile.dispatcher-agent-runner` to
 #                                   `/app/fargate-hooks`. Unset on operator
 #                                   laptops → swap is a no-op + warning.
@@ -84,22 +86,25 @@ install_fargate_preflight_hook() {
         return 0
     fi
 
-    local source_hook="$stage_dir/preflight-bash.sh"
-    local source_helper="$stage_dir/preflight_cross_worktree.py"
-
-    if [[ ! -f "$source_hook" || ! -f "$source_helper" ]]; then
-        # Stage dir set but files missing — rogue local image or test
-        # harness mistake. Don't fail; the operator-laptop hook is a
-        # safe fallback.
-        log "fargate_hook_skip" \
-            "reason=stage_files_missing" \
-            "stage_dir=$stage_dir"
-        return 0
-    fi
+    # Three staged files: the hook, the cross-worktree helper, and the
+    # safety checks both hooks source (#4703). Order matters: the hook is
+    # LAST, so a partial copy never leaves the Fargate hook in place
+    # without its library — until it lands, the operator-local hook stays
+    # active and still finds a library next to it.
+    local f
+    for f in preflight_cross_worktree.py preflight_shared_checks.sh preflight-bash.sh; do
+        if [[ ! -f "$stage_dir/$f" ]]; then
+            # Stage dir set but files missing — rogue local image or test
+            # harness mistake. Don't fail; the operator-laptop hook is a
+            # safe fallback.
+            log "fargate_hook_skip" \
+                "reason=stage_files_missing" \
+                "stage_dir=$stage_dir"
+            return 0
+        fi
+    done
 
     local hooks_dir="$repo_root/.claude/hooks"
-    local target_hook="$hooks_dir/preflight-bash.sh"
-    local target_helper="$hooks_dir/preflight_cross_worktree.py"
 
     # `git checkout -B "$BRANCH_NAME" origin/main` recreates the tracked
     # `.claude/hooks/` tree so the targets normally exist. Defensive
@@ -107,21 +112,17 @@ install_fargate_preflight_hook() {
     # slower.
     mkdir -p "$hooks_dir"
 
-    # Copy the hook + helper from the stage dir over the tracked
-    # files. `cp -p` preserves mode; we also force +x as a belt-and-
-    # braces measure (the Dockerfile already chmods +x the source).
-    if ! cp -p "$source_hook" "$target_hook" 2>/dev/null; then
-        log "fargate_hook_copy_failed" \
-            "path=$target_hook"
-        return 0
-    fi
-    chmod +x "$target_hook" 2>/dev/null || true
-
-    if ! cp -p "$source_helper" "$target_helper" 2>/dev/null; then
-        log "fargate_hook_copy_failed" \
-            "path=$target_helper"
-        return 0
-    fi
+    # Copy the staged files over the tracked ones. `cp -p` preserves
+    # mode; we also force +x on the hook as a belt-and-braces measure
+    # (the Dockerfile already chmods +x the source).
+    for f in preflight_cross_worktree.py preflight_shared_checks.sh preflight-bash.sh; do
+        if ! cp -p "$stage_dir/$f" "$hooks_dir/$f" 2>/dev/null; then
+            log "fargate_hook_copy_failed" \
+                "path=$hooks_dir/$f"
+            return 0
+        fi
+    done
+    chmod +x "$hooks_dir/preflight-bash.sh" 2>/dev/null || true
 
     # `git update-index --skip-worktree` tells git to pretend the file
     # is unchanged. Without this, the diff would show up in every ralph
@@ -130,17 +131,13 @@ install_fargate_preflight_hook() {
     # potentially replace the operator-local hook on merge).
     # Best-effort: failure means status/diff carries the swap as a noise
     # change but the hook is still swapped. Mirrors daemon.py.
-    if ! git -C "$repo_root" update-index --skip-worktree \
-            .claude/hooks/preflight-bash.sh >/dev/null 2>&1; then
-        log "fargate_hook_skip_worktree_failed" \
-            "path=.claude/hooks/preflight-bash.sh"
-    fi
-
-    if ! git -C "$repo_root" update-index --skip-worktree \
-            .claude/hooks/preflight_cross_worktree.py >/dev/null 2>&1; then
-        log "fargate_hook_skip_worktree_failed" \
-            "path=.claude/hooks/preflight_cross_worktree.py"
-    fi
+    for f in preflight-bash.sh preflight_cross_worktree.py preflight_shared_checks.sh; do
+        if ! git -C "$repo_root" update-index --skip-worktree \
+                ".claude/hooks/$f" >/dev/null 2>&1; then
+            log "fargate_hook_skip_worktree_failed" \
+                "path=.claude/hooks/$f"
+        fi
+    done
 
     log "fargate_hook_installed" \
         "stage_dir=$stage_dir" \

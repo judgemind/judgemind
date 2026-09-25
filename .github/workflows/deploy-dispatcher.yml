@@ -55,6 +55,12 @@ on:
       # own (future) build workflow.
       - "!scripts/dispatcher/agent-runner-entrypoint.sh"
       - "scripts/check-issue-author.sh"
+      # The Fargate preflight hook files Dockerfile.dispatcher stages in
+      # /app/fargate-hooks/ (#2982, #4703). Without these, a fix to the
+      # shared safety checks would not reach the daemon image.
+      - "scripts/preflight-bash-fargate.sh"
+      - ".claude/hooks/preflight_cross_worktree.py"
+      - ".claude/hooks/preflight_shared_checks.sh"
       - ".github/workflows/deploy-dispatcher.yml"
       # scripts/wait-for-rollout.sh is invoked by the deploy-to-dev job
       # below. Changes to the shared script must trigger this deploy so

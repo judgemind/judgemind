@@ -172,9 +172,11 @@ def main() -> int:
     for verb, dest in destinations:
         if _is_blocked(dest, repo_root, worktree_root):
             normalized = os.path.normpath(dest)
-            rel = normalized[len(repo_root) + 1 :] if normalized.startswith(
-                repo_root + "/"
-            ) else normalized
+            rel = (
+                normalized[len(repo_root) + 1 :]
+                if normalized.startswith(repo_root + "/")
+                else normalized
+            )
             suggested = os.path.join(worktree_root, rel)
             print(
                 f"BLOCKED: Bash command writes to {normalized} via '{verb}', "

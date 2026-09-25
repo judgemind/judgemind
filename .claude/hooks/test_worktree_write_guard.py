@@ -324,9 +324,7 @@ def test_performance() -> None:
         )
     elapsed = time.monotonic() - start
     avg_ms = (elapsed / iterations) * 1000
-    assert avg_ms < 200, (
-        f"Average execution time {avg_ms:.1f}ms exceeds 200ms limit"
-    )
+    assert avg_ms < 200, f"Average execution time {avg_ms:.1f}ms exceeds 200ms limit"
 
 
 try:

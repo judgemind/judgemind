@@ -7,8 +7,24 @@
 # §Unattended Operation Patterns.
 #
 # Exit 0 = allow, exit 2 = block with message on stderr.
+#
+# Checks 0, 10, 11 and 12 are safety rules shared with the Fargate hook
+# (scripts/preflight-bash-fargate.sh). They live in ONE place,
+# preflight_shared_checks.sh next to this file, and are only *called* from
+# here (#4703). Edit them there, not here. The other checks are
+# operator-laptop-only — see docs/agent/interactive-shell-rules.md.
 
 set -uo pipefail
+
+# Load the shared safety checks. Fail closed: without them the push-to-main,
+# worktree, cross-worktree-write and stash rules would silently vanish.
+PREFLIGHT_SHARED_LIB="$(dirname "$0")/preflight_shared_checks.sh"
+if [ ! -f "$PREFLIGHT_SHARED_LIB" ]; then
+    echo "BLOCKED: preflight hook library missing: $PREFLIGHT_SHARED_LIB. The shared safety checks cannot run, so every Bash command is blocked. Restore .claude/hooks/preflight_shared_checks.sh (git checkout -- .claude/hooks/). See #4703." >&2
+    exit 2
+fi
+# shellcheck source=./preflight_shared_checks.sh
+source "$PREFLIGHT_SHARED_LIB"
 
 # Read the JSON input from stdin
 INPUT=$(cat)
@@ -44,28 +60,8 @@ STRIPPED_COMMAND=$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
-# 0. Push to main/master — block during task work.
-#    Catches: git push origin main, git push -u origin main, git -C /path push origin main
-#    The regex requires "push" as a git subcommand (after git or git -C <path>),
-#    not just anywhere in the command. This avoids false positives on commands like
-#    "git add .githooks/pre-push" where "push" appears in a filename.
-if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+push\b' ; then
-    # Extract what looks like the branch being pushed (last word, or after "origin")
-    if echo "$COMMAND" | grep -qE '\bpush\b.*\b(main|master)\b' ; then
-        echo "BLOCKED: Pushing directly to main/master is not allowed during task work. Push to a feature branch and open a PR. See CLAUDE.md §Git Workflow." >&2
-        exit 2
-    fi
-    # Also catch bare "git push" when on main (check current branch)
-    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
-    if [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
-        # Only block if the push target looks like it includes the current branch
-        # A bare "git push" while on main pushes to main
-        if ! echo "$COMMAND" | grep -qE '\bpush\b.*\b[a-z]+-' ; then
-            echo "BLOCKED: You are on '$current_branch' and running git push. Push to a feature branch instead. See CLAUDE.md §Git Workflow." >&2
-            exit 2
-        fi
-    fi
-fi
+# 0. Push to main/master — shared check (preflight_shared_checks.sh).
+preflight_check_push_to_main || exit $?
 
 # 1. Dollar-paren command substitution: $( ... )
 if echo "$COMMAND" | grep -qE '\$\(' ; then
@@ -228,124 +224,14 @@ if [ "$RUN_IN_BG" = "true" ]; then
     fi
 fi
 
-# 10. git worktree add inside an existing worktree.
-#     Subagents must work in their assigned worktree only. Creating child worktrees
-#     causes orphaned worktrees that cleanup_worktree.sh cannot track and the
-#     dispatcher does not know about. If the worktree is in a bad state, the agent
-#     should fix it (git checkout -- ., git clean -fd) instead of creating a new one.
-#     Detection: command is "git worktree add" AND cwd contains ".claude/worktrees/".
-if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+worktree\s+add\b' ; then
-    if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
-        echo "BLOCKED: git worktree add is not allowed inside an existing worktree. Subagents must work in their assigned worktree only. If your worktree is in a bad state, fix it with 'git checkout -- .' or 'git clean -fd'. See CLAUDE.md §Critical Rules." >&2
-        exit 2
-    fi
-fi
-
-# 11. Cross-worktree writes via Bash (cp/mv/tar/redirection).
-#     Extends worktree-write-guard.sh (which covers Edit/Write) to the Bash tool.
-#     When a worktree subagent runs a command that writes into the main repo
-#     checkout but outside its own worktree, block — that bypasses the PR
-#     workflow the same way Edit/Write would. See issue #2455.
-#
-#     Detection (only active when cwd is inside .claude/worktrees/<id>/):
-#       - cp / mv: any positional argument that is an absolute path inside
-#         $REPO_ROOT/ (conservative — cp/mv both have a destination as the
-#         last arg, but checking all absolute-path args catches unusual shapes).
-#       - tar with -C <dir> or --directory=<dir>: <dir> is the destination.
-#       - Shell redirection > <path> / >> <path>: <path> is the destination.
-#
-#     Only absolute paths are checked. Relative paths resolve against CWD
-#     (the worktree), so they can't escape into the main repo.
-#
-#     Allowed absolute destinations:
-#       - inside $WORKTREE_ROOT/
-#       - inside $REPO_ROOT/tmp/ (cross-worktree status files, etc.)
-#       - outside $REPO_ROOT/ entirely (e.g. /tmp, /var, /Users/x/other-repo)
-#
-#     Blocked: inside $REPO_ROOT/ but outside the above allowlists.
-#
-#     Delegates command parsing to preflight_cross_worktree.py for
-#     maintainability — the parsing is non-trivial and easier to test in
-#     isolation.
-case "$EFFECTIVE_CWD" in
-    */.claude/worktrees/*)
-        CROSS_WT_REPO_ROOT="${EFFECTIVE_CWD%%/.claude/worktrees/*}"
-        CROSS_WT_REST="${EFFECTIVE_CWD#"$CROSS_WT_REPO_ROOT"/.claude/worktrees/}"
-        CROSS_WT_ID="${CROSS_WT_REST%%/*}"
-        CROSS_WT_ROOT="$CROSS_WT_REPO_ROOT/.claude/worktrees/$CROSS_WT_ID"
-        HOOK_DIR="$(dirname "$0")"
-        CROSS_WT_MSG=$(
-            COMMAND="$COMMAND" \
-            REPO_ROOT="$CROSS_WT_REPO_ROOT" \
-            WORKTREE_ROOT="$CROSS_WT_ROOT" \
-            python3 "$HOOK_DIR/preflight_cross_worktree.py" 2>/dev/null
-        )
-        if [ -n "$CROSS_WT_MSG" ]; then
-            echo "$CROSS_WT_MSG" >&2
-            exit 2
-        fi
-        ;;
-esac
-
-# 12. Bare `git stash pop` / `git stash apply` — cross-worktree stash pollution.
-#     `git stash` is a per-clone global stack, not per-worktree. All worktrees
-#     share $GIT_DIR/refs/stash, so a `git stash pop` in one worktree can
-#     silently apply a stash created by another worktree (or by a long-gone
-#     agent). This causes two failure modes:
-#       (a) the current worktree's edits vanish (replaced by the other stash);
-#       (b) another agent's uncommitted WIP lands in this worktree and can be
-#           staged into the next commit via `git add -A` or similar.
-#
-#     Both were observed during #2746 (see #2749). The fix is to require an
-#     explicit reference so the agent has demonstrably identified which stash
-#     it wants to apply.
-#
-#     Detection:
-#       - Command (outside quoted strings) contains `git stash pop` or `git
-#         stash apply` — including `git -C <path> stash pop|apply`.
-#       - Each such invocation (its args up to the next `;`, `&`, `|`, `)` or
-#         newline) is checked independently. It is allowed only if one of
-#         its positional args is an explicit ref: `stash@{<digits>}`, or a
-#         full/abbreviated commit SHA (7-40 hex chars) — e.g. the SHA
-#         captured via `git stash list --format='%H %gs'` (#4683).
-#       - Flags (`--index`, `--quiet`) are not refs. A ref belonging to a
-#         different subcommand in the same command line (e.g.
-#         `git stash pop; git stash drop stash@{0}`) does not excuse the bare
-#         pop.
-#       - Allow `git stash show`, `git stash list`, `git stash push`, `git
-#         stash drop` — these are not the affected verbs.
-#
-#     Uses $STRIPPED_COMMAND (quoted substrings removed) so that the string
-#     "git stash pop" appearing inside a quoted argument — e.g. a PR title
-#     like `gh pr create --title "block git stash pop"` — does not falsely
-#     trigger the check. Same approach as checks 4 and 5.
-#
-#     Safer alternatives (see CLAUDE.md and docs/agent/unattended-patterns.md):
-#       1. Use `git stash list` to confirm stash@{0}'s subject matches the
-#          current branch, then `git stash pop stash@{0}` with the explicit ref
-#          — or `git stash apply <sha>` with the stash commit's SHA.
-#       2. Prefer a throwaway commit over stash: `git commit -am "WIP" && ...
-#          && git reset --soft HEAD~1`. No shared global state.
-STASH_APPLY_RE='\bgit\b(\s+-C\s+\S+)?\s+stash\s+(pop|apply)\b'
-if echo "$STRIPPED_COMMAND" | grep -qE "$STASH_APPLY_RE" ; then
-    STASH_BARE=0
-    while IFS= read -r stash_invocation; do
-        stash_has_ref=0
-        # Drop everything through the pop/apply verb, then walk the args.
-        while IFS= read -r stash_arg; do
-            if printf '%s' "$stash_arg" | grep -qE '^(stash@\{[0-9]+\}|[0-9a-fA-F]{7,40})$' ; then
-                stash_has_ref=1
-            fi
-        done < <(printf '%s\n' "$stash_invocation" | sed -E 's/^.*[[:space:]]stash[[:space:]]+(pop|apply)//' | tr -s ' \t' '\n\n')
-        if [ "$stash_has_ref" -eq 0 ]; then
-            STASH_BARE=1
-        fi
-    done < <(printf '%s\n' "$STRIPPED_COMMAND" | grep -oE "${STASH_APPLY_RE}[^;&|)]*")
-    if [ "$STASH_BARE" -eq 1 ]; then
-        echo "BLOCKED: Bare 'git stash pop' / 'git stash apply' is not allowed. The stash list is shared across all worktrees in this clone, so a bare pop can silently apply another agent's or another worktree's stash — reverting your edits and dumping their WIP into your worktree (see #2749). Run 'git stash list' first, confirm the stash's subject matches your current branch, then pop it by explicit ref: 'git stash pop stash@{N}' or 'git stash apply <sha>'. Every pop/apply in the command needs its own ref. Or use a throwaway commit instead (git commit -am 'WIP' / git reset --soft HEAD~1). See CLAUDE.md §Unattended Operation Patterns." >&2
-        exit 2
-    fi
-fi
+# 10-12. Shared safety checks (preflight_shared_checks.sh), also enforced
+#        by the Fargate hook: `git worktree add` inside a worktree,
+#        cross-worktree writes via cp/mv/tar/redirection, and bare
+#        `git stash pop` / `git stash apply`. See the library for detection
+#        details and rationale.
+preflight_check_worktree_add || exit $?
+preflight_check_cross_worktree_write || exit $?
+preflight_check_bare_stash_apply || exit $?
 
 # ── Diagnoser bright lines (issue #3366) ─────────────────────────────
 #

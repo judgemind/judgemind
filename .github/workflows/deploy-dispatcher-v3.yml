@@ -54,6 +54,7 @@ on:
       - "scripts/preflight.sh"
       - "scripts/preflight-bash-fargate.sh"
       - ".claude/hooks/preflight_cross_worktree.py"
+      - ".claude/hooks/preflight_shared_checks.sh"
       # Vendored transcript renderer — `Dockerfile.dispatcher-v3` COPYs
       # `vendor/judgemind-transcripts/render-transcript.py` into
       # `/opt/judgemind-transcripts/`. Changes to the vendored copy must
