@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 64 migrations.
+-- Generated from 66 migrations.
 
 
 
@@ -992,6 +992,9 @@ CREATE TABLE telemetry.validation_results (
     output_tokens integer,
     latency_ms integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    county text,
+    scraper_id text,
+    s3_key text,
     CONSTRAINT validation_results_result_check CHECK ((result = ANY (ARRAY['pass'::text, 'flag'::text, 'fail'::text, 'error'::text])))
 );
 
@@ -1009,6 +1012,15 @@ COMMENT ON COLUMN telemetry.validation_results.model IS 'LLM model used for vali
 
 
 COMMENT ON COLUMN telemetry.validation_results.latency_ms IS 'Wall-clock time for the validation LLM call in milliseconds.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.county IS 'County of the source document (event county). NULL for rows written before migration 66 or by callers without attribution. Issue #4706.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.scraper_id IS 'scraper_id of the source capture event. NULL for rows written before migration 66 or by callers without attribution. Issue #4706.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.s3_key IS 'S3 key of the raw capture in the document archive bucket. Lets FAIL rows (no derived.documents row) and split children (uuid5 ids) be traced to their raw. NULL for rows written before migration 66. Issue #4706.';
 
 
 ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);
