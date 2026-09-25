@@ -1357,6 +1357,26 @@ class TestScPdfSplitDept12:
         assert not any(cn.startswith("UNKNOWN") for cn in case_numbers)
         assert all(c["hearing_date"] == "2026-09-23" for c in captured)
 
+    def test_table_split_dispatches_dept16_children_with_case_numbers(self) -> None:
+        """#4696: a Dept 16 table-layout PDF that format A split into
+        entries with no case number now dispatches one child per case."""
+        from courts.ca.sc_tentatives import extract_pdf_text
+        from ingestion.worker import _try_sc_pdf_split
+
+        pdf_bytes = (Path(__file__).parent / "fixtures" / "sc_table_4696_dept16.pdf").read_bytes()
+        event = _make_sc_event(ruling_text=extract_pdf_text(pdf_bytes))
+        captured: list[dict] = []
+        assert _try_sc_pdf_split(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            captured.append,
+            raw_pdf_bytes=pdf_bytes,
+        )
+        case_numbers = [c["case_number"] for c in captured]
+        assert len(case_numbers) == 10
+        assert all(cn and not cn.startswith("UNKNOWN") for cn in case_numbers)
+
 
 class TestScPdfSplitHeaderHearingDate:
     """#4667: prefix-mode reingest / rebuild events carry no hearing_date, so

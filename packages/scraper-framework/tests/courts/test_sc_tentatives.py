@@ -2165,22 +2165,329 @@ class TestSantaClaraDept12Helpers:
         assert "OVERRULED" in rulings[1].ruling_text
 
     @pytest.mark.parametrize(
-        ("header", "expected_calls"),
+        "header",
         [
-            ("Department 12\n", 1),
-            ("Department 12 (Hon. Nahal Iravani-Sani)\n", 1),
-            ("Department 10\n", 0),
-            ("", 0),
+            "Department 12\n",
+            "Department 12 (Hon. Nahal Iravani-Sani)\n",
+            "Department 10\n",
+            "",
         ],
     )
-    def test_dept12_split_gated_to_department_12(
-        self, monkeypatch: pytest.MonkeyPatch, header: str, expected_calls: int
+    def test_table_split_runs_in_every_department(
+        self, monkeypatch: pytest.MonkeyPatch, header: str
     ) -> None:
-        """Other departments publish variants of the same table; they keep
-        the pre-#4681 path until those variants are validated."""
+        """#4696: the table layout is not Dept 12's alone, so the splitter
+        runs whenever the header is present, whatever the department."""
         import courts.ca.sc_tentatives as sc
 
         calls: list[str] = []
         monkeypatch.setattr(sc, "_split_rulings_dept12", lambda t, b: calls.append(t) or [])
         sc._split_rulings(header + "LINE # CASE # CASE TITLE RULING\n", pdf_bytes=b"%PDF")
-        assert len(calls) == expected_calls
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# #4696 — the same ``LINE # | CASE # | CASE TITLE | RULING`` table layout in
+# the other departments.  Before #4696 these PDFs went to format A (which
+# split on the table's ``LINE N`` rows into entries with no case number) or
+# to the whole-document LLM split; both produced ``UNKNOWN-`` case numbers.
+#
+# One real dev-S3 raw per department (``# old:`` is the pre-#4696 split):
+#   dept1  = 4cf758be… ``TENTATIVE RULING`` last column          old: []
+#   dept2  = 90ecc909… ``Case No. 23PR194562 (lead case,
+#            consolidated with 25PR200738)`` CASE # cells         old: [None]
+#   dept7  = 8de7e95f… probate, ``See Line 3``                    old: 1 entry
+#   dept8  = 23f245fd… ``Click on LINE 1 or scroll down``         old: []
+#   dept10 = 5208cea9… six rows repeating one case number,
+#            ``Calendar Lines 3 through 8``, second session       old: []
+#   dept11 = e8b2bee9… ``See Line 1 below``                       old: []
+#   dept13 = 94c59f5d… ``Ctrl Click (or scroll down) on Lines 3-4`` old: [None, …]
+#   dept16 = afb7f1b4… format A found 6 entries, 5 without a case
+#            number; the table has 10 cases                     old: [None×5, …]
+#   dept19 = 481f91bb… ``Line 1 (Calendar Lines 1-14)`` bodies   old: 1 entry
+#   dept22 = b0d9f4bc… ``Calendar Line 1 Calendar Lines 1-2``     old: []
+# ---------------------------------------------------------------------------
+
+_TABLE_4696_EXPECTED_CASE_NUMBERS = {
+    "sc_table_4696_dept1.pdf": [
+        "24CV440808",
+        "24CV444353",
+        "25CV461733",
+        "25CV463973",
+        "25CV466751",
+        "25CV469820",
+        "25CV477397",
+        "26CV486118",
+    ],
+    "sc_table_4696_dept2.pdf": ["23PR194562", "25PR199269"],
+    "sc_table_4696_dept7.pdf": ["23PR195657", "25PR199998", "25PR200274"],
+    "sc_table_4696_dept8.pdf": [
+        "22CV407773",
+        "22CV407883",
+        "23CV412452",
+        "25CV460326",
+        "26CV486054",
+    ],
+    "sc_table_4696_dept10.pdf": [
+        "23CV428277",
+        "24CV431689",
+        "25CV463479",  # Lines 3-8, one row per motion
+        "25CV471047",  # Lines 9-10
+        "24CV441592",
+        "24CV454281",
+        "24CV444462",
+        "24CV444553",
+        "25CV459605",
+        "23CV413103",  # second session, Line 1
+        "23CV423385",
+        "24CV453808",
+    ],
+    "sc_table_4696_dept11.pdf": [
+        "24CV454922",
+        "25CV473159",
+        "24CV452088",
+        "22CV407147",
+        "26CV490422",
+        "26CV492584",
+        "26CV497694",
+    ],
+    "sc_table_4696_dept13.pdf": [
+        "25CV467738",
+        "23CV417018",
+        "24CV448687",
+        "24CV451966",
+        "25CV470309",
+        "21CV387882",
+        "22CV398325",
+        "25CV460802",
+        "25CV479479",
+    ],
+    "sc_table_4696_dept16.pdf": [
+        "20CV368334",
+        "25CV474776",
+        "25CV473804",
+        "25CV468644",
+        "25CV481480",
+        "25CV458272",
+        "25CV458413",
+        "25CV469740",
+        "26CV484023",
+        "23CV416289",
+    ],
+    "sc_table_4696_dept19.pdf": [
+        "24CV439209",
+        "22CV400012",
+        "23CV410973",
+        "23CV421591",
+        "23CV421642",
+        "25CV479119",
+    ],
+    "sc_table_4696_dept22.pdf": [
+        "19CV353132",
+        "21CV375255",
+        "24CV443643",
+        "25CV464854",
+        "25CV465406",
+        "25CV465597",
+        "25CV466084",
+        "25CV466507",
+        "25CV466612",
+        "25CV466683",
+        "25CV467217",
+        "25CV467837",
+        "25CV467986",
+        "25CV468145",
+        "25CV468430",
+        "25CV469657",
+        "25CV469662",
+        "25CV469673",
+        "25CV471234",
+    ],
+}
+
+
+def _table_4696_by_cn(name: str) -> dict[str | None, SplitRuling]:
+    return {r.case_number: r for r in _dept12_split(name)}
+
+
+class TestSantaClaraTableSplitOtherDepartments:
+    """#4696: the table splitter on real PDFs from every other department."""
+
+    @pytest.mark.parametrize("fixture", sorted(_TABLE_4696_EXPECTED_CASE_NUMBERS))
+    def test_table_split_one_entry_per_case(self, fixture: str) -> None:
+        rulings = _dept12_split(fixture)
+        assert [r.case_number for r in rulings] == _TABLE_4696_EXPECTED_CASE_NUMBERS[fixture]
+        assert [r.ruling_index for r in rulings] == list(range(1, len(rulings) + 1))
+
+    @pytest.mark.parametrize("fixture", sorted(_TABLE_4696_EXPECTED_CASE_NUMBERS))
+    def test_table_split_every_entry_has_title_and_text(self, fixture: str) -> None:
+        for r in _dept12_split(fixture):
+            assert r.case_title, f"{r.case_number} has no case_title"
+            assert r.ruling_text and r.ruling_text.strip(), r.case_number
+
+    def test_table_split_through_heading_attaches_body(self) -> None:
+        """Dept 10: six rows repeat 25CV463479 (``Click LINE 3``); the body
+        is headed ``Calendar Lines 3 through 8``."""
+        zync = _table_4696_by_cn("sc_table_4696_dept10.pdf")["25CV463479"]
+        assert "Calendar Lines 3 through 8" in zync.ruling_text
+        assert "Case No.: 25CV463479" in zync.ruling_text
+
+    def test_table_split_parenthesized_line_heading_attaches_body(self) -> None:
+        """Dept 19 heads its bodies ``Line 1 (Calendar Lines 1-14)``."""
+        by_cn = _table_4696_by_cn("sc_table_4696_dept19.pdf")
+        assert "Before the Court are two motions" in by_cn["24CV439209"].ruling_text
+        assert by_cn["24CV439209"].case_title == "Steleco LLC et al. v. DPR Construction et al."
+        for cn, r in by_cn.items():
+            assert f"Case No.: {cn}" in r.ruling_text, cn
+
+    def test_table_split_doubled_heading_attaches_body(self) -> None:
+        """Dept 22: ``Calendar Line 1 Calendar Lines 1-2``."""
+        hpe = _table_4696_by_cn("sc_table_4696_dept22.pdf")["19CV353132"]
+        assert "Calendar Line 1 Calendar Lines 1-2" in hpe.ruling_text
+
+    def test_table_split_beats_format_a_in_dept16(self) -> None:
+        """Dept 16 docs with the table header: format A split them on the
+        table's ``LINE N`` rows into entries with no case number."""
+        rulings = _dept12_split("sc_table_4696_dept16.pdf")
+        assert all(r.case_number for r in rulings)
+        ikeda = _table_4696_by_cn("sc_table_4696_dept16.pdf")["25CV481480"]
+        assert "Calendar Line 5\nCase Name: Melissa Ikeda" in ikeda.ruling_text
+
+    def test_table_split_ctrl_click_scroll_down_on_lines(self) -> None:
+        """Dept 13: ``Ctrl Click (or scroll down) on Lines 3-4``."""
+        isj = _table_4696_by_cn("sc_table_4696_dept13.pdf")["24CV448687"]
+        assert "Calendar Line" in isj.ruling_text
+        assert len(isj.ruling_text) > 2000
+
+    def test_table_split_case_no_cell_with_consolidated_note(self) -> None:
+        """Dept 2: ``Case No. 23PR194562 (lead case, consolidated with
+        25PR200738)`` — the lead number is the case; the consolidated one
+        is not an entry of its own, and the page header does not leak."""
+        by_cn = _table_4696_by_cn("sc_table_4696_dept2.pdf")
+        assert "25PR200738" not in by_cn
+        assert "COSTA" in (by_cn["23PR194562"].case_title or "")
+        assert "SUPERIOR COURT" not in by_cn["23PR194562"].ruling_text
+
+    def test_table_split_tentative_ruling_header(self) -> None:
+        """Dept 1 titles the last column ``TENTATIVE RULING``."""
+        by_cn = _table_4696_by_cn("sc_table_4696_dept1.pdf")
+        assert "GRANTED" in by_cn["25CV461733"].ruling_text
+
+
+class TestSantaClaraTableSplitHelpers4696:
+    """#4696: heading, cross-reference and single-entry handling."""
+
+    @pytest.mark.parametrize(
+        ("heading", "first"),
+        [
+            ("Calendar Lines 3 through 8", 3),
+            ("Calendar Line 1 through 3", 1),
+            ("Calendar Lines 4 – 5", 4),
+            ("Calendar Line 8, 9, and 10", 8),
+            ("Calendar Line 7, 8, & 9", 7),
+            ("Calendar Line 1 Calendar Lines 1-2", 1),
+            ("Calendar Line 2 Calendar Line 2", 2),
+            ("Calendar line 1 – Tentative Ruling", 1),
+            ("Line 1 (Calendar Lines 1-14)", 1),
+            ("Line 3 (Calendar Line 17)", 3),
+            ("Calendar Line 12", 12),
+        ],
+    )
+    def test_table_split_body_heading_variants(self, heading: str, first: int) -> None:
+        from courts.ca.sc_tentatives import _dept12_body_sections
+
+        text = f"{heading}\nCase No.: 24CV000001\n" + "x" * 100 + "\n"
+        sections = _dept12_body_sections(text)
+        assert [s.first_line for s in sections] == [first]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "Calendar Line 3 to be heard with line 4",
+            "Line 1",  # bare table row, not a body heading
+            "LINE 7 24CV000001 Foo v. Bar",
+            "Calendar Line 5 is continued",
+        ],
+    )
+    def test_table_split_body_heading_rejects_prose(self, line: str) -> None:
+        from courts.ca.sc_tentatives import _dept12_body_sections
+
+        assert _dept12_body_sections(f"{line}\n" + "x" * 100) == []
+
+    @pytest.mark.parametrize(
+        ("cell", "num"),
+        [
+            ("Click LINE 3 or scroll down for ruling.", 3),
+            ("Ctrl Click (or scroll down) on Line 5 for tentative ruling.", 5),
+            ("Click (or scroll down) on Lines 3-4 for tentative ruling.", 3),
+            ("Click or scroll to line 1 for tentative ruling.", 1),
+            ("Click to Line 4", 4),
+            ("Click on (or scroll to) Line 2", 2),
+            ("See Tentative Ruling on Line 6", 6),
+            ("See Line 1 below for tentative ruling.", 1),
+            ("Please CTRL CLICK (or scroll down to) Line 7", 7),
+        ],
+    )
+    def test_table_split_crossref_variants(self, cell: str, num: int) -> None:
+        from courts.ca.sc_tentatives import _SC_DEPT12_CROSSREF_RE
+
+        m = _SC_DEPT12_CROSSREF_RE.search(cell)
+        assert m is not None and int(m.group("num")) == num
+
+    def test_table_split_crossref_ignores_other_sentences(self) -> None:
+        from courts.ca.sc_tentatives import _SC_DEPT12_CROSSREF_RE
+
+        assert _SC_DEPT12_CROSSREF_RE.search("See the motion. Line 3 of the order") is None
+
+    def test_table_split_single_entry_beats_format_a(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A one-case table calendar returns its single entry (the worker's
+        single-ruling path) instead of format A's split of the page-footer
+        ``Line N`` labels into entries with no case number."""
+        import courts.ca.sc_tentatives as sc
+
+        only = SplitRuling(1, "25PR201041", "Click or scroll to line 1", "Estate of X")
+        monkeypatch.setattr(sc, "_split_rulings_dept12", lambda t, b: [only])
+        body = "y" * 120
+        text = f"LINE # CASE # CASE TITLE RULING\nLine 4\n{body}\nLine 30\n{body}\n"
+        assert sc._split_rulings_format_a(text)  # format A would split this
+        assert sc._split_rulings(text, pdf_bytes=b"%PDF") == [only]
+
+    def test_table_split_empty_falls_back_to_format_a(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import courts.ca.sc_tentatives as sc
+
+        monkeypatch.setattr(sc, "_split_rulings_dept12", lambda t, b: [])
+        body = "Case No.: 24CV000001\n" + "y" * 120
+        text = f"LINE # CASE # CASE TITLE RULING\nLine 1\n{body}\nLine 2\n{body}\n"
+        assert len(sc._split_rulings(text, pdf_bytes=b"%PDF")) == 2
+
+    def test_table_split_text_row_skips_consolidated_tail(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_text_rows
+
+        text = (
+            "LINE # CASE # CASE TITLE RULING\n"
+            "LINE 1 Case No. The hearing is continued.\n"
+            "23PR194562 to 5/28/26.\n"
+            "25PR200738)\n"
+        )
+        assert list(_dept12_text_rows(text)) == ["23PR194562"]
+
+    def test_table_split_parse_row_case_no_cell(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_parse_row
+
+        row = ["LINE 1", "Case No.\n23PR194562\n(lead case,\nconsolidated with", "Costa", "X"]
+        assert _dept12_parse_row(row)[1] == "23PR194562"
+        # Column 2 must be a bare case number: a title that cites one is not.
+        assert _dept12_parse_row(["LINE 2", "", "Consolidated with 23PR194562", "X"])[1] is None
+
+
+def test_format_a_case_no_header_with_consolidated_note() -> None:
+    """#4696: ``Case No.: 21CV384705 (Consolidated with …)`` in a Dept 16
+    format-A body still yields the case number."""
+    body = "y" * 120
+    text = (
+        "Line 1\nCase Name: A v. B\nCase No.: 21CV384705 (Consolidated with 22CV000001)\n"
+        f"{body}\nLine 2\nCase Name: C v. D\nCase No.: 24CV000002\n{body}\n"
+    )
+    assert [r.case_number for r in _split_rulings(text)] == ["21CV384705", "24CV000002"]
