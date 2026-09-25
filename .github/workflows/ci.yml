@@ -142,6 +142,10 @@ jobs:
             dockerfile:
               - 'packages/scraper-framework/Dockerfile'
               - '.github/playwright-browser-check/**'
+              # Dependency specs decide what the image resolves; build the
+              # image on any change to them (#4756).
+              - 'packages/scraper-framework/pyproject.toml'
+              - 'packages/judgemind-config/pyproject.toml'
             migrations:
               - 'packages/api/migrations/**'
               # Include ci.yml so that edits to the migration-* jobs below
@@ -2291,6 +2295,22 @@ jobs:
         run: scripts/check-dispatcher-breaker-recovery-alert.sh
 
   # ---------------------------------------------------------------
+  # Dependency upper bounds (#4756): every [project].dependencies entry
+  # in packages/*/pyproject.toml must carry an upper bound so an image
+  # rebuild cannot silently pick up a new major version (the #4705
+  # redis-py 8 socket_timeout incident). Stdlib-only, runs unconditionally.
+  # ---------------------------------------------------------------
+  dependency-upper-bounds-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify every runtime dependency has an upper version bound
+        run: python3 scripts/check-dependency-upper-bounds.py
+
+  # ---------------------------------------------------------------
   # ci-passed coverage guard: assert every top-level job appears in
   # ci-passed.needs: so gaps like #3919 are caught before merge.
   # ---------------------------------------------------------------
@@ -2390,6 +2410,7 @@ jobs:
       - ci-guards-skip-list-coverage-check
       - no-check-prefix-on-ecs-oneshots-check
       - dispatcher-breaker-recovery-alert-check
+      - dependency-upper-bounds-check
     if: always()
     runs-on: ubuntu-latest
     steps:
