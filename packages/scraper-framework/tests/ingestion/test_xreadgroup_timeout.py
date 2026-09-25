@@ -28,8 +28,10 @@ import pytest
 import redis
 
 from ingestion.worker import (
+    _UNKNOWN,
     DEFAULT_BLOCK_MS,
     IngestionWorker,
+    _client_socket_timeout,
     redis_socket_timeout_for_block,
 )
 
@@ -284,3 +286,26 @@ def test_xreadgroup_timeout_run_guard_tolerates_mock_client(
         worker.run()
 
     assert not [r for r in caplog.records if "socket_timeout" in r.getMessage()]
+
+
+def _client_with_kwargs(kwargs: dict[str, object]) -> MagicMock:
+    return MagicMock(connection_pool=MagicMock(connection_kwargs=kwargs))
+
+
+@pytest.mark.parametrize(
+    ("client", "expected"),
+    [
+        (object(), _UNKNOWN),  # no connection_pool attribute
+        (_client_with_kwargs({}), _UNKNOWN),
+        (_client_with_kwargs({"socket_timeout": "5"}), _UNKNOWN),
+        (_client_with_kwargs({"socket_timeout": 7}), 7),
+        (_client_with_kwargs({"socket_timeout": None}), None),
+    ],
+)
+def test_xreadgroup_timeout_client_socket_timeout_reader(client: object, expected: object) -> None:
+    """_client_socket_timeout returns the numeric/None value or the unknown sentinel."""
+    result = _client_socket_timeout(client)
+    if expected is _UNKNOWN:
+        assert result is _UNKNOWN
+    else:
+        assert result == expected
