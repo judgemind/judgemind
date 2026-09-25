@@ -612,7 +612,8 @@ def test_is_stale_viewstate_response_does_not_match_real_ruling() -> None:
 
 @respx.mock
 def test_full_run_stale_viewstate_not_counted() -> None:
-    """Full run: when every POST returns a stale-ViewState error, records_captured == 0."""
+    """Full run: when every POST returns a stale-ViewState error, nothing is
+    captured and the run is a failure rather than success/0 (#4693)."""
     main_html = _load("la_main_page.html")
     stale_html = _load("la_ruling_smc49.html")
 
@@ -621,11 +622,32 @@ def test_full_run_stale_viewstate_not_counted() -> None:
 
     config = default_config()
     config.request_delay_seconds = 0
+    config.max_retries = 1
     scraper = LATentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    assert health.success is False
     assert health.records_captured == 0
+    assert "all 97 LA civil ruling POSTs were blocked" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_fails_when_every_post_raises() -> None:
+    """Every dropdown POST raised: the run is a failure, not success/0 (#4693)."""
+    main_html = _load("la_main_page.html")
+
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(500))
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = LATentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 97 LA civil ruling POSTs failed" in (health.error_message or "")
+    assert "HTTPStatusError" in (health.error_message or "")
 
 
 @respx.mock
@@ -3672,13 +3694,20 @@ def test_appellate_full_run_stamps_metadata_through_parse() -> None:
 
 @respx.mock
 def test_appellate_full_run_handles_stale_viewstate() -> None:
-    """Stale-ViewState POST responses are skipped without failing the run."""
-    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    """Stale-ViewState POST responses are skipped without failing the run
+    as long as another hearing date was fetched."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
     # Reuse real LA stale-ViewState error fixture — same portal, same marker.
     stale_html = _load("la_ruling_smc49.html")
+    ruling_html = _synthetic_appellate_ruling_response()
 
     respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
-    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=stale_html))
+    respx.post(APPELLATE_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=stale_html),
+            httpx.Response(200, text=ruling_html),
+        ]
+    )
 
     config = default_config_appellate()
     config.request_delay_seconds = 0
@@ -3686,7 +3715,45 @@ def test_appellate_full_run_handles_stale_viewstate() -> None:
     health = scraper.run()
 
     assert health.success is True
+    assert health.records_captured == 1
+
+
+@respx.mock
+def test_appellate_run_fails_when_every_post_is_stale_viewstate() -> None:
+    """Every hearing date got a stale-ViewState error page: nothing was
+    fetched, so the run is a failure, not success/0 (#4693)."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    stale_html = _load("la_ruling_smc49.html")
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=stale_html))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = LAAppellateTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
     assert health.records_captured == 0
+    assert "all 1 LA appellate ruling POSTs were blocked" in (health.error_message or "")
+
+
+@respx.mock
+def test_appellate_run_fails_when_every_post_raises() -> None:
+    """Every appellate POST raised: the run is a failure, not success/0 (#4693)."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(500))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = LAAppellateTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 2 LA appellate ruling POSTs failed" in (health.error_message or "")
 
 
 def test_appellate_scraper_registered_in_runner() -> None:

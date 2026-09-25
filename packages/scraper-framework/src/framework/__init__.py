@@ -20,6 +20,7 @@ from .extraction_config import (
     ExtractionMethod,
     get_county_extraction_config,
 )
+from .fetch_tally import FetchTally
 from .hashing import content_changed, sha256_hex
 from .llm_enrichment import (
     ENRICHMENT_SYSTEM_PROMPT,
@@ -70,6 +71,7 @@ from .turnstile_solver import solve_turnstile
 __all__ = [
     "BaseScraper",
     "ScraperPreconditionFailure",
+    "FetchTally",
     "apply_stealth",
     "ConfidenceLevel",
     "CountyExtractionConfig",

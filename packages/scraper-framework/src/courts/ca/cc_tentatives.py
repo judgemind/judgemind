@@ -66,6 +66,7 @@ from bs4 import BeautifulSoup
 
 from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 from framework.extraction_config import get_county_extraction_config
+from framework.fetch_tally import FetchTally
 from framework.llm_utils import parse_llm_json
 
 from .pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
@@ -563,6 +564,8 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
         PDF, falls back to the single-doc-per-PDF regex path.
         """
         docs: list[CapturedDocument] = []
+        # A run where every PDF GET raises must fail, not record success/0 (#4693).
+        tally = FetchTally("CC PDF fetches")
 
         use_llm = _cc_llm_enabled()
         if use_llm:
@@ -598,6 +601,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
             for href, link_text, department, judge_name in recent_links:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     pdf_response = client.get(href)
                     pdf_response.raise_for_status()
@@ -725,6 +729,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                         url=href,
                     )
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch PDF",
                         url=href,
@@ -732,6 +737,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:

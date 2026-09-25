@@ -76,6 +76,7 @@ from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWind
 from framework.browser import apply_stealth as _apply_stealth
 from framework.browser import playwright_proxy_settings
 from framework.events import EventBus
+from framework.fetch_tally import FetchTally
 from framework.proxy_health import diagnose_and_log_proxy_auth
 from framework.proxy_tls import chromium_proxy_tls_launch_kwargs
 from framework.storage import S3Archiver
@@ -703,6 +704,9 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
             A list of CapturedDocument objects.
         """
         docs: list[CapturedDocument] = []
+        # A run where every RulingID request errors or hits an expired
+        # session must fail, not record success/0 (#4693).
+        tally = FetchTally("SF civil RulingID requests")
         today = datetime.now(UTC)
         date_str = today.strftime("%m/%d/%Y")
         # URL-encode the date (slashes become %2F)
@@ -721,6 +725,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         ) as client:
             for ruling_id in RULING_IDS:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
 
                 dept_info = RULING_ID_MAP[ruling_id]
                 department = dept_info["department"]
@@ -735,6 +740,10 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     # Check for session expiry or redirect
                     if response.status_code in (301, 302, 303, 307):
                         location = response.headers.get("location", "")
+                        tally.blocked(
+                            f"redirect {response.status_code} during REST fetch "
+                            "(session may be expired)"
+                        )
                         self._log.warning(
                             "Redirect during REST fetch — session may be expired",
                             ruling_id=ruling_id,
@@ -745,6 +754,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
 
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "HTTP error fetching rulings",
                         ruling_id=ruling_id,
@@ -753,6 +763,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     )
                     continue
                 except httpx.RequestError as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Request error fetching rulings",
                         ruling_id=ruling_id,
@@ -766,6 +777,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     data = json.loads(response.text)
                     result = data.get("result", [])
                     if isinstance(result, list) and result and result[0] == -1:
+                        tally.blocked("session expired during fetch (result -1)")
                         self._log.warning(
                             "Session expired during fetch",
                             ruling_id=ruling_id,
@@ -800,6 +812,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     )
                     docs.append(doc)
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     async def _acquire_session(self) -> str | None:

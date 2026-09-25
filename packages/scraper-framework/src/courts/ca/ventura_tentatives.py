@@ -46,6 +46,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -394,6 +395,9 @@ class VenturaTentativeRulingsScraper(BaseScraper):
             )
 
         docs: list[CapturedDocument] = []
+        # Date searches and result-document fetches. A run where every one of
+        # them raises must fail, not record success/0 (#4693).
+        tally = FetchTally("Ventura date searches and document fetches")
 
         search_dates = self._search_dates or [
             datetime.now(ZoneInfo("America/Los_Angeles")).replace(tzinfo=None)
@@ -423,15 +427,17 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                 self._log.info("Searching for date", date=date_str)
 
                 try:
-                    date_docs = self._search_date(client, token, date_str, search_date)
+                    date_docs = self._search_date(client, token, date_str, search_date, tally)
                     docs.extend(date_docs)
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to search date",
                         date=date_str,
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def _search_date(
@@ -440,8 +446,16 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         token: str,
         date_str: str,
         search_date: datetime,
+        tally: FetchTally | None = None,
     ) -> list[CapturedDocument]:
-        """POST a date search and process the results."""
+        """POST a date search and process the results.
+
+        Each result document is one ``ok()``/``failed()`` on *tally*; a search
+        that returns no results is one ``ok()`` (a genuinely empty date). A
+        failed search POST raises to the caller, which records it.
+        """
+        if tally is None:
+            tally = FetchTally()
         form_data = {
             "__RequestVerificationToken": token,
             "SearchFromDate": date_str,
@@ -453,12 +467,16 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         self._log.info("Found results", date=date_str, count=len(results))
 
         docs: list[CapturedDocument] = []
+        if not results:
+            tally.ok()
         for result in results:
             time.sleep(self.config.request_delay_seconds)
             try:
                 doc = self._fetch_result_document(client, result, search_date)
                 docs.append(doc)
+                tally.ok()
             except Exception as exc:
+                tally.failed(exc)
                 self._log.error(
                     "Failed to fetch document",
                     case_number=result.case_number,

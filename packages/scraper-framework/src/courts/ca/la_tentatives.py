@@ -58,6 +58,7 @@ from bs4 import BeautifulSoup
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.court_directory import CourtDirectory
 from framework.events import EventBus
+from framework.fetch_tally import FetchTally
 from framework.la_parser_utils import (
     BARE_ROLE_LABELS as _BARE_ROLE_LABELS,
 )
@@ -1200,6 +1201,8 @@ class LATentativeRulingsScraper(BaseScraper):
                 departments=len(self._dept_judge_map),
             )
         docs = []
+        # A run where every dropdown POST fails must fail, not record success/0 (#4693).
+        tally = FetchTally("LA civil ruling POSTs")
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
             follow_redirects=True,
@@ -1219,9 +1222,11 @@ class LATentativeRulingsScraper(BaseScraper):
 
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     ruling_html = _post_for_ruling(client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
+                        tally.blocked("stale ViewState error page")
                         self._log.warning(
                             "Stale ViewState error page; skipping",
                             courthouse=opt.courthouse,
@@ -1295,12 +1300,14 @@ class LATentativeRulingsScraper(BaseScraper):
                         cases=len(case_htmls),
                     )
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch ruling",
                         courthouse=opt.courthouse,
                         dept=opt.department,
                         error=str(exc),
                     )
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
@@ -1379,6 +1386,8 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
 
     def fetch_documents(self) -> list[CapturedDocument]:
         docs: list[CapturedDocument] = []
+        # A run where every dropdown POST fails must fail, not record success/0 (#4693).
+        tally = FetchTally("LA appellate ruling POSTs")
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
             follow_redirects=True,
@@ -1401,9 +1410,11 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
 
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     ruling_html = _post_for_ruling_appellate(client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
+                        tally.blocked("stale ViewState error page")
                         self._log.warning(
                             "Stale ViewState error page; skipping",
                             dept=opt.department,
@@ -1433,12 +1444,14 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
                         cases=len(case_htmls),
                     )
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch appellate ruling",
                         dept=opt.department,
                         date=str(opt.hearing_date),
                         error=str(exc),
                     )
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:

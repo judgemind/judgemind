@@ -508,6 +508,31 @@ class TestGovernorAppointmentsScraper:
         assert len(docs) == 1
 
     @respx.mock
+    def test_run_fails_when_every_press_release_fetch_fails(self) -> None:
+        """Every press-release GET raised: failure, not success/0 (#4693)."""
+        minimal_search = """
+        <html><body>
+        <a href="https://www.gov.ca.gov/2026/03/15/governor-newsom-announces-judicial-appointments-1/">
+            Governor Newsom Announces Judicial Appointments 1</a>
+        <a href="https://www.gov.ca.gov/2026/03/14/governor-newsom-announces-judicial-appointments-2/">
+            Governor Newsom Announces Judicial Appointments 2</a>
+        </body></html>
+        """
+        respx.get(f"{SEARCH_URL}?s=judicial+appointment").mock(
+            return_value=httpx.Response(200, text=minimal_search)
+        )
+        respx.get(url__startswith="https://www.gov.ca.gov/2026/").mock(
+            return_value=httpx.Response(500)
+        )
+
+        config = _make_scraper_config()
+        health = GovernorAppointmentsScraper(config, max_pages=1).run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert "all 2 press release fetches failed" in (health.error_message or "")
+
+    @respx.mock
     def test_document_extra_has_appointee_data(self) -> None:
         """CapturedDocument.extra contains parsed appointee data."""
         press_release_html = _load_fixture("press_release_sample.html")

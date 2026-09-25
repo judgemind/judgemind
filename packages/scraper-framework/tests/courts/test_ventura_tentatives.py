@@ -643,7 +643,8 @@ def test_ventura_run_no_doc_link() -> None:
 
 @respx.mock
 def test_ventura_search_date_error() -> None:
-    """A POST error for one date should not crash the whole run."""
+    """A POST error on the only date searched fails the run instead of
+    recording success/0 (#4693)."""
     search_html = _load_html("ventura_search_page.html")
 
     respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
@@ -656,10 +657,57 @@ def test_ventura_search_date_error() -> None:
         config=config,
         search_dates=[datetime(2026, 3, 11)],
     )
-    # The search_date error is caught internally, so run succeeds with 0 records
+    health = scraper.run()
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 1 Ventura date searches and document fetches failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_ventura_search_date_error_with_other_date_empty_succeeds() -> None:
+    """One date's POST errors, another returns no results: the court was
+    reachable and genuinely empty, so the run succeeds (#4693)."""
+    search_html = _load_html("ventura_search_page.html")
+    no_results_html = _load_html("ventura_no_results_page.html")
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(
+        side_effect=[httpx.Response(500), httpx.Response(200, text=no_results_html)]
+    )
+
+    config = ventura_default_config()
+    config.max_retries = 1
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11), datetime(2026, 3, 12)],
+    )
     health = scraper.run()
     assert health.success is True
     assert health.records_captured == 0
+
+
+@respx.mock
+def test_ventura_run_fails_when_every_document_fetch_fails() -> None:
+    """The date search works but every result-document GET fails (#4693)."""
+    search_html = _load_html("ventura_search_page.html")
+    results_html = _load_html("ventura_results_page.html")
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(return_value=httpx.Response(503))
+
+    config = ventura_default_config()
+    config.max_retries = 1
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+    )
+    health = scraper.run()
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "Ventura date searches and document fetches failed" in (health.error_message or "")
 
 
 def test_ventura_parse_document_empty_content() -> None:

@@ -54,6 +54,7 @@ from bs4 import BeautifulSoup, Tag
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.events import EventBus
+from framework.fetch_tally import FetchTally
 from framework.storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
@@ -517,6 +518,9 @@ class SDCalendarScraper(BaseScraper):
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch calendar pages and return filtered motion-type hearings as documents."""
         docs: list[CapturedDocument] = []
+        # A run where every calendar-page GET raises must fail, not record
+        # success/0 (#4693). An empty calendar page is a successful fetch.
+        tally = FetchTally("SD calendar page fetches")
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
@@ -528,6 +532,7 @@ class SDCalendarScraper(BaseScraper):
 
             for url, division_name in urls:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     response = client.get(url)
                     response.raise_for_status()
@@ -574,6 +579,7 @@ class SDCalendarScraper(BaseScraper):
                         docs.append(doc)
 
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch calendar page",
                         division=division_name,
@@ -581,6 +587,7 @@ class SDCalendarScraper(BaseScraper):
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:

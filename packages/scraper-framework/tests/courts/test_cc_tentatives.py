@@ -482,6 +482,32 @@ def test_cc_fetch_pdf_error_skips_gracefully() -> None:
 
 
 @respx.mock
+def test_cc_run_fails_when_every_pdf_fetch_fails() -> None:
+    """Every PDF GET raised: the run is a failure, not success/0 (#4693)."""
+    config = cc_default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 14 - Judge Athanasiou\\14_031026.pdf">Mar 10</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(return_value=httpx.Response(500))
+
+    health = scraper.run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 2 CC PDF fetches failed" in (health.error_message or "")
+
+
+@respx.mock
 def test_cc_fetch_boilerplate_pdf_skipped() -> None:
     """Boilerplate PDFs should be skipped during fetch."""
     config = cc_default_config()

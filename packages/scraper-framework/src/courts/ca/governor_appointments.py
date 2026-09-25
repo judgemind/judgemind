@@ -30,6 +30,7 @@ import structlog
 from bs4 import BeautifulSoup, Tag
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -385,6 +386,9 @@ class GovernorAppointmentsScraper(BaseScraper):
     def fetch_documents(self) -> list[CapturedDocument]:
         """Discover and fetch all judicial appointment press releases."""
         docs: list[CapturedDocument] = []
+        # A run where every press-release GET raises must fail, not record
+        # success/0 (#4693).
+        tally = FetchTally("press release fetches")
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
@@ -398,6 +402,7 @@ class GovernorAppointmentsScraper(BaseScraper):
             # Phase 2: Fetch each press release
             for pr_info in press_release_urls:
                 time.sleep(self.config.request_delay_seconds)
+                tally.attempt()
                 try:
                     doc = self._fetch_press_release(client, pr_info)
                     docs.append(doc)
@@ -407,12 +412,14 @@ class GovernorAppointmentsScraper(BaseScraper):
                         title=pr_info.get("title", ""),
                     )
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch press release",
                         url=pr_info["url"],
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:

@@ -43,7 +43,8 @@ from courts.ca.cc_tentatives_portal import (
     _parse_listing_table,
 )
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
-from framework import ContentFormat
+from framework import ContentFormat, ScraperConfig
+from framework.base import ScraperPreconditionFailure
 
 # Identifier-shape defaults shared across this module's reingest-path
 # regression tests.  Kept as module constants so each call to the shared
@@ -975,14 +976,15 @@ def test_form_url_points_at_live_listing_page() -> None:
 
 @respx.mock
 def test_fetch_documents_logs_error_when_no_judges() -> None:
-    """An access-denied-style page (no dropdown) returns [] and logs at error level (#4591).
+    """An access-denied-style page (no dropdown) logs at error level (#4591)
+    and fails the run (#4693).
 
     Pre-#4591 this logged a ``warning`` and returned ``[]`` silently, so
     the zero-record / scraper-health alerting never fired and the total
     coverage failure went undetected for the whole dual-run period.
-    Upgrading ``cc_portal.no_judges_found`` to ``error`` makes the
-    breakage loud while still not raising (an exception would abort the
-    whole 17-scraper run).
+    ``BaseScraper.run()`` catches the ``ScraperPreconditionFailure`` and
+    records ``success=False`` for this scraper only; other scrapers in the
+    same runner are unaffected.
     """
     access_denied_html = (
         "<html><body><h1>Access Denied</h1>"
@@ -997,9 +999,8 @@ def test_fetch_documents_logs_error_when_no_judges() -> None:
     scraper = CCTentativesPortalScraper(config=config)
 
     with structlog.testing.capture_logs() as cap:
-        docs = scraper.fetch_documents()
-
-    assert docs == []
+        with pytest.raises(ScraperPreconditionFailure, match="judge dropdown not found"):
+            scraper.fetch_documents()
 
     no_judges_events = [e for e in cap if e.get("event") == "cc_portal.no_judges_found"]
     assert len(no_judges_events) == 1, (
@@ -1007,3 +1008,85 @@ def test_fetch_documents_logs_error_when_no_judges() -> None:
         f"{no_judges_events}"
     )
     assert no_judges_events[0].get("log_level") == "error"
+
+
+# ---------------------------------------------------------------------------
+# All-fetches-failed gate (#4693)
+# ---------------------------------------------------------------------------
+
+_TWO_JUDGE_FORM = (
+    '<html><body><form><select name="field_judge_target_id">'
+    '<option value="All">- Any -</option>'
+    '<option value="238">JUDGE A</option>'
+    '<option value="280">JUDGE B</option>'
+    "</select></form></body></html>"
+)
+
+
+def _run_config() -> ScraperConfig:
+    config = portal_default_config()
+    return config.model_copy(update={"request_delay_seconds": 0.0, "max_retries": 1})
+
+
+@respx.mock
+def test_run_fails_when_form_fetch_fails() -> None:
+    respx.get(FORM_URL).mock(return_value=httpx.Response(503))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert "CC portal form fetch failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_fails_when_every_listing_fetch_fails() -> None:
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(500)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(500)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 2 CC portal listing and ruling fetches failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_fails_when_every_detail_fetch_fails() -> None:
+    listing_html = _load_html("listing_devine.html")
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=listing_html)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=listing_html)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+    respx.get(url__regex=r"/tentative-ruling/").mock(return_value=httpx.Response(502))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    # 4 valid rows per listing x 2 judges; test entries are not attempts.
+    assert "all 8 CC portal listing and ruling fetches failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_run_succeeds_when_one_listing_is_empty_and_another_fails() -> None:
+    """A genuinely empty listing is a successful fetch: no failure (#4693)."""
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(500)
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=_load_html("listing_empty.html"))
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is True
+    assert health.records_captured == 0

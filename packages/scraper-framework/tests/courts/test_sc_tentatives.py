@@ -811,6 +811,70 @@ def test_sc_run_handles_pdf_failure() -> None:
     assert health.records_captured == 19
 
 
+@respx.mock
+def test_sc_run_fails_when_every_dept_page_fails() -> None:
+    """Every department page GET raised: failure, not success/0 (#4693)."""
+    landing_html = _load_html("sc_landing_page.html")
+
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+    respx.get(url__regex=r"tentative-rulings/dep").mock(return_value=httpx.Response(503))
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 10 SC department page and PDF fetches failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_sc_run_fails_when_every_pdf_fails() -> None:
+    """Department pages load but every PDF GET raised: failure (#4693).
+
+    Loaded department pages that list PDFs do not count as successes on
+    their own; only a department page with no PDFs is a genuine empty.
+    """
+    landing_html = _load_html("sc_landing_page.html")
+    dept1_html = _load_html("sc_dept1_page.html")
+
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+    respx.get(url__regex=r"tentative-rulings/dep").mock(
+        return_value=httpx.Response(200, text=dept1_html)
+    )
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(500))
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    # 10 departments x 2 PDFs
+    assert "all 20 SC department page and PDF fetches failed" in (health.error_message or "")
+
+
+@respx.mock
+def test_sc_run_succeeds_when_dept_pages_have_no_pdfs() -> None:
+    """Department pages that load and list no PDFs are a genuine empty (#4693)."""
+    landing_html = _load_html("sc_landing_page.html")
+
+    respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+    respx.get(url__regex=r"tentative-rulings/dep").mock(
+        return_value=httpx.Response(200, text="<html><body>No rulings</body></html>")
+    )
+
+    config = sc_default_config()
+    config.request_delay_seconds = 0
+    config.max_retries = 1
+    health = SCTentativeRulingsScraper(config=config).run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
 # ---------------------------------------------------------------------------
 # Config factory
 # ---------------------------------------------------------------------------

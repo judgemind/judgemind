@@ -54,6 +54,7 @@ from framework import (
     ScheduleWindow,
     ScraperConfig,
 )
+from framework.fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -1411,6 +1412,9 @@ class SCTentativeRulingsScraper(BaseScraper):
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch all ruling PDFs from all departments."""
         docs: list[CapturedDocument] = []
+        # Counts department-page and PDF fetches. A run where every one of
+        # them raises must fail, not record success/0 (#4693).
+        tally = FetchTally("SC department page and PDF fetches")
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
@@ -1448,9 +1452,10 @@ class SCTentativeRulingsScraper(BaseScraper):
             for dept_info in departments:
                 time.sleep(self.config.request_delay_seconds)
                 try:
-                    dept_docs = self._fetch_department(client, dept_info)
+                    dept_docs = self._fetch_department(client, dept_info, tally)
                     docs.extend(dept_docs)
                 except Exception as exc:
+                    tally.failed(exc)
                     self._log.error(
                         "Failed to fetch department",
                         department=dept_info.department,
@@ -1458,11 +1463,26 @@ class SCTentativeRulingsScraper(BaseScraper):
                         error=str(exc),
                     )
 
+        tally.raise_if_all_failed(docs)
         return docs
 
     def _fetch_department(
-        self, client: httpx.Client, dept_info: DepartmentInfo
+        self,
+        client: httpx.Client,
+        dept_info: DepartmentInfo,
+        tally: FetchTally | None = None,
     ) -> list[CapturedDocument]:
+        """Fetch one department page and its ruling PDFs.
+
+        Each PDF is one attempt on *tally*, recorded with explicit ``ok()`` /
+        ``failed()`` so the caller can record a department-page failure as a
+        standalone ``failed()``. A department page that loads but
+        lists no PDFs counts as one successful attempt (a genuinely empty
+        department). A failed department-page GET raises to the caller, which
+        records it as a failed attempt.
+        """
+        if tally is None:
+            tally = FetchTally()
         """Fetch a department page and download all ruling PDFs."""
         self._log.debug(
             "Fetching department page",
@@ -1480,11 +1500,14 @@ class SCTentativeRulingsScraper(BaseScraper):
         )
 
         docs: list[CapturedDocument] = []
+        if not pdf_links:
+            tally.ok()
         for href, link_text in pdf_links:
             time.sleep(self.config.request_delay_seconds)
             try:
                 doc = self._fetch_one_pdf(client, href, link_text, dept_info)
                 docs.append(doc)
+                tally.ok()
                 self._log.debug(
                     "Fetched PDF",
                     department=doc.department,
@@ -1492,6 +1515,7 @@ class SCTentativeRulingsScraper(BaseScraper):
                     url=href,
                 )
             except Exception as exc:
+                tally.failed(exc)
                 self._log.error(
                     "Failed to fetch PDF",
                     department=dept_info.department,
