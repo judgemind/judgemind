@@ -393,6 +393,16 @@ ts_pkg_checks() {
         failures=$((failures + 1))
     fi
 
+    # run_check hides output on success, which would swallow the
+    # INTEGRATION TESTS SKIPPED banner packages/api/scripts/run-tests.mjs
+    # prints. A silent skip is how #4711 went unnoticed — surface it.
+    local test_log="$PREPUSH_LOG_DIR/prepush-${pkg//\//_}-npm-test.log"
+    if [ -f "$test_log" ] && grep -q "INTEGRATION TESTS SKIPPED" "$test_log"; then
+        echo "  NOTE: $pkg integration tests were SKIPPED (unit tests only)." >&2
+        grep -E '^(Why:|  - (with|without) SSL:)' "$test_log" | sed 's/^/    /' >&2
+        echo "    How to enable them: $test_log" >&2
+    fi
+
     # Coverage floor check (after tests generate lcov.info)
     local cov_file="$pkg_dir/coverage/lcov.info"
     local baselines_file="coverage-baselines.json"
