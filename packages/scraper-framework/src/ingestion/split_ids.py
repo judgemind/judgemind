@@ -5,9 +5,11 @@ rulings) is split into individual ruling records, each split ruling needs its
 own unique ``document_id``.  This module provides a deterministic UUID5-based
 generator so re-processing the same document always produces the same IDs.
 
-This function is used by:
-  - ``ingestion.worker._llm_split_document()``
-  - ``scripts/reingest_from_s3.py``
+``split_child_document_id`` is the canonical scheme (#4796).  It is used by:
+  - ``ingestion.worker._llm_split_document()`` and its deterministic splitters
+  - ``ingestion.ruling_guards.convert_extracted_rulings()``
+  - ``framework.base.BaseScraper._process_document()`` for scraper
+    pre-split children
 """
 
 from __future__ import annotations
@@ -96,3 +98,35 @@ def make_split_document_id(original_document_id: str, split_index: int) -> str:
         A UUID string suitable for use as ``rulings.document_id``.
     """
     return str(uuid.uuid5(_SPLIT_UUID_NAMESPACE, f"{original_document_id}:{split_index}"))
+
+
+def split_child_document_id(parent_document_id: str, position: int, count: int) -> str:
+    """Return the canonical document id of ruling *position* in a split of
+    one document into *count* rulings.
+
+    This is the one id scheme for split rulings, used by the worker's
+    splitters (live capture, prefix reingest and rebuild all go through
+    them) and by scrapers that split at capture time (#4796):
+
+    - a split into a single ruling keeps the parent id;
+    - otherwise ruling ``position`` (zero-based, in document order) gets
+      ``make_split_document_id(parent_document_id, position)``.
+
+    Never key the id on a court-assigned entry number (e.g. Fresno's
+    ``(20) Tentative Ruling``): the reingest path splits by position, so an
+    entry-number id is a second id for the same ruling.
+
+    Args:
+        parent_document_id: The document id of the unsplit document —
+            ``uuid5(NAMESPACE_URL, content_hash)`` for a captured document.
+        position: Zero-based position of the ruling in the split.
+        count: Total number of rulings in the split.
+
+    Returns:
+        The document id for the ruling.
+    """
+    if position < 0 or (count > 0 and position >= count):
+        raise ValueError(f"split position {position} out of range for a split of {count}")
+    if count <= 1:
+        return parent_document_id
+    return make_split_document_id(parent_document_id, position)

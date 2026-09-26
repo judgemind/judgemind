@@ -665,6 +665,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                             # Used by the phantom-ruling guard below.
                             valid_cns = _extract_calendar_header_case_numbers(text)
                             docs_before_pdf = len(docs)
+                            kept_rulings = []
                             for ruling in llm_rulings:
                                 # Phantom-ruling guard (#3798): drop LLM rulings
                                 # whose case_number does not appear in a top-level
@@ -682,6 +683,8 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                                             source_url=href,
                                         )
                                         continue
+                                kept_rulings.append(ruling)
+                            for position, ruling in enumerate(kept_rulings):
                                 doc = self._make_base_doc(
                                     source_url=href,
                                     raw_content=pdf_content,
@@ -709,6 +712,10 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                                 doc.extra["_llm_extracted"] = True
                                 doc.extra["pre_split"] = True
                                 doc.extra["ruling_index"] = ruling.ruling_index
+                                # Positional id slot, as the worker's split
+                                # of this PDF would assign (#4796).
+                                doc.extra["split_position"] = position
+                                doc.extra["split_count"] = len(kept_rulings)
                                 if ruling.case_type:
                                     doc.extra["case_type"] = ruling.case_type
                                 docs.append(doc)

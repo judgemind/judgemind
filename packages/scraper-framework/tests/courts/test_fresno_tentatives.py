@@ -435,7 +435,8 @@ def test_fresno_run_populates_dept_from_filename() -> None:
 
 
 @respx.mock
-def test_fresno_run_splits_multi_ruling_pdfs() -> None:
+def test_fresno_run_leaves_multi_ruling_pdfs_for_worker_split() -> None:
+    """A multi-ruling PDF is one document; the worker splits it (#4796)."""
     html = _load_html("fresno_index_page.html")
     pdf_bytes = _load_bytes("fresno_403_20260310_d019042f.pdf")
 
@@ -447,15 +448,19 @@ def test_fresno_run_splits_multi_ruling_pdfs() -> None:
     scraper = FresnoTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # Should be more docs than PDFs (20) due to splitting
-    assert len(docs) > 20
+    # One document per PDF (20 links), none pre-split.
+    assert len(docs) == 20
+    assert not any(d.extra.get("pre_split") for d in docs)
+    assert all(d.extra.get("multi_ruling") for d in docs)
+    # PDF-level fields only: no case-level field for the worker to copy
+    # onto the wrong split child.
+    assert all(d.case_number is None and d.case_title is None for d in docs)
+    assert all(d.ruling_text for d in docs)
+    assert all(d.hearing_date == datetime(2026, 3, 10) for d in docs)
 
-    # Each doc should have case number and case title
-    has_case = [d for d in docs if d.case_number]
-    assert len(has_case) > 0
-
-    has_title = [d for d in docs if d.case_title]
-    assert len(has_title) > 0
+    parsed = scraper.parse_document(docs[0])
+    assert parsed.case_number is None
+    assert parsed.hearing_date == datetime(2026, 3, 10)
 
 
 @respx.mock
@@ -895,8 +900,8 @@ def test_fresno_hearing_date_from_filename_invalid_day() -> None:
 
 
 @respx.mock
-def test_fresno_parse_document_pre_split_no_hearing_date_fallback() -> None:
-    """Pre-split doc without hearing_date falls back to filename extraction."""
+def test_fresno_parse_document_multi_ruling_no_hearing_date_fallback() -> None:
+    """Multi-ruling doc without hearing_date falls back to filename extraction."""
     config = fresno_default_config()
     config.request_delay_seconds = 0
     scraper = FresnoTentativeRulingsScraper(config=config)
@@ -908,7 +913,7 @@ def test_fresno_parse_document_pre_split_no_hearing_date_fallback() -> None:
         raw_content=b"fake-pdf",
         content_format=ContentFormat.PDF,
     )
-    doc.extra["pre_split"] = True
+    doc.extra["multi_ruling"] = True
     doc.extra["filename"] = "03-10-26-dept-403.pdf"
     doc.hearing_date = None
 
@@ -1196,14 +1201,60 @@ def test_fresno_split_ruling_has_department_field() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fetch_documents threads per-ruling department into pre-split children
+# Multi-ruling PDFs: one captured document, split by the worker (#4796)
 # ---------------------------------------------------------------------------
+
+_MIXED_DEPT_TEXT = (
+    "(20) Tentative Ruling\n"
+    "Re: Lopez v. Fresno Unified School District\n"
+    "Superior Court Case No. 25CECG03271\n"
+    "Hearing Date: March 10, 2026 (Dept. 403)\n"
+    "Motion: Demurrer to FAC\n"
+    "Tentative Ruling:\n"
+    "To sustain the demurrer.\n\n"
+    "(46) Tentative Ruling\n"
+    "Re: Blevens v. Medrano\n"
+    "Superior Court Case No. 25CECG04177\n"
+    "Hearing Date: March 10, 2026 (Dept. 501)\n"
+    "Motion: Motion to Set Aside Default\n"
+    "Tentative Ruling:\n"
+    "To take the motion off calendar.\n"
+)
+
+
+def _fresno_worker_split(text: str, department: str | None = "403") -> list[dict]:
+    """Run the worker's Fresno split over *text*; return the child events."""
+    from ingestion.worker import _try_fresno_pdf_split
+
+    events: list[dict] = []
+    event = {
+        "document_id": "11111111-1111-5111-8111-111111111111",
+        "county": "Fresno",
+        "content_format": "pdf",
+        "department": department,
+        "scraper_id": "ca-fresno-tentatives-civil",
+    }
+    assert _try_fresno_pdf_split(event, event["document_id"], text, events.append)
+    return events
+
+
+def test_fresno_worker_split_preserves_per_ruling_department() -> None:
+    """Each split child carries the department from its ruling header; the
+    filename department is only the fallback."""
+    events = _fresno_worker_split(_MIXED_DEPT_TEXT, department="403")
+    assert [e["department"] for e in events] == ["403", "501"]
 
 
 @respx.mock
-def test_fresno_fetch_documents_preserves_per_ruling_department() -> None:
-    """Each pre-split child must carry the department from its ruling header."""
+def test_fresno_fetch_documents_multi_ruling_is_one_document() -> None:
+    """A multi-ruling PDF is captured as ONE document with the content id;
+    the worker's positional split gives each ruling a unique id (#2367,
+    #4796)."""
     from unittest.mock import patch
+
+    from framework.base import BaseScraper
+    from framework.hashing import sha256_hex
+    from ingestion.split_ids import make_split_document_id
 
     html = _load_html("fresno_index_page.html")
 
@@ -1212,120 +1263,56 @@ def test_fresno_fetch_documents_preserves_per_ruling_department() -> None:
         return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
     )
 
-    # Simulate a mixed-department PDF: items from 403 and 501 in one file.
-    # The filename encodes 403 but an individual ruling carries 501 — the
-    # per-ruling header must win.
-    mixed_text = (
-        "(20) Tentative Ruling\n"
-        "Re: Lopez v. Fresno Unified School District\n"
-        "Superior Court Case No. 25CECG03271\n"
-        "Hearing Date: March 10, 2026 (Dept. 403)\n"
-        "Motion: Demurrer to FAC\n"
-        "Tentative Ruling:\n"
-        "To sustain the demurrer.\n\n"
-        "(46) Tentative Ruling\n"
-        "Re: Blevens v. Medrano\n"
-        "Superior Court Case No. 25CECG04177\n"
-        "Hearing Date: March 10, 2026 (Dept. 501)\n"
-        "Motion: Motion to Set Aside Default\n"
-        "Tentative Ruling:\n"
-        "To take the motion off calendar.\n"
-    )
-
     with patch(
         "courts.ca.fresno_tentatives._extract_pdf_text",
-        return_value=mixed_text,
+        return_value=_MIXED_DEPT_TEXT,
     ):
         config = fresno_default_config()
         config.request_delay_seconds = 0
         scraper = FresnoTentativeRulingsScraper(config=config)
         docs = scraper.fetch_documents()
 
-    # 20 PDFs each split into 2 rulings = 40 pre-split children
-    pre_split = [d for d in docs if d.extra.get("pre_split")]
-    assert len(pre_split) == 40
-    depts = {d.extra["ruling_index"]: d.department for d in pre_split[:2]}
-    # Ruling 20 → Dept 403, Ruling 46 → Dept 501
-    assert depts == {20: "403", 46: "501"}
+    assert len(docs) == 20
+    doc = docs[0]
+    assert doc.extra.get("multi_ruling") is True
+    assert "pre_split" not in doc.extra
+    assert doc.department == "403"
 
-
-@respx.mock
-def test_fresno_fetch_documents_pre_split_children_are_unique_by_base_hash() -> None:
-    """Pre-split children share raw_content but must get unique document_ids via base.py salting.
-
-    This is a regression test for #2367: before the fix, all children shared the
-    same content-hash-derived document_id, so only the first child landed in
-    rulings due to the UNIQUE(document_id) constraint.  The fix is in
-    framework.base.BaseScraper._process_document which now salts the
-    document_id with ruling_index for pre_split children.
-    """
-    from unittest.mock import patch
-
-    from framework.base import BaseScraper
-
-    html = _load_html("fresno_index_page.html")
-
-    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
-    respx.get(url__regex=r"\.pdf").mock(
-        return_value=httpx.Response(200, content=b"%PDF-1.4 fake-pdf-bytes")
-    )
-
-    split_text = (
-        "(20) Tentative Ruling\n"
-        "Re: Case A\n"
-        "Superior Court Case No. 25CECG00001\n"
-        "Hearing Date: March 10, 2026 (Dept. 403)\n"
-        "Motion: A\n"
-        "Tentative Ruling:\n"
-        "To grant.\n\n"
-        "(30) Tentative Ruling\n"
-        "Re: Case B\n"
-        "Superior Court Case No. 25CECG00002\n"
-        "Hearing Date: March 10, 2026 (Dept. 403)\n"
-        "Motion: B\n"
-        "Tentative Ruling:\n"
-        "To deny.\n\n"
-        "(40) Tentative Ruling\n"
-        "Re: Case C\n"
-        "Superior Court Case No. 25CECG00003\n"
-        "Hearing Date: March 10, 2026 (Dept. 403)\n"
-        "Motion: C\n"
-        "Tentative Ruling:\n"
-        "To continue.\n"
-    )
-
-    with patch(
-        "courts.ca.fresno_tentatives._extract_pdf_text",
-        return_value=split_text,
-    ):
-        config = fresno_default_config()
-        config.request_delay_seconds = 0
-        scraper = FresnoTentativeRulingsScraper(config=config)
-        pre_children = [d for d in scraper.fetch_documents() if d.extra.get("pre_split")]
-
-    # Take only the 3 children from one PDF to check uniqueness cleanly.
-    first_pdf_children = pre_children[:3]
-    assert len(first_pdf_children) == 3
-    # Before processing, each child has the same raw_content and empty document_id.
-    assert len({id(c) for c in first_pdf_children}) == 3
-    assert all(c.raw_content == first_pdf_children[0].raw_content for c in first_pdf_children)
-
-    # Process through base — this assigns document_id via the salted path.
-    # Skip the archive by setting scraper._archiver to None.
     scraper._archiver = None
     scraper._event_bus = None
-    for child in first_pdf_children:
-        BaseScraper._process_document(scraper, child)
-
-    ids = [c.document_id for c in first_pdf_children]
-    # All must be non-empty and unique.
-    assert all(ids)
-    assert len(set(ids)) == 3, f"Expected 3 unique IDs, got {ids}"
-    # All must be valid UUIDs.
+    BaseScraper._process_document(scraper, doc)
     import uuid as _uuid
 
-    for i in ids:
-        _uuid.UUID(i)
+    parent_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, sha256_hex(b"%PDF-1.4 fake-pdf-bytes")))
+    assert doc.document_id == parent_id
+
+    from ingestion.worker import _try_fresno_pdf_split
+
+    children: list[dict] = []
+    event = {
+        "document_id": doc.document_id,
+        "county": "Fresno",
+        "content_format": "pdf",
+        "department": doc.department,
+    }
+    assert _try_fresno_pdf_split(event, doc.document_id, doc.ruling_text, children.append)
+    assert [c["document_id"] for c in children] == [
+        make_split_document_id(parent_id, 0),
+        make_split_document_id(parent_id, 1),
+    ]
+
+
+def test_fresno_worker_split_ignores_page_join_style() -> None:
+    """Text from a live capture (pages joined with ``\\n``) and from the
+    worker's raw-PDF path (``\\n\\f\\n``) split identically (#4796)."""
+    pages = _MIXED_DEPT_TEXT.split("(46)")
+    live_text = pages[0] + "\n(46)" + pages[1]
+    raw_text = pages[0] + "\n\f\n(46)" + pages[1]
+
+    live = _fresno_worker_split(live_text)
+    raw = _fresno_worker_split(raw_text)
+    assert [e["document_id"] for e in live] == [e["document_id"] for e in raw]
+    assert [e["ruling_text"] for e in live] == [e["ruling_text"] for e in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -1361,8 +1348,9 @@ def test_base_process_document_unsalted_id_for_non_pre_split() -> None:
     assert doc.document_id == expected
 
 
-def test_base_process_document_salted_id_for_pre_split() -> None:
-    """Pre-split children get a deterministic salted document_id per ruling_index."""
+def test_base_process_document_pre_split_uses_positional_split_id() -> None:
+    """Pre-split children get ``split_child_document_id(parent, position,
+    count)``: the id the worker's split of the same content assigns (#4796)."""
     from unittest.mock import patch
 
     from framework.base import BaseScraper
@@ -1376,29 +1364,30 @@ def test_base_process_document_salted_id_for_pre_split() -> None:
 
     from framework import ContentFormat
 
-    ids_observed: list[str] = []
-    for idx in (3, 20, 47):
+    def _process(position: int, count: int, ruling_index: int) -> str:
         doc = scraper._make_base_doc(
             source_url="https://example.com/shared.pdf",
             raw_content=b"shared-bytes-for-all-children",
             content_format=ContentFormat.PDF,
         )
         doc.extra["pre_split"] = True
-        doc.extra["ruling_index"] = idx
+        doc.extra["ruling_index"] = ruling_index
+        doc.extra["split_position"] = position
+        doc.extra["split_count"] = count
         with patch.object(scraper, "parse_document", side_effect=lambda d: d):
             BaseScraper._process_document(scraper, doc)
-        ids_observed.append(doc.document_id)
+        return doc.document_id
 
-    # All three must be distinct
-    assert len(set(ids_observed)) == 3, f"expected unique IDs, got {ids_observed}"
-    # And deterministic: re-running should yield the same IDs
     import uuid as _uuid
 
     from framework.hashing import sha256_hex
 
     parent_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, sha256_hex(b"shared-bytes-for-all-children")))
-    for idx, observed in zip((3, 20, 47), ids_observed, strict=True):
-        assert observed == make_split_document_id(parent_id, idx)
+    # The court entry number (ruling_index) never feeds the id.
+    observed = [_process(pos, 3, idx) for pos, idx in enumerate((3, 20, 47))]
+    assert observed == [make_split_document_id(parent_id, i) for i in range(3)]
+    # A split into one ruling keeps the parent id, as the worker does.
+    assert _process(0, 1, 20) == parent_id
 
 
 # ---------------------------------------------------------------------------

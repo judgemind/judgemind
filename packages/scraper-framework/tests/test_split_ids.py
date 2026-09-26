@@ -12,11 +12,32 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from ingestion.split_ids import (
     derive_parent_document_id,
     is_split_child_id,
     make_split_document_id,
+    split_child_document_id,
 )
+
+
+class TestSplitChildDocumentId:
+    """#4796: the one canonical split-child id scheme."""
+
+    def test_single_ruling_keeps_parent_id(self) -> None:
+        assert split_child_document_id("p", 0, 1) == "p"
+
+    def test_multi_ruling_is_positional(self) -> None:
+        parent = derive_parent_document_id("a" * 64)
+        assert [split_child_document_id(parent, i, 3) for i in range(3)] == [
+            make_split_document_id(parent, i) for i in range(3)
+        ]
+
+    @pytest.mark.parametrize(("position", "count"), [(-1, 3), (3, 3), (5, 2)])
+    def test_out_of_range_position_rejected(self, position: int, count: int) -> None:
+        with pytest.raises(ValueError, match="out of range"):
+            split_child_document_id("p", position, count)
 
 
 class TestMakeSplitDocumentId:

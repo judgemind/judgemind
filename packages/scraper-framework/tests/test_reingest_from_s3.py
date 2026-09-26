@@ -16110,3 +16110,252 @@ class TestSplitChildRelinkScope:
 
     def test_reingest_child_with_real_case_relinks(self) -> None:
         assert self._relink_kwarg(self._child(_sc_prefix_event())) is True
+
+
+# ---------------------------------------------------------------------------
+# #4796 — live pre-split capture and prefix reingest write the same ids
+# ---------------------------------------------------------------------------
+#
+# A live Fresno capture used to split the PDF in the scraper and give each
+# child ``make_split_document_id(P, <court entry number>)``; a prefix
+# reingest of the same S3 key splits in the worker and uses
+# ``make_split_document_id(P, 0..N-1)``.  The two id sets never matched, so
+# a reingest and the next live run churned each other's rows.  The worker
+# also treated each live child as a parent: it re-split it (grandchild ids)
+# and ran the stale-child cleanup with the child as the parent.
+
+_FRESNO_FIXTURE_PDF = os.path.join(
+    os.path.dirname(__file__), "fixtures", "fresno_403_20260310_d019042f.pdf"
+)
+_FRESNO_SOURCE_URL = (
+    "https://www.fresno.courts.ca.gov/system/files/tentative-rulings/03-10-26-dept-403.pdf"
+)
+
+
+def _fresno_s3_key(pdf_bytes: bytes) -> str:
+    return f"ca/fresno/superior_court/raw/{hashlib.sha256(pdf_bytes).hexdigest()}.pdf"
+
+
+def _live_fresno_events(pdf_bytes: bytes) -> list[dict[str, Any]]:
+    """Run a live Fresno capture of *pdf_bytes* and return the emitted
+    ``document.captured`` payloads, exactly as the worker receives them."""
+    from courts.ca.fresno_tentatives import FresnoTentativeRulingsScraper
+    from courts.ca.fresno_tentatives import default_config as fresno_config
+    from courts.ca.pdf_link_scraper import PdfLinkScraper
+    from framework import ContentFormat
+    from framework.base import BaseScraper
+    from framework.events import EventBus
+
+    redis_mock = MagicMock()
+    archiver = MagicMock()
+    archiver.archive.return_value = _fresno_s3_key(pdf_bytes)
+    archiver.bucket = "test-bucket"
+    config = fresno_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(
+        config=config, archiver=archiver, event_bus=EventBus(redis_mock)
+    )
+
+    raw = scraper._make_base_doc(
+        source_url=_FRESNO_SOURCE_URL,
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    raw.department = "403"
+    raw.courthouse = "B.F. Sisk Federal Courthouse"
+    raw.extra["link_text"] = "Dept 403"
+    raw.extra["filename"] = "03-10-26-dept-403.pdf"
+
+    with patch.object(PdfLinkScraper, "fetch_documents", return_value=[raw]):
+        docs = scraper.fetch_documents()
+    for doc in docs:
+        # Captured the day before the hearing, as the live scraper would.
+        doc.capture_timestamp = datetime(2026, 3, 9, 12, 0, 0)
+        BaseScraper._process_document(scraper, doc)
+    return [json.loads(c.args[1]["data"]) for c in redis_mock.xadd.call_args_list]
+
+
+def _reingest_fresno_event(pdf_bytes: bytes) -> dict[str, Any]:
+    parsed = {
+        "state": "ca",
+        "county": "fresno",
+        "court": "superior_court",
+        "content_hash": hashlib.sha256(pdf_bytes).hexdigest(),
+        "ext": "pdf",
+    }
+    return reingest._build_prefix_event(
+        _fresno_s3_key(pdf_bytes),
+        pdf_bytes,
+        parsed,
+        "test-bucket",
+        provenance={"source_url": _FRESNO_SOURCE_URL},
+    )
+
+
+def _run_worker_capture(
+    events: list[dict[str, Any]], worker: Any = None
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Process *events*; return (written document ids, stale-cleanup calls)."""
+    if worker is None:
+        worker = _split_set_change_worker()
+    worker._indexer = MagicMock()
+    written: list[str] = []
+    cleanups: list[dict[str, Any]] = []
+
+    def _fake_insert(conn: Any, **kwargs: Any) -> bool:
+        written.append(kwargs["document_id"])
+        return False
+
+    def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+        cleanups.append(
+            {
+                "s3_key": s3_key,
+                "valid_ids": list(valid_ids),
+                "parent_document_id": kwargs.get("parent_document_id"),
+                "owns_key": kwargs.get("owns_key"),
+            }
+        )
+        return 0
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.closed = False
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchone.return_value = ("11111111-2222-4333-8444-555555555555",)
+    mock_cur.fetchall.return_value = []
+
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.resolve_judge", return_value=None),
+        patch("ingestion.worker.batch_upsert_parties"),
+        patch("ingestion.worker.insert_document_and_ruling", side_effect=_fake_insert),
+        patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        for event in events:
+            worker.process_event(event)
+    return written, cleanups
+
+
+def _fresno_fixture_bytes() -> bytes:
+    with open(_FRESNO_FIXTURE_PDF, "rb") as fh:
+        return fh.read()
+
+
+def _content_parent(pdf_bytes: bytes) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, hashlib.sha256(pdf_bytes).hexdigest()))
+
+
+class TestPreSplitIdParity:
+    """#4796: live capture and prefix reingest of one S3 key write the same
+    document ids, and a live pre-split child is never re-split."""
+
+    def test_pre_split_live_and_reingest_write_same_ids_fresno(self) -> None:
+        pdf_bytes = _fresno_fixture_bytes()
+
+        live_ids, _ = _run_worker_capture(_live_fresno_events(pdf_bytes))
+        reingest_ids, _ = _run_worker_capture([_reingest_fresno_event(pdf_bytes)])
+
+        assert len(reingest_ids) > 1, "fixture must be a multi-ruling PDF"
+        assert sorted(live_ids) == sorted(reingest_ids)
+        parent = _content_parent(pdf_bytes)
+        assert sorted(reingest_ids) == sorted(
+            make_split_document_id(parent, i) for i in range(len(reingest_ids))
+        )
+
+    def test_pre_split_live_fresno_cleanup_scoped_to_content_parent(self) -> None:
+        """The live run's stale-child cleanup runs once, for the content
+        parent, keeping exactly the ids a reingest writes."""
+        pdf_bytes = _fresno_fixture_bytes()
+
+        live_ids, cleanups = _run_worker_capture(_live_fresno_events(pdf_bytes))
+
+        assert [c["parent_document_id"] for c in cleanups] == [_content_parent(pdf_bytes)]
+        assert sorted(cleanups[0]["valid_ids"]) == sorted(live_ids)
+        # The content parent owns the whole key: leftover entry-number and
+        # grandchild rows are removed too.
+        assert cleanups[0]["owns_key"] is True
+
+    def test_non_content_parent_cleanup_does_not_own_key(self) -> None:
+        """A split whose parent is not the key's content parent keeps the
+        #4788 own-rows-only scope."""
+        worker = _split_set_change_worker()
+        event = {**_sc_prefix_event(), "content_hash": "d" * 64}
+        with (
+            patch("ingestion.worker.delete_stale_split_children", return_value=0) as mock_del,
+            patch("ingestion.worker.psycopg"),
+        ):
+            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+        assert mock_del.call_args.kwargs["owns_key"] is False
+
+    def _pre_split_event(self, **extra: Any) -> dict[str, Any]:
+        content_hash = "c" * 64
+        parent = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
+        return {
+            "document_id": make_split_document_id(parent, 1),
+            "state": "CA",
+            "county": "Contra Costa",
+            "court": "Superior Court",
+            "content_format": "pdf",
+            "content_hash": content_hash,
+            "s3_key": f"ca/contra_costa/superior_court/raw/{content_hash}.pdf",
+            "s3_bucket": "test-bucket",
+            "scraper_id": "ca-cc-tentatives",
+            "source_url": "https://example.com/x.pdf",
+            "ruling_text": (
+                "The demurrer is SUSTAINED. The motion to strike is GRANTED. "
+                "Case C24-00001 and case C24-00002 are both on calendar today."
+            ),
+            "case_number": "C24-00001",
+            "case_title": "Alpha v. Beta",
+            "hearing_date": "2026-03-05",
+            "outcome": "sustained",
+            "motion_type": "demurrer",
+            "extra": {"pre_split": True, **extra},
+        }
+
+    def test_pre_split_child_not_resplit(self) -> None:
+        """A live pre-split child is written as-is under its own id: no
+        multi-ruling split and no stale-child cleanup with it as parent."""
+        event = self._pre_split_event(_llm_extracted=True, split_position=1, split_count=3)
+        worker = _split_set_change_worker()
+        with patch.object(worker, "_llm_split_document") as mock_split:
+            written, cleanups = _run_worker_capture([event], worker)
+
+        mock_split.assert_not_called()
+        assert cleanups == []
+        assert written == [event["document_id"]]
+
+    def test_as_pre_split_child_marks_only_unmarked_pre_split_events(self) -> None:
+        from ingestion.worker import as_pre_split_child
+
+        plain = {"document_id": "d", "extra": {}}
+        assert as_pre_split_child(plain) is plain
+        already = {"document_id": "d", "_split_processed": True, "extra": {"pre_split": True}}
+        assert as_pre_split_child(already) is already
+
+        event = self._pre_split_event(_llm_extracted=True, split_position=2, split_count=3)
+        marked = as_pre_split_child(event)
+        assert marked["_split_processed"] is True
+        assert marked["_llm_extracted"] is True
+        assert (marked["_split_index"], marked["_split_count"]) == (2, 3)
+        assert marked["_original_document_id"] == str(
+            uuid.uuid5(uuid.NAMESPACE_URL, event["content_hash"])
+        )
+
+        no_hash = as_pre_split_child({"document_id": "d", "extra": {"pre_split": True}})
+        assert no_hash["_original_document_id"] == "d"
+        assert "_llm_extracted" not in no_hash
+
+    def test_pre_split_child_not_resplit_without_position_keys(self) -> None:
+        """An in-flight child captured before the fix (only ``ruling_index``)
+        is not re-split either."""
+        event = self._pre_split_event(ruling_index=20)
+        worker = _split_set_change_worker()
+        with patch.object(worker, "_llm_split_document") as mock_split:
+            written, cleanups = _run_worker_capture([event], worker)
+
+        mock_split.assert_not_called()
+        assert cleanups == []
+        assert written == [event["document_id"]]

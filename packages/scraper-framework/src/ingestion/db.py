@@ -2410,6 +2410,7 @@ def delete_stale_split_children(
     *,
     parent_document_id: str,
     deleted_ids: list[str] | None = None,
+    owns_key: bool = False,
 ) -> int:
     """Delete split-child document records that are no longer valid.
 
@@ -2427,6 +2428,11 @@ def delete_stale_split_children(
          parent owns.  Any other UUIDv5 id on the key is left alone: scraper
          pre-split siblings (Fresno, CC, LA) share the key and have v5 ids
          derived from the content parent, not from this parent (#4788).
+         With ``owns_key=True`` the parent is the key's content parent
+         (``uuid5(content_hash)``): every row on the key was derived from
+         that one S3 object, so every v5 row not in the new set is stale,
+         including grandchild ids an older worker wrote by re-splitting a
+         pre-split child (#4796).
       3. Its ``id`` is NOT in the ``valid_document_ids`` list (the new set
          of split IDs that will be created/upserted by this processing run).
 
@@ -2450,6 +2456,8 @@ def delete_stale_split_children(
             are re-pointed here.
         deleted_ids: Optional list the removed document ids are appended to,
             so the caller can drop them from the search index.
+        owns_key: True when ``parent_document_id`` is the content parent
+            of the S3 object at ``s3_key``; see condition 2.
 
     Returns:
         The number of document rows deleted.
@@ -2474,7 +2482,7 @@ def delete_stale_split_children(
         )
         candidate_ids = [str(row[0]) for row in cur.fetchall()]
 
-    stale_ids = _own_split_rows(parent_document_id, candidate_ids)
+    stale_ids = candidate_ids if owns_key else _own_split_rows(parent_document_id, candidate_ids)
     skipped = len(candidate_ids) - len(stale_ids)
     if skipped:
         logger.info(
