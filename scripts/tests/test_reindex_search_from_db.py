@@ -50,72 +50,67 @@ def test_date_part(value: object, expected: str | None) -> None:
     assert reindex.date_part(value) == expected
 
 
-PG_ROW = {
-    "document_id": "aad4f50a-26ad-5ee0-984d-0259fda7d54a",
+# Expected metadata as ``expected_metadata`` returns it: the search doc built
+# from the Postgres ruling (hearing_date already normalized to YYYY-MM-DD).
+EXPECTED = {
     "case_number": "21STCV42883",
     "case_title": "Murillo v. BNSF Railway Company",
-    "hearing_date": date(2026, 7, 28),
-    "ruling_text": "x" * 800,
-    "summary": None,
+    "case_type": "civil",
+    "judge_name": "Doe, Jane",
+    "hearing_date": "2026-07-28",
+    "motion_type": "demurrer",
+    "outcome": None,
+    "summary": "x" * 500,
 }
 
 
 def test_drift_classes_in_sync() -> None:
-    src = {
-        "case_number": "21STCV42883",
-        "case_title": "Murillo v. BNSF Railway Company",
-        "hearing_date": "2026-07-28",
-    }
-    assert reindex.drift_classes(src, PG_ROW) == []
+    assert reindex.drift_classes(dict(EXPECTED), EXPECTED) == []
+
+
+def test_drift_classes_treats_empty_and_missing_as_equal() -> None:
+    src = {**EXPECTED, "outcome": ""}
+    src.pop("motion_type")
+    assert reindex.drift_classes(src, {**EXPECTED, "motion_type": None}) == []
 
 
 def test_drift_classes_issue_4712_sample() -> None:
-    """The ruling from the issue: datetime date + stale title."""
+    """The ruling from #4712: datetime date + stale title."""
     src = {
-        "case_number": "21STCV42883",
+        **EXPECTED,
         "case_title": "Berenice Murillo v. United Parcel Service, Inc",
         "hearing_date": "2026-07-28T00:00:00",
     }
-    assert reindex.drift_classes(src, PG_ROW) == [
+    assert reindex.drift_classes(src, EXPECTED) == [
         "hearing_date_shape_datetime",
         "case_title_mismatch",
     ]
 
 
 def test_drift_classes_date_and_number_mismatch() -> None:
-    src = {
-        "case_number": "OTHER",
-        "case_title": PG_ROW["case_title"],
-        "hearing_date": None,
-    }
-    assert reindex.drift_classes(src, PG_ROW) == [
-        "hearing_date_mismatch",
+    src = {**EXPECTED, "case_number": "OTHER", "hearing_date": None}
+    assert reindex.drift_classes(src, EXPECTED) == [
         "case_number_mismatch",
+        "hearing_date_mismatch",
+    ]
+
+
+def test_drift_classes_issue_4785_worker_drift() -> None:
+    """#4785: the pre-fix worker wrote raw event values — no case_type, the
+    extracted judge name, a re-extracted motion type."""
+    src = {**EXPECTED, "judge_name": "J. Doe", "motion_type": "other"}
+    src.pop("case_type")
+    assert reindex.drift_classes(src, EXPECTED) == [
+        "case_type_mismatch",
+        "judge_name_mismatch",
+        "motion_type_mismatch",
     ]
 
 
 def test_drift_classes_missing_and_orphan() -> None:
-    assert reindex.drift_classes(None, PG_ROW) == ["missing_in_os"]
+    assert reindex.drift_classes(None, EXPECTED) == ["missing_in_os"]
     assert reindex.drift_classes({"case_number": "X"}, None) == ["orphan_in_os"]
     assert reindex.drift_classes(None, None) == []
-
-
-def test_build_event_normalizes_date_and_fills_summary() -> None:
-    event = reindex.build_event(PG_ROW)
-    assert event["hearing_date"] == "2026-07-28"
-    assert event["summary"] == "x" * 500
-    assert event["case_title"] == "Murillo v. BNSF Railway Company"
-    assert event["document_id"] == PG_ROW["document_id"]
-
-
-def test_build_event_keeps_existing_summary() -> None:
-    event = reindex.build_event({**PG_ROW, "summary": "Short summary."})
-    assert event["summary"] == "Short summary."
-
-
-def test_build_event_empty_text_has_no_summary() -> None:
-    event = reindex.build_event({**PG_ROW, "ruling_text": None})
-    assert event["summary"] is None
 
 
 def test_chunked() -> None:
@@ -123,24 +118,24 @@ def test_chunked() -> None:
     assert list(reindex.chunked([], 2)) == []
 
 
-def test_fetch_pg_rows_first_ruling_wins() -> None:
-    cur = MagicMock()
-    col_a, col_b = MagicMock(), MagicMock()
-    col_a.name, col_b.name = "document_id", "case_title"
-    cur.description = [col_a, col_b]
-    cur.fetchall.return_value = [("d1", "First"), ("d1", "Second"), ("d2", "Other")]
+def test_load_events_and_expected_metadata_delegate_to_framework(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The script builds docs only through framework.search (shared with the
+    worker, #4785); it has no search-doc logic of its own."""
+    ruling_doc = MagicMock()
+    ruling_doc.load_search_events.return_value = {"d1": {"document_id": "d1"}}
+    indexer = MagicMock()
+    indexer.search_doc_metadata.return_value = {"case_number": "X"}
+    monkeypatch.setitem(sys.modules, "framework", MagicMock())
+    monkeypatch.setitem(sys.modules, "framework.search", MagicMock())
+    monkeypatch.setitem(sys.modules, "framework.search.ruling_doc", ruling_doc)
+    monkeypatch.setitem(sys.modules, "framework.search.indexer", indexer)
+
     conn = MagicMock()
-    conn.cursor.return_value.__enter__.return_value = cur
-
-    rows = reindex.fetch_pg_rows(conn, ["d1", "d2"])
-
-    assert rows == {
-        "d1": {"document_id": "d1", "case_title": "First"},
-        "d2": {"document_id": "d2", "case_title": "Other"},
-    }
-    sql, params = cur.execute.call_args.args
-    assert "ANY(%s)" in sql
-    assert params == (["d1", "d2"],)
+    assert reindex.load_events(conn, ["d1"]) == {"d1": {"document_id": "d1"}}
+    ruling_doc.load_search_events.assert_called_once_with(conn, ["d1"])
+    assert reindex.expected_metadata({"document_id": "d1"}) == {"case_number": "X"}
 
 
 def test_fetch_pg_document_ids_county_filter() -> None:

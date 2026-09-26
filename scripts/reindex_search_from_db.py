@@ -10,14 +10,19 @@ re-indexes the documents that have drifted.  It never re-runs the ingestion
 pipeline (no S3 parse, no LLM), so it is cheap enough to run county-wide or
 index-wide.  See #4712.
 
+The expected search doc comes from ``framework.search.ruling_doc`` — the
+same builder the ingestion worker uses after it commits a ruling (#4785) —
+so a doc this script repairs is exactly what the next re-ingest writes.
+
 Drift classes it detects:
 
 * ``hearing_date`` stored in a non ``YYYY-MM-DD`` shape (e.g. a datetime
-  ``2026-07-28T00:00:00``) or null while Postgres has a date — the web
-  search card renders these as "Date unknown".
-* ``hearing_date`` / ``case_title`` / ``case_number`` differing from
-  ``derived.rulings`` + ``derived.cases`` (stale after a case relink or a
-  preserve-first title upsert).
+  ``2026-07-28T00:00:00``) — the web search card renders these as
+  "Date unknown".
+* ``<field>_mismatch`` for every indexed metadata field (hearing_date,
+  case_title, case_number, case_type, judge_name, motion_type, outcome,
+  summary, ...) whose search value differs from the doc built from
+  ``derived.rulings`` + ``derived.cases`` + ``derived.judges``.
 * Postgres rulings with no search document (missing).
 * Search documents with no Postgres ruling (orphans; deleted only with
   ``--delete-orphans``).
@@ -47,39 +52,11 @@ from typing import Any
 
 INDEX_ALIAS = "tentative_rulings"
 DEFAULT_BUCKET = "judgemind-document-archive-dev"
-PG_BATCH = 1000
 INDEX_BATCH = 200
 SAMPLES_PER_CLASS = 10
 
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ]")
-
-# derived.* row → search-document shape.  Mirrors the fields the ingestion
-# worker passes to ``IndexingConsumer.index_document``.
-_RULINGS_SQL = """
-    SELECT
-        d.id::text              AS document_id,
-        c.case_number           AS case_number,
-        co.court_name           AS court,
-        co.county               AS county,
-        co.state                AS state,
-        j.canonical_name        AS judge_name,
-        r.hearing_date          AS hearing_date,
-        r.motion_type           AS motion_type,
-        r.outcome::text         AS outcome,
-        c.case_title            AS case_title,
-        c.case_type             AS case_type,
-        r.summary               AS summary,
-        r.ruling_text           AS ruling_text,
-        d.s3_key                AS s3_key,
-        d.content_hash          AS content_hash,
-        d.format::text          AS content_format
-    FROM derived.rulings r
-    JOIN derived.documents d ON d.id = r.document_id
-    JOIN derived.cases c ON c.id = r.case_id
-    JOIN derived.courts co ON co.id = r.court_id
-    LEFT JOIN derived.judges j ON j.id = r.judge_id
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -118,41 +95,34 @@ def date_part(value: Any) -> str | None:
 
 
 def drift_classes(
-    os_src: dict[str, Any] | None, pg_row: dict[str, Any] | None
+    os_src: dict[str, Any] | None, expected: dict[str, Any] | None
 ) -> list[str]:
-    """Return the drift classes between a search document and its PG ruling.
+    """Return the drift classes between a search document and its expected metadata.
 
-    An empty list means the document is in sync.
+    *expected* is the metadata of the doc built from the Postgres ruling
+    (``expected_metadata``), or None when there is no ruling.  An empty list
+    means the document is in sync.
     """
-    if os_src is None and pg_row is None:
+    if os_src is None and expected is None:
         return []
     if os_src is None:
         return ["missing_in_os"]
-    if pg_row is None:
+    if expected is None:
         return ["orphan_in_os"]
 
     classes: list[str] = []
     shape = classify_hearing_date(os_src.get("hearing_date"))
     if shape not in ("date_only", "null"):
         classes.append(f"hearing_date_shape_{shape}")
-    pg_date = date_part(pg_row.get("hearing_date"))
-    if date_part(os_src.get("hearing_date")) != pg_date:
-        classes.append("hearing_date_mismatch")
-    if (os_src.get("case_title") or None) != (pg_row.get("case_title") or None):
-        classes.append("case_title_mismatch")
-    if (os_src.get("case_number") or None) != (pg_row.get("case_number") or None):
-        classes.append("case_number_mismatch")
+    for field, want in expected.items():
+        have = os_src.get(field)
+        if field == "hearing_date":
+            differs = date_part(have) != date_part(want)
+        else:
+            differs = (have or None) != (want or None)
+        if differs:
+            classes.append(f"{field}_mismatch")
     return classes
-
-
-def build_event(pg_row: dict[str, Any]) -> dict[str, Any]:
-    """Build an ``IndexingConsumer`` event from a ``_RULINGS_SQL`` row."""
-    event = dict(pg_row)
-    event["hearing_date"] = date_part(pg_row.get("hearing_date"))
-    ruling_text = pg_row.get("ruling_text") or ""
-    if not event.get("summary"):
-        event["summary"] = ruling_text[:500] if ruling_text else None
-    return event
 
 
 def chunked(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
@@ -167,12 +137,32 @@ def chunked(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Shared search-doc builder (framework.search — the worker uses it too)
+# ---------------------------------------------------------------------------
+
+
+def load_events(conn: Any, document_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Return ``{document_id: search event}`` built from the committed rows."""
+    from framework.search.ruling_doc import load_search_events
+
+    return load_search_events(conn, document_ids)
+
+
+def expected_metadata(event: dict[str, Any]) -> dict[str, Any]:
+    """Return the indexed metadata the search doc for *event* should carry."""
+    from framework.search.indexer import search_doc_metadata
+
+    return search_doc_metadata(event)
+
+
+# ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
 
 
 def scan_os_docs(os_client: Any, county: str | None) -> dict[str, dict[str, Any]]:
     """Return ``{_id: _source}`` for every search doc (optionally one county)."""
+    from framework.search.indexer import INDEXED_METADATA_FIELDS
     from opensearchpy import helpers
 
     query: dict[str, Any] = {"match_all": {}}
@@ -183,24 +173,11 @@ def scan_os_docs(os_client: Any, county: str | None) -> dict[str, dict[str, Any]
         os_client,
         index=INDEX_ALIAS,
         query={"query": query},
-        _source=["hearing_date", "case_title", "case_number", "county", "document_id"],
+        _source=[*INDEXED_METADATA_FIELDS, "document_id"],
         size=1000,
     ):
         docs[hit["_id"]] = hit.get("_source") or {}
     return docs
-
-
-def fetch_pg_rows(conn: Any, document_ids: list[str]) -> dict[str, dict[str, Any]]:
-    """Return ``{document_id: row}`` for the given ids (first ruling wins)."""
-    rows: dict[str, dict[str, Any]] = {}
-    with conn.cursor() as cur:
-        for batch in chunked(document_ids, PG_BATCH):
-            cur.execute(_RULINGS_SQL + " WHERE d.id::text = ANY(%s)", (batch,))
-            cols = [c.name for c in cur.description]
-            for rec in cur.fetchall():
-                row = dict(zip(cols, rec, strict=True))
-                rows.setdefault(row["document_id"], row)
-    return rows
 
 
 def fetch_pg_document_ids(conn: Any, county: str | None) -> list[str]:
@@ -253,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     os_docs = scan_os_docs(os_client, args.county)
     pg_ids = fetch_pg_document_ids(conn, args.county)
     all_ids = sorted(set(os_docs) | set(pg_ids))
-    pg_rows = fetch_pg_rows(conn, all_ids)
+    events = load_events(conn, all_ids)
 
     shapes = Counter(
         classify_hearing_date(src.get("hearing_date")) for src in os_docs.values()
@@ -263,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
     drifted: list[str] = []
     orphans: list[str] = []
     for doc_id in all_ids:
-        classes = drift_classes(os_docs.get(doc_id), pg_rows.get(doc_id))
+        event = events.get(doc_id)
+        expected = expected_metadata(event) if event is not None else None
+        classes = drift_classes(os_docs.get(doc_id), expected)
         if not classes:
             continue
         if classes == ["orphan_in_os"]:
@@ -290,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
             "os": os_docs.get(doc_id),
             "pg": {
                 k: str(v) if v is not None else None
-                for k, v in (pg_rows.get(doc_id) or {}).items()
+                for k, v in (events.get(doc_id) or {}).items()
                 if k not in ("ruling_text", "summary")
             },
         }
@@ -310,11 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         bucket=os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", DEFAULT_BUCKET),
         ensure_index=False,
     )
-    target_ids = [d for d in all_ids if d in pg_rows] if args.all else drifted
+    target_ids = [d for d in all_ids if d in events] if args.all else drifted
     indexed = 0
     for batch in chunked(target_ids, INDEX_BATCH):
-        events = [build_event(pg_rows[d]) for d in batch if d in pg_rows]
-        indexed += consumer.index_batch(events, force=True)
+        batch_events = [events[d] for d in batch if d in events]
+        indexed += consumer.index_batch(batch_events, force=True)
     deleted = consumer.delete_documents(orphans) if args.delete_orphans else 0
     print(
         "APPLY "

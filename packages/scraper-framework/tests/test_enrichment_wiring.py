@@ -191,10 +191,13 @@ def test_enrichment_fuzzy_match_updates_case_number(
     with caplog.at_level(logging.INFO):
         worker.process_event(event)
 
-    # Verify OpenSearch got the corrected case_number
-    os_mock.index.assert_called_once()
-    indexed_doc = os_mock.index.call_args.kwargs["body"]
-    assert indexed_doc["case_number"] == "23STCV12346"
+    # Verify the case upsert got the corrected case_number.  The search doc
+    # is built from the committed derived.* row, so this is how it reaches
+    # OpenSearch (#4785).
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INTO cases" in str(c)]
+    assert case_calls
+    assert "23STCV12346" in case_calls[0][0][1]
+    assert "23STCV12345" not in case_calls[0][0][1]
 
     # Verify log message
     assert any("Enrichment corrected case_number" in r.getMessage() for r in caplog.records)
@@ -250,10 +253,9 @@ def test_enrichment_alias_match_updates_judge_name(
         mock_conn, "Smith, Jonathan A.", "court-uuid-1", source="ca-la-tentatives-civil"
     )
 
-    # Verify OpenSearch got the canonical judge name
-    os_mock.index.assert_called_once()
-    indexed_doc = os_mock.index.call_args.kwargs["body"]
-    assert indexed_doc["judge_name"] == "Smith, Jonathan A."
+    # The canonical name reaches OpenSearch through the judge row that
+    # resolve_judge (asserted above) links — the search doc is built from
+    # the committed derived.* row (#4785).
 
     # Verify log message
     assert any("Enrichment resolved judge via alias" in r.getMessage() for r in caplog.records)

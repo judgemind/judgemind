@@ -116,6 +116,46 @@ def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[Ingestion
     return worker, os_mock
 
 
+_STORED_DOC_ID = "aaaaaaaa-0000-0000-0000-000000000001"
+
+
+def _stored_row(**overrides: object) -> dict:
+    """A ``RULING_SEARCH_SQL`` row as Postgres holds it after the upsert.
+
+    Since #4785 the worker builds the search doc from this committed row,
+    not from the event, so tests that inspect the indexed doc patch the row
+    lookup with ``_patch_stored_rows``.
+    """
+    row: dict = {
+        "document_id": _STORED_DOC_ID,
+        "case_number": "23STCV12345",
+        "court": "Superior Court",
+        "county": "Los Angeles",
+        "state": "CA",
+        "judge_name": "Smith, John Albert",
+        "hearing_date": date(2026, 3, 5),
+        "motion_type": "demurrer",
+        "outcome": "granted",
+        "case_title": "Doe v. Roe",
+        "case_type": "civil",
+        "summary": None,
+        "ruling_text": "The demurrer is SUSTAINED without leave to amend.",
+        "s3_key": "ca/los_angeles/superior_court/raw/abc123.html",
+        "content_hash": "abc123",
+        "content_format": "html",
+    }
+    row.update(overrides)
+    return row
+
+
+def _patch_stored_rows(*rows: dict):  # noqa: ANN202 — returns a patch context manager
+    """Patch the committed-row lookup the worker indexes from (#4785)."""
+    return patch(
+        "framework.search.ruling_doc.fetch_ruling_search_rows",
+        return_value={row["document_id"]: row for row in rows},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — helpers
 # ---------------------------------------------------------------------------
@@ -178,12 +218,14 @@ def test_process_event_happy_path(mock_psycopg: MagicMock, mock_resolve_judge: M
     mock_cur.rowcount = 1
 
     event = _make_event()
-    worker.process_event(event)
+    stored = _stored_row(ruling_text="The motion for summary judgment is GRANTED.")
+    with _patch_stored_rows(stored):
+        worker.process_event(event)
 
     # Postgres commit was called
     mock_conn.commit.assert_called_once()
 
-    # OpenSearch indexed
+    # OpenSearch indexed from the committed row
     os_mock.index.assert_called_once()
     indexed_doc = os_mock.index.call_args.kwargs["body"]
     assert indexed_doc["document_id"] == event["document_id"]
@@ -202,7 +244,8 @@ def test_process_event_happy_path(mock_psycopg: MagicMock, mock_resolve_judge: M
 def test_process_event_indexes_new_fields_in_opensearch(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
-    """motion_type, outcome, case_title, and summary are passed to OpenSearch."""
+    """motion_type, outcome, case_title, case_type and summary reach
+    OpenSearch — as the committed derived.* row holds them (#4785)."""
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
@@ -220,9 +263,11 @@ def test_process_event_indexes_new_fields_in_opensearch(
         motion_type="demurrer",
         case_title="In re Marriage of Smith",
     )
-    # Bypass LLM split so the event's own fields (motion_type, outcome) flow
-    # through to OpenSearch without being overridden by LLM extraction.
-    with patch.object(worker, "_llm_split_document", return_value=False):
+    stored = _stored_row(case_title="In re Marriage of Smith", ruling_text="x" * 800)
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(stored),
+    ):
         worker.process_event(event)
 
     os_mock.index.assert_called_once()
@@ -230,9 +275,9 @@ def test_process_event_indexes_new_fields_in_opensearch(
     assert indexed_doc["motion_type"] == "demurrer"
     assert indexed_doc["outcome"] == "granted"
     assert indexed_doc["case_title"] == "In re Marriage of Smith"
-    # summary is a truncated version of the cleaned ruling text
-    assert indexed_doc["summary"] is not None
-    assert len(indexed_doc["summary"]) <= 500
+    assert indexed_doc["case_type"] == "civil"
+    # no stored summary: the first 500 chars of the stored ruling text
+    assert indexed_doc["summary"] == "x" * 500
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -555,7 +600,10 @@ def test_process_event_duplicate_skips_opensearch(
 
     # First pass: capture the doc the worker would index.
     os_mock.get.side_effect = Exception("not found")
-    with patch.object(worker, "_llm_split_document", return_value=False):
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(_stored_row()),
+    ):
         worker.process_event(_make_event())
     indexed = os_mock.index.call_args.kwargs["body"]
 
@@ -564,7 +612,10 @@ def test_process_event_duplicate_skips_opensearch(
     os_mock.get.side_effect = None
     os_mock.get.return_value = {"_source": indexed}
     mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (False,)]
-    with patch.object(worker, "_llm_split_document", return_value=False):
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(_stored_row()),
+    ):
         worker.process_event(_make_event())
 
     os_mock.index.assert_not_called()
@@ -595,7 +646,11 @@ def test_process_event_indexes_postgres_case_title_and_hearing_date(
         case_title="Berenice Murillo v. United Parcel Service, Inc",
         hearing_date="2026-03-05T00:00:00",
     )
-    with patch.object(worker, "_llm_split_document", return_value=False):
+    stored = _stored_row(case_title="Murillo v. BNSF Railway Company")
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(stored),
+    ):
         worker.process_event(event)
 
     indexed = os_mock.index.call_args.kwargs["body"]
@@ -626,12 +681,137 @@ def test_process_event_reingest_refreshes_stale_search_doc(
         }
     }
 
-    with patch.object(worker, "_llm_split_document", return_value=False):
+    stored = _stored_row(case_title="Murillo v. BNSF Railway Company")
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(stored),
+    ):
         worker.process_event(_make_event())
 
     os_mock.index.assert_called_once()
     assert os_mock.index.call_args.kwargs["body"]["case_title"] == (
         "Murillo v. BNSF Railway Company"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #4785 — the search doc is built from the committed derived.* row
+# ---------------------------------------------------------------------------
+
+
+def _run_worker_with_stored_row(event: dict, stored: dict | None) -> tuple[MagicMock, MagicMock]:
+    """Run ``process_event`` with the committed row lookup returning *stored*."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.rowcount = 1
+    os_mock.get.side_effect = Exception("not found")
+    rows = {stored["document_id"]: stored} if stored else {}
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"),
+        patch(
+            "ingestion.worker.upsert_case_returning_title",
+            return_value=("case-uuid-1", event.get("case_title")),
+        ),
+        patch(
+            "framework.search.ruling_doc.fetch_ruling_search_rows", return_value=rows
+        ) as mock_fetch,
+        patch.object(worker, "_llm_split_document", return_value=False),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [("court-uuid-1",), (False,)]
+        worker.process_event(event)
+    mock_fetch.assert_called_once_with(mock_conn, [event["document_id"]])
+    return os_mock, mock_conn
+
+
+def test_reingest_missed_hearing_date_keeps_stored_values_in_search() -> None:
+    """#4785: a re-ingest whose extraction misses the hearing date (and reads
+    a different motion type) must not overwrite the search doc with the raw
+    event values.  Postgres keeps the stored date via COALESCE; the search
+    doc must carry that date, or the ruling drops out of default search
+    (``hearing_date <= today``)."""
+    event = _make_event(hearing_date=None, motion_type="motion to strike", judge_name="J. Smith")
+    os_mock, _ = _run_worker_with_stored_row(event, _stored_row())
+
+    os_mock.index.assert_called_once()
+    doc = os_mock.index.call_args.kwargs["body"]
+    assert doc["hearing_date"] == "2026-03-05"
+    assert doc["motion_type"] == "demurrer"
+    assert doc["judge_name"] == "Smith, John Albert"
+    assert doc["case_type"] == "civil"
+    assert doc["summary"] == "The demurrer is SUSTAINED without leave to amend."
+
+
+def test_worker_indexes_nothing_when_no_ruling_row_committed() -> None:
+    """#4785: with no committed ruling row there is nothing to mirror, so the
+    worker does not fall back to raw event values."""
+    os_mock, _ = _run_worker_with_stored_row(_make_event(), None)
+    os_mock.index.assert_not_called()
+
+
+def test_worker_skips_indexing_when_stored_row_read_fails() -> None:
+    """#4785: indexing is best-effort — a failed read of the committed row is
+    logged and swallowed, and the committed Postgres write stands."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.rowcount = 1
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"),
+        patch(
+            "framework.search.ruling_doc.fetch_ruling_search_rows",
+            side_effect=psycopg.OperationalError("boom"),
+        ),
+        patch.object(worker, "_llm_split_document", return_value=False),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+        worker.process_event(_make_event())
+
+    mock_conn.commit.assert_called_once()
+    os_mock.index.assert_not_called()
+
+
+def test_worker_and_reindex_script_build_identical_docs() -> None:
+    """#4785: the worker and ``scripts/reindex_search_from_db.py`` build the
+    same search doc for the same stored row, so a re-ingest after a repair
+    is a no-op and never undoes it."""
+    import os
+    import sys
+
+    from framework.search.indexer import IndexingConsumer
+
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts")
+    sys.path.insert(0, os.path.abspath(scripts_dir))
+    try:
+        import reindex_search_from_db as reindex
+    finally:
+        sys.path.pop(0)
+
+    stored = _stored_row(hearing_date=datetime(2026, 3, 5, 0, 0), summary="Stored summary.")
+    event = _make_event(hearing_date=None, motion_type="other", case_title="Doe v. Roe")
+    os_mock, _ = _run_worker_with_stored_row(event, stored)
+    worker_doc = dict(os_mock.index.call_args.kwargs["body"])
+
+    with patch(
+        "framework.search.ruling_doc.fetch_ruling_search_rows",
+        return_value={_STORED_DOC_ID: stored},
+    ):
+        events = reindex.load_events(MagicMock(), [_STORED_DOC_ID])
+    consumer = IndexingConsumer(
+        opensearch_client=MagicMock(), s3_client=MagicMock(), bucket="b", ensure_index=False
+    )
+    script_doc = consumer._build_os_doc(events[_STORED_DOC_ID], force=True)
+    assert script_doc is not None
+
+    worker_doc.pop("indexed_at")
+    script_doc.pop("indexed_at")
+    assert worker_doc == script_doc
+
+    # And the repaired doc reads as in sync to the script's audit.
+    assert (
+        reindex.drift_classes(worker_doc, reindex.expected_metadata(events[_STORED_DOC_ID])) == []
     )
 
 
@@ -4089,8 +4269,13 @@ def test_process_event_opensearch_uses_llm_summary_when_available(
     ]
 
     event = _make_event()
-    worker.process_event(event)
+    # The LLM summary is written to derived.rulings, and the search doc is
+    # built from that committed row (#4785).
+    with _patch_stored_rows(_stored_row(summary=llm_summary)):
+        worker.process_event(event)
 
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INTO rulings" in str(c)]
+    assert llm_summary in ruling_calls[0][0][1]
     os_mock.index.assert_called_once()
     indexed_doc = os_mock.index.call_args.kwargs["body"]
     assert indexed_doc["summary"] == llm_summary
@@ -4125,13 +4310,13 @@ def test_process_event_opensearch_falls_back_to_truncated_text_without_summary(
         motion_type="demurrer",
         case_title="In re Marriage of Smith",
     )
-    worker.process_event(event)
+    with _patch_stored_rows(_stored_row(summary=None, ruling_text="y" * 900)):
+        worker.process_event(event)
 
     os_mock.index.assert_called_once()
     indexed_doc = os_mock.index.call_args.kwargs["body"]
-    # Should fall back to truncated cleaned_ruling_text
-    assert indexed_doc["summary"] is not None
-    assert len(indexed_doc["summary"]) <= 500
+    # No stored summary: falls back to the stored ruling text, truncated
+    assert indexed_doc["summary"] == "y" * 500
     mock_summarize.assert_not_called()
 
 
