@@ -104,6 +104,34 @@ class BaseScraper(abc.ABC):
         """
         return None
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """Return the hearing date a live capture of this raw would carry (#4774).
+
+        ``rebuild_db`` and prefix-mode ``reingest_from_s3`` build ingestion
+        events straight from S3, so ``parse_document`` never runs and the
+        event has no ``hearing_date``.  The ingestion worker calls this hook
+        on such events, before any split, so every split child gets the
+        same authoritative date the live scraper would have handed it.
+
+        ``text`` is the document text the worker sees: extracted PDF text
+        for PDFs, the raw markup for HTML.  ``source_url`` is the captured
+        URL recorded in the S3 object's metadata, or ``""`` when unknown.
+
+        Overrides must derive the date the same way the live scraper does,
+        from the filename or a labelled header only.  Never return a date
+        from the ruling body, and return None rather than guess (#4682).
+        Default: None (the scraper sets no hearing date from the raw).
+        """
+        return None
+
     def __init__(
         self,
         config: ScraperConfig,

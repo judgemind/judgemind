@@ -3416,3 +3416,26 @@ class TestRebuildPreservesOriginalCaptureTime:
         parsed = _make_parsed()
         event = rebuild_db.build_event(_make_key(parsed), b"<html>x</html>", parsed, "b")
         assert event["capture_timestamp"] is None
+
+
+class TestRebuildRestoresCaptureProvenance:
+    """#4774: the rebuild event carries the captured ``source_url`` and the
+    live ``capture_scraper_id`` from the S3 object's metadata, so the
+    worker's ``hearing_date_for_raw`` hooks can read a filename date and
+    pick the right scraper for a county with several."""
+
+    def test_metadata_source_url_and_scraper_id_on_event(self) -> None:
+        url = "https://retired.cc-courts.org/civil/TR/Department 16/16_031126.pdf"
+        event = _run_one_document_from_s3(
+            b"<html>ruling</html>",
+            {"Metadata": {"source-url": url, "scraper-id": "ca-cc-tentatives"}},
+        )
+        assert event["source_url"] == url
+        assert event["capture_scraper_id"] == "ca-cc-tentatives"
+        # The synthetic rebuild scraper_id is unchanged: audits key on it.
+        assert event["scraper_id"] == "rebuild-ca-santa_clara"
+
+    def test_no_metadata_leaves_source_url_empty(self) -> None:
+        event = _run_one_document_from_s3(b"<html>ruling</html>", {})
+        assert event["source_url"] == ""
+        assert "capture_scraper_id" not in event

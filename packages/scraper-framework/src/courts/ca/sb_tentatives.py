@@ -37,7 +37,7 @@ from typing import Any
 
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
-from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper, source_url_filename
 
 INDEX_URL = "https://old.sb-court.org/GeneralInfo/TentativeRulings.aspx"
 BASE_URL = "https://old.sb-court.org"
@@ -97,6 +97,40 @@ def _sb_hearing_date_from_filename(filename: str) -> datetime | None:
         year = 2000 + int(mmddyy[4:6])
         return datetime(year, month, day)
     except (ValueError, IndexError):
+        return None
+
+
+# PDF title line: "TENTATIVE RULINGS 6-1-26" (M-D-YY, the first line of the
+# PDF).  Anchored to a line that is only the title and the date, so a date in
+# a ruling body never matches (#4682).
+_HEADER_DATE_RE = re.compile(
+    r"^[ \t]*TENTATIVE\s+RULINGS?[ \t]+(?:FOR[ \t]+)?"
+    r"(?P<month>\d{1,2})[-/.](?P<day>\d{1,2})[-/.](?P<year>\d{2}|\d{4})[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _sb_hearing_date_from_text(text: str) -> datetime | None:
+    """Hearing date from the SB PDF header.
+
+    Tries the shared labelled-header patterns (``extract_hearing_date``,
+    which ``parse_document`` has always used), then the SB title line
+    ``TENTATIVE RULINGS 6-1-26``.  None when neither matches.
+    """
+    from ingestion.extract import extract_hearing_date
+
+    hd = extract_hearing_date(text)
+    if hd:
+        return datetime(hd.year, hd.month, hd.day)
+    m = _HEADER_DATE_RE.search(text)
+    if not m:
+        return None
+    year = int(m.group("year"))
+    if year < 100:
+        year += 2000
+    try:
+        return datetime(year, int(m.group("month")), int(m.group("day")))
+    except ValueError:
         return None
 
 
@@ -168,13 +202,29 @@ class SBTentativeRulingsScraper(PdfLinkScraper):
         # Fallback: extract hearing date from PDF text header
         # (covers reingest where link_text is unavailable)
         if doc.ruling_text and not doc.hearing_date:
-            from ingestion.extract import extract_hearing_date
-
-            hd = extract_hearing_date(doc.ruling_text)
-            if hd:
-                doc.hearing_date = datetime(hd.year, hd.month, hd.day)
+            doc.hearing_date = _sb_hearing_date_from_text(doc.ruling_text)
 
         return doc
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``CV{LOC}{DEPT}{MMDDYY}.pdf`` filename date, else the PDF header (#4774).
+
+        The link text ``parse_document`` reads is the URL's filename.
+        """
+        if content_format not in ("", "pdf"):
+            return None
+        filename_date = _sb_hearing_date_from_filename(source_url_filename(source_url))
+        if filename_date is not None:
+            return filename_date
+        return _sb_hearing_date_from_text(text) if text else None
 
 
 def default_config(s3_bucket: str = "") -> ScraperConfig:

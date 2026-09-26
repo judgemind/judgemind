@@ -322,6 +322,25 @@ def _extract_header_fields(content: BeautifulSoup) -> _HeaderFields:
     return result
 
 
+def _la_header_hearing_date(text: str, content_format: str = "") -> datetime | None:
+    """Return the ``Hearing Date:`` from an LA page's ``<b>`` header (#4774).
+
+    The ``hearing_date_for_raw`` hook for both LA scrapers.  Live captures
+    carry the dropdown date, and ``_extract_ruling_fields`` replaces it with
+    this header date.  A multi-case page holds one department's calendar for
+    one day, so its first header date is the page's date.  Like
+    ``_extract_ruling_fields``, reads only the ``div#speechSynthesis`` ruling
+    block.  Returns None for non-HTML content, a page without that block, or
+    a block with no header date.
+    """
+    if content_format not in ("", "html") or not text:
+        return None
+    content = BeautifulSoup(text, "lxml").find("div", id="speechSynthesis")
+    if content is None:
+        return None
+    return _extract_header_fields(content).hearing_date
+
+
 # ---------------------------------------------------------------------------
 # LLM extraction feature flag and configuration (#1938)
 # ---------------------------------------------------------------------------
@@ -1323,6 +1342,18 @@ class LATentativeRulingsScraper(BaseScraper):
         tally.raise_if_all_failed(docs)
         return docs
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """Page ``Hearing Date:`` header (#4774); see ``_la_header_hearing_date``."""
+        return _la_header_hearing_date(text, content_format)
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         if doc.extra.get("_llm_extracted"):
             # LLM-extracted docs may have some fields as None.
@@ -1475,6 +1506,18 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
                     )
         tally.raise_if_all_failed(docs)
         return docs
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """Page ``Hearing Date:`` header (#4774); see ``_la_header_hearing_date``."""
+        return _la_header_hearing_date(text, content_format)
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         # Guard against re-parsing LLM-pre-split documents (#2469, #2484).

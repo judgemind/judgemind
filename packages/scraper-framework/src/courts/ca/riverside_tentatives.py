@@ -473,6 +473,20 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
 
         return raw_docs
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``Tentative Rulings for <date>`` PDF header, as ``parse_document`` (#4774)."""
+        if content_format not in ("", "pdf") or not text:
+            return None
+        return _riv_hearing_date_from_text(text)
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract fields from PDF text.
 

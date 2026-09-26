@@ -112,6 +112,48 @@ def parse_event_datetime(text: str) -> datetime | None:
         return None
 
 
+# Ruling-file header line under the case caption, e.g.
+#   SUPERIOR COURT OF CALIFORNIA / COUNTY OF VENTURA / Probate Notes
+#   2024PRCE029972: IN THE MATTER OF DOROTHY MARWICK
+#   05/05/2026 in Department J6
+# The whole line must be the date plus the department, so a date in the
+# ruling body ("last heard on 04/14/26") never matches (#4682).
+_HEADER_DATE_LINE_RE = re.compile(
+    r"^[ \t]*(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})"
+    r"[ \t]+in[ \t]+Department[ \t]+\S+[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# The header sits in the first few lines; never search the body.
+_HEADER_REGION_CHARS = 1000
+
+
+def ventura_header_hearing_date(text: str) -> datetime | None:
+    """Return the hearing date from a ruling file's header.
+
+    Two header layouts are archived:
+
+    * PDF probate notes: a ``MM/DD/YYYY in Department X`` line under the
+      case caption.
+    * HTML rulings: a ``Hearing Date:`` label followed by the date.
+
+    Only the header region is searched.  None when neither is present.
+    """
+    header = text[:_HEADER_REGION_CHARS]
+    m = _HEADER_DATE_LINE_RE.search(header)
+    if m:
+        try:
+            return datetime(int(m.group("year")), int(m.group("month")), int(m.group("day")))
+        except ValueError:
+            return None
+
+    from ingestion.extract import extract_hearing_date
+
+    labelled = extract_hearing_date(header)
+    if labelled is None:
+        return None
+    return datetime(labelled.year, labelled.month, labelled.day)
+
+
 class SearchResult:
     """A single row from the Ventura tentative rulings search results table."""
 
@@ -556,6 +598,27 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         doc.extra["event_type"] = result.event_type
 
         return doc
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``MM/DD/YYYY in Department J6`` line of the ruling header (#4774).
+
+        The live scraper takes the date from the search-results row, which
+        the archived file does not carry.  The file's own header repeats it
+        on the line under the case caption.  See ``ventura_header_hearing_date``.
+        """
+        if not text:
+            return None
+        if content_format == "html":
+            text = _extract_html_text(text.encode("utf-8")) or ""
+        return ventura_header_hearing_date(text)
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Parse additional fields from the downloaded document content.

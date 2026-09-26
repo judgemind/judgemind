@@ -77,6 +77,34 @@ def capture_timestamp_from_s3_object(response: Mapping[str, Any]) -> datetime | 
     return None
 
 
+SOURCE_URL_METADATA_KEY = "source-url"
+SCRAPER_ID_METADATA_KEY = "scraper-id"
+
+
+def capture_provenance_from_s3_object(response: Mapping[str, Any]) -> dict[str, str]:
+    """Return the event fields a raw object's capture metadata can restore (#4774).
+
+    :meth:`S3Archiver.archive` stamps the live scraper's ``source_url`` and
+    ``scraper_id`` on every raw object.  Rebuild and prefix-mode reingest
+    events are built from S3, so these are the only record of the capture's
+    URL (which carries the filename some scrapers read the hearing date
+    from) and of which live scraper captured it (several share a county).
+
+    Returns ``{"source_url": ..., "capture_scraper_id": ...}`` with only the
+    keys whose metadata is present and non-empty — ``{}`` for a local-cache
+    read, which has no metadata.
+    """
+    metadata = response.get("Metadata") or {}
+    fields: dict[str, str] = {}
+    source_url = str(metadata.get(SOURCE_URL_METADATA_KEY) or "").strip()
+    if source_url:
+        fields["source_url"] = source_url
+    scraper_id = str(metadata.get(SCRAPER_ID_METADATA_KEY) or "").strip()
+    if scraper_id:
+        fields["capture_scraper_id"] = scraper_id
+    return fields
+
+
 class S3Archiver:
     """Archives raw captured content to S3. Documents are written once and never modified."""
 
@@ -116,9 +144,9 @@ class S3Archiver:
                 Body=doc.raw_content,
                 ContentType=content_type,
                 Metadata={
-                    "scraper-id": doc.scraper_id,
+                    SCRAPER_ID_METADATA_KEY: doc.scraper_id,
                     "content-hash": doc.content_hash,
-                    "source-url": doc.source_url,
+                    SOURCE_URL_METADATA_KEY: doc.source_url,
                     CAPTURE_TIMESTAMP_METADATA_KEY: doc.capture_timestamp.isoformat(),
                 },
             )

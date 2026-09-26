@@ -96,6 +96,7 @@ from .llm_extract import (
     is_pdf_binary,
 )
 from .llm_providers import create_client as create_llm_client
+from .raw_hearing_date import raw_hearing_date
 from .ruling_formatter import format_ruling_text
 from .ruling_guards import (
     NON_RULING_PDF_DROPPED_EVENT,
@@ -851,60 +852,6 @@ def _try_sf_pdf_split(
     return True
 
 
-def _sc_header_hearing_date(event_data: dict[str, Any], ruling_text: str) -> str | None:
-    """Return the Santa Clara PDF header hearing date as ``YYYY-MM-DD`` (#4667).
-
-    Live scraper events already carry ``hearing_date``
-    (``SCTentativeRulingsScraper.parse_document``), but prefix-mode reingest
-    and ``rebuild_db`` build events straight from S3 with none.  Without a
-    doc-level date, both the deterministic split and the LLM split leave each
-    child to guess from its own body text — which has no header — and they
-    picked up dates of birth, discovery service dates, etc.  This applies the
-    scraper's header parser (plus its stale-year correction) instead.
-
-    Returns ``None`` for non-Santa-Clara / non-PDF events or when the header
-    carries no parseable date.
-    """
-    if (event_data.get("county") or "").upper() != "SANTA CLARA":
-        return None
-    if event_data.get("content_format") != "pdf" or not ruling_text:
-        return None
-
-    from courts.ca.sc_tentatives import correct_header_year_typo, parse_hearing_date
-
-    header_date = parse_hearing_date(ruling_text)
-    captured_at = _parse_datetime(event_data.get("capture_timestamp"))
-    header_date = correct_header_year_typo(header_date, captured_at)
-    return header_date.date().isoformat() if header_date is not None else None
-
-
-def _cc_header_hearing_date(event_data: dict[str, Any], ruling_text: str) -> str | None:
-    """Return the Contra Costa PDF header hearing date as ``YYYY-MM-DD`` (#4769).
-
-    The live legacy scraper (``CCTentativeRulingsScraper``) sets
-    ``hearing_date`` from the ``NN_MMDDYY.pdf`` filename or the PDF's
-    ``HEARING DATE:`` / ``COURT CALENDAR FOR`` header and hands it to the LLM
-    as authoritative metadata.  Prefix-mode reingest and ``rebuild_db`` build
-    events straight from S3 with no ``hearing_date`` and an empty
-    ``source_url``, so the LLM split children were left with NULL or
-    body-text dates.  This applies the scraper's label-anchored header parser
-    instead.  A PDF with no such label yields ``None`` — never a body date
-    (#4667/#4682).
-
-    Returns ``None`` for non-Contra-Costa / non-PDF events or when the header
-    carries no parseable date.
-    """
-    if (event_data.get("county") or "").upper() != "CONTRA COSTA":
-        return None
-    if event_data.get("content_format") != "pdf" or not ruling_text:
-        return None
-
-    from courts.ca.cc_tentatives import _cc_hearing_date_from_pdf
-
-    header_date = _cc_hearing_date_from_pdf(ruling_text)
-    return header_date.date().isoformat() if header_date is not None else None
-
-
 def _try_sc_pdf_split(
     event_data: dict[str, Any],
     document_id: str,
@@ -962,9 +909,9 @@ def _try_sc_pdf_split(
     split_rulings = _split_rulings(ruling_text, pdf_bytes=raw_pdf_bytes)
 
     # Doc-level hearing date for every child (#4667).  ``process_event``
-    # normally fills this already via ``_sc_header_hearing_date``; this is
-    # the same derivation for direct callers.
-    doc_hearing_date: Any = event_data.get("hearing_date") or _sc_header_hearing_date(
+    # normally fills this already via ``raw_hearing_date``; this is the same
+    # derivation for direct callers.
+    doc_hearing_date: Any = event_data.get("hearing_date") or raw_hearing_date(
         event_data, ruling_text
     )
     if not split_rulings:
@@ -2553,16 +2500,15 @@ class IngestionWorker:
         if ruling_text != event_data.get("ruling_text"):
             event_data = {**event_data, "ruling_text": ruling_text}
 
-        # Santa Clara and Contra Costa events from prefix-mode reingest /
-        # rebuild_db carry no hearing_date (the scraper's parse_document never
-        # ran).  Derive the doc-level date from the PDF header BEFORE any
-        # split so both the deterministic and the LLM split hand it to every
-        # child, instead of each child guessing from its own body text
-        # (#4667, #4769).
+        # Events from prefix-mode reingest / rebuild_db carry no hearing_date
+        # (the scraper's parse_document never ran).  Ask the capturing
+        # scraper's ``hearing_date_for_raw`` hook for the date its live
+        # capture would carry (filename or labelled header) BEFORE any split,
+        # so both the deterministic and the LLM split hand it to every child
+        # instead of each child guessing from its own body text (#4667,
+        # #4769, #4774).
         if not event_data.get("hearing_date") and not event_data.get("_split_processed"):
-            header_date = _sc_header_hearing_date(
-                event_data, ruling_text
-            ) or _cc_header_hearing_date(event_data, ruling_text)
+            header_date = raw_hearing_date(event_data, ruling_text)
             if header_date:
                 event_data = {**event_data, "hearing_date": header_date}
 

@@ -1122,6 +1122,23 @@ class SDTentativeRulingsScraper(BaseScraper):
 
         return doc
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``Hearing Date:`` of the ROA page's tentative-ruling row (#4774).
+
+        The same ``parse_tentative_ruling`` read the live capture uses.
+        """
+        if content_format not in ("", "html") or not text:
+            return None
+        return parse_tentative_ruling(BeautifulSoup(text, "lxml"))[1]
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Re-parse a document from its raw HTML content.
 

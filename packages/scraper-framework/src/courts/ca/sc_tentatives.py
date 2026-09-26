@@ -1637,6 +1637,20 @@ class SCTentativeRulingsScraper(BaseScraper):
         doc.extra["dept_page_url"] = dept_info.page_url
         return doc
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: Any = None,
+    ) -> Any:
+        """PDF header date with the stale-year fix, as ``parse_document`` (#4667, #4774)."""
+        if content_format not in ("", "pdf") or not text:
+            return None
+        return correct_header_year_typo(parse_hearing_date(text), capture_timestamp)
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract structured fields from PDF text."""
         try:

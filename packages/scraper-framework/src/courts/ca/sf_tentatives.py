@@ -53,7 +53,7 @@ from typing import Any
 
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
-from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper, source_url_filename
 
 INDEX_URL = "https://webapps.sftc.org/ufctr/ufctr.dll"
 BASE_URL = "https://webapps.sftc.org/ufctr/"
@@ -410,6 +410,24 @@ class SFTentativeRulingsScraper(PdfLinkScraper):
             doc.case_title = _sf_case_title_from_pdf_text(doc.ruling_text)
 
         return doc
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``403 Tentative Rulings 3.03.2026.pdf`` filename date (#4774).
+
+        The link text ``parse_document`` reads is the URL's filename.  The
+        live scraper reads no date from the PDF text, so neither does this.
+        """
+        if content_format not in ("", "pdf"):
+            return None
+        return _sf_hearing_date_from_filename(source_url_filename(source_url))
 
 
 # Extra scraper_ids under which this module's ``_split_rulings`` /

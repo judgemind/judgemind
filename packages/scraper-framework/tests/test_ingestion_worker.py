@@ -1454,14 +1454,15 @@ class TestScPdfSplitHeaderHearingDate:
         )
         assert event["hearing_date"] == "2026-09-22"
 
-    def test_issue_4667_header_helper_gates_county_and_format(self) -> None:
-        from ingestion.worker import _sc_header_hearing_date
+    def test_issue_4667_header_hook_gates_format(self) -> None:
+        from ingestion.raw_hearing_date import raw_hearing_date
 
         text = self._HEADER
-        assert _sc_header_hearing_date(_make_sc_event(county="Orange"), text) is None
-        assert _sc_header_hearing_date(_make_sc_event(content_format="html"), text) is None
-        assert _sc_header_hearing_date(_make_sc_event(), "") is None
-        assert _sc_header_hearing_date(_make_sc_event(), text) == "2026-09-23"
+        assert raw_hearing_date(_make_sc_event(content_format="html"), text) is None
+        assert raw_hearing_date(_make_sc_event(), "") is None
+        assert raw_hearing_date(_make_sc_event(), text) == "2026-09-23"
+        prefix = _make_sc_event(scraper_id="reingest-ca-santa_clara", source_url="")
+        assert raw_hearing_date(prefix, text) == "2026-09-23"
 
     def test_issue_4667_no_header_date_leaves_none(self) -> None:
         children = self._run(
@@ -1548,14 +1549,14 @@ class TestCcHeaderHearingDate:
         event = self._split_input(ruling_text="DEPARTMENT 10\n" + self._BODY)
         assert event["hearing_date"] is None
 
-    def test_issue_4769_header_helper_gates_county_and_format(self) -> None:
-        from ingestion.worker import _cc_header_hearing_date
+    def test_issue_4769_header_hook_gates_county_and_format(self) -> None:
+        from ingestion.raw_hearing_date import raw_hearing_date
 
         text = self._HEADER
-        assert _cc_header_hearing_date(_make_cc_prefix_event(county="Orange"), text) is None
-        assert _cc_header_hearing_date(_make_cc_prefix_event(content_format="txt"), text) is None
-        assert _cc_header_hearing_date(_make_cc_prefix_event(), "") is None
-        assert _cc_header_hearing_date(_make_cc_prefix_event(), text) == "2026-04-09"
+        assert raw_hearing_date(_make_cc_prefix_event(county="Nowhere"), text) is None
+        assert raw_hearing_date(_make_cc_prefix_event(content_format="txt"), text) is None
+        assert raw_hearing_date(_make_cc_prefix_event(), "") is None
+        assert raw_hearing_date(_make_cc_prefix_event(), text) == "2026-04-09"
 
 
 # ---------------------------------------------------------------------------

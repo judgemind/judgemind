@@ -1234,6 +1234,29 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         self._populate_from_envelope(doc, envelope)
         return doc
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """The envelope's ``court_date``, as ``_populate_from_envelope`` (#4774).
+
+        None for a legacy bare-HTML archive or any non-envelope text.
+        """
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or not {"ruling_id", "department"} <= payload.keys():
+            return None
+        return parse_hearing_date(payload.get("court_date"))
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Populate structured fields from ``doc.raw_content`` (#4134).
 
