@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 import pdfplumber
@@ -52,6 +52,20 @@ _PDF_MAGIC_WINDOW = 1024
 
 # Block reason recorded on a FetchTally when a PDF URL serves something else.
 NOT_A_PDF_REASON = "PDF URL returned a body that is not a PDF (no %PDF- header)"
+
+
+def source_url_filename(source_url: str | None) -> str:
+    """Return the decoded last path segment of a captured PDF URL.
+
+    ``hearing_date_for_raw`` hooks read the filename a live capture parsed
+    from the link (#4774).  The URL comes from S3 object metadata, which
+    may hold it percent-encoded (``403%20Tentative%20Rulings...``) or not.
+    Returns ``""`` for an empty URL.
+    """
+    if not source_url:
+        return ""
+    path = urlsplit(source_url).path
+    return unquote(path.rsplit("/", 1)[-1])
 
 
 def looks_like_pdf(content: bytes) -> bool:

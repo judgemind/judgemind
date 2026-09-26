@@ -622,6 +622,20 @@ class SDCalendarScraper(BaseScraper):
         tally.raise_if_all_failed(docs)
         return docs
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``CIVIL CALENDAR For <day>, MM/DD/YYYY`` page header (#4774)."""
+        if content_format not in ("", "html") or not text:
+            return None
+        return _parse_calendar_date(text)
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Re-parse a calendar document, extracting per-case metadata and text.
 

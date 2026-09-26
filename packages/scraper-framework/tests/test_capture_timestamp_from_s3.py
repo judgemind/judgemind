@@ -32,6 +32,7 @@ from framework.models import CapturedDocument, ContentFormat  # noqa: E402
 from framework.storage import (  # noqa: E402
     CAPTURE_TIMESTAMP_METADATA_KEY,
     S3Archiver,
+    capture_provenance_from_s3_object,
     capture_timestamp_from_s3_object,
 )
 from ingestion.worker import _parse_datetime  # noqa: E402
@@ -158,3 +159,72 @@ class TestReingestPrefixCaptureTimestamp:
             "ca/santa_clara/superior_court/raw/abc.html", b"<html/>", parsed, "b"
         )
         assert event["capture_timestamp"] is None
+
+
+# ---------------------------------------------------------------------------
+# Capture provenance: source_url + live scraper id from S3 metadata (#4774)
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureProvenanceFromS3Object:
+    def test_reads_source_url_and_scraper_id(self) -> None:
+        resp = {
+            "Metadata": {
+                "source-url": "https://www.fresno.courts.ca.gov/x/03-10-26-dept-403.pdf",
+                "scraper-id": "ca-fresno-tentatives-civil",
+            }
+        }
+        assert capture_provenance_from_s3_object(resp) == {
+            "source_url": "https://www.fresno.courts.ca.gov/x/03-10-26-dept-403.pdf",
+            "capture_scraper_id": "ca-fresno-tentatives-civil",
+        }
+
+    def test_missing_or_blank_metadata_omitted(self) -> None:
+        assert capture_provenance_from_s3_object({"Body": io.BytesIO(b"x")}) == {}
+        assert capture_provenance_from_s3_object({"Metadata": None}) == {}
+        assert (
+            capture_provenance_from_s3_object({"Metadata": {"source-url": " ", "scraper-id": ""}})
+            == {}
+        )
+
+    def test_round_trips_archiver_metadata(self) -> None:
+        client = MagicMock()
+        client.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        raw = b"%PDF-1.4 ruling"
+        doc = CapturedDocument(
+            scraper_id="ca-sb-tentatives-civil",
+            state="CA",
+            county="San Bernardino",
+            court="Superior Court",
+            source_url="https://old.sb-court.org/x/CVR17060126.pdf",
+            capture_timestamp=datetime(2026, 5, 30, tzinfo=UTC),
+            content_format=ContentFormat.PDF,
+            raw_content=raw,
+            content_hash=hashlib.sha256(raw).hexdigest(),
+        )
+        S3Archiver(bucket="b", s3_client=client).archive(doc)
+        metadata = client.put_object.call_args.kwargs["Metadata"]
+        assert capture_provenance_from_s3_object({"Metadata": metadata}) == {
+            "source_url": "https://old.sb-court.org/x/CVR17060126.pdf",
+            "capture_scraper_id": "ca-sb-tentatives-civil",
+        }
+
+
+class TestReingestPrefixCaptureProvenance:
+    def test_prefix_event_carries_metadata_provenance(self) -> None:
+        event = _run_prefix_document(
+            {
+                "Metadata": {
+                    "source-url": "https://old.sb-court.org/x/CVR17060126.pdf",
+                    "scraper-id": "ca-sb-tentatives-civil",
+                }
+            }
+        )
+        assert event["source_url"] == "https://old.sb-court.org/x/CVR17060126.pdf"
+        assert event["capture_scraper_id"] == "ca-sb-tentatives-civil"
+        assert event["scraper_id"] == "reingest-ca-santa_clara"
+
+    def test_prefix_event_without_metadata_has_empty_source_url(self) -> None:
+        event = _run_prefix_document({})
+        assert event["source_url"] == ""
+        assert "capture_scraper_id" not in event

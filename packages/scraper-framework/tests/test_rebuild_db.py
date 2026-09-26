@@ -92,6 +92,26 @@ class TestBuildEvent:
         assert event["content_format"] == "html"
         assert "hearing_date" not in event
 
+    def test_scraper_hook_date_wins_over_generic_regex(self) -> None:
+        """#4774: the capturing scraper's ``hearing_date_for_raw`` hook dates
+        the event first, as prefix reingest does in the worker.  The Ventura
+        ruling's header ``Hearing Date:`` must win over the generic regex,
+        which picks an earlier line-leading ``Date:`` in the body."""
+        html_content = (
+            b"<html><body><p>Date: 01/02/2025 filed</p>"
+            b"<p>SUPERIOR COURT OF CALIFORNIA</p><p>COUNTY OF VENTURA</p>"
+            b"<p>Hearing Date:</p><p>March 11, 2026</p></body></html>"
+        )
+        parsed = _make_parsed(county="ventura", ext="html")
+        event = rebuild_db.build_event(
+            _make_key(parsed),
+            html_content,
+            parsed,
+            "test-bucket",
+            provenance={"capture_scraper_id": "ca-ventura-tentatives"},
+        )
+        assert event["hearing_date"] == "2026-03-11"
+
     def test_html_with_date_prefix_format(self) -> None:
         """HTML with 'Date: MM/DD/YYYY' format should extract hearing_date."""
         html_content = b"<html>Date: 03/15/2026 some ruling text</html>"
@@ -3416,3 +3436,26 @@ class TestRebuildPreservesOriginalCaptureTime:
         parsed = _make_parsed()
         event = rebuild_db.build_event(_make_key(parsed), b"<html>x</html>", parsed, "b")
         assert event["capture_timestamp"] is None
+
+
+class TestRebuildRestoresCaptureProvenance:
+    """#4774: the rebuild event carries the captured ``source_url`` and the
+    live ``capture_scraper_id`` from the S3 object's metadata, so the
+    worker's ``hearing_date_for_raw`` hooks can read a filename date and
+    pick the right scraper for a county with several."""
+
+    def test_metadata_source_url_and_scraper_id_on_event(self) -> None:
+        url = "https://retired.cc-courts.org/civil/TR/Department 16/16_031126.pdf"
+        event = _run_one_document_from_s3(
+            b"<html>ruling</html>",
+            {"Metadata": {"source-url": url, "scraper-id": "ca-cc-tentatives"}},
+        )
+        assert event["source_url"] == url
+        assert event["capture_scraper_id"] == "ca-cc-tentatives"
+        # The synthetic rebuild scraper_id is unchanged: audits key on it.
+        assert event["scraper_id"] == "rebuild-ca-santa_clara"
+
+    def test_no_metadata_leaves_source_url_empty(self) -> None:
+        event = _run_one_document_from_s3(b"<html>ruling</html>", {})
+        assert event["source_url"] == ""
+        assert "capture_scraper_id" not in event

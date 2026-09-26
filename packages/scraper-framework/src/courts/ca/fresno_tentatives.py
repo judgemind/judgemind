@@ -72,7 +72,12 @@ import structlog
 
 from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 
-from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper, _extract_pdf_text
+from .pdf_link_scraper import (
+    PdfLinkConfig,
+    PdfLinkScraper,
+    _extract_pdf_text,
+    source_url_filename,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -628,6 +633,27 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
                 split_docs.append(child)
 
         return split_docs
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """Labelled PDF header date, else the ``MM-DD-YY-dept-NNN.pdf`` filename (#4774).
+
+        The same sources, in the same order, as ``fetch_documents`` /
+        ``parse_document``.
+        """
+        if content_format not in ("", "pdf"):
+            return None
+        header_date = _fresno_hearing_date_from_text(text) if text else None
+        if header_date is not None:
+            return header_date
+        return _fresno_hearing_date_from_filename(source_url_filename(source_url))
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract fields from PDF text.

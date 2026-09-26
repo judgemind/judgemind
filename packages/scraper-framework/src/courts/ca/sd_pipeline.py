@@ -17,6 +17,7 @@ Integration issue: #903
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -209,6 +210,25 @@ class SDPipelineScraper(BaseScraper):
         """
         parser = self._get_phase2_parser()
         return parser.parse_document(doc)
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """Delegate to the Phase 2 scraper, as ``parse_document`` does (#4774)."""
+        from courts.ca.sd_tentatives import SDTentativeRulingsScraper
+
+        return SDTentativeRulingsScraper.hearing_date_for_raw(
+            text,
+            source_url=source_url,
+            content_format=content_format,
+            capture_timestamp=capture_timestamp,
+        )
 
 
 # ---------------------------------------------------------------------------

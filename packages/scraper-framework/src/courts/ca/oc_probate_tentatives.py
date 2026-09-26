@@ -183,6 +183,20 @@ class OCProbateTentativeRulingsScraper(PdfLinkScraper):
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``Date: MM/DD/YY`` PDF header, as ``parse_document`` (#4774)."""
+        if content_format not in ("", "pdf") or not text:
+            return None
+        return _probate_hearing_date_from_text(text)
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract all fields from probate PDF text."""
         doc = super().parse_document(doc)

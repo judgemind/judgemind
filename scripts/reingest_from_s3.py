@@ -251,7 +251,10 @@ from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
-from framework.storage import capture_timestamp_from_s3_object  # noqa: E402
+from framework.storage import (  # noqa: E402
+    capture_provenance_from_s3_object,
+    capture_timestamp_from_s3_object,
+)
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
     insert_document_and_ruling,
@@ -3876,6 +3879,7 @@ def _build_prefix_event(
     parsed: dict[str, str],
     bucket: str,
     capture_timestamp: datetime | None = None,
+    provenance: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Construct an ingestion event dict from an S3 object for prefix mode.
 
@@ -3884,6 +3888,11 @@ def _build_prefix_event(
     when unknown — never ``now()``, which made the deterministic
     ``hearing_date_in_range`` rule reject every ruling heard >180 days
     before the reingest (#4661).
+
+    ``provenance`` is :func:`framework.storage.capture_provenance_from_s3_object`
+    of the object: the captured ``source_url`` and the live
+    ``capture_scraper_id``, which the worker's ``hearing_date_for_raw``
+    hooks need to reproduce the live scraper's hearing date (#4774).
     """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
@@ -3902,6 +3911,7 @@ def _build_prefix_event(
         "source_url": "",
         "capture_timestamp": capture_timestamp.isoformat() if capture_timestamp else None,
     }
+    event.update(provenance or {})
 
     # For text-based formats (HTML, TXT), pass content as ruling_text.
     # For binary formats (PDF, DOCX), pass raw bytes as latin-1 string
@@ -4260,6 +4270,7 @@ def _process_prefix_document(
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response["Body"].read()
         capture_timestamp = capture_timestamp_from_s3_object(response)
+        provenance = capture_provenance_from_s3_object(response)
     except Exception as exc:
         logger.warning("Failed to fetch S3 object, skipping", s3_key=key, exc_info=True)
         return {
@@ -4296,7 +4307,14 @@ def _process_prefix_document(
             actual_content_hash=actual_hash,
         )
 
-    event = _build_prefix_event(key, content, parsed, bucket, capture_timestamp=capture_timestamp)
+    event = _build_prefix_event(
+        key,
+        content,
+        parsed,
+        bucket,
+        capture_timestamp=capture_timestamp,
+        provenance=provenance,
+    )
 
     # Lazy per-process worker — cached on the function object.
     worker = getattr(_process_prefix_document, "_worker", None)

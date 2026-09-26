@@ -74,6 +74,7 @@ from .pdf_link_scraper import (
     PdfLinkScraper,
     _extract_pdf_text,
     looks_like_pdf,
+    source_url_filename,
 )
 
 logger = structlog.get_logger(__name__)
@@ -770,6 +771,27 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
         tally.raise_if_all_failed(docs)
         return docs
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """``NN_MMDDYY.pdf`` filename date, else the labelled PDF header (#4769, #4774).
+
+        Same order as ``fetch_documents``.  A PDF with neither yields None,
+        never a body date.
+        """
+        if content_format not in ("", "pdf"):
+            return None
+        filename_date = _cc_hearing_date_from_filename(source_url_filename(source_url))
+        if filename_date is not None:
+            return filename_date
+        return _cc_hearing_date_from_pdf(text) if text else None
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract structured fields from CC PDF text.
