@@ -46,6 +46,7 @@ from datetime import date, datetime
 from typing import Any
 
 INDEX_ALIAS = "tentative_rulings"
+DEFAULT_BUCKET = "judgemind-document-archive-dev"
 PG_BATCH = 1000
 INDEX_BATCH = 200
 SAMPLES_PER_CLASS = 10
@@ -298,10 +299,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         return 0
 
+    from framework.s3_cache import make_s3_client
     from framework.search.indexer import IndexingConsumer
 
+    # Rulings with no ruling_text in derived.* (e.g. statewide governor
+    # pages) fall back to the raw S3 object, as the ingestion worker does.
     consumer = IndexingConsumer(
-        opensearch_client=os_client, s3_client=None, bucket="", ensure_index=False
+        opensearch_client=os_client,
+        s3_client=make_s3_client(),
+        bucket=os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", DEFAULT_BUCKET),
+        ensure_index=False,
     )
     target_ids = [d for d in all_ids if d in pg_rows] if args.all else drifted
     indexed = 0
