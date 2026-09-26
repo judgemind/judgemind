@@ -43,6 +43,7 @@ from ingestion.db import (
     upsert_court,
     upsert_party,
 )
+from ingestion.split_ids import make_split_document_id
 
 # ---------------------------------------------------------------------------
 # _strip_nul helper
@@ -3368,15 +3369,22 @@ class TestResolveJudgeFromDepartment:
 # ---------------------------------------------------------------------------
 
 
+_STALE_PARENT = "11111111-1111-5111-8111-111111111111"
+
+
+def _kid(idx: int, parent: str = _STALE_PARENT) -> str:
+    return make_split_document_id(parent, idx)
+
+
 class TestDeleteStaleSplitChildren:
     """Unit tests for delete_stale_split_children (#2295)."""
 
     def test_deletes_stale_split_children(self) -> None:
-        """Should delete UUID v5 documents with the same s3_key not in valid set."""
+        """Should delete this parent's children with the same s3_key not in valid set."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        # First query returns stale document IDs
-        stale_id = "aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa"
+        # First query returns the candidate v5 document IDs on the key
+        stale_id = _kid(1)
         cur.fetchall.return_value = [(stale_id,)]
         # Second batch: rowcount for the DELETE FROM documents
         cur.rowcount = 1
@@ -3384,7 +3392,8 @@ class TestDeleteStaleSplitChildren:
         result = delete_stale_split_children(
             conn,
             s3_key="ca/orange/superior_court/raw/abc123.pdf",
-            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+            valid_document_ids=[_kid(0)],
+            parent_document_id=_STALE_PARENT,
         )
         assert result == 1
 
@@ -3402,7 +3411,8 @@ class TestDeleteStaleSplitChildren:
         result = delete_stale_split_children(
             conn,
             s3_key="ca/orange/superior_court/raw/abc123.pdf",
-            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+            valid_document_ids=[_kid(0)],
+            parent_document_id=_STALE_PARENT,
         )
         assert result == 0
         # Only the SELECT query should have run
@@ -3416,7 +3426,8 @@ class TestDeleteStaleSplitChildren:
         result = delete_stale_split_children(
             conn,
             s3_key="",
-            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+            valid_document_ids=[_kid(0)],
+            parent_document_id=_STALE_PARENT,
         )
         assert result == 0
         cur.execute.assert_not_called()
@@ -3431,6 +3442,7 @@ class TestDeleteStaleSplitChildren:
             conn,
             s3_key=None,  # type: ignore[arg-type]
             valid_document_ids=[],
+            parent_document_id=_STALE_PARENT,
         )
         assert result == 0
         cur.execute.assert_not_called()
@@ -3439,7 +3451,7 @@ class TestDeleteStaleSplitChildren:
         """Detaches alert_events, then deletes validation_results, rulings, documents."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        stale_id = "cccccccc-5555-5555-5555-cccccccccccc"
+        stale_id = _kid(2)
         cur.fetchall.return_value = [(stale_id,)]
         cur.rowcount = 1
 
@@ -3447,6 +3459,7 @@ class TestDeleteStaleSplitChildren:
             conn,
             s3_key="ca/orange/superior_court/raw/abc123.pdf",
             valid_document_ids=[],
+            parent_document_id=_STALE_PARENT,
         )
 
         # Extract SQL from execute calls (after the SELECT)
@@ -3464,13 +3477,14 @@ class TestDeleteStaleSplitChildren:
         split children detach their alerts instead of deleting them."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchall.return_value = [("cccccccc-5555-5555-5555-cccccccccccc",)]
+        cur.fetchall.return_value = [(_kid(3),)]
         cur.rowcount = 1
 
         delete_stale_split_children(
             conn,
             s3_key="ca/santa_clara/superior_court/abc.pdf",
             valid_document_ids=[],
+            parent_document_id=_STALE_PARENT,
         )
 
         for call in cur.execute.call_args_list:
@@ -3479,8 +3493,8 @@ class TestDeleteStaleSplitChildren:
     def test_split_set_change_repoints_alerts_at_parent(self) -> None:
         """Alerts on a removed child are re-pointed at the stable parent
         document id (NULL when the parent is itself being removed)."""
-        parent = "dddddddd-5555-5555-5555-dddddddddddd"
-        stale = "cccccccc-5555-5555-5555-cccccccccccc"
+        parent = _STALE_PARENT
+        stale = _kid(4)
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         cur.fetchall.return_value = [(stale,)]
@@ -3514,7 +3528,7 @@ class TestDeleteStaleSplitChildren:
         """The caller can collect the removed ids (for OpenSearch cleanup)."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        stale = "cccccccc-5555-5555-5555-cccccccccccc"
+        stale = _kid(5)
         cur.fetchall.return_value = [(stale,)]
         cur.rowcount = 1
         out: list[str] = []
@@ -3523,9 +3537,83 @@ class TestDeleteStaleSplitChildren:
             conn,
             s3_key="ca/santa_clara/superior_court/abc.pdf",
             valid_document_ids=[],
+            parent_document_id=_STALE_PARENT,
             deleted_ids=out,
         )
         assert out == [stale]
+
+
+class TestStaleChildCleanupScopedToParent:
+    """#4788: the stale set is only this parent's own rows (the parent id and
+    ``make_split_document_id(parent, i)``), never every v5 id on the key.
+
+    Scraper pre-split children (Fresno, CC, LA) share one ``s3_key`` and all
+    have v5 ids: ``make_split_document_id(uuid5(content_hash), ruling_index)``.
+    When one of them goes through the worker's split dispatch its "parent" id
+    is its own id, so a key-wide v5 match deleted its siblings.
+    """
+
+    def test_pre_split_sibling_is_not_stale(self) -> None:
+        content_parent = _STALE_PARENT
+        this_child = _kid(1, content_parent)
+        sibling = _kid(2, content_parent)
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Every v5 row on the key: the sibling (and the content parent).
+        cur.fetchall.return_value = [(sibling,), (content_parent,)]
+        cur.rowcount = 2
+        out: list[str] = []
+
+        deleted = delete_stale_split_children(
+            conn,
+            s3_key="ca/fresno/superior_court/abc.pdf",
+            valid_document_ids=[this_child],
+            parent_document_id=this_child,
+            deleted_ids=out,
+        )
+
+        assert deleted == 0
+        assert out == []
+        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
+        assert not any(s.startswith(("DELETE", "UPDATE")) for s in sqls)
+
+    def test_only_this_parents_children_are_stale(self) -> None:
+        foreign = make_split_document_id("22222222-2222-5222-8222-222222222222", 0)
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [(_kid(2),), (foreign,), (_kid(20),)]
+        cur.rowcount = 2
+        out: list[str] = []
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[_kid(0), _kid(1)],
+            parent_document_id=_STALE_PARENT,
+            deleted_ids=out,
+        )
+
+        # High slot numbers (Fresno ``(20) Tentative Ruling``) are still
+        # recognised as this parent's children.
+        assert out == [_kid(2), _kid(20)]
+
+    def test_parent_row_itself_is_stale_when_split(self) -> None:
+        """An earlier single-ruling run stored the ruling on the parent id;
+        a multi-case split no longer writes it (#4700)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [(_STALE_PARENT,)]
+        cur.rowcount = 1
+        out: list[str] = []
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/santa_clara/superior_court/abc.pdf",
+            valid_document_ids=[_kid(0), _kid(1)],
+            parent_document_id=_STALE_PARENT,
+            deleted_ids=out,
+        )
+        assert out == [_STALE_PARENT]
 
 
 class TestSplitSetChangeRelinkCase:
@@ -3599,6 +3687,57 @@ def _insert_ruling_conflict_sql(conn: MagicMock) -> str:
         if args and isinstance(args[0], str) and "INSERT INTO rulings" in args[0]:
             return args[0]
     raise ValueError("No execute() call with INSERT INTO rulings found")
+
+
+class TestRelinkNeverOntoPlaceholderCase:
+    """#4788: a relink may only move a split child to a real case.
+
+    A re-process whose case number comes back missing falls back to a
+    synthetic ``UNKNOWN-<document_id>`` case.  Relinking onto it deleted the
+    correctly linked ruling, detached its ``public.alert_events`` and moved
+    the document to the placeholder case.  With a placeholder target the
+    write keeps the preserve-first semantics instead.
+    """
+
+    def _call(self, conn: MagicMock) -> None:
+        insert_document_and_ruling(
+            conn,
+            document_id="eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
+            case_id="case-placeholder",
+            court_id="court-1",
+            content_format="pdf",
+            content_hash="h",
+            s3_key="k",
+            s3_bucket="b",
+            source_url="",
+            scraper_id="reingest-ca-santa_clara",
+            captured_at=datetime(2026, 3, 1),
+            hearing_date=date(2026, 3, 5),
+            ruling_text="The motion is GRANTED.",
+            relink_case=True,
+        )
+
+    @pytest.mark.parametrize("case_number", ["UNKNOWN-eeeeeeee", None])
+    def test_placeholder_target_keeps_ruling_and_alerts(self, case_number: str | None) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (case_number,)
+        self._call(conn)
+
+        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
+        assert not any(s.startswith("DELETE FROM rulings") for s in sqls)
+        assert not any(s.startswith("UPDATE alert_events") for s in sqls)
+        assert "COALESCE(documents.case_id, EXCLUDED.case_id)" in _insert_document_sql(conn)
+
+    def test_real_target_still_relinks(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("24CV000123",)
+        self._call(conn)
+
+        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
+        assert any(s.startswith("DELETE FROM rulings") for s in sqls)
+        assert "case_id = EXCLUDED.case_id" in _insert_document_sql(conn)
 
 
 def _insert_document_sql(conn: MagicMock) -> str:

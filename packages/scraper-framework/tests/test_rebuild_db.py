@@ -81,6 +81,13 @@ class TestBuildEvent:
         assert event["hearing_date"] == "2026-03-15"
         assert event["ruling_text"] == html_content.decode("utf-8")
 
+    def test_event_marks_split_set_replacement(self) -> None:
+        """#4788: a rebuild re-derives the split set, so its events opt in to
+        the split-child case relink.  Live scraper events never carry this."""
+        parsed = _make_parsed(ext="html")
+        event = rebuild_db.build_event(_make_key(parsed), b"<html></html>", parsed, "b")
+        assert event["_replace_split_set"] is True
+
     def test_html_without_hearing_date(self) -> None:
         """HTML content without a recognizable date should not have hearing_date."""
         html_content = b"<html><body>No date here</body></html>"

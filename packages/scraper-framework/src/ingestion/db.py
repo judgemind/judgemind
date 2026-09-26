@@ -2288,9 +2288,21 @@ def insert_document_and_ruling(
     for the new case instead of carrying the old case's fields and text.
     A ruling already on the same case is updated in place as usual.
 
+    A relink only ever moves a ruling onto a real case (#4788).  When the
+    target case is a placeholder (``UNKNOWN-*`` / NULL case number, or no
+    such row), ``relink_case`` is ignored and the preserve-first semantics
+    apply: a re-process that missed the case number must not delete a
+    correctly linked ruling or detach its ``public.alert_events``.
+
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).
     """
+    if relink_case and _is_placeholder_case(conn, case_id):
+        logger.info(
+            "insert_document_and_ruling: relink skipped, target case is a placeholder",
+            extra={"document_id": document_id, "case_id": case_id},
+        )
+        relink_case = False
     if relink_case:
         with conn.cursor() as cur:
             cur.execute(
@@ -2347,12 +2359,56 @@ def insert_document_and_ruling(
     return is_new
 
 
+#: Synthetic case-number prefix the worker uses when no case number could be
+#: extracted (``UNKNOWN-<document_id>``).  Mirrors
+#: ``ruling_guards._UNKNOWN_CASE_NUMBER_PREFIX``.
+_PLACEHOLDER_CASE_PREFIX = "UNKNOWN-"
+
+
+def _is_placeholder_case(conn: psycopg.Connection, case_id: str) -> bool:
+    """Return True unless *case_id* names a case with a real case number.
+
+    A missing row, a NULL/empty case number, or a synthetic ``UNKNOWN-*``
+    case number all count as a placeholder (#4788).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT case_number FROM cases WHERE id = %s::uuid", (case_id,))
+        row = cur.fetchone()
+    case_number = row[0] if row else None
+    if not isinstance(case_number, str) or not case_number.strip():
+        return True
+    return case_number.startswith(_PLACEHOLDER_CASE_PREFIX)
+
+
+#: Upper bound on the split slot index considered when recognising a
+#: parent's children.  Slot indices are small (a split of N rulings uses
+#: 0..N-1; scraper pre-split children use the court's entry number, e.g.
+#: Fresno ``(20) Tentative Ruling``), so this is generous.
+_MAX_SPLIT_SLOT = 1000
+
+
+def _own_split_rows(parent_document_id: str, candidate_ids: list[str]) -> list[str]:
+    """Filter *candidate_ids* to rows that belong to *parent_document_id*:
+    the parent id itself and ``make_split_document_id(parent, i)``.
+
+    Other UUIDv5 ids on the same S3 key (for example scraper pre-split
+    siblings, whose ids derive from the content parent, not from this
+    parent) are never this parent's children (#4788).
+    """
+    from .split_ids import make_split_document_id
+
+    bound = max(_MAX_SPLIT_SLOT, len(candidate_ids) + 1)
+    own = {parent_document_id}
+    own.update(make_split_document_id(parent_document_id, i) for i in range(bound))
+    return [cid for cid in candidate_ids if cid in own]
+
+
 def delete_stale_split_children(
     conn: psycopg.Connection,
     s3_key: str,
     valid_document_ids: list[str],
     *,
-    parent_document_id: str | None = None,
+    parent_document_id: str,
     deleted_ids: list[str] | None = None,
 ) -> int:
     """Delete split-child document records that are no longer valid.
@@ -2366,7 +2422,11 @@ def delete_stale_split_children(
 
     A document is eligible for deletion when:
       1. It shares the same ``s3_key`` as the document being re-processed.
-      2. Its ``id`` is a UUID version 5 (deterministic split child ID).
+      2. Its ``id`` is ``parent_document_id`` itself or
+         ``make_split_document_id(parent_document_id, i)`` — a row this
+         parent owns.  Any other UUIDv5 id on the key is left alone: scraper
+         pre-split siblings (Fresno, CC, LA) share the key and have v5 ids
+         derived from the content parent, not from this parent (#4788).
       3. Its ``id`` is NOT in the ``valid_document_ids`` list (the new set
          of split IDs that will be created/upserted by this processing run).
 
@@ -2385,8 +2445,9 @@ def delete_stale_split_children(
             children.
         valid_document_ids: The document IDs that will be created/upserted
             in this processing run.  These are NOT deleted.
-        parent_document_id: The split parent's document id.  Alerts on a
-            removed child are re-pointed here.
+        parent_document_id: The split parent's document id.  Only this
+            parent's own rows are eligible, and alerts on a removed child
+            are re-pointed here.
         deleted_ids: Optional list the removed document ids are appended to,
             so the caller can drop them from the search index.
 
@@ -2397,15 +2458,11 @@ def delete_stale_split_children(
         return 0
 
     with conn.cursor() as cur:
-        # Find all split-child documents for this S3 key that are NOT in the
-        # new valid set.  UUID v5 documents have version byte = 5; we filter
-        # for that to avoid accidentally deleting the original parent document
-        # (which is UUID v4).
-        #
-        # The version nibble sits at position 13 of the hex representation
-        # (the first nibble of the 3rd group in the standard UUID format).
-        # PostgreSQL's uuid type supports substring extraction on the text
-        # representation.
+        # Candidates: UUID v5 documents on this S3 key that are NOT in the
+        # new valid set.  The version nibble is the first character of the
+        # 3rd group of the text form.  Every v5 row on the key is only a
+        # candidate: ``_own_split_rows`` below keeps the ones this parent
+        # owns (#4788).
         cur.execute(
             """
             SELECT id FROM documents
@@ -2415,7 +2472,17 @@ def delete_stale_split_children(
             """,
             (s3_key, valid_document_ids),
         )
-        stale_ids = [str(row[0]) for row in cur.fetchall()]
+        candidate_ids = [str(row[0]) for row in cur.fetchall()]
+
+    stale_ids = _own_split_rows(parent_document_id, candidate_ids)
+    skipped = len(candidate_ids) - len(stale_ids)
+    if skipped:
+        logger.info(
+            "delete_stale_split_children: kept %d v5 row(s) on the key that are "
+            "not children of this parent",
+            skipped,
+            extra={"s3_key": s3_key, "parent_document_id": parent_document_id},
+        )
 
     if not stale_ids:
         return 0

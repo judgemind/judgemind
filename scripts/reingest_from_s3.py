@@ -3910,6 +3910,10 @@ def _build_prefix_event(
         "scraper_id": f"reingest-{parsed['state']}-{parsed['county']}",
         "source_url": "",
         "capture_timestamp": capture_timestamp.isoformat() if capture_timestamp else None,
+        # Prefix reingest re-derives the split set, so reused split-child
+        # ids may take the re-derived (real) case link (#4700, #4788).
+        # ``ingestion.worker.REPLACE_SPLIT_SET_KEY``.
+        "_replace_split_set": True,
     }
     event.update(provenance or {})
 

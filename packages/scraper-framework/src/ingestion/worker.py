@@ -179,6 +179,32 @@ def _markdown_to_html(text: str) -> str:
     return "\n".join(html_parts)
 
 
+#: Event key set by ``scripts/reingest_from_s3.py`` (prefix mode) and
+#: ``scripts/rebuild_db.py``: this event re-derives the document's split set
+#: and may replace it.  Split child events inherit it from the parent event.
+#: Live scraper events never carry it (#4788).
+REPLACE_SPLIT_SET_KEY = "_replace_split_set"
+
+
+def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
+    """Decide whether a split child's write may move it to a different case.
+
+    Only when all hold (#4700, #4788):
+
+    - the event is a split child (``_split_processed``);
+    - it comes from a split-set replacement (prefix reingest / rebuild), not
+      a live capture or a retry, where the slot's case is already settled;
+    - the new case number is real, never a missing or ``UNKNOWN-``
+      placeholder, so a relink only moves a ruling to a better-supported
+      case.
+    """
+    if not event_data.get("_split_processed"):
+        return False
+    if event_data.get(REPLACE_SPLIT_SET_KEY) is not True:
+        return False
+    return bool(case_number) and not str(case_number).startswith("UNKNOWN-")
+
+
 def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: str) -> list[str]:
     """Return every document id the split that produced *split_event* writes.
 
@@ -3716,9 +3742,12 @@ class IngestionWorker:
                 summary_model=summary_model,
                 summary_generated_at=summary_generated_at,
                 # A split child's id names a slot in the split, not a case:
-                # when the split set changes, the re-derived case wins
-                # (#4700).  Non-split documents stay preserve-first.
-                relink_case=bool(is_split),
+                # when a reingest/rebuild replaces the split set, the
+                # re-derived case wins (#4700).  Live writes and retries,
+                # non-split documents, and placeholder cases stay
+                # preserve-first, so a re-process that misses the case
+                # number cannot delete a correct ruling (#4788).
+                relink_case=_should_relink_split_case(event_data, effective_case_number),
             )
 
             # 5. Link case to judge
@@ -4388,9 +4417,10 @@ class IngestionWorker:
         # so the DELETE does not race with the INSERT/UPSERT.
         #
         # This also handles the case where a previous multi-ruling run is
-        # re-processed as a single ruling — all old UUID v5 split children
-        # are cleaned up because the single-ruling's document_id is the
-        # original UUID v4 ID, not a UUID v5 split ID.
+        # re-processed as a single ruling: the single ruling keeps the parent
+        # id, so every ``make_split_document_id(parent, i)`` row is stale.
+        # Only this parent's own rows are eligible; other v5 rows on the same
+        # key (scraper pre-split siblings) are kept (#4788).
         #
         # Textless multimodal rows are skipped by the dispatch loop below
         # (#4714) and never written, so a row left at their slot by an
