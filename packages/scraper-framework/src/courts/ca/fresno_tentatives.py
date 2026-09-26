@@ -518,11 +518,12 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
 
     Department is extracted from the PDF filename.  Judge names are not
     available (PDFs contain only initials).  Each PDF may contain multiple
-    rulings, split into individual CapturedDocument records.
+    rulings; the ingestion worker splits those (#4796), so one PDF is one
+    CapturedDocument.
 
     Overrides ``_fetch_one_pdf`` to extract department from the URL filename
     (since the link text contains only the date), and ``fetch_documents`` to
-    split multi-ruling PDFs.
+    fill single-ruling fields and mark multi-ruling PDFs.
     """
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
@@ -568,71 +569,55 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
         return doc
 
     def fetch_documents(self) -> list[CapturedDocument]:
-        """Fetch PDFs and split multi-ruling PDFs into individual documents."""
+        """Fetch PDFs; emit one document per PDF.
+
+        A multi-ruling PDF is NOT split here.  It is emitted whole, with only
+        the PDF-level fields (department from the filename, courthouse, the
+        header hearing date) and ``extra["multi_ruling"]``, and the ingestion
+        worker splits it with ``_split_rulings`` — the same split a prefix
+        reingest or rebuild of the S3 object runs.  Splitting in the scraper
+        gave each ruling a second document id (keyed on the court's entry
+        number instead of the split position), so a reingest and the next
+        live run wrote duplicate rows for the same rulings (#4796).
+        """
         raw_docs = super().fetch_documents()
-        split_docs: list[CapturedDocument] = []
 
         for doc in raw_docs:
             try:
                 text = _extract_pdf_text(doc.raw_content)
             except Exception as exc:
                 logger.warning("PDF text extraction failed", error=str(exc))
-                split_docs.append(doc)
                 continue
 
             rulings = _split_rulings(text)
-            if len(rulings) <= 1:
-                # Single ruling or no rulings — keep original doc
-                # Still try to extract fields from a single ruling
-                if len(rulings) == 1:
-                    r = rulings[0]
-                    doc.case_number = r.case_number
-                    doc.case_title = r.case_title
-                    doc.motion_type = r.motion_type
-                    doc.outcome = r.outcome
-                    doc.ruling_text = r.ruling_text
-                    doc.hearing_date = r.hearing_date
-                    # Prefer per-ruling department if the PDF header
-                    # disagrees with the filename (e.g. a re-posted PDF).
-                    if r.department:
-                        doc.department = r.department
-                split_docs.append(doc)
-                continue
-
-            # Extract hearing date from the full PDF header
-            pdf_hearing_date = _fresno_hearing_date_from_text(text)
-
-            logger.info(
-                "Splitting multi-ruling PDF",
-                department=doc.department,
-                ruling_count=len(rulings),
-            )
-            for ruling in rulings:
-                child = self._make_base_doc(
-                    source_url=doc.source_url,
-                    raw_content=doc.raw_content,
-                    content_format=ContentFormat.PDF,
+            if len(rulings) == 1:
+                # Single ruling — extract its fields here.
+                r = rulings[0]
+                doc.case_number = r.case_number
+                doc.case_title = r.case_title
+                doc.motion_type = r.motion_type
+                doc.outcome = r.outcome
+                doc.ruling_text = r.ruling_text
+                doc.hearing_date = r.hearing_date
+                # Prefer per-ruling department if the PDF header
+                # disagrees with the filename (e.g. a re-posted PDF).
+                if r.department:
+                    doc.department = r.department
+            elif len(rulings) > 1:
+                # Multi-ruling PDF — left whole for the worker's split.  No
+                # case-level fields: the worker copies event fields onto any
+                # child whose own entry lacks them, so a PDF-level case
+                # number would be stamped onto the wrong rulings.
+                doc.ruling_text = text
+                doc.hearing_date = _fresno_hearing_date_from_text(text)
+                doc.extra["multi_ruling"] = True
+                logger.info(
+                    "Multi-ruling PDF left for the worker's split",
+                    department=doc.department,
+                    ruling_count=len(rulings),
                 )
-                # Preserve parent metadata; prefer the per-ruling department
-                # extracted from the ruling header (the PDF may contain
-                # rulings from multiple departments even though the filename
-                # encodes only one).  Fall back to the filename-derived
-                # department when the per-ruling regex doesn't match.
-                child.department = ruling.department or doc.department
-                child.courthouse = doc.courthouse
-                child.extra = {**doc.extra}
-                # Set per-ruling fields
-                child.case_number = ruling.case_number
-                child.ruling_text = ruling.ruling_text
-                child.case_title = ruling.case_title
-                child.motion_type = ruling.motion_type
-                child.outcome = ruling.outcome
-                child.hearing_date = ruling.hearing_date or pdf_hearing_date
-                child.extra["ruling_index"] = ruling.ruling_index
-                child.extra["pre_split"] = True
-                split_docs.append(child)
 
-        return split_docs
+        return raw_docs
 
     @classmethod
     def hearing_date_for_raw(
@@ -658,12 +643,12 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract fields from PDF text.
 
-        If the document was pre-split by fetch_documents, skip the parent's
-        parse_document and only fill in missing fields.
+        A multi-ruling PDF (``extra["multi_ruling"]``, set by
+        ``fetch_documents``) keeps its PDF-level fields only: the parent's
+        regex parse would take the first case number in the PDF as the
+        document's.  Only the filename hearing-date fallback runs.
         """
-        if doc.extra.get("pre_split"):
-            # Already split — fields already populated
-            # Extract hearing date from filename as fallback
+        if doc.extra.get("multi_ruling"):
             if not doc.hearing_date:
                 filename = doc.extra.get("filename", "")
                 doc.hearing_date = _fresno_hearing_date_from_filename(filename)

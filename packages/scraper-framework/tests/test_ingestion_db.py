@@ -3597,6 +3597,28 @@ class TestStaleChildCleanupScopedToParent:
         # recognised as this parent's children.
         assert out == [_kid(2), _kid(20)]
 
+    def test_content_parent_owns_every_row_on_its_key(self) -> None:
+        """#4796: the key's content parent removes every v5 row it no longer
+        writes — old entry-number children AND grandchildren that an older
+        worker wrote by re-splitting a pre-split child."""
+        entry_child = _kid(20)
+        grandchild = make_split_document_id(entry_child, 1)
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [(entry_child,), (grandchild,)]
+        cur.rowcount = 2
+        out: list[str] = []
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/fresno/superior_court/raw/abc.pdf",
+            valid_document_ids=[_kid(0), _kid(1)],
+            parent_document_id=_STALE_PARENT,
+            deleted_ids=out,
+            owns_key=True,
+        )
+        assert out == [entry_child, grandchild]
+
     def test_parent_row_itself_is_stale_when_split(self) -> None:
         """An earlier single-ruling run stored the ruling on the parent id;
         a multi-case split no longer writes it (#4700)."""

@@ -2277,6 +2277,8 @@ class TestFetchDocumentsLlmPath:
         first = docs[0]
         assert first.extra.get("_llm_extracted") is True
         assert first.extra.get("pre_split") is True
+        # Positional split slot (#4796): one LLM ruling per page.
+        assert (first.extra["split_position"], first.extra["split_count"]) == (0, 1)
         assert first.case_number == "25NNCV00140"
         assert first.case_title == "Wu v. Pak"
         assert first.outcome == "denied"

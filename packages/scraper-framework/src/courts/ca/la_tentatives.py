@@ -1272,7 +1272,7 @@ class LATentativeRulingsScraper(BaseScraper):
                     if use_llm:
                         llm_rulings = _llm_extract_rulings(ruling_html)
                         if llm_rulings:
-                            for ruling in llm_rulings:
+                            for position, ruling in enumerate(llm_rulings):
                                 doc = self._make_base_doc(
                                     source_url=CIVIL_URL,
                                     raw_content=ruling_html.encode("utf-8"),
@@ -1294,6 +1294,10 @@ class LATentativeRulingsScraper(BaseScraper):
                                 doc.extra["_llm_extracted"] = True
                                 doc.extra["pre_split"] = True
                                 doc.extra["ruling_index"] = ruling.ruling_index
+                                # Positional id slot, as the worker's split
+                                # of this page would assign (#4796).
+                                doc.extra["split_position"] = position
+                                doc.extra["split_count"] = len(llm_rulings)
                                 docs.append(doc)
                             self._log.debug(
                                 "LLM extracted rulings",

@@ -209,17 +209,69 @@ def _should_relink_split_case(event_data: dict[str, Any], case_number: str | Non
 def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: str) -> list[str]:
     """Return every document id the split that produced *split_event* writes.
 
-    All split paths build their child events the same way: a single-case
-    split reuses the parent id, and a multi-case split uses
+    All split paths build their child ids with ``split_child_document_id``:
+    a single-case split reuses the parent id, and a multi-case split uses
     ``make_split_document_id(parent, 0..N-1)`` with ``N = _split_count``.
     Any other split-child row for the same S3 key is stale (#4700).
     """
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
     if split_event.get("document_id") == parent_document_id:
         return [parent_document_id]
     count = int(split_event.get("_split_count") or 1)
-    return [make_split_document_id(parent_document_id, idx) for idx in range(count)]
+    return [split_child_document_id(parent_document_id, idx, count) for idx in range(count)]
+
+
+def as_pre_split_child(event_data: dict[str, Any]) -> dict[str, Any]:
+    """Mark a scraper pre-split child event as a split child.
+
+    A scraper that splits a page at capture time (the CC / LA LLM paths)
+    emits one event per ruling with ``extra["pre_split"]``.  Each such event
+    is one ruling, already split: the worker must not treat it as a parent.
+    Re-splitting it wrote grandchild ids (``make_split(child, j)``) when the
+    LLM returned several rulings for it, and ran the stale-child cleanup
+    with the child as the parent (#4796).
+
+    Returns *event_data* unchanged unless it is an unmarked pre-split child;
+    otherwise a copy with the worker's split-child keys set:
+    ``_split_processed`` (skips the split and the cleanup), the content
+    parent as ``_original_document_id``, the split position / count, and
+    ``_llm_extracted`` when the scraper filled the fields with an LLM.
+    """
+    extra = event_data.get("extra")
+    if event_data.get("_split_processed") or not (
+        isinstance(extra, dict) and extra.get("pre_split")
+    ):
+        return event_data
+
+    from .split_ids import derive_parent_document_id
+
+    content_hash = event_data.get("content_hash") or ""
+    marked: dict[str, Any] = {
+        **event_data,
+        "_split_processed": True,
+        "_original_document_id": (
+            derive_parent_document_id(content_hash)
+            if content_hash
+            else event_data.get("document_id")
+        ),
+        "_split_index": int(extra.get("split_position") or 0),
+        "_split_count": int(extra.get("split_count") or 1),
+    }
+    if extra.get("_llm_extracted"):
+        marked["_llm_extracted"] = True
+    return marked
+
+
+def _canonical_split_text(text: str) -> str:
+    """Normalise page joins so one PDF splits the same way on every path.
+
+    A live capture joins pdfplumber pages with ``"\\n"``
+    (``pdf_link_scraper._extract_pdf_text``); the worker's raw-PDF path
+    joins them with ``"\\n\\f\\n"`` (``llm_extract.extract_text_from_pdf``).
+    The split must not depend on which one produced the text (#4796).
+    """
+    return text.replace("\n\f\n", "\n")
 
 
 def _try_sd_calendar_split(
@@ -274,11 +326,10 @@ def _try_sd_calendar_split(
     )
 
     # Import here so we don't create a new top-level dependency.
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
-    is_multi = len(split_rulings) > 1
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -381,11 +432,10 @@ def _try_la_html_split(
     )
 
     # Import here so we don't create a new top-level dependency.
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
-    is_multi = len(split_rulings) > 1
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -481,7 +531,7 @@ def _try_fresno_pdf_split(
     # the courts package at module load time.
     from courts.ca.fresno_tentatives import _split_rulings
 
-    split_rulings = _split_rulings(ruling_text)
+    split_rulings = _split_rulings(_canonical_split_text(ruling_text))
     if not split_rulings:
         # No numbered entries found — fall through to LLM.
         logger.info(
@@ -523,11 +573,13 @@ def _try_fresno_pdf_split(
         },
     )
 
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
-    # At this point len(split_rulings) > 1 — always generate split document IDs.
+    # At this point len(split_rulings) > 1 — ids are positional
+    # (``split_child_document_id``), never the court's ``(20)`` entry number,
+    # so live capture and reingest of the PDF agree (#4796).
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx)
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -663,11 +715,11 @@ def _try_riverside_pdf_split(
         },
     )
 
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
     # At this point len(split_rulings) > 1 — always generate split doc IDs.
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx)
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -817,11 +869,11 @@ def _try_sf_pdf_split(
         },
     )
 
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
     # At this point len(split_rulings) > 1 — always generate split doc IDs.
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx)
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -983,11 +1035,11 @@ def _try_sc_pdf_split(
         },
     )
 
-    from .split_ids import make_split_document_id
+    from .split_ids import split_child_document_id
 
     # At this point len(split_rulings) > 1 — always generate split doc IDs.
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx)
+        split_doc_id = split_child_document_id(document_id, idx, len(split_rulings))
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (
@@ -2418,6 +2470,10 @@ class IngestionWorker:
         with timing.phase("parse_document_ms"):
             event_data = self._unwrap_cc_portal_envelope(event_data)
 
+        # A scraper pre-split child is one ruling, not a parent to split
+        # again (#4796).
+        event_data = as_pre_split_child(event_data)
+
         document_id: str = event_data["document_id"]
         state: str = event_data["state"]
         county: str = event_data["county"]
@@ -3843,6 +3899,11 @@ class IngestionWorker:
         s3_key = event_data.get("s3_key")
         if not s3_key:
             return
+        from .split_ids import derive_parent_document_id
+
+        # The content parent owns every row on its S3 key (#4796).
+        content_hash = event_data.get("content_hash")
+        owns_key = bool(content_hash) and document_id == derive_parent_document_id(content_hash)
         removed: list[str] = []
         try:
             conn = self._get_connection()
@@ -3852,6 +3913,7 @@ class IngestionWorker:
                 valid_ids,
                 parent_document_id=document_id,
                 deleted_ids=removed,
+                owns_key=owns_key,
             )
             if deleted:
                 conn.commit()

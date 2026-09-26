@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .extract import normalize_motion_type
-from .split_ids import make_split_document_id
+from .split_ids import split_child_document_id
 
 if TYPE_CHECKING:
     from framework.llm_schema import ExtractedRuling
@@ -293,7 +293,7 @@ def convert_extracted_rulings(
 
     for idx, ruling in enumerate(extracted_rulings):
         # --- Document ID ---
-        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        split_doc_id = split_child_document_id(document_id, idx, count)
 
         # --- Parties ---
         parties_data: list[dict[str, str]] = [

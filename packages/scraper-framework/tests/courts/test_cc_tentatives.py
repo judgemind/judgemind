@@ -1623,6 +1623,12 @@ def test_cc_fetch_with_llm_enabled(
         assert doc.department == "14"
         assert doc.courthouse == "Richmond Courthouse"
 
+    # Positional split slots, not the LLM's ruling_index (#4796).
+    assert [(d.extra["split_position"], d.extra["split_count"]) for d in docs] == [
+        (0, 2),
+        (1, 2),
+    ]
+
     # Check first doc fields
     assert docs[0].case_number == "L23-06679"
     assert docs[0].case_title == "Discover Bank v. Gerald Gilchrist"

@@ -323,11 +323,12 @@ class BaseScraper(abc.ABC):
 
         For pre-split child documents (``doc.extra["pre_split"] == True``)
         that share the same ``raw_content`` as their siblings (e.g. a
-        multi-ruling PDF split into per-ruling children), the document_id
-        is further salted with ``ruling_index`` so each child gets a unique
-        ``document_id``.  Without this, all split children would collide on
-        ``rulings.document_id`` UNIQUE, causing only the first child to
-        land in the DB (#2367).
+        multi-ruling page split into per-ruling children), the document_id
+        is ``split_child_document_id(parent, split_position, split_count)``
+        so each child gets a unique ``document_id`` (#2367) that matches
+        the id the worker's split of the same content produces (#4796).
+        A pre-split child must carry ``extra["split_position"]`` (zero-based)
+        and ``extra["split_count"]``.
         """
         # Inline CSS for HTML documents (makes archived HTML self-contained).
         # We share one httpx.Client across the entire scraper run to avoid the
@@ -386,14 +387,18 @@ class BaseScraper(abc.ABC):
         parent_document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc.content_hash))
 
         # Pre-split children share the same raw_content but represent
-        # different rulings extracted from it.  Salt the document_id with
-        # the ruling_index so each child gets a unique UUID that still
-        # round-trips deterministically.  See ingestion.split_ids for the
-        # same helper used by the reingest path (#2367).
-        if doc.extra.get("pre_split") and "ruling_index" in doc.extra:
-            from ingestion.split_ids import make_split_document_id
+        # different rulings extracted from it (#2367).  Their ids come from
+        # the same helper, and the same zero-based split position, as the
+        # worker's split of the unsplit document, so a live capture and a
+        # prefix reingest of one S3 key write the same ids (#4796).
+        if doc.extra.get("pre_split"):
+            from ingestion.split_ids import split_child_document_id
 
-            doc.document_id = make_split_document_id(parent_document_id, doc.extra["ruling_index"])
+            doc.document_id = split_child_document_id(
+                parent_document_id,
+                doc.extra["split_position"],
+                doc.extra["split_count"],
+            )
         else:
             doc.document_id = parent_document_id
         doc = self.parse_document(doc)
