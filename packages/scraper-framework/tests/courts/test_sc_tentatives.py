@@ -318,6 +318,136 @@ def test_issue_4667_standalone_date_outside_header_region_ignored() -> None:
     assert parse_hearing_date(text) is None
 
 
+# ---------------------------------------------------------------------------
+# #4780: header layouts the parser used to miss.  Each fixture is the trimmed
+# pdfplumber text of a real dev S3 raw (``sc_header_layouts_*_4780.txt``,
+# named after the layout; the source sha256 prefix is in the comment).  The
+# ruling bodies in these fixtures carry decoy dates (filing dates, trust
+# dates, a DOB-style "dated June 20, 2021"), so a body-date fallback would
+# fail the None cases.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        # 25de615f dept-10-fri: "Date: 7/21/26" is the ruling date; the
+        # hearing date is the "Set For:" value.
+        ("set_for_dept10", datetime(2026, 7, 24)),
+        # e8285c0c dept-7-wed: "June 17, 2026 at 10:00 a.m. in Dept 7".
+        ("dated_caption_dept7", datetime(2026, 6, 17)),
+        # 237c37bb dept-22-fri: "DATE: Friday, August 7, 2026 TIME: 9:00 AM".
+        ("weekday_dept22", datetime(2026, 8, 7)),
+        # 4cf758be dept-1-tues: "DATE: Tuesday, 30 June 2026".
+        ("day_first_dept1", datetime(2026, 6, 30)),
+        # 5054ef6b dept-2-thurs: "DATE: June 4 , 2026" (space before comma).
+        ("space_comma_dept2", datetime(2026, 6, 4)),
+        # 808aae42 dept-7-fri pleading-paper order: "came on for hearing
+        # before the Honorable ... on May\n17 22, 2026 at 10:00 a.m. in
+        # Department 7" (a pleading line number splits the date).
+        ("recital_pleading_dept7", datetime(2026, 5, 22)),
+        # 645d53bc dept-7-fri: same recital, line number on its own line.
+        ("recital_pleading_split_dept7", datetime(2026, 5, 29)),
+    ],
+)
+def test_sc_header_layouts_4780_dated(fixture: str, expected: datetime) -> None:
+    text = (FIXTURES / f"sc_header_layouts_{fixture}_4780.txt").read_text()
+    assert parse_hearing_date(text) == expected
+    # One parser feeds both paths: the rebuild/reingest hook agrees.
+    assert (
+        SCTentativeRulingsScraper.hearing_date_for_raw(
+            text, content_format="pdf", capture_timestamp=expected
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        # f9978563 dept-7-wed: "TENATIVE:" probate ruling, no date in header.
+        "no_date_probate_dept7",
+        # b0d2d959 dept-11-mon: "Calendar Line 1 / Case Name / Case No."
+        "no_date_calendar_line_dept11",
+        # ac590caa dept-2-mon: pleading paper, no hearing recital; body has
+        # "dated June 20, 2021" / "June 10, 1993".
+        "no_date_pleading_dept2",
+        # 3dc972a6 dept-10-fri: caption with no date anywhere.
+        "no_date_caption_dept10",
+        # 45dde72a dept-12-wed: "Welcome to Department 12", no header date.
+        "no_date_welcome_dept12",
+    ],
+)
+def test_sc_header_layouts_4780_dateless_returns_none(fixture: str) -> None:
+    text = (FIXTURES / f"sc_header_layouts_{fixture}_4780.txt").read_text()
+    assert parse_hearing_date(text) is None
+
+
+def test_sc_header_layouts_4780_ocr_hearing_date_label() -> None:
+    """Image-only dept 7 PDFs (73be2fd5) print a labelled caption; the worker OCRs them."""
+    text = (
+        "Tentative Ruling\n"
+        "Case Name: The Estate of Anthony Intravaia\n"
+        "Case No.: 25PR199782\n"
+        "Hearing date, time, and department: March 13, 2026 at 10:00 a.m. in Department 7\n"
+        "INTRODUCTION\n"
+        "On April 15, 2025, Petitioner initiated this case.\n"
+    )
+    assert parse_hearing_date(text) == datetime(2026, 3, 13)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A caption-shaped date outside the header region is body text.
+        "Department 7\n" + ("filler text line\n" * 200) + "June 17, 2026 at 10:00 a.m. in Dept 7\n",
+        # A recital outside the header region.
+        "Department 7\n"
+        + ("filler text line\n" * 200)
+        + "The matter came on for hearing before the Honorable A. B. on May 22, 2026 at"
+        " 10:00 a.m. in Department 7.\n",
+        # A date sentence that is not a caption line (no line anchor).
+        "The court set a compliance hearing for April 8, 2027 at 2:30 P.M. in Department 22.\n",
+        # "set for" in prose is not the "Set For:" label.
+        "The motion is set for: hearing on 7/24/26.\n",
+        # Mixed-case "Date:" is the ruling date in dept 10, never the hearing date.
+        "TENTATIVE RULING\nDate: 7/21/26 No. 25CV463446 (Santa Clara County)\n",
+        # Day-first dates count only after the "DATE:" label.
+        "Department 1\n30 June 2026\n",
+        # Blank dept 2 header stays None even with a weekday-shaped body line.
+        "DATE: , 2026 TIME: 10:00 A.M.\nOn Friday, August 7, 2026 the petition was filed.\n",
+    ],
+)
+def test_sc_header_layouts_4780_body_dates_ignored(text: str) -> None:
+    assert parse_hearing_date(text) is None
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("DATE: Friday, August 7, 2026 TIME: 9:00 AM", datetime(2026, 8, 7)),
+        ("DATE: Tuesday, 30 June 2026", datetime(2026, 6, 30)),
+        ("DATE: Thursday, 02 July 2026", datetime(2026, 7, 2)),
+        ("DATE: 30 June 2026 TIME: 9:00 am", datetime(2026, 6, 30)),
+        ("DATE: June 4 , 2026 TIME: 10:00 A.M.", datetime(2026, 6, 4)),
+        ("DATE: WEDNESDAY, SEPT. 2, 2026", datetime(2026, 9, 2)),
+        ("Set For: 7/24/26", datetime(2026, 7, 24)),
+        ("Set For: July 24, 2026", datetime(2026, 7, 24)),
+        ("June 17, 2026 at 10:00 a.m. in Dept 7", datetime(2026, 6, 17)),
+        ("June 17, 2026 at 1:30 p.m. in Department 7", datetime(2026, 6, 17)),
+        ("Sept. 2, 2026 at 9:00 AM in Dept. 7", datetime(2026, 9, 2)),
+        # Dept 16 (ed4bfb50, 2026-07-31) numbers its header lines.
+        ("2. July 31, 2026", datetime(2026, 7, 31)),
+    ],
+)
+def test_sc_header_layouts_4780_line_formats(line: str, expected: datetime) -> None:
+    assert parse_hearing_date(f"TENTATIVE RULING\n{line}\nbody text\n") == expected
+
+
+def test_sc_header_layouts_4780_invalid_day_first_returns_none() -> None:
+    assert parse_hearing_date("DATE: Tuesday, 31 June 2026\n") is None
+
+
 @pytest.mark.parametrize(
     ("header", "captured", "expected"),
     [
