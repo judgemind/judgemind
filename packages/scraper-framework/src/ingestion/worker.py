@@ -3693,7 +3693,7 @@ class IngestionWorker:
             # 4. Insert document + ruling via shared helper (#1790).
             # The helper guarantees the same document_id is passed to both
             # insert_document and insert_ruling, preventing FK divergence (#1775).
-            is_new = insert_document_and_ruling(
+            insert_document_and_ruling(
                 conn,
                 document_id=document_id,
                 case_id=case_id,
@@ -3747,34 +3747,32 @@ class IngestionWorker:
             raise
         timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
-        # Index in OpenSearch.  For split rulings, always index (each split
-        # gets its own OS entry keyed by the synthetic split document_id).
-        # For non-split rulings, only index when the document is new.
-        should_index = is_new or is_split
-        if should_index:
-            # Use the ruling's document_id (synthetic for splits) as the OS _id
-            self._indexer.index_document(
-                {
-                    "document_id": document_id,
-                    "case_number": case_number,
-                    "court": court_name,
-                    "county": county,
-                    "state": state,
-                    "judge_name": judge_name,
-                    "hearing_date": event_data.get("hearing_date"),
-                    "motion_type": motion_type,
-                    "outcome": outcome,
-                    "case_title": case_title,
-                    "summary": summary
-                    or (cleaned_ruling_text[:500] if cleaned_ruling_text else None),
-                    "ruling_text": ruling_text,
-                    "s3_key": s3_key,
-                    "content_hash": content_hash,
-                    "content_format": content_format,
-                }
-            )
-        else:
-            logger.debug("Document %s already in Postgres — skipping OpenSearch index", document_id)
+        # Index in OpenSearch, keyed by the ruling's document_id (synthetic
+        # for splits).  Every write goes through the indexer, new or not:
+        # its idempotency check compares content_hash AND metadata, so an
+        # unchanged re-ingest is a no-op while a relink or title/date fix
+        # overwrites the stale search doc.  The doc mirrors what Postgres
+        # holds — the parsed hearing date and the case title the upsert
+        # kept — not the raw event values (#4712).
+        self._indexer.index_document(
+            {
+                "document_id": document_id,
+                "case_number": case_number,
+                "court": court_name,
+                "county": county,
+                "state": state,
+                "judge_name": judge_name,
+                "hearing_date": hearing_dt,
+                "motion_type": motion_type,
+                "outcome": outcome,
+                "case_title": effective_title or case_title,
+                "summary": summary or (cleaned_ruling_text[:500] if cleaned_ruling_text else None),
+                "ruling_text": ruling_text,
+                "s3_key": s3_key,
+                "content_hash": content_hash,
+                "content_format": content_format,
+            }
+        )
 
     # ------------------------------------------------------------------
     # LLM extraction path (#1473, #1475)

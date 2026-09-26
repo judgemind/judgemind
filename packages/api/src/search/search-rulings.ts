@@ -57,6 +57,36 @@ function pageSize(first: number | undefined | null): number {
   return Math.min(Math.max(1, n), MAX_PAGE_SIZE);
 }
 
+interface PgRulingRow {
+  id: string;
+  document_id: string;
+  hearing_date: string | Date | null;
+  case_title: string | null;
+  case_number: string | null;
+}
+
+const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?:$|[T ])/;
+
+/**
+ * Reduce a hearing date to its `YYYY-MM-DD` calendar date, or null.
+ *
+ * `hearingDate` is a date: Postgres stores a DATE, and the web client parses
+ * it as one.  Older search docs carry a datetime (`2026-07-28T00:00:00`),
+ * which the web rendered as "Date unknown" (#4712).
+ */
+export function normalizeHearingDate(value: unknown): string | null {
+  if (value instanceof Date) {
+    // node-postgres parses a DATE without a type parser as local midnight.
+    if (isNaN(value.getTime())) return null;
+    const mm = String(value.getMonth() + 1).padStart(2, '0');
+    const dd = String(value.getDate()).padStart(2, '0');
+    return `${value.getFullYear()}-${mm}-${dd}`;
+  }
+  if (typeof value !== 'string') return null;
+  const match = DATE_PREFIX_RE.exec(value.trim());
+  return match ? match[1] : null;
+}
+
 function encodeCursor(sortValues: unknown[]): string {
   return Buffer.from(JSON.stringify(sortValues)).toString('base64');
 }
@@ -176,33 +206,40 @@ export async function searchRulings(
   const hasNextPage = hits.length > limit;
   const pageHits = hits.slice(0, limit);
 
-  // Batch lookup ruling IDs from PG using document_ids
+  // Batch lookup the rulings behind these hits.  Postgres (derived.*) is the
+  // source of truth; the search doc can lag it (a case relink or title fix
+  // that has not been re-indexed yet), so the displayed case title, case
+  // number and hearing date come from Postgres when the ruling exists (#4712).
   const documentIds = pageHits.map((h) => h._source.document_id as string).filter(Boolean);
-  const rulingIdMap = new Map<string, string>();
+  const rulingMap = new Map<string, PgRulingRow>();
 
   if (documentIds.length > 0) {
-    const { rows } = await pool.query<{ id: string; document_id: string }>(
-      'SELECT id, document_id FROM rulings WHERE document_id = ANY($1)',
+    const { rows } = await pool.query<PgRulingRow>(
+      `SELECT r.id, r.document_id, r.hearing_date, c.case_title, c.case_number
+         FROM rulings r
+         JOIN cases c ON c.id = r.case_id
+        WHERE r.document_id = ANY($1)`,
       [documentIds],
     );
     for (const row of rows) {
-      rulingIdMap.set(row.document_id, row.id);
+      rulingMap.set(row.document_id, row);
     }
   }
 
   const edges: SearchEdge[] = pageHits.map((hit) => {
     const src = hit._source;
     const docId = src.document_id as string;
+    const pg = rulingMap.get(docId);
     return {
       node: {
-        rulingId: rulingIdMap.get(docId) ?? docId,
-        caseNumber: (src.case_number as string) ?? null,
-        caseTitle: (src.case_title as string) ?? null,
+        rulingId: pg?.id ?? docId,
+        caseNumber: pg ? pg.case_number : ((src.case_number as string) ?? null),
+        caseTitle: pg ? pg.case_title : ((src.case_title as string) ?? null),
         court: (src.court as string) ?? null,
         county: (src.county as string) ?? null,
         state: (src.state as string) ?? null,
         judgeName: (src.judge_name as string) ?? null,
-        hearingDate: (src.hearing_date as string) ?? null,
+        hearingDate: normalizeHearingDate(pg?.hearing_date) ?? normalizeHearingDate(src.hearing_date),
         motionType: (src.motion_type as string) ?? null,
         outcome: (src.outcome as string) ?? null,
         excerpt: hit.highlight?.ruling_text?.[0] ?? (src.summary as string) ?? null,

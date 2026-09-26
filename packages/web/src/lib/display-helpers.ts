@@ -54,10 +54,14 @@ export function formatLabel(value: string | null): string {
 // ---------------------------------------------------------------------------
 
 /** Format an ISO 8601 date string as a short readable date (e.g. "Mar 5, 2026").
+ *  Accepts a date (`2026-03-05`) or a datetime (`2026-03-05T00:00:00`); only the
+ *  calendar date is used (#4712).
  *  Returns "Date unknown" for null, undefined, or unparseable inputs. */
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return 'Date unknown';
-  const d = new Date(iso + 'T00:00:00Z');
+  const datePart = /^(\d{4}-\d{2}-\d{2})(?:$|[T ])/.exec(iso.trim())?.[1];
+  if (!datePart) return 'Date unknown';
+  const d = new Date(datePart + 'T00:00:00Z');
   if (isNaN(d.getTime())) return 'Date unknown';
   return d.toLocaleDateString('en-US', {
     month: 'short',

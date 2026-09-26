@@ -540,7 +540,8 @@ def test_process_event_enrichment_runs_without_hearing_date(
 def test_process_event_duplicate_skips_opensearch(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
-    """If document_id already in Postgres, OpenSearch indexing is skipped."""
+    """If document_id is already in Postgres and its search doc already
+    matches (same hash and metadata), the OpenSearch write is skipped."""
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
@@ -552,10 +553,86 @@ def test_process_event_duplicate_skips_opensearch(
     ]
     mock_cur.rowcount = 1  # upsert always returns rowcount=1
 
-    worker.process_event(_make_event())
+    # First pass: capture the doc the worker would index.
+    os_mock.get.side_effect = Exception("not found")
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(_make_event())
+    indexed = os_mock.index.call_args.kwargs["body"]
 
-    # OpenSearch should NOT be called for duplicate
+    # Second pass: the index already holds that doc — no rewrite.
+    os_mock.reset_mock()
+    os_mock.get.side_effect = None
+    os_mock.get.return_value = {"_source": indexed}
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (False,)]
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(_make_event())
+
     os_mock.index.assert_not_called()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(
+    "ingestion.worker.upsert_case_returning_title",
+    return_value=("case-uuid-1", "Murillo v. BNSF Railway Company"),
+)
+@patch("ingestion.worker.psycopg")
+def test_process_event_indexes_postgres_case_title_and_hearing_date(
+    mock_psycopg: MagicMock, mock_upsert: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
+    """#4712: the search doc mirrors derived.* — the case title Postgres kept
+    (preserve-first upsert) and the parsed hearing date, not the raw event
+    values.  Before the fix, a datetime-shaped event hearing_date and the
+    event's own title reached OpenSearch, so search hits showed "Date
+    unknown" and a title that no longer matched the case."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+    os_mock.get.side_effect = Exception("not found")
+
+    event = _make_event(
+        case_title="Berenice Murillo v. United Parcel Service, Inc",
+        hearing_date="2026-03-05T00:00:00",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    indexed = os_mock.index.call_args.kwargs["body"]
+    assert indexed["case_title"] == "Murillo v. BNSF Railway Company"
+    assert indexed["hearing_date"] == "2026-03-05"
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(
+    "ingestion.worker.upsert_case_returning_title",
+    return_value=("case-uuid-1", "Murillo v. BNSF Railway Company"),
+)
+@patch("ingestion.worker.psycopg")
+def test_process_event_reingest_refreshes_stale_search_doc(
+    mock_psycopg: MagicMock, mock_upsert: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
+    """#4712: a re-ingested (not new) document whose search doc carries a
+    stale title is rewritten, even though its content hash is unchanged."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), (False,)]
+    mock_cur.rowcount = 1
+    os_mock.get.return_value = {
+        "_source": {
+            "content_hash": "abc123",
+            "case_title": "Berenice Murillo v. United Parcel Service, Inc",
+        }
+    }
+
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(_make_event())
+
+    os_mock.index.assert_called_once()
+    assert os_mock.index.call_args.kwargs["body"]["case_title"] == (
+        "Murillo v. BNSF Railway Company"
+    )
 
 
 # ---------------------------------------------------------------------------
