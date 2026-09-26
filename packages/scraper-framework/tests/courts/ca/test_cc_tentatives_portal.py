@@ -5,7 +5,15 @@ Fixtures in tests/fixtures/cc_portal/:
   listing_devine.html    — /tentative-rulings?field_judge_target_id=238 (7 rows, 3 test entries)
   listing_reyes.html     — /tentative-rulings?field_judge_target_id=245 (L24-04564)
   listing_weil.html      — /tentative-rulings?field_judge_target_id=280 (MSN23-2201)
-  listing_empty.html     — no-results page (judge dropdown, no results table)
+  listing_empty.html     — trimmed live no-results page (2026-09-25): judge
+                           dropdown, the "There aren't any tentative rulings"
+                           message in div.search__message, and an empty
+                           div.search__content results region (#4789)
+  listing_reyes_live.html — trimmed live listing for judge 245 (2026-09-25):
+                           one row in the div.search__content table (#4789)
+  listing_illegal_choice.html — trimmed live response to an unknown judge id
+                           (2026-09-25): Drupal error alert, empty results
+                           region, no no-results message (#4789)
   detail_c22-01746_no_pdf.html — live detail page whose ruling is posted inline
                            with no PDF link (#4735)
   detail_l24-04564.html  — detail page for L24-04564 (current jcc-body__main-text
@@ -24,6 +32,7 @@ from __future__ import annotations
 import base64
 import functools
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,6 +50,7 @@ from courts.ca.cc_tentatives_portal import (
     CCTentativesPortalScraper,
     _cc_dept_from_filename,
     _coerce_hearing_date,
+    _is_empty_listing_page,
     _is_test_entry,
     _parse_detail_page,
     _parse_judge_dropdown,
@@ -1359,6 +1369,129 @@ def test_run_succeeds_when_every_listing_is_genuinely_empty() -> None:
 
     assert health.success is True
     assert health.records_captured == 0
+
+
+# ---------------------------------------------------------------------------
+# Empty listing needs the positive no-results marker (#4789)
+# ---------------------------------------------------------------------------
+#
+# The judge dropdown renders on every listing page, so "dropdown present, no
+# rows" cannot tell a quiet day from a results table whose markup changed.
+# A genuinely empty listing (live, 2026-09-25) carries the no-results message
+# in div.search__message AND an empty div.search__content results region.
+
+_NO_RESULTS_P = "<p>There aren't any tentative rulings matching your filter criteria.</p>"
+
+
+def _empty_listing_without_marker() -> str:
+    """listing_empty.html with the no-results message removed: the dropdown
+    and results region are still there, but nothing says "no results"."""
+    html = _load_html("listing_empty.html")
+    assert _NO_RESULTS_P in html
+    return html.replace(_NO_RESULTS_P, "")
+
+
+def _empty_listing_without_results_region() -> str:
+    """listing_empty.html whose results region was renamed (a redesign)."""
+    html = _load_html("listing_empty.html")
+    assert 'class="search__content"' in html
+    return html.replace('class="search__content"', 'class="results__body"')
+
+
+def _live_listing_with_changed_table() -> str:
+    """listing_reyes_live.html with the results <table> turned into a <div>
+    list, so the row parser finds nothing while the page is clearly populated."""
+    html = _load_html("listing_reyes_live.html")
+    assert '<table class="cols-2">' in html
+    return html.replace('<table class="cols-2">', '<div class="results-list">').replace(
+        "</table>", "</div>"
+    )
+
+
+def test_live_listing_fixture_parses_one_row() -> None:
+    rows = _parse_listing_table(_load_html("listing_reyes_live.html"))
+    assert [r["case_number"] for r in rows] == ["L24-04564"]
+    assert rows[0]["hearing_date"] == datetime(2025, 1, 29, 16, 31, tzinfo=UTC)
+
+
+def test_is_empty_listing_page_true_for_live_empty_listing() -> None:
+    assert _is_empty_listing_page(_load_html("listing_empty.html")) is True
+
+
+@pytest.mark.parametrize(
+    "html_factory",
+    [
+        pytest.param(lambda: _load_html("listing_reyes_live.html"), id="populated"),
+        pytest.param(lambda: _load_html("listing_illegal_choice.html"), id="illegal-choice"),
+        pytest.param(_empty_listing_without_marker, id="no-marker"),
+        pytest.param(_empty_listing_without_results_region, id="no-results-region"),
+        pytest.param(_live_listing_with_changed_table, id="changed-table"),
+        pytest.param(lambda: _BLOCK_PAGE, id="block-page"),
+    ],
+)
+def test_is_empty_listing_page_false_without_positive_marker(
+    html_factory: Callable[[], str],
+) -> None:
+    assert _is_empty_listing_page(html_factory()) is False
+
+
+def _mock_both_listings(html: str) -> None:
+    for judge_id in ("238", "280"):
+        respx.get(LISTING_URL, params={"field_judge_target_id": judge_id}).mock(
+            return_value=httpx.Response(200, text=html)
+        )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+
+@pytest.mark.parametrize(
+    "html_factory",
+    [
+        pytest.param(_empty_listing_without_marker, id="no-marker"),
+        pytest.param(_empty_listing_without_results_region, id="no-results-region"),
+        pytest.param(_live_listing_with_changed_table, id="changed-table"),
+        pytest.param(lambda: _load_html("listing_illegal_choice.html"), id="illegal-choice"),
+    ],
+)
+@respx.mock
+def test_run_fails_when_listing_has_dropdown_but_no_rows_and_no_empty_marker(
+    html_factory: Callable[[], str],
+) -> None:
+    """A listing page that still renders the judge dropdown but has neither
+    parseable rows nor the no-results marker is a layout change, not a quiet
+    day. When every listing looks like that, the run fails (#4789)."""
+    html = html_factory()
+    assert _parse_judge_dropdown(html), "mutation must keep the judge dropdown"
+    assert _parse_listing_table(html) == []
+    _mock_both_listings(html)
+
+    health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert "all 2 CC portal listing and ruling fetches were blocked" in (health.error_message or "")
+    assert "no no-results marker" in (health.error_message or "")
+
+
+@respx.mock
+def test_changed_listing_for_one_judge_does_not_hide_the_other_judges_rulings() -> None:
+    """One judge's listing with a changed table is counted blocked, while an
+    empty listing for another judge still counts as a quiet day: the run
+    stays green, and the blocked listing is logged (#4789)."""
+    respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
+        return_value=httpx.Response(200, text=_live_listing_with_changed_table())
+    )
+    respx.get(LISTING_URL, params={"field_judge_target_id": "280"}).mock(
+        return_value=httpx.Response(200, text=_load_html("listing_empty.html"))
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=_TWO_JUDGE_FORM))
+
+    with structlog.testing.capture_logs() as logs:
+        health = CCTentativesPortalScraper(config=_run_config()).run()
+
+    assert health.success is True
+    events = [e["event"] for e in logs]
+    assert "cc_portal.unexpected_listing_page" in events
+    assert "cc_portal.empty_listing" in events
 
 
 # ---------------------------------------------------------------------------
