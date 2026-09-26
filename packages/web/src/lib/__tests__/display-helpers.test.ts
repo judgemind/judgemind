@@ -178,6 +178,17 @@ describe('formatDate', () => {
   it('formats a date at year boundary correctly', () => {
     expect(formatDate('2025-12-31')).toBe('Dec 31, 2025');
   });
+
+  // #4712: some search hits carried a datetime and rendered "Date unknown".
+  it('formats a datetime string by its calendar date', () => {
+    expect(formatDate('2026-07-28T00:00:00')).toBe('Jul 28, 2026');
+    expect(formatDate('2026-07-28T23:30:00+00:00')).toBe('Jul 28, 2026');
+    expect(formatDate('2026-07-28 09:30:00')).toBe('Jul 28, 2026');
+  });
+
+  it('returns "Date unknown" for an impossible date', () => {
+    expect(formatDate('2026-13-45')).toBe('Date unknown');
+  });
 });
 
 // ---------------------------------------------------------------------------

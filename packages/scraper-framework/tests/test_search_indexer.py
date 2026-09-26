@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -12,8 +13,10 @@ from opensearchpy.exceptions import ConnectionError as OSConnectionError
 
 from framework.search.indexer import (
     CONSUMER_GROUP,
+    INDEXED_METADATA_FIELDS,
     STREAM_DOCUMENT_VALIDATED,
     IndexingConsumer,
+    normalize_hearing_date,
 )
 
 
@@ -124,8 +127,8 @@ class TestIndexDocument:
     def test_skips_when_same_hash(
         self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
     ) -> None:
-        # Document already indexed with same hash
-        mock_opensearch.get.return_value = {"_source": {"content_hash": "abc123def456"}}
+        # Document already indexed with same hash and metadata
+        mock_opensearch.get.return_value = _existing_source(sample_event)
 
         result = consumer.index_document(sample_event)
 
@@ -256,11 +259,7 @@ class TestIndexBatch:
         consumer: IndexingConsumer,
         mock_opensearch: MagicMock,
     ) -> None:
-        # First doc already indexed with same hash, second is new
-        mock_opensearch.get.side_effect = [
-            {"_source": {"content_hash": "existing_hash"}},
-            Exception("not found"),
-        ]
+        # First doc already indexed with same hash and metadata, second is new
         mock_bulk.return_value = (1, 0)
 
         events = [
@@ -281,6 +280,10 @@ class TestIndexBatch:
                 "content_hash": "new_hash",
             },
         ]
+        mock_opensearch.get.side_effect = [
+            _existing_source(events[0]),
+            Exception("not found"),
+        ]
 
         count = consumer.index_batch(events)
         assert count == 1
@@ -295,8 +298,6 @@ class TestIndexBatch:
         mock_opensearch: MagicMock,
     ) -> None:
         # All docs already indexed
-        mock_opensearch.get.return_value = {"_source": {"content_hash": "same_hash"}}
-
         events = [
             {
                 "document_id": "doc-1",
@@ -307,6 +308,7 @@ class TestIndexBatch:
                 "content_hash": "same_hash",
             },
         ]
+        mock_opensearch.get.return_value = _existing_source(events[0])
 
         count = consumer.index_batch(events)
         assert count == 0
@@ -1116,3 +1118,112 @@ class TestDeleteDocuments:
     ) -> None:
         mock_opensearch.delete.side_effect = OSConnectionError("N/A", "boom", Exception())
         assert consumer.delete_documents(["a"]) == 0
+
+
+class TestHearingDateNormalization:
+    """#4712: the index stores hearing_date as YYYY-MM-DD, whatever the event shape."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("2026-07-28", "2026-07-28"),
+            ("2026-07-28T00:00:00", "2026-07-28"),
+            ("2026-07-28T00:00:00+00:00", "2026-07-28"),
+            ("2026-07-28 09:30:00", "2026-07-28"),
+            (date(2026, 7, 28), "2026-07-28"),
+            (datetime(2026, 7, 28, 9, 30), "2026-07-28"),
+            (None, None),
+            ("", None),
+            ("not-a-date", None),
+        ],
+    )
+    def test_normalize_hearing_date(self, value: object, expected: str | None) -> None:
+        assert normalize_hearing_date(value) == expected
+
+    def test_datetime_event_is_indexed_as_date_only(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.side_effect = Exception("not found")
+        consumer.index_document({**sample_event, "hearing_date": "2026-07-28T00:00:00"})
+
+        assert mock_opensearch.index.call_args.kwargs["body"]["hearing_date"] == "2026-07-28"
+
+    def test_date_object_event_is_indexed_as_date_only(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.side_effect = Exception("not found")
+        consumer.index_document({**sample_event, "hearing_date": date(2026, 7, 28)})
+
+        assert mock_opensearch.index.call_args.kwargs["body"]["hearing_date"] == "2026-07-28"
+
+
+def _existing_source(sample_event: dict, **overrides: object) -> dict:
+    """An OS ``get`` response mirroring what the indexer wrote for *sample_event*."""
+    src = {k: sample_event.get(k) for k in INDEXED_METADATA_FIELDS}
+    src["document_id"] = sample_event["document_id"]
+    src["ruling_text"] = "old text"
+    src["indexed_at"] = "2026-01-01T00:00:00+00:00"
+    src.update(overrides)
+    return {"_source": src}
+
+
+class TestMetadataDriftReindex:
+    """#4712: same content_hash but changed metadata (case relink, title,
+    hearing_date shape) must overwrite the stale search doc."""
+
+    def test_skips_when_hash_and_metadata_match(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(sample_event)
+
+        assert consumer.index_document(sample_event) is False
+        mock_opensearch.index.assert_not_called()
+
+    def test_reindexes_when_case_title_changed(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(
+            sample_event, case_title="Berenice Murillo v. United Parcel Service, Inc"
+        )
+
+        assert consumer.index_document(sample_event) is True
+        assert mock_opensearch.index.call_args.kwargs["body"]["case_title"] == "Smith v. Jones"
+
+    def test_reindexes_when_case_number_changed(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(sample_event, case_number="BC000000")
+
+        assert consumer.index_document(sample_event) is True
+
+    def test_reindexes_legacy_datetime_hearing_date(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(
+            sample_event, hearing_date="2026-03-15T00:00:00"
+        )
+
+        assert consumer.index_document(sample_event) is True
+        assert mock_opensearch.index.call_args.kwargs["body"]["hearing_date"] == "2026-03-15"
+
+    def test_force_bypasses_idempotency(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(sample_event)
+
+        assert consumer.index_document(sample_event, force=True) is True
+        mock_opensearch.get.assert_not_called()
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_index_batch_force_bypasses_idempotency(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+        sample_event: dict,
+    ) -> None:
+        mock_opensearch.get.return_value = _existing_source(sample_event)
+        mock_bulk.return_value = (1, 0)
+
+        assert consumer.index_batch([sample_event], force=True) == 1
+        mock_opensearch.get.assert_not_called()

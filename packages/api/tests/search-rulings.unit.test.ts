@@ -3,8 +3,79 @@
  * for motion type and outcome filters (#1105).
  */
 
-import { describe, it, expect } from 'vitest';
-import { buildQuery } from '../src/search/search-rulings';
+import { describe, it, expect, vi } from 'vitest';
+import type { Client } from '@opensearch-project/opensearch';
+import type { Pool } from 'pg';
+import { buildQuery, normalizeHearingDate, searchRulings } from '../src/search/search-rulings';
+
+describe('normalizeHearingDate (#4712)', () => {
+  it.each([
+    ['2026-07-28', '2026-07-28'],
+    ['2026-07-28T00:00:00', '2026-07-28'],
+    ['2026-07-28T00:00:00+00:00', '2026-07-28'],
+    ['2026-07-28 09:30:00', '2026-07-28'],
+  ])('reduces %s to a calendar date', (input, expected) => {
+    expect(normalizeHearingDate(input)).toBe(expected);
+  });
+
+  it('accepts a Date', () => {
+    expect(normalizeHearingDate(new Date(2026, 6, 28))).toBe('2026-07-28');
+    expect(normalizeHearingDate(new Date('nope'))).toBeNull();
+  });
+
+  it.each([[null], [undefined], [''], ['not-a-date'], [42]])('returns null for %s', (input) => {
+    expect(normalizeHearingDate(input)).toBeNull();
+  });
+});
+
+describe('searchRulings hit shaping (#4712)', () => {
+  function makeOs(source: Record<string, unknown>): Client {
+    return {
+      search: vi.fn().mockResolvedValue({
+        body: {
+          hits: {
+            total: { value: 1 },
+            hits: [{ _id: source.document_id, _score: 1, _source: source, sort: [1, 'x'] }],
+          },
+        },
+      }),
+    } as unknown as Client;
+  }
+
+  function makePool(rows: Array<Record<string, unknown>>): Pool {
+    return { query: vi.fn().mockResolvedValue({ rows }) } as unknown as Pool;
+  }
+
+  const staleSource = {
+    document_id: 'aad4f50a-26ad-5ee0-984d-0259fda7d54a',
+    case_number: '21STCV42883',
+    case_title: 'Berenice Murillo v. United Parcel Service, Inc',
+    hearing_date: '2026-07-28T00:00:00',
+  };
+
+  it('returns a date-only hearingDate when the index holds a datetime', async () => {
+    const result = await searchRulings(makeOs(staleSource), makePool([]), { query: 'demurrer' });
+    expect(result.edges[0].node.hearingDate).toBe('2026-07-28');
+  });
+
+  it('prefers the Postgres case title, case number and hearing date over the search doc', async () => {
+    const pool = makePool([
+      {
+        id: '599b21b0-42b2-4434-9c35-4e4dd74ce0a9',
+        document_id: staleSource.document_id,
+        hearing_date: '2026-07-29',
+        case_title: 'Murillo v. BNSF Railway Company',
+        case_number: '21STCV42883',
+      },
+    ]);
+    const result = await searchRulings(makeOs(staleSource), pool, { query: 'demurrer' });
+    const node = result.edges[0].node;
+    expect(node.rulingId).toBe('599b21b0-42b2-4434-9c35-4e4dd74ce0a9');
+    expect(node.caseTitle).toBe('Murillo v. BNSF Railway Company');
+    expect(node.caseNumber).toBe('21STCV42883');
+    expect(node.hearingDate).toBe('2026-07-29');
+  });
+});
 
 describe('buildQuery', () => {
   it('returns bool with match_all and future-date filter when no query or filters', () => {

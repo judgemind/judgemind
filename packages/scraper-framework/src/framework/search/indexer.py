@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+import re
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 from opensearchpy import helpers
@@ -54,6 +55,49 @@ logger = logging.getLogger(__name__)
 CONSUMER_GROUP = "indexer"
 CONSUMER_NAME = "indexer-1"
 STREAM_DOCUMENT_VALIDATED = "document.validated"
+
+# Search-document fields derived from ``derived.*`` metadata (everything except
+# the ruling text and ``indexed_at``).  The idempotency check compares these as
+# well as ``content_hash``: a case relink or a title/date correction leaves the
+# content hash unchanged but must still overwrite the stale doc (#4712).
+INDEXED_METADATA_FIELDS: tuple[str, ...] = (
+    "case_number",
+    "court",
+    "county",
+    "state",
+    "judge_name",
+    "hearing_date",
+    "motion_type",
+    "outcome",
+    "case_title",
+    "case_type",
+    "summary",
+    "s3_key",
+    "content_hash",
+)
+
+_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:$|[T ])")
+
+
+def normalize_hearing_date(value: Any) -> str | None:
+    """Return *value* as a ``YYYY-MM-DD`` string, or None if it carries no date.
+
+    Scraper events carry ``hearing_date`` as a date, a datetime, or an ISO
+    string of either shape (``2026-07-28T00:00:00``).  The index stores the
+    calendar date only, matching ``derived.rulings.hearing_date`` (a DATE);
+    the API and web client treat ``hearingDate`` as a date string (#4712).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        match = _DATE_PREFIX_RE.match(value.strip())
+        if match:
+            return match.group(1)
+    return None
 
 
 def _is_anonymous_user_403(exc: BaseException) -> bool:
@@ -162,7 +206,7 @@ class IndexingConsumer:
     # Direct indexing interface
     # ------------------------------------------------------------------
 
-    def index_document(self, event: dict[str, Any]) -> bool:
+    def index_document(self, event: dict[str, Any], *, force: bool = False) -> bool:
         """Index a single document from event data.
 
         Expected event fields:
@@ -170,8 +214,10 @@ class IndexingConsumer:
             judge_name, hearing_date, content_hash, content_format
 
         Returns True if the document was indexed (new or updated),
-        False if skipped (same content_hash already indexed) or if the
-        OpenSearch write failed with a transient connection/timeout error.
+        False if skipped (already indexed with the same content_hash and
+        metadata) or if the OpenSearch write failed with a transient
+        connection/timeout error.  ``force=True`` skips the idempotency
+        check (used by ``scripts/reindex_search_from_db.py``).
 
         Transient connection errors (``ConnectionTimeout`` /
         ``ConnectionError`` from ``opensearchpy``) are logged as warnings
@@ -184,7 +230,7 @@ class IndexingConsumer:
         Non-transient errors (invalid index, 4xx data errors, auth
         failures) still propagate so real bugs are surfaced loudly.
         """
-        os_doc = self._build_os_doc(event)
+        os_doc = self._build_os_doc(event, force=force)
         if os_doc is None:
             return False
 
@@ -242,19 +288,19 @@ class IndexingConsumer:
                 )
         return removed
 
-    def index_batch(self, events: list[dict[str, Any]]) -> int:
+    def index_batch(self, events: list[dict[str, Any]], *, force: bool = False) -> int:
         """Index a batch of documents using the OpenSearch bulk API.
 
         Reduces N HTTP round-trips to 1 per batch. Individual document
         errors are logged but do not prevent other documents from being
-        indexed.
+        indexed.  ``force=True`` skips the per-document idempotency check.
 
         Returns the count of documents successfully indexed.
         """
         actions: list[dict[str, Any]] = []
         for event in events:
             try:
-                os_doc = self._build_os_doc(event)
+                os_doc = self._build_os_doc(event, force=force)
                 if os_doc is not None:
                     actions.append(
                         {
@@ -392,18 +438,26 @@ class IndexingConsumer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_os_doc(self, event: dict[str, Any]) -> dict[str, Any] | None:
+    def _build_os_doc(self, event: dict[str, Any], *, force: bool = False) -> dict[str, Any] | None:
         """Build an OpenSearch document from an event, or return None to skip.
 
         Returns None if the document is already indexed with the same
-        content_hash (idempotency check).
+        content_hash and the same metadata (idempotency check), unless
+        ``force`` is set.
         """
         document_id = event["document_id"]
         content_hash = event.get("content_hash", "")
         s3_key = event.get("s3_key")
 
-        # Idempotency: skip if already indexed with the same hash
-        if content_hash and self._already_indexed(document_id, content_hash):
+        metadata: dict[str, Any] = {field: event.get(field) for field in INDEXED_METADATA_FIELDS}
+        metadata["hearing_date"] = normalize_hearing_date(event.get("hearing_date"))
+        metadata["s3_key"] = s3_key
+        metadata["content_hash"] = content_hash
+
+        # Idempotency: skip only if already indexed with the same hash AND
+        # the same metadata.  A case relink or a title/date fix keeps the
+        # hash but must overwrite the stale doc (#4712).
+        if not force and content_hash and self._already_indexed(document_id, metadata):
             logger.debug(
                 "Document %s already indexed with hash %s, skipping",
                 document_id,
@@ -416,33 +470,21 @@ class IndexingConsumer:
         ruling_text = event.get("ruling_text") or (self._fetch_text(s3_key) if s3_key else "")
 
         return {
-            "case_number": event.get("case_number"),
-            "court": event.get("court"),
-            "county": event.get("county"),
-            "state": event.get("state"),
-            "judge_name": event.get("judge_name"),
-            "hearing_date": event.get("hearing_date"),
-            "motion_type": event.get("motion_type"),
-            "outcome": event.get("outcome"),
-            "case_title": event.get("case_title"),
-            "case_type": event.get("case_type"),
-            "summary": event.get("summary"),
+            **metadata,
             "ruling_text": ruling_text,
             "document_id": document_id,
-            "s3_key": s3_key,
-            "content_hash": content_hash,
             "indexed_at": datetime.now(UTC).isoformat(),
         }
 
-    def _already_indexed(self, document_id: str, content_hash: str) -> bool:
-        """Check if a document with the same content_hash is already indexed."""
+    def _already_indexed(self, document_id: str, metadata: dict[str, Any]) -> bool:
+        """Check if the indexed doc already carries this content_hash and metadata."""
         try:
             result = self._os.get(index=self._index, id=document_id)
-            existing_hash = result["_source"].get("content_hash", "")
-            return existing_hash == content_hash
+            existing = result["_source"]
         except Exception:
             # Document not found or index doesn't exist — needs indexing
             return False
+        return all(existing.get(field) == value for field, value in metadata.items())
 
     def _fetch_text(self, s3_key: str) -> str:
         """Fetch document text content from S3."""
