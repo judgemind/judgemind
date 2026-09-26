@@ -82,10 +82,19 @@ _JUDGE_RE = re.compile(
 # Department number from PDF header: "Department 1", "Department 16"
 _DEPT_PDF_RE = re.compile(r"^Department\s+(?P<department>\d+)$", re.MULTILINE)
 
-# Hearing date from the PDF header.  Three header layouts are known:
+# Hearing date from the PDF header.  Known header layouts:
 #   "DATE: March 3, 2026 TIME: 9:00 A.M."   (dept 1)
 #   "DATE: 09/23/2026 TIME: 9:00 A.M."      (dept 12, live since 2026-09 — #4667)
-#   "March 3, 2026" on its own line         (depts 6, 16)
+#   "March 3, 2026" on its own line         (depts 6, 16; "2. July 31, 2026" — #4780)
+#   "DATE: Friday, August 7, 2026"          (dept 22 — #4780)
+#   "DATE: Tuesday, 30 June 2026"           (dept 1 — #4780)
+#   "DATE: June 4 , 2026"                   (dept 2 probate — #4780)
+#   "Set For: 7/24/26"                      (dept 10; its "Date:" is the ruling date — #4780)
+#   "June 17, 2026 at 10:00 a.m. in Dept 7" (dept 7 probate caption — #4780)
+#   "Hearing date, time, and department: March 13, 2026 at 10:00 a.m. in
+#    Department 7"                          (dept 7, image-only, OCR'd — #4780)
+#   "... came on for hearing before the Honorable X on May 22, 2026 at
+#    10:00 a.m. in Department 7"            (dept 7 pleading-paper orders — #4780)
 # The date MUST come from the header.  An earlier version made the "DATE:"
 # prefix optional and searched the whole document, so when the header switched
 # to the numeric form the regex silently matched the first long-form date in
@@ -95,30 +104,71 @@ _DEPT_PDF_RE = re.compile(r"^Department\s+(?P<department>\d+)$", re.MULTILINE)
 # ("DATE: Sept. 21, 2026" — dept 2 probate).  Month names are matched
 # case-insensitively via a scoped ``(?i:...)`` group ("DATE: AUGUST 5, 2026"
 # — dept 2 probate) while the "DATE:" label itself stays case-sensitive.
-_LONG_FORM_DATE = (
+_MONTH_NAME = (
     r"(?i:January|February|March|April|May|June|July|August|September"
     r"|October|November|December"
     r"|(?:Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?)"
-    r"\s+\d{1,2},?\s+\d{4}"
 )
+# "June 4, 2026", "June 4 , 2026" (dept 2 — #4780), "Sept. 21, 2026".
+_LONG_FORM_DATE = rf"{_MONTH_NAME}\s+\d{{1,2}}\s*,?\s+\d{{4}}"
+# "30 June 2026" (dept 1 — #4780).  Only accepted after a label.
+_DAY_FIRST_DATE = rf"\d{{1,2}}\s+{_MONTH_NAME}\s+\d{{4}}"
 _NUMERIC_DATE = r"\d{1,2}[/-]\d{1,2}[/-](?:\d{4}|\d{2})(?!\d)"
+_WEEKDAY = r"(?i:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
 
-# Labelled header date — "DATE: <numeric or long-form>".  Searched anywhere
-# because the label itself is the anchor (it repeats on every page header).
-# Case-sensitive on purpose: every observed header uses upper-case "DATE:",
-# while ruling prose uses "Hearing date:" / "Filing Date:" for other dates.
+# Labelled header date — "DATE: [<weekday>,] <numeric, long-form or
+# day-first>".  Searched anywhere because the label itself is the anchor (it
+# repeats on every page header).  Case-sensitive on purpose: every observed
+# header uses upper-case "DATE:", while ruling prose uses "Hearing date:" /
+# "Filing Date:" for other dates, and dept 10's mixed-case "Date:" is the
+# date the ruling was written, not the hearing (#4780).
 _DATE_LABEL_RE = re.compile(
-    rf"\bDATE:\s*(?P<date>{_NUMERIC_DATE}|{_LONG_FORM_DATE})",
+    rf"\bDATE:\s*(?:{_WEEKDAY})?"
+    rf"(?P<date>{_NUMERIC_DATE}|{_LONG_FORM_DATE}|{_DAY_FIRST_DATE})",
 )
 
 # Unlabelled header date — a long-form date alone on its own line.  Only
 # searched within the first ``_HEADER_REGION_CHARS`` characters so a date that
 # happens to wrap onto its own line inside a ruling body cannot match.
+# Dept 16 sometimes numbers its header lines: "2. July 31, 2026" (#4780).
 _STANDALONE_DATE_RE = re.compile(
-    rf"^[ \t]*(?P<date>{_LONG_FORM_DATE})[ \t]*$",
+    rf"^[ \t]*(?:\d{{1,2}}\.[ \t]+)?(?P<date>{_LONG_FORM_DATE})[ \t]*$",
     re.MULTILINE,
 )
 _HEADER_REGION_CHARS = 1500
+
+# The rest are header-region only (#4780).
+
+# Dept 10: "Set For: 7/24/26".  Case-sensitive label, like "DATE:".
+_SET_FOR_RE = re.compile(
+    rf"\b(?:Set For|SET FOR):[ \t]*(?P<date>{_NUMERIC_DATE}|{_LONG_FORM_DATE})",
+)
+
+_TIME_IN_DEPT = (
+    r"\s+at\s+\d{1,2}(?::\d{2})?\s*(?i:[ap]\.?\s*m\.?)\s+in\s+(?i:Dept\.?|Department)\s*\d+"
+)
+
+# Dept 7 caption line: "June 17, 2026 at 10:00 a.m. in Dept 7", optionally
+# after "Hearing date, time, and department:".  Must start a line.
+_CAPTION_DATE_RE = re.compile(
+    r"^[ \t]*(?:Hearing date, time,? and department:[ \t]*)?"
+    rf"(?P<date>{_LONG_FORM_DATE}){_TIME_IN_DEPT}",
+    re.MULTILINE,
+)
+
+# Dept 7 pleading-paper orders open with "The above-entitled action came on
+# for hearing before the Honorable X on May 22, 2026 at 10:00 a.m. in
+# Department 7."  The recital states the hearing this order decides.
+_RECITAL_DATE_RE = re.compile(
+    r"\bcame\s+on\s+for\s+hearing\s+before\s+[^;]{0,160}?\bon\s+"
+    rf"(?P<date>{_LONG_FORM_DATE}){_TIME_IN_DEPT}",
+)
+
+# Pleading paper prints line numbers 1-28 down the margin, which pdfplumber
+# interleaves with the text ("on May\n17 22, 2026").  Detected by the text
+# opening "1\n2\n3\n".
+_PLEADING_PAPER_RE = re.compile(r"\A\s*1\n2\n3\n")
+_PLEADING_LINE_NO_RE = re.compile(r"^\d{1,2}(?:[ \t]+|$)", re.MULTILINE)
 
 # Case number: 2-digit year prefix + CV or PR + 6 digits (e.g. 24CV443183, 25PR199782)
 _CASE_NUMBER_RE = re.compile(r"\b\d{2}(?:CV|PR)\d{6}\b", re.IGNORECASE)
@@ -352,7 +402,7 @@ def parse_department(text: str) -> str | None:
 
 
 def _parse_header_date(raw: str) -> Any:
-    """Parse a numeric (``09/23/2026``, ``9-3-26``) or long-form date string."""
+    """Parse a numeric (``09/23/2026``, ``9-3-26``), long-form or day-first date string."""
     from datetime import datetime
 
     raw = " ".join(raw.split())
@@ -365,13 +415,15 @@ def _parse_header_date(raw: str) -> Any:
             return datetime(year, month, day)
         except ValueError:
             return None
-    long_form = re.fullmatch(r"([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})", raw)
-    if long_form:
-        month_num = _MONTH_PREFIXES.get(long_form.group(1)[:3].lower())
+    long_form = re.fullmatch(r"(?P<m>[A-Za-z]+)\.?\s+(?P<d>\d{1,2})\s*,?\s+(?P<y>\d{4})", raw)
+    day_first = re.fullmatch(r"(?P<d>\d{1,2})\s+(?P<m>[A-Za-z]+)\.?\s+(?P<y>\d{4})", raw)
+    parts = long_form or day_first
+    if parts:
+        month_num = _MONTH_PREFIXES.get(parts.group("m")[:3].lower())
         if month_num is None:
             return None
         try:
-            return datetime(int(long_form.group(3)), month_num, int(long_form.group(2)))
+            return datetime(int(parts.group("y")), month_num, int(parts.group("d")))
         except ValueError:
             return None
     return None
@@ -435,10 +487,16 @@ def correct_header_year_typo(hearing_date: Any, captured_at: Any) -> Any:
 def parse_hearing_date(text: str) -> Any:
     """Extract the hearing date from the PDF header.
 
-    Tries, in order: a ``DATE:``-labelled date (numeric or long-form), then a
-    long-form date alone on its own line within the header region.  Returns
-    ``None`` rather than guessing from ruling-body prose, so the downstream
-    LLM enrichment can fill the field instead (#4667).
+    Tries, in order: a ``DATE:``-labelled date anywhere, then, within the
+    header region only, a long-form date alone on its own line, a
+    ``Set For:`` label, a ``<date> at <time> in Dept N`` caption line, and a
+    ``came on for hearing before ... on <date> at <time> in Department N``
+    order recital.  Returns ``None`` rather than guessing from ruling-body
+    prose, so the downstream LLM enrichment can fill the field instead
+    (#4667, #4682, #4780).
+
+    This is the one parser behind both the live ``parse_document`` and the
+    rebuild/reingest ``hearing_date_for_raw`` hook.
 
     Returns a datetime object or None.
     """
@@ -446,7 +504,15 @@ def parse_hearing_date(text: str) -> Any:
         parsed = _parse_header_date(m.group("date"))
         if parsed is not None:
             return parsed
-    for m in _STANDALONE_DATE_RE.finditer(text[:_HEADER_REGION_CHARS]):
+    header = text[:_HEADER_REGION_CHARS]
+    for regex in (_STANDALONE_DATE_RE, _SET_FOR_RE, _CAPTION_DATE_RE):
+        for m in regex.finditer(header):
+            parsed = _parse_header_date(m.group("date"))
+            if parsed is not None:
+                return parsed
+    if _PLEADING_PAPER_RE.match(text):
+        header = _PLEADING_LINE_NO_RE.sub("", text)[:_HEADER_REGION_CHARS]
+    for m in _RECITAL_DATE_RE.finditer(header):
         parsed = _parse_header_date(m.group("date"))
         if parsed is not None:
             return parsed
