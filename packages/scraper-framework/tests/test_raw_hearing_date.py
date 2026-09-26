@@ -17,7 +17,7 @@ date handed to the split.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -345,6 +345,22 @@ class _FakeRaises(BaseScraper):
         raise ValueError("boom")
 
 
+class _FakeDate(BaseScraper):
+    @classmethod
+    def hearing_date_for_raw(cls, text: str, **_kw: Any) -> Any:
+        return date(2026, 2, 3)
+
+
+class _FakeEcho(BaseScraper):
+    """Returns the capture timestamp it was handed."""
+
+    @classmethod
+    def hearing_date_for_raw(
+        cls, text: str, *, capture_timestamp: datetime | None = None, **_kw: Any
+    ) -> datetime | None:
+        return capture_timestamp
+
+
 def _patched_index(
     by_id: dict[str, type], by_county: dict[tuple[str, str], tuple[type, ...]]
 ) -> Any:
@@ -359,8 +375,38 @@ class TestResolver:
             assert raw_hearing_date(dict(self._EV), "x") is None
 
     def test_county_candidates_agreeing_yield_the_date(self) -> None:
-        with _patched_index({}, {("CA", "TEST"): (_FakeA, _FakeNone, _FakeA)}):
+        with _patched_index({}, {("CA", "TEST"): (_FakeA, _FakeA)}):
             assert raw_hearing_date(dict(self._EV), "x") == "2026-01-02"
+
+    def test_county_scraper_without_hook_vetoes_fallback(self) -> None:
+        """Orange civil reads no date from its raws; without capture metadata a
+        raw may be one of its files, so another scraper's parser must not date
+        it (#4682)."""
+        with _patched_index({}, {("CA", "TEST"): (_FakeA, _FakeNone)}):
+            assert raw_hearing_date(dict(self._EV), "x") is None
+
+    def test_hook_returning_a_date_object(self) -> None:
+        with _patched_index({"ca-d": _FakeDate}, {}):
+            assert raw_hearing_date({**self._EV, "capture_scraper_id": "ca-d"}, "x") == (
+                "2026-02-03"
+            )
+
+    @pytest.mark.parametrize(
+        "capture_timestamp",
+        [datetime(2026, 9, 15, 1, 43), "not-a-date", None, "2026-09-15T01:43:00Z"],
+    )
+    def test_capture_timestamp_shapes_reach_the_hook(self, capture_timestamp: Any) -> None:
+        with _patched_index({"ca-e": _FakeEcho}, {}):
+            event = {
+                **self._EV,
+                "capture_scraper_id": "ca-e",
+                "capture_timestamp": capture_timestamp,
+            }
+            result = raw_hearing_date(event, "x")
+        if capture_timestamp in (None, "not-a-date"):
+            assert result is None
+        else:
+            assert result == "2026-09-15"
 
     def test_capture_scraper_id_is_authoritative_even_when_none(self) -> None:
         by_id = {"ca-none": _FakeNone, "ca-a": _FakeA}
@@ -387,8 +433,6 @@ class TestResolver:
 _NO_RAW_HEARING_DATE = {
     # Leaves hearing_date to the multimodal LLM; sets none itself.
     "OCTentativeRulingsScraper",
-    # JSON envelope: the worker's CC-portal unwrap restores the row date.
-    "CCTentativesPortalScraper",
     # Governor appointment press releases, not rulings.
     "GovernorAppointmentsScraper",
 }
@@ -414,3 +458,145 @@ def test_every_ca_scraper_declares_raw_hearing_date() -> None:
 )
 def test_source_url_filename(url: str, expected: str) -> None:
     assert source_url_filename(url) == expected
+
+
+# ---------------------------------------------------------------------------
+# Hook guards and edge cases
+# ---------------------------------------------------------------------------
+
+
+def _hook(module: str, cls_name: str) -> Any:
+    import importlib
+
+    return getattr(importlib.import_module(module), cls_name).hearing_date_for_raw
+
+
+# (module, class, a content_format the live scraper never archives)
+_WRONG_FORMAT = [
+    ("courts.ca.cc_tentatives", "CCTentativeRulingsScraper", "html"),
+    ("courts.ca.fresno_tentatives", "FresnoTentativeRulingsScraper", "html"),
+    ("courts.ca.riverside_tentatives", "RiversideTentativeRulingsScraper", "html"),
+    ("courts.ca.sb_tentatives", "SBTentativeRulingsScraper", "html"),
+    ("courts.ca.sf_tentatives", "SFTentativeRulingsScraper", "html"),
+    ("courts.ca.sc_tentatives", "SCTentativeRulingsScraper", "html"),
+    ("courts.ca.oc_family_law_tentatives", "OCFamilyLawTentativeRulingsScraper", "html"),
+    ("courts.ca.oc_probate_tentatives", "OCProbateTentativeRulingsScraper", "html"),
+    ("courts.ca.la_tentatives", "LATentativeRulingsScraper", "pdf"),
+    ("courts.ca.la_tentatives", "LAAppellateTentativeRulingsScraper", "pdf"),
+    ("courts.ca.sd_calendar", "SDCalendarScraper", "pdf"),
+    ("courts.ca.sd_tentatives", "SDTentativeRulingsScraper", "pdf"),
+    ("courts.ca.sd_pipeline", "SDPipelineScraper", "pdf"),
+]
+
+
+@pytest.mark.parametrize(("module", "cls_name", "fmt"), _WRONG_FORMAT)
+def test_hook_ignores_other_content_formats(module: str, cls_name: str, fmt: str) -> None:
+    text = (
+        "HEARING DATE: 04/09/2026\nTentative Rulings for March 2, 2026\n"
+        "Hearing Date: March 2, 2026\nDATE: 03/02/2026\n"
+    )
+    hook = _hook(module, cls_name)
+    assert hook(text, source_url="https://x/16_031126.pdf", content_format=fmt) is None
+
+
+@pytest.mark.parametrize(
+    ("module", "cls_name"),
+    [
+        ("courts.ca.riverside_tentatives", "RiversideTentativeRulingsScraper"),
+        ("courts.ca.sd_calendar", "SDCalendarScraper"),
+        ("courts.ca.sd_tentatives", "SDTentativeRulingsScraper"),
+        ("courts.ca.sf_civil_tentatives", "SFCivilTentativeRulingsScraper"),
+        ("courts.ca.ventura_tentatives", "VenturaTentativeRulingsScraper"),
+        ("courts.ca.cc_tentatives_portal", "CCTentativesPortalScraper"),
+        ("courts.ca.la_tentatives", "LATentativeRulingsScraper"),
+    ],
+)
+def test_hook_empty_text_is_none(module: str, cls_name: str) -> None:
+    assert _hook(module, cls_name)("", content_format="") is None
+
+
+def test_la_hook_needs_the_ruling_block() -> None:
+    """Like ``_extract_ruling_fields``: no ``div#speechSynthesis``, no date."""
+    hook = _hook("courts.ca.la_tentatives", "LATentativeRulingsScraper")
+    assert hook("<html><b>Hearing Date:</b> March 2, 2026</html>", content_format="html") is None
+
+
+def test_sd_pipeline_hook_delegates_to_phase_two() -> None:
+    hook = _hook("courts.ca.sd_pipeline", "SDPipelineScraper")
+    assert hook(_html("sd_roa_demurrer.html"), content_format="html") == datetime(2026, 3, 13)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["<html>legacy bare body</html>", "[1, 2]", json.dumps({"ruling_id": "r1"})],
+)
+def test_sf_civil_hook_non_envelope_is_none(text: str) -> None:
+    hook = _hook("courts.ca.sf_civil_tentatives", "SFCivilTentativeRulingsScraper")
+    assert hook(text, content_format="html") is None
+
+
+def test_cc_portal_hook_reads_envelope_row_date() -> None:
+    hook = _hook("courts.ca.cc_tentatives_portal", "CCTentativesPortalScraper")
+    envelope = {
+        "row": {"case_number": "C22-01081", "hearing_date": "2025-02-28 09:00:00"},
+        "detail_html_b64": "",
+    }
+    assert hook(json.dumps(envelope), content_format="txt") == datetime(2025, 2, 28, 9, 0)
+    assert hook("plain calendar text", content_format="txt") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("TENTATIVE RULINGS 6-1-26\n", datetime(2026, 6, 1)),
+        ("TENTATIVE RULINGS FOR 06/01/2026\n", datetime(2026, 6, 1)),
+        ("TENTATIVE RULINGS 13-45-26\n", None),
+        ("Department S36\nTENTATIVE RULINGS 6-1-26 continued from 5-1-26\n", None),
+    ],
+)
+def test_sb_header_title_line(text: str, expected: datetime | None) -> None:
+    from courts.ca.sb_tentatives import _sb_hearing_date_from_text
+
+    assert _sb_hearing_date_from_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (_VENTURA_PROBATE_NOTES, datetime(2026, 5, 5)),
+        ("COUNTY OF VENTURA\n13/45/2026 in Department J6\n", None),
+        ("COUNTY OF VENTURA\n" + "x" * 1200 + "\n05/05/2026 in Department J6\n", None),
+    ],
+)
+def test_ventura_header_hearing_date(text: str, expected: datetime | None) -> None:
+    from courts.ca.ventura_tentatives import ventura_header_hearing_date
+
+    assert ventura_header_hearing_date(text) == expected
+
+
+def test_scraper_index_skips_broken_modules_and_factories() -> None:
+    import importlib
+
+    from ingestion import raw_hearing_date as rhd
+
+    real_import = importlib.import_module
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "courts.ca.sb_tentatives":
+            raise ImportError("missing optional dependency")
+        return real_import(name, *args, **kwargs)
+
+    def broken_factory() -> Any:
+        raise RuntimeError("config needs env")
+
+    broken_factory.__module__ = "courts.ca.ventura_tentatives"
+    ventura = real_import("courts.ca.ventura_tentatives")
+    with (
+        patch.object(rhd.importlib, "import_module", side_effect=fake_import),
+        patch.object(ventura, "default_config", broken_factory),
+    ):
+        by_id, by_county = rhd._scraper_index.__wrapped__()
+    assert "ca-sb-tentatives-civil" not in by_id
+    assert "ca-ventura-tentatives" not in by_id
+    assert ("CA", "SAN BERNARDINO") not in by_county
+    assert by_id["ca-sc-tentatives-civil"].__name__ == "SCTentativeRulingsScraper"

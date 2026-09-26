@@ -20,8 +20,10 @@ Picking the scraper:
    hook is authoritative, even when it returns None.
 2. Otherwise (e.g. a rebuild from a local S3 cache, which has no object
    metadata) every scraper registered for the event's state and county is
-   asked.  A date is used only when all the hooks that return one agree;
-   disagreement returns None rather than a guess.
+   asked.  A date is used only when every scraper there has a hook and all
+   the hooks that return one agree.  A county with a scraper that reads no
+   date from its raws (Orange civil), or disagreeing hooks, gives None
+   rather than a guess.
 """
 
 from __future__ import annotations
@@ -159,10 +161,15 @@ def raw_hearing_date(event_data: dict[str, Any], text: str | None) -> str | None
         str(event_data.get("state") or "").upper(),
         str(event_data.get("county") or "").upper(),
     )
+    candidates = by_county.get(key, ())
+    if any(not _overrides_hook(candidate) for candidate in candidates):
+        # A scraper in this county reads no date from its raws (e.g. Orange
+        # civil leaves it to the LLM).  Without the capture metadata this raw
+        # may be one of its files, and another scraper's header parser could
+        # date it wrongly — so no date rather than a guess (#4682).
+        return None
     dates: set[date] = set()
-    for candidate in by_county.get(key, ()):
-        if not _overrides_hook(candidate):
-            continue
+    for candidate in candidates:
         found = _as_date(_call_hook(candidate, text, source_url, content_format, capture_timestamp))
         if found is not None:
             dates.add(found)

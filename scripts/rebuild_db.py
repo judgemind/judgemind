@@ -344,13 +344,23 @@ def build_event(
         # text.  Lazy import to avoid top-level dependency on the ingestion
         # package (which is only available in the scraper-framework venv,
         # not in the main process for all callers).
+        #
+        # The capturing scraper's ``hearing_date_for_raw`` hook goes first
+        # (#4774): prefix-mode reingest leaves the date to that hook in the
+        # worker, and a pre-filled date here would pre-empt it, so rebuild
+        # and reingest would date the same raw differently.
         if content_format == "html":
             try:
                 from ingestion.extract import extract_hearing_date
+                from ingestion.raw_hearing_date import raw_hearing_date
 
-                hearing_dt = extract_hearing_date(text)
-                if hearing_dt is not None:
-                    event["hearing_date"] = str(hearing_dt)
+                hook_date = raw_hearing_date(event, text)
+                if hook_date:
+                    event["hearing_date"] = hook_date
+                else:
+                    hearing_dt = extract_hearing_date(text)
+                    if hearing_dt is not None:
+                        event["hearing_date"] = str(hearing_dt)
             except ImportError:
                 pass
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -1644,8 +1645,8 @@ class SCTentativeRulingsScraper(BaseScraper):
         *,
         source_url: str = "",
         content_format: str = "",
-        capture_timestamp: Any = None,
-    ) -> Any:
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
         """PDF header date with the stale-year fix, as ``parse_document`` (#4667, #4774)."""
         if content_format not in ("", "pdf") or not text:
             return None

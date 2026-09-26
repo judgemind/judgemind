@@ -1115,6 +1115,26 @@ class CCTentativesPortalScraper(BaseScraper):
             return None
         return transcribe_envelope_pdf(envelope, extract_pdf_text).text or ""
 
+    @classmethod
+    def hearing_date_for_raw(
+        cls,
+        text: str,
+        *,
+        source_url: str = "",
+        content_format: str = "",
+        capture_timestamp: datetime | None = None,
+    ) -> datetime | None:
+        """The envelope's hearing date, as ``_populate_doc_from_envelope`` (#4774).
+
+        The worker's ``_unwrap_cc_portal_envelope`` already dates envelope
+        events before this runs; the hook makes the derivation explicit and
+        returns None for any non-envelope text.
+        """
+        envelope = load_envelope(text)
+        if envelope is None:
+            return None
+        return _coerce_hearing_date(envelope_fields(envelope).get("hearing_date"))
+
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Parse structured fields from ``doc.raw_content``.
 
