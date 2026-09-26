@@ -16048,3 +16048,65 @@ class TestSplitSetChange:
 
         mock_ins.assert_called_once()
         assert mock_ins.call_args.kwargs.get("relink_case", False) is False
+
+
+class TestSplitChildRelinkScope:
+    """#4788: the split-child case relink from #4700 is scoped.
+
+    It applies only to events that replace a split set (prefix reingest and
+    rebuild set ``_replace_split_set``), and never onto an ``UNKNOWN-``
+    placeholder case.  A live write or retry of a split child keeps the
+    preserve-first case link, so a re-process that misses the case number
+    cannot delete a correct ruling or detach its alerts.
+    """
+
+    def _child(self, event: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+        parent_id = event["document_id"]
+        child = {
+            **event,
+            "document_id": make_split_document_id(parent_id, 2),
+            "_original_document_id": parent_id,
+            "_split_processed": True,
+            "_llm_extracted": True,
+            "_split_index": 2,
+            "_split_count": 3,
+            "ruling_text": "The demurrer is SUSTAINED.",
+            "case_number": "24CV000001",
+            "case_title": "Alpha v. Beta",
+            "hearing_date": "2026-03-05",
+            "outcome": "sustained",
+            "motion_type": "demurrer",
+        }
+        child.update(overrides)
+        return child
+
+    def _relink_kwarg(self, child: dict[str, Any]) -> Any:
+        worker = _split_set_change_worker()
+        with (
+            patch("ingestion.worker.psycopg") as mock_psycopg,
+            patch("ingestion.worker.resolve_judge", return_value=None),
+            patch("ingestion.worker.batch_upsert_parties"),
+            patch("ingestion.worker.insert_document_and_ruling", return_value=False) as mock_ins,
+        ):
+            mock_psycopg.connect.return_value = _split_set_change_conn("case-uuid-new")
+            worker.process_event(child)
+        mock_ins.assert_called_once()
+        return mock_ins.call_args.kwargs.get("relink_case", False)
+
+    def test_prefix_event_marks_split_set_replacement(self) -> None:
+        assert _sc_prefix_event()["_replace_split_set"] is True
+
+    def test_live_split_child_keeps_preserve_first(self) -> None:
+        """A live / retry split child (no ``_replace_split_set``) never relinks."""
+        event = {k: v for k, v in _sc_prefix_event().items() if k != "_replace_split_set"}
+        event["scraper_id"] = "ca-santa-clara-tentatives"
+        assert self._relink_kwarg(self._child(event)) is False
+
+    def test_reingest_child_without_case_number_never_relinks(self) -> None:
+        """A reingest child whose case number comes back missing gets the
+        synthetic ``UNKNOWN-`` case; relinking onto it is never allowed."""
+        child = self._child(_sc_prefix_event(), case_number=None)
+        assert self._relink_kwarg(child) is False
+
+    def test_reingest_child_with_real_case_relinks(self) -> None:
+        assert self._relink_kwarg(self._child(_sc_prefix_event())) is True
