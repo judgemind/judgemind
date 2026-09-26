@@ -32,6 +32,20 @@ Both databases are created on first `docker compose up` (the second via
 tests from migrating or mutating the operational database — see #3006 for
 the incident that motivated it.
 
+**Running the API integration tests locally.** `npm test` in `packages/api`
+(also the pre-push target) runs the integration suite only when
+`TEST_DATABASE_URL` is set and reachable; otherwise it runs unit tests and
+prints an `INTEGRATION TESTS SKIPPED` banner that says why. The DB probe
+honors `sslmode` in the URL (then `PGSSLMODE`) and, with neither, tries plain
+TCP before SSL, so the plain docker-compose postgres works (#4711). The
+suite also needs OpenSearch:
+
+```
+docker compose up -d postgres opensearch
+TEST_DATABASE_URL=postgresql://judgemind:localdev@localhost:5432/judgemind_test \
+TEST_OPENSEARCH_URL=http://localhost:9200 npm --prefix packages/api test
+```
+
 ## Schema management
 
 - `scripts/apply_migrations.sh` — applies all migrations (up sections only) to local DB.

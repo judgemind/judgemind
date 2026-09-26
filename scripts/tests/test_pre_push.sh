@@ -1672,6 +1672,61 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 39: skipped integration tests are surfaced on a passing push (#4711)
+# ───────────────────────────────────────────────────────────────────────
+# run_check hides a passing check's output, so the INTEGRATION TESTS
+# SKIPPED banner from packages/api/scripts/run-tests.mjs would vanish.
+# The stub `npm test` prints the banner and exits 0; the hook must still
+# show the skip and its reason.
+echo "[scenario 39] npm test that skips integration tests is surfaced (#4711)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-it-skip
+mkdir -p "$WORK/packages/api/src"
+cat > "$WORK/packages/api/package.json" <<'JSON'
+{
+  "name": "api",
+  "version": "0.0.1",
+  "scripts": { "lint": "true", "test": "sh emit-skip.sh" }
+}
+JSON
+cat > "$WORK/packages/api/emit-skip.sh" <<'SH'
+echo "INTEGRATION TESTS SKIPPED — running unit tests only." >&2
+echo "Why: TEST_DATABASE_URL is not set." >&2
+echo "unit tests passed"
+SH
+cat > "$WORK/packages/api/src/index.ts" <<'TS'
+export const hello = (): string => "hello";
+TS
+git -C "$WORK" add packages/api
+git -C "$WORK" commit --quiet -m "feat: api stub with skipping npm test"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+run_hook "refs/heads/feature-it-skip $feat_sha refs/heads/feature-it-skip $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "a passing npm test must not fail the push (#4711)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "NOTE: api integration tests were SKIPPED"; then
+    report_fail "expected the skip NOTE in hook output (#4711)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "Why: TEST_DATABASE_URL is not set."; then
+    report_fail "expected the skip reason in hook output (#4711)" "$hook_out"
+else
+    report_pass "skipped integration tests are surfaced on a passing push (#4711)"
+fi
+
+echo "[scenario 39b] npm test that runs integration tests prints no skip NOTE (#4711)"
+cat > "$WORK/packages/api/emit-skip.sh" <<'SH'
+echo "DB available — running all tests (unit + integration), without SSL"
+SH
+git -C "$WORK" commit --quiet -am "chore: npm test runs everything"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+run_hook "refs/heads/feature-it-skip $feat_sha refs/heads/feature-it-skip $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "a passing npm test must not fail the push (#4711)" "$hook_out"
+elif echo "$hook_out" | grep -q "integration tests were SKIPPED"; then
+    report_fail "no skip NOTE expected when integration tests ran (#4711)" "$hook_out"
+else
+    report_pass "no skip NOTE when integration tests ran (#4711)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
