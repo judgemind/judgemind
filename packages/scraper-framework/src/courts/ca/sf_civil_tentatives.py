@@ -258,6 +258,34 @@ def _api_result_list(json_text: str) -> list[Any] | None:
     return result
 
 
+def _no_rulings_block_reason(result: list[Any]) -> str | None:
+    """Why a ``result`` list that parsed to no rulings is not a quiet day.
+
+    Only the documented empty answer, ``[0, ""]`` (an integer count of 0
+    plus the HTML slot), means "no rulings for this RulingID". Any other
+    shape that yields no rulings is a changed or broken response: a short
+    list, a count that is not an integer, a negative count other than the
+    ``-1`` session-expiry sentinel, or a positive count whose table no
+    longer parses. Counting those as empty would let a layout change record
+    success with 0 records (#4789).
+
+    Returns:
+        None for the documented empty answer, else a one-line reason.
+    """
+    if not result:
+        return "empty result list"
+    count = result[0]
+    if isinstance(count, bool) or not isinstance(count, int):
+        return f"count {count!r} is not an integer"
+    if len(result) < 2:
+        return f"result has {len(result)} element(s), expected [count, html]"
+    if count == 0:
+        return None
+    if count < 0:
+        return f"negative count {count}"
+    return f"API reports {count} rulings but none parsed"
+
+
 def parse_api_response(json_text: str) -> list[ParsedRuling]:
     """Parse the tr.dll AJAX response into individual rulings.
 
@@ -826,6 +854,20 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                 # Parse the response
                 rulings = parse_api_response(response.text)
                 if not rulings:
+                    # Only the documented ``[0, ""]`` answer is a quiet day.
+                    # A positive count whose table no longer parses (a
+                    # layout change) or any other shape is blocked (#4789).
+                    reason = _no_rulings_block_reason(result)
+                    if reason is not None:
+                        tally.blocked(f"unexpected result: {reason}")
+                        self._log.warning(
+                            "sf_civil.unexpected_result",
+                            ruling_id=ruling_id,
+                            department=department,
+                            reason=reason,
+                            body_prefix=response.text[:200],
+                        )
+                        continue
                     self._log.info(
                         "No rulings for RulingID",
                         ruling_id=ruling_id,
@@ -839,6 +881,17 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     department=department,
                     count=len(rulings),
                 )
+                reported = result[0]
+                if isinstance(reported, int) and len(rulings) < reported:
+                    # Part of the table no longer parses: keep what did,
+                    # but leave a trail for the layout change (#4789).
+                    self._log.warning(
+                        "sf_civil.partial_parse",
+                        ruling_id=ruling_id,
+                        department=department,
+                        reported=reported,
+                        parsed=len(rulings),
+                    )
 
                 # Create one CapturedDocument per ruling
                 for ruling in rulings:

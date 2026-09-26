@@ -36,6 +36,13 @@ Listing table row format:
     </td>
   </tr>
 
+  The table sits in the Views results region <div class="search__content">.
+  A listing with no rulings renders that region with only an empty
+  <div class="search__pager"> and puts "There aren't any tentative rulings
+  matching your filter criteria." in <div class="search__message">. Only
+  that explicit state counts as an empty listing; no rows without it is a
+  changed layout and is counted blocked (#4789).
+
 Detail page format (current portal, #4598):
   <article role="article" about="/tentative-ruling/l24-04564">
     <div class="jcc-body__main-text usa-prose clearfix">
@@ -184,6 +191,38 @@ def _parse_judge_dropdown(html: str) -> list[tuple[str, str]]:
         results.append((value, text))
 
     return results
+
+
+# The portal's own no-results text, rendered in div.search__message when a
+# filter matches nothing (live, 2026-09-25). Accept straight or curly quotes.
+_NO_RESULTS_RE = re.compile(r"there aren[’']t any tentative rulings", re.IGNORECASE)
+
+
+def _is_empty_listing_page(html: str) -> bool:
+    """True only for a listing page that positively says it has no results.
+
+    The judge dropdown renders on every listing page, so "dropdown present,
+    no rows parsed" cannot tell a quiet day from a results table whose markup
+    changed (#4789). A genuinely empty listing on the live portal carries
+    both of:
+
+    - the no-results message ("There aren't any tentative rulings matching
+      your filter criteria.") inside ``div.search__message``, and
+    - the Views results region ``div.search__content`` holding no results
+      table (only its empty ``div.search__pager``).
+
+    A populated page, a page whose results region was renamed, an
+    unknown-judge page (Drupal's "An illegal choice has been detected"
+    alert, which renders no message), and a block page all return False.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    message = soup.select_one("div.search__message")
+    if message is None or not _NO_RESULTS_RE.search(message.get_text(" ", strip=True)):
+        return False
+    region = soup.select_one("div.search__content")
+    if region is None:
+        return False
+    return region.find(["table", "tr"]) is None
 
 
 def _parse_listing_table(html: str) -> list[dict]:
@@ -907,18 +946,21 @@ class CCTentativesPortalScraper(BaseScraper):
                     continue
 
                 rows = _parse_listing_table(listing_response.text)
-                if not rows and not _parse_judge_dropdown(listing_response.text):
-                    # A genuinely empty listing still renders the judge
-                    # dropdown. A 200 with neither rows nor the dropdown is
-                    # a block page or a layout change, not a quiet day (#4735).
+                if not rows and not _is_empty_listing_page(listing_response.text):
+                    # Only a page carrying the portal's explicit no-results
+                    # state is a quiet day. The judge dropdown renders on
+                    # every listing page, so a 200 with no rows and no
+                    # no-results marker is a block page or a changed results
+                    # table, not an empty listing (#4735, #4789).
                     tally.blocked(
                         "listing page is not a tentative-rulings listing "
-                        "(no results table, no judge dropdown)"
+                        "(no result rows, no no-results marker)"
                     )
                     self._log.error(
                         "cc_portal.unexpected_listing_page",
                         judge_id=judge_id,
                         judge_name=judge_name_dropdown,
+                        has_judge_dropdown=bool(_parse_judge_dropdown(listing_response.text)),
                         body_prefix=listing_response.text[:200],
                     )
                     continue
