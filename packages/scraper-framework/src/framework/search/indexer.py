@@ -100,6 +100,18 @@ def normalize_hearing_date(value: Any) -> str | None:
     return None
 
 
+def search_doc_metadata(event: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``INDEXED_METADATA_FIELDS`` of the search doc built from *event*.
+
+    This is exactly what the idempotency check compares, so a stored search
+    doc whose fields equal this dict needs no rewrite.
+    """
+    metadata: dict[str, Any] = {field: event.get(field) for field in INDEXED_METADATA_FIELDS}
+    metadata["hearing_date"] = normalize_hearing_date(event.get("hearing_date"))
+    metadata["content_hash"] = event.get("content_hash", "")
+    return metadata
+
+
 def _is_anonymous_user_403(exc: BaseException) -> bool:
     """Return True if the exception is OpenSearch's "User: anonymous" 403.
 
@@ -446,13 +458,9 @@ class IndexingConsumer:
         ``force`` is set.
         """
         document_id = event["document_id"]
-        content_hash = event.get("content_hash", "")
-        s3_key = event.get("s3_key")
-
-        metadata: dict[str, Any] = {field: event.get(field) for field in INDEXED_METADATA_FIELDS}
-        metadata["hearing_date"] = normalize_hearing_date(event.get("hearing_date"))
-        metadata["s3_key"] = s3_key
-        metadata["content_hash"] = content_hash
+        metadata = search_doc_metadata(event)
+        content_hash = metadata["content_hash"]
+        s3_key = metadata["s3_key"]
 
         # Idempotency: skip only if already indexed with the same hash AND
         # the same metadata.  A case relink or a title/date fix keeps the

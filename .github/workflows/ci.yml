@@ -58,6 +58,8 @@ jobs:
               # unrelated scraper PR surfaced it).  See #4452 and the
               # check-test-script-imports-mapped guard wired below.
               - 'scripts/reingest_from_s3.py'
+              # test_ingestion.py pins worker == reindex-script docs (#4785).
+              - 'scripts/reindex_search_from_db.py'
             scraper-framework:
               - 'packages/scraper-framework/src/framework/**'
               - 'packages/scraper-framework/src/ingestion/**'

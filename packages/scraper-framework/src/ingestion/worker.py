@@ -48,6 +48,7 @@ from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
+from framework.search.ruling_doc import load_search_events
 from validation.deterministic import (
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
@@ -3776,32 +3777,52 @@ class IngestionWorker:
             raise
         timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
-        # Index in OpenSearch, keyed by the ruling's document_id (synthetic
-        # for splits).  Every write goes through the indexer, new or not:
-        # its idempotency check compares content_hash AND metadata, so an
-        # unchanged re-ingest is a no-op while a relink or title/date fix
-        # overwrites the stale search doc.  The doc mirrors what Postgres
-        # holds — the parsed hearing date and the case title the upsert
-        # kept — not the raw event values (#4712).
-        self._indexer.index_document(
-            {
-                "document_id": document_id,
-                "case_number": case_number,
-                "court": court_name,
-                "county": county,
-                "state": state,
-                "judge_name": judge_name,
-                "hearing_date": hearing_dt,
-                "motion_type": motion_type,
-                "outcome": outcome,
-                "case_title": effective_title or case_title,
-                "summary": summary or (cleaned_ruling_text[:500] if cleaned_ruling_text else None),
-                "ruling_text": ruling_text,
-                "s3_key": s3_key,
-                "content_hash": content_hash,
-                "content_format": content_format,
-            }
-        )
+        self._index_committed_ruling(conn, document_id)
+
+    def _index_committed_ruling(self, conn: psycopg.Connection, document_id: str) -> None:
+        """Index the ruling *document_id* exactly as Postgres committed it.
+
+        The search doc is built from the stored ``derived.*`` row by the
+        builder ``scripts/reindex_search_from_db.py`` also uses, never from
+        this event's raw values: the ruling upsert keeps the first
+        ``case_id`` / ``judge_id`` and COALESCEs a NULL ``hearing_date`` /
+        ``motion_type`` / ``outcome`` / ``summary`` to the stored value, so
+        event values drift from Postgres on re-ingest (#4785).
+
+        Every write goes through the indexer, new or not: its idempotency
+        check compares content_hash AND metadata, so an unchanged re-ingest
+        is a no-op while a relink or a title/date fix overwrites the stale
+        search doc (#4712).  Best-effort, like the indexer itself: the
+        Postgres write is already committed and the index is derivable from
+        ``derived.*``.
+        """
+        try:
+            events = load_search_events(conn, [document_id])
+        except Exception as exc:  # noqa: BLE001 — search indexing is best-effort
+            logger.warning(
+                "Search indexing skipped: could not read the committed ruling",
+                extra={"document_id": document_id, "error": str(exc)},
+            )
+            events = {}
+        finally:
+            # End the read transaction (autocommit is off) so the persistent
+            # connection is not left idle in transaction.
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+        event = events.get(document_id)
+        if event is None:
+            # No committed ruling row for this document (e.g. it was
+            # superseded by content-hash dedup), so there is nothing to
+            # mirror.  Removing a stale search doc here is #4783.
+            logger.info(
+                "Search indexing skipped: document has no committed ruling",
+                extra={"document_id": document_id},
+            )
+            return
+        self._indexer.index_document(event)
 
     # ------------------------------------------------------------------
     # LLM extraction path (#1473, #1475)
