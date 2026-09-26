@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+import structlog.testing
 from helpers.reingest import make_reingest_cap_doc
 
 from courts.ca.sf_civil_tentatives import (
@@ -824,6 +825,120 @@ class TestSFCivilScraperRun:
         docs = scraper.fetch_documents()
         assert len(docs) > 0
         assert calls > 2
+
+    # -- "No rulings" needs the API's positive empty marker (#4789) --------
+    #
+    # The API's documented empty answer is ``{"result": [0, ""]}``. Anything
+    # else that yields no rulings (a short list, a non-int count, a positive
+    # count whose table no longer parses) is a changed or broken response,
+    # not a quiet day.
+
+    @staticmethod
+    def _changed_table_body() -> str:
+        """The real 12-ruling fixture with its row labels renamed, as if the
+        court changed the table markup: ``result[0]`` is still 12 but the
+        parser finds no "Case Number:" rows."""
+        body = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        assert "Case Number:" in body
+        return body.replace("Case Number:", "Case No.")
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param('{"result": []}', id="empty-list"),
+            pytest.param('{"result": [5]}', id="count-without-table"),
+            pytest.param('{"result": [7, "<table><tr><td>x</td></tr></table>"]}', id="bad-table"),
+            pytest.param('{"result": [3, ""]}', id="count-with-empty-html"),
+            pytest.param('{"result": ["0", ""]}', id="string-count"),
+            pytest.param('{"result": [true, ""]}', id="bool-count"),
+            pytest.param('{"result": [null, ""]}', id="null-count"),
+            pytest.param('{"result": [-2, ""]}', id="negative-count"),
+        ],
+    )
+    @respx.mock
+    def test_non_empty_marker_with_no_rulings_is_blocked(self, body: str) -> None:
+        """A result list that parses to no rulings but is not the documented
+        ``[0, ""]`` empty answer fails the run as blocked (#4789)."""
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text=body),
+        )
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        with pytest.raises(ScraperPreconditionFailure, match="were blocked.*unexpected result"):
+            scraper.fetch_documents()
+
+    @respx.mock
+    def test_positive_count_whose_table_parses_to_zero_rulings_is_blocked(self) -> None:
+        """AC: ``result[0] > 0`` with a table that parses to 0 rulings is
+        tallied as blocked, so a changed table on every RulingID fails the run
+        instead of recording success with 0 records (#4789)."""
+        body = self._changed_table_body()
+        assert parse_api_response(body) == []
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text=body),
+        )
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        health = scraper.run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert f"all {len(RULING_IDS)} SF civil RulingID requests were blocked" in (
+            health.error_message or ""
+        )
+        assert "reports 12 rulings but none parsed" in (health.error_message or "")
+
+    @respx.mock
+    def test_changed_table_on_one_ruling_id_keeps_other_docs(self) -> None:
+        """A changed table on one RulingID is counted blocked; rulings from
+        the others are kept and ``[0, ""]`` RulingIDs stay a quiet day."""
+        good = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        changed = self._changed_table_body()
+        calls = 0
+
+        def side_effect(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(200, text=good)
+            if calls == 2:
+                return httpx.Response(200, text=changed)
+            return httpx.Response(200, text='{"result": [0, ""]}')
+
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(side_effect=side_effect)
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        docs = scraper.fetch_documents()
+        assert len(docs) == 12
+        assert calls == len(RULING_IDS)
+
+    @respx.mock
+    def test_partial_parse_keeps_rulings_and_logs_warning(self) -> None:
+        """When only part of the table parses, the parsed rulings are kept
+        and the shortfall is logged (#4789)."""
+        good = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        partial = good.replace("Case Number:", "Case No.", 1)
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text=partial),
+        )
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        with structlog.testing.capture_logs() as logs:
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 11 * len(RULING_IDS)
+        partial_logs = [e for e in logs if e["event"] == "sf_civil.partial_parse"]
+        assert len(partial_logs) == len(RULING_IDS)
+        assert partial_logs[0]["reported"] == 12
+        assert partial_logs[0]["parsed"] == 11
 
     @respx.mock
     def test_handles_session_expiry(self) -> None:
