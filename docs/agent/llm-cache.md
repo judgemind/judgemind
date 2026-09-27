@@ -14,7 +14,9 @@ llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_hash}.json
 
 - `{provider}-{model}` — e.g. `google-gemini-1.5-flash-8b` or `anthropic-claude-haiku-4-5-20251001`. Changes automatically when the configured model changes.
 - `prompt-{prompt_hash}` — SHA-256 of the system prompt text. Any edit to the prompt text produces a new hash, making old cache entries unreachable without `--bust-llm-cache`.
-- `{content_hash}` — SHA-256 of the raw document content (PDF bytes or text) **plus** any scraper-provided metadata (`judge_name`, `department`, `hearing_date`). Metadata is included because the LLM output may differ when metadata changes even for identical document content.
+- `{content_hash}` — for the **multimodal PDF path**, SHA-256 of the PDF bytes alone (#4815). For the **text path** (`extract`), SHA-256 of the text **plus** any scraper-provided metadata (`judge_name`, `department`, `hearing_date`), because the text prompt still sends that metadata to the LLM.
+
+**PDF path: same bytes, same split (#4815).** Callers hand the same PDF different metadata. The live scraper event carries the link-text judge and department, a `rebuild_db.py` event carries neither, and a DB-mode reingest carries the canonical judge name. When the key included metadata, each path had its own LLM run cached. The runs disagreed (Orange `ab7b1ec3…`: 12 rulings live, 13 on rebuild), and positional split-child ids shifted every time the paths alternated. Now `extract_from_pdf` sends no metadata to the LLM, keys the document and page entries on bytes alone, and caches a metadata-free result. It then applies the caller's `judge_name` / `department` / `hearing_date` with `_apply_pdf_metadata_overrides`. Entries written before #4815 under a bytes + metadata key are read only when no bytes-only entry exists. They are then promoted (copied) to the bytes-only key, so every path converges on one split after its first post-deploy run. A promotion logs `llm_cache.pdf_legacy_key_promoted`.
 
 Local development reads are served from `S3_CACHE_DIR` via `CachedS3Client` (fast disk reads). On ECS, reads and writes go directly to S3. The cache is shared across environments.
 
@@ -26,7 +28,7 @@ Local development reads are served from `S3_CACHE_DIR` via `CachedS3Client` (fas
 llm-cache/{provider}-{model}/prompt-{prompt_hash}/pages/{page_hash}.json   →   {"raw_text": "<LLM response>"}
 ```
 
-- `{page_hash}` — SHA-256 of the rendered page PNG bytes plus the same scraper metadata as the document key. The per-page user message depends on that metadata.
+- `{page_hash}` — SHA-256 of the rendered page PNG bytes alone (#4815). The per-page user message is a fixed instruction with no caller metadata. A pre-#4815 page entry keyed on PNG bytes + metadata is served and promoted when the bytes-only entry is missing.
 - The **raw LLM response** is stored, not parsed rows. A page-cache hit re-runs `_parse_page_rows`, so parser fixes apply to page-cached pages without a bust. If the stored text no longer parses — including valid JSON of the wrong shape, or text that makes the parser raise (#4738) — the entry is treated as a miss: the page is re-extracted and its entry overwritten.
 - Page entries are read only when the document-level entry misses. `--bust-llm-cache` skips page reads too, but pages are still written.
 

@@ -709,6 +709,60 @@ def _is_calendar_header(text: str | None) -> bool:
     return bool(_CALENDAR_HEADER_RE.search(text))
 
 
+# A department preamble as the multimodal LLM transcribes it: the calendar
+# header ("TENTATIVE RULINGS", "DEPT C34") at the very start of the text,
+# possibly wrapped in markdown emphasis (``**TENTATIVE RULINGS**\n\n**DEPT
+# C34**``), which ``_CALENDAR_HEADER_RE`` does not match (#4815).
+_CALENDAR_PREAMBLE_RE = re.compile(
+    r"\A[\s*#_]*TENTATIVE\s+RULINGS?[\s*#_:]+(?:DEPARTMENT|DEPT\.?)[\s*#_:]*[A-Z]{0,3}\d+",
+    re.IGNORECASE,
+)
+
+
+def _is_calendar_preamble(ruling: ExtractedRuling) -> bool:
+    """Return True if ``ruling`` is a department's calendar preamble, not a ruling.
+
+    Orange multimodal extraction sometimes emits page 1's header and standing
+    instructions ("TENTATIVE RULINGS / DEPT C34 / JUDGE ... / Tentative
+    Rulings: The Court endeavors to post ...") as a row of its own (#4815).
+    That row takes split position 0 and shifts every real ruling's
+    positional document id.
+
+    A row is a preamble only when all of these hold, so a real ruling is
+    never dropped:
+
+    * no case number was extracted and no entry number was assigned;
+    * its text starts with the calendar header; and
+    * its text contains no case number either.
+    """
+    if ruling.extracted_case_number or ruling.entry_number is not None:
+        return False
+    text = ruling.ruling_text
+    if not text or not _CALENDAR_PREAMBLE_RE.search(text):
+        return False
+    return _extract_case_number_from_info(text) is None
+
+
+def _drop_calendar_preamble_rulings(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Drop calendar-preamble rows (see :func:`_is_calendar_preamble`) (#4815).
+
+    Only drops when a real ruling remains, so a document is never emptied.
+    """
+    kept = [r for r in rulings if not _is_calendar_preamble(r)]
+    if not kept or len(kept) == len(rulings):
+        return rulings
+    for ruling in rulings:
+        if _is_calendar_preamble(ruling):
+            logger.info(
+                "llm_extractor.calendar_preamble_dropped",
+                department=ruling.department,
+                text_preview=(ruling.ruling_text or "")[:80],
+            )
+    return kept
+
+
 def _deduplicate_ruling_texts(
     rulings: list[ExtractedRuling],
 ) -> list[ExtractedRuling]:
@@ -2461,6 +2515,9 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
     - ``_drop_role_literal_orphan_rulings`` (#3663): drop SC body-section
       orphans BEFORE the calendar-listing filter so the orphan's long
       ruling_text does not confuse the calendar-only heuristic.
+    - ``_drop_calendar_preamble_rulings`` (#4815): drop a department's
+      header + standing-instructions row, which has no case or entry number
+      and would otherwise take split position 0.
     - ``_drop_calendar_listing_rulings`` (#2446) / ``_drop_short_unsubstantive_rulings``
       (#2645): drop OC calendar-only / empty-cell noise rows; both run after
       cross-reference resolution so legitimate shared text is not misclassified.
@@ -2481,6 +2538,7 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
       split document IDs stay stable and a second pass is a no-op.
     """
     rulings = _drop_role_literal_orphan_rulings(rulings)
+    rulings = _drop_calendar_preamble_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
@@ -2535,6 +2593,34 @@ def _apply_pdf_cache_hit_filters(
             kept_count=len(rulings),
         )
     return rulings
+
+
+def _apply_pdf_metadata_overrides(
+    rulings: list[ExtractedRuling],
+    metadata: dict[str, str] | None,
+) -> list[ExtractedRuling]:
+    """Apply the caller's authoritative metadata to extracted PDF rulings (#4815).
+
+    ``extract_from_pdf`` extracts and caches a metadata-free result so the
+    same bytes give the same rulings on every path; this applies the
+    caller's ``judge_name`` / ``department`` / ``hearing_date`` afterwards.
+    Each present, non-empty key overrides the extracted value on every
+    ruling, which is the precedence ``_append_ruling_from_case`` gave
+    metadata when it was applied during the join.  No post-join filter reads
+    these three fields, so applying them after the filters is equivalent.
+    """
+    if not metadata:
+        return rulings
+    update: dict[str, str] = {}
+    if metadata.get("judge_name"):
+        update["extracted_judge_name"] = metadata["judge_name"]
+    if metadata.get("department"):
+        update["department"] = metadata["department"]
+    if metadata.get("hearing_date"):
+        update["hearing_date"] = metadata["hearing_date"]
+    if not update:
+        return rulings
+    return [r.model_copy(update=update) for r in rulings]
 
 
 def _apply_text_cache_hit_filters(
@@ -3118,7 +3204,10 @@ class LlmExtractor:
             pdf_bytes: Raw PDF file content.
             metadata: Optional dict with authoritative scraper-provided
                 context.  Supported keys: ``judge_name``, ``department``,
-                ``hearing_date``.
+                ``hearing_date``.  Applied to the returned rulings only; it
+                is never sent to the LLM and is not part of any cache key,
+                so the same bytes split the same way for every caller
+                (#4815).
             max_pages: Maximum number of PDF pages to render.  Pages beyond
                 this limit are silently skipped.
             bust_cache: When ``True``, skip the cache read on this call.
@@ -3142,16 +3231,31 @@ class LlmExtractor:
         if not pdf_bytes:
             return []
 
-        content_key = _content_hash_for_cache(pdf_bytes, metadata)
+        # The LLM input and every cache key are a function of the PDF bytes
+        # alone (#4815).  ``metadata`` differs by caller for the same bytes:
+        # the live scraper event carries the link-text judge / department,
+        # a rebuild event carries neither, and a DB-mode reingest carries the
+        # canonical judge name.  Keying on it gave each path its own LLM run
+        # (Orange ``ab7b1ec3...``: 12 rulings live, 13 on rebuild), and the
+        # positional split-child ids shifted every time the paths alternated.
+        # Metadata is applied after extraction by
+        # ``_apply_pdf_metadata_overrides``, exactly as ``_join_page_rows``
+        # used to apply it.
+        content_key = _content_hash_for_cache(pdf_bytes)
+        # Entries written before #4815 are keyed on bytes + metadata.  They
+        # are read (and promoted to ``content_key``) only when no bytes-only
+        # entry exists, so each document converges on one cached split.
+        legacy_content_key = _content_hash_for_cache(pdf_bytes, metadata) if metadata else None
         effective_bust = bust_cache or self._bust_cache
 
         # Check cache
         if self._cache is not None and not effective_bust:
-            cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
+            cached = self._cached_document(content_key, legacy_content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])
                 rulings = [ExtractedRuling(**r) for r in cached]
-                return _apply_pdf_cache_hit_filters(rulings, content_key=content_key)
+                rulings = _apply_pdf_cache_hit_filters(rulings, content_key=content_key)
+                return _apply_pdf_metadata_overrides(rulings, metadata)
 
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
@@ -3167,17 +3271,19 @@ class LlmExtractor:
         failed_pages: list[int] = []
         page_cache_hits = 0
         for page_idx, (img_bytes, media_type) in enumerate(page_images):
-            page_key = _content_hash_for_cache(img_bytes, metadata)
+            page_key = _content_hash_for_cache(img_bytes)
+            legacy_page_key = _content_hash_for_cache(img_bytes, metadata) if metadata else None
             page = None
             if self._cache is not None and not effective_bust:
-                page = self._cached_page(page_key, page_idx, document_id)
+                page = self._cached_page(
+                    page_key, page_idx, document_id, legacy_page_key=legacy_page_key
+                )
             if page is not None:
                 page_cache_hits += 1
             else:
                 page = self._extract_single_page(
                     img_bytes,
                     media_type,
-                    metadata=metadata,
                     usage=usage,
                     page_index=page_idx,
                     document_id=document_id,
@@ -3218,8 +3324,10 @@ class LlmExtractor:
             logger.warning("llm_extractor.no_rows_extracted", page_count=len(page_images))
             return []
 
-        # Join rows into cases and convert to ExtractedRuling objects.
-        rulings = _join_page_rows(all_rows, metadata=metadata)
+        # Join rows into cases and convert to ExtractedRuling objects.  The
+        # join is metadata-free so the cached entry is the same for every
+        # caller (#4815); the caller's metadata is applied on return.
+        rulings = _join_page_rows(all_rows)
 
         # Write the document-level entry ONLY if every page ended "ok".  A
         # page that failed (API error, or JSON that did not parse even after
@@ -3234,7 +3342,30 @@ class LlmExtractor:
                 [r.model_dump(mode="json") for r in rulings],
             )
 
-        return rulings
+        return _apply_pdf_metadata_overrides(rulings, metadata)
+
+    def _cached_document(self, content_key: str, legacy_key: str | None) -> list[dict] | None:
+        """Return the document-level PDF cache entry for these bytes, or None.
+
+        The bytes-only entry (*content_key*) always wins.  When it is missing,
+        an entry written before #4815 under the caller's bytes + metadata key
+        (*legacy_key*) is served instead and promoted to *content_key*, so
+        every later caller, whatever its metadata, gets the same split.
+        """
+        assert self._cache is not None
+        cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
+        if cached is not None or legacy_key is None:
+            return cached
+        cached = self._cache.get(PDF_PER_PAGE_PROMPT, legacy_key)
+        if cached is not None:
+            logger.info(
+                "llm_cache.pdf_legacy_key_promoted",
+                content_key=content_key[:12],
+                legacy_key=legacy_key[:12],
+                ruling_count=len(cached),
+            )
+            self._cache.put(PDF_PER_PAGE_PROMPT, content_key, cached)
+        return cached
 
     # ------------------------------------------------------------------
     # Internal: API call with retries
@@ -3561,7 +3692,6 @@ class LlmExtractor:
         img_bytes: bytes,
         media_type: str,
         *,
-        metadata: dict[str, str] | None = None,
         usage: TokenUsage,
         page_index: int = 0,
         document_id: str | None = None,
@@ -3569,7 +3699,10 @@ class LlmExtractor:
         """Send a single page image to the LLM and return its extraction outcome.
 
         Uses the ``PDF_PER_PAGE_PROMPT`` to extract rows.  Each row is a dict
-        with keys ``entry_number``, ``case_info``, and ``ruling_text``.
+        with keys ``entry_number``, ``case_info``, and ``ruling_text``.  The
+        request carries the page image and a fixed instruction only, never
+        caller metadata, so its result (and its cache key) depends on the
+        page image alone (#4815).
 
         Returns a :class:`_PageExtraction` whose ``status`` separates a
         complete result (``"ok"``, possibly with zero rows) from a failure
@@ -3580,7 +3713,7 @@ class LlmExtractor:
         the page is reported as ``"parse_error"``.  Parse problems never
         propagate as exceptions: they stay local to the page.
         """
-        text_message = self._build_user_message_for_page(metadata)
+        text_message = self._build_user_message_for_page()
         raw_text: str | None = None
         for parse_attempt in range(1 + self._max_page_parse_retries):
             message = text_message
@@ -3617,14 +3750,36 @@ class LlmExtractor:
         return _PageExtraction(status="parse_error", rows=[], raw_text=raw_text)
 
     def _cached_page(
-        self, page_key: str, page_index: int, document_id: str | None = None
+        self,
+        page_key: str,
+        page_index: int,
+        document_id: str | None = None,
+        *,
+        legacy_page_key: str | None = None,
     ) -> _PageExtraction | None:
         """Return a page-cache hit re-parsed with the current parser, or None.
 
         An entry that no longer parses — including one that is valid JSON of
         the wrong shape, or that makes the parser raise — is a miss, so the
         page is re-extracted and its entry overwritten (#4738).
+
+        *page_key* hashes the page image alone (#4815).  When it has no usable
+        entry, an entry written before #4815 under the image + metadata key
+        (*legacy_page_key*) is served and promoted to *page_key*.
         """
+        assert self._cache is not None
+        page = self._parsed_page_entry(page_key, page_index, document_id)
+        if page is not None or legacy_page_key is None:
+            return page
+        page = self._parsed_page_entry(legacy_page_key, page_index, document_id)
+        if page is not None and page.raw_text is not None:
+            self._cache.put_page(PDF_PER_PAGE_PROMPT, page_key, page.raw_text)
+        return page
+
+    def _parsed_page_entry(
+        self, page_key: str, page_index: int, document_id: str | None
+    ) -> _PageExtraction | None:
+        """Read one page-cache entry and re-parse it; None when unusable."""
         assert self._cache is not None
         raw_text = self._cache.get_page(PDF_PER_PAGE_PROMPT, page_key)
         if not isinstance(raw_text, str):
@@ -3767,27 +3922,18 @@ class LlmExtractor:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _build_user_message_for_page(
-        metadata: dict[str, str] | None,
-    ) -> str:
-        """Build the text portion of the user message for per-page extraction."""
-        parts: list[str] = []
-        if metadata:
-            meta_lines: list[str] = []
-            if metadata.get("judge_name"):
-                meta_lines.append(f"Judge name: {metadata['judge_name']}")
-            if metadata.get("department"):
-                meta_lines.append(f"Department: {metadata['department']}")
-            if metadata.get("hearing_date"):
-                meta_lines.append(f"Hearing date: {metadata['hearing_date']}")
-            if meta_lines:
-                parts.append("Context:\n" + "\n".join(meta_lines))
+    def _build_user_message_for_page() -> str:
+        """Build the text portion of the user message for per-page extraction.
 
-        parts.append(
+        Deliberately constant: caller metadata (judge / department / hearing
+        date) is not sent, so the same page image always gets the same
+        request no matter which path (live, rebuild, reingest) extracts it
+        (#4815).  Metadata is applied after extraction instead.
+        """
+        return (
             "Extract all tentative rulings from this page. "
             "One entry per case. Skip page headers and footers."
         )
-        return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
     # Internal: response parsing
