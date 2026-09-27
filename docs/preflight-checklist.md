@@ -70,7 +70,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 |----|------|-------|
 | TW-01 | Single issue per PR | Do not combine unrelated changes |
 | TW-02 | Sync before implementing | `git fetch origin main && git rebase origin/main` |
-| TW-03 | Watch CI to completion | `gh run watch` must exit before doing anything else |
+| TW-03 | Watch CI to completion | `scripts/wait-for-ci.sh <PR>` must exit 0/1/3 before doing anything else; re-run it while it exits 124 |
 | TW-04 | Clean up worktree when done | Worktree cleanup is automatic for `isolation: "worktree"` agents |
 | TW-05 | Never deploy to production | Production deploys are human-only |
 | TW-06 | Venv isolation per worktree | Never share venvs between worktrees |

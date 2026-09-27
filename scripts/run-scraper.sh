@@ -20,9 +20,23 @@
 # Options:
 #   --env <env>         Environment (default: dev)
 #   --detach            Launch the task and exit immediately; prints the task ARN
-#   --timeout <secs>    Max seconds to wait for task completion (default: 1800)
+#                       and saves it to tmp/last-ecs-task.arn
+#   --timeout <secs>    How long this call waits, counted from script start
+#                       (default: 480, under the Bash tool's 600s cap, #4835)
 #   --dry-run           Show what would be done without running
 #   --help              Show this help message
+#
+# Exit codes (attached mode):
+#   <n>   the scraper container's exit code once the task STOPPED
+#   124   the wait ran out while the scraper is still running. NOT a
+#         failure. Do NOT re-run this command (it would launch a second
+#         scraper task). Keep waiting with `scripts/ecs-wait-task.sh`,
+#         which reads the ARN saved to tmp/last-ecs-task.arn; re-run that
+#         until it stops exiting 124.
+#   125   the task's status could not be read (describe-tasks kept
+#         failing). The task may still be running; refresh credentials,
+#         then re-attach with `scripts/ecs-wait-task.sh`.
+#   1     launch/setup error
 #
 # Examples:
 #   # Run a single scraper and stream logs until completion
@@ -31,8 +45,9 @@
 #   # Run multiple scrapers in one task
 #   scripts/run-scraper.sh ca-la-tentatives-civil ca-oc-tentatives
 #
-#   # Launch and return immediately (for long-running scrapers)
+#   # Launch and return immediately (for long-running scrapers), then wait
 #   scripts/run-scraper.sh --detach federal-courtlistener-opinions
+#   scripts/ecs-wait-task.sh      # re-run while it exits 124
 #
 set -euo pipefail
 # AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
@@ -43,7 +58,13 @@ export AWS_PAGER=""
 ENVIRONMENT="dev"
 DRY_RUN=false
 DETACH=false
-TIMEOUT=1800
+# 480s from script start keeps one call under the Bash tool's 600s cap (#4835).
+TIMEOUT=480
+SCRIPT_START_SECS=$SECONDS
+# Poll interval for the wait loop; overridable so tests can run fast.
+POLL_INTERVAL="${RUN_SCRAPER_POLL_INTERVAL:-10}"
+# Consecutive describe-tasks failures before reporting status unknown (125).
+DESCRIBE_MAX_CONSECUTIVE_ERRORS="${RUN_SCRAPER_MAX_DESCRIBE_ERRORS:-3}"
 REGION="us-west-2"
 SCRAPER_IDS=()
 
@@ -68,7 +89,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -n 36 "$0" | tail -n +2 | sed 's/^# \?//'
+            sed -n '2,/^set -euo pipefail$/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
             exit 0
             ;;
         -*)
@@ -82,6 +103,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+    echo "Error: --timeout must be a non-negative integer (seconds), got: '${TIMEOUT}'" >&2
+    exit 1
+fi
 
 # ─── Resolve repo root and sibling scripts ────────────────────────────────
 
@@ -227,8 +253,18 @@ echo "" >&2
 
 # ─── Detach mode ─────────────────────────────────────────────────────────────
 
+# save_task_arn — persist the ARN so scripts/ecs-wait-task.sh can re-attach
+# without it being copied by hand.  Failures are non-fatal.
+save_task_arn() {
+    if mkdir -p "${REPO_ROOT}/tmp" 2>/dev/null; then
+        printf '%s\n' "${TASK_ARN}" > "${REPO_ROOT}/tmp/last-ecs-task.arn" 2>/dev/null || true
+    fi
+}
+save_task_arn
+
 if [[ "$DETACH" == "true" ]]; then
     echo "Detach mode: task launched successfully." >&2
+    echo "Wait for it with: scripts/ecs-wait-task.sh   (re-run while it exits 124)" >&2
     # Print task ARN to stdout for callers to capture
     echo "${TASK_ARN}"
     exit 0
@@ -238,9 +274,11 @@ fi
 
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
-POLL_INTERVAL=10
 ELAPSED=0
 LAST_STATUS=""
+CURRENT_STATUS=""
+DESCRIBE_OUTPUT=""
+DESCRIBE_CONSECUTIVE_ERRORS=0
 
 # Log streaming state
 LOG_STREAM_NAME=""
@@ -312,14 +350,43 @@ print(data.get('nextForwardToken', ''))
     fi
 }
 
-while [[ $ELAPSED -lt $TIMEOUT ]]; do
-    DESCRIBE_OUTPUT=$(aws ecs describe-tasks \
+# wait_budget_left — true while both the counted poll time and the real
+# wall-clock time since the script started are under TIMEOUT (#4835).
+wait_budget_left() {
+    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]]
+}
+
+while wait_budget_left; do
+    # A failed describe-tasks must not abort the wait under `set -e`, and
+    # must not be reported as a scraper failure: the task may be running.
+    _describe=""
+    _status=""
+    if _describe=$(aws ecs describe-tasks \
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json)
-
-    CURRENT_STATUS=$(echo "$DESCRIBE_OUTPUT" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])")
+        --output json 2>&1); then
+        _status=$(echo "$_describe" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])" 2>/dev/null) || _status=""
+    fi
+    if [[ -z "$_status" ]]; then
+        DESCRIBE_CONSECUTIVE_ERRORS=$((DESCRIBE_CONSECUTIVE_ERRORS + 1))
+        if [[ $DESCRIBE_CONSECUTIVE_ERRORS -ge $DESCRIBE_MAX_CONSECUTIVE_ERRORS ]]; then
+            echo "" >&2
+            echo "ERROR: task status unknown (task ARN ${TASK_ARN}) — describe-tasks failed ${DESCRIBE_CONSECUTIVE_ERRORS} times in a row." >&2
+            echo "AWS output: $(echo "$_describe" | tr '\n' ' ' | cut -c1-300)" >&2
+            echo "The scraper may still be running. Do NOT re-run this command." >&2
+            echo "Fix: refresh AWS credentials (e.g. aws sso login), then re-attach:" >&2
+            echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+            exit 125
+        fi
+        echo "WARNING: could not describe task (${DESCRIBE_CONSECUTIVE_ERRORS}/${DESCRIBE_MAX_CONSECUTIVE_ERRORS}); retrying in ${POLL_INTERVAL}s..." >&2
+        sleep "$POLL_INTERVAL"
+        ELAPSED=$((ELAPSED + POLL_INTERVAL))
+        continue
+    fi
+    DESCRIBE_CONSECUTIVE_ERRORS=0
+    DESCRIBE_OUTPUT="$_describe"
+    CURRENT_STATUS="$_status"
 
     if [[ "$CURRENT_STATUS" != "$LAST_STATUS" ]]; then
         echo "Status: ${CURRENT_STATUS}" >&2
@@ -370,12 +437,17 @@ if [[ "$LOG_STREAMING" == "true" ]]; then
 fi
 
 if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
-    echo "Error: task did not complete within ${TIMEOUT}s." >&2
-    echo "Task ARN: ${TASK_ARN}" >&2
-    echo "Last status: ${CURRENT_STATUS}" >&2
-    echo "Check logs manually:" >&2
-    echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
-    exit 1
+    # The wait ran out but the scraper has NOT failed: it is still running
+    # on ECS.  Exit 124 (#4835) so the caller re-attaches instead of
+    # launching a second scraper task.
+    echo "" >&2
+    echo "Scraper still running (task ARN ${TASK_ARN}) — stopped waiting after ${TIMEOUT}s." >&2
+    echo "Last status: ${CURRENT_STATUS:-<none>}. This is NOT a failure." >&2
+    echo "Do NOT re-run this command: that would launch a second scraper task." >&2
+    echo "To keep waiting (re-run while it exits 124; it only reads status):" >&2
+    echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+    echo "Tail logs:  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
+    exit 124
 fi
 
 # ─── Step 6: Get exit code ───────────────────────────────────────────────────

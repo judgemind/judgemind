@@ -266,7 +266,7 @@ If a hook blocks a command, do NOT try to work around it. Default to **mark need
 
 You can use the full toolset of a `/task` agent or the operator's dispatcher session:
 
-- **Bash** — `git`, `gh`, `aws`, `psql` (via `scripts/dev-db-query.sh`), any other shell command. Set `timeout: 1200000` on long-running commands per `CLAUDE.md`.
+- **Bash** — `git`, `gh`, `aws`, `psql` (via `scripts/dev-db-query.sh`), any other shell command. Set `timeout: 600000` on long-running commands per `CLAUDE.md`.
 - **Edit / Write / Read / Glob / Grep** — full filesystem access. Edit files in the failed agent's worktree (when present), write helpers to `{worktree}/tmp/diagnoser/`, read PR diffs, etc. Note: the v3 diagnoser runs in its own ECS task; it does not have the failed agent's worktree on disk by default. Use `git fetch origin pull/<PR>/head:adopt-<PR>` to materialize the agent's branch when you need to inspect or patch it.
 - **Agent (sub-skill invocation)** — call `/ralph`, `/audit`, etc. when judgment requires. Sub-skills run with their own normal contracts.
 - **MCP servers** — `github`, `awslabs_cloudwatch-mcp-server`, `awslabs_ecs-mcp-server`, `plugin:telegram` (read/notify only — see Telegram Integration in `CLAUDE.md`).

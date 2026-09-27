@@ -143,6 +143,31 @@ MOCK_AWS
     echo "$tmpdir"
 }
 
+# #4835: --follow is bounded so one call fits inside the Bash tool's cap.
+test_follow_is_bounded() {
+    local default
+    default=$(grep -oE 'ECS_LOGS_FOLLOW_MAX_SECS:-[0-9]+' "$ECS_LOGS" | head -n 1 | cut -d- -f2)
+    if [[ -n "$default" && "$default" -le 540 ]]; then
+        pass "--follow default limit ($default s) is <= 540s"
+    else
+        fail "--follow default limit ($default s) is <= 540s"
+    fi
+
+    local tmpdir output exit_code=0
+    tmpdir=$(setup_mock_aws)
+    output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        MOCK_STREAMS=$'ecs/container/task-a' \
+        ECS_LOGS_FOLLOW_MAX_SECS=1 ECS_LOGS_POLL_INTERVAL=1 \
+        "$ECS_LOGS" /ecs/test-group --follow --lines 1 2>&1
+    ) || exit_code=$?
+    if [[ "$exit_code" -eq 124 ]] && echo "$output" | grep -q "Re-run the same command"; then
+        pass "--follow stops with exit 124 and says to re-run"
+    else
+        fail "--follow stops with exit 124 and says to re-run" "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Tests ──────────────────────────────────────────────────────────────────
 
 # Test 1: No arguments prints usage error
@@ -351,6 +376,7 @@ test_no_streams() {
 
 # ── Run all tests ──────────────────────────────────────────────────────────
 
+test_follow_is_bounded
 test_no_args
 test_help
 test_oneshot_task_found_by_exact_prefix

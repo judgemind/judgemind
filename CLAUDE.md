@@ -15,7 +15,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 
 ### NEVER — Workflow
 - Never use `run_in_background` in any subagent (`/task`, `/ralph`, or Agent-spawned workers). All commands inside subagents run synchronously.
-- Never use the `Monitor` tool. Use synchronous polling instead — `scripts/wait-for-ci.sh` for PR CI gates, `gh run watch --interval 60` for workflow runs. Monitor's change-detection fires a wake-up event on every state-string change, including innocuous flickers like `mergeable=UNKNOWN ↔ MERGEABLE` while CI is still running, which bombards the agent with no-progress turns until it yields. Verified failure mode in PR #3927 / #3922 / #3909 transcripts.
+- Never use the `Monitor` tool. Use synchronous polling instead — `scripts/wait-for-ci.sh` for PR CI gates, `scripts/wait-for-run.sh <run-id>` for workflow runs. Monitor's change-detection fires a wake-up event on every state-string change, including innocuous flickers like `mergeable=UNKNOWN ↔ MERGEABLE` while CI is still running, which bombards the agent with no-progress turns until it yields. Verified failure mode in PR #3927 / #3922 / #3909 transcripts.
 - Never commit directly to `main` during autonomous task work.
 - **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
@@ -34,10 +34,14 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Pull latest code: `git fetch origin main` then `git rebase origin/main` as separate tool calls before modifying files.
 - Use `{worktree}/tmp/` for temp files, never `/tmp/`.
 - Use dedicated tools (Read, Glob, Grep) instead of Bash for file operations.
-- Watch CI to completion (`gh run watch`) before doing anything else after pushing.
+- Watch CI to completion (`scripts/wait-for-ci.sh <PR>`, re-run while it exits 124) before doing anything else after pushing.
 - Create a PR immediately after your first push to a branch.
 - Re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed.
-- Set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/rebuild_db.sh`, any data-processing script.
+- Set `timeout: 600000` (10 minutes, the Bash tool's cap) on Bash commands that may take longer than 2 minutes: `pytest`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, `scripts/rebuild_db.sh`, any data-processing script, and the long-wait helpers below. A larger value does not help: the tool moves any call still running at 600s to the background.
+- Wait on long jobs with the resumable helpers, never with a single blocking call. Each helper waits at most 480s per call. Exit `124` means "still running, not a failure": re-run the command it prints. Exit `125` means the status could not be read (e.g. expired credentials): fix that, then re-run. Re-running only reads state and never relaunches work (#4835).
+  - PR CI: `scripts/wait-for-ci.sh <PR>`. Workflow runs (deploys, terraform): `scripts/wait-for-run.sh <run-id>`.
+  - ECS oneshots: `scripts/ecs-run-task.sh --detach <script>`, then `scripts/ecs-wait-task.sh`. The same applies to `scripts/run-scraper.sh`. After a `124` from an attached `ecs-run-task.sh` / `run-scraper.sh`, re-attach with `scripts/ecs-wait-task.sh`; re-running the launcher would start a second task.
+  - Service redeploys: `scripts/ecs-redeploy.sh <service>`; after a `124`, re-run it with the printed `--deployment-id <id>`.
 
 ## Enforced Rules — Automated Checks
 
@@ -181,7 +185,7 @@ Every human-facing alert MUST pass all three tests. An alert that fails any of t
 - **Scope completeness check before implementing.** Grep for all locations affected by the change.
 - **Ralph for testable code only** (Python, TypeScript). Non-testable tasks implement directly, then run pre-PR checks and self-review the diff.
 - **Check for duplicate PRs** — `scripts/check-duplicate-pr.sh <N>` (open PRs) and `scripts/check-shipped-pr.sh <N>` (already-shipped via merged PR with no `Closes` keyword — pivots /task to verify-and-close per `.claude/skills/task/SKILL.md` §4a.2; #4204).
-- **CI watch is non-negotiable.** `gh run watch <id> --interval 60 --exit-status --compact`. Fix and re-push until CI is green.
+- **CI watch is non-negotiable.** `scripts/wait-for-ci.sh <PR>` with `timeout: 600000`; re-run it while it exits 124. Fix and re-push until CI is green.
 - **Verify `mergeable: MERGEABLE` and `statusCheckRollup` all SUCCESS/SKIPPED before merging.**
 - **Verification evidence comment is MANDATORY on every task completion.** For deployed services: curl / DB query / log lines / screenshot. For docs/CI/tooling: state the skip reason.
 - **For new user-visible affordances, the evidence must be the affordance exercised** — not "the page loads." A stop button requires log lines showing the kill AND a DB/state snapshot. Rendering is not evidence.
@@ -207,7 +211,7 @@ For detailed patterns to avoid permission prompts, see `docs/agent/unattended-pa
 
 ### GitHub API Rate Limit Awareness
 
-GitHub allows 5,000 API requests per hour. Always use `--interval 60` with `gh run watch`. Never retry 403 errors in a tight loop.
+GitHub allows 5,000 API requests per hour. `scripts/wait-for-ci.sh` and `scripts/wait-for-run.sh` poll every 30s; if you use `gh run watch` directly, always pass `--interval 60`. Never retry 403 errors in a tight loop.
 
 ## Accounts & Infrastructure
 

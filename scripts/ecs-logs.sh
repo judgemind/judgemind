@@ -13,6 +13,10 @@
 #   scripts/ecs-logs.sh /ecs/judgemind-scraper-dev --task abc123 --lines 50
 #   scripts/ecs-logs.sh /ecs/judgemind-api-dev --follow --lines 100
 #
+# --follow stops after ECS_LOGS_FOLLOW_MAX_SECS (default 480) and exits 124,
+# so one call fits inside the Bash tool's 600s cap (#4835).  Re-run the same
+# command to keep following; it only reads logs.
+#
 # Known log groups:
 #   /ecs/judgemind-scraper-dev
 #   /ecs/judgemind-ingestion-worker-dev
@@ -28,7 +32,10 @@ REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 LINES=30
 FOLLOW=false
 TASK_FILTER=""
-POLL_INTERVAL=5
+POLL_INTERVAL="${ECS_LOGS_POLL_INTERVAL:-5}"
+# How long --follow runs before it stops (exit 124).  Under the Bash tool's
+# 600s cap (#4835).  0 = follow until interrupted (terminal use only).
+FOLLOW_MAX_SECS="${ECS_LOGS_FOLLOW_MAX_SECS:-480}"
 
 # ─── Usage ─────────────────────────────────────────────────────────────────
 
@@ -41,7 +48,9 @@ Arguments:
 
 Options:
   --task <id>       Filter log streams by ECS task ID (partial match)
-  --follow          Poll for new events every 5s (like tail -f)
+  --follow          Poll for new events every 5s (like tail -f). Stops after
+                    480s with exit 124 (ECS_LOGS_FOLLOW_MAX_SECS; 0 = never);
+                    re-run the same command to keep following.
   --lines N         Number of lines to show (default: 30)
   --help            Show this help message
 
@@ -294,7 +303,12 @@ fetch_events
 # Follow mode: poll for new events
 if [[ "$FOLLOW" == true ]]; then
     echo "--- following (Ctrl+C to stop) ---" >&2
+    _follow_start=$SECONDS
     while true; do
+        if [[ "$FOLLOW_MAX_SECS" -gt 0 && $(( SECONDS - _follow_start )) -ge "$FOLLOW_MAX_SECS" ]]; then
+            echo "--- stopped following after ${FOLLOW_MAX_SECS}s (exit 124; nothing is wrong). Re-run the same command to keep following. ---" >&2
+            exit 124
+        fi
         sleep "$POLL_INTERVAL"
         fetch_events
     done

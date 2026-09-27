@@ -21,7 +21,11 @@
 #   - AWS CLI v2
 #   - Credentials for the judgemind AWS account (155326049300)
 #   - The ingestion worker task definition must exist
-# When invoked from a Claude Code Bash tool call, set `timeout: 1200000` (20 minutes) — oneshot reingests commonly exceed the 2-minute default.
+# Fits in one Claude Code Bash tool call (#4835): attached mode waits at most
+# 480s by default, then exits 124 while the task keeps running. Set
+# `timeout: 600000` on the Bash call. For a job you expect to run longer,
+# prefer `--detach`, then `scripts/ecs-wait-task.sh` (re-run it until the
+# task stops; each call waits at most 480s).
 #
 # Usage:
 #   scripts/ecs-run-task.sh <script-path> [-- script-args...]
@@ -47,15 +51,17 @@
 #   --logs <task-arn>   Retrieve logs and status for a previously launched task.
 #                       Accepts a full task ARN.
 #   --dry-run           Show what would be done without running
-#   --timeout <secs>    Max seconds to wait for task completion.  Default:
-#                       1800, or --max-runtime + 600 when --max-runtime is
-#                       set (whichever is larger), so the client never gives
-#                       up before the server-side cap can fire (#4723).
+#   --timeout <secs>    How long this call waits for the task, counted from
+#                       when the script starts.  Default: 480, which keeps
+#                       the call under the Bash tool's 600s cap (#4835).
 #                       This is a client-side wait: if the task does not stop
 #                       within this window the script exits 124 and reports
-#                       "still running" — the task keeps running on ECS.
-#                       Re-attach with `scripts/ecs-wait-task.sh` (the ARN is
-#                       saved to tmp/last-ecs-task.arn) or `--logs <arn>`.
+#                       "still running" — the task keeps running on ECS
+#                       (#4723).  Do NOT re-run this command then: that
+#                       would launch a second task.  Re-attach with
+#                       `scripts/ecs-wait-task.sh` (the ARN is saved to
+#                       tmp/last-ecs-task.arn) and re-run that until the
+#                       task stops, or use `--logs <arn>`.
 #   --max-runtime <secs> Wrap the container command with `timeout` so the task
 #                       self-terminates after this many seconds even if the
 #                       Python script hangs or retry-loops.  Default: unset
@@ -69,7 +75,8 @@
 # Exit codes (attached mode):
 #   <n>   the container's exit code once the task reaches STOPPED
 #   124   the wait timed out while the task was still running (NOT a task
-#         failure — the task keeps going; re-attach with ecs-wait-task.sh)
+#         failure — the task keeps going; re-attach with ecs-wait-task.sh,
+#         never by re-running this command)
 #   125   the task's status could not be observed: describe-tasks hit an
 #         auth/permission/parameter error (e.g. ExpiredToken, AccessDenied —
 #         fails fast), or failed 6 times in a row
@@ -80,7 +87,8 @@
 # Examples:
 #   scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
 #   scripts/ecs-run-task.sh scripts/backfill_summaries.py
-#   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_summaries.py
+#   scripts/ecs-run-task.sh --detach scripts/backfill_summaries.py
+#   scripts/ecs-wait-task.sh      # re-run while it exits 124
 #   scripts/ecs-run-task.sh --role judgemind-<custom>-dev scripts/migrate_s3_keys.py -- --cleanup-orphans
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
@@ -95,12 +103,14 @@ ENVIRONMENT="dev"
 DRY_RUN=false
 DETACH=false
 LOGS_TASK_ARN=""
-TIMEOUT=""          # empty = derive from --max-runtime (see resolve step)
-DEFAULT_TIMEOUT=1800
-# Headroom added to --max-runtime when deriving the wait timeout: covers
-# Fargate provisioning (PENDING can take several minutes), the 30s
-# --kill-after escalation, and CloudWatch/ECS status lag.
-MAX_RUNTIME_WAIT_HEADROOM=600
+TIMEOUT=""          # empty = DEFAULT_TIMEOUT
+# 480s from script start keeps one call (launch + wait + final log flush)
+# under the Bash tool's 600s cap (#4835).  A longer task is reported as
+# still running (exit 124), never as failed, so --max-runtime no longer
+# stretches the wait (it did before #4835, per #4723).
+DEFAULT_TIMEOUT=480
+# Wall-clock start, so launch time counts against the wait budget.
+SCRIPT_START_SECS=$SECONDS
 # Poll interval for the wait loop; overridable so tests can run fast.
 POLL_INTERVAL="${ECS_RUN_TASK_POLL_INTERVAL:-10}"
 MAX_RUNTIME=""
@@ -355,27 +365,16 @@ if [[ -n "$MAX_RUNTIME" ]]; then
 fi
 
 # ─── Resolve the client-side wait timeout ─────────────────────────────────
-# An explicit --timeout always wins.  Otherwise, when --max-runtime is set,
-# wait at least max-runtime + headroom so the client never declares the
-# task dead while the server-side cap has not yet fired (#4723: a 10800s
-# rebuild was reported "failed" at 1800s while still RUNNING).
+# An explicit --timeout always wins; otherwise wait DEFAULT_TIMEOUT.  When the
+# wait ends first, the task is reported as still running (exit 124), never
+# as failed (#4723), and the caller re-attaches with ecs-wait-task.sh.
 if [[ -n "$TIMEOUT" ]]; then
     if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
         echo "Error: --timeout must be a non-negative integer (seconds), got: '${TIMEOUT}'" >&2
         exit 1
     fi
-    if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 && "$TIMEOUT" -lt "$MAX_RUNTIME" ]]; then
-        echo "WARNING: --timeout ${TIMEOUT}s is shorter than --max-runtime ${MAX_RUNTIME}s;" >&2
-        echo "  the wait may end while the task is still running (it will be reported as still running, not failed)." >&2
-    fi
 else
     TIMEOUT="$DEFAULT_TIMEOUT"
-    if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
-        _derived=$(( MAX_RUNTIME + MAX_RUNTIME_WAIT_HEADROOM ))
-        if [[ "$_derived" -gt "$TIMEOUT" ]]; then
-            TIMEOUT="$_derived"
-        fi
-    fi
 fi
 
 # ─── Cleanup trap ────────────────────────────────────────────────────────────
@@ -1020,7 +1019,15 @@ exit_status_unknown() {
     exit "$EXIT_STATUS_UNKNOWN"
 }
 
-while [[ $ELAPSED -lt $TIMEOUT ]]; do
+# wait_budget_left — true while both the counted poll time and the real
+# wall-clock time since the script started are under TIMEOUT.  The wall
+# clock also covers launch time and slow AWS calls, so the whole call stays
+# inside the Bash tool's cap (#4835).
+wait_budget_left() {
+    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]]
+}
+
+while wait_budget_left; do
     # describe-tasks failures must not abort the wait under `set -e`.  Keep
     # the AWS error text (it used to go to /dev/null, #4791) so fatal errors
     # can fail fast and persistent ones can be reported.
@@ -1141,8 +1148,10 @@ if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
     save_task_arn
     echo "" >&2
     echo "Task still running (task ARN ${TASK_ARN}) — stopped waiting after ${TIMEOUT}s." >&2
-    echo "Last status: ${CURRENT_STATUS}. This is NOT a task failure; do not relaunch." >&2
-    echo "To keep waiting:  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+    echo "Last status: ${CURRENT_STATUS}. This is NOT a task failure." >&2
+    echo "Do NOT re-run this command: that would launch a second task." >&2
+    echo "To keep waiting (re-run while it exits 124; it only reads status):" >&2
+    echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
     echo "Status + logs:    scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
     echo "Tail logs:        scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
     exit 124

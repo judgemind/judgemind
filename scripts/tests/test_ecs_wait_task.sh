@@ -15,7 +15,9 @@
 #   - A task that STOPS with a non-zero exitCode propagates that code
 #   - A task that STOPS without an exitCode exits 1 with a clear stderr
 #     "Container stopped without exit code" line
-#   - --timeout fires when the task never reaches STOPPED (exit 2)
+#   - The wait budget runs out while the task is RUNNING (exit 124), and
+#     re-running the same command resumes the wait (#4835)
+#   - describe-tasks failing exits 125 (status unknown)
 #   - --quiet suppresses the per-poll status lines but keeps the final
 #     summary line on stdout
 #
@@ -394,33 +396,103 @@ test_running_then_stopped() {
     fi
 }
 
-# Test 10: --timeout fires when the task stays RUNNING.
+# Test 10: the wait budget runs out while the task stays RUNNING. Exit 124
+# ("still running — re-run the same command", #4835), not a failure.
 test_timeout_fires() {
     local tmpdir
     tmpdir=$(make_temp_dir)
     write_running_response "$tmpdir/responses/01.json"
     # All subsequent responses also RUNNING (clamp behavior).
 
-    # --timeout 0 means unlimited, so use 1 minute. Combined with
-    # --poll-interval 30s we need ~3 polls to exceed 60s elapsed.
     local output exit_code=0
-    output=$(
-        setup_mock_aws "$tmpdir" >/dev/null
-        PATH="$tmpdir:$PATH" \
-        RESPONSES_DIR="$tmpdir/responses" \
-        CALL_COUNTER_FILE="$tmpdir/counter" \
-            "$SCRIPT_UNDER_TEST" --poll-interval 1 --timeout 1 "$ARN" 2>&1
-    ) || exit_code=$?
+    output=$(run_script "$tmpdir" --timeout-secs 2 "$ARN" 2>&1) || exit_code=$?
 
-    if [ "$exit_code" -eq 2 ]; then
-        pass "--timeout 1 fires with exit 2 when task stays RUNNING"
+    if [ "$exit_code" -eq 124 ]; then
+        pass "--timeout-secs 2 exits 124 when task stays RUNNING"
     else
-        fail "--timeout 1 fires with exit 2 when task stays RUNNING" "exit=$exit_code output=$output"
+        fail "--timeout-secs 2 exits 124 when task stays RUNNING" "exit=$exit_code output=$output"
     fi
-    if echo "$output" | grep -q "timed out after 1m"; then
-        pass "timeout message names the budget"
+    if echo "$output" | grep -q "Still waiting" && echo "$output" | grep -q "NOT a task failure"; then
+        pass "still-waiting message says it is not a failure"
     else
-        fail "timeout message names the budget" "output=$output"
+        fail "still-waiting message says it is not a failure" "output=$output"
+    fi
+    if echo "$output" | grep -qF "scripts/ecs-wait-task.sh $ARN"; then
+        pass "still-waiting message prints the command to re-run"
+    else
+        fail "still-waiting message prints the command to re-run" "output=$output"
+    fi
+    if echo "$output" | grep -q "status=STOPPED"; then
+        fail "still-waiting path prints no STOPPED summary line" "output=$output"
+    else
+        pass "still-waiting path prints no STOPPED summary line"
+    fi
+}
+
+# Test 10b (#4835): the default budget fits under the Bash tool's 600s cap.
+test_default_timeout_under_tool_cap() {
+    local default
+    default=$(grep -E '^DEFAULT_TIMEOUT_SECS=[0-9]+$' "$SCRIPT_UNDER_TEST" | head -n 1 | cut -d= -f2)
+    if [ -n "$default" ] && [ "$default" -le 540 ]; then
+        pass "default wait budget ($default s) is <= 540s"
+    else
+        fail "default wait budget ($default s) is <= 540s"
+    fi
+}
+
+# Test 10c (#4835): re-running after exit 124 resumes the same wait and
+# returns the container's exit code once the task stops. The script only
+# ever calls describe-tasks (the mock rejects anything else), so a re-run
+# cannot relaunch the task.
+test_reinvoke_after_still_waiting_resumes() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    # First call: RUNNING, sleep 1s, RUNNING, budget spent -> 124.
+    # Second call: STOPPED on its first poll.
+    write_running_response "$tmpdir/responses/01.json"
+    write_running_response "$tmpdir/responses/02.json"
+    write_stopped_response_with_exit_code "$tmpdir/responses/03.json" 0
+
+    local output exit_code=0
+    output=$(run_script "$tmpdir" --timeout-secs 1 "$ARN" 2>&1) || exit_code=$?
+    if [ "$exit_code" -eq 124 ]; then
+        pass "reinvoke: first call exits 124 while the task is RUNNING"
+    else
+        fail "reinvoke: first call exits 124 while the task is RUNNING" "exit=$exit_code output=$output"
+    fi
+
+    exit_code=0
+    output=$(run_script "$tmpdir" --timeout-secs 1 "$ARN" 2>&1) || exit_code=$?
+    if [ "$exit_code" -eq 0 ] && echo "$output" | grep -q "status=STOPPED exit_code=0"; then
+        pass "reinvoke: second call resumes and returns the container exit code"
+    else
+        fail "reinvoke: second call resumes and returns the container exit code" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 10d (#4791 convention): describe-tasks failing means the status is
+# unknown. Exit 125, not a usage error, and say not to relaunch.
+test_describe_failure_exits_125() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    cat > "$tmpdir/aws" << 'MOCK_AWS'
+#!/usr/bin/env bash
+echo "An error occurred (ExpiredTokenException): The security token included in the request is expired" >&2
+exit 255
+MOCK_AWS
+    chmod +x "$tmpdir/aws"
+
+    local output exit_code=0
+    output=$(PATH="$tmpdir:$PATH" "$SCRIPT_UNDER_TEST" --poll-interval 1 "$ARN" 2>&1) || exit_code=$?
+    if [ "$exit_code" -eq 125 ]; then
+        pass "describe-tasks failure exits 125 (status unknown)"
+    else
+        fail "describe-tasks failure exits 125 (status unknown)" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -q "ExpiredTokenException" && echo "$output" | grep -q "Do not relaunch"; then
+        pass "status-unknown message shows the AWS error and says not to relaunch"
+    else
+        fail "status-unknown message shows the AWS error and says not to relaunch" "output=$output"
     fi
 }
 
@@ -475,6 +547,9 @@ test_nonzero_exit_propagates
 test_stopped_no_exit_code
 test_running_then_stopped
 test_timeout_fires
+test_default_timeout_under_tool_cap
+test_reinvoke_after_still_waiting_resumes
+test_describe_failure_exits_125
 test_quiet_suppresses_progress
 
 echo ""

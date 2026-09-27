@@ -29,18 +29,18 @@ The Next.js web app (`packages/web/`) is deployed on **Vercel** with automatic G
 **Environment variables** (set in Vercel project, managed by Terraform):
 - `NEXT_PUBLIC_GRAPHQL_URL` = `https://dev.api.judgemind.org/graphql`
 
-**Checking deploy status (preferred — use `gh run watch`):**
+**Checking deploy status (preferred — use `scripts/wait-for-run.sh`):**
 ```
 # Watch the Vercel deploy status workflow (standard agent pattern)
 gh run list --repo judgemind/judgemind --workflow vercel-deploy-status.yml --branch main --limit 1 --json databaseId -q '.[0].databaseId'
-gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
+scripts/wait-for-run.sh <run-id>     # timeout: 600000; re-run while it exits 124
 ```
 
 The `vercel-deploy-status.yml` GitHub Action runs on every push to `main`. It detects whether `packages/web/` changed:
 - **Web changed:** polls the Vercel Deployments API until the deploy completes, then exits with success/failure. It first queries by exact commit SHA; if the deployment is not found after 5 attempts (handles squash merges where Vercel stores the branch SHA, not the merge commit SHA), it falls back to querying recent production deployments by timestamp.
 - **No web changes:** exits immediately with success (so the workflow stays green).
 
-This lets agents use the standard `gh run watch` pattern instead of polling the Vercel API in a loop.
+This lets agents use the standard `scripts/wait-for-run.sh` pattern instead of polling the Vercel API in a loop.
 
 **Fallback (manual check):**
 ```
@@ -409,19 +409,20 @@ This closes the race window observed in PR #2907 where a new resolver shipped on
 | `scripts/ecs-run-task.sh` | All data scripts (backfills, migrations, audits) | Reliable | Standalone Fargate task, CloudWatch logs, no session timeout |
 | `scripts/dev-db-query.sh` | Quick SQL queries | Good for short queries | Uses ECS Exec internally; may drop on long queries |
 | `scripts/ecs-run.sh` | Interactive debugging only | Unreliable | SSM sessions drop after seconds; never use for scripts |
-| `scripts/ecs-wait-task.sh` | Wait on a `--detach`'d oneshot until STOPPED | Reliable | 60s polling, no upper time limit, propagates container exitCode |
+| `scripts/ecs-wait-task.sh` | Wait on a `--detach`'d oneshot until STOPPED | Reliable | 60s polling, 480s per call then exit 124 (re-run to keep waiting), propagates container exitCode |
 
 ```
-# Run a script and wait for completion (default)
+# Short scripts: run and wait for completion (waits at most 480s, then exit 124)
 scripts/ecs-run-task.sh scripts/backfill_llm_enrichment.py -- --dry-run
 
 # Long-running tasks: launch and detach, then wait via the helper
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
-scripts/ecs-wait-task.sh                    # reads tmp/last-ecs-task.arn auto-saved on detach
+scripts/ecs-wait-task.sh                    # reads tmp/last-ecs-task.arn; re-run while it exits 124
 scripts/ecs-run-task.sh --logs <task-arn>   # alternative: stream logs after the fact
 
 # Initial population of a county with S3 data but no DB records
-scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange"
+scripts/ecs-run-task.sh --detach scripts/rebuild_db.py -- --county "Orange"
+scripts/ecs-wait-task.sh
 
 # Tail logs for a task by ID (printed when the task launches)
 scripts/ecs-task-logs.sh <task-id>
@@ -431,7 +432,26 @@ scripts/ecs-task-logs.sh <task-id> --follow
 scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completeness.py
 ```
 
-**Long oneshots: prefer `scripts/ecs-wait-task.sh` over `aws ecs wait tasks-stopped`.** The native `aws ecs wait tasks-stopped` polls 100 times at 6s intervals = 10 min hard cap, which is too short for typical reingests/rebuilds (30-180 min). `scripts/ecs-wait-task.sh` polls every 60s with no upper time limit, emits one-line liveness notes the agent transcript can use to verify progress, and propagates the container's `exitCode` as the script's exit code. It reads the ARN from `tmp/last-ecs-task.arn` (auto-written by `ecs-run-task.sh --detach`) when no positional ARN is passed. See #4252 and `scripts/ecs-wait-task.sh --help`.
+**Long oneshots: prefer `scripts/ecs-wait-task.sh` over `aws ecs wait tasks-stopped`.** The native `aws ecs wait tasks-stopped` polls 100 times at 6s intervals = 10 min hard cap, which is too short for typical reingests/rebuilds (30-180 min). `scripts/ecs-wait-task.sh` polls every 60s, emits one-line liveness notes the agent transcript can use to verify progress, and propagates the container's `exitCode` as the script's exit code. It reads the ARN from `tmp/last-ecs-task.arn` (auto-written by `ecs-run-task.sh --detach`) when no positional ARN is passed. See #4252 and `scripts/ecs-wait-task.sh --help`.
+
+**Every long-wait helper is resumable (#4835).** The Bash tool moves any call still running at 600s to the background, so one call of each helper waits at most 480s. Run them with `timeout: 600000`. The exit codes are shared:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| `124` | Still running when this call's wait ran out. Not a failure. | Re-run the command the helper prints. |
+| `125` | Status could not be read (e.g. expired credentials, API errors). The work may still be running. | Fix access, then re-run the printed command. Do not relaunch. |
+
+| Helper | Waits on | Re-run after 124 |
+|---|---|---|
+| `scripts/wait-for-ci.sh <PR>` | PR check runs | The same command |
+| `scripts/wait-for-run.sh <run-id>` | One workflow run (deploys, terraform) | The same command |
+| `scripts/ecs-wait-task.sh [<arn>]` | An ECS task | The same command |
+| `scripts/ecs-run-task.sh <script>` (attached) | The task it launched | `scripts/ecs-wait-task.sh` — never the launcher, which would start a second task |
+| `scripts/run-scraper.sh <id>` (attached) | The scraper task it launched | `scripts/ecs-wait-task.sh` — never the launcher |
+| `scripts/ecs-redeploy.sh <service>` | The deployment it forced | `scripts/ecs-redeploy.sh <service> <cluster> --deployment-id <id>`, as printed |
+| `scripts/ecs-logs.sh <group> --follow` | New log events | The same command (it re-prints the last N lines) |
+
+Re-running only reads state; none of them relaunches work. `scripts/wait-for-rollout.sh`, which CI deploy jobs call directly, keeps a 900s default but uses the same `124` / `125` exits.
 
 **Large-county rebuilds need memory override.** `rebuild_db.py --county <name>` holds per-worker OpenSearch/Postgres clients and LLM batch state for every document in the county. At the default 4096 MB, counties with thousands of documents (Los Angeles, Santa Clara, Orange) can exit 137 (OOM). Use `--cpu 2048 --memory 8192` for these rebuilds (see #2481):
 
@@ -609,7 +629,7 @@ Best practices:
 
    `timeout` sends `SIGTERM` at the deadline, giving Python's atexit handlers and `psycopg` a chance to close connections cleanly, and escalates to `SIGKILL` 30 seconds later if the script ignores the signal.  The container then exits with the script's own exit code (on clean termination) or `137` (SIGKILL).  Requires coreutils, which is present in the `python:3.12-slim` base image used by the ingestion worker task definition.
 
-   The client-side wait follows `--max-runtime`: without an explicit `--timeout`, `ecs-run-task.sh` waits `max(1800, max-runtime + 600)` seconds. If the wait expires while the task is still running, the script exits `124` and prints `Task still running (task ARN …)`. That is not a task failure, so do not relaunch. Re-attach with `scripts/ecs-wait-task.sh`, which reads the ARN the script saved to `tmp/last-ecs-task.arn`, or run `scripts/ecs-run-task.sh --logs <arn>` (#4723). Exit `125` means the script could not observe the task's status at all: `describe-tasks` hit an auth, permission or parameter error (for example `ExpiredToken` or `AccessDenied`, which fail fast), or it failed 6 times in a row. The script prints the AWS error and a `Fix:` block. The task may still be running, so refresh credentials and re-attach with `scripts/ecs-wait-task.sh` rather than relaunching (#4791).
+   The client-side wait is 480s by default (counted from script start, so one call fits inside the Bash tool's 600s cap, #4835), whatever `--max-runtime` says; pass `--timeout <secs>` to change it. For a job longer than a few minutes, launch with `--detach` and wait with `scripts/ecs-wait-task.sh`. If the wait expires while the task is still running, the script exits `124` and prints `Task still running (task ARN …)`. That is not a task failure, so do not relaunch. Re-attach with `scripts/ecs-wait-task.sh`, which reads the ARN the script saved to `tmp/last-ecs-task.arn`, or run `scripts/ecs-run-task.sh --logs <arn>` (#4723). Exit `125` means the script could not observe the task's status at all: `describe-tasks` hit an auth, permission or parameter error (for example `ExpiredToken` or `AccessDenied`, which fail fast), or it failed 6 times in a row. The script prints the AWS error and a `Fix:` block. The task may still be running, so refresh credentials and re-attach with `scripts/ecs-wait-task.sh` rather than relaunching (#4791).
 
 **When to use which.**  The in-script cap is always-on for `rebuild_db.py` and handles the specific pool-break-storm pattern surgically.  The lifetime cap is a blanket backstop for any oneshot that could hang for reasons the script doesn't know about (slow network, LLM API outage, stuck DB query).  Use both together for rebuilds on dev.
 
@@ -641,7 +661,8 @@ PDFs and exited 0) surfaces as a non-zero exit instead of a false success. The
 gate is on automatically for the cache-bust prefix path:
 
 ```
-scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+scripts/ecs-wait-task.sh     # re-run while it exits 124; exits with the reingest's own code
 ```
 
 Override the threshold with `--max-error-ratio 0.05` (your value always wins),

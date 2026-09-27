@@ -316,10 +316,11 @@ test_timeout_wraps_interpreter_not_download() {
     fi
 }
 
-# ── Wait-timeout derivation (#4723) ──────────────────────────────────────────
+# ── Wait-timeout default (#4723, #4835) ─────────────────────────────────────
 #
-# The client-side wait must honor --max-runtime: a 10800s rebuild used to be
-# reported "failed" at the hard-coded 1800s while still RUNNING.
+# One attached call must fit inside the Bash tool's 600s cap, so the wait is
+# bounded at 480s by default, with or without --max-runtime.  A longer task
+# is reported as still running (exit 124), never as failed (#4723).
 
 run_dry() {
     # run_dry <args...> — dry-run against the mock aws; echoes combined output.
@@ -332,31 +333,20 @@ run_dry() {
 test_ecs_run_task_timeout_default_without_max_runtime() {
     local output
     output=$(run_dry)
-    if echo "$output" | grep -q "Wait timeout: 1800s"; then
-        pass "ecs_run_task_timeout: default wait is 1800s without --max-runtime"
+    if echo "$output" | grep -q "Wait timeout: 480s"; then
+        pass "ecs_run_task_timeout: default wait is 480s (under the 600s tool cap)"
     else
-        fail "ecs_run_task_timeout: default wait is 1800s without --max-runtime" "output: $output"
+        fail "ecs_run_task_timeout: default wait is 480s (under the 600s tool cap)" "output: $output"
     fi
 }
 
-test_ecs_run_task_timeout_derived_from_max_runtime() {
+test_ecs_run_task_timeout_max_runtime_does_not_stretch_wait() {
     local output
     output=$(run_dry --max-runtime 10800)
-    # 10800 + 600 headroom; must be >= max-runtime + 120 per the AC.
-    if echo "$output" | grep -q "Wait timeout: 11400s"; then
-        pass "ecs_run_task_timeout: --max-runtime 10800 ⇒ wait 11400s"
+    if echo "$output" | grep -q "Wait timeout: 480s"; then
+        pass "ecs_run_task_timeout: --max-runtime 10800 keeps the 480s wait"
     else
-        fail "ecs_run_task_timeout: --max-runtime 10800 ⇒ wait 11400s" "output: $output"
-    fi
-}
-
-test_ecs_run_task_timeout_small_max_runtime_keeps_floor() {
-    local output
-    output=$(run_dry --max-runtime 60)
-    if echo "$output" | grep -q "Wait timeout: 1800s"; then
-        pass "ecs_run_task_timeout: small --max-runtime keeps the 1800s floor"
-    else
-        fail "ecs_run_task_timeout: small --max-runtime keeps the 1800s floor" "output: $output"
+        fail "ecs_run_task_timeout: --max-runtime 10800 keeps the 480s wait" "output: $output"
     fi
 }
 
@@ -364,14 +354,9 @@ test_ecs_run_task_timeout_explicit_wins() {
     local output
     output=$(run_dry --timeout 300 --max-runtime 10800)
     if echo "$output" | grep -q "Wait timeout: 300s"; then
-        pass "ecs_run_task_timeout: explicit --timeout overrides derivation"
+        pass "ecs_run_task_timeout: explicit --timeout is used"
     else
-        fail "ecs_run_task_timeout: explicit --timeout overrides derivation" "output: $output"
-    fi
-    if echo "$output" | grep -q "WARNING: --timeout 300s is shorter than --max-runtime"; then
-        pass "ecs_run_task_timeout: warns when --timeout < --max-runtime"
-    else
-        fail "ecs_run_task_timeout: warns when --timeout < --max-runtime" "output: $output"
+        fail "ecs_run_task_timeout: explicit --timeout is used" "output: $output"
     fi
 }
 
@@ -586,6 +571,54 @@ test_ecs_run_task_timeout_reports_still_running() {
     else
         fail "ecs_run_task_timeout: ARN saved for ecs-wait-task.sh" "file: $(cat "$root/tmp/last-ecs-task.arn" 2>/dev/null)"
     fi
+    if echo "$output" | grep -q "Do NOT re-run this command" \
+        && echo "$output" | grep -qF "scripts/ecs-wait-task.sh ${LATE_TASK_ARN}"; then
+        pass "ecs_run_task_timeout: says not to re-run, names the re-attach command"
+    else
+        fail "ecs_run_task_timeout: says not to re-run, names the re-attach command" "output: $output"
+    fi
+}
+
+# #4835: after exit 124, the documented re-attach (ecs-wait-task.sh, which
+# reads the saved ARN) resumes the wait and returns the task's exit code,
+# and the task is launched exactly once.
+test_ecs_run_task_reattach_after_still_running_does_not_relaunch() {
+    local root fake_script output exit_code=0
+    root=$(make_temp_dir)
+    setup_full_mock "$root"
+    cp "$SCRIPT_DIR/ecs-wait-task.sh" "$root/scripts/ecs-wait-task.sh"
+    fake_script=$(make_fake_script)
+
+    # --timeout 30 at a 10s poll = 3 describe-tasks calls, all RUNNING.
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=5 \
+        ECS_RUN_TASK_POLL_INTERVAL=10 \
+        "$root/scripts/ecs-run-task.sh" --timeout 30 "$fake_script" 2>&1
+    ) || exit_code=$?
+    if [[ $exit_code -eq 124 ]]; then
+        pass "reattach: attached call exits 124 while the task runs"
+    else
+        fail "reattach: attached call exits 124 while the task runs" "exit $exit_code; output: $output"
+    fi
+
+    exit_code=0
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=5 \
+        "$root/scripts/ecs-wait-task.sh" 2>&1
+    ) || exit_code=$?
+    if [[ $exit_code -eq 0 ]] && echo "$output" | grep -q "status=STOPPED exit_code=0"; then
+        pass "reattach: ecs-wait-task.sh on the saved ARN resumes and exits 0"
+    else
+        fail "reattach: ecs-wait-task.sh on the saved ARN resumes and exits 0" "exit $exit_code; output: $output"
+    fi
+
+    local launches
+    launches=$(grep -c "^ecs run-task" "$root/state/calls.log" 2>/dev/null || true)
+    if [[ "$launches" == "1" ]]; then
+        pass "reattach: the task was launched exactly once"
+    else
+        fail "reattach: the task was launched exactly once" "run-task calls: $launches"
+    fi
 }
 
 test_ecs_run_task_empty_first_read_does_not_skip_events() {
@@ -770,12 +803,12 @@ test_with_max_runtime_wraps_timeout
 test_max_runtime_zero_disables
 test_timeout_wraps_interpreter_not_download
 test_ecs_run_task_timeout_default_without_max_runtime
-test_ecs_run_task_timeout_derived_from_max_runtime
-test_ecs_run_task_timeout_small_max_runtime_keeps_floor
+test_ecs_run_task_timeout_max_runtime_does_not_stretch_wait
 test_ecs_run_task_timeout_explicit_wins
 test_ecs_run_task_timeout_invalid_rejected
 test_ecs_run_task_finds_late_sorting_log_stream
 test_ecs_run_task_timeout_reports_still_running
+test_ecs_run_task_reattach_after_still_running_does_not_relaunch
 test_ecs_run_task_survives_transient_describe_failure
 test_ecs_run_task_empty_first_read_does_not_skip_events
 test_ecs_run_task_empty_page_with_new_token_does_not_stall

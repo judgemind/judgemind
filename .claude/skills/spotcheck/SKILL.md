@@ -58,7 +58,7 @@ updated: <ISO-8601>
 summary: Running spot-check
 ```
 
-Run the one-shot sampling script. This launches an ECS oneshot that samples rulings + originals across all counties and writes the result JSON to S3. Use `timeout: 1200000`.
+Run the one-shot sampling script. This launches an ECS oneshot that samples rulings + originals across all counties and writes the result JSON to S3. Use `timeout: 600000`; if it exits 124 (still running), re-attach with `scripts/ecs-wait-task.sh` rather than relaunching.
 
 ```
 scripts/ecs-run-task.sh scripts/spotcheck/run_spotcheck.py -- --n 10
@@ -212,7 +212,7 @@ The four checks (per county):
 3. **case_title_text_mismatch** — significant case_title party words don't appear in the ruling_text (mirror of `audit_oc_ruling_integrity.py` applied per-county).
 4. **all_same_case_title_cluster** — same `documents.s3_key` produced multiple rulings, all sharing identical `case_title` — strong indicator the LLM applied page-1's case to every entry.
 
-Run it via `scripts/ecs-run-task.sh` so it has the dev DSN. Use `timeout: 1200000`:
+Run it via `scripts/ecs-run-task.sh` so it has the dev DSN. Use `timeout: 600000` (re-attach with `scripts/ecs-wait-task.sh` on exit 124):
 
 ```
 scripts/ecs-run-task.sh scripts/audit_llm_carry_forward.py
@@ -264,7 +264,7 @@ Process:
 2. Run the relevant pre-PR checks for the touched package — see `docs/agent/code-standards.md` §Pre-PR Checks. Most spotcheck-fix PRs touch one or two files; the tight-loop is usually `ruff check packages/<pkg>/`, `pytest packages/<pkg>/tests/<test>.py`, and the diff-coverage gate.
 3. Commit with a conventional message (`fix(area): description`) and push.
 4. Open a PR with `gh pr create --base main --body-file <file>`. PR body must describe the root cause (not just the symptom), the fix shape, and how it prevents the class of regression. Include `Found by: /spotcheck` in the body so the merge log shows provenance.
-5. Watch CI to green via `gh run watch <id> --interval 60 --exit-status --compact`.
+5. Watch CI to green via `scripts/wait-for-ci.sh <PR>` (re-run while it exits 124).
 6. Merge once CI passes: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 
 Examples of "fix inline" scope:
@@ -396,7 +396,7 @@ Then write status: `phase: done`, `summary: Spotcheck complete — N issues, M P
 
 - No `$()` or heredocs in Bash; separate tool calls for dynamic values.
 - Temp files in `{worktree}/tmp/`, not `/tmp/`.
-- `timeout: 1200000` on `scripts/ecs-run-task.sh` and any data script.
+- `timeout: 600000` on `scripts/ecs-run-task.sh` and any data script (the Bash tool's cap; exit 124 = still running, re-attach with `scripts/ecs-wait-task.sh`).
 - Judge name column is `judges.canonical_name`, not `name`.
 - S3 bucket is `judgemind-document-archive-dev`. Prefix is lowercase with underscores (`ca/orange/`, not `CA/Orange/`).
 - `.claude/` writes go through `scripts/write-claude-file.sh` — the platform blocks Edit/Write inside `.claude/`.

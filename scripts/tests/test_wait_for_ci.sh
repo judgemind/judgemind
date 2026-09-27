@@ -3,7 +3,7 @@
 #
 # Exercises the check-runs polling loop against a mock gh CLI that emits a
 # sequence of pre-canned JSON responses keyed on call number. Verifies the
-# success (exit 0), early-failure (exit 1), timeout (exit 2), missing-arg,
+# success (exit 0), early-failure (exit 1), still-waiting (exit 124), missing-arg,
 # and --help paths.
 #
 # Usage:
@@ -465,7 +465,8 @@ test_early_failure() {
     fi
 }
 
-# Test 3: Timeout — check-runs always returns in_progress. Use short timeout. Expect exit 2.
+# Test 3: Timeout — check-runs always returns in_progress. Use short timeout.
+# Expect exit 124 ("still running — re-run the same command", #4835).
 test_timeout() {
     local tmpdir
     tmpdir=$(make_temp_dir)
@@ -475,16 +476,70 @@ test_timeout() {
     exit_code=0
     output=$(run_script "$tmpdir" 42 --timeout-secs 2 --poll-interval 1 2>&1) || exit_code=$?
 
-    if [ "$exit_code" -eq 2 ]; then
-        pass "timeout: exits 2 on timeout"
+    if [ "$exit_code" -eq 124 ]; then
+        pass "timeout: exits 124 (still running) on timeout"
     else
-        fail "timeout: exits 2 on timeout" "exit=$exit_code output=$output"
+        fail "timeout: exits 124 (still running) on timeout" "exit=$exit_code output=$output"
     fi
 
-    if echo "$output" | grep -q "Timed out"; then
-        pass "timeout: emits timeout message"
+    if echo "$output" | grep -q "STILL WAITING"; then
+        pass "timeout: emits still-waiting message"
     else
-        fail "timeout: emits timeout message" "output=$output"
+        fail "timeout: emits still-waiting message" "output=$output"
+    fi
+
+    if echo "$output" | grep -qF "scripts/wait-for-ci.sh 42 --timeout-secs 2 --poll-interval 1"; then
+        pass "timeout: prints the exact command to re-run"
+    else
+        fail "timeout: prints the exact command to re-run" "output=$output"
+    fi
+}
+
+# Test 3b (#4835): the default wait fits under the Bash tool's 600s cap.
+test_default_timeout_under_tool_cap() {
+    local default
+    default=$(grep -E '^TIMEOUT_SECS=[0-9]+$' "$SCRIPT_UNDER_TEST" | head -n 1 | cut -d= -f2)
+    if [ -n "$default" ] && [ "$default" -le 540 ]; then
+        pass "default_timeout: default --timeout-secs ($default) is <= 540"
+    else
+        fail "default_timeout: default --timeout-secs ($default) is <= 540"
+    fi
+}
+
+# Test 3c (#4835): re-running after exit 124 resumes the wait. The second
+# call picks up where CI is now (green) and exits 0, and neither call
+# re-triggers CI (no `gh run rerun`).
+test_reinvoke_after_still_waiting_resumes() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_in_progress_response "$tmpdir/responses/01.json"
+    write_all_success_response "$tmpdir/responses/02.json"
+    local rerun_log="$tmpdir/rerun.log"
+    : > "$rerun_log"
+
+    local output exit_code
+    exit_code=0
+    output=$(RERUN_LOG_FILE="$rerun_log" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 0 2>&1) || exit_code=$?
+    if [ "$exit_code" -eq 124 ]; then
+        pass "reinvoke: first call exits 124 while CI is still running"
+    else
+        fail "reinvoke: first call exits 124 while CI is still running" "exit=$exit_code output=$output"
+    fi
+
+    exit_code=0
+    output=$(RERUN_LOG_FILE="$rerun_log" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 0 2>&1) || exit_code=$?
+    if [ "$exit_code" -eq 0 ]; then
+        pass "reinvoke: second call resumes and exits 0 once CI is green"
+    else
+        fail "reinvoke: second call resumes and exits 0 once CI is green" "exit=$exit_code output=$output"
+    fi
+
+    if [ ! -s "$rerun_log" ]; then
+        pass "reinvoke: no CI re-run was triggered by either call"
+    else
+        fail "reinvoke: no CI re-run was triggered by either call" "reruns=$(cat "$rerun_log")"
     fi
 }
 
@@ -609,10 +664,10 @@ test_no_regression_in_progress_ci_passed() {
     output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
         run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
 
-    if [ "$exit_code" -eq 2 ]; then
-        pass "no_regression_in_progress_ci_passed: times out (exit 2) when ci-passed is still in_progress"
+    if [ "$exit_code" -eq 124 ]; then
+        pass "no_regression_in_progress_ci_passed: stops waiting (exit 124) when ci-passed is still in_progress"
     else
-        fail "no_regression_in_progress_ci_passed: times out (exit 2) when ci-passed is still in_progress" "exit=$exit_code output=$output"
+        fail "no_regression_in_progress_ci_passed: stops waiting (exit 124) when ci-passed is still in_progress" "exit=$exit_code output=$output"
     fi
 
     if echo "$output" | grep -q "canonical merge gate green"; then
@@ -1100,7 +1155,7 @@ test_rebase_required_does_not_fire_when_failure_present() {
 # Test 18 (#4412): The exit-3 path must NOT fire while ci-passed is still
 # in_progress, even if mergeStateStatus=DIRTY. We can't tell the agent to
 # rebase based on a partial CI signal — they may still need to wait for a
-# real failure to surface. Times out (exit 2) instead.
+# real failure to surface. Stops waiting (exit 124) instead.
 test_rebase_required_does_not_fire_while_ci_passed_in_progress() {
     local tmpdir
     tmpdir=$(make_temp_dir)
@@ -1111,10 +1166,10 @@ test_rebase_required_does_not_fire_while_ci_passed_in_progress() {
     output=$(MERGEABLE_RESPONSE=CONFLICTING MERGE_STATE_RESPONSE=DIRTY \
         run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
 
-    if [ "$exit_code" -eq 2 ]; then
-        pass "rebase_required_no_misfire_ci_in_progress: times out (exit 2), does not exit 3"
+    if [ "$exit_code" -eq 124 ]; then
+        pass "rebase_required_no_misfire_ci_in_progress: stops waiting (exit 124), does not exit 3"
     else
-        fail "rebase_required_no_misfire_ci_in_progress: times out (exit 2), does not exit 3" "exit=$exit_code output=$output"
+        fail "rebase_required_no_misfire_ci_in_progress: stops waiting (exit 124), does not exit 3" "exit=$exit_code output=$output"
     fi
 }
 
@@ -1430,6 +1485,8 @@ test_graphql_rate_limit_no_false_positive_info() {
 test_happy_path
 test_early_failure
 test_timeout
+test_default_timeout_under_tool_cap
+test_reinvoke_after_still_waiting_resumes
 test_missing_pr_arg
 test_help
 test_canonical_gate_fastpath_with_stale_pending
