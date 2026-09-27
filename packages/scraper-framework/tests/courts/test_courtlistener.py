@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from datetime import datetime
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -1197,35 +1197,77 @@ class TestFetchOpinionsForClusters:
         assert warnings, f"Expected warning for cluster_id={failing_id}, got: {cap_logs!r}"
 
     @respx.mock
-    def test_50_cluster_fetch_completes_quickly(self) -> None:
-        """Fetching 50 clusters with mocked responses finishes well under 5 s.
+    def test_50_cluster_fetch_runs_concurrently_with_pacing(self) -> None:
+        """50 clusters are fetched with all 5 slots busy at once, each paced 0.2 s.
 
-        With 5 concurrent slots each sleeping 0.2 s, the theoretical minimum
-        wall-clock time for 50 clusters is ceil(50/5)*0.2 = 2.0 s.  The test
-        asserts < 5 s to give a comfortable margin for CI overhead while still
-        proving that the code is not sequential (sequential would take ≥10 s).
-        Also verifies that exactly 50 opinion API requests were issued.
+        This used to assert that the batch took < 5 s of wall-clock time.
+        That bound flaked on a loaded or sleeping laptop (#4721). The test
+        now proves the same two things without a clock:
+
+        * Concurrency: every request handler waits on a gate that opens
+          only when DEFAULT_OPINION_FETCH_CONCURRENCY requests are in flight
+          at once. A sequential fetch never opens it, the gate wait times
+          out, and the clusters go missing from the result.
+        * Pacing: ``asyncio.sleep`` is replaced with a recorder, so every
+          slot must request the 0.2 s pacing sleep. The test does not
+          actually wait 0.2 s.
+
+        It also checks that exactly 50 opinion API requests were issued.
         """
         num_clusters = 50
+        in_flight = [0]
+        max_inflight = [0]
+        slots_full = asyncio.Event()
+        gate_broken = [False]
+        pacing_delays: list[float] = []
+        real_sleep = asyncio.sleep
 
-        def _mock_opinions(request: httpx.Request) -> httpx.Response:
+        async def _record_sleep(delay: float, *args: Any, **kwargs: Any) -> Any:
+            pacing_delays.append(delay)
+            # Still yield to the event loop so other tasks can run.
+            return await real_sleep(0)
+
+        async def _gated_handler(request: httpx.Request) -> httpx.Response:
+            in_flight[0] += 1
+            max_inflight[0] = max(max_inflight[0], in_flight[0])
+            if in_flight[0] >= DEFAULT_OPINION_FETCH_CONCURRENCY:
+                slots_full.set()
+            try:
+                # Generous failure-path timeout only: a correct run opens
+                # the gate after the first 5 requests start, with no waiting.
+                await asyncio.wait_for(slots_full.wait(), timeout=10)
+            except TimeoutError:
+                # Like a broken barrier: record it and release everyone
+                # else, so a serial fetch fails once instead of 50 times.
+                gate_broken[0] = True
+                slots_full.set()
+                raise
+            finally:
+                in_flight[0] -= 1
             cluster_id = int(request.url.params["cluster"])
             opinion = _make_opinion(opinion_id=cluster_id * 10, cluster_id=cluster_id)
             return httpx.Response(200, json=_make_paginated_response([opinion]))
 
-        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_gated_handler)
 
         cluster_ids = list(range(1, num_clusters + 1))
         client = CourtListenerClient(request_delay=0)
 
-        start = time.monotonic()
-        result = client.fetch_opinions_for_clusters(cluster_ids)
-        elapsed = time.monotonic() - start
+        with patch("courts.federal.courtlistener.asyncio.sleep", _record_sleep):
+            result = client.fetch_opinions_for_clusters(cluster_ids)
 
         client.close()
 
+        assert not gate_broken[0], (
+            f"Never had {DEFAULT_OPINION_FETCH_CONCURRENCY} requests in flight at once "
+            f"(max {max_inflight[0]}) — the batch fetch is not concurrent."
+        )
         assert len(result) == num_clusters, f"Expected {num_clusters} results, got {len(result)}"
-        assert elapsed < 5.0, f"Batch fetch took {elapsed:.2f}s, expected < 5s"
+        assert all(len(result[cid]) == 1 for cid in cluster_ids)
+        # All slots were busy at once, and never more than the cap.
+        assert max_inflight[0] == DEFAULT_OPINION_FETCH_CONCURRENCY
+        # Every request took its 0.2 s pacing sleep inside its slot.
+        assert pacing_delays.count(0.2) == num_clusters, pacing_delays
         # One opinion API request per cluster.
         assert client.request_count == num_clusters, (
             f"Expected {num_clusters} API requests, got {client.request_count}"
