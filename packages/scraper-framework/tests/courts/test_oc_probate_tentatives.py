@@ -120,6 +120,91 @@ def test_probate_date_cm5() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Header date variants seen on dev S3 (#4808): no colon, unpadded month/day
+# ---------------------------------------------------------------------------
+
+# Trimmed pdfplumber text of real dev raws:
+#   cm04 — f883c2d8… (CM4rulings.pdf): "Date 1/16/2026", no colon
+#   cm06 — d469e354… (CM6rulings.pdf): "Date: 2/6/26", unpadded
+_HEADER_VARIANT_FIXTURES = [
+    ("oc_probate_cm04_date_no_colon_4808.txt", datetime(2026, 1, 16)),
+    ("oc_probate_cm06_date_unpadded_4808.txt", datetime(2026, 2, 6)),
+]
+
+
+@pytest.mark.parametrize(("fixture", "expected"), _HEADER_VARIANT_FIXTURES)
+def test_oc_probate_header_variants_4808_hook(fixture: str, expected: datetime) -> None:
+    text = (FIXTURES / fixture).read_text(encoding="utf-8")
+    assert _probate_hearing_date_from_text(text) == expected
+    got = OCProbateTentativeRulingsScraper.hearing_date_for_raw(text, content_format="pdf")
+    assert got == expected
+
+
+@pytest.mark.parametrize(("fixture", "expected"), _HEADER_VARIANT_FIXTURES)
+def test_oc_probate_header_variants_4808_parse_document(
+    fixture: str, expected: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live parse reads the same header the hook does."""
+    import courts.ca.pdf_link_scraper as pdf_mod
+    from framework import CapturedDocument, ContentFormat
+
+    text = (FIXTURES / fixture).read_text(encoding="utf-8")
+    monkeypatch.setattr(pdf_mod, "_extract_pdf_text", lambda _raw: text)
+    scraper = OCProbateTentativeRulingsScraper(config=probate_default_config())
+    doc = CapturedDocument(
+        scraper_id="ca-oc-tentatives-probate",
+        state="CA",
+        county="Orange",
+        court="Superior Court",
+        source_url="https://www.occourts.org/sites/default/files/oc/default/tentative-rulings/CM4rulings.pdf",
+        capture_timestamp=datetime(2026, 9, 26),
+        content_format=ContentFormat.PDF,
+        raw_content=b"%PDF-1.4",
+        content_hash="",
+    )
+    assert scraper.parse_document(doc).hearing_date == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Date 1/16/2026", datetime(2026, 1, 16)),
+        ("Date: 2/6/26", datetime(2026, 2, 6)),
+        ("Date: 6/10/2026", datetime(2026, 6, 10)),
+        ("Date: 10/2/2026", datetime(2026, 10, 2)),
+        ("Date: 7/1/2026", datetime(2026, 7, 1)),
+        ("Date:06/24/2026", datetime(2026, 6, 24)),
+        ("  Date 03/04/26", datetime(2026, 3, 4)),
+    ],
+)
+def test_oc_probate_header_variants_4808_line_formats(line: str, expected: datetime) -> None:
+    text = "TENTATIVE RULINGS FOR DEPARTMENT CM04\nHON. JUDGE X\n" + line + "\nbody\n"
+    assert _probate_hearing_date_from_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Malformed header (dev raw 46a2dc92…): keep None rather than guess.
+        "TENTATIVE RULINGS FOR DEPARTMENT CM08\nDate: 05/013/2026\n",
+        # Doubled-glyph text layer (dev raw 997981a6…): no parseable label.
+        "TTEENNTTAATTIIVVEE RRUULLIINNGGSS\nDDaattee:: 0066//2244//22002266\n",
+        # Blank header date (boilerplate placeholder).
+        "TENTATIVE RULINGS FOR DEPARTMENT CM3\nHON. Judge X\nDate:\n",
+        # Body dates: the label must start the line (#4682).
+        "The trust dated 1/16/2013 is the petitioner.\n",
+        "The Update 1/16/2026 notice was served.\n",
+        "Filing Date 1/16/2026 of the petition.\n",
+        "Datebook 1/16/2026\n",
+        # Impossible calendar date.
+        "Date 2/30/2026\n",
+    ],
+)
+def test_oc_probate_header_variants_4808_returns_none(text: str) -> None:
+    assert _probate_hearing_date_from_text(text) is None
+
+
+# ---------------------------------------------------------------------------
 # Case title extraction
 # ---------------------------------------------------------------------------
 

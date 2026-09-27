@@ -14,7 +14,7 @@ PDF structure (CM3 / Judge Erin Rowe, 6 pages):
   Header: "Superior Court of the State of California / County of Orange"
   "TENTATIVE RULINGS FOR DEPARTMENT CM3"
   "HON. Judge Erin Rowe"
-  "Date: 03/04/26"
+  "Date: 03/04/26"  (also "Date: 2/6/26" and, in CM04, "Date 1/16/2026")
   Case rows:
     "# Case Name Tentative"
     "<line#> <CaseName - Type>"
@@ -52,8 +52,16 @@ _JUDGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Hearing date from PDF: "Date: 03/04/26" (MM/DD/YY or MM/DD/YYYY)
-_PDF_DATE_RE = re.compile(r"Date:\s*(?P<date>\d{2}/\d{2}/\d{2,4})")
+# Hearing date from the PDF header's "Date" line.  Layouts seen on dev S3
+# (#4808): "Date: 03/04/26", "Date: 02/19/2026", "Date: 2/6/26" (unpadded)
+# and "Date 1/16/2026" (CM04, no colon).  The label must start its line, so
+# a date in the ruling body ("Trust dated 1/16/2013", "Filing Date ...") is
+# never read as the hearing date (#4682).  Anything else (a malformed
+# "05/013/2026", a doubled-glyph text layer) gives None rather than a guess.
+_PDF_DATE_RE = re.compile(
+    r"^[ \t]*Date:?[ \t]*(?P<date>\d{1,2}/\d{1,2}/(?:\d{4}|\d{2}))(?!\d)",
+    re.MULTILINE,
+)
 
 # Case number: 8 digits starting with 0 (e.g. "01157766")
 _CASE_NUMBER_RE = re.compile(r"\b0\d{7}\b")
@@ -95,7 +103,11 @@ def _probate_judge_from_text(text: str) -> str | None:
 
 
 def _probate_hearing_date_from_text(text: str) -> datetime | None:
-    """Extract hearing date from probate PDF (MM/DD/YY or MM/DD/YYYY format)."""
+    """Extract the hearing date from the probate PDF's header ``Date`` line.
+
+    Accepts M/D/YY and M/D/YYYY, with or without a colon after ``Date``.
+    Returns None when no line starts with a parseable ``Date`` label.
+    """
     m = _PDF_DATE_RE.search(text)
     if not m:
         return None
@@ -192,7 +204,7 @@ class OCProbateTentativeRulingsScraper(PdfLinkScraper):
         content_format: str = "",
         capture_timestamp: datetime | None = None,
     ) -> datetime | None:
-        """``Date: MM/DD/YY`` PDF header, as ``parse_document`` (#4774)."""
+        """The PDF header ``Date`` line, as ``parse_document`` (#4774, #4808)."""
         if content_format not in ("", "pdf") or not text:
             return None
         return _probate_hearing_date_from_text(text)
