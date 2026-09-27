@@ -1,25 +1,15 @@
-"""Shared ``case_type`` fallback resolver for ingestion + reingest paths.
+"""The ``case_type`` fallback chain used by ingestion.
 
-Two code paths produce a final ``case_type`` for ruling documents:
+``packages/scraper-framework/src/ingestion/worker.py`` applies it as the
+post-LLM fallback just before the ``Field extraction summary`` log line.
+Live capture, ``rebuild_db.py`` and ``reingest_from_s3.py`` all write
+through the worker (one write path since #4845).
 
-* Live ingestion — ``packages/scraper-framework/src/ingestion/worker.py``
-  applies ``extract_case_type_from_*`` helpers as post-LLM fallbacks just
-  before the ``Field extraction summary`` log line.
-* Reparse — ``scripts/reingest_from_s3.py`` calls the same helpers inside
-  ``_apply_regex_fallbacks``.
-
-For four years the two paths each open-coded the same fallback chain in
-slightly different order/structure, and any time a new helper landed it
-had to be added to both — a footgun that has fired six times (#1731,
-#1749, #1763, #1836, #2062 surfacing as #4263, #2406).  The hygiene
-guard added in #4290 (``scripts/check-case-type-fallback-parity.py``)
-catches the divergence shape, but the duplication is still the root
-cause.
-
-This module exposes one function — :func:`resolve_case_type` — that
-encodes the canonical fallback chain.  Both paths import it instead of
-inlining the four ``extract_case_type_from_*`` helpers, so divergence
-becomes impossible by construction.
+For four years the worker and the old DB-row reingest path each
+open-coded the chain, and any new helper had to be added to both — a
+footgun that fired six times (#1731, #1749, #1763, #1836, #2062
+surfacing as #4263, #2406).  This module exposes one function —
+:func:`resolve_case_type` — that encodes the canonical fallback chain.
 
 The fallback order — case_number prefix → scraper_id → motion_type →
 case_title — is the order that ships in production.  See worker.py for
@@ -105,8 +95,7 @@ def resolve_case_type(
     encodes the production behaviour.  Earlier checks have higher
     confidence (a case number prefix is a deterministic signal; a
     case title heuristic is the weakest).  Do not reorder without
-    weighing the regression risk on the ``test_fallback_parity.py``
-    and ``test_worker_reingest_parity.py`` suites.
+    weighing the regression risk on the worker's case_type tests.
     """
     if case_type is not None:
         return case_type, None

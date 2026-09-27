@@ -1,8 +1,8 @@
 """Per-document phase timing helper for the ingestion pipeline (#4116).
 
-Both ``packages/scraper-framework/src/ingestion/worker.py`` (live ingestion)
-and ``scripts/reingest_from_s3.py`` (offline reingest) process documents
-through the same logical phases:
+``packages/scraper-framework/src/ingestion/worker.py`` processes every
+document (live ingestion, rebuild and reingest, #4845) through these
+logical phases:
 
   1. ``parse_document_ms`` — extract text from the raw S3 content via
      pdfplumber/HTML and run the scraper's ``parse_document()``.
@@ -122,8 +122,8 @@ def emit_via_stdlib_logger(logger: logging.Logger) -> EmitFn:
 def emit_via_structlog_logger(logger: Any) -> EmitFn:
     """Build an emit function that writes via a ``structlog.BoundLogger``.
 
-    Used by ``scripts/reingest_from_s3.py`` which calls
-    ``structlog.get_logger()``.  structlog's API takes the event as
+    For callers that use ``structlog.get_logger()``.  structlog's API
+    takes the event as
     the first positional arg and **kwargs for context fields.
     """
 

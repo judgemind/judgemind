@@ -1205,7 +1205,6 @@ def _patch_propagation_check(text: str, slug: str, fmt: str) -> str:
     insertion = (
         f'    "SplitRuling@{slug}_tentatives": {{\n'
         f'        "worker_fn": "_try_{slug}_{fmt}_split",\n'
-        f'        "reingest": True,\n'
         f"    }},\n"
     )
     if cc_marker_idx != -1:

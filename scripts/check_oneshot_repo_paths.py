@@ -104,9 +104,6 @@ VALIDATED: tuple[str, ...] = (
     "data-quality-check.py",
     # check-scraper-zero-record-runner.py — runs in dedicated ECS task; scripts/ baked into image (#2677)
     "check-scraper-zero-record-runner.py",
-    # drain_splitter_carry_forward_clusters.py — _SCRAPER_SRC is no-op in ECS;
-    # scraper-framework installed in /app venv; /app/scripts baked into image (#4321)
-    "drain_splitter_carry_forward_clusters.py",
     # cc-dual-run-diff.py — _SF_SRC has .is_dir() guard; scraper-framework
     # installed in /app venv inside ECS, so the sys.path append is a no-op there;
     # the helper imports (courts.ca.cc_tentatives_portal._cc_dept_from_filename,

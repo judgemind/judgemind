@@ -229,7 +229,7 @@ The transcription LLM prompt describes **visual structure, not text heuristics**
 - **Rate-limit retry:** each provider adapter retries once on 429 / ResourceExhausted with a 1-second backoff.
 - **Enrichment logging:** the worker tracks which tier populated each field in an `extraction_methods` dict (`"scraper"`, `"llm"`, `"llm_enrichment"`, `"regex"`) and logs a summary for every document. Enables monitoring of extraction quality per court.
 
-**Reingestion.** Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. Operates on **existing database records only** — it queries `documents` to find S3 keys to reprocess. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>`, which discovers documents directly from S3 keys.
+**Reingestion.** Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`, which runs each object through `IngestionWorker.process_event` (one write path, #4845). By default it re-ingests the S3 keys of **existing database records only** — it queries `documents` for them; `--prefix` lists S3 instead. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>`, which discovers documents directly from S3 keys.
 
 #### 3.3.2.1 Dual LLM extraction paths
 
@@ -238,7 +238,7 @@ Two distinct LLM extraction modules cohabit in `packages/scraper-framework/src/`
 | Path | Module | Used by | Purpose |
 |---|---|---|---|
 | **A — Splitting / multimodal** | `framework/llm_extractor.py` (`LlmExtractor.extract()` / `.extract_from_pdf()`) | `ingestion/worker.py::_llm_split_document` | Splits multi-case documents into one `ExtractedRuling` per case; multimodal per-page extraction for image-based PDFs (e.g. OC); recursive sub-chunk retry on partial failure. |
-| **B — Per-document field fill** | `ingestion/llm_extract.py` (`extract_fields_llm()`) | `ingestion/worker.py::process_event` (line ~1906); `scripts/reingest_from_s3.py` (line ~1266) | Populates remaining scalar fields on already-split rulings; fans chunks out via `ThreadPoolExecutor` for per-document parallelism. |
+| **B — Per-document field fill** | `ingestion/llm_extract.py` (`extract_fields_llm()`) | `ingestion/worker.py::process_event` (live, rebuild and reingest all run through it) | Populates remaining scalar fields on already-split rulings; fans chunks out via `ThreadPoolExecutor` for per-document parallelism. |
 
 **Failure-event log shape (#4246, #4249).** Each path emits its own structured log event when an LLM API call fails on a chunk:
 

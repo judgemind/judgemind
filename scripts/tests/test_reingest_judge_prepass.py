@@ -1,21 +1,31 @@
-"""Tests for the judge pre-pass in scripts/reingest_from_s3.py (#4408).
+"""Tests for the judge pre-pass in scripts/reingest_from_s3.py (#4408, #4419).
 
-The pre-pass walks the FETCH cursor once before the main per-doc write loop
-and seeds full-name judges into ``derived.judges``.  This closes the
-chronological-resolver-race class surfaced by #4397: when LA per-case docs
-carrying only a surname (``JUDGE/DEPT: <Surname>/<dept>``) sort earlier in
-the ``(captured_at, id)`` cursor than the boilerplate doc carrying the full
-name, the per-case docs would commit ``judge_id = NULL`` until the
-boilerplate doc later auto-created the judge in ``derived.judges``.
+Both reingest modes select a list of S3 keys and hand it to
+``_reingest_keys``, which seeds courts, runs the judge pre-pass
+(``_seed_judges_from_keys``) and then runs every key through the worker in
+a ``ProcessPoolExecutor`` (#4845).  DB-row mode (``run_reingest``) gets its
+keys from ``select_db_keys``; prefix mode (``run_reingest_from_prefix``)
+lists them from S3.
 
-The test below replays this exact scenario with a synthetic 2-doc cursor —
-the surname-only doc precedes the boilerplate doc — and asserts the
-single-pass invocation seeds the full name BEFORE the main loop processes
-the surname-only doc, so ``_expand_single_word_judge_surname``'s suffix-LIKE
-match resolves on the first pass.
+The pre-pass walks the keys once before the pool and seeds full-name judges
+into ``derived.judges``.  This closes the chronological-resolver-race class
+surfaced by #4397: when LA per-case docs carrying only a surname
+(``JUDGE/DEPT: <Surname>/<dept>``) finish in the pool before the boilerplate
+doc carrying the full name, the per-case docs would commit
+``judge_id = NULL`` until the boilerplate doc later auto-created the judge.
+
+Covered here:
+  * ``_seed_judges_from_keys`` — the race replay, skip rules, and the
+    once-per-seeding-chunk commit.
+  * ``_reingest_keys`` — the pre-pass is skipped on dry runs and under
+    ``--skip-judge-prepass``, and otherwise runs before the pool.
+  * ``run_reingest`` / ``run_reingest_from_prefix`` — both modes reach the
+    pre-pass through ``_reingest_keys``.
+  * ``main`` — the CLI forwards ``--skip-judge-prepass`` and
+    ``--parse-timeout`` to both modes.
 
 Run from the repo root:
-    pytest scripts/tests/test_reingest_judge_prepass.py -k chronological_race_closes
+    pytest scripts/tests/test_reingest_judge_prepass.py
 """
 
 from __future__ import annotations
@@ -23,7 +33,8 @@ from __future__ import annotations
 import os
 import sys
 import uuid
-from datetime import datetime
+from concurrent.futures import Future
+from typing import Any, Self
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -43,22 +54,15 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tests._mock_helpers import mock_sys_modules  # noqa: E402
+from tests._mock_helpers import mock_sys_modules
 
 # Some imports need their attributes to resolve to something callable that
 # returns a recognisable sentinel.  ``configure_structlog`` is called at
-# module top level (line ~242) so it must not raise.
+# module top level so it must not raise.
 _mock_structlog = MagicMock()
 _mock_structlog.get_logger = MagicMock(return_value=MagicMock())
 _mock_framework_logging = MagicMock()
 _mock_framework_logging.configure_structlog = MagicMock(return_value=None)
-
-# ``is_split_child_id`` is called from the pre-pass; the default MagicMock
-# returns a truthy MagicMock(), which would cause the pre-pass to skip
-# every document.  Override with an explicit False default — tests that
-# need True can patch via ``reingest_from_s3.is_split_child_id``.
-_mock_ingestion_split_ids = MagicMock()
-_mock_ingestion_split_ids.is_split_child_id = MagicMock(return_value=False)
 
 _modules_to_mock: dict[str, MagicMock] = {
     "psycopg": MagicMock(),
@@ -79,7 +83,7 @@ _modules_to_mock: dict[str, MagicMock] = {
     "ingestion.llm_extract": MagicMock(),
     "ingestion.llm_providers": MagicMock(),
     "ingestion.ruling_guards": MagicMock(),
-    "ingestion.split_ids": _mock_ingestion_split_ids,
+    "ingestion.split_ids": MagicMock(),
     "validation": MagicMock(),
     "validation.deterministic": MagicMock(),
     "validation.gate": MagicMock(),
@@ -87,56 +91,12 @@ _modules_to_mock: dict[str, MagicMock] = {
 }
 
 with mock_sys_modules(_modules_to_mock):
-    import reingest_from_s3 as reingest  # noqa: E402
+    import reingest_from_s3 as reingest
 
 
 # ---------------------------------------------------------------------------
-# Helpers — mirror scraper-framework/tests/test_reingest_from_s3.py shape
-# so the row tuple matches FETCH_DOCUMENTS_QUERY's column order.
+# Shared fixtures
 # ---------------------------------------------------------------------------
-
-_COURT_ID = uuid.uuid4()
-_CASE_ID = uuid.uuid4()
-# Surname-only doc sorts FIRST in cursor order (earlier captured_at).
-_SURNAME_DOC_ID = uuid.uuid4()
-_BOILERPLATE_DOC_ID = uuid.uuid4()
-_CAPTURED_AT_SURNAME = datetime(2026, 5, 8, 23, 43, 32)
-_CAPTURED_AT_BOILERPLATE = datetime(2026, 5, 8, 23, 43, 42)
-
-
-def _make_row(
-    *,
-    doc_id: uuid.UUID,
-    captured_at: datetime,
-    s3_key: str = "la/raw/doc.html",
-    s3_bucket: str = "test-bucket",
-    content_hash: str = "abc123",
-    doc_format: str = "html",
-) -> tuple:
-    """Build a row tuple matching FETCH_DOCUMENTS_QUERY columns."""
-    return (
-        doc_id,  # d.id
-        _CASE_ID,  # d.case_id
-        _COURT_ID,  # d.court_id
-        s3_key,  # d.s3_key
-        s3_bucket,  # d.s3_bucket
-        content_hash,  # d.content_hash
-        "https://court.example.com/ruling",  # d.source_url
-        "ca-la-tentatives-civil",  # d.scraper_id
-        captured_at,  # d.captured_at
-        None,  # d.hearing_date
-        doc_format,  # d.format
-        "CA",  # ct.state
-        "Los Angeles",  # ct.county
-        "Los Angeles Superior Court",  # ct.court_name
-        "24STCV12345",  # c.case_number
-        "Smith v. Jones",  # c.case_title
-        None,  # c.case_type
-        None,  # ruling_hearing_date (subquery)
-        None,  # stored_ruling_text (subquery)
-        None,  # ruling_department (subquery)
-        None,  # ruling_judge_name (subquery)
-    )
 
 
 def _mock_cursor_context(cur: MagicMock) -> MagicMock:
@@ -145,474 +105,6 @@ def _mock_cursor_context(cur: MagicMock) -> MagicMock:
     ctx.__enter__ = MagicMock(return_value=cur)
     ctx.__exit__ = MagicMock(return_value=False)
     return ctx
-
-
-def _mock_conn_pageable(pages: list[list[tuple]]) -> MagicMock:
-    """Return a mock connection that hands out one fetchall page per cursor.
-
-    The pre-pass calls ``conn.cursor()`` once per page; each cursor's
-    ``fetchall()`` returns the next page from ``pages``.  A final empty
-    page after all real pages stops the keyset loop.
-    """
-    conn = MagicMock()
-
-    page_iter = iter(pages + [[]])  # trailing empty page terminates the loop
-
-    def cursor_factory() -> MagicMock:
-        cur = MagicMock()
-        try:
-            page = next(page_iter)
-        except StopIteration:
-            page = []
-        cur.fetchall.return_value = page
-        return _mock_cursor_context(cur)
-
-    conn.cursor.side_effect = cursor_factory
-    return conn
-
-
-_DEFAULT_CURSOR = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
-
-
-# ---------------------------------------------------------------------------
-# The canonical regression test — chronological_race_closes
-# ---------------------------------------------------------------------------
-
-
-class TestSeedJudgesFromCursor:
-    """Tests for ``_seed_judges_from_cursor`` — the #4408 judge pre-pass."""
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    def test_chronological_race_closes_for_la_dept_25(
-        self,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """Replays the #4397 LA dept-25 Mkrtchyan race and asserts the
-        pre-pass closes it on a single reingest invocation.
-
-        Cursor order (verified to sub-second resolution in #4397):
-          1. surname-only doc captured at 23:43:32 — text contains only
-             ``JUDGE/DEPT: Mkrtchyan/25`` form-layout header.
-          2. boilerplate doc captured at 23:43:42 — text contains the
-             full ``JUDGE KARINE MKRTCHYAN`` ALL-CAPS header.
-
-        Pre-#4408 behaviour: the surname-only doc commits judge_id=NULL
-        because the main loop processes it first and ``derived.judges``
-        does not yet contain a row whose canonical_name ends in
-        ``Mkrtchyan``.  The boilerplate doc later auto-creates
-        ``Karine Mkrtchyan`` via ``resolve_judge`` Step 4, but the 62
-        surname-only docs preceding it are stuck at NULL until a second
-        reingest pass.
-
-        Post-#4408 behaviour: the pre-pass walks both docs, sees the
-        full name on doc 2, calls ``resolve_judge`` to upsert
-        ``Karine Mkrtchyan`` BEFORE the main loop runs.  The main loop's
-        ``_expand_single_word_judge_surname`` Step 4 now finds the judge
-        on the suffix-LIKE match and the surname-only doc resolves
-        non-NULL on the first pass.
-        """
-        # Two-row cursor: surname-only doc FIRST (the bug-trigger order).
-        surname_row = _make_row(
-            doc_id=_SURNAME_DOC_ID,
-            captured_at=_CAPTURED_AT_SURNAME,
-            s3_key="la/raw/surname.html",
-            content_hash="surname-hash",
-        )
-        boilerplate_row = _make_row(
-            doc_id=_BOILERPLATE_DOC_ID,
-            captured_at=_CAPTURED_AT_BOILERPLATE,
-            s3_key="la/raw/boilerplate.html",
-            content_hash="boilerplate-hash",
-        )
-        conn = _mock_conn_pageable([[surname_row, boilerplate_row]])
-
-        # Distinct fake bytes per doc so the test can assert which
-        # text was extracted from which raw payload.
-        surname_bytes = b"<html>JUDGE/DEPT: Mkrtchyan/25</html>"
-        boilerplate_bytes = b"<html>DEPT 25 JUDGE KARINE MKRTCHYAN</html>"
-
-        def fetch_s3_side_effect(s3_client: object, bucket: str, key: str) -> bytes:
-            if "surname" in key:
-                return surname_bytes
-            if "boilerplate" in key:
-                return boilerplate_bytes
-            raise AssertionError(f"unexpected S3 key in pre-pass: {key!r}")
-
-        mock_fetch_s3.side_effect = fetch_s3_side_effect
-
-        # Map each raw payload to its extracted text.
-        def extract_text_side_effect(
-            raw_content: bytes, doc_format: str, pdf_timeout: float = 30.0
-        ) -> str:
-            if raw_content == surname_bytes:
-                return "JUDGE/DEPT: Mkrtchyan/25"
-            if raw_content == boilerplate_bytes:
-                return "DEPARTMENT 25 JUDGE KARINE MKRTCHYAN"
-            raise AssertionError("unexpected raw_content in pre-pass")
-
-        mock_extract_text.side_effect = extract_text_side_effect
-
-        # ``extract_judge_name`` returns the surname only for doc 1
-        # (matches the JUDGE/DEPT regex in the real implementation —
-        # see packages/scraper-framework/src/ingestion/extract.py:_JUDGE_NAME_PATTERNS[0]).
-        # Returns the FULL name for doc 2 (matches the LA ALL-CAPS regex).
-        def extract_judge_side_effect(text: str) -> str | None:
-            if "Mkrtchyan/25" in text:
-                # Surname-only — what the live regex returns for the
-                # JUDGE/DEPT pattern at extract.py:_JUDGE_NAME_PATTERNS[0].
-                return "Mkrtchyan"
-            if "JUDGE KARINE MKRTCHYAN" in text:
-                # Full name — what the LA ALL-CAPS regex returns for
-                # the boilerplate doc at extract.py:_JUDGE_NAME_PATTERNS[-1].
-                return "KARINE MKRTCHYAN"
-            return None
-
-        mock_extract_judge.side_effect = extract_judge_side_effect
-
-        # ``resolve_judge`` returns a synthetic UUID when called with the
-        # full name; the pre-pass treats this as a successful seed.
-        mock_resolve_judge.return_value = "judge-id-karine-mkrtchyan"
-
-        # Patch ``_looks_like_valid_judge_name`` so it accepts the
-        # full name (≥2 words) and rejects the bare surname.  We import
-        # it from reingest at the call site so patching the attribute
-        # on the reingest module is the right interception point.
-        def looks_valid_side_effect(name: str) -> bool:
-            return bool(name) and len(name.strip().split()) >= 2
-
-        with patch(
-            "reingest_from_s3._looks_like_valid_judge_name",
-            side_effect=looks_valid_side_effect,
-        ):
-            stats = reingest._seed_judges_from_cursor(
-                conn,
-                MagicMock(),  # s3_client
-                _DEFAULT_CURSOR,
-                "",  # filters
-                [],  # filter_params
-                batch_size=10,
-                limit=None,
-                parse_timeout=60.0,
-                concurrency=2,
-            )
-
-        # ---- Stats: the pre-pass scanned both docs and seeded one judge.
-        assert stats["docs_scanned"] == 2, stats
-        # The bare surname is rejected by _looks_like_valid_judge_name;
-        # only the full name from the boilerplate doc is seeded.
-        assert stats["judges_seeded"] == 1, stats
-        assert stats["judges_skipped_invalid"] == 1, stats
-
-        # ---- resolve_judge was called exactly once, with the FULL name.
-        # This is the load-bearing assertion: the pre-pass surfaces the
-        # full name BEFORE the main loop, so the surname-only doc's
-        # downstream _expand_single_word_judge_surname Step 4 lookup
-        # finds the judge regardless of cursor ordering.
-        assert mock_resolve_judge.call_count == 1, mock_resolve_judge.call_args_list
-        seeded_args, _seeded_kwargs = mock_resolve_judge.call_args
-        # resolve_judge(conn, raw_name, court_id) positional signature.
-        assert seeded_args[1] == "KARINE MKRTCHYAN", seeded_args
-        assert seeded_args[2] == str(_COURT_ID), seeded_args
-
-        # ---- Surname-only doc's main-pass resolution succeeds.
-        # The pre-pass is the structural fix; the realised behavioural
-        # outcome is that ``_expand_single_word_judge_surname`` Step 4
-        # at packages/scraper-framework/src/ingestion/db.py:1296-1310
-        # runs the suffix-LIKE query
-        #     SELECT canonical_name FROM judges
-        #     WHERE court_id = %s::uuid
-        #       AND LOWER(canonical_name) LIKE %s
-        # with ``f"% {surname_lower}"`` as the parameter.  Post-prepass
-        # the seeded row ``Karine Mkrtchyan`` matches that suffix, so
-        # the function returns the canonical full name and the surname
-        # doc's downstream insert binds judge_id non-NULL.
-        #
-        # We replay that exact SQL against a synthetic post-prepass
-        # connection here.  The mock cursor returns the row that would
-        # exist in ``derived.judges`` after the pre-pass's
-        # ``resolve_judge`` call above.  Pre-#4408, an identical lookup
-        # *before* the pre-pass would return zero rows, leaving the
-        # surname doc's judge_id NULL — the exact bug class #4408
-        # closes.
-        post_prepass_cur = MagicMock()
-        post_prepass_cur.fetchall.return_value = [("Karine Mkrtchyan",)]
-        post_prepass_conn = MagicMock()
-        post_prepass_conn.cursor.return_value = _mock_cursor_context(post_prepass_cur)
-
-        # Simulate Step 4's branching: returns the canonical name when
-        # exactly one suffix match exists, None otherwise.  Mirrors
-        # ingestion.db._expand_single_word_judge_surname Step 4 logic.
-        with post_prepass_conn.cursor() as _cur:
-            _cur.execute(
-                """
-                SELECT canonical_name FROM judges
-                WHERE court_id = %s::uuid
-                  AND LOWER(canonical_name) LIKE %s
-                """,
-                (str(_COURT_ID), "% mkrtchyan"),
-            )
-            suffix_rows = _cur.fetchall()
-
-        # Post-#4408 single-pass invariant:
-        #   * pre-pass seeded "Karine Mkrtchyan" before the main loop ran;
-        #   * Step 4's suffix-LIKE query returns exactly one match;
-        #   * the bare surname "Mkrtchyan" therefore expands to the
-        #     canonical full name and the surname doc commits with
-        #     judge_id NON-NULL.
-        assert len(suffix_rows) == 1, (
-            "AC2 violated: surname doc still resolves NULL after a "
-            "single reingest invocation; pre-pass did not close the "
-            "chronological-resolver-race class."
-        )
-        expanded = suffix_rows[0][0]
-        assert expanded == "Karine Mkrtchyan"
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    def test_seed_skips_documents_without_s3_key(
-        self,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """Documents with NULL s3_key/s3_bucket are skipped in the pre-pass."""
-        no_s3_row = _make_row(
-            doc_id=_SURNAME_DOC_ID,
-            captured_at=_CAPTURED_AT_SURNAME,
-            s3_key="",
-            s3_bucket="",
-        )
-        conn = _mock_conn_pageable([[no_s3_row]])
-
-        stats = reingest._seed_judges_from_cursor(
-            conn,
-            MagicMock(),
-            _DEFAULT_CURSOR,
-            "",
-            [],
-            batch_size=10,
-            limit=None,
-            parse_timeout=60.0,
-            concurrency=2,
-        )
-
-        assert stats["docs_scanned"] == 0
-        assert stats["judges_seeded"] == 0
-        mock_fetch_s3.assert_not_called()
-        mock_extract_judge.assert_not_called()
-        mock_resolve_judge.assert_not_called()
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    @patch("reingest_from_s3.is_split_child_id")
-    def test_seed_skips_split_children(
-        self,
-        mock_is_split: MagicMock,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """Split-child documents are skipped (mirror reingest_batch guard)."""
-        split_row = _make_row(
-            doc_id=_SURNAME_DOC_ID,
-            captured_at=_CAPTURED_AT_SURNAME,
-        )
-        conn = _mock_conn_pageable([[split_row]])
-
-        # is_split_child_id returns True for this row → must be skipped.
-        mock_is_split.return_value = True
-
-        stats = reingest._seed_judges_from_cursor(
-            conn,
-            MagicMock(),
-            _DEFAULT_CURSOR,
-            "",
-            [],
-            batch_size=10,
-            limit=None,
-            parse_timeout=60.0,
-            concurrency=2,
-        )
-
-        assert stats["docs_scanned"] == 0
-        assert stats["judges_seeded"] == 0
-        mock_fetch_s3.assert_not_called()
-        mock_resolve_judge.assert_not_called()
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    def test_seed_only_seeds_full_names(
-        self,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """Bare single-word surnames are NOT seeded (would be rejected by
-        ``_looks_like_valid_judge_name`` in ``resolve_judge`` anyway).
-        """
-        row = _make_row(
-            doc_id=_SURNAME_DOC_ID,
-            captured_at=_CAPTURED_AT_SURNAME,
-        )
-        conn = _mock_conn_pageable([[row]])
-
-        mock_fetch_s3.return_value = b"<html>JUDGE/DEPT: Mkrtchyan/25</html>"
-        mock_extract_text.return_value = "JUDGE/DEPT: Mkrtchyan/25"
-        mock_extract_judge.return_value = "Mkrtchyan"  # bare surname
-
-        with patch(
-            "reingest_from_s3._looks_like_valid_judge_name",
-            return_value=False,  # bare surname rejected
-        ):
-            stats = reingest._seed_judges_from_cursor(
-                conn,
-                MagicMock(),
-                _DEFAULT_CURSOR,
-                "",
-                [],
-                batch_size=10,
-                limit=None,
-                parse_timeout=60.0,
-                concurrency=2,
-            )
-
-        assert stats["docs_scanned"] == 1
-        assert stats["judges_seeded"] == 0
-        assert stats["judges_skipped_invalid"] == 1
-        mock_resolve_judge.assert_not_called()
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    def test_seed_handles_no_judge_match(
-        self,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """When extract_judge_name returns None, no seed and no error."""
-        row = _make_row(
-            doc_id=_SURNAME_DOC_ID,
-            captured_at=_CAPTURED_AT_SURNAME,
-        )
-        conn = _mock_conn_pageable([[row]])
-
-        mock_fetch_s3.return_value = b"<html>no judge here</html>"
-        mock_extract_text.return_value = "no judge here"
-        mock_extract_judge.return_value = None  # no match
-
-        stats = reingest._seed_judges_from_cursor(
-            conn,
-            MagicMock(),
-            _DEFAULT_CURSOR,
-            "",
-            [],
-            batch_size=10,
-            limit=None,
-            parse_timeout=60.0,
-            concurrency=2,
-        )
-
-        assert stats["docs_scanned"] == 1
-        assert stats["judges_seeded"] == 0
-        assert stats["judges_skipped_invalid"] == 0
-        mock_resolve_judge.assert_not_called()
-
-    @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
-    @patch("reingest_from_s3._extract_text_from_content")
-    @patch("reingest_from_s3._fetch_s3_content")
-    def test_seed_respects_limit(
-        self,
-        mock_fetch_s3: MagicMock,
-        mock_extract_text: MagicMock,
-        mock_extract_judge: MagicMock,
-        mock_resolve_judge: MagicMock,
-    ) -> None:
-        """When limit is set, the pre-pass stops after scanning at most limit docs."""
-        rows = [
-            _make_row(
-                doc_id=uuid.uuid4(),
-                captured_at=datetime(2026, 5, 8, 23, 43, 32 + i),
-                s3_key=f"la/raw/doc-{i}.html",
-                content_hash=f"hash-{i}",
-            )
-            for i in range(5)
-        ]
-        # Use a single page so limit gates within the page rather than
-        # across pages — the implementation caps ``effective_size`` from
-        # ``min(batch_size, limit - docs_scanned)``.
-        conn = _mock_conn_pageable([rows])
-
-        mock_fetch_s3.return_value = b"<html>no judge</html>"
-        mock_extract_text.return_value = "no judge"
-        mock_extract_judge.return_value = None
-
-        stats = reingest._seed_judges_from_cursor(
-            conn,
-            MagicMock(),
-            _DEFAULT_CURSOR,
-            "",
-            [],
-            batch_size=10,
-            limit=2,  # cap at 2
-            parse_timeout=60.0,
-            concurrency=2,
-        )
-
-        # Limit applies to the page-fetch SQL ``effective_size`` parameter,
-        # so the FETCH query returns at most 2 rows on the first page —
-        # docs_scanned should not exceed ``limit``.
-        assert stats["docs_scanned"] <= 2
-
-
-# ---------------------------------------------------------------------------
-# Wiring tests — confirm the helper is correctly invoked from run_reingest.
-# ---------------------------------------------------------------------------
-
-
-class TestRunReingestWiresPrePass:
-    """Tests that ``run_reingest`` invokes the pre-pass with correct gates."""
-
-    def test_skip_judge_prepass_param_exists(self) -> None:
-        """run_reingest accepts the skip_judge_prepass kwarg (#4408)."""
-        import inspect
-
-        sig = inspect.signature(reingest.run_reingest)
-        assert "skip_judge_prepass" in sig.parameters
-        # Default must be False so the pre-pass runs by default.
-        assert sig.parameters["skip_judge_prepass"].default is False
-
-    def test_cli_exposes_skip_judge_prepass_flag(self) -> None:
-        """The CLI exposes --skip-judge-prepass (#4408)."""
-        # Find the argparse setup in main() — the flag must appear.
-        import inspect
-
-        source = inspect.getsource(reingest.main)
-        assert "--skip-judge-prepass" in source
-        assert "skip_judge_prepass=args.skip_judge_prepass" in source
-
-
-# ---------------------------------------------------------------------------
-# Prefix-mode pre-pass — #4419 follow-up to #4408
-# ---------------------------------------------------------------------------
 
 
 _PREFIX_BUCKET = "test-prefix-bucket"
@@ -624,47 +116,57 @@ _PREFIX_COURT_CODE = "ca-los-angeles"
 _PREFIX_COURT_ID = str(uuid.uuid4())
 _PREFIX_COURT_IDS = {_PREFIX_COURT_CODE: _PREFIX_COURT_ID}
 
-# S3 keys mirroring the live LA path layout — _S3_KEY_PATTERN requires
-# content_hash to match ``[0-9a-f]+`` so the test hashes use only hex.
-_SURNAME_KEY = (
-    "ca/los_angeles/los_angeles_superior_court/raw/"
-    "aaaa1111bbbb2222cccc3333dddd4444.html"
-)
-_BOILERPLATE_KEY = (
-    "ca/los_angeles/los_angeles_superior_court/raw/"
-    "eeee5555ffff6666aaaa7777bbbb8888.html"
-)
+_LA_RAW = "ca/los_angeles/los_angeles_superior_court/raw/"
+
+
+def _la_key(hex_hash: str) -> str:
+    """An LA content-addressed key.  ``_S3_KEY_PATTERN`` needs a hex hash."""
+    return f"{_LA_RAW}{hex_hash}.html"
+
+
+# S3 keys mirroring the live LA path layout.
+_SURNAME_KEY = _la_key("aaaa1111bbbb2222cccc3333dddd4444")
+_BOILERPLATE_KEY = _la_key("eeee5555ffff6666aaaa7777bbbb8888")
+
+
+def _looks_valid(name: str) -> bool:
+    """Stand-in for ``_looks_like_valid_judge_name``: full names only."""
+    return bool(name) and len(name.strip().split()) >= 2
+
+
+# ---------------------------------------------------------------------------
+# _seed_judges_from_keys
+# ---------------------------------------------------------------------------
 
 
 class TestSeedJudgesFromKeys:
-    """Tests for ``_seed_judges_from_keys`` — the #4419 prefix-mode pre-pass."""
+    """Tests for ``_seed_judges_from_keys`` — the #4408 / #4419 pre-pass."""
 
     @patch("reingest_from_s3.resolve_judge")
     @patch("reingest_from_s3.extract_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_prefix_mode_chronological_race_closes(
+    def test_chronological_race_closes(
         self,
         mock_fetch_s3: MagicMock,
         mock_extract_text: MagicMock,
         mock_extract_judge: MagicMock,
         mock_resolve_judge: MagicMock,
     ) -> None:
-        """Replays the #4397 LA dept-25 race in prefix mode and asserts the
-        pre-pass closes it on a single ``--prefix`` invocation.
+        """Replays the #4397 LA dept-25 race and asserts the pre-pass closes
+        it on a single reingest invocation.
 
-        The synthetic 2-doc prefix scan mirrors the cursor-mode test, but
-        ordered surname-first (the bug-trigger order — when prefix-mode's
+        The keys are ordered surname-first (the bug-trigger order — when the
         ``ProcessPoolExecutor`` happens to complete the surname doc before
         the boilerplate doc, the surname doc commits ``judge_id = NULL``
         without the pre-pass).
 
-        Post-#4419 invariant: the pre-pass walks both keys, sees the full
-        name on the boilerplate doc, calls ``resolve_judge`` to upsert
-        ``Karine Mkrtchyan`` BEFORE the main pool runs.  The main pool's
+        Invariant: the pre-pass walks both keys, sees the full name on the
+        boilerplate doc, and calls ``resolve_judge`` to upsert
+        ``Karine Mkrtchyan`` BEFORE the pool runs.  The pool's
         ``_expand_single_word_judge_surname`` Step 4 lookup then finds the
         seeded judge regardless of completion order, so the surname doc
-        resolves NON-NULL on the first prefix-mode invocation.
+        resolves NON-NULL on the first invocation.
         """
         keys = [_SURNAME_KEY, _BOILERPLATE_KEY]
 
@@ -677,7 +179,7 @@ class TestSeedJudgesFromKeys:
                 return surname_bytes
             if key == _BOILERPLATE_KEY:
                 return boilerplate_bytes
-            raise AssertionError(f"unexpected S3 key in prefix pre-pass: {key!r}")
+            raise AssertionError(f"unexpected S3 key in pre-pass: {key!r}")
 
         mock_fetch_s3.side_effect = fetch_s3_side_effect
 
@@ -688,7 +190,7 @@ class TestSeedJudgesFromKeys:
                 return "JUDGE/DEPT: Mkrtchyan/25"
             if raw_content == boilerplate_bytes:
                 return "DEPARTMENT 25 JUDGE KARINE MKRTCHYAN"
-            raise AssertionError("unexpected raw_content in prefix pre-pass")
+            raise AssertionError("unexpected raw_content in pre-pass")
 
         mock_extract_text.side_effect = extract_text_side_effect
 
@@ -700,17 +202,13 @@ class TestSeedJudgesFromKeys:
             return None
 
         mock_extract_judge.side_effect = extract_judge_side_effect
-
         mock_resolve_judge.return_value = "judge-id-karine-mkrtchyan"
-
-        def looks_valid_side_effect(name: str) -> bool:
-            return bool(name) and len(name.strip().split()) >= 2
 
         conn = MagicMock()
 
         with patch(
             "reingest_from_s3._looks_like_valid_judge_name",
-            side_effect=looks_valid_side_effect,
+            side_effect=_looks_valid,
         ):
             stats = reingest._seed_judges_from_keys(
                 conn,
@@ -730,7 +228,7 @@ class TestSeedJudgesFromKeys:
         # ---- resolve_judge called exactly once with the FULL name and
         # the court_id resolved from the parsed S3 key.  This is the
         # load-bearing assertion: the pre-pass surfaces the full name
-        # BEFORE the main pool, so single-word surnames resolve via
+        # BEFORE the pool, so single-word surnames resolve via
         # ``_expand_single_word_judge_surname`` Step 4 regardless of
         # worker-pool completion order.
         assert mock_resolve_judge.call_count == 1, mock_resolve_judge.call_args_list
@@ -738,9 +236,7 @@ class TestSeedJudgesFromKeys:
         assert seeded_args[1] == "KARINE MKRTCHYAN", seeded_args
         assert seeded_args[2] == _PREFIX_COURT_ID, seeded_args
 
-        # ---- conn.commit() called exactly once at the end (only when
-        # at least one judge was seeded).  Empty pre-passes commit zero
-        # times — same shape as ``_seed_judges_from_cursor``.
+        # ---- One chunk seeded one judge → exactly one commit.
         assert conn.commit.call_count == 1, conn.commit.call_args_list
 
         # ---- Surname-only doc's main-pass resolution succeeds.
@@ -764,8 +260,8 @@ class TestSeedJudgesFromKeys:
 
         assert len(suffix_rows) == 1, (
             "AC2 violated: surname doc still resolves NULL after a "
-            "single prefix-mode invocation; pre-pass did not close the "
-            "chronological-resolver-race class for prefix mode."
+            "single reingest invocation; pre-pass did not close the "
+            "chronological-resolver-race class."
         )
         assert suffix_rows[0][0] == "Karine Mkrtchyan"
 
@@ -773,7 +269,70 @@ class TestSeedJudgesFromKeys:
     @patch("reingest_from_s3.extract_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_prefix_pre_pass_skips_unparseable_keys(
+    def test_commits_once_per_chunk_that_seeded(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_extract_text: MagicMock,
+        mock_extract_judge: MagicMock,
+        mock_resolve_judge: MagicMock,
+    ) -> None:
+        """The pre-pass commits after each ``_PREPASS_CHUNK`` that seeded a
+        judge, and not after a chunk that seeded none.
+
+        Chunk size 2 over five keys gives chunks [0, 1], [2, 3], [4].  Keys
+        0, 1 and 4 carry a full name; keys 2 and 3 carry none.  So chunks 1
+        and 3 seed and chunk 2 does not: two commits, not one per judge (3)
+        and not one per chunk (3).
+        """
+        keys = [_la_key(f"{i:032x}") for i in range(5)]
+        full_name_keys = {keys[0], keys[1], keys[4]}
+
+        mock_fetch_s3.side_effect = lambda _c, _b, key: key.encode()
+        mock_extract_text.side_effect = lambda raw, fmt, pdf_timeout=30.0: raw.decode()
+        mock_extract_judge.side_effect = lambda text: (
+            "KARINE MKRTCHYAN" if text in full_name_keys else None
+        )
+        mock_resolve_judge.return_value = "judge-id"
+
+        # Record how many judges had been seeded at each commit, to prove
+        # the commits land at chunk boundaries.
+        conn = MagicMock()
+        seeded_at_commit: list[int] = []
+        conn.commit.side_effect = lambda: seeded_at_commit.append(
+            mock_resolve_judge.call_count
+        )
+
+        with (
+            patch.object(reingest, "_PREPASS_CHUNK", 2),
+            patch(
+                "reingest_from_s3._looks_like_valid_judge_name",
+                side_effect=_looks_valid,
+            ),
+        ):
+            stats = reingest._seed_judges_from_keys(
+                conn,
+                MagicMock(),
+                keys,
+                _PREFIX_BUCKET,
+                _PREFIX_COURT_IDS,
+                parse_timeout=60.0,
+                concurrency=2,
+            )
+
+        assert stats == {
+            "docs_scanned": 5,
+            "judges_seeded": 3,
+            "judges_skipped_invalid": 0,
+        }
+        # Chunk 1 seeded 2 judges → commit; chunk 2 seeded none → no commit;
+        # chunk 3 seeded 1 more → commit.
+        assert seeded_at_commit == [2, 3]
+
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3._extract_text_from_content")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_skips_unparseable_keys(
         self,
         mock_fetch_s3: MagicMock,
         mock_extract_text: MagicMock,
@@ -800,14 +359,14 @@ class TestSeedJudgesFromKeys:
         assert stats["judges_seeded"] == 0
         mock_fetch_s3.assert_not_called()
         mock_resolve_judge.assert_not_called()
-        # No seeds → no commit (matches cursor-mode "skip empty page commit").
+        # No seeds → no commit.
         assert conn.commit.call_count == 0
 
     @patch("reingest_from_s3.resolve_judge")
     @patch("reingest_from_s3.extract_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_prefix_pre_pass_skips_keys_with_no_court_mapping(
+    def test_skips_keys_with_no_court_mapping(
         self,
         mock_fetch_s3: MagicMock,
         mock_extract_text: MagicMock,
@@ -815,14 +374,12 @@ class TestSeedJudgesFromKeys:
         mock_resolve_judge: MagicMock,
     ) -> None:
         """Keys whose court_code is missing from ``court_ids`` are skipped."""
-        # Valid pattern, but the court_ids mapping is empty.
-        keys = [_SURNAME_KEY]
         conn = MagicMock()
 
         stats = reingest._seed_judges_from_keys(
             conn,
             MagicMock(),
-            keys,
+            [_SURNAME_KEY],
             _PREFIX_BUCKET,
             {},  # empty mapping
             parse_timeout=60.0,
@@ -838,15 +395,46 @@ class TestSeedJudgesFromKeys:
     @patch("reingest_from_s3.extract_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_prefix_pre_pass_only_seeds_full_names(
+    def test_skips_keys_whose_s3_fetch_fails(
         self,
         mock_fetch_s3: MagicMock,
         mock_extract_text: MagicMock,
         mock_extract_judge: MagicMock,
         mock_resolve_judge: MagicMock,
     ) -> None:
-        """Bare single-word surnames are NOT seeded (mirror cursor-mode)."""
-        keys = [_SURNAME_KEY]
+        """A key whose raw object can't be fetched is not scanned; the pool
+        accounts for it on its own re-fetch."""
+        mock_fetch_s3.side_effect = RuntimeError("NoSuchKey")
+        conn = MagicMock()
+
+        stats = reingest._seed_judges_from_keys(
+            conn,
+            MagicMock(),
+            [_SURNAME_KEY],
+            _PREFIX_BUCKET,
+            _PREFIX_COURT_IDS,
+            parse_timeout=60.0,
+            concurrency=2,
+        )
+
+        assert stats["docs_scanned"] == 0
+        mock_extract_text.assert_not_called()
+        mock_resolve_judge.assert_not_called()
+        assert conn.commit.call_count == 0
+
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3._extract_text_from_content")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_only_seeds_full_names(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_extract_text: MagicMock,
+        mock_extract_judge: MagicMock,
+        mock_resolve_judge: MagicMock,
+    ) -> None:
+        """Bare single-word surnames are NOT seeded (``resolve_judge``'s
+        ``_looks_like_valid_judge_name`` guard would reject them anyway)."""
         conn = MagicMock()
 
         mock_fetch_s3.return_value = b"<html>JUDGE/DEPT: Mkrtchyan/25</html>"
@@ -860,7 +448,7 @@ class TestSeedJudgesFromKeys:
             stats = reingest._seed_judges_from_keys(
                 conn,
                 MagicMock(),
-                keys,
+                [_SURNAME_KEY],
                 _PREFIX_BUCKET,
                 _PREFIX_COURT_IDS,
                 parse_timeout=60.0,
@@ -877,7 +465,7 @@ class TestSeedJudgesFromKeys:
     @patch("reingest_from_s3.extract_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_prefix_pre_pass_handles_no_judge_match(
+    def test_handles_no_judge_match(
         self,
         mock_fetch_s3: MagicMock,
         mock_extract_text: MagicMock,
@@ -885,7 +473,6 @@ class TestSeedJudgesFromKeys:
         mock_resolve_judge: MagicMock,
     ) -> None:
         """When extract_judge_name returns None, no seed and no error."""
-        keys = [_SURNAME_KEY]
         conn = MagicMock()
 
         mock_fetch_s3.return_value = b"<html>no judge here</html>"
@@ -895,7 +482,7 @@ class TestSeedJudgesFromKeys:
         stats = reingest._seed_judges_from_keys(
             conn,
             MagicMock(),
-            keys,
+            [_SURNAME_KEY],
             _PREFIX_BUCKET,
             _PREFIX_COURT_IDS,
             parse_timeout=60.0,
@@ -909,24 +496,267 @@ class TestSeedJudgesFromKeys:
         assert conn.commit.call_count == 0
 
 
-class TestRunReingestFromPrefixWiresPrePass:
-    """Tests that ``run_reingest_from_prefix`` invokes the pre-pass."""
+# ---------------------------------------------------------------------------
+# _reingest_keys / run_reingest / run_reingest_from_prefix — pre-pass wiring
+# ---------------------------------------------------------------------------
 
-    def test_skip_judge_prepass_param_exists(self) -> None:
-        """run_reingest_from_prefix accepts the skip_judge_prepass kwarg (#4419)."""
-        import inspect
+_PREPASS_STATS = {
+    "docs_scanned": 2,
+    "judges_seeded": 1,
+    "judges_skipped_invalid": 1,
+}
 
-        sig = inspect.signature(reingest.run_reingest_from_prefix)
-        assert "skip_judge_prepass" in sig.parameters
-        assert sig.parameters["skip_judge_prepass"].default is False
 
-    def test_cli_routes_skip_judge_prepass_to_prefix_runner(self) -> None:
-        """main() passes args.skip_judge_prepass through to run_reingest_from_prefix."""
-        import inspect
+class _Pipeline:
+    """Patches everything ``_reingest_keys`` touches outside the pre-pass.
 
-        source = inspect.getsource(reingest.main)
-        # The prefix-mode call site must forward skip_judge_prepass.
-        assert "skip_judge_prepass=args.skip_judge_prepass" in source
-        # And the prefix-mode call site must pass parse_timeout (used by
-        # the pre-pass for PDF text extraction).
-        assert "parse_timeout=args.parse_timeout" in source
+    ``events`` records the order in which the pre-pass and the process pool
+    are entered, so a test can assert the pre-pass runs first.  The pool
+    returns an already-finished ``Future`` per key, so the real
+    ``as_completed`` drains it without running ``_process_prefix_document``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.seed_judges = MagicMock(
+            side_effect=self._seed_judges, return_value=_PREPASS_STATS
+        )
+        self.pool_cls = MagicMock(side_effect=self._make_pool)
+        self.submitted: list[str] = []
+        self._patchers = [
+            patch("reingest_from_s3.psycopg"),
+            patch("reingest_from_s3.boto3"),
+            patch("reingest_from_s3._seed_courts", return_value=_PREFIX_COURT_IDS),
+            patch("reingest_from_s3._seed_judges_from_keys", self.seed_judges),
+            patch("reingest_from_s3.ProcessPoolExecutor", self.pool_cls),
+        ]
+
+    def _seed_judges(self, *args: Any, **kwargs: Any) -> dict[str, int]:
+        self.events.append("prepass")
+        return _PREPASS_STATS
+
+    def _make_pool(self, *args: Any, **kwargs: Any) -> MagicMock:
+        self.events.append("pool")
+        pool = MagicMock()
+
+        def submit(fn: Any, key: str, *rest: Any) -> Future:
+            self.submitted.append(key)
+            fut: Future = Future()
+            fut.set_result({"status": "ok", "hash_mismatch": False})
+            return fut
+
+        pool.submit.side_effect = submit
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=pool)
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    def __enter__(self) -> Self:
+        for p in self._patchers:
+            p.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        for p in reversed(self._patchers):
+            p.stop()
+
+
+def _run_keys(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "bucket": _PREFIX_BUCKET,
+        "concurrency": 2,
+        "dry_run": False,
+        "bust_llm_cache": False,
+        "parse_timeout": 12.5,
+        "skip_judge_prepass": False,
+        "write_failed_manifest": None,
+    }
+    kwargs.update(overrides)
+    return reingest._reingest_keys(
+        "postgresql://test", [_SURNAME_KEY, _BOILERPLATE_KEY], **kwargs
+    )
+
+
+class TestReingestKeysPrePass:
+    """``_reingest_keys`` gates and orders the pre-pass for both modes."""
+
+    def test_prepass_runs_before_the_pool(self) -> None:
+        with _Pipeline() as pipe:
+            stats = _run_keys()
+
+        assert pipe.events == ["prepass", "pool"]
+        args, kwargs = pipe.seed_judges.call_args
+        # (conn, s3_client, keys, bucket, court_ids)
+        assert args[2] == [_SURNAME_KEY, _BOILERPLATE_KEY]
+        assert args[3] == _PREFIX_BUCKET
+        assert args[4] == _PREFIX_COURT_IDS
+        assert kwargs == {"parse_timeout": 12.5, "concurrency": 2}
+        assert pipe.submitted == [_SURNAME_KEY, _BOILERPLATE_KEY]
+        assert stats["processed"] == 2
+        assert stats["judge_prepass_docs_scanned"] == 2
+        assert stats["judge_prepass_judges_seeded"] == 1
+        assert stats["judge_prepass_judges_skipped_invalid"] == 1
+
+    def test_dry_run_skips_prepass_and_pool(self) -> None:
+        """A dry run writes no ``derived.judges`` rows and processes nothing."""
+        with _Pipeline() as pipe:
+            stats = _run_keys(dry_run=True)
+
+        pipe.seed_judges.assert_not_called()
+        pipe.pool_cls.assert_not_called()
+        assert stats == {
+            "total_keys": 2,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+
+    def test_skip_judge_prepass_skips_prepass_but_runs_pool(self) -> None:
+        with _Pipeline() as pipe:
+            stats = _run_keys(skip_judge_prepass=True)
+
+        pipe.seed_judges.assert_not_called()
+        assert pipe.events == ["pool"]
+        assert stats["processed"] == 2
+        assert "judge_prepass_judges_seeded" not in stats
+
+
+class TestRunReingestPrePass:
+    """DB-row mode reaches the pre-pass through ``_reingest_keys``."""
+
+    def test_db_mode_runs_prepass_on_selected_keys(self) -> None:
+        selected = [_SURNAME_KEY, _BOILERPLATE_KEY]
+        with (
+            _Pipeline() as pipe,
+            patch(
+                "reingest_from_s3.select_db_keys", return_value=selected
+            ) as mock_select,
+        ):
+            stats = reingest.run_reingest(
+                "postgresql://test",
+                county="Los Angeles",
+                limit=5,
+                concurrency=3,
+                parse_timeout=7.0,
+            )
+
+        assert mock_select.call_args.kwargs == {"limit": 5}
+        assert pipe.events == ["prepass", "pool"]
+        args, kwargs = pipe.seed_judges.call_args
+        assert args[2] == selected
+        assert args[4] == _PREFIX_COURT_IDS
+        assert kwargs == {"parse_timeout": 7.0, "concurrency": 3}
+        assert pipe.submitted == selected
+        assert stats["judge_prepass_judges_seeded"] == 1
+
+    def test_db_mode_skip_judge_prepass(self) -> None:
+        with (
+            _Pipeline() as pipe,
+            patch("reingest_from_s3.select_db_keys", return_value=[_SURNAME_KEY]),
+        ):
+            reingest.run_reingest(
+                "postgresql://test", county="Los Angeles", skip_judge_prepass=True
+            )
+
+        pipe.seed_judges.assert_not_called()
+        assert pipe.events == ["pool"]
+
+    def test_db_mode_no_keys_skips_everything(self) -> None:
+        with (
+            _Pipeline() as pipe,
+            patch("reingest_from_s3.select_db_keys", return_value=[]),
+        ):
+            stats = reingest.run_reingest("postgresql://test", county="Nowhere")
+
+        assert pipe.events == []
+        assert stats["total_keys"] == 0
+
+
+class TestRunReingestFromPrefixPrePass:
+    """Prefix mode reaches the pre-pass through ``_reingest_keys``."""
+
+    def test_prefix_mode_runs_prepass_on_listed_keys(self) -> None:
+        listed = [_SURNAME_KEY, _BOILERPLATE_KEY]
+        with (
+            _Pipeline() as pipe,
+            patch("reingest_from_s3._list_s3_keys", return_value=listed),
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="ca/los_angeles/",
+                concurrency=4,
+                parse_timeout=9.0,
+            )
+
+        assert pipe.events == ["prepass", "pool"]
+        args, kwargs = pipe.seed_judges.call_args
+        assert args[2] == listed
+        assert kwargs == {"parse_timeout": 9.0, "concurrency": 4}
+        assert stats["judge_prepass_judges_seeded"] == 1
+
+    def test_prefix_mode_dry_run_skips_prepass(self) -> None:
+        with (
+            _Pipeline() as pipe,
+            patch("reingest_from_s3._list_s3_keys", return_value=[_SURNAME_KEY]),
+        ):
+            reingest.run_reingest_from_prefix(
+                "postgresql://test", prefix="ca/los_angeles/", dry_run=True
+            )
+
+        pipe.seed_judges.assert_not_called()
+        pipe.pool_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring
+# ---------------------------------------------------------------------------
+
+_EMPTY_STATS = {
+    "total_keys": 0,
+    "processed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "error_ratio": 0.0,
+}
+
+
+class TestCliForwardsPrePassFlags:
+    """``main`` forwards ``--skip-judge-prepass`` / ``--parse-timeout``."""
+
+    def _main(self, argv: list[str]) -> tuple[MagicMock, MagicMock]:
+        with (
+            patch.object(sys, "argv", ["reingest_from_s3.py", *argv]),
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://test"}),
+            patch(
+                "reingest_from_s3.run_reingest", return_value=_EMPTY_STATS
+            ) as mock_db,
+            patch(
+                "reingest_from_s3.run_reingest_from_prefix",
+                return_value=_EMPTY_STATS,
+            ) as mock_prefix,
+        ):
+            reingest.main()
+        return mock_db, mock_prefix
+
+    def test_skip_judge_prepass_defaults_off(self) -> None:
+        mock_db, _ = self._main(["--county", "Los Angeles"])
+        assert mock_db.call_args.kwargs["skip_judge_prepass"] is False
+
+    def test_db_mode_forwards_flags(self) -> None:
+        mock_db, mock_prefix = self._main(
+            ["--county", "Los Angeles", "--skip-judge-prepass", "--parse-timeout", "12"]
+        )
+        mock_prefix.assert_not_called()
+        kwargs = mock_db.call_args.kwargs
+        assert kwargs["skip_judge_prepass"] is True
+        assert kwargs["parse_timeout"] == 12.0
+
+    def test_prefix_mode_forwards_flags(self) -> None:
+        mock_db, mock_prefix = self._main(
+            ["--prefix", "ca/", "--skip-judge-prepass", "--parse-timeout", "12"]
+        )
+        mock_db.assert_not_called()
+        kwargs = mock_prefix.call_args.kwargs
+        assert kwargs["prefix"] == "ca/"
+        assert kwargs["skip_judge_prepass"] is True
+        assert kwargs["parse_timeout"] == 12.0

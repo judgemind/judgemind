@@ -1,10 +1,8 @@
 """Unit tests for ``framework.extraction_config.decide_extraction_strategy``.
 
 Validates the structural-fix helper introduced in #4081 — the single
-source of truth consulted by both ``ingestion.worker`` and
-``scripts/reingest_from_s3.py`` for "how should this document be
-extracted?".  See ``test_worker_reingest_parity.py`` for the
-cross-path live-call regression guard introduced in #4071.
+source of truth ``ingestion.worker`` consults for "how should this
+document be extracted?" (the one write path since #4845).
 """
 
 from __future__ import annotations

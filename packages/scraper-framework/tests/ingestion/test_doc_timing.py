@@ -2,7 +2,7 @@
 
 The ``DocTiming`` helper in ``ingestion.doc_timing`` is the shared
 primitive used by both ``ingestion.worker.IngestionWorker.process_event``
-(live ingestion) and ``scripts/reingest_from_s3.py`` (offline reingest)
+(live ingestion) and, before #4845, ``scripts/reingest_from_s3.py``
 to emit one structured timing line per processed document.
 
 These tests verify:
@@ -230,63 +230,3 @@ def test_emit_via_structlog_logger_routes_to_kwargs() -> None:
     # All four buckets always present.
     for key in PHASE_NAMES:
         assert key in kwargs
-
-
-def test_reparse_document_records_parse_and_regex_timing() -> None:
-    """End-to-end smoke: ``_reparse_document`` populates ``parse_document_ms``
-    and ``regex_fallback_ms`` on the returned dict so the per-doc loop
-    in :func:`reingest_from_s3.reingest_batch` can hand them to
-    :class:`DocTiming.add_ms`.
-
-    This guards the wiring between ``_reparse_document`` (instrumented
-    here for #4116) and the main DB-write loop that builds the
-    ``reingest_doc_timing`` log line.  The test bypasses the LLM (no
-    client), the registered scraper (unknown id), and external IO
-    (raw bytes are HTML).
-    """
-    import importlib
-    import os
-    import sys
-
-    # Reuse the same path-bootstrap as test_reingest_from_s3.py.
-    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts")
-    sys.path.insert(0, scripts_dir)
-    reingest = importlib.import_module("reingest_from_s3")
-
-    raw_html = b"<html><body><p>Some ruling text.</p></body></html>"
-    doc_meta = {
-        "document_id": "00000000-0000-0000-0000-000000000001",
-        "case_id": "00000000-0000-0000-0000-000000000001",
-        "case_number": "C12345",
-        "case_title": "Smith v. Jones",
-        "case_type": "civil",
-        "court_id": "00000000-0000-0000-0000-000000000001",
-        "court_name": "Test Court",
-        "state": "CA",
-        "county": "TestCounty",
-        "scraper_id": "no-such-scraper-for-doc-timing-test",
-        "format": "html",
-        "captured_at": None,
-        "hearing_date": None,
-        "content_hash": "deadbeef",
-        "s3_key": "test/key.html",
-        "s3_bucket": "test-bucket",
-        "source_url": "https://example.com/x",
-        "stored_ruling_text": None,
-    }
-
-    result = reingest._reparse_document(
-        raw_html,
-        doc_meta["scraper_id"],
-        doc_meta,
-        pdf_timeout=5.0,
-        llm_client=None,
-    )
-
-    assert "parse_document_ms" in result
-    assert "regex_fallback_ms" in result
-    # Both phases run on every call path through _reparse_document — the
-    # values are real wall-clock measurements, not mocked, so we just
-    # assert >= 0.0 (perf_counter is monotonic).
-    assert result["parse_document_ms"] >= 0.0
-    assert result["regex_fallback_ms"] >= 0.0

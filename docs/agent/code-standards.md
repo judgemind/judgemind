@@ -82,7 +82,7 @@ Reaffirming the rule above: ECS oneshot scripts uploaded by `scripts/ecs-run-tas
 
 Worked examples:
 
-- `from framework.logging import configure_structlog` — the canonical structured-logging entry point used by `scripts/drain_splitter_carry_forward_clusters.py` (PR #4368) and the 13 other top-level scripts migrated in PR #4373. This is the long-standing precedent for cross-script sharing and is mandatory for any top-level script that emits `extra=` log fields (see §Logger configuration below).
+- `from framework.logging import configure_structlog` — the canonical structured-logging entry point (introduced in PR #4368) used by the 13 top-level scripts migrated in PR #4373. This is the long-standing precedent for cross-script sharing and is mandatory for any top-level script that emits `extra=` log fields (see §Logger configuration below).
 - `from framework.s3_keys import parse_flat_hash_key, is_mislabel, head_object_metadata_hash, build_twin_key, KEY_PATTERN` — the four flat-hash key helpers extracted in #4447 (PR #4450). The shipped consumers are `scripts/archive/cleanup_mislabeled_s3_2661.py`, `scripts/archive/repoint_mislabeled_documents_4439.py`, and `scripts/archive/create_missing_twins_4446.py` (all archived in #4565 after their runtime applies landed; the post-#4447 / post-#4455 import shape is preserved in each archived copy). `framework.s3_keys` is the explicit landing zone for parsing/validation helpers operating on the `raw/<county>/<format>/<filename_hash>.<ext>` flat-hash key shape.
 
 **When NOT to extract.** The bar for promoting a helper from a `scripts/*.py` file into `framework.*` is real — don't do it for everything. Skip the extraction when:
@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
 
 `configure_structlog(json=True, stdlib_bridge=True)` routes stdlib `logging.getLogger(__name__)` calls through structlog's ProcessorFormatter + ExtraAdder, JSON-encoding the LogRecord plus its extras as one event per line. The `stdlib_bridge=True` flag is the load-bearing piece — without it, `extra=` fields still drop because structlog and stdlib `logging` remain unwired.
 
-`scripts/drain_splitter_carry_forward_clusters.py` (PR #4368) is the reference implementation. PR #4373 migrated the other 13 affected `scripts/*.py` files. The `no-basicconfig-with-extra-check` CI job (`scripts/check-no-basicconfig-with-extra.sh`, #4376) enforces the contract: it AST-walks every top-level `scripts/*.py` and fails CI when a file calls `logging.basicConfig(...)` AND passes `extra=` to a logger method AND does NOT also call `configure_structlog(...)`. Files that call both `basicConfig` and `configure_structlog` are accepted — the contributor has been deliberate about routing.
+`scripts/audit_correctly_labeled_s3_orphans.py` is a reference implementation (the pattern came from PR #4368; PR #4373 migrated 13 affected `scripts/*.py` files). The `no-basicconfig-with-extra-check` CI job (`scripts/check-no-basicconfig-with-extra.sh`, #4376) enforces the contract: it AST-walks every top-level `scripts/*.py` and fails CI when a file calls `logging.basicConfig(...)` AND passes `extra=` to a logger method AND does NOT also call `configure_structlog(...)`. Files that call both `basicConfig` and `configure_structlog` are accepted — the contributor has been deliberate about routing.
 
 ## TypeScript (API, frontend)
 

@@ -1,10 +1,8 @@
-"""Shared multi-ruling conversion logic for worker.py and reingest_from_s3.py.
+"""Multi-ruling conversion logic for the ingestion worker.
 
-Extracts the common pattern of converting ``ExtractedRuling`` objects (from
-LLM extraction) into a flat, caller-agnostic representation with the
-cross-contamination guard applied.  Both the live ingestion worker and the
-reingest script import this module instead of maintaining parallel conversion
-loops.
+Converts ``ExtractedRuling`` objects (from LLM extraction) into a flat,
+caller-agnostic representation with the cross-contamination guard applied.
+Live capture, rebuild and reingest all reach it through the worker (#4845).
 
 The cross-contamination guard (#2057, #2078) ensures that when a multi-ruling
 PDF is split, each ruling's ``ruling_text`` is either its own extracted text
@@ -264,7 +262,7 @@ def convert_extracted_rulings(
 
     This is the single source of truth for the multi-ruling
     cross-contamination guard and the ruling-to-dict conversion logic.
-    Both ``worker.py`` and ``reingest_from_s3.py`` call this function.
+    ``worker.py`` calls it for every LLM split (live, rebuild, reingest).
 
     Parameters
     ----------

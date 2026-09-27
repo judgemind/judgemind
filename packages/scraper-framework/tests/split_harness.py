@@ -369,65 +369,25 @@ DbModeDriver = Callable[["KeyHarness", "Key", Step], None]
 
 
 def default_db_mode_driver(harness: KeyHarness, key: Key, step: Step) -> None:
-    """Run DB-row reingest over *key*: ``run_reingest(s3_key_list=[key])``.
+    """Run ``scripts/reingest_from_s3.py`` DB-row mode over *key*.
 
-    The S3 read and the extractor are stubbed with the harness's doubles;
-    the reingest's own selection, split and write logic runs unchanged.
+    The script's own key selection (``select_db_keys``) and event builder
+    (``_build_prefix_event``) run unchanged; each selected object goes
+    through the harness worker instead of a process pool, with the S3 read
+    and the extractor stubbed.
     """
     import reingest_from_s3 as reingest
 
-    with (
-        patch.object(reingest, "_fetch_s3_content", return_value=b"%PDF-1.4 harness"),
-        patch.object(
-            reingest,
-            "_full_reparse_document",
-            side_effect=lambda _raw, _sid, doc_meta, *a, **k: _db_mode_extracted(doc_meta, step),
-        ),
-    ):
-        filters, params = reingest._build_filters(None, None, None, s3_key_list=[key.s3_key])
-        result = reingest.reingest_batch(
-            harness.conn,
-            MagicMock(),
-            100,
-            (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID),
-            filters,
-            params,
-            full_reparse=True,
-            processed_s3_keys=set(),
-            search_indexer=harness.indexer,
+    filters, params = reingest._build_filters(None, None, None, s3_key_list=[key.s3_key])
+    for s3_key in reingest.select_db_keys(harness.checker, filters, params):
+        event = reingest._build_prefix_event(
+            s3_key,
+            b"",
+            reingest._parse_s3_key(s3_key),
+            "harness-bucket",
+            capture_timestamp=CAPTURED_AT,
         )
-    if result["failed"]:
-        raise RuntimeError(f"reingest_batch: {result['failed']} document write(s) failed")
-
-
-def _db_mode_extracted(doc_meta: dict[str, Any], step: Step) -> list[dict[str, Any]]:
-    """What ``_full_reparse_document`` returns for *step*'s rows."""
-    parent = doc_meta["document_id"]
-    rows = list(step.rows)
-    count = len(rows)
-    out: list[dict[str, Any]] = []
-    for i, row in enumerate(rows):
-        spec = step.specs[row.spec] if row.kind != "preamble" else None
-        text = spec.text if spec is not None and row.kind == "ruling" else None
-        entry: dict[str, Any] = {
-            "case_number": spec.case_number if spec else None,
-            "case_title": spec.title if spec else None,
-            "case_type": None,
-            "hearing_date": HEARING,
-            "judge_name": None,
-            "department": None,
-            "outcome": None,
-            "motion_type": "demurrer" if text else None,
-            "ruling_text": text,
-            "parties": [],
-            "extraction_methods": {},
-        }
-        if count > 1:
-            entry["is_split"] = True
-            entry["ruling_index"] = i
-            entry["split_document_id"] = make_split_document_id(parent, i)
-        out.append(entry)
-    return out
+        harness.worker.process_event(event)
 
 
 DB_MODE_DRIVER: DbModeDriver = default_db_mode_driver
@@ -455,11 +415,14 @@ class Key:
 def make_key(tag: str) -> Key:
     content_hash = hashlib.sha256(tag.encode()).hexdigest()
     parent = derive_parent_document_id(content_hash)
+    # Each key gets its own county (so its own court and case rows); the
+    # slug is in the key, where the reingest script reads the county from.
+    county_slug = f"harness_{hashlib.sha1(tag.encode()).hexdigest()[:10]}"
     return Key(
-        s3_key=f"ca/harness/superior_court/raw/{content_hash}.pdf",
+        s3_key=f"ca/{county_slug}/superior_court/raw/{content_hash}.pdf",
         content_hash=content_hash,
         parent=parent,
-        county=f"Harness {hashlib.sha1(tag.encode()).hexdigest()[:10]}",
+        county=county_slug.replace("_", " ").title(),
         slots={make_split_document_id(parent, i): f"S{i}" for i in range(64)},
     )
 
@@ -467,8 +430,13 @@ def make_key(tag: str) -> Key:
 class KeyHarness:
     """Runs steps for keys against *dsn* and checks the invariants."""
 
-    def __init__(self, dsn: str, run_token: str, seed: int) -> None:
+    def __init__(
+        self, dsn: str, run_token: str, seed: int, invariants: frozenset[str] | None = None
+    ) -> None:
         self.dsn = dsn
+        #: The invariants this run enforces (all by default); ``error`` is
+        #: always enforced.
+        self.invariants = (invariants or frozenset(INVARIANTS)) | {"error"}
         self.seed = seed
         self.run_token = run_token
         self.checker = psycopg.connect(dsn, autocommit=True)
@@ -564,13 +532,13 @@ class KeyHarness:
             raise self._pending
         after_rows = read_key(self.checker, key.s3_key)
         after = ruling_identities(after_rows)
-        self._check_gap(before, after)
-        self._check_alerts(key, after_rows)
-        self._check_search(key, after_rows)
+        self._guard("gap", self._check_gap, before, after)
+        self._guard("alert", self._check_alerts, key, after_rows)
+        self._guard("search", self._check_search, key, after_rows)
         if step.kind != "db":
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
-            self._check_rows(key, after_rows, step)
+            self._guard("synthetic_title", self._check_rows, key, after_rows, step)
 
     def write_legacy_row(self, key: Key, document_id: str, spec: Spec) -> None:
         """Write one document + ruling on *key* directly, the way an older
@@ -613,6 +581,15 @@ class KeyHarness:
     def _fail(self, invariant: str, message: str) -> None:
         raise InvariantError(invariant, f"{self._step_label}: {message}")
 
+    def _guard(self, invariant: str, check: Callable[..., None], *args: Any) -> None:
+        """Run *check*, which enforces *invariant*; ignore its failure when
+        this run does not enforce that invariant."""
+        try:
+            check(*args)
+        except InvariantError as exc:
+            if exc.invariant in self.invariants:
+                raise
+
     def _after_commit(self) -> None:
         """Check the committed state.  A violation is recorded, not raised
         here, so the code under test cannot swallow it; ``run_step`` raises
@@ -623,16 +600,19 @@ class KeyHarness:
         rows = read_key(self.checker, key.s3_key)
         self._snapshots.append(ruling_identities(rows))
         try:
-            self._check_supersede(key, rows)
-            for r in rows:
-                if r.ruling_id and r.hearing_date is not None and r.hearing_date_source is None:
-                    self._fail(
-                        "date_source",
-                        f"ruling on {key.label(r.id)} has hearing_date {r.hearing_date} "
-                        "and no hearing_date_source",
-                    )
+            self._guard("superseded", self._check_supersede, key, rows)
+            self._guard("date_source", self._check_date_source, key, rows)
         except InvariantError as exc:
             self._pending = exc
+
+    def _check_date_source(self, key: Key, rows: list[DocRow]) -> None:
+        for r in rows:
+            if r.ruling_id and r.hearing_date is not None and r.hearing_date_source is None:
+                self._fail(
+                    "date_source",
+                    f"ruling on {key.label(r.id)} has hearing_date {r.hearing_date} "
+                    "and no hearing_date_source",
+                )
 
     # -- invariants -----------------------------------------------------
 
@@ -795,11 +775,19 @@ def normalized(key: Key, rows: list[DocRow]) -> tuple[frozenset[tuple], frozense
     return rulings, active
 
 
-def run_seed(dsn: str, seed: int, run_token: str, *, name: str = "seq") -> None:
+def run_seed(
+    dsn: str,
+    seed: int,
+    run_token: str,
+    *,
+    name: str = "seq",
+    invariants: frozenset[str] | None = None,
+) -> None:
     """Run *seed*'s sequence and the convergence checks; raise
     :class:`InvariantError` on the first broken invariant.  Two runs of one
-    seed in one session need distinct *name*s (their keys derive from it)."""
-    run_steps(dsn, generate(seed), run_token, seed=seed, name=name)
+    seed in one session need distinct *name*s (their keys derive from it).
+    *invariants* limits the check to those invariants (default: all)."""
+    run_steps(dsn, generate(seed), run_token, seed=seed, name=name, invariants=invariants)
 
 
 def run_steps(
@@ -810,10 +798,12 @@ def run_steps(
     seed: int = -1,
     name: str = "seq",
     setup: Callable[[KeyHarness, Key], None] | None = None,
+    invariants: frozenset[str] | None = None,
 ) -> None:
     """Run *steps* on one key, then the convergence checks.  *setup*, when
-    given, prepares the key's starting state."""
-    harness = KeyHarness(dsn, run_token, seed)
+    given, prepares the key's starting state; *invariants* limits the check
+    to those invariants (default: all)."""
+    harness = KeyHarness(dsn, run_token, seed, invariants)
     try:
         key = make_key(f"{run_token}-{seed}-{name}-main")
         if setup is not None:
@@ -836,7 +826,9 @@ def run_steps(
             harness.run_step(fresh_key, replace(final, kind=kind), f"fresh {kind}")
             fresh[kind] = normalized(fresh_key, read_key(harness.checker, fresh_key.s3_key))
 
-        if history != fresh["reingest"]:
+        if "converge" not in harness.invariants:
+            return
+        if not _converged(history, fresh["reingest"]):
             raise InvariantError(
                 "converge",
                 f"seed={seed}: reingest after the history leaves {_fmt(history)}, "
@@ -850,6 +842,35 @@ def run_steps(
             )
     finally:
         harness.close()
+
+
+def _converged(
+    history: tuple[frozenset[tuple], frozenset[str]],
+    fresh: tuple[frozenset[tuple], frozenset[str]],
+) -> bool:
+    """Whether a key re-ingested after a history holds the rows a fresh
+    ingest of the same bytes holds.
+
+    One difference is allowed: where the fresh ingest found no case number
+    (``UNKNOWN``), the key may keep the real case its ruling had before.  A
+    re-extraction that misses a case number must not throw away the one an
+    earlier extraction of the same bytes found (#4788).
+    """
+    if history[1] != fresh[1]:
+        return False
+    hist = {slot: rest for slot, *rest in history[0]}
+    new = {slot: rest for slot, *rest in fresh[0]}
+    if hist.keys() != new.keys() or len(hist) != len(history[0]) or len(new) != len(fresh[0]):
+        return history == fresh
+    for slot, (text, case, title) in new.items():
+        h_text, h_case, h_title = hist[slot]
+        if h_text != text:
+            return False
+        if h_case == case and h_title == title:
+            continue
+        if not (case == "UNKNOWN" and h_case != "UNKNOWN"):
+            return False
+    return True
 
 
 def _fmt(state: tuple[frozenset[tuple], frozenset[str]]) -> str:
