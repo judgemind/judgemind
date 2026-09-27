@@ -795,10 +795,11 @@ def normalized(key: Key, rows: list[DocRow]) -> tuple[frozenset[tuple], frozense
     return rulings, active
 
 
-def run_seed(dsn: str, seed: int, run_token: str) -> None:
+def run_seed(dsn: str, seed: int, run_token: str, *, name: str = "seq") -> None:
     """Run *seed*'s sequence and the convergence checks; raise
-    :class:`InvariantError` on the first broken invariant."""
-    run_steps(dsn, generate(seed), run_token, seed=seed)
+    :class:`InvariantError` on the first broken invariant.  Two runs of one
+    seed in one session need distinct *name*s (their keys derive from it)."""
+    run_steps(dsn, generate(seed), run_token, seed=seed, name=name)
 
 
 def run_steps(

@@ -123,7 +123,7 @@ _BUG_4838_STEPS = _bug_4838_steps()
 @pytest.mark.parametrize(("bug", "seed", "invariant"), _BUG_SEEDS)
 def test_known_bug(bug: str, seed: int, invariant: str) -> None:
     try:
-        harness.run_seed(_DSN, seed, _RUN)
+        harness.run_seed(_DSN, seed, _RUN, name=f"bug{bug}")
     except harness.InvariantError as exc:
         assert exc.invariant == invariant, f"#{bug}: expected [{invariant}], got {exc}"
         raise
