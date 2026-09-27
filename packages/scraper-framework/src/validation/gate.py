@@ -253,6 +253,7 @@ def insert_validation_result(
     county: str | None,
     scraper_id: str | None,
     s3_key: str | None,
+    hearing_date_source: str | None = None,
 ) -> None:
     """Insert a validation result into the validation_results table.
 
@@ -273,6 +274,10 @@ def insert_validation_result(
         county or trace a row back to its raw S3 capture. They are
         keyword-required (no default) so a new call site cannot silently
         drop attribution; pass ``None`` explicitly when it is unknown.
+    hearing_date_source : str | None
+        Provenance of the hearing date the rules judged
+        (``validation.hearing_date_source``, #4793).  ``None`` when the
+        ruling had no hearing date or the caller does not track it.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -280,8 +285,8 @@ def insert_validation_result(
             INSERT INTO validation_results
                 (document_id, ruling_id, result, reason, model,
                  input_tokens, output_tokens, latency_ms,
-                 county, scraper_id, s3_key)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 county, scraper_id, s3_key, hearing_date_source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 document_id,
@@ -295,6 +300,7 @@ def insert_validation_result(
                 county or None,
                 scraper_id or None,
                 s3_key or None,
+                hearing_date_source or None,
             ),
         )
 

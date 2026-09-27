@@ -1839,6 +1839,7 @@ def insert_ruling(
     summary_generated_at: datetime | None = None,
     *,
     force_update: bool = False,
+    hearing_date_source: str | None = None,
 ) -> None:
     """Upsert a ruling row linked to the document, with content-based dedup.
 
@@ -1938,6 +1939,12 @@ def insert_ruling(
     ``summary_generated_at``, ``ruling_text_hash``) always use COALESCE
     regardless of ``force_update``: we never erase a good ruling text just
     because a re-extraction happened to miss it.
+
+    ``hearing_date_source`` (#4793) records where ``hearing_date`` came from
+    (``validation.hearing_date_source``).  It always follows the date: when
+    the stored ``hearing_date`` is kept (an incoming NULL date under the
+    default mode), its stored source is kept too; otherwise the incoming
+    source is written.
     """
     ruling_text = _strip_nul(ruling_text)
     ruling_text_html = _strip_nul(ruling_text_html)
@@ -1974,7 +1981,10 @@ def insert_ruling(
     if force_update:
         conflict_case_id = "case_id = EXCLUDED.case_id"
         conflict_judge_id = "judge_id = EXCLUDED.judge_id"
-        conflict_hearing_date = "hearing_date = EXCLUDED.hearing_date"
+        conflict_hearing_date = (
+            "hearing_date = EXCLUDED.hearing_date,\n"
+            "            hearing_date_source = EXCLUDED.hearing_date_source"
+        )
         conflict_outcome = "outcome = EXCLUDED.outcome"
         conflict_motion_type = "motion_type = EXCLUDED.motion_type"
         conflict_department = "department = EXCLUDED.department"
@@ -1983,8 +1993,12 @@ def insert_ruling(
         conflict_case_id = "case_id = COALESCE(rulings.case_id, EXCLUDED.case_id)"
         conflict_judge_id = "judge_id = COALESCE(rulings.judge_id, EXCLUDED.judge_id)"
         # Correctable facts: incoming wins when non-NULL.
+        # The source follows the date it describes (#4793).
         conflict_hearing_date = (
-            "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)"
+            "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date),\n"
+            "            hearing_date_source = CASE"
+            " WHEN EXCLUDED.hearing_date IS NULL THEN rulings.hearing_date_source"
+            " ELSE EXCLUDED.hearing_date_source END"
         )
         conflict_outcome = "outcome = COALESCE(EXCLUDED.outcome, rulings.outcome)"
         conflict_motion_type = "motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type)"
@@ -1997,14 +2011,14 @@ def insert_ruling(
             department, is_tentative,
             outcome, motion_type,
             summary, summary_model, summary_generated_at,
-            ruling_text_hash
+            ruling_text_hash, hearing_date_source
         )
         VALUES (
             %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
             %s, TRUE,
             %s::ruling_outcome, %s,
             %s, %s, %s,
-            %s
+            %s, %s
         )
         ON CONFLICT (document_id) DO UPDATE SET
             {conflict_case_id},
@@ -2051,6 +2065,7 @@ def insert_ruling(
                     summary_model,
                     summary_generated_at,
                     text_hash,
+                    hearing_date_source if hearing_date is not None else None,
                 ),
             )
             cur.execute("RELEASE SAVEPOINT ruling_insert")
@@ -2248,6 +2263,7 @@ def insert_document_and_ruling(
     summary_generated_at: datetime | None = None,
     force_update: bool = False,
     relink_case: bool = False,
+    hearing_date_source: str | None = None,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
 
@@ -2287,6 +2303,9 @@ def insert_document_and_ruling(
     (its alerts detached, never deleted) so the ruling is re-inserted fresh
     for the new case instead of carrying the old case's fields and text.
     A ruling already on the same case is updated in place as usual.
+
+    ``hearing_date_source`` is written with the ruling's ``hearing_date``
+    (see ``insert_ruling``, #4793).
 
     A relink only ever moves a ruling onto a real case (#4788).  When the
     target case is a placeholder (``UNKNOWN-*`` / NULL case number, or no
@@ -2354,6 +2373,7 @@ def insert_document_and_ruling(
         summary_model=summary_model,
         summary_generated_at=summary_generated_at,
         force_update=force_update,
+        hearing_date_source=hearing_date_source,
     )
 
     return is_new
