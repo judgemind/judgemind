@@ -172,6 +172,37 @@ class TestRosterTypoArbitration:
                     "Postgres raises InvalidColumnReference (regression #3855):\n" + sql
                 )
 
+    def test_arbitration_skips_name_held_by_another_judge(self) -> None:
+        """Promotion into a canonical name another judge already holds is skipped (#4826).
+
+        Dev: 'Donald Gaffney' (276 rulings) is corroborated as 'Donald F. Gaffney',
+        but a second, empty judge row already has that canonical name.  The
+        UPDATE is guarded by NOT EXISTS, matches no row, and arbitration stops
+        instead of raising UniqueViolation and failing the whole document.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # Step 3b: court_code
+            ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
+            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+            [("matthew c. braner", "sd_calendar")],  # corroborated
+        ]
+        mock_cur.rowcount = 0  # the guarded UPDATE found the name already held
+
+        result = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_calendar")
+
+        assert result == "existing-judge-uuid"
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        update = next(c for c in sql if "UPDATE judges" in c)
+        assert "NOT EXISTS" in update
+        # No demotion alias for the roster name: promotion did not happen.
+        assert not any("'roster_match'" in c and "INSERT INTO judge_aliases" in c for c in sql)
+
     def test_single_non_roster_source_does_not_override_yet(self) -> None:
         """A single-source contradiction with no corroboration leaves canonical untouched.
 
