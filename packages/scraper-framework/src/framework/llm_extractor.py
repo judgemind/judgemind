@@ -2472,6 +2472,192 @@ def _reattach_fused_tail_case_numbers(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: split a fused row's ruling text (#4715)
+# ---------------------------------------------------------------------------
+#
+# The multimodal LLM sometimes returns two adjacent OC calendar rows as ONE
+# row: both captions in ``case_info`` and both cells' text in ``ruling_text``.
+# ``_split_fused_case_info`` (#2500) splits the captions, but the join gives
+# the whole text to the first sub-case and leaves the others textless:
+#
+#   [i]   entry=2,    "Herrera vs. Bodda",
+#         "OFF CALENDAR\n\n**TENTATIVE RULING:**\n\nFor the reasons ... OVERRULED ..."
+#   [i+1] entry=None, "Mosqueda vs. Ford Motor Co.", None
+#
+# In the PDF, entry 2 (Herrera) is OFF CALENDAR and entry 3 (Mosqueda) holds
+# the demurrer ruling, so the Mosqueda ruling was stored under Herrera.
+#
+# OC prints a calendar entry that has no ruling as a one-line disposition
+# ("OFF CALENDAR", "CONTINUED TO 12/16/26").  When a fused row's text starts
+# with such stub lines, each stub is one entry's whole cell, and the text that
+# follows (from a "TENTATIVE RULING:" heading or the next stub) belongs to the
+# next entry.  That is the only boundary this helper trusts.
+
+# One whole line that is a no-ruling calendar disposition.
+_STUB_DISPOSITION_LINE_RE = re.compile(
+    r"\A(?:"
+    r"(?:TAKEN\s+)?OFF[\s\-–—]*CALENDAR"
+    r"|O\s*/\s*C"
+    r"|NO\s+TENTATIVE(?:\s+RULING)?(?:\s+POSTED)?"
+    r")\s*[.!]?\Z",
+    re.IGNORECASE,
+)
+
+# The heading that opens an OC ruling cell ("TENTATIVE RULING:", often bold).
+_TENTATIVE_RULING_HEADING_RE = re.compile(r"\ATENTATIVE\s+RULING\s*:?\Z", re.IGNORECASE)
+
+
+def _plain_line(line: str) -> str:
+    """Strip whitespace and markdown emphasis markers from one line."""
+    return line.strip().strip("*_#").strip()
+
+
+def _is_stub_disposition_line(line: str) -> bool:
+    """True when ``line`` is a whole no-ruling disposition ("OFF CALENDAR")."""
+    plain = _plain_line(line)
+    if not plain:
+        return False
+    return bool(
+        _STUB_DISPOSITION_LINE_RE.match(plain)
+        or _BARE_CONTINUANCE_RE.match(plain)
+        or _BARE_DISPOSITION_RE.match(plain)
+    )
+
+
+def _split_leading_stub_segments(text: str) -> list[str]:
+    """Split ``text`` after each leading stub-disposition line.
+
+    Returns one segment per leading stub line, then one segment for the rest
+    of the text.  A boundary is placed only where every line so far in the
+    current segment is a stub and the next line is another stub or a
+    "TENTATIVE RULING:" heading.  Body text never creates a boundary, so a
+    text with no leading stub comes back as a single segment.
+    """
+    segments: list[list[str]] = [[]]
+    # True while every non-blank line seen so far is a stub disposition.
+    leading = True
+    for line in text.splitlines():
+        if not line.strip():
+            segments[-1].append(line)
+            continue
+        is_stub = _is_stub_disposition_line(line)
+        starts_entry = is_stub or bool(_TENTATIVE_RULING_HEADING_RE.match(_plain_line(line)))
+        if leading and starts_entry and any(ln.strip() for ln in segments[-1]):
+            segments.append([line])
+        else:
+            segments[-1].append(line)
+        leading = leading and is_stub
+    return [joined for s in segments if (joined := "\n".join(s).strip())]
+
+
+def _is_real_fused_tail_entry(tail: ExtractedRuling, parent: ExtractedRuling) -> bool:
+    """True when a fused tail looks like a separate calendar entry.
+
+    #4714's tails are not entries: a repeat of the row's own caption, or a
+    role-literal / placeholder caption.  Those never receive text.
+    """
+    title = (tail.extracted_case_title or "").strip()
+    if not title:
+        return False
+    if _is_role_literal_title(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title):
+        return False
+
+    def _caption(value: str) -> str:
+        return _TRAILING_OC_COURT_PREFIX_RE.sub("", value).strip().casefold()
+
+    return _caption(title) != _caption(parent.extracted_case_title or "")
+
+
+def _next_entry_skips_one(rulings: list[ExtractedRuling], index: int) -> bool:
+    """True when the next numbered row after ``index`` skips an entry number.
+
+    Corroborates that a stub-then-ruling text spans an entry the LLM lost:
+    row 12 reads "OFF CALENDAR" then a ruling, and the next row is entry 14.
+    """
+    entry = rulings[index].entry_number
+    if entry is None:
+        return False
+    for later in rulings[index + 1 :]:
+        if later.entry_number is not None:
+            return later.entry_number >= entry + 2
+    return False
+
+
+def _split_fused_row_texts(rulings: list[ExtractedRuling]) -> list[ExtractedRuling]:
+    """Give each sub-case of a fused OC row its own ruling text (#4715).
+
+    For each ruling ``P`` with text followed by a run of ``k`` fused-tail rows
+    (no entry number, no text), split ``P``'s text with
+    :func:`_split_leading_stub_segments`.  When that yields exactly ``k + 1``
+    segments, segment 0 goes to ``P`` and segment ``i`` to the ``i``-th tail.
+    A segment that is only a calendar disposition ("OFF CALENDAR") is not a
+    ruling, so its row gets ``ruling_text=None``.  Standalone stub rows are
+    dropped by ``_drop_calendar_listing_rulings``; these rows are kept
+    textless instead so positional split ids do not shift, and the worker
+    skips them.
+
+    When no boundary is found, or the segment count does not match the number
+    of tails, the text stays with ``P`` (the pre-#4715 behavior) and
+    ``llm_extractor.fused_row_text_unsplit`` is logged.  Most fused tails are
+    not separate entries at all (#4714: a repeated caption or a cited case),
+    and taking a real ruling away from its own case would lose it.
+
+    No row is added or dropped, and the output is a fixed point: after a split
+    ``P`` is textless and no text-bearing row starts with a stub line.
+    """
+    result = list(rulings)
+    i = 0
+    while i < len(result):
+        parent = result[i]
+        j = i + 1
+        while j < len(result) and _is_fused_tail(result[j]):
+            j += 1
+        tails = list(range(i + 1, j))
+        text = parent.ruling_text or ""
+        if not tails and text.strip() and parent.cross_reference_source is None:
+            segments = _split_leading_stub_segments(text)
+            if len(segments) >= 2 and _next_entry_skips_one(result, i):
+                # The LLM lost the next entry's caption entirely, so there is
+                # no row to give its text to.  Keep it off this case: a
+                # missing ruling is better than one stored under the wrong
+                # case.
+                own = None if _is_calendar_listing_only(segments[0]) else segments[0]
+                result[i] = parent.model_copy(update={"ruling_text": own})
+                logger.warning(
+                    "llm_extractor.fused_row_text_orphaned",
+                    entry_number=parent.entry_number,
+                    case_title=parent.extracted_case_title,
+                    orphaned_length=sum(len(s) for s in segments[1:]),
+                    orphaned_preview=segments[1][:100],
+                )
+        elif tails and text.strip() and parent.cross_reference_source is None:
+            segments = _split_leading_stub_segments(text)
+            real_entries = all(_is_real_fused_tail_entry(result[k], parent) for k in tails)
+            if len(segments) == len(tails) + 1 and real_entries:
+                rows = [i, *tails]
+                for row_idx, segment in zip(rows, segments, strict=True):
+                    new_text = None if _is_calendar_listing_only(segment) else segment
+                    result[row_idx] = result[row_idx].model_copy(update={"ruling_text": new_text})
+                logger.info(
+                    "llm_extractor.fused_row_text_split",
+                    entry_number=parent.entry_number,
+                    case_titles=[result[k].extracted_case_title for k in rows],
+                    text_lengths=[len(result[k].ruling_text or "") for k in rows],
+                )
+            else:
+                logger.info(
+                    "llm_extractor.fused_row_text_unsplit",
+                    entry_number=parent.entry_number,
+                    case_title=parent.extracted_case_title,
+                    tail_titles=[result[k].extracted_case_title for k in tails],
+                    segment_count=len(segments),
+                    reason="tails_not_entries" if not real_entries else "no_boundary",
+                )
+        i = j if j > i + 1 else i + 1
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cache-hit filter re-application (#2513)
 # ---------------------------------------------------------------------------
 #
@@ -2512,6 +2698,10 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
 
     The filter order is significant — see the inline notes for the rationale:
 
+    - ``_split_fused_row_texts`` (#4715): runs FIRST, while each fused tail
+      still sits right after the row it was split from (the drop filters can
+      remove that row, #4737).  It moves text between existing rows and never
+      adds or drops one, so split document IDs stay stable.
     - ``_drop_role_literal_orphan_rulings`` (#3663): drop SC body-section
       orphans BEFORE the calendar-listing filter so the orphan's long
       ruling_text does not confuse the calendar-only heuristic.
@@ -2537,6 +2727,7 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
       only copies a case number onto a ruling row and never drops a row, so
       split document IDs stay stable and a second pass is a no-op.
     """
+    rulings = _split_fused_row_texts(rulings)
     rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_preamble_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
@@ -5065,7 +5256,10 @@ def _join_page_rows(
     # ruling_text (the body almost certainly belongs to the case whose
     # title appears first in the fused string); subsequent sub-cases
     # get ruling_text=None so they do not silently claim the first
-    # case's ruling body.
+    # case's ruling body.  When the body really spans two calendar
+    # entries ("OFF CALENDAR" then the next entry's ruling),
+    # ``_split_fused_row_texts`` (#4715) moves each part to its own row in
+    # the shared filter tail below.
     #
     # When fusion splits a case into N>1 rulings, any entry_number that
     # originally pointed to this case index needs to be remapped to the
