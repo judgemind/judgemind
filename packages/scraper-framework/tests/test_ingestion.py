@@ -694,6 +694,43 @@ def test_process_event_reingest_refreshes_stale_search_doc(
     )
 
 
+@pytest.mark.parametrize(
+    ("case_number", "expect_force"),
+    [(None, True), ("23STCV12345", False)],
+)
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.upsert_case_returning_title", return_value=("case-uuid-1", "Title"))
+@patch("ingestion.worker.psycopg")
+def test_synthetic_unknown_case_title_follows_its_document(
+    mock_psycopg: MagicMock,
+    mock_upsert: MagicMock,
+    mock_resolve_judge: MagicMock,
+    case_number: str | None,
+    expect_force: bool,
+) -> None:
+    """#4715: an ``UNKNOWN-<document_id>`` case is owned by one document slot,
+    so a re-ingest that moves a different ruling into the slot must update its
+    title.  Real case numbers keep the preserve-first upsert (#2468)."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+    os_mock.get.side_effect = Exception("not found")
+
+    event = _make_event(case_number=case_number, case_title="Mosqueda vs. Ford Motor Company")
+    with (
+        patch.object(worker, "_llm_split_document", return_value=False),
+        _patch_stored_rows(_stored_row()),
+    ):
+        worker.process_event(event)
+
+    call = mock_upsert.call_args
+    if expect_force:
+        assert call.args[1] == f"UNKNOWN-{event['document_id']}"
+    assert call.kwargs["force_update"] is expect_force
+
+
 # ---------------------------------------------------------------------------
 # #4785 — the search doc is built from the committed derived.* row
 # ---------------------------------------------------------------------------
