@@ -257,6 +257,7 @@ from framework.storage import (  # noqa: E402
 )
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
+    delete_stale_split_children,
     insert_document_and_ruling,
     _expand_single_word_judge_surname,
     _looks_like_valid_judge_name,
@@ -287,7 +288,11 @@ from ingestion.llm_extract import (  # noqa: E402
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 from ingestion.ruling_guards import convert_extracted_rulings  # noqa: E402
-from ingestion.split_ids import is_split_child_id, make_split_document_id  # noqa: E402
+from ingestion.split_ids import (  # noqa: E402
+    derive_parent_document_id,
+    is_split_child_id,
+    split_child_document_id,
+)
 from validation.deterministic import run_deterministic_rules  # noqa: E402
 from validation.gate import ValidationResult, insert_validation_result  # noqa: E402
 
@@ -1617,8 +1622,10 @@ def _full_reparse_document(
 
     Each dict in the returned list includes:
       - All fields from ``_reparse_document()``
-      - ``ruling_index``: int — the 1-based ruling number within the PDF
-      - ``split_document_id``: str — deterministic UUID for the split ruling
+      - ``ruling_index``: int — the zero-based position of the ruling in
+        the split (not the splitter's entry number)
+      - ``split_document_id``: str — ``split_child_document_id(document_id,
+        ruling_index, count)``, the id the worker writes for the same ruling
       - ``is_split``: bool — True if this came from splitting
     """
     _load_scraper_registry()
@@ -1831,10 +1838,17 @@ def _full_reparse_document(
         scraper_id=scraper_id,
     )
 
+    # Split ids use the one canonical scheme (#4796, #4801): the ruling's
+    # zero-based position in the split, never the splitter's
+    # ``ruling_index`` (a court entry number for Fresno).  ``ruling_index``
+    # below is the position too, so the DB write derives the same synthetic
+    # child ``content_hash`` as the worker (``_split_index``).
     results: list[dict] = []
-    for ruling in split_results:
-        ruling_index = ruling.ruling_index
-        split_doc_id = make_split_document_id(doc_meta["document_id"], ruling_index)
+    split_count = len(split_results)
+    for ruling_index, ruling in enumerate(split_results):
+        split_doc_id = split_child_document_id(
+            doc_meta["document_id"], ruling_index, split_count
+        )
 
         # Guard against cross-contamination (#2078): when splitting
         # produces a ruling with no text, use None instead of empty
@@ -2527,6 +2541,20 @@ def _reparse_document_multimodal(
     return results
 
 
+def _resplit_guard_hash(s3_key: str | None, content_hash: str | None) -> str | None:
+    """Return the content hash that identifies the split parent of *s3_key*.
+
+    For a content-addressed key (``.../raw/<sha256>.<ext>``) that is the
+    key's hash: every row on the key comes from that one S3 object, and its
+    content parent is ``uuid5(NAMESPACE_URL, key hash)`` (#4801).  Other keys
+    fall back to the row's own ``content_hash``.
+    """
+    parsed = _parse_s3_key(s3_key) if s3_key else None
+    if parsed is not None and len(parsed["content_hash"]) == 64:
+        return parsed["content_hash"]
+    return content_hash
+
+
 def _supersede_document(
     conn: psycopg.Connection,
     document_id: str,
@@ -2721,7 +2749,7 @@ def _seed_judges_from_cursor(
             # ``reingest_batch`` (#1919, #2367, #2416).  Split children
             # share their parent's S3 object; processing them here would
             # double-count text the parent already covers.
-            if is_split_child_id(doc_id_str, content_hash):
+            if is_split_child_id(doc_id_str, _resplit_guard_hash(s3_key, content_hash)):
                 continue
 
             if not s3_key or not s3_bucket:
@@ -3044,8 +3072,17 @@ def reingest_batch(
         # from true split-child v5 IDs.  Without the content_hash, the
         # version-check alone mis-classifies regular scraper docs as split
         # children (#2367 follow-up).
+        #
+        # On a content-addressed key the check uses the *key's* hash, not
+        # the row's: only the key's content parent ``uuid5(key hash)`` may
+        # re-split the object.  A row whose id is ``uuid5(own content_hash)``
+        # but whose content_hash is a synthetic split-child hash looks like
+        # a parent to the row-hash check; re-splitting it wrote the CC / LA
+        # grandchild rows of #4801.
         re_split_mode = full_reparse or multimodal_extractor is not None
-        if re_split_mode and is_split_child_id(doc_id_str, content_hash):
+        if re_split_mode and is_split_child_id(
+            doc_id_str, _resplit_guard_hash(s3_key, content_hash)
+        ):
             logger.info(
                 "Skipping split-child document in re-split mode",
                 document_id=doc_id_str,
@@ -3317,6 +3354,25 @@ def reingest_batch(
                 # with no ruling rows at all.
                 if any_split:
                     _supersede_document(conn, doc_id_str)
+                    # Remove the key's split-child rows this split no longer
+                    # writes, as the worker does on every split path (#4700).
+                    # The content parent owns every row on its key (#4796),
+                    # so older entry-number children and grandchild rows go
+                    # too (#4801).
+                    _key_hash = _resplit_guard_hash(
+                        doc_meta.get("s3_key"), doc_meta.get("content_hash")
+                    )
+                    delete_stale_split_children(
+                        conn,
+                        doc_meta.get("s3_key") or "",
+                        [
+                            e.get("split_document_id", doc_id_str)
+                            for e in extracted_list
+                        ],
+                        parent_document_id=doc_id_str,
+                        owns_key=bool(_key_hash)
+                        and doc_id_str == derive_parent_document_id(_key_hash),
+                    )
 
                 # Sibling case numbers — used by the deterministic
                 # cross-case contamination check (#2371) to flag rulings
