@@ -3853,8 +3853,20 @@ class IngestionWorker:
             # this ingestion has no title, the existing title is preserved and
             # returned.  This prevents future null-title warnings for cases
             # that have already been titled.
+            #
+            # A synthetic ``UNKNOWN-<document_id>`` case belongs to this one
+            # document, so its incoming title wins (#4715).  A split child's
+            # id is positional: when a re-split moves a different ruling into
+            # the slot (a fused row's text given to its own case), the
+            # preserve-first upsert kept the previous ruling's caption on it.
+            synthetic_case = effective_case_number == f"UNKNOWN-{document_id}"
             case_id, effective_title = upsert_case_returning_title(
-                conn, effective_case_number, court_id, case_title=case_title, case_type=case_type
+                conn,
+                effective_case_number,
+                court_id,
+                case_title=case_title,
+                case_type=case_type,
+                force_update=synthetic_case,
             )
             if not case_title and effective_title:
                 case_title = effective_title
