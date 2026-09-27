@@ -113,3 +113,78 @@ def test_superseded_parent_revives_when_it_takes_the_ruling_back(conn: object) -
 
     assert _doc(conn, stray) is None
     assert _doc(conn, parent) == ("active", None, None, 1)
+
+
+def _cycles(conn: object, *ids: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM documents a JOIN documents b "
+            "ON a.previous_version_id = b.id AND b.previous_version_id = a.id "
+            "WHERE a.id = ANY(%s::uuid[])",
+            (list(ids),),
+        )
+        return cur.fetchone()[0]
+
+
+def test_dedup_against_a_superseded_winner_revives_it_and_forms_no_cycle(conn: object) -> None:
+    """#4813: Orange 5e2650f8 / 8a8f866c.
+
+    Row B lost dedup to row A (B.prev = A).  A shifted split later left the
+    ruling on B while B stayed superseded (written before #4811's revive, and
+    B's slot then failed validation so B was never re-written).  When A
+    re-wrote the same ruling it lost dedup to B, and the dedup path set
+    A.prev = B without looking at B: a two-row cycle, with the ruling held by
+    a superseded row.  The dedup winner holds the ruling, so it must be
+    active and must not point back at the loser.
+    """
+    court_id = upsert_court(conn, "CA", "Test County 4813", "Superior Court")
+    case_id = upsert_case(conn, "2023-04813", court_id)
+    key = f"ca/orange/superior_court/raw/{'d' * 64}.pdf"
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+
+    _write(conn, document_id=a, case_id=case_id, court_id=court_id, s3_key=key)
+    _write(conn, document_id=b, case_id=case_id, court_id=court_id, s3_key=key)
+    assert _doc(conn, b)[:3] == ("superseded", "duplicate_content", uuid.UUID(a))
+
+    # Legacy state: B holds the ruling but is still superseded, pointing at A.
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rulings SET document_id = %s::uuid WHERE document_id = %s::uuid",
+            (b, a),
+        )
+
+    _write(conn, document_id=a, case_id=case_id, court_id=court_id, s3_key=key)
+
+    assert _cycles(conn, a, b) == 0
+    assert _doc(conn, b) == ("active", None, None, 1)
+    status, change_type, prev, rulings = _doc(conn, a)
+    assert (status, change_type, str(prev), rulings) == (
+        "superseded",
+        "duplicate_content",
+        b,
+        0,
+    )
+
+
+def test_dedup_breaks_a_back_pointer_on_an_active_winner(conn: object) -> None:
+    """An active winner whose previous_version_id names the loser must drop
+    it: the loser is about to point at the winner (#4813)."""
+    court_id = upsert_court(conn, "CA", "Test County 4813", "Superior Court")
+    case_id = upsert_case(conn, "2023-14813", court_id)
+    key = f"ca/orange/superior_court/raw/{'e' * 64}.pdf"
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+
+    _write(conn, document_id=a, case_id=case_id, court_id=court_id, s3_key=key)
+    _write(conn, document_id=b, case_id=case_id, court_id=court_id, s3_key=key)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE documents SET previous_version_id = NULL WHERE id = %s::uuid", (b,))
+        cur.execute(
+            "UPDATE documents SET previous_version_id = %s::uuid WHERE id = %s::uuid",
+            (b, a),
+        )
+
+    # B is re-written and loses dedup to A again.
+    _write(conn, document_id=b, case_id=case_id, court_id=court_id, s3_key=key)
+
+    assert _cycles(conn, a, b) == 0
+    assert _doc(conn, a) == ("active", None, None, 1)

@@ -1696,7 +1696,9 @@ class TestInsertRulingContentDedup:
         )
 
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+            c
+            for c in execute_calls
+            if "UPDATE documents" in c[0][0] and "SET status = 'superseded'" in c[0][0]
         ]
         assert len(doc_update_calls) == 1
         # The loser's document_id is always the LAST positional param
@@ -1706,6 +1708,50 @@ class TestInsertRulingContentDedup:
         assert update_params[-1] == "losing-doc", (
             f"UPDATE documents must target the losing document_id (got params={update_params!r})."
         )
+
+    def test_unique_violation_revives_winner_and_breaks_back_pointer(self) -> None:
+        """#4813: the dedup winner holds the ruling, so a superseded winner is
+        revived and a winner pointing back at the loser drops that pointer
+        before the loser is linked to it — no ``previous_version_id`` cycle."""
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("winner-doc",)
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        calls = [
+            (c.args[0], c.args[1] if len(c.args) > 1 else None) for c in cur.execute.call_args_list
+        ]
+        revive = [i for i, (s, _) in enumerate(calls) if "SET status = 'active'" in s]
+        unlink = [
+            i
+            for i, (s, p) in enumerate(calls)
+            if s.startswith("UPDATE documents SET previous_version_id = NULL")
+            and p == ("winner-doc", "losing-doc")
+        ]
+        loser = [i for i, (s, _) in enumerate(calls) if "SET status = 'superseded'" in s]
+        assert len(revive) == 1 and calls[revive[0]][1] == ("winner-doc",)
+        assert "status = 'superseded'" in calls[revive[0]][0]
+        assert len(unlink) == 1
+        assert len(loser) == 1 and calls[loser[0]][1] == ("winner-doc", "losing-doc")
+        assert revive[0] < loser[0] and unlink[0] < loser[0]
 
     def test_unique_violation_supersede_in_force_update_mode(self) -> None:
         """``force_update=True`` (reingest path) still supersedes the loser.
@@ -1784,7 +1830,9 @@ class TestInsertRulingContentDedup:
         execute_calls = cur.execute.call_args_list
         # The UPDATE documents statement should set previous_version_id.
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+            c
+            for c in execute_calls
+            if "UPDATE documents" in c[0][0] and "SET status = 'superseded'" in c[0][0]
         ]
         assert len(doc_update_calls) == 1
         update_sql = doc_update_calls[0][0][0]
@@ -1873,7 +1921,9 @@ class TestInsertRulingContentDedup:
 
         execute_calls = cur.execute.call_args_list
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+            c
+            for c in execute_calls
+            if "UPDATE documents" in c[0][0] and "SET status = 'superseded'" in c[0][0]
         ]
         assert len(doc_update_calls) == 1
         update_sql = doc_update_calls[0][0][0]
@@ -4051,7 +4101,9 @@ class TestInsertRulingContentHashSupersede:
         assert delete_calls[0][0][1] == ("losing-doc-id",)
 
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+            c
+            for c in execute_calls
+            if "UPDATE documents" in c[0][0] and "SET status = 'superseded'" in c[0][0]
         ]
         assert doc_update_calls
         # The loser's document_id is always the LAST positional param

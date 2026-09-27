@@ -78,6 +78,14 @@ child id takes the re-derived case link.  A splitter change therefore needs
 only a targeted prefix reingest of the affected keys, not ``rebuild_db.py
 --reset``.  Old ``cases`` rows that lose their last ruling are left in place.
 
+Search index.  Prefix mode indexes through the worker.  DB-row mode (the
+default, without ``--prefix``) writes Postgres only: when ``OPENSEARCH_URL``
+is set it deletes the search docs of rows it leaves without a ruling (stale
+split children, a superseded split parent, dedup losers; #4813), but it
+never indexes new or changed rulings.  Follow a DB-row run with
+``scripts/reindex_search_from_db.py --apply --delete-orphans`` so search
+matches ``derived.*``.
+
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
 extraction logic, and pushes a synthetic DocumentCapturedEvent through the
@@ -2555,6 +2563,74 @@ def _resplit_guard_hash(s3_key: str | None, content_hash: str | None) -> str | N
     return content_hash
 
 
+def _drop_search_orphans(
+    conn: psycopg.Connection,
+    search_indexer: Any,
+    document_ids: list[str],
+) -> int:
+    """Delete the search docs of *document_ids* that hold no ruling row.
+
+    Run after a DB-mode commit (#4813).  A row with no ruling (deleted as a
+    stale split child, superseded as a split parent, or a content-hash dedup
+    loser) must not stay in search, or search returns a ruling that does not
+    exist (#4783).  Best-effort: the index is derivable from ``derived.*``
+    (``reindex_search_from_db.py --delete-orphans``), so a failure is logged
+    and the reingest continues.  Returns the number of ids sent for delete.
+    """
+    ids = list(dict.fromkeys(d for d in document_ids if d))
+    if not ids:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT document_id::text FROM rulings "
+                "WHERE document_id = ANY(%s::uuid[])",
+                (ids,),
+            )
+            live = {str(row[0]) for row in cur.fetchall()}
+        conn.rollback()
+    except Exception as exc:  # noqa: BLE001 — search cleanup is best-effort
+        logger.warning(
+            "search_orphan_check_failed",
+            document_ids=ids,
+            error=str(exc),
+        )
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+    orphans = [d for d in ids if d not in live]
+    if orphans:
+        search_indexer.delete_documents(orphans)
+        logger.info("search_orphans_deleted", document_ids=orphans)
+    return len(orphans)
+
+
+def _make_search_indexer(s3_client: object) -> Any | None:
+    """Return an ``IndexingConsumer`` for DB-mode orphan cleanup, or None
+    when ``OPENSEARCH_URL`` is unset (#4813)."""
+    os_url = os.environ.get("OPENSEARCH_URL", "")
+    if not os_url:
+        logger.warning(
+            "search_orphan_cleanup_disabled",
+            reason="OPENSEARCH_URL not set",
+            fix="run scripts/reindex_search_from_db.py --apply --delete-orphans",
+        )
+        return None
+    from framework.opensearch_client import make_opensearch_client
+    from framework.search.indexer import IndexingConsumer
+
+    return IndexingConsumer(
+        opensearch_client=make_opensearch_client(os_url),
+        s3_client=s3_client,
+        bucket=os.environ.get(
+            "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
+        ),
+        ensure_index=False,
+    )
+
+
 def _supersede_document(
     conn: psycopg.Connection,
     document_id: str,
@@ -2903,6 +2979,7 @@ def reingest_batch(
     multimodal_extractor: LlmExtractor | None = None,
     force_retranscribe: bool = False,
     bust_llm_cache: bool = False,
+    search_indexer: Any | None = None,
 ) -> dict[str, Any]:
     """Process one batch. Returns a dict of batch stats.
 
@@ -2938,6 +3015,13 @@ def reingest_batch(
     invokes the scraper's splitting logic (e.g. ``_split_rulings()`` for
     Riverside) to break multi-ruling PDFs into individual ruling records.
     Original unsplit documents are marked as superseded.
+
+    If *search_indexer* (an ``IndexingConsumer``) is given, search docs of
+    rows this batch left without a ruling — stale split children it deleted,
+    a superseded split parent, content-hash dedup losers — are deleted from
+    the index after each commit (#4813, the worker's #4783 pattern).  This
+    mode never indexes new or changed rulings: follow a DB-mode run with
+    ``reindex_search_from_db.py --apply``.
     """
     processed = 0
     updated = 0
@@ -3339,6 +3423,11 @@ def reingest_batch(
             if "regex_fallback_ms" in _e:
                 timing.add_ms("regex_fallback_ms", _e.pop("regex_fallback_ms"))
 
+        # Ids whose search doc may be orphaned by this write: split children
+        # deleted as stale, the superseded split parent, and any row that
+        # lost content-hash dedup (#4813).
+        removed_ids: list[str] = []
+        touched_ids: list[str] = [doc_id_str]
         try:
             with conn.transaction():
                 # Check if this document was split into multiple rulings
@@ -3370,6 +3459,7 @@ def reingest_batch(
                             for e in extracted_list
                         ],
                         parent_document_id=doc_id_str,
+                        deleted_ids=removed_ids,
                         owns_key=bool(_key_hash)
                         and doc_id_str == derive_parent_document_id(_key_hash),
                     )
@@ -3630,6 +3720,7 @@ def reingest_batch(
                     # values (including NULL when a guard cleared the
                     # field).  Text / summary fields always keep COALESCE —
                     # see ``db.insert_ruling`` docstring (#2405).
+                    touched_ids.append(effective_doc_id)
                     insert_document_and_ruling(
                         conn,
                         document_id=effective_doc_id,
@@ -3670,6 +3761,8 @@ def reingest_batch(
 
             conn.commit()
             updated += 1
+            if search_indexer is not None:
+                _drop_search_orphans(conn, search_indexer, removed_ids + touched_ids)
 
             logger.info(
                 "Committed document",
@@ -4870,6 +4963,10 @@ def run_reingest(
 
     s3_client = boto3.client("s3")
 
+    # DB mode deletes the search docs of rows it leaves without a ruling
+    # (#4813).  It does not index new or changed rulings.
+    search_indexer = None if dry_run else _make_search_indexer(s3_client)
+
     # Create LLM client for extraction (shared across batches for connection
     # reuse).  Respects LLM_PROVIDER and LLM_MODEL env vars via
     # create_llm_client().  If --no-llm is specified or no API key is
@@ -5054,6 +5151,7 @@ def run_reingest(
                 multimodal_extractor=multimodal_extractor,
                 force_retranscribe=force_retranscribe,
                 bust_llm_cache=bust_llm_cache,
+                search_indexer=search_indexer,
             )
             processed = batch_result["processed"]
             updated = batch_result["updated"]
