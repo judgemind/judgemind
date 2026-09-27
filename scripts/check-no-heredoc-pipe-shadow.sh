@@ -186,8 +186,21 @@ scan_file() {
 violations=0
 violation_lines=""
 
+# A violation needs a line matching HEREDOC_START_RE, and every such line
+# also matches the looser PREFILTER_RE (a pipe, then ``python3``, then
+# ``<<`` later on the line). One ``grep -lE`` over every target narrows
+# the per-line bash walk (and its per-file subshell) to the handful of
+# files that can match (#4720). grep -l keeps the input order.
+PREFILTER_RE='[|][[:space:]]*python3.*<<'
+CANDIDATES=()
 if [[ ${#SCAN_TARGETS[@]} -gt 0 ]]; then
-    for f in "${SCAN_TARGETS[@]}"; do
+    while IFS= read -r f; do
+        CANDIDATES+=("$f")
+    done < <(grep -lE -e "$PREFILTER_RE" -- "${SCAN_TARGETS[@]}" 2>/dev/null || true)
+fi
+
+if [[ ${#CANDIDATES[@]} -gt 0 ]]; then
+    for f in "${CANDIDATES[@]}"; do
         # Skip explicitly-excluded files.
         skip=false
         for excl in "${EXCLUDE_FILES[@]}"; do

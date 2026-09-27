@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # check-api-keys.sh — Verify external API keys are valid and have quota.
 #
+# ci-guards: skip
+#   An operational probe (AWS Secrets Manager + live API calls), not a
+#   code guard. scripts/run-ci-guards.sh skips it per its network opt-out
+#   rule (#4720). Run it by hand when checking key health.
+#
 # Sends a minimal request to each provider to confirm the key works.
 # Uses scripts/with-secret.sh for key injection — keys never appear in output.
 #

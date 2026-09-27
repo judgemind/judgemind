@@ -189,6 +189,50 @@ EOF
 assert_fails "file with from-import urlopen missing timeout= fails" \
     "$TMPDIR_TEST/bad_urlopen_from_import_no_timeout.py"
 
+# ─── Test (k): full-tree mode flags seeded violations across files (#4720) ───
+# The no-argument mode scans every scripts/**/*.py in one python3 process.
+# Seed a fake repo: two violating files, one clean file, a violation under
+# tests/ (excluded), and one file that does not parse (skipped). The scan
+# must report exactly the two violations, in sorted path order.
+FAKE_REPO="$TMPDIR_TEST/fake_repo"
+mkdir -p "$FAKE_REPO/scripts/tests" "$FAKE_REPO/scripts/sub"
+cp "$CHECK_SCRIPT" "$FAKE_REPO/scripts/check-subprocess-timeouts.sh"
+cat > "$FAKE_REPO/scripts/a_bad.py" <<'EOF'
+import subprocess
+subprocess.run(["true"])
+EOF
+cat > "$FAKE_REPO/scripts/b_good.py" <<'EOF'
+import subprocess
+subprocess.run(["true"], timeout=5)
+EOF
+cat > "$FAKE_REPO/scripts/sub/c_bad.py" <<'EOF'
+from urllib.request import urlopen
+urlopen("https://example.com")
+EOF
+cat > "$FAKE_REPO/scripts/tests/test_ignored.py" <<'EOF'
+import subprocess
+subprocess.run(["true"])
+EOF
+cat > "$FAKE_REPO/scripts/d_syntax_error.py" <<'EOF'
+def broken(:
+EOF
+TESTS=$((TESTS + 1))
+k_rc=0
+k_out="$("$FAKE_REPO/scripts/check-subprocess-timeouts.sh" 2>&1)" || k_rc=$?
+k_expected_a="    $FAKE_REPO/scripts/a_bad.py:2: subprocess.run([\"true\"])"
+k_expected_c="    $FAKE_REPO/scripts/sub/c_bad.py:2: urlopen(\"https://example.com\")"
+k_violation_count="$(printf '%s\n' "$k_out" | grep -c -E '^    /.*\.py:[0-9]+: ' || true)"
+if [[ "$k_rc" -eq 1 ]] \
+    && printf '%s\n' "$k_out" | grep -qxF "$k_expected_a" \
+    && printf '%s\n' "$k_out" | grep -qxF "$k_expected_c" \
+    && [[ "$k_violation_count" -eq 2 ]]; then
+    echo "PASS: full-tree scan flags exactly the seeded violations (tests/ excluded, syntax errors skipped)"
+else
+    echo "FAIL: full-tree scan (rc=$k_rc, violations=$k_violation_count)"
+    printf '%s\n' "$k_out" | sed 's/^/    /'
+    FAILURES=$((FAILURES + 1))
+fi
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "$TESTS tests run, $FAILURES failed"

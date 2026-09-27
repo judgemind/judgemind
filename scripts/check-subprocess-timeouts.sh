@@ -161,6 +161,7 @@ violations_total=0
 files_scanned=0
 violation_lines=()
 
+py_files=()
 while IFS= read -r -d '' py_file; do
     # Exclude any path containing /tests/ or /.venv/ segment.
     if [[ "$py_file" == */tests/* ]]; then
@@ -169,20 +170,20 @@ while IFS= read -r -d '' py_file; do
     if [[ "$py_file" == */.venv/* ]]; then
         continue
     fi
-    files_scanned=$((files_scanned + 1))
+    py_files+=("$py_file")
+done < <(find "$REPO_ROOT/scripts" -name "*.py" -print0 | sort -z)
+files_scanned=${#py_files[@]}
 
-    # Run the AST checker on this file.
-    file_output="$(python3 - "$py_file" <<'PYEOF'
+# Run the AST checker over every file in ONE python3 process (#4720).
+# Starting one interpreter per file cost ~5s of CPU across the ~300
+# scripts/*.py files. The per-file logic is unchanged.
+all_output=""
+if (( files_scanned > 0 )); then
+    all_output="$(python3 - "${py_files[@]}" <<'PYEOF'
 import ast
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-source = path.read_text()
-try:
-    tree = ast.parse(source)
-except SyntaxError:
-    sys.exit(0)
 
 def is_subprocess_run(func):
     return (
@@ -191,6 +192,7 @@ def is_subprocess_run(func):
         and isinstance(func.value, ast.Name)
         and func.value.id == "subprocess"
     )
+
 
 def is_urlopen(func):
     # urllib.request.urlopen(...)
@@ -208,30 +210,38 @@ def is_urlopen(func):
         return True
     return False
 
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
+
+for arg in sys.argv[1:]:
+    path = Path(arg)
+    source = path.read_text()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
         continue
-    func = node.func
-    if not (is_subprocess_run(func) or is_urlopen(func)):
-        continue
-    has_timeout = any(
-        kw.arg == "timeout" or kw.arg is None
-        for kw in node.keywords
-    )
-    if not has_timeout:
-        snippet = source.splitlines()[node.lineno - 1].strip()
-        print(f"{path}:{node.lineno}: {snippet}")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (is_subprocess_run(func) or is_urlopen(func)):
+            continue
+        has_timeout = any(
+            kw.arg == "timeout" or kw.arg is None
+            for kw in node.keywords
+        )
+        if not has_timeout:
+            snippet = source.splitlines()[node.lineno - 1].strip()
+            print(f"{path}:{node.lineno}: {snippet}")
 PYEOF
 )"
+fi
 
-    if [[ -n "${file_output// /}" ]]; then
-        while IFS= read -r vline; do
-            [[ -z "$vline" ]] && continue
-            violation_lines+=("$vline")
-            violations_total=$((violations_total + 1))
-        done <<< "$file_output"
-    fi
-done < <(find "$REPO_ROOT/scripts" -name "*.py" -print0 | sort -z)
+if [[ -n "${all_output// /}" ]]; then
+    while IFS= read -r vline; do
+        [[ -z "$vline" ]] && continue
+        violation_lines+=("$vline")
+        violations_total=$((violations_total + 1))
+    done <<< "$all_output"
+fi
 
 if (( violations_total > 0 )); then
     echo "ERROR: network egress call(s) missing timeout= kwarg or **kwargs splat."

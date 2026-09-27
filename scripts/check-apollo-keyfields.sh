@@ -60,22 +60,30 @@ types_without_id=""
 current_type=""
 has_id=false
 
+# The line tests use bash's built-in ``[[ =~ ]]`` (the same POSIX ERE
+# engine as ``grep -E``) rather than ``echo | grep`` / ``echo | sed``
+# per line: those spawned up to four processes per schema line and made
+# this guard one of the slowest in run-ci-guards.sh (#4720).
+TYPE_OPEN_RE='^[[:space:]]*type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\{'
+ID_FIELD_RE='^[[:space:]]*id:[[:space:]]*ID'
+TYPE_CLOSE_RE='^[[:space:]]*\}'
+
 while IFS= read -r line; do
     # Match "type TypeName {" (with possible leading whitespace)
-    if echo "$line" | grep -qE '^[[:space:]]*type[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{'; then
+    if [[ "$line" =~ $TYPE_OPEN_RE ]]; then
         # Save previous type if it was open and had no id
         if [ -n "$current_type" ] && [ "$has_id" = false ]; then
             types_without_id="$types_without_id $current_type"
         fi
-        current_type=$(echo "$line" | sed -E 's/^[[:space:]]*type[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\{.*/\1/')
+        current_type="${BASH_REMATCH[1]}"
         has_id=false
     elif [ -n "$current_type" ]; then
         # Check for id field: "id: ID!" or "id: ID"
-        if echo "$line" | grep -qE '^[[:space:]]*id:[[:space:]]*ID'; then
+        if [[ "$line" =~ $ID_FIELD_RE ]]; then
             has_id=true
         fi
         # Check for closing brace (end of type definition)
-        if echo "$line" | grep -qE '^[[:space:]]*\}'; then
+        if [[ "$line" =~ $TYPE_CLOSE_RE ]]; then
             if [ "$has_id" = false ]; then
                 types_without_id="$types_without_id $current_type"
             fi
