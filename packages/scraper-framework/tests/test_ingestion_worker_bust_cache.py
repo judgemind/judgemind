@@ -3,12 +3,8 @@
 When the worker is constructed with ``bust_llm_cache=True``, every
 ``LlmExtractor`` it lazy-creates (multimodal + framework) must be created
 with ``bust_cache=True`` so cache reads are skipped on every extraction
-call.  This is the only path through which already-split parent PDFs (whose
-split-child rows live in ``derived.documents``) can be re-extracted with a
-fresh LLM call — DB-row mode (``--multimodal --bust-llm-cache``) skips
-split-child rows via the ``is_split_child_id`` guard to avoid the #2416
-exponential explosion, leaving prefix-mode the sole avenue once a parent
-has been split.
+call.  ``reingest_from_s3.py --bust-llm-cache`` relies on it to replay a
+fresh extraction onto already-split objects.
 
 Tests use ``unittest.mock.patch`` to replace ``LlmExtractor`` at the
 worker module's import site so no Google API key is required and no real

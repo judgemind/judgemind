@@ -214,8 +214,8 @@ if ! echo "$out" | grep -q '^  Fix:'; then
     echo "FAIL: Fix block label not emitted"
     fail=1
 fi
-if ! echo "$out" | grep -q 'drain_splitter_carry_forward_clusters.py'; then
-    echo "FAIL: Fix block missing reference to drain_splitter_carry_forward_clusters.py"
+if ! echo "$out" | grep -q 'audit_correctly_labeled_s3_orphans.py'; then
+    echo "FAIL: Fix block missing reference to audit_correctly_labeled_s3_orphans.py"
     fail=1
 fi
 if ! echo "$out" | grep -q 'audit_correctly_labeled_s3_orphans.py'; then

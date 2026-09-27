@@ -3,8 +3,7 @@
 # permanent: true
 """check_split_ruling_fields_propagated.py — AST scanner that verifies every
 ``*SplitRuling`` dataclass field is propagated through the worker's
-``_try_<county>_split`` dispatcher AND the reingest path's
-``_full_reparse_document`` (issue #4298).
+``_try_<county>_split`` dispatcher (issue #4298).
 
 Driven by ``scripts/check-split-ruling-fields-propagated.sh``.  See that
 wrapper for the CI integration story.
@@ -19,38 +18,41 @@ day-of-bench judges in production.
 
 The latent failure shape: when a contributor adds a new field to a
 ``*SplitRuling`` dataclass, there is no static check that flags missing
-propagation through the worker's split-event builder or the reingest's
-extracted-dict builder.  The same shape applies to ``SDSplitRuling``,
-``SplitRuling`` (Fresno), Riverside ``SplitRuling``, and any future
-``*SplitRuling`` introduced for new counties.
+propagation through the worker's split-event builder.  The same shape
+applies to ``SDSplitRuling``, ``SplitRuling`` (Fresno), Riverside
+``SplitRuling``, and any future ``*SplitRuling`` introduced for new
+counties.
+
+The worker is the only write path.  ``scripts/reingest_from_s3.py`` used
+to carry its own ``_full_reparse_document`` extracted-dict builder, which
+this check also scanned; #4845 collapsed reingest onto
+``IngestionWorker.process_event``, so the worker's split dispatchers now
+cover both live ingestion and reingest.
 
 What this scan flags
 --------------------
-For each registered ``*SplitRuling`` dataclass / ``__slots__`` class:
+For each registered ``*SplitRuling`` dataclass / ``__slots__`` class with
+a ``worker_fn`` in ``_DATACLASS_SCOPE``, every non-internal field MUST
+appear as a key in that worker function's ``split_event`` dict literal.
 
-  1. Every non-internal field MUST appear as a key in the corresponding
-     worker function's ``split_event`` dict literal (or, for dataclasses
-     with no worker function, this check is skipped — see
-     ``_DATACLASS_SCOPE``).
-  2. Every non-internal field MUST appear in the reingest path's
-     ``_full_reparse_document`` either as a key in the ``extracted`` dict
-     literal OR as a direct ``ruling.<field>`` attribute access OR as a
-     ``getattr(ruling, "<field>", ...)`` access on the loop variable.
+Every discovered ``*SplitRuling`` MUST be registered in
+``_DATACLASS_SCOPE``, even one with no worker dispatcher (registered with
+no ``worker_fn``), so a new dataclass cannot silently skip the check.
 
 Internal fields (``ruling_index``) are excluded — they are loop-control
 state, not part of the per-ruling payload.
 
-Known propagation gaps that the check tolerates today are listed in
+Known propagation gaps that the check tolerates are listed in
 ``_KNOWN_PROPAGATION_GAPS`` with explicit issue references.  Adding to
 this list requires a TODO with a tracking issue number — the goal is to
-shrink it to empty over time as the gaps are closed.
+keep it empty.
 
 Usage
 -----
 
     python3 scripts/check_split_ruling_fields_propagated.py \\
         [--scraper-framework PATH] \\
-        [--reingest PATH]
+        [--worker PATH]
 
 Defaults resolve to the repo's standard locations.  Both flags are
 provided so the script can be unit-tested against synthesized inputs.
@@ -59,7 +61,7 @@ Exit codes
 ----------
 
   0 — All ``*SplitRuling`` fields are propagated through the registered
-      worker + reingest paths (modulo the documented exclusion list).
+      worker paths (modulo the documented exclusion list).
   1 — At least one propagation gap was detected.
 
 Output
@@ -88,71 +90,41 @@ from pathlib import Path
 # propagation check.
 _INTERNAL_FIELDS: frozenset[str] = frozenset({"ruling_index"})
 
-# Per-dataclass scope: which paths (worker, reingest) the check should
-# verify.  Some dataclasses have no worker dispatcher today (CCSplitRuling
-# is LLM-only via the reingest registry), and the check must not flag
-# them as missing from a function that doesn't exist.  Keys are
-# dataclass class names.
-#
-# Each entry is a dict with two optional keys:
+# Per-dataclass scope.  Keys are dataclass class names.  Each entry may
+# carry:
 #   ``worker_fn``  — name of the ``_try_<county>_split`` function in
 #                    ``ingestion/worker.py`` that consumes this dataclass.
-#                    Omitted means "no worker dispatcher today; reingest
-#                    only".
-#   ``reingest``   — True if the dataclass flows through
-#                    ``scripts/reingest_from_s3.py::_full_reparse_document``.
-#                    All known dataclasses do; this defaults to True.
+#                    Omitted means "no worker dispatcher today" — the
+#                    dataclass is registered (so it is not flagged as an
+#                    unknown ``*SplitRuling``) but there is no function to
+#                    check its fields against.
+# Any other keys in an entry are ignored.
 _DATACLASS_SCOPE: dict[str, dict[str, object]] = {
-    "LASplitRuling": {"worker_fn": "_try_la_html_split", "reingest": True},
-    "SDSplitRuling": {"worker_fn": "_try_sd_calendar_split", "reingest": True},
+    "LASplitRuling": {"worker_fn": "_try_la_html_split"},
+    "SDSplitRuling": {"worker_fn": "_try_sd_calendar_split"},
     # Fresno + Riverside + SF + Santa Clara all name their dataclass plain
     # ``SplitRuling`` — we disambiguate by source-file path during dataclass
     # discovery.
-    "SplitRuling@fresno_tentatives": {
-        "worker_fn": "_try_fresno_pdf_split",
-        "reingest": True,
-    },
-    "SplitRuling@riverside_tentatives": {
-        "worker_fn": "_try_riverside_pdf_split",
-        "reingest": True,
-    },
-    "SplitRuling@sf_tentatives": {
-        "worker_fn": "_try_sf_pdf_split",
-        "reingest": True,
-    },
-    "SplitRuling@sc_tentatives": {
-        "worker_fn": "_try_sc_pdf_split",
-        "reingest": True,
-    },
-    # CC has no worker dispatcher today — its split path runs only via the
-    # reingest LLM split registry.  When CC is wired into worker.py, add
+    "SplitRuling@fresno_tentatives": {"worker_fn": "_try_fresno_pdf_split"},
+    "SplitRuling@riverside_tentatives": {"worker_fn": "_try_riverside_pdf_split"},
+    "SplitRuling@sf_tentatives": {"worker_fn": "_try_sf_pdf_split"},
+    "SplitRuling@sc_tentatives": {"worker_fn": "_try_sc_pdf_split"},
+    # CC has no worker dispatcher today, so there is no ``split_event``
+    # literal to check ``CCSplitRuling`` against — it is registered only so
+    # the unknown-dataclass contract stays satisfied.  (It used to be checked
+    # against the reingest path's ``_full_reparse_document``, which #4845
+    # removed.)  When CC is wired into worker.py, add
     # ``"worker_fn": "_try_cc_pdf_split"`` here.
-    "CCSplitRuling": {"reingest": True},
+    "CCSplitRuling": {},
 }
 
-# Known propagation gaps that the check intentionally tolerates today.
-# Each entry must reference a tracking issue.  The goal is to shrink this
-# to empty over time.  The check exits 0 when the only violations are
-# whitelisted here, but logs a warning so the gaps stay visible.
+# Known propagation gaps that the check intentionally tolerates.  Each
+# entry must reference a tracking issue.  The goal is to keep this empty.
+# The check exits 0 when the only violations are whitelisted here, but
+# logs a warning so the gaps stay visible.
 #
-# Schema: dataclass-class-name -> {target -> {field-set}} where target is
-# "worker" or "reingest".
-#
-# Note: ``parties`` is intentionally NOT whitelisted.  ``_full_reparse_document``
-# DOES carry the ``parties`` key in its extracted-dict literal (hardcoded to
-# ``[]``), so this check — which scans for field-name propagation, not for
-# whether the propagated value is non-empty — sees it as present.  The
-# semantic gap (per-case parties from the splitter are dropped and refilled
-# by LLM enrichment) is a separate concern and out of scope for this check.
-_KNOWN_PROPAGATION_GAPS: dict[str, dict[str, frozenset[str]]] = {
-    # ``ruling_text_html`` is set on ``LASplitRuling`` by the deterministic
-    # LA HTML splitter (#2450) and IS propagated through the worker's
-    # ``_try_la_html_split`` split_event dict.  The reingest path
-    # ``_full_reparse_document`` does not currently surface it — every LA
-    # reingest after #2450 loses the per-case HTML.  Tracked separately
-    # as a follow-up to #4298 (filed during retrospective).
-    "LASplitRuling": {"reingest": frozenset({"ruling_text_html"})},
-}
+# Schema: dataclass-class-name -> {"worker" -> {field-set}}.
+_KNOWN_PROPAGATION_GAPS: dict[str, dict[str, frozenset[str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +150,7 @@ class DataclassDef:
 class Violation:
     dataclass_name: str
     field: str
-    target: str  # "worker" or "reingest"
+    target: str  # "worker" or "scope"
     function_name: str
     file_path: str
 
@@ -225,13 +197,14 @@ def _extract_dataclass_fields(node: ast.ClassDef) -> frozenset[str]:
         # Shape 2: ``__slots__ = (...)``
         if isinstance(stmt, ast.Assign):
             for tgt in stmt.targets:
-                if isinstance(tgt, ast.Name) and tgt.id == "__slots__":
-                    if isinstance(stmt.value, (ast.Tuple, ast.List)):
-                        for elt in stmt.value.elts:
-                            if isinstance(elt, ast.Constant) and isinstance(
-                                elt.value, str
-                            ):
-                                fields.add(elt.value)
+                if (
+                    isinstance(tgt, ast.Name)
+                    and tgt.id == "__slots__"
+                    and isinstance(stmt.value, (ast.Tuple, ast.List))
+                ):
+                    for elt in stmt.value.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            fields.add(elt.value)
 
     return frozenset(fields)
 
@@ -248,7 +221,6 @@ def discover_dataclasses(scraper_framework_root: Path) -> list[DataclassDef]:
         return []
 
     found: list[DataclassDef] = []
-    bare_name_counts: dict[str, int] = {}
 
     for py_file in sorted(courts_root.rglob("*.py")):
         try:
@@ -263,7 +235,6 @@ def discover_dataclasses(scraper_framework_root: Path) -> list[DataclassDef]:
                     # Empty class body or non-field statements — skip.
                     continue
                 bare = node.name
-                bare_name_counts[bare] = bare_name_counts.get(bare, 0) + 1
                 # Use the disambiguated key when the bare name is shared
                 # across multiple files.  ``_DATACLASS_SCOPE`` mirrors this
                 # naming for SplitRuling (Fresno) / SplitRuling (Riverside).
@@ -347,104 +318,6 @@ def discover_worker_functions(
 
 
 # ---------------------------------------------------------------------------
-# Discovery: reingest ``_full_reparse_document``
-# ---------------------------------------------------------------------------
-
-
-def _ruling_attrs_in_function(
-    node: ast.FunctionDef, loop_var: str = "ruling"
-) -> frozenset[str]:
-    """Return the set of attribute names accessed on the ``ruling`` loop
-    variable (or an alias, if the body assigns one) inside *node*.
-
-    Recognizes:
-      * ``ruling.<name>`` direct attribute access
-      * ``getattr(ruling, "<name>", ...)`` calls
-
-    Aliases of ``ruling`` are not tracked — the reingest path uses the
-    canonical name everywhere today.
-    """
-    attrs: set[str] = set()
-    for sub in ast.walk(node):
-        # ruling.<attr>
-        if (
-            isinstance(sub, ast.Attribute)
-            and isinstance(sub.value, ast.Name)
-            and sub.value.id == loop_var
-        ):
-            attrs.add(sub.attr)
-
-        # getattr(ruling, "<attr>", default)
-        if (
-            isinstance(sub, ast.Call)
-            and isinstance(sub.func, ast.Name)
-            and sub.func.id == "getattr"
-            and len(sub.args) >= 2
-            and isinstance(sub.args[0], ast.Name)
-            and sub.args[0].id == loop_var
-            and isinstance(sub.args[1], ast.Constant)
-            and isinstance(sub.args[1].value, str)
-        ):
-            attrs.add(sub.args[1].value)
-
-    return frozenset(attrs)
-
-
-def _extracted_dict_keys_in_function(node: ast.FunctionDef) -> frozenset[str]:
-    """Walk *node* and return the union of literal string keys assigned
-    to any ``extracted = {...}`` (or ``extracted: dict = {...}``) literal.
-    """
-    keys: set[str] = set()
-    for sub in ast.walk(node):
-        targets: list[ast.expr] = []
-        value: ast.expr | None = None
-        if isinstance(sub, ast.Assign):
-            targets = list(sub.targets)
-            value = sub.value
-        elif isinstance(sub, ast.AnnAssign):
-            targets = [sub.target] if sub.target is not None else []
-            value = sub.value
-        else:
-            continue
-
-        if not any(isinstance(t, ast.Name) and t.id == "extracted" for t in targets):
-            continue
-        if not isinstance(value, ast.Dict):
-            continue
-        for k in value.keys:
-            if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                keys.add(k.value)
-    return frozenset(keys)
-
-
-def discover_reingest_propagation(
-    reingest_path: Path,
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Parse ``_full_reparse_document`` in *reingest_path* and return:
-
-      * the set of literal keys in the function's ``extracted`` dict literal
-      * the set of attribute names accessed on the ``ruling`` loop variable
-
-    A field is considered "propagated" through reingest if it appears in
-    EITHER set.  Returns two empty frozensets if the function is not
-    found.
-    """
-    if not reingest_path.is_file():
-        return (frozenset(), frozenset())
-
-    tree = ast.parse(
-        reingest_path.read_text(encoding="utf-8"), filename=str(reingest_path)
-    )
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_full_reparse_document":
-            return (
-                _extracted_dict_keys_in_function(node),
-                _ruling_attrs_in_function(node),
-            )
-    return (frozenset(), frozenset())
-
-
-# ---------------------------------------------------------------------------
 # Fix-block guidance: copy-pasteable patch for scope-table omissions
 # ---------------------------------------------------------------------------
 
@@ -461,9 +334,7 @@ def _suggest_worker_fn_name(stem: str, worker_path: Path) -> tuple[str, bool]:
     ``(_try_<county>_pdf_split, False)`` so the Fix block is still
     copy-pasteable — the operator just edits the format if needed.
     """
-    county = stem
-    if county.endswith("_tentatives"):
-        county = county[: -len("_tentatives")]
+    county = stem.removesuffix("_tentatives")
 
     if not worker_path.is_file():
         return (f"_try_{county}_pdf_split", False)
@@ -516,12 +387,13 @@ def _suggest_scope_entry(dc: DataclassDef, worker_path: Path) -> str:
 
     lines = [
         "",
-        "Fix: Add this entry to _DATACLASS_SCOPE in "
-        "scripts/check_split_ruling_fields_propagated.py:",
+        (
+            "Fix: Add this entry to _DATACLASS_SCOPE in "
+            "scripts/check_split_ruling_fields_propagated.py:"
+        ),
         "",
         f'    "{scope_key}": {{',
         f'        "worker_fn": "{worker_fn}",{worker_comment}',
-        '        "reingest": True,',
         "    },",
         "",
     ]
@@ -546,12 +418,9 @@ def _whitelist(target: str, dataclass_key: str) -> frozenset[str]:
 def cross_check(
     dataclasses: list[DataclassDef],
     worker_fns: dict[str, frozenset[str]],
-    reingest_extracted: frozenset[str],
-    reingest_ruling_attrs: frozenset[str],
     worker_path: Path,
-    reingest_path: Path,
 ) -> tuple[list[Violation], list[Violation]]:
-    """Cross-reference dataclass fields against worker + reingest sets.
+    """Cross-reference dataclass fields against the worker's split events.
 
     Returns ``(blocking, whitelisted)`` — blocking violations cause a
     non-zero exit; whitelisted ones are logged but don't fail the run.
@@ -576,56 +445,41 @@ def cross_check(
             )
             continue
 
-        non_internal = dc.fields - _INTERNAL_FIELDS
-
-        # Worker check
         worker_fn = scope.get("worker_fn")
-        if isinstance(worker_fn, str):
-            keys = worker_fns.get(worker_fn, frozenset())
-            wl = _whitelist("worker", dc.key)
-            if not keys and worker_fn:
-                # Function not found in worker.py at all — that's a hard
-                # error.  Either the scope table is wrong or worker.py
-                # is corrupt.
-                blocking.append(
-                    Violation(
-                        dataclass_name=dc.class_name,
-                        field="<function not found>",
-                        target="worker",
-                        function_name=worker_fn,
-                        file_path=str(worker_path),
-                    )
-                )
-            else:
-                for f in sorted(non_internal - keys):
-                    v = Violation(
-                        dataclass_name=dc.class_name,
-                        field=f,
-                        target="worker",
-                        function_name=worker_fn,
-                        file_path=str(worker_path),
-                    )
-                    if f in wl:
-                        whitelisted.append(v)
-                    else:
-                        blocking.append(v)
+        if not isinstance(worker_fn, str) or not worker_fn:
+            # Registered with no worker dispatcher — nothing to check.
+            continue
 
-        # Reingest check
-        if scope.get("reingest", True):
-            reingest_combined = reingest_extracted | reingest_ruling_attrs
-            wl = _whitelist("reingest", dc.key)
-            for f in sorted(non_internal - reingest_combined):
-                v = Violation(
+        non_internal = dc.fields - _INTERNAL_FIELDS
+        keys = worker_fns.get(worker_fn, frozenset())
+        if not keys:
+            # Function not found in worker.py at all — that's a hard
+            # error.  Either the scope table is wrong or worker.py is
+            # corrupt.
+            blocking.append(
+                Violation(
                     dataclass_name=dc.class_name,
-                    field=f,
-                    target="reingest",
-                    function_name="_full_reparse_document",
-                    file_path=str(reingest_path),
+                    field="<function not found>",
+                    target="worker",
+                    function_name=worker_fn,
+                    file_path=str(worker_path),
                 )
-                if f in wl:
-                    whitelisted.append(v)
-                else:
-                    blocking.append(v)
+            )
+            continue
+
+        wl = _whitelist("worker", dc.key)
+        for f in sorted(non_internal - keys):
+            v = Violation(
+                dataclass_name=dc.class_name,
+                field=f,
+                target="worker",
+                function_name=worker_fn,
+                file_path=str(worker_path),
+            )
+            if f in wl:
+                whitelisted.append(v)
+            else:
+                blocking.append(v)
 
     return blocking, whitelisted
 
@@ -644,19 +498,11 @@ def _default_scraper_framework_root() -> Path:
     )
 
 
-def _default_reingest_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "scripts" / "reingest_from_s3.py"
-
-
-def _default_worker_path() -> Path:
-    return _default_scraper_framework_root() / "ingestion" / "worker.py"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Verify that every *SplitRuling dataclass field is propagated "
-            "through the worker + reingest split paths (issue #4298)."
+            "through the worker's split dispatchers (issue #4298)."
         ),
     )
     parser.add_argument(
@@ -675,12 +521,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--reingest",
-        type=Path,
-        default=_default_reingest_path(),
-        help="Path to scripts/reingest_from_s3.py (default: repo root).",
-    )
-    parser.add_argument(
         "--quiet-whitelisted",
         action="store_true",
         help=(
@@ -696,7 +536,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.worker is not None
         else (scraper_root / "ingestion" / "worker.py")
     )
-    reingest_path: Path = args.reingest
 
     dataclasses = discover_dataclasses(scraper_root)
     if not dataclasses:
@@ -710,18 +549,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     worker_fns = discover_worker_functions(worker_path)
-    reingest_extracted, reingest_ruling_attrs = discover_reingest_propagation(
-        reingest_path
-    )
 
-    blocking, whitelisted = cross_check(
-        dataclasses,
-        worker_fns,
-        reingest_extracted,
-        reingest_ruling_attrs,
-        worker_path,
-        reingest_path,
-    )
+    blocking, whitelisted = cross_check(dataclasses, worker_fns, worker_path)
 
     if whitelisted and not args.quiet_whitelisted:
         for v in whitelisted:
@@ -733,11 +562,11 @@ def main(argv: list[str] | None = None) -> int:
     if blocking:
         # Index dataclasses by bare class name so we can look up file_path
         # when emitting the Fix block for ``<class itself>`` (scope-table)
-        # violations.  The bare name is unique enough for the scope-omission
-        # case — when two SplitRuling classes share the bare name (Fresno
-        # + Riverside today), both must be registered in _DATACLASS_SCOPE,
-        # so two scope violations fire and each gets its own Fix block.
-        # We map class_name → list[DataclassDef] to handle that case.
+        # violations.  When two SplitRuling classes share the bare name
+        # (Fresno + Riverside today), both must be registered in
+        # _DATACLASS_SCOPE, so two scope violations fire and each gets its
+        # own Fix block.  We map class_name → list[DataclassDef] to handle
+        # that case.
         dc_by_name: dict[str, list[DataclassDef]] = {}
         for dc in dataclasses:
             dc_by_name.setdefault(dc.class_name, []).append(dc)
@@ -750,24 +579,17 @@ def main(argv: list[str] | None = None) -> int:
                 # ``SplitRuling@<stem>`` disambiguator) and probe worker.py
                 # for an existing ``_try_<county>_split`` function.
                 candidates = dc_by_name.get(v.dataclass_name, [])
-                # If multiple dataclasses share the bare name, emit one Fix
-                # block per — they are independently scope-violating.
-                # Otherwise the loop runs at most once.
                 emitted_keys: set[str] = set()
                 for dc in candidates:
-                    fix_block = _suggest_scope_entry(dc, worker_path)
-                    # Avoid duplicates if a single iteration of the outer
-                    # blocking loop encounters the same DataclassDef again
-                    # via a different violation.
                     key = f"{dc.class_name}@{Path(dc.file_path).stem}"
                     if key in emitted_keys:
                         continue
                     emitted_keys.add(key)
-                    print(fix_block, file=sys.stderr)
+                    print(_suggest_scope_entry(dc, worker_path), file=sys.stderr)
         print(
             f"\nFound {len(blocking)} *SplitRuling propagation gap(s).  "
-            "Either propagate the field through the worker / reingest path, "
-            "or add it to _KNOWN_PROPAGATION_GAPS in "
+            "Either propagate the field through the worker's split_event "
+            "dict, or add it to _KNOWN_PROPAGATION_GAPS in "
             "scripts/check_split_ruling_fields_propagated.py with a "
             "tracking issue.",
             file=sys.stderr,

@@ -2447,24 +2447,11 @@ def default_config_appellate(s3_bucket: str = "") -> ScraperConfig:
 # ---------------------------------------------------------------------------
 # Multi-scraper module registry hint (#2599)
 # ---------------------------------------------------------------------------
-# This module exposes two scrapers; the ``_load_scraper_registry`` discovery
-# in ``scripts/reingest_from_s3.py`` uses this mapping to pair each
+# This module exposes two scrapers; the scraper discovery in
+# ``ingestion.raw_hearing_date`` uses this mapping to pair each
 # ``scraper_id`` with its concrete class.  Without it, alphabetical class
 # iteration picks the wrong class for ``ca-la-tentatives-civil``.
 _SCRAPER_CLASS_BY_ID: dict[str, type] = {
     "ca-la-tentatives-civil": LATentativeRulingsScraper,
     "ca-la-tentatives-appellate": LAAppellateTentativeRulingsScraper,
 }
-
-# Extra scraper_ids under which this module's ``_SCRAPER_REGISTRY`` (#4386),
-# ``_split_rulings`` (#4331), and ``_llm_extract_rulings`` (#4331) should be
-# registered.  Required so audit / drain / reingest scripts that key on
-# ``documents.scraper_id`` resolve the scraper class and splitter on rebuild-
-# path rows (rows reconstructed from S3 by ``scripts/rebuild_db.py``, which
-# emits ``rebuild-ca-los_angeles`` instead of the live ``ca-la-...`` id).
-# Both civil and appellate share this rebuild id since they're produced from
-# the same county slug.  See #4331 (split-registry aliasing) and #4386
-# (scraper-class registry aliasing — without it, ``_reparse_document``
-# returned ``None`` for the scraper class, ``parse_document`` was never
-# called, and the LA rebuild path silently dropped its judge_id resolution).
-_SPLIT_REGISTRY_ALIASES: list[str] = ["rebuild-ca-los_angeles"]

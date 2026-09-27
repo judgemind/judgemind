@@ -241,7 +241,7 @@ def get_county_extraction_config(
 # Extraction strategy — single source of truth for worker + reingest gates
 # ---------------------------------------------------------------------------
 # The ingestion worker (``packages/scraper-framework/src/ingestion/worker.py``)
-# and the reingest path (``scripts/reingest_from_s3.py``) both decide:
+# decides, for live capture, rebuild and reingest alike (#4845):
 #
 #   - Should the framework LLM be skipped entirely? (``ExtractionMethod.NONE``)
 #   - Should the multimodal extractor handle this document? (raw-PDF + per-page
@@ -254,13 +254,12 @@ def get_county_extraction_config(
 # spelled the gate logic out itself.  When ``ExtractionMethod`` gained the
 # ``NONE`` value the worker honored it but reingest did not — producing the
 # divergence pattern in #2490, #2501, #2502, #2521, #4056.  The Option A
-# parity test in ``tests/test_worker_reingest_parity.py`` (#4071) was the
-# preventative; this helper is the structural fix described in #4081 (Option B).
+# parity test (#4071) was the preventative; this helper is the structural fix
+# described in #4081 (Option B), and #4845 removed the second path.
 #
-# Both paths now call ``decide_extraction_strategy(...)`` once and read the
-# resulting ``ExtractionStrategy`` fields.  Adding a new ``ExtractionMethod``
-# value or a new ``CountyExtractionConfig`` field updates both paths in one
-# place — the divergence pattern becomes structurally impossible.
+# The worker calls ``decide_extraction_strategy(...)`` once and reads the
+# resulting ``ExtractionStrategy`` fields, so a new ``ExtractionMethod``
+# value or ``CountyExtractionConfig`` field is handled in one place.
 #
 # Default semantics for unconfigured (state, county, scraper_id) tuples
 # preserve the worker's pre-refactor behavior:
@@ -294,10 +293,7 @@ class ExtractionStrategy:
             configured OR no config exists for the (state, county,
             scraper_id) tuple.  Worker uses this to decide whether to
             download the raw PDF from S3 and route to the per-page
-            multimodal extractor.  Reingest's ``_reparse_document`` does
-            not have a multimodal sub-path today, so the flag is
-            informational there — but exposing it keeps the strategy
-            self-describing for future reingest enhancements.
+            multimodal extractor.
         max_output_tokens: Per-call max output tokens for the LLM.
             Defaults to ``4096`` when no override is configured (#2355).
         system_prompt: County-specific system prompt, or ``None`` to use
@@ -329,9 +325,8 @@ def decide_extraction_strategy(
 ) -> ExtractionStrategy:
     """Resolve the extraction strategy for a (state, county, scraper_id) tuple.
 
-    Single source of truth for both ``ingestion.worker`` and
-    ``scripts/reingest_from_s3.py``.  See module docstring for the full
-    divergence-history rationale.
+    Single source of truth for ``ingestion.worker``.  See module docstring
+    for the divergence-history rationale.
 
     Parameters
     ----------

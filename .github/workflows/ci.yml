@@ -49,8 +49,8 @@ jobs:
               - 'packages/scraper-framework/**'
               - 'packages/judgemind-config/**'
               # Top-level scripts/*.py imported by tests in the
-              # ingestion-tests job (test_reingest_from_s3.py,
-              # test_reingest_registry.py).  Without these entries a PR
+              # ingestion-tests job (test_reingest_from_s3.py).
+              # Without these entries a PR
               # that only modifies the script skips ingestion-tests
               # entirely — the slip-through that produced #4449 (PR
               # #4421 modified scripts/reingest_from_s3.py only, the
@@ -290,7 +290,6 @@ jobs:
           .venv/bin/pytest tests/ -n auto --dist worksteal -v --tb=short --durations=30
           --ignore=tests/courts/
           --ignore=tests/test_reingest_from_s3.py
-          --ignore=tests/test_reingest_registry.py
           --ignore=tests/test_ingestion.py
           --ignore=tests/test_extract.py
       - name: Upload coverage
@@ -446,7 +445,6 @@ jobs:
         run: >-
           .venv/bin/pytest
           tests/test_reingest_from_s3.py
-          tests/test_reingest_registry.py
           tests/test_ingestion.py
           tests/test_extract.py
           -n auto --dist worksteal -v --tb=short --durations=30
@@ -1272,8 +1270,8 @@ jobs:
   # ---------------------------------------------------------------
   # SplitRuling field-propagation guard: every per-county
   # *SplitRuling dataclass field must be propagated through the
-  # ingestion worker's _try_<county>_split dispatcher AND the
-  # reingest path's _full_reparse_document.  See #4298 for the
+  # ingestion worker's _try_<county>_split dispatcher (the one write
+  # path since #4845).  See #4298 for the
   # check, #4282 for the latent bug class it prevents (LASplitRuling
   # had no judge_name field for years; the worker carried a stale
   # comment about its absence and nobody noticed).
@@ -1282,7 +1280,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Verify SplitRuling fields propagate through worker and reingest paths
+      - name: Verify SplitRuling fields propagate through the worker split dispatchers
         run: scripts/check-split-ruling-fields-propagated.sh
 
   # ---------------------------------------------------------------
@@ -1572,21 +1570,6 @@ jobs:
       - uses: actions/checkout@v6
       - name: Enforce dual LLM extraction path symmetry
         run: scripts/check-llm-paths-symmetry.sh
-
-  # ---------------------------------------------------------------
-  # case_type fallback chain parity: worker.py (live ingestion) and
-  # _apply_regex_fallbacks in reingest_from_s3.py (reparse) must
-  # reference the same set of extract_case_type_from_* helpers.  The
-  # pattern of one path adding a helper that never lands in the other
-  # has recurred 6 times over four years (#1731, #1749, #1763, #1836,
-  # #2062 surfaced as #4263, #2406) — see #4290.
-  # ---------------------------------------------------------------
-  case-type-fallback-parity-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Enforce case_type fallback chain parity
-        run: scripts/check-case-type-fallback-parity.sh
 
   # ---------------------------------------------------------------
   # Test DATABASE_URL fallback guard: api tests must read
@@ -2412,7 +2395,6 @@ jobs:
       - docs-tailwind-drift-check
       - llm-json-loads-check
       - llm-paths-symmetry-check
-      - case-type-fallback-parity-check
       - oneshot-imports-check
       - no-basicconfig-with-extra-check
       - no-manual-sys-modules-mock-check

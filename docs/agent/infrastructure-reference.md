@@ -416,7 +416,7 @@ This closes the race window observed in PR #2907 where a new resolver shipped on
 scripts/ecs-run-task.sh scripts/backfill_llm_enrichment.py -- --dry-run
 
 # Long-running tasks: launch and detach, then wait via the helper
-scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --county Orange
 scripts/ecs-wait-task.sh                    # reads tmp/last-ecs-task.arn auto-saved on detach
 scripts/ecs-run-task.sh --logs <task-arn>   # alternative: stream logs after the fact
 
@@ -564,7 +564,7 @@ Burst consumers — watch these when launching oneshot tasks:
 | Consumer | Max connections | Notes |
 |---|---|---|
 | `rebuild_db.py --concurrency N` | **N + 1** | One per `ProcessPoolExecutor` worker, plus the main process's reset connection (default `--concurrency 64` → 65 connections; `--concurrency 16` → 17) |
-| `reingest_from_s3.py` | 1-2 | Single-process script |
+| `reingest_from_s3.py --concurrency N` | **N + 2** | One per `ProcessPoolExecutor` worker (default `--concurrency 10`), plus the key-selection and judge pre-pass connections |
 | `enrich_all_rulings.py` | 1-2 | Single-process script, but holds a long-running transaction |
 | `scripts/dev-db-query.sh` | 1 | One-shot query per invocation |
 
@@ -623,15 +623,15 @@ Best practices:
 
 ### Reingest vs Rebuild
 
-`reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
+`reingest_from_s3.py` has one write path (#4845): every S3 object it re-ingests runs through `IngestionWorker.process_event` as a split-set replacement, the same code live capture and `rebuild_db.py` use. It only chooses the objects. **DB-row mode** (the default) selects the S3 keys of existing `documents` rows that match the filters (`--county`, dates, `--case-number-like`, `--department-in`, `--s3-key-list`, ...); if a county has no records in the `documents` table it re-ingests 0 keys. **Prefix mode** (`--prefix`) lists the objects in S3 instead. Search is indexed by the worker in both modes. The DB-row write path and its flags (`--full-reparse`, `--multimodal`, `--no-llm`, `--force-llm`, `--force-retranscribe`, `--checkpoint-file` / `--resume`, `--batch-size`, `--parse-workers`, `--report-metrics`) were removed in #4845.
 
 | Scenario | Script | Why |
 |---|---|---|
 | Cleanup orphaned/corrupted `derived.*` state (failed run, bad IDs, partial mutation) | `rebuild_db.py --county <name>` | `derived.*` is fully rebuildable from S3. Rebuild is idempotent, validates the real ingestion/enrichment path (fixing inbound data, not just existing rows), and handles edge cases surgical scripts miss. Surgical one-offs often introduce bugs of their own — only write one if rebuild cost is prohibitive at the affected scale. |
-| Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries `documents` table — only works when records already exist |
+| Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` (add `--bust-llm-cache` after a prompt change) | Selects the keys from the `documents` table (only works when records already exist) and re-ingests each object through the worker |
 | Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name>` | Discovers documents directly from S3 keys — does not require pre-existing DB records. The Python script's default already preserves existing data; no flag is needed. |
 | Fix wrong **identity-anchor** fields (`judge_id`, `case_id`) on existing rulings | `rebuild_db.py --reset --county <name>` | Identity anchors use preserve-first `COALESCE(rulings.col, EXCLUDED.col)` semantics in `insert_ruling` (#2475) — a plain rebuild (no `--reset`) cannot replace an existing wrong `judge_id` or `case_id` with a corrected one. `--reset` truncates the county's `derived.*` rows first so the next ingest writes the corrected anchors freshly. Correctable facts (`hearing_date`, `outcome`, `motion_type`, `department`, `ruling_text`, `ruling_text_html`, `summary`) use incoming-wins semantics and update without `--reset`. See `packages/scraper-framework/src/ingestion/db.py::insert_ruling` for the full column classification. (#3732, #4284) |
-| Re-split documents after a **splitter change** (e.g. LLM split → deterministic split) | `reingest_from_s3.py --prefix <key-prefix>` or `--s3-key-list <file>` | Prefix mode runs each object through the ingestion worker, which replaces the document's split set (#4700): children the new split no longer produces are deleted, and a reused child id (`make_split_document_id(parent, idx)`) takes the re-derived `case_id` instead of the preserve-first link, but only when that case number is real, never an `UNKNOWN-` placeholder (#4788). Live writes and retries never relink, and only this parent's own rows are ever treated as stale. Alerts on removed rows are detached (`ruling_id` NULL, `document_id` re-pointed at the parent or NULL), never deleted. No `--reset` needed. Old `cases` rows that lose their last ruling stay in place. |
+| Re-split documents after a **splitter change** (e.g. LLM split → deterministic split) | `reingest_from_s3.py --county <name>`, `--prefix <key-prefix>`, or `--s3-key-list <file>` | Both modes run each object through the ingestion worker, which replaces the document's split set (#4700): children the new split no longer produces are deleted, and a reused child id (`make_split_document_id(parent, idx)`) takes the re-derived `case_id` instead of the preserve-first link, but only when that case number is real, never an `UNKNOWN-` placeholder (#4788). Live writes and retries never relink, and only this parent's own rows are ever treated as stale. Alerts on removed rows are detached (`ruling_id` NULL, `document_id` re-pointed at the parent or NULL), never deleted. No `--reset` needed. Old `cases` rows that lose their last ruling stay in place. |
 | Full database rebuild from scratch | `rebuild_db.py --reset` | `--reset` is opt-in and truncates derived tables before re-processing everything from S3. |
 
 **Partial-failure exit gate (#4624).** A `--bust-llm-cache` **prefix** reingest

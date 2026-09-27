@@ -83,7 +83,7 @@ Pass `--bust-llm-cache` to `scripts/reingest_from_s3.py` (#2424) when any of the
 Example invocation:
 
 ```
-scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --county orange --bust-llm-cache
+scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --county Orange --bust-llm-cache
 ```
 
 **Partial-failure exit gate (#4624).** For `--bust-llm-cache` **prefix**

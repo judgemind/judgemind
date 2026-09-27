@@ -1478,13 +1478,8 @@ class IngestionWorker:
         # framework) is created with ``bust_cache=True``, so cache reads are
         # skipped on every extraction call.  Cache *writes* still happen, so
         # subsequent runs without the flag benefit from the fresh extraction.
-        # This is required by the ``reingest_from_s3.py --prefix
-        # --bust-llm-cache`` re-extract path (#4049): split-child documents
-        # cannot be re-extracted via DB-row mode (the ``is_split_child_id``
-        # guard correctly skips them to prevent the #2416 exponential
-        # explosion), so the only path to replay a fresh extraction onto an
-        # already-split parent PDF is the prefix-mode worker re-running over
-        # the parent S3 key with cache reads disabled.
+        # ``reingest_from_s3.py --bust-llm-cache`` sets it to replay a fresh
+        # extraction onto already-split objects (#4049).
         self._bust_llm_cache: bool = bust_llm_cache
         self._indexer = IndexingConsumer(
             opensearch_client=opensearch_client,
@@ -2237,13 +2232,6 @@ class IngestionWorker:
             (``"llm_enrichment"``) or a diagnostic marker for fields that
             the enrichment stage was expected to fill but left as ``None``.
             Fields already populated before enrichment ran are NOT present.
-
-        Notes
-        -----
-        A parallel implementation exists in ``scripts/reingest_from_s3.py``
-        that operates on a dict instead of individual variables.  Any
-        schema change (new field, renamed field) must be applied in both
-        places.
         """
         methods: dict[str, str] = {}
         method_tag = _ENRICHMENT_METHOD_TAG
@@ -2617,15 +2605,12 @@ class IngestionWorker:
         source_url: str = event_data.get("source_url", "")
         scraper_id: str = event_data.get("scraper_id", "")
 
-        # Resolve the extraction strategy once for this event (#4081).
-        # Single source of truth shared with scripts/reingest_from_s3.py — both
-        # paths read ``strategy.skip_llm`` / ``use_multimodal`` /
-        # ``max_output_tokens`` / ``system_prompt`` / ``provider`` / ``model``
-        # / ``max_chars_per_chunk`` instead of re-deriving the gate logic from
-        # ``CountyExtractionConfig`` inline.  This closes the divergence
-        # pattern catalogued in #2490, #2501, #2502, #2521, #4056 — adding a
-        # new ``ExtractionMethod`` value or ``CountyExtractionConfig`` field
-        # now updates both paths in one place.
+        # Resolve the extraction strategy once for this event (#4081):
+        # ``strategy.skip_llm`` / ``use_multimodal`` / ``max_output_tokens`` /
+        # ``system_prompt`` / ``provider`` / ``model`` /
+        # ``max_chars_per_chunk`` come from one helper instead of being
+        # re-derived from ``CountyExtractionConfig`` inline.  Reingest and
+        # rebuild run through this method too (#4845).
         from framework.extraction_config import decide_extraction_strategy
 
         strategy = decide_extraction_strategy(state, county, scraper_id=scraper_id)
@@ -3249,10 +3234,7 @@ class IngestionWorker:
         # Post-LLM-enrichment case_type fallback chain — case_number
         # prefix (#706) -> scraper_id (#1524) -> motion_type (#1702) ->
         # case_title (#2062).  See ``ingestion.case_type_resolver`` for
-        # the canonical chain definition; the same resolver is invoked
-        # by ``_apply_regex_fallbacks`` in ``scripts/reingest_from_s3.py``
-        # so live ingestion and reparse cannot diverge by construction
-        # (#4295, follow-on to the #4290 hygiene guard).
+        # the canonical chain definition (#4295).
         eff_title = case_title or event_data.get("case_title")
         resolved_ct, resolved_method = resolve_case_type(
             case_type=case_type,

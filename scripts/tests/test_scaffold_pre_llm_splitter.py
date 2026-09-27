@@ -326,10 +326,9 @@ class TestIdempotency:
             "_DATACLASS_SCOPE: dict[str, dict[str, object]] = {\n"
             '    "SplitRuling@tc_tentatives": {\n'
             '        "worker_fn": "_try_tc_pdf_split",\n'
-            '        "reingest": True,\n'
             "    },\n"
             "    # CC has no worker dispatcher today\n"
-            '    "CCSplitRuling": {"reingest": True},\n'
+            '    "CCSplitRuling": {},\n'
             "}\n"
         )
         result = m._patch_propagation_check(existing, "tc", "pdf")
