@@ -6730,9 +6730,13 @@ class TestProgressLogging:
 class TestSplitDocumentIdUnification:
     """Tests that reingest uses the canonical make_split_document_id from ingestion.split_ids."""
 
-    def test_reingest_uses_split_ids_make_split_document_id(self) -> None:
-        """reingest_from_s3 imports make_split_document_id from ingestion.split_ids."""
-        assert reingest.make_split_document_id is make_split_document_id
+    def test_reingest_uses_split_ids_split_child_document_id(self) -> None:
+        """reingest_from_s3 imports the canonical id scheme from ingestion.split_ids."""
+        from ingestion.split_ids import split_child_document_id
+
+        assert reingest.split_child_document_id is split_child_document_id
+        # #4801: no id derivation keyed on the splitter's ruling_index.
+        assert not hasattr(reingest, "make_split_document_id")
 
     def test_no_local_make_split_document_id(self) -> None:
         """reingest_from_s3 does not define its own _make_split_document_id."""
@@ -6743,7 +6747,7 @@ class TestSplitDocumentIdUnification:
         doc_id = str(uuid.uuid4())
         for idx in range(5):
             worker_id = make_split_document_id(doc_id, idx)
-            reingest_id = reingest.make_split_document_id(doc_id, idx)
+            reingest_id = reingest.split_child_document_id(doc_id, idx, 5)
             assert worker_id == reingest_id
 
 
@@ -6884,7 +6888,8 @@ class TestFullReparseDocument:
 
             # First ruling
             assert result[0]["is_split"] is True
-            assert result[0]["ruling_index"] == 1
+            # Zero-based position, not the splitter's entry number (#4801).
+            assert result[0]["ruling_index"] == 0
             assert result[0]["case_number"] == "CVPS2306157"
             assert result[0]["ruling_text"] == "Ruling 1 text"
             assert result[0]["case_title"] == "Yeldell V. Henss"
@@ -6893,7 +6898,7 @@ class TestFullReparseDocument:
 
             # Second ruling
             assert result[1]["is_split"] is True
-            assert result[1]["ruling_index"] == 2
+            assert result[1]["ruling_index"] == 1
             assert result[1]["case_number"] == "CVPS2306202"
             assert result[1]["ruling_text"] == "Ruling 2 text"
 
@@ -14728,7 +14733,8 @@ class TestSplitChildGuardUntouched:
         assert "Skipping split-child document in re-split mode" in source, (
             "is_split_child_id guard removed — #2416 regression risk."
         )
-        assert "is_split_child_id(doc_id_str, content_hash)" in source, (
+        # #4801: the guard checks against the S3 key's content hash.
+        assert "doc_id_str, _resplit_guard_hash(s3_key, content_hash)" in source, (
             "is_split_child_id guard signature changed — verify #4049 plumbing "
             "did not regress the DB-row multimodal mode."
         )
@@ -16359,3 +16365,196 @@ class TestPreSplitIdParity:
         mock_split.assert_not_called()
         assert cleanups == []
         assert written == [event["document_id"]]
+
+
+# ---------------------------------------------------------------------------
+# DB-mode full-reparse uses the canonical split id scheme (#4801)
+# ---------------------------------------------------------------------------
+
+_KEY_HASH_4801 = "a9a4db792c506cfb1e776f334f2753eda048b1d927961aa146d194bdf439a512"
+_KEY_4801 = f"ca/contra_costa/superior_court/raw/{_KEY_HASH_4801}.pdf"
+
+
+def _content_parent_4801() -> str:
+    from ingestion.split_ids import derive_parent_document_id
+
+    return derive_parent_document_id(_KEY_HASH_4801)
+
+
+def _split_child_hash_4801(parent_hash: str, position: int) -> str:
+    return hashlib.sha256(f"{parent_hash}:ruling:{position}".encode()).hexdigest()
+
+
+class TestFullReparseCanonicalSplitIds:
+    """DB-mode ``--full-reparse`` writes the same split ids as the worker (#4801).
+
+    The worker, prefix reingest and rebuild all key split children on
+    ``split_child_document_id(parent, position, count)``.  DB mode keyed them
+    on the splitter's ``ruling_index`` — a court entry number for Fresno —
+    so a DB-mode run wrote a second id for every ruling.
+    """
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_ids_are_positional_not_entry_numbers(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        from courts.ca.fresno_tentatives import SplitRuling
+        from ingestion.split_ids import split_child_document_id
+
+        rulings = [
+            SplitRuling(20, "CV001", "Ruling one", None, None, None, None),
+            SplitRuling(21, "CV002", "Ruling two", None, None, None, None),
+            SplitRuling(23, "CV003", "Ruling three", None, None, None, None),
+        ]
+        reingest._SPLIT_REGISTRY["test-4801"] = MagicMock(return_value=rulings)
+        reingest._SCRAPER_REGISTRY.pop("test-4801", None)
+        mock_extract.return_value = "full pdf text"
+        parent = _content_parent_4801()
+        meta = TestFullReparseDocument()._doc_meta(
+            document_id=parent,
+            content_hash=_KEY_HASH_4801,
+            scraper_id="test-4801",
+            s3_key=_KEY_4801,
+        )
+        try:
+            result = reingest._full_reparse_document(b"raw pdf", "test-4801", meta)
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-4801", None)
+
+        assert [r["split_document_id"] for r in result] == [
+            split_child_document_id(parent, i, 3) for i in range(3)
+        ]
+        # ``ruling_index`` is the position, so the DB write derives the
+        # same synthetic child content_hash as the worker (``_split_index``).
+        assert [r["ruling_index"] for r in result] == [0, 1, 2]
+
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_row_that_is_not_the_keys_content_parent_is_skipped(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+    ) -> None:
+        """A row whose id is ``uuid5(own content_hash)`` but not the key's
+        content parent is a split child with a parent-shaped id (the CC / LA
+        stray rows of #4801).  Re-splitting it wrote grandchildren."""
+        from ingestion.split_ids import derive_parent_document_id
+
+        row_hash = _split_child_hash_4801(_KEY_HASH_4801, 3)
+        stray_id = uuid.UUID(derive_parent_document_id(row_hash))
+        row = list(_make_document_row(doc_id=stray_id, s3_key=_KEY_4801))
+        row[5] = row_hash
+        conn = _mock_conn_with_rows([tuple(row)])
+        mock_fetch_s3.return_value = b"pdf content"
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        mock_full_reparse.assert_not_called()
+        assert result["skipped"] == 1
+
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_content_parent_row_is_still_reparsed(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+    ) -> None:
+        row = list(_make_document_row(doc_id=uuid.UUID(_content_parent_4801()), s3_key=_KEY_4801))
+        row[5] = _KEY_HASH_4801
+        conn = _mock_conn_with_rows([tuple(row)])
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = []
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        mock_full_reparse.assert_called_once()
+
+    @patch("reingest_from_s3.delete_stale_split_children")
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_split_removes_stale_rows_on_the_key(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """Like the worker, the content parent's split removes every other
+        v5 row on its key (``owns_key``) — old entry-number children and
+        grandchildren included."""
+        from ingestion.split_ids import split_child_document_id
+
+        parent = _content_parent_4801()
+        row = list(_make_document_row(doc_id=uuid.UUID(parent), s3_key=_KEY_4801))
+        row[5] = _KEY_HASH_4801
+        conn = _mock_conn_with_rows([tuple(row)])
+        mock_fetch_s3.return_value = b"pdf content"
+        child_ids = [split_child_document_id(parent, i, 2) for i in range(2)]
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": f"Ruling {i}",
+                "case_number": f"CV00{i}",
+                "case_title": None,
+                "judge_name": "Judge X",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": i,
+                "split_document_id": child_ids[i],
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            }
+            for i in range(2)
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        mock_delete_stale.assert_called_once()
+        args, kwargs = mock_delete_stale.call_args
+        assert args[1] == _KEY_4801
+        assert sorted(args[2]) == sorted(child_ids)
+        assert kwargs["parent_document_id"] == parent
+        assert kwargs["owns_key"] is True
