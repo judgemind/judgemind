@@ -44,6 +44,8 @@
 #  33. package + CI-guard failures from concurrent jobs are both counted (#4708)
 #  34. a job that dies without reporting a result fails the push (#4708)
 #  35. xdist gated by PREPUSH_XDIST_PKGS + venv; timing summary printed (#4708)
+#      xdist uses --dist worksteal (#4812)
+#  35b. pytest-timeout in the venv -> --timeout=<N> instead of faulthandler (#4812)
 #  36. default check-log dir is per checkout, not a shared /tmp path (#4708)
 #  37. missing diff-cover fails the push with a Fix: block, not a silent skip (#4719)
 #  38. every packages/*/pyproject.toml lists diff-cover in [dev] (#4719)
@@ -1611,8 +1613,10 @@ if [ "$hook_rc" -ne 0 ]; then
     report_fail "expected passing stubs to pass the hook (#4708)" "$hook_out"
 elif ! echo "$args_with" | grep -q -- "-n auto"; then
     report_fail "expected '-n auto' for an allowlisted package with xdist (#4708); got: $args_with" "$hook_out"
+elif ! echo "$args_with" | grep -q -- "--dist worksteal"; then
+    report_fail "expected '--dist worksteal' with xdist (#4812); got: $args_with" "$hook_out"
 elif ! echo "$args_with" | grep -q -- "faulthandler_timeout=300"; then
-    report_fail "expected faulthandler_timeout=300 in pytest args (#4708); got: $args_with" "$hook_out"
+    report_fail "expected faulthandler_timeout=300 without pytest-timeout (#4708); got: $args_with" "$hook_out"
 elif echo "$args_default" | grep -q -- "-n "; then
     report_fail "expected serial pytest for a package not in PREPUSH_XDIST_PKGS (#4708); got: $args_default" "$hook_out_default"
 elif ! echo "$hook_out" | grep -q "pre-push: timing summary"; then
@@ -1621,6 +1625,25 @@ elif ! echo "$hook_out" | grep -qE "[0-9]+s +testpkg +pytest"; then
     report_fail "expected the pytest stage in the timing summary (#4708)" "$hook_out"
 else
     report_pass "xdist gated by allowlist + venv; timing summary lists stages (#4708)"
+fi
+
+echo "[scenario 35b] pytest-timeout in the venv makes a stuck test fail, not hang (#4812)"
+init_workspace
+commit_testpkg_code feature-timeout
+seed_stub_venv 0 0
+mkdir -p "$WORK/packages/testpkg/.venv/lib/python3.12/site-packages"
+touch "$WORK/packages/testpkg/.venv/lib/python3.12/site-packages/pytest_timeout.py"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-timeout $feat_sha refs/heads/feature-timeout $ZERO_SHA" \
+    | PREPUSH_PYTEST_TIMEOUT=123 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+args_timeout="$(cat "$WORK/packages/testpkg/pytest-args.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected passing stubs to pass the hook (#4812)" "$hook_out"
+elif ! echo "$args_timeout" | grep -q -- "--timeout=123"; then
+    report_fail "expected --timeout=123 when pytest-timeout is installed (#4812); got: $args_timeout" "$hook_out"
+elif echo "$args_timeout" | grep -q -- "faulthandler_timeout"; then
+    report_fail "expected no faulthandler_timeout when pytest-timeout is installed (#4812); got: $args_timeout" "$hook_out"
+else
+    report_pass "pytest-timeout present -> hook passes --timeout (#4812)"
 fi
 
 echo "[scenario 36] default log dir is per checkout, not shared /tmp (#4708)"

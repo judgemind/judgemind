@@ -38,8 +38,11 @@
 #                         (default: scraper-framework). Set to "" to force
 #                         serial pytest everywhere.
 #   PREPUSH_PYTEST_WORKERS  xdist worker count (default: auto).
-#   PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT  seconds before pytest dumps the
-#                         stack of a stuck test (default: 300).
+#   PREPUSH_PYTEST_TIMEOUT  per-test limit in seconds (default: 300). A
+#                         test past it fails when pytest-timeout is in the
+#                         package venv; otherwise its stack is dumped via
+#                         faulthandler_timeout. PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT
+#                         is still read as a fallback name (#4812).
 #   PREPUSH_SERIAL=1      run every stage in the foreground, in order
 #                         (debugging aid; same gates, slower).
 #   CI_GUARDS_JOBS        guard concurrency for scripts/run-ci-guards.sh.
@@ -276,16 +279,30 @@ python_pkg_checks() {
             if [ "$p" = "$pkg" ]; then
                 for d in "$pkg_dir"/.venv/lib/python*/site-packages/xdist; do
                     if [ -d "$d" ]; then
-                        xdist_flag="-n ${PREPUSH_PYTEST_WORKERS:-auto}"
+                        # worksteal: an idle worker takes queued tests
+                        # from a busy one. With the default `load`
+                        # scheduling a file's tests queue on one worker
+                        # back to back, so a file of slow tests became a
+                        # serial tail that ran for 20+ minutes when two
+                        # worktrees pushed at once (#4812).
+                        xdist_flag="-n ${PREPUSH_PYTEST_WORKERS:-auto} --dist worksteal"
                     fi
                 done
             fi
         done
-        # faulthandler_timeout dumps the stack of any test that runs
-        # longer than the limit (it does not kill it), so a hung test
-        # names itself in the log instead of silently eating the push.
-        local fh_timeout="${PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT:-300}"
-        if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag -o faulthandler_timeout=$fh_timeout tests/ -x -q --tb=line"; then
+        # Per-test time limit. With pytest-timeout in the venv, a test
+        # past the limit FAILS (stack printed), so the job ends and the
+        # push reports it. Without it, fall back to faulthandler_timeout,
+        # which only dumps the stack and lets the test run on; and that
+        # dump sits in the buffered job log until the job finishes (#4812).
+        local test_timeout="${PREPUSH_PYTEST_TIMEOUT:-${PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT:-300}}"
+        local timeout_flag="-o faulthandler_timeout=$test_timeout"
+        for d in "$pkg_dir"/.venv/lib/python*/site-packages/pytest_timeout.py; do
+            if [ -f "$d" ]; then
+                timeout_flag="--timeout=$test_timeout"
+            fi
+        done
+        if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line"; then
             echo "  Run: cd $pkg_dir && ./.venv/bin/pytest tests/ -v --tb=short" >&2
             failures=$((failures + 1))
         fi
