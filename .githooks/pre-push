@@ -43,6 +43,11 @@
 #                         package venv; otherwise its stack is dumped via
 #                         faulthandler_timeout. PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT
 #                         is still read as a fallback name (#4812).
+#   PREPUSH_PYTEST_MAX_SECS  cap on a whole pytest run, in seconds the
+#                         machine is awake (default: 600). Past it, the
+#                         hook dumps the stack of every process in the run
+#                         and kills it (#4822). Time the machine spends
+#                         asleep does not count.
 #   PREPUSH_SERIAL=1      run every stage in the foreground, in order
 #                         (debugging aid; same gates, slower).
 #   CI_GUARDS_JOBS        guard concurrency for scripts/run-ci-guards.sh.
@@ -50,6 +55,8 @@
 set -uo pipefail
 
 HOOK_START=$(date +%s)
+# Directory holding this hook and its lib/ helpers.
+PREPUSH_HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
 PREPUSH_JOB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/prepush-jobs.XXXXXX")
 trap 'rm -rf "$PREPUSH_JOB_DIR"' EXIT
 PREPUSH_TIMINGS="$PREPUSH_JOB_DIR/timings.tsv"
@@ -95,6 +102,112 @@ run_check() {
         echo "  Last 20 lines of output:" >&2
         tail -n 20 "$log_file" | sed 's/^/    /' >&2
         echo "  Full log: $log_file" >&2
+    fi
+    return "$rc"
+}
+
+# -------------------------------------------------------------------
+# Capped pytest runs (#4822)
+#
+# run_capped <max_awake_secs> <cmd> [args...]
+#   Runs <cmd> in the background and polls it once a second. The poll
+#   count is the cap, not the wall clock: `sleep 1` does not advance
+#   while the machine is asleep, so a run frozen by system sleep is not
+#   killed for it. If <cmd> is still running after <max_awake_secs>
+#   polls, dump_and_kill_tree dumps every process's stack and kills the
+#   run, and run_capped returns 124 (as timeout(1) does). Otherwise it
+#   returns <cmd>'s own status.
+#
+#   It also prints how long the machine slept during the run (wall time
+#   minus awake time) when that is 60 s or more. Two 18-minute pre-push
+#   "stalls" after #4812 lined up with 15-minute macOS sleeps in
+#   `pmset -g log` ('Dark Wake Thermal Emergency' 01:39:43-01:54:45 PT
+#   for #4820, 'Maintenance Sleep' 00:14:10-00:29:12 PT for #4815),
+#   which is why every worker looked idle. The note makes the next one
+#   say so itself.
+#
+# Output goes to stdout; run_check puts it in the check's log.
+# -------------------------------------------------------------------
+PREPUSH_TIMEOUT_RC=124
+PREPUSH_SLEEP_NOTE="pre-push: the machine was asleep for"
+
+# tree_pids <pid> — every descendant of <pid>, deepest first.
+tree_pids() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        tree_pids "$child"
+        echo "$child"
+    done
+}
+
+# dump_and_kill_tree <pid>
+#   Dumps the Python stack of every process under <pid>, then kills
+#   them all. py-spy (when installed and allowed to attach) dumps a
+#   process without stopping it. Otherwise SIGABRT: pytest turns on
+#   faulthandler in the controller and in every xdist worker, so each
+#   prints all its threads' stacks to stderr (this log) as it dies.
+#   Every Python process is stopped (SIGSTOP) before any aborts, so the
+#   stacks are from the same moment and xdist cannot start replacement
+#   workers. Anything left gets SIGKILL.
+dump_and_kill_tree() {
+    local root="$1" pids p comm python_pids=""
+    pids="$(tree_pids "$root") $root"
+    for p in $pids; do
+        comm="$(ps -o comm= -p "$p" 2>/dev/null)"
+        case "$comm" in
+            *python*|*pytest*) ;;
+            *) continue ;;
+        esac
+        if command -v py-spy >/dev/null 2>&1 \
+                && py-spy dump --pid "$p" 2>/dev/null; then
+            continue
+        fi
+        python_pids="$python_pids $p"
+    done
+    if [ -n "$python_pids" ]; then
+        echo "pre-push: sending SIGABRT (faulthandler stack dump) to:$python_pids"
+        # Freeze them all first, then let them abort one at a time, so
+        # the dumps do not interleave in the shared log. Workers come
+        # before the controller (tree_pids is deepest first).
+        kill -STOP $python_pids 2>/dev/null
+        for p in $python_pids; do
+            echo "--- stack of pid $p ---"
+            kill -ABRT "$p" 2>/dev/null
+            kill -CONT "$p" 2>/dev/null
+            sleep 0.5
+        done
+    fi
+    for p in $pids; do
+        kill -KILL "$p" 2>/dev/null
+    done
+}
+
+run_capped() {
+    local max="$1"
+    shift
+    local start awake=0 rc=0 slept pid
+    start=$(date +%s)
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$awake" -ge "$max" ]; then
+            slept=$(( $(date +%s) - start - awake ))
+            echo ""
+            echo "pre-push: TIMEOUT: still running after ${awake}s awake (cap PREPUSH_PYTEST_MAX_SECS=${max}s; ${slept}s asleep on top)."
+            echo "pre-push: dumping every process's stack, then killing the run (#4822)."
+            dump_and_kill_tree "$pid"
+            wait "$pid" 2>/dev/null
+            return "$PREPUSH_TIMEOUT_RC"
+        fi
+        sleep 1
+        awake=$((awake + 1))
+    done
+    wait "$pid" || rc=$?
+    slept=$(( $(date +%s) - start - awake ))
+    # 60 s, not less: each poll also spends a little time outside
+    # `sleep 1`, which adds up over a long run on a loaded machine.
+    if [ "$slept" -ge 60 ]; then
+        echo "$PREPUSH_SLEEP_NOTE ~${slept}s of this ${awake}s-awake run (system sleep, not a hang; see pmset -g log) (#4822)"
     fi
     return "$rc"
 }
@@ -202,6 +315,56 @@ print_timing_summary() {
 }
 
 # -------------------------------------------------------------------
+# venv_has_declared_deps <pkg> <pkg_dir>
+#
+# Returns 0 when <pkg_dir>/.venv has every dependency and [dev] extra
+# that <pkg_dir>/pyproject.toml declares. Otherwise prints the missing
+# ones and a Fix: block, and returns 1 (#4822).
+#
+# The check is lib/missing_venv_deps.py next to this hook, run by the venv's
+# own python (python3 when the venv has none). If the helper cannot
+# run (no site-packages dir, Python < 3.11, bad TOML) the hook warns
+# and carries on: a broken helper must not block every push.
+# -------------------------------------------------------------------
+venv_has_declared_deps() {
+    local pkg="$1" pkg_dir="$2" py rc=0 out d
+    local helper="$PREPUSH_HOOK_DIR/lib/missing_venv_deps.py"
+    [ -f "$pkg_dir/pyproject.toml" ] && [ -f "$helper" ] || return 0
+    py="$pkg_dir/.venv/bin/python"
+    [ -x "$py" ] || py=python3
+    local site_dirs=()
+    for d in "$pkg_dir"/.venv/lib/python*/site-packages; do
+        [ -d "$d" ] && site_dirs+=("$d")
+    done
+    if [ "${#site_dirs[@]}" -eq 0 ]; then
+        return 0
+    fi
+    out="$("$py" "$helper" "$pkg_dir/pyproject.toml" "${site_dirs[@]}" 2>&1)" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) ;;
+        *)
+            echo "  WARNING: could not check $pkg's venv against $pkg_dir/pyproject.toml:" >&2
+            echo "$out" | sed 's/^/    /' >&2
+            return 0
+            ;;
+    esac
+    echo "" >&2
+    echo "  FAILED: $pkg's venv is missing packages that $pkg_dir/pyproject.toml declares:" >&2
+    echo "$out" | sed 's/^/    /' >&2
+    echo "  The venv was built before pyproject.toml changed. Tests did not run:" >&2
+    echo "  on this venv they would run without some gates, e.g. with no" >&2
+    echo "  per-test --timeout when pytest-timeout is missing (#4822)." >&2
+    echo "  Fix:" >&2
+    if [[ "$pkg" == infra/* ]]; then
+        echo "    ${pkg_dir}/.venv/bin/pip install -e '${pkg_dir}[dev]'" >&2
+    else
+        echo "    scripts/install-package-venv.sh $pkg" >&2
+    fi
+    return 1
+}
+
+# -------------------------------------------------------------------
 # python_pkg_checks <pkg> <has_code: true|false>
 #
 # ruff check + ruff format for one Python package, then (code changes
@@ -258,6 +421,15 @@ python_pkg_checks() {
     # Tests and coverage gates run for code changes only.
     [ "$has_code" = true ] || return 0
 
+    # A venv built before a pyproject.toml change lacks the new
+    # dependency, and the gates below adapt to what is installed: without
+    # pytest-timeout the suite ran with no per-test timeout at all, and
+    # nothing said so (#4822). Refuse to run the suite on such a venv.
+    if [ -x "$pkg_dir/.venv/bin/pytest" ] && ! venv_has_declared_deps "$pkg" "$pkg_dir"; then
+        failures=$((failures + 1))
+        return 0
+    fi
+
     if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
         echo "pre-push: running tests for Python package '$pkg'..." >&2
         # pytest-testmon must not run alongside pytest-cov: both drive
@@ -295,6 +467,8 @@ python_pkg_checks() {
         # push reports it. Without it, fall back to faulthandler_timeout,
         # which only dumps the stack and lets the test run on; and that
         # dump sits in the buffered job log until the job finishes (#4812).
+        # The fallback is for packages that do not declare pytest-timeout;
+        # a venv missing a declared one never gets here (#4822).
         local test_timeout="${PREPUSH_PYTEST_TIMEOUT:-${PREPUSH_PYTEST_FAULTHANDLER_TIMEOUT:-300}}"
         local timeout_flag="-o faulthandler_timeout=$test_timeout"
         for d in "$pkg_dir"/.venv/lib/python*/site-packages/pytest_timeout.py; do
@@ -302,9 +476,25 @@ python_pkg_checks() {
                 timeout_flag="--timeout=$test_timeout"
             fi
         done
-        if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line"; then
+        # The whole run is capped too (run_capped): a hang outside any
+        # one test (collection, xdist, coverage combine) has no per-test
+        # limit, and a stall should end with stacks, not a killed push.
+        local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
+        local pytest_log="$PREPUSH_LOG_DIR/prepush-${pkg//\//_}-pytest.log"
+        run_check "$pkg" "pytest" run_capped "$max_secs" \
+            bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line" \
+            || pytest_rc=$?
+        if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
+            echo "  pytest did not finish within ${max_secs}s awake (PREPUSH_PYTEST_MAX_SECS) and was killed." >&2
+            echo "  The stack of every pytest process is in the full log above; search it for 'most recent call first'." >&2
+        fi
+        if [ "$pytest_rc" -ne 0 ]; then
             echo "  Run: cd $pkg_dir && ./.venv/bin/pytest tests/ -v --tb=short" >&2
             failures=$((failures + 1))
+        fi
+        # run_check hides a passing check's log; show a sleep note anyway.
+        if [ -f "$pytest_log" ]; then
+            grep -F "$PREPUSH_SLEEP_NOTE" "$pytest_log" | sed 's/^/  NOTE: /' >&2
         fi
         # pytest-cov writes coverage.xml relative to CWD. Running pytest
         # with CWD = pkg_dir ensures coverage.xml lands in pkg_dir, where

@@ -49,6 +49,11 @@
 #  36. default check-log dir is per checkout, not a shared /tmp path (#4708)
 #  37. missing diff-cover fails the push with a Fix: block, not a silent skip (#4719)
 #  38. every packages/*/pyproject.toml lists diff-cover in [dev] (#4719)
+#  40. venv missing a declared [dev] dep (pytest-timeout) fails with a Fix:
+#      block and pytest does not run (#4822)
+#  40b. same venv with the dep installed runs pytest with --timeout (#4822)
+#  41. a pytest run past PREPUSH_PYTEST_MAX_SECS is killed, whole process
+#      tree included, with each process's stack in the log (#4822)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -1693,6 +1698,124 @@ if [ -n "$missing_pkgs" ]; then
 else
     report_pass "every packages/*/pyproject.toml lists diff-cover in [dev] (#4719)"
 fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 40-41 (#4822): a stale venv is refused, and a pytest run
+# that never ends is killed with stacks instead of stalling the push.
+# ───────────────────────────────────────────────────────────────────────
+
+# declare_testpkg_dev_dep <requirement> — commit a testpkg pyproject.toml
+# whose [dev] extras list <requirement>; updates feat_sha.
+declare_testpkg_dev_dep() {
+    cat > "$WORK/packages/testpkg/pyproject.toml" <<PYPROJ
+[project]
+name = "testpkg"
+version = "0.0.1"
+
+[project.optional-dependencies]
+dev = [
+    "$1",
+]
+PYPROJ
+    git -C "$WORK" commit --quiet -am "chore: testpkg declares $1"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+echo "[scenario 40] venv missing a declared [dev] dep fails with a Fix: block, pytest not run (#4822)"
+init_workspace
+commit_testpkg_code feature-stale-venv
+declare_testpkg_dev_dep "pytest-timeout>=2.3"
+seed_stub_venv 0 0
+# A venv built before pytest-timeout was added: site-packages exists,
+# pytest-timeout is not in it.
+mkdir -p "$WORK/packages/testpkg/.venv/lib/python3.12/site-packages"
+rm -f "$WORK/packages/testpkg/pytest-args.txt"
+run_hook "refs/heads/feature-stale-venv $feat_sha refs/heads/feature-stale-venv $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a venv missing pytest-timeout to fail the push (#4822)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: testpkg's venv is missing packages"; then
+    report_fail "expected 'FAILED: testpkg's venv is missing packages' (#4822)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "pytest-timeout>=2.3"; then
+    report_fail "expected the missing requirement 'pytest-timeout>=2.3' to be named (#4822)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a 'Fix:' block (#4822)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/install-package-venv.sh testpkg"; then
+    report_fail "expected 'scripts/install-package-venv.sh testpkg' in the Fix block (#4822)" "$hook_out"
+elif [ -f "$WORK/packages/testpkg/pytest-args.txt" ]; then
+    report_fail "pytest must not run on a stale venv, i.e. without --timeout (#4822); it ran with: $(cat "$WORK/packages/testpkg/pytest-args.txt")" "$hook_out"
+elif ! echo "$hook_out" | grep -q "pre-push: 1 check(s) failed"; then
+    report_fail "expected exactly one failure counted (#4822)" "$hook_out"
+else
+    report_pass "stale venv fails with a Fix: block and pytest does not run (#4822)"
+fi
+
+echo "[scenario 40b] the same venv with the declared dep installed runs pytest with --timeout (#4822)"
+site="$WORK/packages/testpkg/.venv/lib/python3.12/site-packages"
+touch "$site/pytest_timeout.py"
+mkdir -p "$site/pytest_timeout-2.3.1.dist-info"
+printf 'Metadata-Version: 2.1\nName: pytest-timeout\nVersion: 2.3.1\n' > "$site/pytest_timeout-2.3.1.dist-info/METADATA"
+run_hook "refs/heads/feature-stale-venv $feat_sha refs/heads/feature-stale-venv $ZERO_SHA"
+args_fixed="$(cat "$WORK/packages/testpkg/pytest-args.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the hook to pass once pytest-timeout is installed (#4822)" "$hook_out"
+elif ! echo "$args_fixed" | grep -q -- "--timeout=300"; then
+    report_fail "expected pytest to run with --timeout=300 (#4822); got: $args_fixed" "$hook_out"
+else
+    report_pass "venv with the declared dep runs pytest with --timeout (#4822)"
+fi
+
+echo "[scenario 41] pytest past PREPUSH_PYTEST_MAX_SECS is killed with stacks (#4822)"
+init_workspace
+commit_testpkg_code feature-hung-run
+seed_stub_venv 0 0
+# The stub stands in for a pytest controller whose run never ends (a
+# hang outside any single test, where pytest-timeout cannot help). It
+# starts a child Python process, like an xdist worker, that never ends
+# either. Both enable faulthandler, as pytest does.
+hang_marker="prepush-hang-marker-$$-$RANDOM"
+cat > "$WORK/packages/testpkg/.venv/bin/pytest" <<PY
+#!/usr/bin/env python3
+import faulthandler
+import subprocess
+import sys
+import time
+
+faulthandler.enable()
+worker = subprocess.Popen(
+    [sys.executable, "-c",
+     "import faulthandler, time; faulthandler.enable(); time.sleep(600)",
+     "$hang_marker"]
+)
+
+
+def controller_waits_forever():
+    time.sleep(600)
+
+
+controller_waits_forever()
+PY
+chmod +x "$WORK/packages/testpkg/.venv/bin/pytest"
+hang_start=$(date +%s)
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-hung-run $feat_sha refs/heads/feature-hung-run $ZERO_SHA" \
+    | PREPUSH_PYTEST_MAX_SECS=3 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+hang_secs=$(( $(date +%s) - hang_start ))
+pytest_log="$PREPUSH_LOG_DIR/prepush-testpkg-pytest.log"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a pytest run past the cap to fail the push (#4822)" "$hook_out"
+elif [ "$hang_secs" -gt 60 ]; then
+    report_fail "expected the hook to end soon after the 3s cap; took ${hang_secs}s (#4822)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "pytest did not finish within 3s awake"; then
+    report_fail "expected 'pytest did not finish within 3s awake' (#4822)" "$hook_out"
+elif ! grep -q "controller_waits_forever" "$pytest_log" 2>/dev/null; then
+    report_fail "expected the controller's stack (controller_waits_forever) in $pytest_log (#4822)" "$(cat "$pytest_log" 2>/dev/null)"
+elif [ "$(grep -c "most recent call first" "$pytest_log")" -lt 2 ]; then
+    report_fail "expected a stack from the controller AND the worker in $pytest_log (#4822)" "$(cat "$pytest_log")"
+elif pgrep -f "$hang_marker" >/dev/null 2>&1; then
+    report_fail "the child process outlived the killed run (#4822)" "$(pgrep -fl "$hang_marker")"
+else
+    report_pass "a run past the cap is killed with each process's stack in the log (#4822)"
+fi
+pkill -KILL -f "$hang_marker" 2>/dev/null || true
 
 # ───────────────────────────────────────────────────────────────────────
 # Scenario 39: skipped integration tests are surfaced on a passing push (#4711)
