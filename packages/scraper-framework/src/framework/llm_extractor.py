@@ -2583,6 +2583,61 @@ def _next_entry_skips_one(rulings: list[ExtractedRuling], index: int) -> bool:
     return False
 
 
+def _second_caption(title: str) -> str | None:
+    """Return the second caption of a two-caption fused title, else None.
+
+    "Cadence Bank N.A. vs. Richardson Carrillo vs. Bryant" gives
+    "Carrillo vs. Bryant".  The first caption is what
+    :func:`_truncate_concatenated_title` keeps.
+    """
+    if len(_TITLE_SEPARATOR_RE.findall(title)) != 2:
+        return None
+    first = _truncate_concatenated_title(title)
+    if not first or first == title or not title.startswith(first):
+        return None
+    rest = title[len(first) :].strip(" ,;:")
+    return rest if _TITLE_SEPARATOR_RE.search(rest) else None
+
+
+def _assign_repeated_fused_captions(rulings: list[ExtractedRuling]) -> list[ExtractedRuling]:
+    """Give the second of two rows that share one fused caption the second caption (#4715).
+
+    The LLM sometimes copies one two-caption string onto two adjacent calendar
+    rows.  In Cadence (dev S3 ``15bb9e58...``), entries 12 and 13 both read
+    "Cadence Bank N.A. vs. Richardson Carrillo vs. Bryant".  Entry 12 is OFF
+    CALENDAR and entry 13 holds Carrillo v. Bryant's ruling.  Title truncation
+    then filed both under Cadence Bank.  When two rows with consecutive entry
+    numbers have the same two-caption title, the second row is the second
+    caption's entry.  Only titles change, so split ids do not move.
+    """
+    result = list(rulings)
+    for i in range(1, len(result)):
+        prev, cur = result[i - 1], result[i]
+        title = cur.extracted_case_title
+        if (
+            not title
+            or title != prev.extracted_case_title
+            or prev.entry_number is None
+            or cur.entry_number != prev.entry_number + 1
+            or (
+                cur.extracted_case_number
+                and cur.extracted_case_number == prev.extracted_case_number
+            )
+        ):
+            continue
+        second = _second_caption(title)
+        if second is None:
+            continue
+        result[i] = cur.model_copy(update={"extracted_case_title": second})
+        logger.info(
+            "llm_extractor.repeated_fused_caption_assigned",
+            entry_number=cur.entry_number,
+            fused_title=title,
+            assigned_title=second,
+        )
+    return result
+
+
 def _split_fused_row_texts(rulings: list[ExtractedRuling]) -> list[ExtractedRuling]:
     """Give each sub-case of a fused OC row its own ruling text (#4715).
 
@@ -2698,7 +2753,10 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
 
     The filter order is significant — see the inline notes for the rationale:
 
-    - ``_split_fused_row_texts`` (#4715): runs FIRST, while each fused tail
+    - ``_assign_repeated_fused_captions`` (#4715): runs first, before title
+      truncation and before the drop filters remove the first of the two
+      rows that share one fused caption.  It only changes a title.
+    - ``_split_fused_row_texts`` (#4715): runs next, while each fused tail
       still sits right after the row it was split from (the drop filters can
       remove that row, #4737).  It moves text between existing rows and never
       adds or drops one, so split document IDs stay stable.
@@ -2727,6 +2785,7 @@ def _apply_pdf_post_join_filters(rulings: list[ExtractedRuling]) -> list[Extract
       only copies a case number onto a ruling row and never drops a row, so
       split document IDs stay stable and a second pass is a no-op.
     """
+    rulings = _assign_repeated_fused_captions(rulings)
     rulings = _split_fused_row_texts(rulings)
     rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_preamble_rulings(rulings)
