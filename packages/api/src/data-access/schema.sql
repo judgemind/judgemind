@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 66 migrations.
+-- Generated from 67 migrations.
 
 
 
@@ -331,7 +331,8 @@ CREATE TABLE derived.rulings (
     ruling_number integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    ruling_text_hash text
+    ruling_text_hash text,
+    hearing_date_source text
 );
 
 
@@ -342,6 +343,9 @@ COMMENT ON COLUMN derived.rulings.summary IS 'Cached AI summary. Served from cac
 
 
 COMMENT ON COLUMN derived.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
+
+
+COMMENT ON COLUMN derived.rulings.hearing_date_source IS 'Where hearing_date came from: structured_scraper, structured_hook, structured_header (structured sources, exempt from the 180-day rule), or splitter, llm, regex_fallback. NULL for rows written before migration 67 or with no hearing_date. Issue #4793.';
 
 
 CREATE TABLE dispatcher.agents (
@@ -995,6 +999,7 @@ CREATE TABLE telemetry.validation_results (
     county text,
     scraper_id text,
     s3_key text,
+    hearing_date_source text,
     CONSTRAINT validation_results_result_check CHECK ((result = ANY (ARRAY['pass'::text, 'flag'::text, 'fail'::text, 'error'::text])))
 );
 
@@ -1021,6 +1026,9 @@ COMMENT ON COLUMN telemetry.validation_results.scraper_id IS 'scraper_id of the 
 
 
 COMMENT ON COLUMN telemetry.validation_results.s3_key IS 'S3 key of the raw capture in the document archive bucket. Lets FAIL rows (no derived.documents row) and split children (uuid5 ids) be traced to their raw. NULL for rows written before migration 66. Issue #4706.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.hearing_date_source IS 'Provenance of the hearing date the deterministic rules judged (see derived.rulings.hearing_date_source). NULL for rows written before migration 67 or with no hearing_date. Issue #4793.';
 
 
 ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);
