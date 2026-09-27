@@ -54,7 +54,7 @@ def test_postgres_is_configured_when_required() -> None:
 
 
 _OPEN_BUGS = pytest.mark.xfail(
-    reason="#4845: the split write path breaks invariants until PR 2 lands",
+    reason="#4845: the worker's split write path breaks invariants until PR 3 lands",
     raises=harness.InvariantError,
     strict=False,
 )
@@ -71,20 +71,38 @@ def test_invariants_hold(seed: int) -> None:
 # Reproductions of filed bugs
 # ---------------------------------------------------------------------------
 
-#: (bug, seed, invariant the seed breaks).  Found by the sweep; see the
-#: step trace in each failure message.
+
+def _open(bug: str) -> pytest.MarkDecorator:
+    return pytest.mark.xfail(
+        reason=f"#{bug} open until #4845 PR 3 lands",
+        raises=harness.InvariantError,
+        strict=True,
+    )
+
+
+#: (bug, seed, invariant the seed breaks).  Found by the sweep; each run
+#: enforces only that invariant, so an unrelated bug cannot mask or fake the
+#: reproduction.  All of them failed before #4845 (PR 1's CI run records the
+#: failures).
 _BUG_SEEDS = [
     # A textless row at slot 0 shifts every ruling one slot right; the
     # write of slot j+1 finds its ruling on the earlier, never-dispatched
     # slot j, dedup supersedes j+1 and deletes j+1's ruling.
-    ("4836", 9, "gap"),
-    ("4836", 11, "gap"),
+    pytest.param("4836", 9, "gap", marks=_open("4836")),
+    pytest.param("4836", 11, "gap", marks=_open("4836")),
     # A ruling moves off its holder slot, whose own write is then rejected
     # by validation: the holder keeps a search doc with no ruling behind it.
-    ("4837", 69, "search"),
-    # DB-row reingest writes hearing_date with no hearing_date_source.
-    ("4839", 13, "date_source"),
+    pytest.param("4837", 69, "search", marks=_open("4837")),
+    # DB-row reingest wrote hearing_date with no hearing_date_source.  Fixed
+    # by the one write path: DB-row mode now runs through the worker.
+    pytest.param("4839", 13, "date_source"),
 ]
+
+
+@_needs_pg
+@pytest.mark.parametrize(("bug", "seed", "invariant"), _BUG_SEEDS)
+def test_known_bug(bug: str, seed: int, invariant: str) -> None:
+    harness.run_seed(_DSN, seed, _RUN, name=f"bug{bug}", invariants=frozenset({invariant}))
 
 
 def _single_after_split_setup(h: harness.KeyHarness, key: harness.Key) -> None:
@@ -115,37 +133,16 @@ _BUG_4838_STEPS = _bug_4838_steps()
 
 
 @_needs_pg
-@pytest.mark.xfail(
-    reason="open until #4845 PR 2 (one write path) lands",
-    raises=harness.InvariantError,
-    strict=True,
-)
-@pytest.mark.parametrize(("bug", "seed", "invariant"), _BUG_SEEDS)
-def test_known_bug(bug: str, seed: int, invariant: str) -> None:
-    try:
-        harness.run_seed(_DSN, seed, _RUN, name=f"bug{bug}")
-    except harness.InvariantError as exc:
-        assert exc.invariant == invariant, f"#{bug}: expected [{invariant}], got {exc}"
-        raise
-
-
-@_needs_pg
-@pytest.mark.xfail(
-    reason="open until #4845 PR 2 (one write path) lands",
-    raises=harness.InvariantError,
-    strict=True,
-)
 def test_known_bug_4838_db_mode_keeps_stale_children() -> None:
-    """DB-row reingest of a document that now parses as one ruling keeps
-    the old split children on the key (#4838)."""
-    try:
-        harness.run_steps(
-            _DSN,
-            _BUG_4838_STEPS[1:],
-            _RUN,
-            name="bug4838",
-            setup=_single_after_split_setup,
-        )
-    except harness.InvariantError as exc:
-        assert exc.invariant == "converge", str(exc)
-        raise
+    """DB-row reingest of a document that now parses as one ruling must not
+    keep the old split children on the key (#4838).  Before #4845 DB-row
+    mode skipped the stale-child cleanup for a single-ruling parse, and the
+    parent lost dedup to a stale child."""
+    harness.run_steps(
+        _DSN,
+        _BUG_4838_STEPS[1:],
+        _RUN,
+        name="bug4838",
+        setup=_single_after_split_setup,
+        invariants=frozenset({"converge"}),
+    )

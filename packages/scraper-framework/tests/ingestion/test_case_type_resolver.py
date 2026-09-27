@@ -1,8 +1,7 @@
 """Unit tests for ``ingestion.case_type_resolver.resolve_case_type``.
 
-The resolver replaces an open-coded fallback chain that previously lived
-both in ``packages/scraper-framework/src/ingestion/worker.py`` and in
-``_apply_regex_fallbacks`` inside ``scripts/reingest_from_s3.py``.  See
+The resolver replaces an open-coded fallback chain that used to live in
+both the worker and the old DB-row reingest path (removed in #4845).  See
 issue #4295 (parent #4290).
 
 The tests below exercise every branch of the chain in the canonical
@@ -233,8 +232,7 @@ class TestResolveCaseTypePriority:
     scraper_id, scraper_id wins over motion_type, etc."""
 
     def test_case_number_beats_scraper_id(self) -> None:
-        """``CIVSB`` -> civil, even when scraper_id encodes probate.
-        Mirrors ``test_fallback_parity.py::test_case_type_priority_number_over_scraper_id``."""
+        """``CIVSB`` -> civil, even when scraper_id encodes probate."""
         result = resolve_case_type(
             case_type=None,
             case_number="CIVSB2501234",

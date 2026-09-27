@@ -65,7 +65,6 @@ What the check does
 
        INGESTION_TESTS = {
            "tests/test_reingest_from_s3.py",
-           "tests/test_reingest_registry.py",
            "tests/test_ingestion.py",
            "tests/test_extract.py",
        }
@@ -117,7 +116,6 @@ from pathlib import Path
 INGESTION_TESTS = frozenset(
     {
         "tests/test_reingest_from_s3.py",
-        "tests/test_reingest_registry.py",
         "tests/test_ingestion.py",
         "tests/test_extract.py",
     }
