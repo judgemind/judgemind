@@ -2376,6 +2376,21 @@ def insert_document_and_ruling(
         hearing_date_source=hearing_date_source,
     )
 
+    # A document that holds a ruling is live.  One superseded by an earlier
+    # content-hash dedup gets its ruling back when the winner is gone (the
+    # ``owns_key`` stale-row cleanup, a split-set change), and must come back
+    # to ``active``: the API answers 410 for a superseded document (#4809).
+    # A dedup loser in *this* call had its ruling deleted by ``insert_ruling``,
+    # so the EXISTS guard leaves it superseded.
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE documents SET status = 'active', change_type = NULL, "
+            "previous_version_id = NULL "
+            "WHERE id = %s::uuid AND status = 'superseded' "
+            "AND EXISTS (SELECT 1 FROM rulings WHERE document_id = %s::uuid)",
+            (document_id, document_id),
+        )
+
     return is_new
 
 

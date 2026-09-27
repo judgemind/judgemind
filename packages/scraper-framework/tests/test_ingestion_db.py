@@ -2379,6 +2379,38 @@ class TestInsertDocumentAndRuling:
     """Tests for the insert_document_and_ruling helper that wraps
     insert_document + insert_ruling with a consistent document_id."""
 
+    def test_revives_superseded_document_that_holds_a_ruling(self) -> None:
+        """#4809: after the ruling write, a superseded document that holds a
+        ruling row comes back to active.  The SQL shape is pinned here; the
+        real-Postgres behaviour is in test_supersede_revive_pg.py."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        insert_document_and_ruling(
+            conn,
+            document_id="doc-4809",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="hash-4809",
+            s3_key="rulings/doc.html",
+            s3_bucket="bucket-1",
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="The motion is granted.",
+        )
+
+        sql, params = cur.execute.call_args_list[-1][0]
+        assert "SET status = 'active'" in sql
+        assert "change_type = NULL" in sql
+        assert "previous_version_id = NULL" in sql
+        assert "status = 'superseded'" in sql
+        assert "EXISTS (SELECT 1 FROM rulings WHERE document_id" in sql
+        assert params == ("doc-4809", "doc-4809")
+
     def test_calls_insert_document_with_correct_document_id(self) -> None:
         """The helper passes document_id to insert_document."""
         conn = _mock_conn()
