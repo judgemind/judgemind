@@ -97,18 +97,26 @@ if [[ ${#candidates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Find files that contain the regex fragment.
+# Find files that contain the regex fragment ``parent\s*:\s*#`` in any
+# form. The single-quoted-grep pattern is portable across BSD/GNU. It
+# runs ONCE over every candidate via ``xargs grep -l`` instead of once
+# per file (#4720): ~3,000 per-file grep processes made this one of the
+# slowest guards in run-ci-guards.sh. xargs runs its grep batches in
+# order and grep -l keeps the input order, so ``matching`` lists the same
+# files, in the same order, that the old per-file ``grep -q`` accepted.
+matching=()
+while IFS= read -r -d '' f; do
+    matching+=("$f")
+done < <(
+    printf '%s\0' "${candidates[@]}" \
+        | xargs -0 grep -l --null -E 'parent\\s\*:\\s\*#' -- 2>/dev/null || true
+)
+
 violations=()
-for f in "${candidates[@]}"; do
+for f in "${matching[@]+"${matching[@]}"}"; do
     # Skip the canonical home.
     relpath="${f#"$SCAN_ROOT/"}"
     if [[ "$relpath" == "$CANONICAL_RELPATH" ]]; then
-        continue
-    fi
-
-    # Look for the regex fragment ``parent\s*:\s*#`` in any form.
-    # The single-quoted-grep pattern is portable across BSD/GNU.
-    if ! grep -qE 'parent\\s\*:\\s\*#' "$f" 2>/dev/null; then
         continue
     fi
 

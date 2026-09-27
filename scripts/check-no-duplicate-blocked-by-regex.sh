@@ -115,8 +115,23 @@ fi
 # greps in scripts/*.sh (e.g. ``grep -E "Blocked by #" file``) do NOT
 # trip the guard, but the full Python regex shape (with ``\s+`` /
 # ``\\s+``) does.
+#
+# The fragment grep (explained below) runs ONCE over every candidate via
+# ``xargs grep -l`` instead of once per file (#4720): ~3,000 per-file
+# grep processes made this one of the slowest guards in run-ci-guards.sh.
+# xargs runs its grep batches in order and grep -l keeps the input order,
+# so ``matching`` lists the same files, in the same order, that the old
+# per-file ``grep -q`` accepted.
+matching=()
+while IFS= read -r -d '' f; do
+    matching+=("$f")
+done < <(
+    printf '%s\0' "${candidates[@]}" \
+        | xargs -0 grep -l --null -E 'blocked by[:?]*\\s\+#' -- 2>/dev/null || true
+)
+
 violations=()
-for f in "${candidates[@]}"; do
+for f in "${matching[@]+"${matching[@]}"}"; do
     # Skip the canonical home.
     relpath="${f#"$SCAN_ROOT/"}"
     if [[ "$relpath" == "$CANONICAL_RELPATH" ]]; then
@@ -147,9 +162,7 @@ for f in "${candidates[@]}"; do
     # scripts/unblock-dependents.sh, awk literal-string interpolation
     # in block-issue.sh) do NOT trip the guard, but the full Python
     # regex shape (with the ``\s`` operator) does.
-    if ! grep -qE 'blocked by[:?]*\\s\+#' "$f" 2>/dev/null; then
-        continue
-    fi
+    # (Applied by the batched ``grep -l`` that built ``matching`` above.)
 
     # Found a candidate — check for the allowlist marker.
     if head -n 50 "$f" 2>/dev/null | grep -qE "$ALLOWLIST_MARKER"; then

@@ -17,6 +17,9 @@
 #
 # venv: none
 # permanent: true
+# ci-guards: skip
+#   Builds a Docker image, so scripts/run-ci-guards.sh (pre-push) skips it
+#   per its "Docker" opt-out rule (#4720). CI still runs it in its own job.
 
 set -uo pipefail
 

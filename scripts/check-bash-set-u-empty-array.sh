@@ -52,8 +52,9 @@
 #
 # Detection strategy
 # ------------------
-# This check is line-text-based (not AST-based) so it runs in a few
-# hundred milliseconds on a cold macOS laptop. For each shell script:
+# This check is line-text-based (not AST-based). The scan runs in one
+# Python process (``scripts/_check_bash_set_u_empty_array_scan.py``,
+# #4720) and takes well under a second. For each shell script:
 #
 #   1. Detect whether ``set -u`` (or ``set -o nounset``, or any ``set
 #      -[a-z]*u`` flags combo like ``-eu`` / ``-euo pipefail``) appears
@@ -213,7 +214,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '155,189p' "${BASH_SOURCE[0]}"
+            sed -n '156,190p' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         --*)
@@ -238,12 +239,8 @@ if [[ $DRY_RUN -eq 1 && $FIX_MODE -eq 0 ]]; then
 fi
 SCAN_DIR="${SCAN_DIR:-$REPO_ROOT}"
 
-# ─── Files that legitimately mention the forbidden pattern ───────────────
-# The check script and its test must spell the pattern literally.
-EXCLUDE_FILES=(
-    "scripts/check-bash-set-u-empty-array.sh"
-    "scripts/tests/test_check_bash_set_u_empty_array.sh"
-)
+# Files that legitimately mention the forbidden pattern (this script and
+# its test) are skipped by EXCLUDE_SUFFIXES in the scanner helper below.
 
 # ─── Directories to exclude from the scan ────────────────────────────────
 EXCLUDE_DIRS=(
@@ -294,501 +291,53 @@ shape_a_violations=0
 #   fix_inames[i]     — array name (e.g. ``LABELS``)
 #   fix_iter_lines[i] — 1-based line number of the iteration read
 #
-# Populated in Pass B below. Consumed by the --fix block at the
+# Populated from the scanner's B records below. Consumed by the --fix block at the
 # bottom of the script.
 fix_files=()
 fix_inames=()
 fix_iter_lines=()
 
-# Match any ``set`` invocation that turns on nounset:
-#   set -u
-#   set -eu
-#   set -euo pipefail
-#   set -o nounset
-# Comment-leading whitespace is stripped before this regex is applied.
-NOUNSET_REGEX='^[[:space:]]*set[[:space:]]+(-[a-zA-Z]*u[a-zA-Z]*([[:space:]]|$)|-o[[:space:]]+nounset)'
+# The three passes (nounset detection, shape A, shape B with its
+# control-flow depth tracking) run in one Python process over every file
+# (#4720). The pure-bash line walk they replace took ~10s of CPU on an
+# idle laptop, which made this the slowest guard in run-ci-guards.sh.
+# ``_check_bash_set_u_empty_array_scan.py`` is a line-for-line port of
+# that walk with the same regexes, so the verdicts are unchanged. It
+# emits one record per line:
+#
+#   R<TAB><text>                        a report line
+#   A                                   one shape (A) violation
+#   B<TAB><line><TAB><name><TAB><file>  one shape (B) violation (for --fix)
+SCAN_HELPER="$REPO_ROOT/scripts/_check_bash_set_u_empty_array_scan.py"
+scan_out="$(mktemp "${TMPDIR:-/tmp}/check-bash-set-u-empty-array.XXXXXX")"
+trap 'rm -f "$scan_out"' EXIT
+scan_rc=0
+printf '%s\0' "${sh_files[@]}" | python3 "$SCAN_HELPER" > "$scan_out" || scan_rc=$?
+if (( scan_rc != 0 )); then
+    echo "check-bash-set-u-empty-array: scanner $SCAN_HELPER failed (exit $scan_rc)" >&2
+    exit 2
+fi
 
-# Match ``declare -a <name>`` or ``typeset -a <name>`` where <name> is
-# NOT followed by ``=`` (i.e. bare declare). Captures <name> in
-# BASH_REMATCH[2].
-DECLARE_BARE_REGEX='^[[:space:]]*(declare|typeset)[[:space:]]+-[a-zA-Z]*a[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)([[:space:]]|$)'
-
-# Match a bare-empty array initialiser ``<name>=()`` — i.e. the parens
-# are empty (whitespace-only between ``(`` and ``)``). Captures <name>
-# in BASH_REMATCH[1]. Anchored at start-of-line (with optional
-# leading whitespace) so a substring like ``foo=()`` inside an
-# expression is not picked up. Excludes ``declare -a <name>=()`` /
-# ``local -a <name>=()`` / ``readonly <name>=()`` and friends — those
-# inline-assignment forms are not the bare-empty pattern this check
-# targets, and they also fall under shape (A)'s "inline OK" carve-out.
-EMPTY_INIT_REGEX='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=\([[:space:]]*\)[[:space:]]*$'
-
-for file in "${sh_files[@]}"; do
-    # Skip allow-listed files.
-    skip=false
-    for excl in "${EXCLUDE_FILES[@]}"; do
-        if [[ "$file" == *"$excl" ]]; then
-            skip=true
-            break
-        fi
-    done
-    if "$skip"; then
-        continue
-    fi
-
-    # Read file into an array of lines. Use the ``while read`` idiom —
-    # not ``mapfile`` — because this very script must run on bash 3.2.
-    lines=()
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        lines+=("$line")
-    done < "$file"
-
-    nlines=${#lines[@]}
-    [[ $nlines -eq 0 ]] && continue
-
-    # Pass 1: does this file enable ``set -u``?
-    has_nounset=false
-    i=0
-    while (( i < nlines )); do
-        l="${lines[$i]}"
-        # Skip comment lines.
-        if [[ "$l" =~ ^[[:space:]]*# ]]; then
-            i=$((i + 1))
-            continue
-        fi
-        if [[ "$l" =~ $NOUNSET_REGEX ]]; then
-            has_nounset=true
-            break
-        fi
-        i=$((i + 1))
-    done
-
-    if ! "$has_nounset"; then
-        continue
-    fi
-
-    # Pass 2: find bare ``declare -a <name>`` lines and check for
-    # read-before-assign. We re-walk the file linearly, recording each
-    # bare declare and then checking forward.
-    decl_idx=0
-    while (( decl_idx < nlines )); do
-        dline="${lines[$decl_idx]}"
-
-        # Skip comments.
-        if [[ "$dline" =~ ^[[:space:]]*# ]]; then
-            decl_idx=$((decl_idx + 1))
-            continue
-        fi
-
-        if [[ "$dline" =~ $DECLARE_BARE_REGEX ]]; then
-            name="${BASH_REMATCH[2]}"
-
-            # Build name-specific patterns. ``<name>=`` and
-            # ``<name>+=`` are bash assignment forms; the read forms
-            # are ``${#<name>[@]}`` / ``${#<name>[*]}`` /
-            # ``${<name>[@]...}`` / ``${<name>[*]...}``.
-            #
-            # Regex notes:
-            #   - Anchor reads at ``\$\{`` (literal ``${``) so we don't
-            #     match ``$<name>`` (scalar read, not array).
-            #   - Anchor assigns at ``<name>=(`` or ``<name>+=(`` so
-            #     a substring like ``foo_bar=...`` does not falsely
-            #     match when the array name is ``foo``.
-            assign_regex="(^|[^A-Za-z0-9_])${name}\\+?=\\("
-            read_regex="\\\$\\{#?${name}\\["
-
-            scan_idx=$((decl_idx + 1))
-            verdict=""
-            verdict_line=0
-            verdict_content=""
-            while (( scan_idx < nlines )); do
-                sline="${lines[$scan_idx]}"
-
-                # Skip comments inside the scan.
-                if [[ "$sline" =~ ^[[:space:]]*# ]]; then
-                    scan_idx=$((scan_idx + 1))
-                    continue
-                fi
-
-                # Check assignment first — it is the safe outcome and
-                # we want to short-circuit cleanly.
-                if [[ "$sline" =~ $assign_regex ]]; then
-                    verdict="assigned"
-                    break
-                fi
-
-                if [[ "$sline" =~ $read_regex ]]; then
-                    verdict="read"
-                    verdict_line=$((scan_idx + 1))
-                    verdict_content="$sline"
-                    break
-                fi
-
-                scan_idx=$((scan_idx + 1))
-            done
-
-            if [[ "$verdict" == "read" ]]; then
-                report_lines+=("  [declare -a $name read before assign under set -u]")
-                report_lines+=("    $file:$((decl_idx + 1)): $dline")
-                report_lines+=("    $file:$verdict_line: $verdict_content")
-                report_lines+=("    fix: replace 'declare -a $name' with '$name=()'")
-                violations=$((violations + 1))
-                shape_a_violations=$((shape_a_violations + 1))
-            fi
-        fi
-
-        decl_idx=$((decl_idx + 1))
-    done
-
-    # Pass 3 — bare-empty ``<name>=()`` + iteration-empty footgun
-    # ----------------------------------------------------------
-    # Find every ``<name>=()`` line. For each, scan forward looking
-    # for whichever of these comes first:
-    #
-    #   (a) an *unconditional* assignment ``<name>=(...)`` /
-    #       ``<name>+=(...)`` — this binds the array, the scan
-    #       short-circuits with verdict "assigned" (safe).
-    #   (b) an iteration-form read ``${<name>[@]}`` / ``${<name>[*]}``
-    #       (NOT the size form ``${#<name>[@]}``, NOT the guarded
-    #       form ``${<name>[@]+...}``) — verdict "read" (flag).
-    #
-    # "Unconditional" means: the assignment is at the same control-
-    # flow depth as the ``<name>=()`` declaration. An assignment at
-    # depth > base is *conditional* — it only binds the array on
-    # some code paths, so the scan continues forward looking for
-    # either an unconditional bind or an iteration read. This is
-    # the fix for #4479: the prior linear scan stopped at the
-    # *first* ``<name>+=`` it saw, even if that ``+=`` was inside an
-    # ``if`` / ``case`` / ``while`` branch that may not execute.
-    # The post-#4051 ``block-on-new-issue.sh`` is the canonical
-    # example: ``LABELS=()`` then ``LABELS+=("$2")`` inside a
-    # ``case`` arm of an arg-parse loop, then unguarded ``for label
-    # in "${LABELS[@]}"; do ...`` — runtime-broken on bash 3.2 when
-    # no ``--label`` was supplied, but the pre-#4479 check missed it.
-    #
-    # Length-guard recognition (#4479 AC#2 — keep current scripts/
-    # tree clean): an iteration read inside an ``if [ "${#<name>[@]}"
-    # -gt 0 ]; then ... fi`` (or ``[[ ... ]]`` / ``-ne 0`` / ``!= 0``
-    # / ``-ge 1``) block is exempt from the flag. The block is at
-    # depth = base_depth + 1 and the matching ``fi`` is the first
-    # ``fi`` at depth = base_depth on the line walk after the
-    # opening ``if``.
-    #
-    # Early-exit-on-empty recognition: a closed ``if [[
-    # ${#<name>[@]} -eq 0 ]]; then ... exit|return ...; fi`` block
-    # before any iteration read marks the array as "guaranteed
-    # non-empty after this point" — verdict short-circuits to
-    # "assigned" the moment the closing ``fi`` is processed. This
-    # covers the ``check-shard-coverage.sh`` style "early-exit if
-    # we found nothing, then iterate".
-
-    # ─── Pass A: precompute control-flow depth at each line ───
-    # We track TWO depth counters:
-    #
-    #   depth_at_line[i]      — total nesting depth after line i.
-    #                           Used for length-guard / early-exit
-    #                           block scoping (``if [ ... ]; then
-    #                           ... fi`` blocks).
-    #   branch_depth_at_line[i] — depth counting ONLY ``if`` / ``case``
-    #                           branches (not ``while`` / ``until`` /
-    #                           ``for`` loop bodies). Used to decide
-    #                           whether a ``<name>+=(...)`` is
-    #                           branch-conditional (and thus does
-    #                           NOT bind unconditionally) versus
-    #                           inside a loop body (which we treat
-    #                           as binding — the loop body runs zero
-    #                           or more times, but for the static
-    #                           scan we accept the loop-binding
-    #                           pattern that real codebases use,
-    #                           e.g. ``arr=(); while read line; do
-    #                           arr+=("$line"); done; for x in
-    #                           "${arr[@]}"...``). The runtime risk
-    #                           there — empty input → empty array →
-    #                           bash-3.2 trip — is a separate bug
-    #                           class. The #4479 fix targets the
-    #                           ``if``/``case`` arm shape that #4051
-    #                           hit (conditional ``+=`` inside an
-    #                           arg-parse ``case``).
-    #
-    # One-liners (``if X; then Y; fi`` / ``for X; do Y; done``) net
-    # to 0 — detected by presence of the matching closer on the
-    # same line.
-    depth_at_line=()
-    branch_depth_at_line=()
-    cur_depth=0
-    cur_branch_depth=0
-    li=0
-    while (( li < nlines )); do
-        dline_text="${lines[$li]}"
-
-        # Strip leading whitespace cheaply via parameter expansion
-        # plus a regex peel — bash 3.2-safe (no ${var/#pattern/}
-        # tricks needed beyond what 3.2 supports).
-        trimmed="$dline_text"
-        while [[ "$trimmed" == [[:space:]]* ]]; do
-            trimmed="${trimmed# }"
-            trimmed="${trimmed#	}"
-        done
-
-        # Skip comments and blank lines for depth tracking.
-        if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
-            depth_at_line+=("$cur_depth")
-            branch_depth_at_line+=("$cur_branch_depth")
-            li=$((li + 1))
-            continue
-        fi
-
-        # Detect openers / closers. Pattern matching uses bash
-        # regex (``[[ =~ ]]``) rather than ``case`` because the
-        # bare word ``case`` is a reserved keyword and cannot
-        # appear as a glob alternation pattern in a ``case``
-        # statement.
-        #
-        # An "opener" is one of ``if`` / ``while`` / ``until`` /
-        # ``for`` / ``case`` at start-of-trimmed-line. A "one-
-        # liner" (e.g. ``if X; then Y; fi``) carries its matching
-        # closer on the same line and contributes no net depth
-        # change. ``elif`` is treated as continuation (no depth
-        # change) of an already-open ``if`` block.
-        line_delta=0
-        branch_delta=0
-        if [[ "$trimmed" =~ ^elif([[:space:]]|$) ]]; then
-            :  # continuation, no depth change
-        elif [[ "$trimmed" =~ ^(if|while|until|for)([[:space:]]|$) ]]; then
-            # Opener of an if/while/until/for block. Look for a
-            # matching closer on the same line — one-liner.
-            opener="${BASH_REMATCH[1]}"
-            closer="fi"
-            case "$opener" in
-                while|until|for) closer="done" ;;
-            esac
-            if [[ "$trimmed" =~ \;[[:space:]]*${closer}([[:space:]]|\;|$) ]] || \
-               [[ "$trimmed" =~ [[:space:]]${closer}([[:space:]]|\;|$) ]]; then
-                :  # one-liner, no net change
-            else
-                line_delta=1
-                if [[ "$opener" == "if" ]]; then
-                    branch_delta=1
-                fi
-            fi
-        elif [[ "$trimmed" =~ ^case([[:space:]]|$) ]]; then
-            # ``case`` opener — this counts as a branch.
-            if [[ "$trimmed" =~ \;[[:space:]]*esac([[:space:]]|\;|$) ]] || \
-               [[ "$trimmed" =~ [[:space:]]esac([[:space:]]|\;|$) ]]; then
-                :
-            else
-                line_delta=1
-                branch_delta=1
-            fi
-        elif [[ "$trimmed" =~ ^fi([[:space:]]|\;|$) ]]; then
-            line_delta=-1
-            branch_delta=-1
-        elif [[ "$trimmed" =~ ^esac([[:space:]]|\;|$) ]]; then
-            line_delta=-1
-            branch_delta=-1
-        elif [[ "$trimmed" =~ ^done([[:space:]]|\;|$) ]]; then
-            line_delta=-1
-        fi
-
-        # Apply the delta. Note: for closers, depth_at_line[i]
-        # records the depth *after* the close — i.e. the depth
-        # the next line opens at.
-        cur_depth=$((cur_depth + line_delta))
-        if (( cur_depth < 0 )); then
-            cur_depth=0  # defensive: malformed file shouldn't crash us
-        fi
-        cur_branch_depth=$((cur_branch_depth + branch_delta))
-        if (( cur_branch_depth < 0 )); then
-            cur_branch_depth=0
-        fi
-        depth_at_line+=("$cur_depth")
-        branch_depth_at_line+=("$cur_branch_depth")
-        li=$((li + 1))
-    done
-
-    # ─── Pass B: per-name forward scan ───
-    init_idx=0
-    while (( init_idx < nlines )); do
-        iline="${lines[$init_idx]}"
-
-        # Skip comments.
-        if [[ "$iline" =~ ^[[:space:]]*# ]]; then
-            init_idx=$((init_idx + 1))
-            continue
-        fi
-
-        if [[ "$iline" =~ $EMPTY_INIT_REGEX ]]; then
-            iname="${BASH_REMATCH[1]}"
-            # base_branch_depth is the ``if``/``case`` nesting at
-            # the ``<name>=()`` line — used to decide whether a
-            # later ``+=`` is at the same branch depth (binding)
-            # or deeper (branch-conditional, not binding).
-            base_branch_depth="${branch_depth_at_line[$init_idx]}"
-
-            # Name-specific regexes. Anchoring rationale: see
-            # the assign / read / guarded-form notes preserved
-            # below from the prior implementation.
-            iassign_regex="(^|[^A-Za-z0-9_])${iname}\\+?=\\("
-            iread_regex="\\\$\\{${iname}\\[[@*]\\]\\}"
-            iguarded_regex="\\\$\\{${iname}\\[[@*]\\]\\+"
-            # Length-guard openers. Match both ``[ ... ]`` and
-            # ``[[ ... ]]`` test forms, with optional double-quotes
-            # around the size expression, and either ``-gt 0`` /
-            # ``-ge 1`` / ``-ne 0`` / ``!= 0`` for "non-empty".
-            ilen_guard_open_regex="^[[:space:]]*if[[:space:]]+\\[\\[?[[:space:]]+\"?\\\$\\{#${iname}\\[[@*]\\]\\}\"?[[:space:]]+(-gt[[:space:]]+0|-ge[[:space:]]+1|-ne[[:space:]]+0|!=[[:space:]]+0)[[:space:]]+\\]\\]?[[:space:]]*\\;?[[:space:]]*then"
-            # Early-exit openers — same shape but checking == 0.
-            iearly_exit_open_regex="^[[:space:]]*if[[:space:]]+\\[\\[?[[:space:]]+\"?\\\$\\{#${iname}\\[[@*]\\]\\}\"?[[:space:]]+(-eq[[:space:]]+0|-lt[[:space:]]+1|-le[[:space:]]+0|==[[:space:]]+0)[[:space:]]+\\]\\]?[[:space:]]*\\;?[[:space:]]*then"
-            # Stop statement (exit / return) inside an early-exit block.
-            istop_regex="^[[:space:]]*(exit|return)([[:space:]]|$)"
-
-            iscan_idx=$((init_idx + 1))
-            iverdict=""
-            iverdict_line=0
-            iverdict_content=""
-
-            # Length-guard tracking: when we open an
-            # ``if [ "${#name[@]}" -gt 0 ]`` block, record the
-            # depth at which it opened. Reads inside that block
-            # (depth > open_depth) are exempt. The block closes
-            # when depth drops back to open_depth.
-            len_guard_open_depth=-1
-
-            # Early-exit-on-empty tracking: when we see an
-            # ``if [[ ${#name[@]} -eq 0 ]]; then ... exit|return ;
-            # fi`` block close cleanly, mark the array as
-            # guaranteed non-empty going forward.
-            in_early_exit_block=0
-            early_exit_open_depth=-1
-            early_exit_has_stop=0
-
-            while (( iscan_idx < nlines )); do
-                isline="${lines[$iscan_idx]}"
-                idepth="${depth_at_line[$iscan_idx]}"
-
-                # Skip comments inside the scan.
-                if [[ "$isline" =~ ^[[:space:]]*# ]]; then
-                    iscan_idx=$((iscan_idx + 1))
-                    continue
-                fi
-
-                # ── Length-guard block close detection ──
-                # If we were inside a length-guard block and depth
-                # has dropped back to the open-depth, the block
-                # has just closed — clear the tracker.
-                if (( len_guard_open_depth >= 0 )) && (( idepth <= len_guard_open_depth )); then
-                    len_guard_open_depth=-1
-                fi
-
-                # ── Length-guard block open detection ──
-                # An ``if [ "${#name[@]}" -gt 0 ]; then`` line
-                # opens a block at depth = idepth. Reads of
-                # ``name`` inside this block are exempt.
-                if [[ "$isline" =~ $ilen_guard_open_regex ]]; then
-                    # idepth has already been incremented by Pass A
-                    # for this opener line, so we record idepth - 1
-                    # as the "outside" depth.
-                    len_guard_open_depth=$((idepth - 1))
-                fi
-
-                # ── Early-exit-on-empty block tracking ──
-                # If we were tracking an early-exit candidate and
-                # depth has dropped back, the block has just
-                # closed. If a stop statement was seen inside it,
-                # short-circuit verdict to "assigned".
-                if (( in_early_exit_block )) && (( idepth <= early_exit_open_depth )); then
-                    if (( early_exit_has_stop )); then
-                        iverdict="assigned"
-                        break
-                    fi
-                    in_early_exit_block=0
-                    early_exit_open_depth=-1
-                    early_exit_has_stop=0
-                fi
-
-                # Open a fresh early-exit candidate?
-                if [[ "$isline" =~ $iearly_exit_open_regex ]]; then
-                    in_early_exit_block=1
-                    early_exit_open_depth=$((idepth - 1))
-                    early_exit_has_stop=0
-                fi
-
-                # Stop statement inside the early-exit candidate?
-                if (( in_early_exit_block )) && (( idepth > early_exit_open_depth )); then
-                    if [[ "$isline" =~ $istop_regex ]]; then
-                        early_exit_has_stop=1
-                    fi
-                fi
-
-                # ── Check assignment ──
-                # An assignment ``<name>=(`` or ``<name>+=(`` is
-                # treated as binding (verdict "assigned") UNLESS
-                # it is inside an ``if`` / ``case`` branch deeper
-                # than the declaration's branch depth. That is,
-                # we accept loop-body bindings (``while`` / ``for``
-                # / ``until``) as binding because real codebases
-                # use ``arr=(); while read line; do arr+=...; done;
-                # for x in "${arr[@]}"; do ...`` and the runtime
-                # risk (empty input → empty array → bash-3.2 trip)
-                # is a separate, lower-severity bug class than the
-                # ``if``/``case``-arm conditional that #4051 hit.
-                # The ``branch_depth`` check is what distinguishes
-                # the two.
-                ibranch_depth="${branch_depth_at_line[$iscan_idx]}"
-                if [[ "$isline" =~ $iassign_regex ]]; then
-                    if (( ibranch_depth <= base_branch_depth )); then
-                        iverdict="assigned"
-                        break
-                    fi
-                    # else: branch-conditional assignment (inside
-                    # an ``if`` / ``case`` arm) — does NOT bind
-                    # the array unconditionally. Continue scanning.
-                fi
-
-                # Skip lines using the guarded ``${name[@]+...}``
-                # parameter-expansion idiom. The line is bash-3.2-
-                # safe even when the array is empty, so do not
-                # treat it as a flagged read. The scan continues
-                # past the guarded line — the array may still be
-                # empty afterward.
-                if [[ "$isline" =~ $iguarded_regex ]]; then
-                    iscan_idx=$((iscan_idx + 1))
-                    continue
-                fi
-
-                # ── Check iteration read ──
-                if [[ "$isline" =~ $iread_regex ]]; then
-                    # If we're inside an active length-guard
-                    # block for this name, the read is safe.
-                    if (( len_guard_open_depth >= 0 )) && (( idepth > len_guard_open_depth )); then
-                        iscan_idx=$((iscan_idx + 1))
-                        continue
-                    fi
-                    iverdict="read"
-                    iverdict_line=$((iscan_idx + 1))
-                    iverdict_content="$isline"
-                    break
-                fi
-
-                iscan_idx=$((iscan_idx + 1))
-            done
-
-            if [[ "$iverdict" == "read" ]]; then
-                report_lines+=("  [$iname=() iterated empty under set -u (bash 3.2 footgun)]")
-                report_lines+=("    $file:$((init_idx + 1)): $iline")
-                report_lines+=("    $file:$iverdict_line: $iverdict_content")
-                report_lines+=("    fix: guard with 'if [ \"\${#$iname[@]}\" -gt 0 ]; then ... fi'")
-                report_lines+=("         or pre-populate '$iname' before iterating")
-                violations=$((violations + 1))
-                # Stash data for --fix mode (shape B only).
-                fix_files+=("$file")
-                fix_inames+=("$iname")
-                fix_iter_lines+=("$iverdict_line")
-            fi
-        fi
-
-        init_idx=$((init_idx + 1))
-    done
-done
+TAB=$'\t'
+while IFS= read -r rec || [[ -n "$rec" ]]; do
+    case "$rec" in
+        "R$TAB"*)
+            report_lines+=("${rec#R$TAB}")
+            ;;
+        A)
+            violations=$((violations + 1))
+            shape_a_violations=$((shape_a_violations + 1))
+            ;;
+        "B$TAB"*)
+            rest="${rec#B$TAB}"
+            fix_iter_lines+=("${rest%%$TAB*}")
+            rest="${rest#*$TAB}"
+            fix_inames+=("${rest%%$TAB*}")
+            fix_files+=("${rest#*$TAB}")
+            violations=$((violations + 1))
+            ;;
+    esac
+done < "$scan_out"
 
 if (( violations == 0 )); then
     echo "check-bash-set-u-empty-array: ${#sh_files[@]} shell script(s) scanned — all clean."

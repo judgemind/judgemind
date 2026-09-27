@@ -130,8 +130,21 @@ is_allowlisted() {
 
 declare -a violation_lines=()
 
+# Every pattern above requires the literal ``"TIMED_OUT"`` on the matching
+# line. One fixed-string ``grep -rlF`` lists the few files that contain it,
+# and the four regex passes run over just those files instead of walking
+# the whole repo four times (#4720). ``grep -H`` keeps the same
+# ``path:line:content`` output, and grep -l keeps the walk order.
+candidate_files=()
+while IFS= read -r f; do
+    [[ -n "$f" ]] && candidate_files+=("$f")
+done < <(grep -rlF -e '"TIMED_OUT"' "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null || true)
+
 for pat in "${PATTERNS[@]}"; do
-    matches=$(grep -rnE "$pat" "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null || true)
+    if [[ ${#candidate_files[@]} -eq 0 ]]; then
+        break
+    fi
+    matches=$(grep -HnE "$pat" "${candidate_files[@]}" 2>/dev/null || true)
     if [[ -z "$matches" ]]; then
         continue
     fi

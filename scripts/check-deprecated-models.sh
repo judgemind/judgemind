@@ -82,9 +82,33 @@ done
 violations=0
 violation_files=()
 
-# Use grep -rn with extended regex to find deprecated model references.
-# Process matches and filter out excluded files.
-matches=$(grep -rnE "$PATTERN" "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null || true)
+# Two-stage scan (#4720). BSD grep evaluates a ten-way alternation (or ten
+# ``-F -e`` patterns) slowly: one ``grep -rnE "$PATTERN"`` over the repo
+# took ~4s of CPU. So stage 1 lists the files that contain the models'
+# longest common literal prefix (``claude-3-`` today), which is fast, and
+# stage 2 runs the full pattern over just those files. Every match of
+# the full pattern contains the prefix, so the result is the same, in the
+# same ``path:line:content`` form and file order. If the list ever loses
+# a useful common prefix, the scan falls back to the single-stage form.
+common_prefix="${DEPRECATED_MODELS[0]}"
+for model in "${DEPRECATED_MODELS[@]}"; do
+    while [[ -n "$common_prefix" && "$model" != "$common_prefix"* ]]; do
+        common_prefix="${common_prefix%?}"
+    done
+done
+
+if (( ${#common_prefix} >= 4 )); then
+    candidate_files=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && candidate_files+=("$f")
+    done < <(grep -rlF -e "$common_prefix" "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null || true)
+    matches=""
+    if [[ ${#candidate_files[@]} -gt 0 ]]; then
+        matches=$(grep -HnE "$PATTERN" "${candidate_files[@]}" 2>/dev/null || true)
+    fi
+else
+    matches=$(grep -rnE "$PATTERN" "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null || true)
+fi
 
 if [[ -n "$matches" ]]; then
     while IFS= read -r line; do
