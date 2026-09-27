@@ -80,6 +80,9 @@ class TestBuildEvent:
         assert event["content_format"] == "html"
         assert event["hearing_date"] == "2026-03-15"
         assert event["ruling_text"] == html_content.decode("utf-8")
+        # Orange has a hook-less scraper, so this is the regex fallback: the
+        # worker keeps the 180-day rule for it (#4793).
+        assert event["hearing_date_source"] == "regex_fallback"
 
     def test_event_marks_split_set_replacement(self) -> None:
         """#4788: a rebuild re-derives the split set, so its events opt in to
@@ -98,6 +101,7 @@ class TestBuildEvent:
 
         assert event["content_format"] == "html"
         assert "hearing_date" not in event
+        assert "hearing_date_source" not in event
 
     def test_scraper_hook_date_wins_over_generic_regex(self) -> None:
         """#4774: the capturing scraper's ``hearing_date_for_raw`` hook dates
@@ -118,6 +122,7 @@ class TestBuildEvent:
             provenance={"capture_scraper_id": "ca-ventura-tentatives"},
         )
         assert event["hearing_date"] == "2026-03-11"
+        assert event["hearing_date_source"] == "structured_hook"
 
     def test_html_with_date_prefix_format(self) -> None:
         """HTML with 'Date: MM/DD/YYYY' format should extract hearing_date."""

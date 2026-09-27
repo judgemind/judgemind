@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from framework.title_heuristics import has_uninformative_party_title
+from validation.hearing_date_source import is_structured
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,14 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Maximum allowed gap between hearing_date and captured_at.
+# Maximum allowed gap between hearing_date and captured_at.  Out of this
+# window a structured-source date is flagged, any other date fails (#4793).
 _HEARING_DATE_MAX_DELTA_DAYS = 180
+
+# Sanity floor for structured-source dates (#4793): a structured parser can
+# still misread a year, so these fail regardless of source.
+_STRUCTURED_HEARING_DATE_MIN = date(2000, 1, 1)
+_STRUCTURED_HEARING_DATE_MAX_AHEAD_DAYS = 365
 
 # Truncation sentinel length — ruling_text at exactly this length
 # suggests the entire page was stored instead of an individual ruling.
@@ -186,24 +193,67 @@ def check_no_html_in_ruling_text(ruling_text: str | None) -> DeterministicRuleRe
 def check_hearing_date_in_range(
     hearing_date: date | None,
     captured_at: date | None,
+    hearing_date_source: str | None = None,
 ) -> DeterministicRuleResult:
     """Check that hearing_date is within +/-180 days of captured_at.
 
     A hearing date far from the capture date usually indicates a wrong
     date was extracted (e.g. a date from a different case or boilerplate).
+
+    A date from a structured source (``validation.hearing_date_source``) is
+    trusted instead (#4793, decision on #4755): courts keep old rulings
+    posted, and the scraper read the date from a labelled header, filename
+    or listing.  Out of the 180-day window it is only flagged.  A sanity
+    floor still fails a structured year before 2000 or a date more than a
+    year after capture, since a structured parser can misread a year.
+    Other sources (LLM, regex, a splitter's body parse, unknown) keep the
+    180-day fail.
     """
-    if hearing_date is None or captured_at is None:
-        return DeterministicRuleResult(rule="hearing_date_in_range", result="pass")
+    rule = "hearing_date_in_range"
+    if hearing_date is None:
+        return DeterministicRuleResult(rule=rule, result="pass")
+
+    structured = is_structured(hearing_date_source)
+    if structured:
+        if hearing_date < _STRUCTURED_HEARING_DATE_MIN:
+            return DeterministicRuleResult(
+                rule=rule,
+                result="fail",
+                reason=f"hearing_date ({hearing_date}) from {hearing_date_source} is before "
+                f"{_STRUCTURED_HEARING_DATE_MIN} — below the structured-date floor",
+            )
+        if (
+            captured_at is not None
+            and (hearing_date - captured_at).days > _STRUCTURED_HEARING_DATE_MAX_AHEAD_DAYS
+        ):
+            return DeterministicRuleResult(
+                rule=rule,
+                result="fail",
+                reason=f"hearing_date ({hearing_date}) from {hearing_date_source} is more than "
+                f"{_STRUCTURED_HEARING_DATE_MAX_AHEAD_DAYS} days after captured_at "
+                f"({captured_at})",
+            )
+
+    if captured_at is None:
+        return DeterministicRuleResult(rule=rule, result="pass")
 
     delta = abs((hearing_date - captured_at).days)
     if delta > _HEARING_DATE_MAX_DELTA_DAYS:
+        if structured:
+            return DeterministicRuleResult(
+                rule=rule,
+                result="flag",
+                reason=f"hearing_date ({hearing_date}) is {delta} days from "
+                f"captured_at ({captured_at}) — outside the {_HEARING_DATE_MAX_DELTA_DAYS}-day "
+                f"window, kept because it came from {hearing_date_source}",
+            )
         return DeterministicRuleResult(
-            rule="hearing_date_in_range",
+            rule=rule,
             result="fail",
             reason=f"hearing_date ({hearing_date}) is {delta} days from "
             f"captured_at ({captured_at}) — exceeds {_HEARING_DATE_MAX_DELTA_DAYS}-day threshold",
         )
-    return DeterministicRuleResult(rule="hearing_date_in_range", result="pass")
+    return DeterministicRuleResult(rule=rule, result="pass")
 
 
 def check_no_multiple_adversarial_patterns(case_title: str | None) -> DeterministicRuleResult:
@@ -584,6 +634,7 @@ def run_deterministic_rules(
     hearing_date: date | None,
     captured_at: date | None,
     other_case_numbers: list[str] | None = None,
+    hearing_date_source: str | None = None,
 ) -> DeterministicValidationResult:
     """Run all deterministic validation rules on a ruling.
 
@@ -605,6 +656,11 @@ def run_deterministic_rules(
         ``no_cross_case_ruling_text`` rule which flags rulings whose text
         references another case's number (#2371).  Existing callers that
         omit this kwarg keep their previous behaviour.
+    hearing_date_source : str | None
+        Where ``hearing_date`` came from (``validation.hearing_date_source``).
+        A structured source turns an out-of-window ``hearing_date_in_range``
+        result into a non-blocking flag (#4793).  ``None`` keeps the 180-day
+        fail.
 
     Returns
     -------
@@ -613,7 +669,7 @@ def run_deterministic_rules(
     """
     results: list[DeterministicRuleResult] = [
         check_no_html_in_ruling_text(ruling_text),
-        check_hearing_date_in_range(hearing_date, captured_at),
+        check_hearing_date_in_range(hearing_date, captured_at, hearing_date_source),
         check_no_multiple_adversarial_patterns(case_title),
         check_ruling_text_not_empty(ruling_text),
         check_case_number_not_unknown(case_number),

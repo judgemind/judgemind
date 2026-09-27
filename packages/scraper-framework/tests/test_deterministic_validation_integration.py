@@ -183,7 +183,12 @@ def test_det_validation_fail_wrong_date_skips_db_write(
     mock_extract_llm: MagicMock,
     mock_insert_validation: MagicMock,
 ) -> None:
-    """SD ruling 5eac1c2d — hearing_date=2003 triggers hearing_date_in_range fail."""
+    """SD ruling 5eac1c2d — hearing_date=2003 triggers hearing_date_in_range fail.
+
+    The date is labelled as LLM-extracted: only non-structured dates keep the
+    180-day fail (#4793).  A structured date this old is flagged instead —
+    see ``tests/test_hearing_date_source.py``.
+    """
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
@@ -192,6 +197,7 @@ def test_det_validation_fail_wrong_date_skips_db_write(
     event = _make_event(
         county="San Diego",
         hearing_date="2003-07-15",
+        hearing_date_source="llm",
         capture_timestamp="2026-03-04T23:00:00",
     )
     worker.process_event(event)

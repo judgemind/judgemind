@@ -265,6 +265,20 @@ Rules every scraper author and reviewer must follow. These apply to new scrapers
 
 **Required fields.** A scraper is not shippable until it correctly extracts all of the following from source data present at development time: **judge name, motion type, case title, hearing date, outcome, parties**. Fields the court website does not provide may be left blank; fields the court website does provide must be extracted. Do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills.
 
+**Hearing dates carry their source.** Every hearing date the pipeline assigns carries a `hearing_date_source`, stored in `derived.rulings.hearing_date_source` and `telemetry.validation_results.hearing_date_source` (#4793). The values are defined in `validation/hearing_date_source.py`. Structured sources read the date from a labelled place, never from free text:
+
+- `structured_scraper`: the scraper's `parse_document`, from a labelled header, the filename, or a listing `<time datetime>`.
+- `structured_hook`: the scraper's `hearing_date_for_raw` hook, used when rebuild or prefix reingest builds the event from S3.
+- `structured_header`: the CC portal calendar PDF header.
+
+The other sources are not structured:
+
+- `splitter`: a splitter's per-entry body date that differs from the parent's date.
+- `llm`: the LLM split or per-field LLM extraction.
+- `regex_fallback`: `extract_hearing_date`.
+
+The deterministic `hearing_date_in_range` rule fails a ruling whose date is more than 180 days from `captured_at`. This applies to every source except the structured ones. A structured date outside that window is only flagged, and the ruling is still written, because courts keep old rulings posted. A structured date still fails if its year is before 2000 or it is more than 365 days after capture. An LLM date never replaces a structured date and never takes its label. Scrapers must therefore set `hearing_date` only from a labelled header, a filename, or a listing, never from the ruling body.
+
 **Regression tests against real fixtures.** Every scraper must ship with tests against archived real court pages covering typical rulings, edge cases, and known formatting variations. Each test must assert the value of every required field. "The scraper runs without error" is not a test.
 
 **Precondition failures must raise.** If `fetch_documents` has a prerequisite step (session acquisition, auth, proxy handshake) that, when it fails, prevents fetching any documents, it MUST call `self._require_precondition(...)` (which raises `ScraperPreconditionFailure`). Returning `[]` would be recorded as a successful zero-records run by `BaseScraper.run()` and mask silent outages — see #2620.

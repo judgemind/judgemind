@@ -213,20 +213,40 @@ def test_live_path_worker_transcribes_pdf_only_portal_ruling() -> None:
     _assert_c22_01081_section(kwargs["ruling_text"])
 
 
-def test_live_path_stale_pdf_only_ruling_fails_only_the_hearing_date_rule(
+def test_live_path_stale_pdf_only_ruling_is_written_with_a_date_flag(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The 2025 portal rulings: text is present, only the date rule rejects them."""
+    """The 2025 portal rulings (#4755, #4793): the calendar PDF header dates
+    them more than 180 days before capture.  That date is structured, so the
+    date rule only flags it and the ruling is written."""
     payload, archived = _capture(datetime(2025, 3, 10, 21, 21, 20, tzinfo=UTC))
 
     worker = _worker({_S3_KEY: archived})
-    with caplog.at_level(logging.WARNING, logger="ingestion.worker"):
+    with caplog.at_level(logging.INFO, logger="ingestion.worker"):
         mock_ins = _process(worker, payload)
 
-    mock_ins.assert_not_called()
-    fails = [r for r in caplog.records if "Deterministic validation FAIL" in r.getMessage()]
-    assert len(fails) == 1
-    assert fails[0].det_failed_rules == ["hearing_date_in_range"]
+    mock_ins.assert_called_once()
+    assert mock_ins.call_args.kwargs["hearing_date"] == date(2025, 2, 28)
+    assert mock_ins.call_args.kwargs["hearing_date_source"] == "structured_header"
+    assert not [r for r in caplog.records if "Deterministic validation FAIL" in r.getMessage()]
+    results = [r for r in caplog.records if r.getMessage() == "Deterministic validation result"]
+    assert len(results) == 1
+    assert results[0].det_overall == "flag"
+    assert results[0].det_flagged_rules == ["hearing_date_in_range"]
+
+
+def test_rebuild_path_stale_envelope_is_written_with_the_header_date() -> None:
+    """Prefix reingest of a 2025 envelope archived in 2026 (the recovery path
+    for the blocked portal rulings): the header date is kept and labelled."""
+    _payload, archived = _capture(datetime(2025, 3, 10, 21, 21, 20, tzinfo=UTC))
+    event = _rebuild_event(archived)
+    event["capture_timestamp"] = "2026-09-24T04:00:00+00:00"
+
+    mock_ins = _process(_worker(), event)
+
+    mock_ins.assert_called_once()
+    assert mock_ins.call_args.kwargs["hearing_date"] == date(2025, 2, 28)
+    assert mock_ins.call_args.kwargs["hearing_date_source"] == "structured_header"
 
 
 def test_live_path_s3_fetch_failure_leaves_text_empty_and_warns(
@@ -310,6 +330,9 @@ def test_rebuild_path_worker_unwraps_inline_envelope() -> None:
     mock_ins.assert_called_once()
     kwargs = mock_ins.call_args.kwargs
     assert mock_ins.case_number == "C22-01746"
+    # The date is the scraper's listing-row date (#4793).
+    assert kwargs["hearing_date"] is not None
+    assert kwargs["hearing_date_source"] == "structured_scraper"
     assert kwargs["ruling_text"].startswith(
         "Defendant Walnut Creek Presbyterian Church’s Motion for Summary Judgment"
     )
@@ -428,8 +451,10 @@ def test_pdf_header_date_overrides_listing_time_on_event(
     logs = _transcription_logs(caplog)
     assert len(logs) == 1
     assert logs[0].hearing_date == "2025-02-28"
-    assert logs[0].hearing_date_source == "pdf_header"
+    assert logs[0].hearing_date_source == "structured_header"
     assert logs[0].event_hearing_date == "2025-03-10T21:21:20+00:00"
+    # The ruling row carries the same label (#4793).
+    assert mock_ins.call_args.kwargs["hearing_date_source"] == "structured_header"
 
 
 def test_pdf_without_header_date_keeps_event_date(caplog: pytest.LogCaptureFixture) -> None:
@@ -454,4 +479,6 @@ def test_pdf_without_header_date_keeps_event_date(caplog: pytest.LogCaptureFixtu
     logs = _transcription_logs(caplog)
     assert len(logs) == 1
     assert logs[0].hearing_date == "2025-02-28"
-    assert logs[0].hearing_date_source == "event"
+    # The event's own date came from the scraper (the PDF filename).
+    assert logs[0].hearing_date_source == "structured_scraper"
+    assert mock_ins.call_args.kwargs["hearing_date_source"] == "structured_scraper"

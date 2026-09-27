@@ -55,6 +55,15 @@ from validation.deterministic import (
     run_deterministic_rules,
 )
 from validation.gate import ValidationResult, insert_validation_result, validate_document
+from validation.hearing_date_source import (
+    LLM,
+    REGEX_FALLBACK,
+    SPLITTER,
+    STRUCTURED_HEADER,
+    STRUCTURED_HOOK,
+    STRUCTURED_SCRAPER,
+    is_structured,
+)
 from validation.issue_filer import file_validation_issue
 
 from .case_type_resolver import resolve_case_type
@@ -263,6 +272,66 @@ def as_pre_split_child(event_data: dict[str, Any]) -> dict[str, Any]:
     return marked
 
 
+#: Event key carrying the provenance of ``hearing_date`` (#4793).  Values are
+#: the ``validation.hearing_date_source`` constants.
+HEARING_DATE_SOURCE_KEY = "hearing_date_source"
+
+
+def with_scraper_hearing_date_source(event_data: dict[str, Any]) -> dict[str, Any]:
+    """Label a capture event's own ``hearing_date`` as ``structured_scraper``.
+
+    A top-level event's date was set by the capturing scraper's
+    ``parse_document`` from a labelled header, filename or listing (#4774).
+    Events that already carry a source keep it: rebuild_db labels its hook
+    and regex dates, and the worker labels every split child it builds.
+    Returns *event_data* unchanged when there is nothing to label.
+    """
+    if (
+        not event_data.get("hearing_date")
+        or event_data.get(HEARING_DATE_SOURCE_KEY)
+        or event_data.get("_split_processed")
+    ):
+        return event_data
+    return {**event_data, HEARING_DATE_SOURCE_KEY: STRUCTURED_SCRAPER}
+
+
+def _parent_hearing_date(parent: dict[str, Any]) -> tuple[Any, str | None]:
+    value = parent.get("hearing_date")
+    return (value, parent.get(HEARING_DATE_SOURCE_KEY)) if value else (None, None)
+
+
+def _child_hearing_date(child_value: Any, parent: dict[str, Any]) -> tuple[Any, str | None]:
+    """Return ``(hearing_date, source)`` for a deterministic split child.
+
+    The splitter's per-entry date wins, as before, but it is parsed from the
+    entry body, so it is labelled ``splitter`` (the 180-day rule applies)
+    unless it equals the parent's date, which keeps the parent's label.
+    With no per-entry date the child inherits the parent's date and label.
+    """
+    parent_value, parent_source = _parent_hearing_date(parent)
+    if not child_value:
+        return parent_value, parent_source
+    child_date = _parse_date(child_value)
+    if child_date is not None and child_date == _parse_date(parent_value):
+        return child_value, parent_source
+    return child_value, SPLITTER
+
+
+def _llm_child_hearing_date(llm_value: Any, parent: dict[str, Any]) -> tuple[Any, str | None]:
+    """Return ``(hearing_date, source)`` for an LLM split child (#4793).
+
+    A structured parent date always wins: an LLM value never overwrites it
+    and never takes on its label.  Otherwise the LLM's per-ruling date is
+    used, labelled ``llm``, and the parent's date is the fallback.
+    """
+    parent_value, parent_source = _parent_hearing_date(parent)
+    if parent_value and is_structured(parent_source):
+        return parent_value, parent_source
+    if llm_value:
+        return llm_value, LLM
+    return parent_value, parent_source
+
+
 def _canonical_split_text(text: str) -> str:
     """Normalise page joins so one PDF splits the same way on every path.
 
@@ -338,6 +407,9 @@ def _try_sd_calendar_split(
                 else str(sr.hearing_date)
             )
 
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, event_data
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -354,7 +426,8 @@ def _try_sd_calendar_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
             "parties": sr.parties if sr.parties else event_data.get("parties", []),
         }
         try:
@@ -451,6 +524,9 @@ def _try_la_html_split(
         # judge_name and the downstream dept-to-judge directory fallback —
         # otherwise dept-25 Mkrtchyan rulings get misattributed to the
         # directory's primary-assignment judge (Latrice A. G. Byrdsong).
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, event_data
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -466,7 +542,8 @@ def _try_la_html_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
             "parties": sr.parties if sr.parties else event_data.get("parties", []),
             "judge_name": sr.judge_name or event_data.get("judge_name"),
         }
@@ -588,6 +665,9 @@ def _try_fresno_pdf_split(
                 else str(sr.hearing_date)
             )
 
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, event_data
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -603,7 +683,8 @@ def _try_fresno_pdf_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
         }
         try:
             dispatch(split_event)
@@ -738,6 +819,9 @@ def _try_riverside_pdf_split(
         # ``Re:`` / ``Motion:`` / ``Tentative Ruling:`` headers Riverside
         # PDFs don't have.  Each entry gets its own LLM call against
         # only its own text, so cross-entry carry-forward is impossible.
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, event_data
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -752,7 +836,8 @@ def _try_riverside_pdf_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
         }
         try:
             dispatch(split_event)
@@ -894,6 +979,9 @@ def _try_sf_pdf_split(
         # would produce a high false-negative rate.  Each entry gets
         # its own LLM call against only its own text, so cross-entry
         # carry-forward is impossible.
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, event_data
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -908,7 +996,8 @@ def _try_sf_pdf_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
         }
         try:
             dispatch(split_event)
@@ -990,9 +1079,14 @@ def _try_sc_pdf_split(
     # Doc-level hearing date for every child (#4667).  ``process_event``
     # normally fills this already via ``raw_hearing_date``; this is the same
     # derivation for direct callers.
-    doc_hearing_date: Any = event_data.get("hearing_date") or raw_hearing_date(
-        event_data, ruling_text
-    )
+    doc_hearing_parent: dict[str, Any] = event_data
+    if not event_data.get("hearing_date"):
+        hook_date = raw_hearing_date(event_data, ruling_text)
+        if hook_date:
+            doc_hearing_parent = {
+                "hearing_date": hook_date,
+                HEARING_DATE_SOURCE_KEY: STRUCTURED_HOOK,
+            }
     if not split_rulings:
         # No ``Line N`` boundaries found — fall through to LLM.
         logger.info(
@@ -1056,6 +1150,9 @@ def _try_sc_pdf_split(
         # entry's enrichment runs against only its own text, so cross-
         # entry carry-forward is impossible.  This matches the
         # Riverside splitter's fall-through behavior (#3649).
+        child_hearing_date, child_hearing_date_source = _child_hearing_date(
+            hearing_date_value, doc_hearing_parent
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -1070,7 +1167,8 @@ def _try_sc_pdf_split(
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
-            "hearing_date": hearing_date_value or doc_hearing_date,
+            "hearing_date": child_hearing_date,
+            HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
         }
         try:
             dispatch(split_event)
@@ -1685,6 +1783,9 @@ class IngestionWorker:
                 if name != "ruling_text" and value and not event_data.get(name)
             }
             updates["ruling_text"] = fields.get("ruling_text") or ""
+            if updates.get("hearing_date"):
+                # The scraper's listing-row date (#4793).
+                updates[HEARING_DATE_SOURCE_KEY] = STRUCTURED_SCRAPER
         else:
             extra = event_data.get("extra")
             if ruling_text or not (
@@ -1717,10 +1818,13 @@ class IngestionWorker:
             event_hearing_date = event_data.get("hearing_date")
             if result.hearing_date is not None:
                 updates["hearing_date"] = result.hearing_date.date().isoformat()
-                hearing_date_source = "pdf_header"
-            else:
-                hearing_date_source = "event"
+                updates[HEARING_DATE_SOURCE_KEY] = STRUCTURED_HEADER
             final_hearing_date = _parse_date(updates.get("hearing_date") or event_hearing_date)
+            hearing_date_source = (
+                updates.get(HEARING_DATE_SOURCE_KEY) or event_data.get(HEARING_DATE_SOURCE_KEY)
+                if final_hearing_date
+                else None
+            )
             log = logger.info if result.text else logger.warning
             log(
                 "CC portal envelope PDF transcription: %s",
@@ -2464,6 +2568,10 @@ class IngestionWorker:
         ``return`` from this method counts as an exit and triggers the
         outer wrapper's ``timing.emit()`` exactly once.
         """
+        # Label the capture's own hearing date before anything can replace
+        # it, so the label always follows the date (#4793).
+        event_data = with_scraper_hearing_date_source(event_data)
+
         # CC portal JSON envelopes (#4753): transcribe a PDF-only ruling and
         # unwrap an envelope carried as the event text (rebuild / prefix
         # reingest) before any field is read.
@@ -2593,7 +2701,11 @@ class IngestionWorker:
         if not event_data.get("hearing_date") and not event_data.get("_split_processed"):
             header_date = raw_hearing_date(event_data, ruling_text)
             if header_date:
-                event_data = {**event_data, "hearing_date": header_date}
+                event_data = {
+                    **event_data,
+                    "hearing_date": header_date,
+                    HEARING_DATE_SOURCE_KEY: STRUCTURED_HOOK,
+                }
 
         # LLM extraction is the sole path for document splitting and
         # structured field extraction.  The legacy regex splitter framework
@@ -2616,6 +2728,11 @@ class IngestionWorker:
         # Parse timestamps
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
+        # Provenance of ``hearing_dt``; reassigned wherever ``hearing_dt`` is
+        # (#4793).
+        hearing_date_source: str | None = (
+            event_data.get(HEARING_DATE_SOURCE_KEY) if hearing_dt is not None else None
+        )
 
         raw_outcome: str | None = event_data.get("outcome")
         # Normalize scraper-provided outcome to lowercase enum value (#1878).
@@ -2741,6 +2858,7 @@ class IngestionWorker:
                         case_type=plausibility_case_type,
                     ):
                         hearing_dt = llm_result.hearing_date
+                        hearing_date_source = LLM
                         extraction_methods["hearing_date"] = "llm"
                     else:
                         logger.info(
@@ -2899,6 +3017,7 @@ class IngestionWorker:
             if hearing_dt is None and ruling_text:
                 hearing_dt = extract_hearing_date(ruling_text)
                 if hearing_dt is not None:
+                    hearing_date_source = REGEX_FALLBACK
                     extraction_methods.setdefault("hearing_date", "regex")
                     logger.info(
                         "Extracted hearing_date from ruling text (regex fallback)",
@@ -3297,6 +3416,7 @@ class IngestionWorker:
                 case_title=case_title,
                 hearing_date=hearing_dt,
                 captured_at=captured_at_date,
+                hearing_date_source=hearing_date_source,
             )
 
         if det_result.overall != "pass":
@@ -3310,6 +3430,7 @@ class IngestionWorker:
                     "det_reasons": det_result.reasons,
                     "county": county,
                     "case_number": case_number,
+                    "hearing_date_source": hearing_date_source,
                 },
             )
 
@@ -3354,6 +3475,7 @@ class IngestionWorker:
                     county=county,
                     scraper_id=scraper_id,
                     s3_key=s3_key,
+                    hearing_date_source=hearing_date_source,
                 )
                 conn.commit()
             except Exception as exc:
@@ -3390,6 +3512,7 @@ class IngestionWorker:
                     county=county,
                     scraper_id=scraper_id,
                     s3_key=s3_key,
+                    hearing_date_source=hearing_date_source,
                 )
                 conn.commit()
             except Exception as exc:
@@ -3501,6 +3624,7 @@ class IngestionWorker:
                         county=county,
                         scraper_id=scraper_id,
                         s3_key=s3_key,
+                        hearing_date_source=hearing_date_source,
                     )
                     conn.commit()
                 except Exception as exc:
@@ -3805,6 +3929,7 @@ class IngestionWorker:
                 # preserve-first, so a re-process that misses the case
                 # number cannot delete a correct ruling (#4788).
                 relink_case=_should_relink_split_case(event_data, effective_case_number),
+                hearing_date_source=hearing_date_source,
             )
 
             # 5. Link case to judge
@@ -3824,6 +3949,7 @@ class IngestionWorker:
                     county=county,
                     scraper_id=scraper_id,
                     s3_key=s3_key,
+                    hearing_date_source=hearing_date_source,
                 )
 
             conn.commit()
@@ -4693,6 +4819,9 @@ class IngestionWorker:
                 ruling_text_html_for_event = _markdown_to_html(cr.ruling_text)
                 ruling_text_for_event = _strip_markdown(cr.ruling_text)
 
+            child_hearing_date, child_hearing_date_source = _llm_child_hearing_date(
+                cr.hearing_date, event_data
+            )
             split_event: dict[str, Any] = {
                 **event_data,
                 "document_id": cr.document_id,
@@ -4710,7 +4839,9 @@ class IngestionWorker:
                 "department": cr.department or event_data.get("department"),
                 "motion_type": cr.motion_type or event_data.get("motion_type"),
                 "outcome": cr.outcome or event_data.get("outcome"),
-                "hearing_date": cr.hearing_date or event_data.get("hearing_date"),
+                # A structured parent date wins over the LLM's (#4793).
+                "hearing_date": child_hearing_date,
+                HEARING_DATE_SOURCE_KEY: child_hearing_date_source,
                 "parties": cr.parties if cr.parties else event_data.get("parties", []),
             }
 

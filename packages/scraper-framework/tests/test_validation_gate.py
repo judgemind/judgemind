@@ -382,7 +382,8 @@ class TestInsertValidationResult:
         assert params[3] == "Case title mismatch"
         # Empty-string scraper_id (the worker's missing-key default) is
         # stored as NULL, not '' (#4706).
-        assert params[-3:] == ("Los Angeles", None, None)
+        # Trailing hearing_date_source (#4793) defaults to NULL.
+        assert params[-4:] == ("Los Angeles", None, None, None)
 
     def test_insert_validation_result_county_scraper_id_s3_key(self) -> None:
         """#4706: attribution columns are written so FAIL rows (no
@@ -415,12 +416,13 @@ class TestInsertValidationResult:
         sql, params = mock_cur.execute.call_args[0]
         column_list = sql.split("(", 1)[1].split(")", 1)[0]
         columns = [c.strip() for c in column_list.split(",")]
-        assert columns[-3:] == ["county", "scraper_id", "s3_key"]
+        assert columns[-4:] == ["county", "scraper_id", "s3_key", "hearing_date_source"]
         assert len(params) == len(columns)
-        assert params[-3:] == (
+        assert params[-4:] == (
             "Contra Costa",
             "ca-contra-costa-tentatives",
             "ca/contra_costa/superior_court/raw/abc.json",
+            None,
         )
 
     def test_insert_validation_result_county_requires_attribution_kwargs(self) -> None:

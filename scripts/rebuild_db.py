@@ -358,13 +358,18 @@ def build_event(
                 from ingestion.extract import extract_hearing_date
                 from ingestion.raw_hearing_date import raw_hearing_date
 
+                # Label each date with its source so the worker applies the
+                # 180-day rule to the regex date but not the hook's (#4793).
+                # Values: ``validation.hearing_date_source``.
                 hook_date = raw_hearing_date(event, text)
                 if hook_date:
                     event["hearing_date"] = hook_date
+                    event["hearing_date_source"] = "structured_hook"
                 else:
                     hearing_dt = extract_hearing_date(text)
                     if hearing_dt is not None:
                         event["hearing_date"] = str(hearing_dt)
+                        event["hearing_date_source"] = "regex_fallback"
             except ImportError:
                 pass
 

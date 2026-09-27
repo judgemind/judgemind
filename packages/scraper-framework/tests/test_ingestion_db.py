@@ -1574,7 +1574,7 @@ class TestInsertRulingContentDedup:
     """Verify insert_ruling content-hash dedup behavior."""
 
     def test_insert_includes_ruling_text_hash(self) -> None:
-        """The INSERT includes ruling_text_hash as the last parameter."""
+        """The INSERT includes ruling_text_hash, followed by hearing_date_source (#4793)."""
         conn = _mock_conn()
         insert_ruling(
             conn,
@@ -1593,9 +1593,10 @@ class TestInsertRulingContentDedup:
         sql = insert_calls[0][0][0]
         args = insert_calls[0][0][1]
         assert "ruling_text_hash" in sql
-        # text_hash is the last argument
+        # text_hash is the second-to-last argument; no source was passed.
         expected_hash = normalize_ruling_text_hash("Motion GRANTED")
-        assert args[-1] == expected_hash
+        assert args[-2] == expected_hash
+        assert args[-1] is None
 
     def test_insert_with_none_ruling_text_has_null_hash(self) -> None:
         """When ruling_text is None, ruling_text_hash should be None."""
