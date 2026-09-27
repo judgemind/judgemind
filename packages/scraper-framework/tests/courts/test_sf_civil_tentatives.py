@@ -13,6 +13,7 @@ Other RulingIDs use the same response format.
 
 from __future__ import annotations
 
+import unittest.mock
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -960,6 +961,47 @@ class TestSFCivilScraperRun:
         assert health.success is False
         assert health.records_captured == 0
         assert "session expired" in (health.error_message or "")
+
+    @respx.mock
+    def test_all_failed_session_expiry_retry_reacquires_session(self) -> None:
+        """Every RulingID answered "session expired": the whole-run retry
+        drops the stale session, acquires a fresh one, and captures (#4713)."""
+        json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+        route = respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            side_effect=[httpx.Response(200, text='{"result": [-1]}')] * len(RULING_IDS)
+            + [httpx.Response(200, text=json_text)] * len(RULING_IDS),
+        )
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+        fresh_session = "FFEEDDCC" + TEST_SESSION_ID[8:]
+        acquire = unittest.mock.AsyncMock(return_value=fresh_session)
+
+        with unittest.mock.patch.object(scraper, "_acquire_session", acquire):
+            health = scraper.run()
+
+        assert health.success is True
+        assert health.records_captured > 0
+        acquire.assert_awaited_once()
+        assert route.call_count == 2 * len(RULING_IDS)
+        assert fresh_session in str(route.calls[-1].request.url)
+
+    @respx.mock
+    def test_all_failed_http_403_no_retry(self) -> None:
+        """Every RulingID answered 403: deterministic, so one attempt (#4713)."""
+        route = respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(403),
+        )
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(config=config, session_id=TEST_SESSION_ID)
+
+        health = scraper.run()
+
+        assert health.success is False
+        assert route.call_count == len(RULING_IDS)
 
     @respx.mock
     def test_content_format_is_html(self) -> None:

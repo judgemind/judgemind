@@ -12,11 +12,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
-from framework.base import ScraperPreconditionFailure
-from framework.fetch_tally import FetchTally
+from framework.base import AllFetchesFailed, ScraperPreconditionFailure
+from framework.fetch_tally import FetchTally, is_transient_fetch_error
 
 
 class TestFetchTally:
@@ -319,3 +320,160 @@ class TestPartialFailureRunIntegration:
         scraper = _AbortingScraper(_config(), ok=1, skipped=0)
         scraper._mark_partial_failure(None)
         assert scraper._partial_failure is None
+
+
+# ---------------------------------------------------------------------------
+# Whole-run retry classification (#4713)
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://court.example/ruling.pdf")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+class _PlaywrightTimeoutError(Exception):
+    """Stand-in for playwright's TimeoutError, matched by module and name."""
+
+
+_PlaywrightTimeoutError.__module__ = "playwright._impl._errors"
+_PlaywrightTimeoutError.__name__ = "TimeoutError"
+
+
+class _PlaywrightError(Exception):
+    """Stand-in for playwright's generic Error."""
+
+
+_PlaywrightError.__module__ = "playwright._impl._errors"
+_PlaywrightError.__name__ = "Error"
+
+
+def _raise_all_failed(tally: FetchTally) -> AllFetchesFailed:
+    with pytest.raises(AllFetchesFailed) as ei:
+        tally.raise_if_all_failed([])
+    return ei.value
+
+
+class TestAllFailedRetryClassification:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.ConnectTimeout("connect timed out"),
+            httpx.ReadTimeout("read timed out"),
+            httpx.ConnectError("connection refused"),
+            httpx.RemoteProtocolError("server disconnected"),
+            TimeoutError("timed out"),
+            ConnectionResetError("reset by peer"),
+            _http_status_error(502),
+            _http_status_error(503),
+            _http_status_error(504),
+            _PlaywrightTimeoutError("Timeout 30000ms exceeded"),
+            _PlaywrightError("net::ERR_CONNECTION_RESET at https://court.example"),
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_all_failed_transient_errors_allow_retry(self, error: Exception) -> None:
+        assert is_transient_fetch_error(error) is True
+        tally = FetchTally("items")
+        for _ in range(3):
+            tally.attempt()
+            tally.failed(error)
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is True
+        assert exc.no_retry_reason is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _http_status_error(403),
+            _http_status_error(404),
+            _http_status_error(429),
+            ValueError("no ruling table found"),
+            AttributeError("'NoneType' object has no attribute 'text'"),
+            _PlaywrightError("locator not found"),
+        ],
+        ids=lambda e: f"{type(e).__name__}-{e}",
+    )
+    def test_all_failed_deterministic_errors_no_retry(self, error: Exception) -> None:
+        assert is_transient_fetch_error(error) is False
+        tally = FetchTally("items")
+        tally.attempt()
+        tally.failed(error)
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is False
+        assert exc.no_retry_reason is not None
+        assert "not transient" in exc.no_retry_reason
+
+    def test_all_failed_one_deterministic_error_no_retry(self) -> None:
+        tally = FetchTally("items")
+        for _ in range(4):
+            tally.attempt()
+            tally.failed(httpx.ReadTimeout("slow"))
+        tally.attempt()
+        tally.failed(_http_status_error(403))
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is False
+        assert "1 of 5" in (exc.no_retry_reason or "")
+
+    def test_all_failed_transient_cause_counts_as_transient(self) -> None:
+        wrapped = RuntimeError("fetch failed")
+        wrapped.__cause__ = httpx.ConnectError("refused")
+        assert is_transient_fetch_error(wrapped) is True
+
+    def test_all_failed_string_error_no_retry(self) -> None:
+        tally = FetchTally("items")
+        tally.attempt()
+        tally.failed("HTTP 500 with no exception")
+        assert _raise_all_failed(tally).retryable is False
+
+    def test_all_failed_blocked_no_retry(self) -> None:
+        tally = FetchTally("items")
+        for _ in range(3):
+            tally.attempt()
+            tally.blocked("Cloudflare challenge page")
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is False
+        assert "blocked" in (exc.no_retry_reason or "")
+
+    def test_all_failed_blocked_plus_transient_no_retry(self) -> None:
+        tally = FetchTally("items")
+        tally.attempt()
+        tally.failed(httpx.ReadTimeout("slow"))
+        tally.attempt()
+        tally.blocked("access denied page")
+        assert _raise_all_failed(tally).retryable is False
+
+    def test_all_failed_transient_block_allows_retry(self) -> None:
+        # A stale session / ViewState clears when a fresh run re-acquires it.
+        tally = FetchTally("items")
+        for _ in range(3):
+            tally.attempt()
+            tally.blocked("session expired during fetch", transient=True)
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is True
+        assert "session expired" in str(exc)
+
+    def test_all_failed_after_abort_no_retry(self) -> None:
+        tally = FetchTally("items")
+        for _ in range(5):
+            tally.attempt()
+            tally.failed(httpx.ReadTimeout("slow"))
+        tally.abort("5 consecutive failures", remaining=7)
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is False
+        assert "abort" in (exc.no_retry_reason or "")
+
+    def test_abort_after_successes_no_docs_no_retry(self) -> None:
+        tally = FetchTally("items")
+        tally.attempt()
+        tally.attempt()
+        tally.failed(httpx.ReadTimeout("slow"))
+        tally.abort("breaker", remaining=3)
+        exc = _raise_all_failed(tally)
+        assert exc.retryable is False
+
+    def test_all_fetches_failed_is_a_precondition_failure(self) -> None:
+        exc = AllFetchesFailed("x", no_retry_reason=None)
+        assert isinstance(exc, ScraperPreconditionFailure)
+        assert isinstance(exc, RuntimeError)

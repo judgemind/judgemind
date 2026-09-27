@@ -1,6 +1,6 @@
 """Judgemind scraper framework — public API."""
 
-from .base import BaseScraper, ScraperPreconditionFailure
+from .base import AllFetchesFailed, BaseScraper, ScraperPreconditionFailure
 from .browser import apply_stealth
 from .court_directory import CourtDirectory
 from .css_inliner import inline_css
@@ -20,7 +20,7 @@ from .extraction_config import (
     ExtractionMethod,
     get_county_extraction_config,
 )
-from .fetch_tally import FetchTally
+from .fetch_tally import FetchTally, is_transient_fetch_error
 from .hashing import content_changed, sha256_hex
 from .llm_enrichment import (
     ENRICHMENT_SYSTEM_PROMPT,
@@ -69,9 +69,11 @@ from .storage import S3Archiver, build_s3_key
 from .turnstile_solver import solve_turnstile
 
 __all__ = [
+    "AllFetchesFailed",
     "BaseScraper",
     "ScraperPreconditionFailure",
     "FetchTally",
+    "is_transient_fetch_error",
     "apply_stealth",
     "ConfidenceLevel",
     "CountyExtractionConfig",

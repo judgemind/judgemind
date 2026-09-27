@@ -73,6 +73,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.base import AllFetchesFailed
 from framework.browser import apply_stealth as _apply_stealth
 from framework.browser import playwright_proxy_settings
 from framework.events import EventBus
@@ -742,7 +743,13 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         self._log.info("Session acquired", session_id_prefix=self._session_id[:8])
 
         # Step 2: Fetch rulings via REST API
-        return self._fetch_with_session(self._session_id)
+        try:
+            return self._fetch_with_session(self._session_id)
+        except AllFetchesFailed:
+            # Drop the session so a whole-run retry acquires a fresh one;
+            # an expired session is why those blocks count as transient (#4713).
+            self._session_id = None
+            raise
 
     def _fetch_with_session(self, session_id: str) -> list[CapturedDocument]:
         """Fetch rulings for all RulingIDs using an authenticated session.
@@ -796,7 +803,8 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                         location = response.headers.get("location", "")
                         tally.blocked(
                             f"redirect {response.status_code} during REST fetch "
-                            "(session may be expired)"
+                            "(session may be expired)",
+                            transient=True,
                         )
                         self._log.warning(
                             "Redirect during REST fetch — session may be expired",
@@ -844,7 +852,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
 
                 # Check for session expiry in response (-1 result)
                 if result and result[0] == -1:
-                    tally.blocked("session expired during fetch (result -1)")
+                    tally.blocked("session expired during fetch (result -1)", transient=True)
                     self._log.warning(
                         "Session expired during fetch",
                         ruling_id=ruling_id,
