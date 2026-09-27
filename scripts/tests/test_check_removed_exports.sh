@@ -363,6 +363,47 @@ git commit -m "replace duplicate function with import from helpers" --quiet
 
 assert_passes "Passes when function removed and re-imported (#2091 variant for functions)" scripts/check-removed-exports.sh main
 
+# ─── Test 10: Name removed from one module, kept in another edited module ──
+# #4845: deleting reingest_from_s3._match_ruling while also editing
+# ingestion/worker.py (which still defines _match_ruling) flagged every
+# `from ingestion.worker import _match_ruling`.  A module that still
+# defines the name at HEAD must not count as a module that lost it.
+git checkout main --quiet
+git branch -D test-branch-9b --quiet 2>/dev/null || true
+git checkout -b test-branch-10-base --quiet
+
+cat > packages/mylib/src/keeper.py << 'PYEOF'
+def shared_name():
+    return "keeper"
+PYEOF
+cat > packages/mylib/src/dropper.py << 'PYEOF'
+def shared_name():
+    return "dropper"
+PYEOF
+cat > packages/mylib/tests/test_keeper.py << 'PYEOF'
+from mylib.src.keeper import shared_name
+PYEOF
+git add -A
+git commit -m "two modules define shared_name" --quiet
+git checkout main --quiet
+git merge test-branch-10-base --quiet
+git branch -D test-branch-10-base --quiet 2>/dev/null || true
+git checkout -b test-branch-10 --quiet
+
+# Drop the name from dropper.py and make an unrelated edit to keeper.py.
+cat > packages/mylib/src/dropper.py << 'PYEOF'
+def other():
+    return "dropper"
+PYEOF
+cat > packages/mylib/src/keeper.py << 'PYEOF'
+def shared_name():
+    return "keeper, edited"
+PYEOF
+git add -A
+git commit -m "drop shared_name from dropper only" --quiet
+
+assert_passes "Passes when the imported module still defines the removed name (#4845)" scripts/check-removed-exports.sh main
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
 echo ""

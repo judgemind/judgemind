@@ -136,6 +136,15 @@ while IFS= read -r name; do
         esac
         if git show "$BASE_REF:$changed" 2>/dev/null \
             | grep -qE "^(def ${name}\(|class ${name}[\(:]|${name} =)"; then
+            # A file that still defines the name at HEAD did not lose it:
+            # the same name was removed from some *other* module (#4845:
+            # deleting reingest_from_s3._match_ruling flagged every import of
+            # ingestion.worker._match_ruling because worker.py was also
+            # edited).
+            if [[ -f "$REPO_ROOT/$changed" ]] \
+                && grep -qE "^(def ${name}\(|class ${name}[\(:]|${name} =)" "$REPO_ROOT/$changed"; then
+                continue
+            fi
             REMOVED_FROM_PATHS="${REMOVED_FROM_PATHS}${changed}\n"
         fi
     done <<< "$CHANGED_FILES"
