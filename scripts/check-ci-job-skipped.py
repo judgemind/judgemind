@@ -466,6 +466,10 @@ def get_diff_from_git(base_ref: str, repo_root: Path) -> str:
         ["git", "-C", str(repo_root), "diff", f"{base}...HEAD", "--unified=3"],
         capture_output=True,
         text=True,
+        # A PDF fixture with no NUL byte near its start diffs as text, and its
+        # bytes are not UTF-8 (#4715).  Only workflow YAML hunks matter here.
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     if result.returncode != 0:
