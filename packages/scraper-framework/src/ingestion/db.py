@@ -2168,6 +2168,24 @@ def insert_ruling(
         deleted = cur.rowcount
 
         if winner_document_id is not None:
+            # The winner holds the ruling, so it is live (#4809) and must
+            # not point back at the loser, or the two rows form a
+            # ``previous_version_id`` cycle (#4813: Orange 5e2650f8 /
+            # 8a8f866c).  A winner can be superseded here when it took a
+            # ruling back without being revived (written before #4811, or
+            # its own split slot failed validation and was never
+            # re-written), which left it pointing at today's loser.
+            cur.execute(
+                "UPDATE documents SET status = 'active', change_type = NULL, "
+                "previous_version_id = NULL "
+                "WHERE id = %s::uuid AND status = 'superseded'",
+                (winner_document_id,),
+            )
+            cur.execute(
+                "UPDATE documents SET previous_version_id = NULL "
+                "WHERE id = %s::uuid AND previous_version_id = %s::uuid",
+                (winner_document_id, document_id),
+            )
             cur.execute(
                 "UPDATE documents "
                 "SET status = 'superseded', "

@@ -16558,3 +16558,161 @@ class TestFullReparseCanonicalSplitIds:
         assert sorted(args[2]) == sorted(child_ids)
         assert kwargs["parent_document_id"] == parent
         assert kwargs["owns_key"] is True
+
+
+class TestDbModeSearchOrphans:
+    """DB-mode reingest deletes the search docs of rows it leaves without a
+    ruling (#4813), the worker's #4783 pattern."""
+
+    @patch("reingest_from_s3._drop_search_orphans")
+    @patch("reingest_from_s3.delete_stale_split_children")
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_split_checks_removed_and_written_ids_after_commit(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+        mock_delete_stale: MagicMock,
+        mock_drop: MagicMock,
+    ) -> None:
+        from ingestion.split_ids import split_child_document_id
+
+        parent = _content_parent_4801()
+        row = list(_make_document_row(doc_id=uuid.UUID(parent), s3_key=_KEY_4801))
+        row[5] = _KEY_HASH_4801
+        conn = _mock_conn_with_rows([tuple(row)])
+        mock_fetch_s3.return_value = b"pdf content"
+        child_ids = [split_child_document_id(parent, i, 2) for i in range(2)]
+        stale = split_child_document_id(parent, 2, 3)
+
+        def _fake_delete(*args: object, **kwargs: object) -> int:
+            kwargs["deleted_ids"].append(stale)
+            return 1
+
+        mock_delete_stale.side_effect = _fake_delete
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": f"Ruling {i}",
+                "case_number": f"CV00{i}",
+                "case_title": None,
+                "judge_name": "Judge X",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": i,
+                "split_document_id": child_ids[i],
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            }
+            for i in range(2)
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+        indexer = MagicMock()
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+            search_indexer=indexer,
+        )
+
+        mock_drop.assert_called_once()
+        args = mock_drop.call_args[0]
+        assert args[1] is indexer
+        assert set(args[2]) == {stale, parent, *child_ids}
+
+    @patch("reingest_from_s3._drop_search_orphans")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_no_indexer_no_search_calls(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_drop: MagicMock,
+    ) -> None:
+        row = list(_make_document_row(doc_id=uuid.UUID(_content_parent_4801()), s3_key=_KEY_4801))
+        row[5] = _KEY_HASH_4801
+        conn = _mock_conn_with_rows([tuple(row)])
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = []
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        mock_drop.assert_not_called()
+
+    def test_drop_search_orphans_deletes_only_ids_without_a_ruling(self) -> None:
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [("live-1",)]
+        indexer = MagicMock()
+
+        n = reingest._drop_search_orphans(
+            conn, indexer, ["gone-1", "live-1", "gone-2", "gone-1", ""]
+        )
+
+        assert n == 2
+        indexer.delete_documents.assert_called_once_with(["gone-1", "gone-2"])
+        assert cur.execute.call_args[0][1] == (["gone-1", "live-1", "gone-2"],)
+        conn.rollback.assert_called()
+
+    def test_drop_search_orphans_all_live_deletes_nothing(self) -> None:
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [("a",)]
+        indexer = MagicMock()
+
+        assert reingest._drop_search_orphans(conn, indexer, ["a"]) == 0
+        assert reingest._drop_search_orphans(conn, indexer, []) == 0
+        indexer.delete_documents.assert_not_called()
+
+    def test_drop_search_orphans_read_failure_leaves_index_alone(self) -> None:
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError("db")
+        indexer = MagicMock()
+
+        assert reingest._drop_search_orphans(conn, indexer, ["a"]) == 0
+        indexer.delete_documents.assert_not_called()
+        conn.rollback.assert_called()
+
+    def test_make_search_indexer_needs_opensearch_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENSEARCH_URL", raising=False)
+        assert reingest._make_search_indexer(MagicMock()) is None
+
+    def test_make_search_indexer_builds_consumer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENSEARCH_URL", "http://localhost:9200")
+        client = MagicMock()
+        with patch("framework.opensearch_client.make_opensearch_client", return_value=client):
+            indexer = reingest._make_search_indexer(MagicMock())
+        from framework.search.indexer import IndexingConsumer
+
+        assert isinstance(indexer, IndexingConsumer)
+        client.indices.create.assert_not_called()
