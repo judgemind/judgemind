@@ -344,7 +344,9 @@ class TestPerPageCache:
         third_call.assert_not_called()
         assert len(third) == 2
 
-    def test_page_cache_key_includes_metadata(self) -> None:
+    def test_page_cache_key_excludes_metadata(self) -> None:
+        """The page request carries no metadata (#4815), so the same page
+        image is one cache entry whatever metadata the caller brings."""
         cache, s3 = _real_cache()
         ext = _make_extractor(cache)
 
@@ -358,10 +360,9 @@ class TestPerPageCache:
             ext.extract_from_pdf(b"pdf-a", metadata={"department": "C25"})
             ext.extract_from_pdf(b"pdf-b", metadata={"department": "N16"})
 
-        # Different metadata => different page prompt => no page-cache reuse.
-        assert mock_call.call_count == 2
+        assert mock_call.call_count == 1
         page_keys = [k for k in s3.objects if "/pages/" in k]
-        assert len(page_keys) == 2
+        assert len(page_keys) == 1
 
     def test_bust_cache_skips_page_cache_reads_but_writes(self) -> None:
         cache, s3 = _real_cache()

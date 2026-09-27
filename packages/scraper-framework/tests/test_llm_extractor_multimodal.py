@@ -2889,10 +2889,15 @@ class TestExtractFromPdf:
 
         assert rulings == []
 
-    def test_metadata_passed_through(self, sample_pdf_bytes: bytes) -> None:
-        """Metadata is included in the text message to the LLM."""
+    def test_metadata_applied_after_extraction_not_sent(self, sample_pdf_bytes: bytes) -> None:
+        """Metadata is applied to the rulings, never sent to the LLM (#4815).
+
+        Sending it made the LLM input (and cache key) depend on which path
+        called, so identical bytes split differently live vs on rebuild.
+        """
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
+        ext._cache = None
 
         mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
@@ -2905,15 +2910,18 @@ class TestExtractFromPdf:
                 return_value=mock_response,
             ) as mock_call,
         ):
-            ext.extract_from_pdf(
+            rulings = ext.extract_from_pdf(
                 sample_pdf_bytes,
                 metadata={"judge_name": "Override Judge", "department": "D99"},
             )
 
         call_kwargs = mock_call.call_args.kwargs
         text_message = call_kwargs["text_message"]
-        assert "Override Judge" in text_message
-        assert "D99" in text_message
+        assert "Override Judge" not in text_message
+        assert "D99" not in text_message
+        assert rulings
+        assert {r.extracted_judge_name for r in rulings} == {"Override Judge"}
+        assert {r.department for r in rulings} == {"D99"}
 
     def test_max_pages_passed_to_renderer(self, sample_pdf_bytes: bytes) -> None:
         """max_pages is forwarded to _render_pdf_pages."""
@@ -3363,28 +3371,17 @@ class TestExtractSinglePageRetry:
 class TestBuildUserMessageForPage:
     """Tests for the per-page extraction text message builder."""
 
-    def test_no_metadata(self) -> None:
-        """Without metadata, produces a generic extraction message."""
-        msg = LlmExtractor._build_user_message_for_page(None)
+    def test_generic_message(self) -> None:
+        """The per-page message is a fixed extraction instruction."""
+        msg = LlmExtractor._build_user_message_for_page()
         assert "Extract all tentative rulings" in msg
 
-    def test_with_all_metadata(self) -> None:
-        """With all metadata keys, includes them in the message."""
-        msg = LlmExtractor._build_user_message_for_page(
-            {
-                "judge_name": "Test Judge",
-                "department": "D99",
-                "hearing_date": "2026-03-01",
-            }
+    def test_message_is_constant(self) -> None:
+        """No caller context goes into the message, so it never varies (#4815)."""
+        assert LlmExtractor._build_user_message_for_page() == (
+            LlmExtractor._build_user_message_for_page()
         )
-        assert "Test Judge" in msg
-        assert "D99" in msg
-        assert "2026-03-01" in msg
-
-    def test_with_hearing_date_only(self) -> None:
-        """With only hearing_date, includes it in the message."""
-        msg = LlmExtractor._build_user_message_for_page({"hearing_date": "2026-04-15"})
-        assert "2026-04-15" in msg
+        assert "Context" not in LlmExtractor._build_user_message_for_page()
 
 
 # ---------------------------------------------------------------------------
