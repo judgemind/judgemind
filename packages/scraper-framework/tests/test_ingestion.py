@@ -4141,6 +4141,7 @@ def test_reclaim_pending_processes_multiple_messages(mock_psycopg: MagicMock) ->
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.db._move_split_sibling_ruling", new=MagicMock(return_value=False))
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 def test_process_event_already_split_no_re_split(

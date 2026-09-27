@@ -264,6 +264,7 @@ from framework.storage import (  # noqa: E402
     capture_timestamp_from_s3_object,
 )
 from ingestion.db import (  # noqa: E402
+    SplitSet,
     batch_upsert_parties,
     delete_stale_split_children,
     insert_document_and_ruling,
@@ -3441,28 +3442,19 @@ def reingest_batch(
                 # split child.  When _supersede_document then runs AFTER the
                 # loop, it deletes those same rulings — leaving split children
                 # with no ruling rows at all.
+                split_ids = [
+                    e.get("split_document_id", doc_id_str) for e in extracted_list
+                ]
+                # A child whose ruling sits on another slot of this split
+                # (the split set shifted) moves it instead of losing
+                # content-hash dedup to it (#4820).
+                split_set = (
+                    SplitSet(parent_document_id=doc_id_str, child_ids=tuple(split_ids))
+                    if any_split
+                    else None
+                )
                 if any_split:
                     _supersede_document(conn, doc_id_str)
-                    # Remove the key's split-child rows this split no longer
-                    # writes, as the worker does on every split path (#4700).
-                    # The content parent owns every row on its key (#4796),
-                    # so older entry-number children and grandchild rows go
-                    # too (#4801).
-                    _key_hash = _resplit_guard_hash(
-                        doc_meta.get("s3_key"), doc_meta.get("content_hash")
-                    )
-                    delete_stale_split_children(
-                        conn,
-                        doc_meta.get("s3_key") or "",
-                        [
-                            e.get("split_document_id", doc_id_str)
-                            for e in extracted_list
-                        ],
-                        parent_document_id=doc_id_str,
-                        deleted_ids=removed_ids,
-                        owns_key=bool(_key_hash)
-                        and doc_id_str == derive_parent_document_id(_key_hash),
-                    )
 
                 # Sibling case numbers — used by the deterministic
                 # cross-case contamination check (#2371) to flag rulings
@@ -3744,6 +3736,7 @@ def reingest_batch(
                         outcome=normalize_outcome(extracted["outcome"]),
                         motion_type=extracted["motion_type"],
                         force_update=True,
+                        split_set=split_set,
                     )
 
                     if judge_id:
@@ -3757,6 +3750,27 @@ def reingest_batch(
                     )
                     timing.add_ms(
                         "db_write_ms", (time.perf_counter() - _db_t0) * 1000.0
+                    )
+
+                if any_split:
+                    # Remove the key's split-child rows this split no longer
+                    # writes, as the worker does on every split path (#4700).
+                    # The content parent owns every row on its key (#4796),
+                    # so older entry-number children and grandchild rows go
+                    # too (#4801).  Runs after the children are written so a
+                    # ruling on a stale slot moves to its new slot first
+                    # (#4820).
+                    _key_hash = _resplit_guard_hash(
+                        doc_meta.get("s3_key"), doc_meta.get("content_hash")
+                    )
+                    delete_stale_split_children(
+                        conn,
+                        doc_meta.get("s3_key") or "",
+                        split_ids,
+                        parent_document_id=doc_id_str,
+                        deleted_ids=removed_ids,
+                        owns_key=bool(_key_hash)
+                        and doc_id_str == derive_parent_document_id(_key_hash),
                     )
 
             conn.commit()

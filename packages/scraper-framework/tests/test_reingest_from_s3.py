@@ -15894,7 +15894,8 @@ class TestSplitSetChange:
 
     def test_split_set_change_deterministic_split_removes_surplus_children(self) -> None:
         """The deterministic Santa Clara split path cleans stale children
-        BEFORE dispatching the first child, with exactly the new child ids."""
+        AFTER dispatching the children (#4820: a stale slot's ruling can move
+        to its new slot first), with exactly the new child ids."""
         from courts.ca.sc_tentatives import SplitRuling
 
         worker = _split_set_change_worker()
@@ -15932,7 +15933,7 @@ class TestSplitSetChange:
             )
 
         assert handled is True
-        assert order == ["cleanup", "dispatch:0", "dispatch:1"]
+        assert order == ["dispatch:0", "dispatch:1", "cleanup"]
         assert len(calls) == 1
         s3_key, valid_ids, kwargs = calls[0]
         assert s3_key == event["s3_key"]
