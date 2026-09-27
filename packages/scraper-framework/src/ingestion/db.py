@@ -19,6 +19,8 @@ import json
 import logging
 import re
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -2161,6 +2163,13 @@ def insert_ruling(
         except Exception:  # noqa: BLE001 — telemetry lookup is best-effort
             cur.execute("ROLLBACK TO SAVEPOINT supersede_ctx")
 
+        # ``alert_events.ruling_id`` has no ON DELETE action: detach alerts on
+        # the row being deleted (never delete them) or the DELETE fails (#4820).
+        cur.execute(
+            "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
+            "(SELECT id FROM rulings WHERE document_id = %s::uuid)",
+            (document_id,),
+        )
         cur.execute(
             "DELETE FROM rulings WHERE document_id = %s::uuid",
             (document_id,),
@@ -2256,6 +2265,19 @@ def insert_ruling(
     )
 
 
+@dataclass(frozen=True)
+class SplitSet:
+    """The split a child document is written as part of (#4820).
+
+    ``child_ids`` is every document id the split writes, in position order
+    (the order the children are written in).  ``parent_document_id`` is the
+    document that was split.
+    """
+
+    parent_document_id: str
+    child_ids: tuple[str, ...]
+
+
 def insert_document_and_ruling(
     conn: psycopg.Connection,
     *,
@@ -2282,6 +2304,7 @@ def insert_document_and_ruling(
     force_update: bool = False,
     relink_case: bool = False,
     hearing_date_source: str | None = None,
+    split_set: SplitSet | None = None,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
 
@@ -2331,6 +2354,13 @@ def insert_document_and_ruling(
     apply: a re-process that missed the case number must not delete a
     correctly linked ruling or detach its ``public.alert_events``.
 
+    ``split_set`` names the split this document is a child of (#4820).  When
+    given, a ruling with this write's case and text that sits on a sibling
+    slot of the same S3 key which this pass has not written yet (a later
+    slot, or a stale slot the split no longer writes) is **moved** here, not
+    treated as a separate capture that wins content-hash dedup.  See
+    ``_move_split_sibling_ruling``.
+
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).
     """
@@ -2375,6 +2405,16 @@ def insert_document_and_ruling(
         relink_case=relink_case,
     )
 
+    if split_set is not None:
+        _move_split_sibling_ruling(
+            conn,
+            document_id=document_id,
+            case_id=case_id,
+            text_hash=normalize_ruling_text_hash(_strip_nul(ruling_text)),
+            s3_key=s3_key,
+            split_set=split_set,
+        )
+
     insert_ruling(
         conn,
         document_id=document_id,
@@ -2410,6 +2450,134 @@ def insert_document_and_ruling(
         )
 
     return is_new
+
+
+def _content_parent_of_key(s3_key: str) -> str | None:
+    """Return ``uuid5(NAMESPACE_URL, <sha256>)`` for a content-addressed key
+    (``.../<sha256>.<ext>``), else None."""
+    stem = s3_key.rsplit("/", 1)[-1].split(".", 1)[0]
+    if len(stem) != 64 or any(ch not in "0123456789abcdef" for ch in stem):
+        return None
+    from .split_ids import derive_parent_document_id
+
+    return derive_parent_document_id(stem)
+
+
+def _is_unwritten_split_slot(
+    holder_id: str, document_id: str, s3_key: str, split: SplitSet
+) -> bool:
+    """Whether *holder_id* is a slot of *split* that this pass has not
+    written yet, as seen from the child *document_id* being written.
+
+    Children are written in position order, so a slot after *document_id*
+    still holds the previous split's content.  A row the split no longer
+    writes is stale, and the post-split cleanup (``delete_stale_split_children``)
+    removes it: a row this parent owns, or any UUIDv5 row on the key when
+    the parent is the key's content parent (#4796).  A slot before
+    *document_id* was already written in this pass, so a match there is a
+    true duplicate within the document and keeps #2458 dedup.
+    """
+    ids = split.child_ids
+    if holder_id in ids:
+        return ids.index(holder_id) > ids.index(document_id)
+    if _own_split_rows(split.parent_document_id, [holder_id]):
+        return True
+    try:
+        is_v5 = uuid.UUID(holder_id).version == 5
+    except ValueError:
+        return False
+    return is_v5 and _content_parent_of_key(s3_key) == split.parent_document_id
+
+
+def _move_split_sibling_ruling(
+    conn: psycopg.Connection,
+    *,
+    document_id: str,
+    case_id: str,
+    text_hash: str | None,
+    s3_key: str | None,
+    split_set: SplitSet,
+) -> bool:
+    """Move the ruling this split child is about to write from the sibling
+    slot that holds it, instead of letting content-hash dedup supersede this
+    child (#4820).
+
+    When a key's split set shifts by one position (a stale 13-way Orange
+    split put ruling k at slot k+1), writing slot k's ruling finds its text
+    on slot k+1, which this pass has not re-written yet.  Superseding slot k
+    there, and then deleting the row slot k+1 held when slot k+1 is written,
+    cascaded down the split and deleted all but the last ruling until the
+    next run.  The holder is a sibling about to be re-written (or removed as
+    stale), not a separate capture, so the ruling row moves:
+
+    - the row this document held (content the new split puts elsewhere or
+      drops) is deleted, its alerts detached, never deleted;
+    - the holder's ruling row is re-keyed to this document, keeping its id,
+      so ``alert_events.ruling_id`` stays attached; alerts on it follow it
+      to this document;
+    - the holder is marked superseded by this document until its own slot
+      is written, when ``insert_document_and_ruling`` revives it (#4809).
+
+    Every step runs in the caller's transaction, so no committed state has
+    the ruling missing.  Returns True when a ruling was moved.
+    """
+    if text_hash is None or not s3_key or document_id not in split_set.child_ids:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.id::text, r.document_id::text FROM rulings r "
+            "JOIN documents d ON d.id = r.document_id "
+            "WHERE r.case_id = %s::uuid AND r.ruling_text_hash = %s "
+            "AND r.document_id <> %s::uuid AND d.s3_key = %s",
+            (case_id, text_hash, document_id, s3_key),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return False
+    ruling_id, holder_id = row[0], row[1]
+    if not _is_unwritten_split_slot(holder_id, document_id, s3_key, split_set):
+        return False
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
+            "(SELECT id FROM rulings WHERE document_id = %s::uuid)",
+            (document_id,),
+        )
+        cur.execute("DELETE FROM rulings WHERE document_id = %s::uuid", (document_id,))
+        displaced = cur.rowcount
+        cur.execute(
+            "UPDATE rulings SET document_id = %s::uuid WHERE id = %s::uuid",
+            (document_id, ruling_id),
+        )
+        cur.execute(
+            "UPDATE alert_events SET document_id = %s::uuid WHERE ruling_id = %s::uuid",
+            (document_id, ruling_id),
+        )
+        # The document holds the ruling, so it is linked to the ruling's case.
+        cur.execute(
+            "UPDATE documents SET case_id = %s::uuid, previous_version_id = CASE "
+            "WHEN previous_version_id = %s::uuid THEN NULL ELSE previous_version_id END "
+            "WHERE id = %s::uuid",
+            (case_id, holder_id, document_id),
+        )
+        cur.execute(
+            "UPDATE documents SET status = 'superseded', previous_version_id = %s::uuid, "
+            "change_type = 'duplicate_content' WHERE id = %s::uuid",
+            (document_id, holder_id),
+        )
+    logger.info(
+        "insert_document_and_ruling: moved a split sibling's ruling to its new slot",
+        extra={
+            "document_id": document_id,
+            "from_document_id": holder_id,
+            "ruling_id": ruling_id,
+            "s3_key": s3_key,
+            "displaced_rulings": displaced,
+            "event": "split_shift_ruling_move",
+        },
+    )
+    return True
 
 
 #: Synthetic case-number prefix the worker uses when no case number could be

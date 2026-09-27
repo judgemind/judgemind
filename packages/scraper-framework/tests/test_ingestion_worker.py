@@ -11,6 +11,7 @@ Verifies that:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,15 @@ import pytest
 from framework.llm_enrichment import LlmEnrichmentExhaustedError
 from framework.llm_schema import ExtractedRuling, ExtractionOutcome
 from ingestion.worker import IngestionWorker
+
+
+@pytest.fixture(autouse=True)
+def _no_split_sibling_move() -> Iterator[None]:
+    """The mocked cursors here feed fixed ``fetchone`` sequences; the #4820
+    sibling-ruling lookup is covered by ``test_split_shift_move*``."""
+    with patch("ingestion.db._move_split_sibling_ruling", return_value=False):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers

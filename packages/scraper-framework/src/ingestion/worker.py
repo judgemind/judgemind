@@ -68,6 +68,7 @@ from validation.issue_filer import file_validation_issue
 
 from .case_type_resolver import resolve_case_type
 from .db import (
+    SplitSet,
     _expand_single_word_judge_surname,
     _looks_like_valid_judge_name,
     batch_upsert_parties,
@@ -229,6 +230,23 @@ def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: s
         return [parent_document_id]
     count = int(split_event.get("_split_count") or 1)
     return [split_child_document_id(parent_document_id, idx, count) for idx in range(count)]
+
+
+def split_set_for_event(event_data: dict[str, Any]) -> SplitSet | None:
+    """Return the split a split-child event is written as part of, so the
+    child's write can move a ruling from a sibling slot (#4820).
+
+    None for an event that is not a split child or does not name its parent.
+    """
+    if not event_data.get("_split_processed"):
+        return None
+    parent = event_data.get("_original_document_id")
+    if not parent or not event_data.get("document_id"):
+        return None
+    return SplitSet(
+        parent_document_id=str(parent),
+        child_ids=tuple(split_child_ids_for_event(event_data, str(parent))),
+    )
 
 
 def as_pre_split_child(event_data: dict[str, Any]) -> dict[str, Any]:
@@ -3930,6 +3948,9 @@ class IngestionWorker:
                 # number cannot delete a correct ruling (#4788).
                 relink_case=_should_relink_split_case(event_data, effective_case_number),
                 hearing_date_source=hearing_date_source,
+                # A shifted split set moves its rulings between slots
+                # instead of superseding them (#4820).
+                split_set=split_set_for_event(event_data),
             )
 
             # 5. Link case to judge
@@ -4089,6 +4110,43 @@ class IngestionWorker:
         *,
         raw_pdf_bytes: bytes | None = None,
     ) -> bool:
+        """Split *document_id* and write its children (``_split_document``),
+        then remove the key's split-child rows the new split no longer
+        writes (#4700).
+
+        The cleanup runs after the children are written, not before
+        (#4820): when the split set shifts, a stale slot can hold a ruling
+        the new split writes at another slot, and the child write moves it
+        there (``db._move_split_sibling_ruling``).  Deleting the stale slot
+        first deleted that ruling, and its alerts' link, until the child
+        re-created it.
+        """
+        stale_cleanups: list[list[str]] = []
+        try:
+            return self._split_document(
+                event_data,
+                document_id,
+                ruling_text,
+                state,
+                county,
+                raw_pdf_bytes=raw_pdf_bytes,
+                stale_cleanups=stale_cleanups,
+            )
+        finally:
+            for valid_ids in stale_cleanups:
+                self._cleanup_stale_split_children(event_data, document_id, valid_ids)
+
+    def _split_document(
+        self,
+        event_data: dict[str, Any],
+        document_id: str,
+        ruling_text: str | None,
+        state: str,
+        county: str,
+        *,
+        raw_pdf_bytes: bytes | None = None,
+        stale_cleanups: list[list[str]],
+    ) -> bool:
         """Use the framework LlmExtractor to split and extract a document.
 
         The framework ``LlmExtractor`` extracts all structured fields in a
@@ -4134,22 +4192,16 @@ class IngestionWorker:
             return False
 
         # Every deterministic splitter below dispatches its children through
-        # ``dispatch_child``.  Before the first child is written, remove the
+        # ``dispatch_child``.  The first child schedules the removal of the
         # split-child rows of this S3 key that the new split no longer
-        # produces (#4700).  Doing it here covers every splitter, current and
-        # future; previously only the framework-LLM path below cleaned up, so
-        # an LLM split -> deterministic split change left surplus children.
-        cleaned = False
-
+        # produces (#4700), run by ``_llm_split_document`` once the children
+        # are written (#4820).  Doing it here covers every splitter, current
+        # and future; previously only the framework-LLM path below cleaned
+        # up, so an LLM split -> deterministic split change left surplus
+        # children.
         def dispatch_child(split_event: dict[str, Any]) -> None:
-            nonlocal cleaned
-            if not cleaned:
-                cleaned = True
-                self._cleanup_stale_split_children(
-                    event_data,
-                    document_id,
-                    split_child_ids_for_event(split_event, document_id),
-                )
+            if not stale_cleanups:
+                stale_cleanups.append(split_child_ids_for_event(split_event, document_id))
             self.process_event(split_event)
 
         # ------------------------------------------------------------------
@@ -4631,8 +4683,9 @@ class IngestionWorker:
         # Clean up stale split-child documents from a previous processing run
         # that produced more rulings than this run (#2295).  The new split IDs
         # will be upserted cleanly; any old IDs beyond the new count are
-        # orphans.  This must happen before the split events are dispatched
-        # so the DELETE does not race with the INSERT/UPSERT.
+        # orphans.  ``_llm_split_document`` runs it after the split events
+        # are written, so a ruling on a stale slot can move to its new slot
+        # first (#4820).
         #
         # This also handles the case where a previous multi-ruling run is
         # re-processed as a single ruling: the single ruling keeps the parent
@@ -4643,14 +4696,12 @@ class IngestionWorker:
         # Textless multimodal rows are skipped by the dispatch loop below
         # (#4714) and never written, so a row left at their slot by an
         # earlier run is stale too (#4700).
-        self._cleanup_stale_split_children(
-            event_data,
-            document_id,
+        stale_cleanups.append(
             [
                 cr.document_id
                 for cr in converted
                 if not (extraction_method == "multimodal" and not (cr.ruling_text or "").strip())
-            ],
+            ]
         )
 
         # ------------------------------------------------------------------
