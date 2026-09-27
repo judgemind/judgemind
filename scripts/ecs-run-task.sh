@@ -70,6 +70,11 @@
 #   <n>   the container's exit code once the task reaches STOPPED
 #   124   the wait timed out while the task was still running (NOT a task
 #         failure — the task keeps going; re-attach with ecs-wait-task.sh)
+#   125   the task's status could not be observed: describe-tasks hit an
+#         auth/permission/parameter error (e.g. ExpiredToken, AccessDenied —
+#         fails fast), or failed 6 times in a row
+#         (ECS_RUN_TASK_MAX_DESCRIBE_ERRORS).  The task may still be running;
+#         re-attach with ecs-wait-task.sh once AWS calls work again.
 #   1     launch/setup error
 #
 # Examples:
@@ -842,6 +847,22 @@ LOG_STREAM_NAME=""
 LOG_NEXT_TOKEN=""
 LOG_STREAMING=false
 LOG_EVENTS_EMITTED=false
+# Upper bound on get-log-events pages fetched per poll, so a stream that keeps
+# handing back fresh tokens can't starve the describe-tasks status check.
+# Anything left over is picked up on the next poll.
+LOG_MAX_PAGES_PER_POLL=50
+
+# describe-tasks error handling (#4791).  Auth / permission / bad-parameter
+# errors can't fix themselves, so they fail fast.  Anything else is retried,
+# but only DESCRIBE_MAX_CONSECUTIVE_ERRORS times in a row: after that the task
+# state is reported as unknown instead of waiting out the whole timeout.
+DESCRIBE_MAX_CONSECUTIVE_ERRORS="${ECS_RUN_TASK_MAX_DESCRIBE_ERRORS:-6}"
+DESCRIBE_CONSECUTIVE_ERRORS=0
+DESCRIBE_LAST_ERROR=""
+DESCRIBE_ERR_FILE="${TMP_DIR}/describe-tasks.err"
+# Exit code for "we could not observe the task's state" — distinct from 124
+# (observed still running) and from a task failure.
+EXIT_STATUS_UNKNOWN=125
 
 # find_log_stream — Locate the CloudWatch log stream for this task.
 # The awslogs driver names the stream <awslogs-stream-prefix>/<container>/<task-id>;
@@ -878,83 +899,170 @@ stream_new_logs() {
         return
     fi
 
-    local args=(
-        logs get-log-events
-        --log-group-name "$LOG_GROUP"
-        --log-stream-name "$LOG_STREAM_NAME"
-        --region "$REGION"
-        --output json
-    )
+    # Page through the stream until the forward token repeats (end of the
+    # currently-ingested events) or the per-call page cap is hit.  GetLogEvents
+    # can return an EMPTY page whose nextForwardToken differs from the one
+    # sent, with more events behind it (#4791) — so an empty page is not the
+    # end of the stream; only a repeated token is.
+    local page=0
+    while [[ $page -lt $LOG_MAX_PAGES_PER_POLL ]]; do
+        page=$((page + 1))
 
-    if [[ -n "$LOG_NEXT_TOKEN" ]]; then
-        # Use forward token from previous call (already encodes position)
-        args+=(--next-token "$LOG_NEXT_TOKEN")
-    else
-        # First call — read from the beginning of the stream
-        args+=(--start-from-head)
-    fi
+        local args=(
+            logs get-log-events
+            --log-group-name "$LOG_GROUP"
+            --log-stream-name "$LOG_STREAM_NAME"
+            --region "$REGION"
+            --output json
+        )
 
-    local result
-    result=$(aws "${args[@]}") || {
-        echo "WARNING: failed to fetch log events during live streaming" >&2
-        return 0
-    }
+        if [[ -n "$LOG_NEXT_TOKEN" ]]; then
+            # Use forward token from previous call (already encodes position)
+            args+=(--next-token "$LOG_NEXT_TOKEN")
+        else
+            # First call — read from the beginning of the stream
+            args+=(--start-from-head)
+        fi
 
-    # Extract log messages and forward token from the response
-    local messages new_token
-    messages=$(echo "$result" | python3 -c "
+        local result
+        result=$(aws "${args[@]}") || {
+            echo "WARNING: failed to fetch log events during live streaming" >&2
+            return 0
+        }
+
+        # Extract log messages and forward token from the response
+        local messages new_token
+        messages=$(echo "$result" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for event in data.get('events', []):
     print(event.get('message', '').rstrip())
 ") || {
-        echo "WARNING: failed to parse live log events JSON" >&2
-        true
-    }
+            echo "WARNING: failed to parse live log events JSON" >&2
+            true
+        }
 
-    new_token=$(echo "$result" | python3 -c "
+        new_token=$(echo "$result" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 print(data.get('nextForwardToken', ''))
 ") || {
-        echo "WARNING: failed to extract forward token from live log response" >&2
-        true
-    }
+            echo "WARNING: failed to extract forward token from live log response" >&2
+            true
+        }
 
-    # Only advance the token when the read returned events.  An empty read
-    # (e.g. before CloudWatch has ingested the first event — ingestion lags
-    # the event timestamp by several seconds) can hand back a forward token
-    # positioned past events that are still being ingested, silently dropping
-    # them (#4723: a task's first log line never appeared).  Re-reading from
-    # the previous position is always safe.
-    if [[ -n "$messages" ]]; then
-        echo "$messages"
-        LOG_EVENTS_EMITTED=true
-        if [[ -n "$new_token" ]]; then
-            LOG_NEXT_TOKEN="$new_token"
+        if [[ -n "$messages" ]]; then
+            echo "$messages"
+            LOG_EVENTS_EMITTED=true
+        elif [[ "$LOG_EVENTS_EMITTED" == "false" ]]; then
+            # Until the first event has been printed, do NOT adopt the token
+            # from an empty read.  Before CloudWatch has ingested the first
+            # event (ingestion lags the event timestamp by several seconds),
+            # an empty read from the head can hand back a forward token
+            # positioned past events still being ingested, silently dropping
+            # them (#4723).  Re-reading from the head next poll is safe.
+            return 0
         fi
+
+        # Stop when the token is missing or repeats — that is the end of the
+        # events CloudWatch has right now.  Otherwise adopt it (even after an
+        # empty page, #4791) and fetch the next page.
+        if [[ -z "$new_token" || "$new_token" == "$LOG_NEXT_TOKEN" ]]; then
+            return 0
+        fi
+        LOG_NEXT_TOKEN="$new_token"
+    done
+}
+
+# describe_error_is_fatal <error-text> — true when a describe-tasks error can't
+# clear up by retrying: expired/missing credentials, IAM denial, or a bad
+# cluster/ARN parameter.  Retrying these just burns the whole timeout (#4791).
+describe_error_is_fatal() {
+    # Here-string, not a pipe: under pipefail an early `grep -q` exit could
+    # SIGPIPE the writer and turn a match into a failure.
+    grep -Eq \
+        'ExpiredToken|RequestExpired|InvalidClientTokenId|UnrecognizedClient|SignatureDoesNotMatch|AccessDenied|UnauthorizedOperation|not authorized to perform|InvalidParameter|ClusterNotFound|Unable to locate credentials|config profile .* could not be found|Error loading SSO Token|SSO session .*(expired|invalid)|Token has expired' \
+        <<< "$1"
+}
+
+# save_task_arn — persist the ARN so ecs-wait-task.sh can re-attach.
+save_task_arn() {
+    if mkdir -p "${REPO_ROOT}/tmp" 2>/dev/null; then
+        printf '%s\n' "${TASK_ARN}" > "${REPO_ROOT}/tmp/last-ecs-task.arn" 2>/dev/null || true
     fi
 }
 
+# exit_status_unknown <headline> <fix-line>... — the task's state could not be
+# observed.  It may still be running, so keep the S3 script (the cleanup trap
+# checks TASK_STILL_RUNNING), save the ARN, print the AWS error and a Fix:
+# block, and exit EXIT_STATUS_UNKNOWN.  Never says "still running": no RUNNING
+# status backs that claim.
+exit_status_unknown() {
+    local headline="$1"; shift
+    TASK_STILL_RUNNING=true
+    save_task_arn
+    echo "" >&2
+    echo "ERROR: task status unknown (task ARN ${TASK_ARN}) — ${headline}" >&2
+    echo "AWS error: ${DESCRIBE_LAST_ERROR:-<none captured>}" >&2
+    if [[ -n "$CURRENT_STATUS" ]]; then
+        echo "Last observed status: ${CURRENT_STATUS} (before describe-tasks started failing)." >&2
+    else
+        echo "No task status was ever observed." >&2
+    fi
+    echo "The task may still be running on ECS. Check it before relaunching anything." >&2
+    echo "Fix:" >&2
+    local line
+    for line in "$@"; do
+        echo "  ${line}" >&2
+    done
+    echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+    echo "  scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
+    exit "$EXIT_STATUS_UNKNOWN"
+}
+
 while [[ $ELAPSED -lt $TIMEOUT ]]; do
-    # A transient describe-tasks failure (throttle, network blip, expired
-    # creds mid-run) must not abort the wait under `set -e` — that would
-    # report a still-running task as failed.  Warn and retry next poll.
+    # describe-tasks failures must not abort the wait under `set -e`.  Keep
+    # the AWS error text (it used to go to /dev/null, #4791) so fatal errors
+    # can fail fast and persistent ones can be reported.
     _describe=""
     _status=""
+    _err=""
     if _describe=$(aws ecs describe-tasks \
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json 2>/dev/null); then
-        _status=$(echo "$_describe" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])" 2>/dev/null) || _status=""
+        --output json 2>"$DESCRIBE_ERR_FILE"); then
+        # A successful call can still carry no task (e.g. failures:[MISSING]);
+        # the parser prints the failure reason to stderr in that case.
+        _status=$(echo "$_describe" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+tasks = data.get('tasks') or []
+if tasks:
+    print(tasks[0].get('lastStatus', ''))
+else:
+    reasons = [f.get('reason', 'unknown') for f in data.get('failures') or []]
+    print('describe-tasks returned no task; failures: ' + (', '.join(reasons) or 'none'), file=sys.stderr)
+" 2>"$DESCRIBE_ERR_FILE") || _status=""
     fi
     if [[ -z "$_status" ]]; then
-        echo "WARNING: could not describe task (transient?); retrying in ${POLL_INTERVAL}s..." >&2
+        _err=$(tr '\n' ' ' < "$DESCRIBE_ERR_FILE" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//') || _err=""
+        DESCRIBE_LAST_ERROR="${_err:-describe-tasks failed with no error output}"
+        DESCRIBE_CONSECUTIVE_ERRORS=$((DESCRIBE_CONSECUTIVE_ERRORS + 1))
+        if describe_error_is_fatal "$DESCRIBE_LAST_ERROR"; then
+            exit_status_unknown "describe-tasks failed with an auth/permission/parameter error that retrying will not fix." \
+                "aws sso login            # or refresh your AWS credentials, then re-attach:"
+        fi
+        if [[ $DESCRIBE_CONSECUTIVE_ERRORS -ge $DESCRIBE_MAX_CONSECUTIVE_ERRORS ]]; then
+            exit_status_unknown "describe-tasks failed ${DESCRIBE_CONSECUTIVE_ERRORS} times in a row." \
+                "# once AWS calls succeed again, re-attach:"
+        fi
+        echo "WARNING: could not describe task (${DESCRIBE_CONSECUTIVE_ERRORS}/${DESCRIBE_MAX_CONSECUTIVE_ERRORS}): ${DESCRIBE_LAST_ERROR}; retrying in ${POLL_INTERVAL}s..." >&2
         sleep "$POLL_INTERVAL"
         ELAPSED=$((ELAPSED + POLL_INTERVAL))
         continue
     fi
+    DESCRIBE_CONSECUTIVE_ERRORS=0
     DESCRIBE_OUTPUT="$_describe"
     CURRENT_STATUS="$_status"
 
@@ -1015,6 +1123,14 @@ if [[ "$LOG_STREAMING" == "true" ]]; then
     echo "─── End of Live Logs ────────────────────────────────────────────" >&2
 fi
 
+if [[ -z "$CURRENT_STATUS" ]]; then
+    # The wait expired without a single successful describe-tasks call (only
+    # possible when the error cap exceeds the number of polls).  Nothing
+    # backs a "still running" claim (#4791).
+    exit_status_unknown "stopped waiting after ${TIMEOUT}s without ever observing a task status." \
+        "# once AWS calls succeed again, re-attach:"
+fi
+
 if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
     # The client-side wait expired, but the task has NOT failed — it is
     # still running on ECS.  Report it as such (exit 124, distinct from a
@@ -1022,12 +1138,10 @@ if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
     # concurrently (#4723).  Keep the S3 script (cleanup trap checks
     # TASK_STILL_RUNNING) and save the ARN for ecs-wait-task.sh.
     TASK_STILL_RUNNING=true
-    if mkdir -p "${REPO_ROOT}/tmp" 2>/dev/null; then
-        printf '%s\n' "${TASK_ARN}" > "${REPO_ROOT}/tmp/last-ecs-task.arn" 2>/dev/null || true
-    fi
+    save_task_arn
     echo "" >&2
     echo "Task still running (task ARN ${TASK_ARN}) — stopped waiting after ${TIMEOUT}s." >&2
-    echo "Last status: ${CURRENT_STATUS:-UNKNOWN}. This is NOT a task failure; do not relaunch." >&2
+    echo "Last status: ${CURRENT_STATUS}. This is NOT a task failure; do not relaunch." >&2
     echo "To keep waiting:  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
     echo "Status + logs:    scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
     echo "Tail logs:        scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
