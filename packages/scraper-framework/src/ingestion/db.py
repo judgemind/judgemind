@@ -1449,14 +1449,33 @@ def _maybe_arbitrate(
     if not existing_non_roster_sources:
         return False
 
-    # Promote incoming spelling as the new canonical
+    # Promote incoming spelling as the new canonical, unless another judge in
+    # the same court already holds it: the UPDATE would then violate
+    # ``judges_canonical_name_court_id_key`` and fail the whole document
+    # (#4826).  Merging duplicate judge rows is a data-cleanup decision, not
+    # something to do mid-ingest, so keep the current canonical instead.
     cur.execute(
         """
         UPDATE judges SET canonical_name = %s, updated_at = NOW()
         WHERE id = %s::uuid
+          AND NOT EXISTS (
+              SELECT 1 FROM judges other
+              WHERE other.court_id = judges.court_id
+                AND other.canonical_name = %s
+                AND other.id <> judges.id
+          )
         """,
-        (incoming_canonical, judge_id),
+        (incoming_canonical, judge_id, incoming_canonical),
     )
+    if cur.rowcount == 0:
+        logger.warning(
+            "resolve_judge: arbitration skipped, canonical name %r is held by "
+            "another judge in this court (judge %s keeps %r)",
+            incoming_canonical,
+            judge_id,
+            roster_normalized,
+        )
+        return False
     # Preserve the demoted roster name as an alias
     cur.execute(
         """
