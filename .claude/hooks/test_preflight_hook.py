@@ -314,6 +314,56 @@ run_test(
     2,
 )
 
+# Resumable long-wait helpers (#4835) need timeout >= 540000.
+run_test(
+    "wait-for-ci.sh without timeout blocked",
+    "scripts/wait-for-ci.sh 4835",
+    2,
+)
+run_test(
+    "wait-for-ci.sh with timeout 300000 blocked (below one 480s wait)",
+    "scripts/wait-for-ci.sh 4835",
+    2,
+    timeout=300000,
+)
+run_test(
+    "wait-for-ci.sh with timeout 600000 allowed",
+    "scripts/wait-for-ci.sh 4835",
+    0,
+    timeout=600000,
+)
+run_test(
+    "ecs-wait-task.sh with timeout 600000 allowed",
+    "scripts/ecs-wait-task.sh",
+    0,
+    timeout=600000,
+)
+run_test(
+    "wait-for-run.sh without timeout blocked",
+    "scripts/wait-for-run.sh 12345",
+    2,
+)
+run_test(
+    "ecs-run-task.sh --detach without timeout allowed (returns quickly)",
+    "scripts/ecs-run-task.sh --detach scripts/foo.py",
+    0,
+)
+run_test(
+    "run-scraper.sh --dry-run without timeout allowed",
+    "scripts/run-scraper.sh --dry-run ca-la-tentatives-civil",
+    0,
+)
+run_test(
+    "helper path as an argument (e.g. to shellcheck) is not a helper call",
+    "shellcheck scripts/wait-for-ci.sh scripts/ecs-wait-task.sh",
+    0,
+)
+run_test(
+    "test script for a helper is not treated as the helper",
+    "scripts/tests/test_wait_for_ci.sh",
+    0,
+)
+
 # Commands that SHOULD be blocked with too-low timeout
 run_test(
     "pytest with timeout 120000 blocked (too low)",

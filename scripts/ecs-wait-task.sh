@@ -20,9 +20,11 @@
 #
 # Usage: scripts/ecs-wait-task.sh [<task-arn>] [options]
 #
-# When invoked from a Claude Code Bash tool call, set `timeout: 1200000`
-# (20 minutes) — typical reingests/rebuilds exceed the 2-minute default,
-# and you may need to extend further for very long jobs.
+# Resumable by default (#4835): one call waits at most 480s, which fits
+# inside the Bash tool's 600s cap, then exits 124 if the task is still
+# running. Re-run the same command to keep waiting. Waiting only reads the
+# task's state, so re-running never relaunches anything. From a Claude Code
+# Bash tool call, set `timeout: 600000`.
 #
 # Arguments:
 #   <task-arn>            ECS task ARN to wait on. If omitted, the script
@@ -31,9 +33,10 @@
 #                         automatically.
 #
 # Options:
-#   --timeout <minutes>   Max minutes to wait before giving up. Default: 0
-#                         (unlimited — the harness's `timeout: 1200000`
-#                         Bash-tool flag bounds it from outside).
+#   --timeout <minutes>   How long this call waits, in minutes. Default:
+#                         8 (480s). 0 means no limit: only use that from a
+#                         terminal, never from an agent's Bash tool call.
+#   --timeout-secs <s>    Same as --timeout, in seconds.
 #   --poll-interval <s>   Polling interval in seconds. Default: 60.
 #   --quiet               Suppress per-poll liveness notes (still prints
 #                         the final status + exit code on STOP).
@@ -44,16 +47,24 @@
 #   The container's exitCode when the task reaches STOPPED. If the
 #   container died without an exitCode (OOM kill, agent failure), exits 1
 #   with `Container stopped without exit code: <reason>` on stderr.
-#   Exits 2 on timeout (task still RUNNING when --timeout expired).
-#   Exits 3 on usage error (bad arg, ARN parse failure, missing AWS CLI).
+#   Exits 124 when the wait ran out while the task is still running.
+#     This is NOT a task failure. Re-run the same command to keep waiting.
+#   Exits 125 when the task's status could not be read (describe-tasks
+#     failed, e.g. expired credentials). The task may still be running.
+#     Refresh credentials, then re-run the same command.
+#   Exits 3 on usage error (bad arg, ARN parse failure, missing AWS CLI,
+#     or ECS has no record of the ARN).
+#   A container can also exit 124 or 125 itself. The stdout summary line
+#   (`status=STOPPED exit_code=...`) is printed only once the task has
+#   STOPPED, so check for it when the difference matters.
 #
 # Examples:
 #   # Launch a long oneshot, then wait on the auto-saved ARN.
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-wait-task.sh
 #
-#   # Wait on a specific ARN with a 90-minute hard cap.
-#   scripts/ecs-wait-task.sh --timeout 90 \
+#   # Wait on a specific ARN for up to 5 minutes in this call.
+#   scripts/ecs-wait-task.sh --timeout 5 \
 #       arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 #
 #   # Quieter polling (every 5 minutes, no per-poll line).
@@ -66,7 +77,10 @@ export AWS_PAGER=""
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
 TASK_ARN=""
-TIMEOUT_MINUTES=0           # 0 = unlimited
+# Default wait per call: 480s, under the Bash tool's 600s cap (#4835).
+DEFAULT_TIMEOUT_SECS=480
+TIMEOUT_MINUTES=""          # --timeout; empty = use the default
+TIMEOUT_SECS_ARG=""         # --timeout-secs; empty = use the default
 POLL_INTERVAL_SECS=60
 QUIET=false
 REGION="us-west-2"
@@ -81,6 +95,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --timeout)
             TIMEOUT_MINUTES="${2:-}"
+            shift 2
+            ;;
+        --timeout-secs)
+            TIMEOUT_SECS_ARG="${2:-}"
             shift 2
             ;;
         --poll-interval)
@@ -119,8 +137,12 @@ done
 # ─── Validate inputs ────────────────────────────────────────────────────────
 
 # Validate numeric flags before any AWS calls.
-if ! [[ "$TIMEOUT_MINUTES" =~ ^[0-9]+$ ]]; then
+if [[ -n "$TIMEOUT_MINUTES" ]] && ! [[ "$TIMEOUT_MINUTES" =~ ^[0-9]+$ ]]; then
     echo "Error: --timeout must be a non-negative integer (minutes), got: '${TIMEOUT_MINUTES}'" >&2
+    exit 3
+fi
+if [[ -n "$TIMEOUT_SECS_ARG" ]] && ! [[ "$TIMEOUT_SECS_ARG" =~ ^[0-9]+$ ]]; then
+    echo "Error: --timeout-secs must be a non-negative integer (seconds), got: '${TIMEOUT_SECS_ARG}'" >&2
     exit 3
 fi
 if ! [[ "$POLL_INTERVAL_SECS" =~ ^[0-9]+$ ]] || [[ "$POLL_INTERVAL_SECS" -lt 1 ]]; then
@@ -256,14 +278,21 @@ parse_field() {
 
 # ─── Poll loop ───────────────────────────────────────────────────────────────
 
-# Convert minutes-to-seconds budget. 0 = unlimited (we never compare against
-# DEADLINE_SECS in that case — see the loop guard below).
-TIMEOUT_SECS=$(( TIMEOUT_MINUTES * 60 ))
+# Resolve the wait budget in seconds. 0 = unlimited (explicit opt-in only).
+if [[ -n "$TIMEOUT_SECS_ARG" ]]; then
+    TIMEOUT_SECS="$TIMEOUT_SECS_ARG"
+elif [[ -n "$TIMEOUT_MINUTES" ]]; then
+    TIMEOUT_SECS=$(( TIMEOUT_MINUTES * 60 ))
+else
+    TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
+fi
 ELAPSED_SECS=0
+# Wall-clock start: describe-tasks time counts against the budget too.
+WAIT_START_SECS=$SECONDS
 
 if [[ "$QUIET" == "false" ]]; then
-    if [[ "$TIMEOUT_MINUTES" -gt 0 ]]; then
-        echo "Waiting for task ${TASK_ID_FROM_ARN} on cluster ${CLUSTER_FROM_ARN} (poll ${POLL_INTERVAL_SECS}s, timeout ${TIMEOUT_MINUTES}m)..." >&2
+    if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+        echo "Waiting for task ${TASK_ID_FROM_ARN} on cluster ${CLUSTER_FROM_ARN} (poll ${POLL_INTERVAL_SECS}s, timeout ${TIMEOUT_SECS}s)..." >&2
     else
         echo "Waiting for task ${TASK_ID_FROM_ARN} on cluster ${CLUSTER_FROM_ARN} (poll ${POLL_INTERVAL_SECS}s, no timeout)..." >&2
     fi
@@ -274,9 +303,13 @@ poll_once() {
         --cluster "$CLUSTER_FROM_ARN" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json > "$DESCRIBE_PATH" 2>/dev/null; then
-        echo "Error: aws ecs describe-tasks failed. Check the ARN and your AWS credentials." >&2
-        return 1
+        --output json > "$DESCRIBE_PATH" 2>"${TMP_DIR}/describe.err"; then
+        echo "Error: task status unknown: aws ecs describe-tasks failed." >&2
+        echo "AWS error: $(tr '\n' ' ' < "${TMP_DIR}/describe.err" 2>/dev/null)" >&2
+        echo "The task may still be running. Do not relaunch it." >&2
+        echo "Fix: refresh AWS credentials (e.g. aws sso login), then re-run:" >&2
+        echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+        return 125
     fi
 
     local tasks_len
@@ -284,7 +317,7 @@ poll_once() {
     if [[ "$tasks_len" == "0" ]]; then
         echo "Error: ECS returned no task for ARN: ${TASK_ARN}" >&2
         echo "The ARN may be wrong, the task may have been deleted (>1h after stop), or the cluster name is wrong." >&2
-        return 1
+        return 3
     fi
     return 0
 }
@@ -310,7 +343,11 @@ emit_progress() {
 # Main wait loop. We always poll at least once before the first sleep so a
 # task that is already STOPPED returns immediately.
 while true; do
-    poll_once || exit 3
+    _poll_rc=0
+    poll_once || _poll_rc=$?
+    if [[ "$_poll_rc" -ne 0 ]]; then
+        exit "$_poll_rc"
+    fi
 
     emit_progress
 
@@ -319,16 +356,31 @@ while true; do
         break
     fi
 
-    # Timeout check (only when --timeout was set non-zero).
-    if [[ "$TIMEOUT_MINUTES" -gt 0 && "$ELAPSED_SECS" -ge "$TIMEOUT_SECS" ]]; then
-        echo "Error: timed out after ${TIMEOUT_MINUTES}m. Task is still RUNNING." >&2
+    # Budget check (skipped when the budget is 0 = unlimited). Counts both
+    # the polls we slept through and real wall-clock time.
+    _wall_elapsed=$(( SECONDS - WAIT_START_SECS ))
+    if [[ "$_wall_elapsed" -gt "$ELAPSED_SECS" ]]; then
+        ELAPSED_SECS="$_wall_elapsed"
+    fi
+    if [[ "$TIMEOUT_SECS" -gt 0 && "$ELAPSED_SECS" -ge "$TIMEOUT_SECS" ]]; then
+        echo "Still waiting: task ${TASK_ID_FROM_ARN} is still ${LAST_STATUS} after ${TIMEOUT_SECS}s. This is NOT a task failure." >&2
         echo "Task ARN: ${TASK_ARN}" >&2
-        echo "Re-run with a larger --timeout, or scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
-        exit 2
+        echo "Re-run the same command to keep waiting (it only reads status; nothing is relaunched):" >&2
+        echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+        echo "Status + logs: scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
+        exit 124
     fi
 
-    sleep "$POLL_INTERVAL_SECS"
-    ELAPSED_SECS=$(( ELAPSED_SECS + POLL_INTERVAL_SECS ))
+    # Never sleep past the budget, so the call ends on time.
+    _sleep_for="$POLL_INTERVAL_SECS"
+    if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+        _remaining=$(( TIMEOUT_SECS - ELAPSED_SECS ))
+        if [[ "$_remaining" -lt "$_sleep_for" ]]; then
+            _sleep_for="$_remaining"
+        fi
+    fi
+    sleep "$_sleep_for"
+    ELAPSED_SECS=$(( ELAPSED_SECS + _sleep_for ))
 done
 
 # ─── Extract exit code + stop reason ───────────────────────────────────────

@@ -12,7 +12,7 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 **IMPORTANT — Post-compaction recovery.** If your context was just autocompacted (your summary references "previous conversation"), you are NOT done with the task. Autocompaction preserves *what was done* but not the procedural imperative *what still needs to happen next* (see #2545). Before emitting any final report or `end_turn`, run the status-file-driven recovery check described in §A.0 (implementation tasks) or §B.0 (investigation tasks). The status file at `{worktree}/tmp/agent-status.txt` is your authoritative "where am I" anchor — re-read this SKILL.md from the section named by your current `phase` and continue. Only `phase=done`, `phase=verified`, or `phase=blocked` means stop.
 
-**IMPORTANT — MCP-first for GitHub reads.** Prefer `mcp__github__*` tools for reads (issue/PR lookup, status, files, comments, search). Keep `gh` for writes (comment, edit, create, merge, close) — the MCP server currently has no auth token so all writes fail. Keep `gh` permanently for `gh run watch`, `gh run list --workflow`, `gh pr edit --body-file`, and anything else without an MCP equivalent. Decision table: `docs/agent/github-api-access.md`. Full inventory: `docs/agent/gh-to-mcp-migration.md`.
+**IMPORTANT — MCP-first for GitHub reads.** Prefer `mcp__github__*` tools for reads (issue/PR lookup, status, files, comments, search). Keep `gh` for writes (comment, edit, create, merge, close) — the MCP server currently has no auth token so all writes fail. Keep `gh` permanently for `gh run list --workflow`, `gh pr edit --body-file`, and anything else without an MCP equivalent. Wait on workflow runs with `scripts/wait-for-run.sh <run-id>` (a resumable wrapper around `gh run view`). Decision table: `docs/agent/github-api-access.md`. Full inventory: `docs/agent/gh-to-mcp-migration.md`.
 
 Loading a deferred MCP tool requires a one-time `ToolSearch` call to pull its schema — e.g. `ToolSearch query="select:mcp__github__get_issue,mcp__github__list_issues,mcp__github__get_pull_request,mcp__github__get_pull_request_status"`. Once loaded, the tool is callable for the rest of the session.
 
@@ -627,14 +627,14 @@ The daemon-side path (Fargate, `_create_worktree` in `scripts/dispatcher/daemon.
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} setup`
 
-For Python packages you will touch, run the helper (use `timeout: 1200000` since the first install can exceed 2 minutes):
+For Python packages you will touch, run the helper (use `timeout: 600000` since the first install can exceed 2 minutes):
 ```
 {worktree}/scripts/install-package-venv.sh <pkg>     # e.g. scraper-framework, nlp-pipeline
 ```
 
 The helper creates `packages/<pkg>/.venv`, installs the local `judgemind-config` sibling first when required, then installs the target package with `[dev]` extras. Plain `pip install -e ".[dev]"` **fails** for `scraper-framework` and `nlp-pipeline` because `judgemind-config` is an unpublished local dependency (see #2491). The helper is idempotent — re-running it is a no-op when the venv is already populated.
 
-For TypeScript packages (use `timeout: 1200000` as npm install may exceed 2 minutes):
+For TypeScript packages (use `timeout: 600000` as npm install may exceed 2 minutes):
 ```
 npm install
 ```
@@ -847,9 +847,9 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 scripts/dispatcher/progress.sh "$AGENT_ID" awaiting_ci "PR #<PR-N>" || true
 ```
 
-**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
+**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 600000`** (the Bash tool's cap). CI runs typically take 10-25 minutes, but one `wait-for-ci.sh` call waits at most 480s and then exits 124 (still running), so expect to re-run it a few times (#4835).
 
-**Do NOT use the `Monitor` tool for CI watch.** Monitor's bash-while-loop pattern fires a wake-up event on every state-string change, and `gh pr view --json mergeable` flickers between `UNKNOWN` and `MERGEABLE` while CI is still running. Each flicker is an unproductive turn for you and the calling dispatcher — observed root cause behind C2 (#3909), C3 (#3922), C4 (#3927), F2 (#3926) prematurely yielding before they could merge their own PRs. If `scripts/wait-for-ci.sh` gets auto-backgrounded by the harness, **just retry it directly** — do NOT switch to Monitor. Synchronous polling with the canonical helper is the only sanctioned CI-watch path.
+**Do NOT use the `Monitor` tool for CI watch.** Monitor's bash-while-loop pattern fires a wake-up event on every state-string change, and `gh pr view --json mergeable` flickers between `UNKNOWN` and `MERGEABLE` while CI is still running. Each flicker is an unproductive turn for you and the calling dispatcher — observed root cause behind C2 (#3909), C3 (#3922), C4 (#3927), F2 (#3926) prematurely yielding before they could merge their own PRs. If `scripts/wait-for-ci.sh` exits 124, **re-run the same command** — do NOT switch to Monitor or `run_in_background`. Synchronous polling with the canonical helper is the only sanctioned CI-watch path.
 
 Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 
@@ -857,14 +857,16 @@ Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 scripts/wait-for-ci.sh <PR-N>
 ```
 
-This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 via either of two paths: (a) the canonical-merge-gate fast-path — `mergeable == MERGEABLE`, any `ci-passed` entry is `success`, no latest check has failed — fires immediately even if stale `in_progress` entries from a superseded CI run linger in the response (#4069); (b) the all-checks-complete fallback — `pending == 0`, `ci-passed` is `success`, no failures, `mergeStateStatus` is `CLEAN` or `UNSTABLE` — fires when CI legitimately drains to zero pending. Stdout names the path explicitly with `canonical merge gate green` or `all checks complete`. Exit 1 = failure, Exit 2 = timeout.
+This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 via either of two paths: (a) the canonical-merge-gate fast-path — `mergeable == MERGEABLE`, any `ci-passed` entry is `success`, no latest check has failed — fires immediately even if stale `in_progress` entries from a superseded CI run linger in the response (#4069); (b) the all-checks-complete fallback — `pending == 0`, `ci-passed` is `success`, no failures, `mergeStateStatus` is `CLEAN` or `UNSTABLE` — fires when CI legitimately drains to zero pending. Stdout names the path explicitly with `canonical merge gate green` or `all checks complete`. Exit 1 = failure.
+
+**Exit 124 — still running (#4835).** The call's 480s budget ran out before CI finished. This is not a failure: re-run the exact command the script prints (`scripts/wait-for-ci.sh <PR-N>`). Re-running only reads check state; it never re-triggers CI (the flake auto-rerun fires at most once per run, tracked per head SHA). Keep re-running until it exits 0, 1 or 3. Do not raise `--timeout-secs` above 480: a call still running at 600s is moved to the background by the Bash tool.
 
 **Exit 3 — REBASE_REQUIRED (#4412).** When CI is green (`ci-passed=success`, no latest failures) but `mergeStateStatus=DIRTY` (a concurrent merge landed on origin/main that conflicts with this PR's diff), `wait-for-ci.sh` exits 3 immediately on the first poll iteration where this is true rather than continuing to poll until timeout. There is no path forward by waiting — the agent must rebase before the PR can merge. On exit 3, follow the A.4 rebase recipe (`git fetch origin main && git rebase origin/main && git push --force-with-lease`), then re-enter the CI watch loop, incrementing the `ci-watch (N)` phase counter and re-emitting `awaiting_ci`. The exit-3 path is the rebase-fast-path equivalent of A.4's merge-conflict handling — both bottom out in the same rebase + force-push, but exit 3 surfaces the signal in <1s instead of the ~10 min the script previously burned re-logging `still waiting...` until timeout.
 
-For workflow-run-level watching (deploy workflows in §A.8), `gh run watch` stays as the fallback:
+For workflow-run-level watching (deploy workflows in §A.8), use `scripts/wait-for-run.sh` with `timeout: 600000`. It exits 0 on success, 1 on any other conclusion, and 124 when still running (re-run the same command):
 
 ```
-gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
+scripts/wait-for-run.sh <run-id>
 ```
 
 For quick status polls without watching, `mcp__github__get_pull_request_status` returns the combined check rollup in one MCP call.
@@ -1013,10 +1015,10 @@ scripts/dispatcher/progress.sh "$AGENT_ID" awaiting_deploy || true
    - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
    - `packages/web/` or frontend → `deploy-production.yml`
    - `infra/terraform/` → `terraform.yml`
-2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 1200000`** as deploys can take several minutes. (`gh run list --workflow` and `gh run watch` have no MCP equivalent — stay on `gh`.)
+2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 600000`** (the Bash tool's cap). Deploys can take longer than one call: `scripts/wait-for-run.sh` waits at most 480s, then exits 124 (still running); re-run the same command until it exits 0 or 1. (`gh run list --workflow` has no MCP equivalent — stay on `gh`.)
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
-   gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
+   scripts/wait-for-run.sh <run-id>
    ```
 3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
 4. If the deploy **succeeds**: continue to Step 2.
@@ -1040,7 +1042,7 @@ A successful deploy only means the new image is running — not that the service
 |---|---|---|
 | **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors | DB query output showing the column/table exists + a successful request/response |
 | **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape AND any state change the endpoint is supposed to cause (DB row updated, job enqueued, etc.) | The curl response (status + body snippet) AND the state-change artifact (DB query result, log line, enqueued job id) |
-| **Ingestion pipeline** | Confirm the worker processes at least one message successfully. Prefer `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` against `/ecs/judgemind-ingestion-worker-dev` for an ad-hoc Insights query; fall back to `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for the recent-N-lines convenience or `--follow` for live tail. | Log lines showing successful message processing |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully. Prefer `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` against `/ecs/judgemind-ingestion-worker-dev` for an ad-hoc Insights query; fall back to `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for the recent-N-lines convenience or `--follow` for live tail (stops after 480s with exit 124; re-run to keep following). | Log lines showing successful message processing |
 | **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors. Same MCP-first pattern as ingestion (Insights query against `/ecs/judgemind-scraper-dev`). | Log lines showing successful document capture |
 | **Frontend — read-only page** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot via `scripts/run-py.sh scripts/screenshot.py` or page content showing the feature rendered |
 | **Frontend — new interactive control** (button, form, toggle, link that triggers an action) | Exercise the control on `dev.judgemind.org` (actually click / submit / toggle) AND capture the downstream effect it produced | Screenshot or log of the control being used + concrete evidence of the state change it caused (DB row, log line, API response, visible UI transition to the new state). "Button renders" is NOT sufficient. |
@@ -1278,7 +1280,8 @@ Worktree cleanup is handled automatically by Claude Code when the agent exits.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
-- **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, and any data-processing script. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
+- **Use `timeout: 600000`** (the Bash tool's 10-minute cap; larger values do not help) on Bash commands that may exceed 2 minutes: `pytest`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, any data-processing script, and the resumable long-wait helpers (`scripts/wait-for-ci.sh`, `scripts/wait-for-run.sh`, `scripts/ecs-run-task.sh`, `scripts/ecs-wait-task.sh`, `scripts/run-scraper.sh`, `scripts/ecs-redeploy.sh`).
+- **Long-wait helpers are resumable (#4835).** Each waits at most 480s per call. Exit 124 = still running, not a failure: re-run the command it prints. Exit 125 = status unknown (e.g. expired credentials): fix, then re-run. For ECS oneshots and scrapers, prefer `--detach` + `scripts/ecs-wait-task.sh`; after a 124 from an attached `ecs-run-task.sh` / `run-scraper.sh`, re-attach with `scripts/ecs-wait-task.sh` — never re-run the launcher, which would start a second task. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
 - **After any context reset, run §A.0 / §B.0 recovery** — `{worktree}/scripts/check-task-recovery.sh {worktree}` is the authoritative "am I done?" check.
 - **Prefer MCP for reads** (`mcp__github__get_issue`, `get_pull_request`, `list_issues`, `list_pull_requests`, `get_pull_request_status`). Keep `gh` for writes and for workflow-run operations. See `docs/agent/github-api-access.md`.
 - **Cockpit milestones via `progress.sh`.** Call `scripts/dispatcher/progress.sh "$AGENT_ID" <milestone> || true` at every transition (`planning`, `ralph`, `summary`, `push_and_pr`, `awaiting_ci`, `fix_ci`, `merge`, `awaiting_deploy`, `verify`, `retro`). Best-effort, exits 0 unconditionally — see "Milestone progress reporting" in Step 0 and #3973.

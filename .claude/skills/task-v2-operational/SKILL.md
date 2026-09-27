@@ -128,7 +128,7 @@ Execute the operational steps described in `plan_text`. Common patterns:
 scripts/ecs-run-task.sh scripts/<script>.py -- <args>
 ```
 
-Use `timeout: 1200000`. The last line of stderr contains the CloudWatch log URL. Capture stdout/stderr for the evidence block.
+Use `timeout: 600000`; on exit 124 (still running) re-attach with `scripts/ecs-wait-task.sh` rather than relaunching. The last line of stderr contains the CloudWatch log URL. Capture stdout/stderr for the evidence block.
 
 **DB query (validation / row count):**
 
@@ -259,7 +259,7 @@ AC2 ✓ — Row count 4,821 is within expected range of pre-outage snapshot (~4,
 - No `$()`, no heredocs, no `python -c`. See the repo root `CLAUDE.md` Critical Rules.
 - All temp files go in `{worktree}/tmp/dispatcher-operational/`, never `/tmp/`.
 - Use Grep, Glob, and Read tools — never `find`, `cat`, `head`, `tail` from Bash.
-- Set `timeout: 1200000` on any long-running Bash command.
+- Set `timeout: 600000` (the Bash tool's cap) on any long-running Bash command, and use the resumable wait helpers for anything longer (#4835).
 - `evidence_md` is mandatory even for `verdict=blocked` or `verdict=failed` — include the failure output so the diagnoser can diagnose without re-running.
 - Write evidence to a file before posting to gh — never construct multi-line `--body` on the command line.
 - Post the evidence comment BEFORE closing the issue (so the comment is visible on the closed issue).

@@ -83,7 +83,8 @@ Pass `--bust-llm-cache` to `scripts/reingest_from_s3.py` (#2424) when any of the
 Example invocation:
 
 ```
-scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --county orange --bust-llm-cache
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --county orange --bust-llm-cache
+scripts/ecs-wait-task.sh     # re-run while it exits 124 (#4835)
 ```
 
 **Partial-failure exit gate (#4624).** For `--bust-llm-cache` **prefix**
@@ -94,7 +95,8 @@ to pass anything to get this; the gate is the default for the cache-bust prefix
 path:
 
 ```
-scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --prefix orange/ --bust-llm-cache
+scripts/ecs-wait-task.sh     # re-run while it exits 124; exits with the reingest's own code
 ```
 
 To override the threshold pass `--max-error-ratio 0.05` (your value always

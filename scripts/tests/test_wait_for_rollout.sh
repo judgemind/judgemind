@@ -382,7 +382,7 @@ test_failed_rollout() {
     fi
 }
 
-# Test 5: Timeout exits 1 with diagnostic output.
+# Test 5: Timeout exits 124 (still rolling out, #4835) with diagnostic output.
 test_timeout() {
     local tmpdir
     tmpdir=$(make_temp_dir)
@@ -394,10 +394,15 @@ test_timeout() {
     # Tight timeout to keep the test fast.
     output=$(ROLLOUT_TIMEOUT_SECS=1 ROLLOUT_POLL_INTERVAL=0 run_script "$tmpdir" 2>&1) || exit_code=$?
 
-    if [[ "$exit_code" -eq 1 ]]; then
-        pass "timeout exits 1"
+    if [[ "$exit_code" -eq 124 ]]; then
+        pass "timeout exits 124 (still rolling out)"
     else
-        fail "timeout exits 1" "exit=$exit_code output=$output"
+        fail "timeout exits 124 (still rolling out)" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -q "Re-run with the same env vars"; then
+        pass "timeout says to re-run to keep waiting"
+    else
+        fail "timeout says to re-run to keep waiting" "output=$output"
     fi
 
     if echo "$output" | grep -q "Timed out after"; then
@@ -504,10 +509,10 @@ MOCK
         ROLLOUT_TIMEOUT_SECS=5 ROLLOUT_POLL_INTERVAL=0 \
         "$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
 
-    if [[ "$exit_code" -eq 1 ]]; then
-        pass "aws CLI failure exits 1"
+    if [[ "$exit_code" -eq 125 ]]; then
+        pass "aws CLI failure exits 125 (state unknown)"
     else
-        fail "aws CLI failure exits 1" "exit=$exit_code output=$output"
+        fail "aws CLI failure exits 125 (state unknown)" "exit=$exit_code output=$output"
     fi
 
     if echo "$output" | grep -q "describe-services failed"; then
@@ -670,10 +675,10 @@ test_deployment_id_timeout() {
     output=$(ROLLOUT_TIMEOUT_SECS=1 ROLLOUT_POLL_INTERVAL=0 \
         run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
 
-    if [[ "$exit_code" -eq 1 ]]; then
-        pass "deployment-id timeout exits 1"
+    if [[ "$exit_code" -eq 124 ]]; then
+        pass "deployment-id timeout exits 124"
     else
-        fail "deployment-id timeout exits 1" "exit=$exit_code output=$output"
+        fail "deployment-id timeout exits 124" "exit=$exit_code output=$output"
     fi
 
     if echo "$output" | grep -q "Timed out after"; then

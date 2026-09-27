@@ -29,7 +29,7 @@
 | `gh pr diff <N>` | *(no direct MCP equivalent)* | **Gap** | Use `get_pull_request_files` to list changes; for raw unified diff, keep `gh pr diff`. |
 | `gh pr review <N> --approve` / `--request-changes` / `--comment` | `mcp__github__create_pull_request_review` | **Available (write — currently blocked)** | |
 | `gh run list --workflow X.yml --branch main --limit 1` | *(no MCP equivalent)* | **Gap — stays on `gh`** | MCP has no workflow-runs API exposure. |
-| `gh run watch <run-id> --interval 60 --exit-status` | *(no MCP equivalent)* | **Gap — stays on `gh`** | MCP has no long-poll watcher. Explicitly documented as out of scope. |
+| `gh run watch <run-id> --interval 60 --exit-status` | *(no MCP equivalent)* | **Gap — stays on `gh`** | MCP has no long-poll watcher. Explicitly documented as out of scope. Agents wait through `scripts/wait-for-run.sh <run-id>`, which polls `gh run view` and fits in one Bash call (#4835). |
 | `gh run view <run-id> --json jobs` | *(no MCP equivalent)* | **Gap — stays on `gh`** | |
 | `gh api rate_limit` | *(no MCP equivalent)* | **Gap — stays on `gh`** | |
 | `gh auth status` / `gh auth token` | *(no MCP equivalent)* | **Gap — stays on `gh`** | |

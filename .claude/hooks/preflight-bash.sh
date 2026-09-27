@@ -159,9 +159,26 @@ fi
 #    When timeout is missing or below 300000 (5 minutes), commands that typically
 #    exceed the default 2-minute timeout get auto-backgrounded by the platform,
 #    which violates the no-background rule for subagents and causes lost results.
+#    The Bash tool caps a call at 600000 (10 minutes), so that is the value to
+#    suggest; anything longer must be resumable (#4835).
 #    Skip this check if run_in_background is true (already background, no auto-bg).
 if [ "$RUN_IN_BG" != "true" ]; then
     NEEDS_TIMEOUT=0
+    # Resumable long-wait helpers (#4835) wait up to 480s per call, so they
+    # need a timeout of at least 540000 to finish inside one call. Their
+    # --detach / --dry-run / --help / --logs forms return quickly.
+    NEEDS_WAIT_HELPER_TIMEOUT=0
+    if echo "$COMMAND" | grep -qE '(^|[;&|][[:space:]]*)(\./)?scripts/(wait-for-ci|wait-for-run|ecs-wait-task|ecs-run-task|run-scraper|ecs-redeploy)\.sh\b' ; then
+        if ! echo "$COMMAND" | grep -qE '(^|[[:space:]])--(detach|dry-run|help|logs)\b' ; then
+            NEEDS_WAIT_HELPER_TIMEOUT=1
+        fi
+    fi
+    if [ "$NEEDS_WAIT_HELPER_TIMEOUT" -eq 1 ]; then
+        if [ "$TIMEOUT" = "none" ] || { echo "$TIMEOUT" | grep -qE '^[0-9]+$' && [ "$TIMEOUT" -lt 540000 ]; }; then
+            echo "BLOCKED: This long-wait helper waits up to 480s per call. Retry with timeout: 600000 (the Bash tool's cap). If it exits 124 (still running), re-run the command it prints. See CLAUDE.md §Critical Rules." >&2
+            exit 2
+        fi
+    fi
 
     # pytest (any invocation)
     if echo "$COMMAND" | grep -qE '\bpytest\b' ; then
@@ -199,13 +216,13 @@ if [ "$RUN_IN_BG" != "true" ]; then
     if [ "$NEEDS_TIMEOUT" -eq 1 ]; then
         # Check if timeout is set and >= 300000
         if [ "$TIMEOUT" = "none" ]; then
-            echo "BLOCKED: This command may exceed the default 2-minute timeout and get auto-backgrounded. Retry with timeout: 1200000 (20 minutes). See CLAUDE.md §Critical Rules." >&2
+            echo "BLOCKED: This command may exceed the default 2-minute timeout and get auto-backgrounded. Retry with timeout: 600000 (the Bash tool's 10-minute cap). See CLAUDE.md §Critical Rules." >&2
             exit 2
         fi
         # Check if timeout is a number and >= 300000
         if echo "$TIMEOUT" | grep -qE '^[0-9]+$' ; then
             if [ "$TIMEOUT" -lt 300000 ]; then
-                echo "BLOCKED: Timeout $TIMEOUT is too low for this long-running command (minimum 300000 / 5 minutes). Retry with timeout: 1200000 (20 minutes). See CLAUDE.md §Critical Rules." >&2
+                echo "BLOCKED: Timeout $TIMEOUT is too low for this long-running command (minimum 300000 / 5 minutes). Retry with timeout: 600000 (the Bash tool's 10-minute cap). See CLAUDE.md §Critical Rules." >&2
                 exit 2
             fi
         fi
@@ -219,7 +236,7 @@ fi
 #    Detection: cwd contains ".claude/worktrees/" in its path.
 if [ "$RUN_IN_BG" = "true" ]; then
     if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
-        echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 1200000 instead. See CLAUDE.md §Critical Rules." >&2
+        echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 600000 instead, and a resumable helper for anything longer. See CLAUDE.md §Critical Rules." >&2
         exit 2
     fi
 fi

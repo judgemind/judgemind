@@ -29,7 +29,7 @@ The `github` MCP server exposes the REST API directly as structured tool calls â
 | Closing an issue with `state_reason` (completed / not_planned / duplicate) | **`gh issue close --reason`** | MCP does not expose `state_reason`. |
 | Merging a PR with `--delete-branch` | **`gh pr merge --squash --delete-branch`** | MCP has `merge_pull_request` but no branch-delete flag. |
 | Editing an existing PR's body after CI or pre-merge checklist updates | **`gh pr edit --body-file`** | MCP has no `update_pull_request` body edit. |
-| Watching a workflow run / CI / deploy | **`gh run watch --interval 60 --exit-status`** | MCP has no long-poll watcher. |
+| Watching a workflow run / CI / deploy | **`scripts/wait-for-run.sh <run-id>`** (PR CI: `scripts/wait-for-ci.sh <PR>`) | MCP has no long-poll watcher. Both helpers wait at most 480s per call and exit 124 when still running: re-run them (#4835). |
 | Listing workflow runs or viewing job detail | **`gh run list` / `gh run view`** | MCP has no `actions` API exposure. |
 | Checking auth state or rate-limit budget | **`gh auth status` / `gh api rate_limit`** | MCP does not cover auth state or the rate-limit endpoint. |
 | Shell script (anything under `scripts/`), GitHub Action, or Git hook | **`gh`** | MCP runs inside Claude Code and is not reachable from shell scripts that execute outside the agent context. |

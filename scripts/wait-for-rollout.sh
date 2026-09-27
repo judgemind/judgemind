@@ -37,7 +37,10 @@
 #   NEW_DEPLOYMENT_ID    — Deployment ID to select the deployment by
 #
 # Optional environment variables:
-#   ROLLOUT_TIMEOUT_SECS   — overall timeout in seconds (default: 900)
+#   ROLLOUT_TIMEOUT_SECS   — overall timeout in seconds (default: 900, sized
+#                            for CI deploy jobs; scripts/ecs-redeploy.sh
+#                            passes 480 so an agent's Bash call stays under
+#                            the tool's 600s cap, #4835)
 #   ROLLOUT_POLL_INTERVAL  — polling interval in seconds (default: 10)
 #   AWS_CLI                — binary name for aws CLI (default: aws; used for
 #                            mocking in tests)
@@ -49,8 +52,13 @@
 #       ingestion worker runs only on-demand), ECS marks the new deployment
 #       COMPLETED immediately with no tasks to launch, and we treat that as
 #       a successful rollout (#2585).
-#   1 — rolloutState=FAILED, or the timeout elapsed, or the aws CLI failed,
-#       or the env-var contract was violated.
+#   1 — rolloutState=FAILED, or the env-var contract was violated.
+#   124 — The timeout elapsed while the deployment was still rolling out
+#       (#4835). Not a failure verdict. Re-running with the same env vars
+#       resumes the wait on the same deployment; it never redeploys.
+#       CI callers treat any non-zero exit as a failed deploy step.
+#   125 — aws ecs describe-services failed, so the rollout state is
+#       unknown (same convention as scripts/ecs-run-task.sh, #4791).
 
 set -euo pipefail
 
@@ -98,8 +106,8 @@ while true; do
         --cluster "$ECS_CLUSTER" \
         --services "$ECS_SERVICE" \
         --output json); then
-    echo "ERROR: aws ecs describe-services failed after ${ELAPSED}s."
-    exit 1
+    echo "ERROR: aws ecs describe-services failed after ${ELAPSED}s; rollout state unknown."
+    exit 125
   fi
 
   DEPLOYMENT=$(echo "$SERVICE_JSON" | jq --arg sel "$JQ_SELECT_ARG" \
@@ -154,11 +162,12 @@ while true; do
   fi
 
   if [ "$NOW_TS" -ge "$DEADLINE" ]; then
-    echo "ERROR: Timed out after ${ROLLOUT_TIMEOUT_SECS}s waiting for $SELECTOR_DESC to stabilize."
+    echo "ERROR: Timed out after ${ROLLOUT_TIMEOUT_SECS}s waiting for $SELECTOR_DESC to stabilize (still rolling out)."
     echo "Last observed state: ${LAST_STATE:-<none>} (${LAST_COUNTS:-<no counts>})"
     echo "Full service JSON snapshot:"
     echo "$SERVICE_JSON" | jq '.services[0] | {serviceName, desiredCount, runningCount, pendingCount, deployments, events: (.events[:5])}'
-    exit 1
+    echo "Re-run with the same env vars to keep waiting on the same deployment (nothing is redeployed)."
+    exit 124
   fi
 
   sleep "$ROLLOUT_POLL_INTERVAL"

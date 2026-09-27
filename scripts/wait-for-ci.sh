@@ -49,7 +49,12 @@
 #   <pr-number>         PR number to monitor (required unless --help)
 #
 # Options:
-#   --timeout-secs N    Overall timeout in seconds (default: 1800)
+#   --timeout-secs N    How long this call waits, in seconds (default: 480).
+#                       Kept under the Bash tool's 600s cap so an agent's
+#                       call never gets moved to the background (#4835).
+#                       When it runs out, exit 124 means "CI still running:
+#                       re-run the same command". Re-running is cheap: it
+#                       only reads state and never re-triggers CI.
 #   --poll-interval N   Polling interval in seconds (default: 30)
 #   --repo OWNER/REPO   GitHub repository (default: judgemind/judgemind)
 #   --no-auto-rerun     Disable the known-flake auto-rerun classifier (#4148).
@@ -89,7 +94,10 @@
 #       --failed` is invoked once and polling continues (path stdout names
 #       the matched pattern with `flake detected: <label>`). A second
 #       flake on the same run exits 1 — see #4148.
-#   2 — Timeout: --timeout-secs elapsed without reaching a terminal state.
+#   124 — Still running: --timeout-secs elapsed before CI reached a
+#       terminal state. Not a failure. Re-run the same command to keep
+#       waiting (#4835). The flake auto-rerun sentinel is keyed on the
+#       head SHA, so a re-run never fires a second `gh run rerun`.
 #   3 — REBASE_REQUIRED (#4412): CI is green (`ci-passed=success`, no latest
 #       failures) but `mergeStateStatus=DIRTY` — a concurrent merge landed on
 #       origin/main that conflicts with this PR's diff. There is no path
@@ -143,7 +151,9 @@ set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-TIMEOUT_SECS=1800
+# 480s keeps the whole call (setup + one last poll) under the Bash tool's
+# 600s cap (#4835). Exit 124 tells the caller to re-run.
+TIMEOUT_SECS=480
 POLL_INTERVAL=30
 REPO="judgemind/judgemind"
 PR_NUMBER=""
@@ -172,8 +182,11 @@ print_help() {
     grep '^#   --' "$0" | sed 's/^# //'
     echo ""
     grep '^# Exit codes:' "$0" | sed 's/^# //'
-    grep '^#   [0123]' "$0" | sed 's/^# //'
+    grep -E '^#   (0|1|3|124) ' "$0" | sed 's/^# //'
 }
+
+# Kept verbatim so the exit-124 message can print the exact re-run command.
+ORIG_ARGS=("$@")
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -637,11 +650,19 @@ EOF
     # Check timeout before sleeping.
     if [ "$NOW_TS" -ge "$DEADLINE" ]; then
         echo ""
-        echo "ERROR: Timed out after ${TIMEOUT_SECS}s waiting for CI on PR #${PR_NUMBER}." >&2
+        echo "STILL WAITING: CI on PR #${PR_NUMBER} is still running after ${TIMEOUT_SECS}s. This is not a failure." >&2
         echo "Last state: pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT} cancelled=${CANCELLED_COUNT}" >&2
         echo "ci-passed conclusion: ${CI_PASSED_CONCLUSION:-(not yet present)}" >&2
-        exit 2
+        echo "Re-run the same command to keep waiting (it only reads state; nothing is re-triggered):" >&2
+        echo "  scripts/wait-for-ci.sh ${ORIG_ARGS[*]}" >&2
+        exit 124
     fi
 
-    sleep "$POLL_INTERVAL"
+    # Never sleep past the deadline, so the call ends on time (#4835).
+    _sleep_for="$POLL_INTERVAL"
+    _remaining=$((DEADLINE - NOW_TS))
+    if [ "$_remaining" -lt "$_sleep_for" ]; then
+        _sleep_for="$_remaining"
+    fi
+    sleep "$_sleep_for"
 done
