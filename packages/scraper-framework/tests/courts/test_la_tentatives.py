@@ -3741,6 +3741,50 @@ def test_appellate_run_fails_when_every_post_is_stale_viewstate() -> None:
 
 
 @respx.mock
+def test_appellate_all_failed_stale_viewstate_retry_rescues_run() -> None:
+    """Stale ViewState on every POST clears when a fresh run re-reads the
+    form, so run() retries the whole fetch once and captures (#4713)."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    stale_html = _load("la_ruling_smc49.html")
+    ruling_html = _synthetic_appellate_ruling_response()
+
+    get_route = respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=stale_html),
+            httpx.Response(200, text=ruling_html),
+        ]
+    )
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    health = LAAppellateTentativeRulingsScraper(config=config).run()
+
+    assert get_route.call_count == 2
+    assert health.success is True
+    assert health.records_captured == 1
+
+
+@respx.mock
+def test_appellate_all_failed_not_a_ruling_page_no_retry() -> None:
+    """A page that is not a ruling page (layout change, block page) on every
+    POST is deterministic: one attempt only (#4713)."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+
+    get_route = respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(
+        return_value=httpx.Response(200, text="<html><body>Access denied</body></html>")
+    )
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    health = LAAppellateTentativeRulingsScraper(config=config).run()
+
+    assert get_route.call_count == 1
+    assert health.success is False
+
+
+@respx.mock
 def test_appellate_run_fails_when_every_post_raises() -> None:
     """Every appellate POST raised: the run is a failure, not success/0 (#4693)."""
     main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])

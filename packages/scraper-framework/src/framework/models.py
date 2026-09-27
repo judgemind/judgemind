@@ -100,6 +100,13 @@ class ScraperConfig(BaseModel):
     request_delay_seconds: float = 1.0
     request_timeout_seconds: float = 30.0
     max_retries: int = 3
+    # Whole-run retry for an all-items-failed fetch (#4713).  BaseScraper.run()
+    # retries it once, after this delay, only when every failure looked
+    # transient and the failed attempt took at most the budget.  A longer
+    # attempt means the outage outlasted the whole loop; the next scheduled
+    # run is the retry.  A budget of 0 turns the retry off.
+    all_failed_retry_budget_seconds: float = 300.0
+    all_failed_retry_delay_seconds: float = 30.0
     respect_robots_txt: bool = True
 
     # Lifecycle

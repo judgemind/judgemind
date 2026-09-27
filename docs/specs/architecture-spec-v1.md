@@ -285,6 +285,20 @@ The deterministic `hearing_date_in_range` rule fails a ruling whose date is more
 
 **All-items-failed must raise.** A fetch loop that catches and logs each item's exception (one bad PDF must not lose the rest) MUST count outcomes with `framework.fetch_tally.FetchTally` and call `tally.raise_if_all_failed(docs)` before returning. When nothing was captured and every attempt raised or was blocked, the run is recorded as `success=False` with the counts and last error in `error_message`. A fetch that completes and finds nothing stays a success — see #4693.
 
+**All-items-failed runs are retried at most once, and only for transient failures.** The gate raises `AllFetchesFailed` (a `ScraperPreconditionFailure`), which carries the tally's retry verdict. `BaseScraper.run()` runs `fetch_documents` again only when all three hold:
+
+1. Every failed item raised a transient error (`framework.fetch_tally.is_transient_fetch_error`: timeouts, connection and proxy errors, dropped connections, HTTP 500/502/503/504, Playwright timeouts and `net::ERR_*`), and every blocked item was marked `blocked(reason, transient=True)`.
+2. The loop did not abort.
+3. The failed attempt took at most `ScraperConfig.all_failed_retry_budget_seconds` (default 300 s).
+
+The retry waits `all_failed_retry_delay_seconds` (default 30 s), and the total number of attempts stays capped by `max_retries`. Every other all-failed run is recorded as failed after one attempt, with the reason in the `all_fetches_failed.no_retry` log event:
+
+- Anti-bot and access-denied pages, responses of the wrong shape, HTTP 4xx (403, 404, 429), and parse errors from a layout change are deterministic. A rerun seconds later gets the same answer.
+- A circuit-breaker abort already decided the source is failing.
+- An attempt longer than the budget means the outage outlasted the whole loop. It is not a blip, and rerunning it would multiply a long failing run. For example, LA's 97 POSTs timing out at 30 s each take about 48 minutes, and three attempts took about 2.4 hours. The next scheduled run (12 h cadence) is the retry. Failing fast also gets the failure signal out sooner.
+
+Mark a block `transient=True` only when a fresh `fetch_documents` call clears it by construction. Examples are LA's stale ViewState (the fetch re-reads the form) and SF civil's expired session (the scraper drops its cached session on `AllFetchesFailed`). Failures outside the per-item loop, such as a listing page or a session handshake, are one request each. They keep the normal exponential-backoff retry up to `max_retries`. See #4713.
+
 **Early aborts must fail the run.** A fetch loop that stops early with items left (a circuit breaker such as SD's 5-in-a-row lookup streak) MUST call `tally.abort(reason, remaining=N)`, then end the fetch with `tally.raise_if_all_failed(docs)` followed by `self._mark_partial_failure(tally.partial_failure_message())`. With no docs the gate raises. With docs, `BaseScraper.run()` archives them first and then records `success=False` with the abort counts in `error_message`, so partial captures are kept and skipped items are not hidden behind a green run. A composite scraper that calls another scraper's `fetch_documents` directly (`ca-sd-pipeline`) must carry the sub-scraper's mark over to its own run — see #4734.
 
 Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.

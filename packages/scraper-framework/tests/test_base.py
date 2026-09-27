@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 import structlog.testing
 
@@ -491,3 +492,232 @@ def test_capture_dedup_miss_allows_archive_and_emit() -> None:
     mock_archiver.archive.assert_called_once()
     mock_bus.emit_document_captured.assert_called_once()
     assert health.records_captured == 1
+
+
+# ---------------------------------------------------------------------------
+# Whole-run retry policy for all-items-failed fetches (#4713)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Replaces time.monotonic / time.sleep in framework.base."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    import framework.base as base_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(base_mod.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(base_mod.time, "sleep", clock.sleep)
+    return clock
+
+
+class _ScriptedFetchScraper(BaseScraper):
+    """Each fetch_documents call plays the next outcome in *script*.
+
+    An outcome is ``"ok"`` (return one doc) or an exception to put on every
+    one of *items* per-item attempts (``"blocked"`` blocks them instead).
+    A ``RuntimeError`` outcome is raised directly, as a listing-page or
+    session failure would be. Each call advances the fake clock by
+    *seconds_per_attempt*.
+    """
+
+    def __init__(
+        self,
+        config: ScraperConfig,
+        script: list[object],
+        clock: _FakeClock,
+        *,
+        items: int = 3,
+        seconds_per_attempt: float = 10.0,
+    ) -> None:
+        super().__init__(config)
+        self.script = script
+        self.clock = clock
+        self.items = items
+        self.seconds_per_attempt = seconds_per_attempt
+        self.calls = 0
+
+    def fetch_documents(self) -> list[CapturedDocument]:
+        from framework.fetch_tally import FetchTally
+
+        outcome = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        self.clock.now += self.seconds_per_attempt
+        if outcome == "ok":
+            return [_make_doc(self.config)]
+        if isinstance(outcome, RuntimeError):
+            # A failure outside the per-item loop (listing page, session).
+            raise outcome
+        tally = FetchTally("items")
+        for _ in range(self.items):
+            tally.attempt()
+            if outcome == "blocked":
+                tally.blocked("Cloudflare challenge page")
+            else:
+                assert isinstance(outcome, Exception)
+                tally.failed(outcome)
+        tally.raise_if_all_failed([])
+        return []
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        return doc
+
+
+def _retry_config(**overrides: object) -> ScraperConfig:
+    fields: dict[str, object] = {
+        "scraper_id": "test-retry",
+        "state": "CA",
+        "county": "Test County",
+        "court": "Superior Court",
+        "target_urls": ["https://example.com"],
+    }
+    fields.update(overrides)
+    return ScraperConfig(**fields)  # type: ignore[arg-type]
+
+
+def _timeout() -> httpx.ReadTimeout:
+    return httpx.ReadTimeout("read timed out")
+
+
+def _forbidden() -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://example.com/r")
+    response = httpx.Response(403, request=request)
+    return httpx.HTTPStatusError("HTTP 403", request=request, response=response)
+
+
+class TestAllFailedRetryPolicy:
+    def test_all_failed_transient_fast_attempt_retries_once(self, fake_clock: _FakeClock) -> None:
+        config = _retry_config(max_retries=3)
+        scraper = _ScriptedFetchScraper(config, [_timeout()], fake_clock)
+
+        health = scraper.run()
+
+        assert scraper.calls == 2
+        assert health.success is False
+        assert "all 3 items failed" in (health.error_message or "")
+        assert fake_clock.sleeps == [config.all_failed_retry_delay_seconds]
+
+    def test_all_failed_transient_retry_rescues_the_run(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(), [_timeout(), "ok"], fake_clock)
+
+        health = scraper.run()
+
+        assert scraper.calls == 2
+        assert health.success is True
+        assert health.records_captured == 1
+
+    def test_all_failed_blocked_no_retry(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(), ["blocked"], fake_clock)
+
+        health = scraper.run()
+
+        assert scraper.calls == 1
+        assert health.success is False
+        assert "blocked" in (health.error_message or "")
+        assert fake_clock.sleeps == []
+
+    def test_all_failed_deterministic_error_no_retry(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(), [_forbidden()], fake_clock)
+
+        health = scraper.run()
+
+        assert scraper.calls == 1
+        assert health.success is False
+        assert "HTTPStatusError" in (health.error_message or "")
+
+    def test_all_failed_slow_attempt_no_retry(self, fake_clock: _FakeClock) -> None:
+        # LA shape: 97 POSTs x 30 s timeouts ~ 48 min. An outage that
+        # outlasted the whole loop will not clear in seconds; the next
+        # scheduled run is the retry.
+        config = _retry_config()
+        scraper = _ScriptedFetchScraper(
+            config,
+            [_timeout()],
+            fake_clock,
+            items=97,
+            seconds_per_attempt=97 * 30.0,
+        )
+
+        health = scraper.run()
+
+        assert scraper.calls == 1
+        assert health.success is False
+        assert health.response_time_seconds == pytest.approx(97 * 30.0)
+
+    def test_all_failed_retry_budget_boundary(self, fake_clock: _FakeClock) -> None:
+        config = _retry_config(all_failed_retry_budget_seconds=60.0)
+        at_budget = _ScriptedFetchScraper(
+            config, [_timeout()], fake_clock, seconds_per_attempt=60.0
+        )
+        assert at_budget.run() is not None
+        assert at_budget.calls == 2
+
+        over_budget = _ScriptedFetchScraper(
+            config, [_timeout()], fake_clock, seconds_per_attempt=60.5
+        )
+        over_budget.run()
+        assert over_budget.calls == 1
+
+    def test_all_failed_retry_respects_max_retries_one(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(max_retries=1), [_timeout()], fake_clock)
+
+        scraper.run()
+
+        assert scraper.calls == 1
+
+    def test_all_failed_retry_disabled_by_zero_budget(self, fake_clock: _FakeClock) -> None:
+        config = _retry_config(all_failed_retry_budget_seconds=0.0)
+        scraper = _ScriptedFetchScraper(config, [_timeout()], fake_clock)
+
+        scraper.run()
+
+        assert scraper.calls == 1
+
+    def test_non_all_failed_exception_keeps_full_retry(self, fake_clock: _FakeClock) -> None:
+        # A listing-page or session failure is one request: cheap to retry
+        # with the normal exponential backoff, up to max_retries.
+        scraper = _ScriptedFetchScraper(
+            _retry_config(max_retries=3), [RuntimeError("listing")], fake_clock
+        )
+
+        health = scraper.run()
+
+        assert scraper.calls == 3
+        assert health.success is False
+        assert fake_clock.sleeps == [2.0, 4.0]
+
+    def test_all_failed_after_other_failure_still_capped(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(
+            _retry_config(max_retries=3),
+            [RuntimeError("listing"), _timeout(), _timeout()],
+            fake_clock,
+        )
+
+        scraper.run()
+
+        # listing failure -> retry; all-failed transient -> one retry; the
+        # third attempt is the last allowed by max_retries.
+        assert scraper.calls == 3
+
+    def test_all_failed_retry_logs_decision(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(), ["blocked"], fake_clock)
+
+        with structlog.testing.capture_logs() as logs:
+            scraper.run()
+
+        decisions = [e for e in logs if e["event"] == "all_fetches_failed.no_retry"]
+        assert len(decisions) == 1
+        assert "blocked" in decisions[0]["reason"]

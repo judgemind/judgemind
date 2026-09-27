@@ -1245,7 +1245,7 @@ class LATentativeRulingsScraper(BaseScraper):
                 try:
                     ruling_html = _post_for_ruling(client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
-                        tally.blocked("stale ViewState error page")
+                        tally.blocked("stale ViewState error page", transient=True)
                         self._log.warning(
                             "Stale ViewState error page; skipping",
                             courthouse=opt.courthouse,
@@ -1462,7 +1462,7 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
                 try:
                     ruling_html = _post_for_ruling_appellate(client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
-                        tally.blocked("stale ViewState error page")
+                        tally.blocked("stale ViewState error page", transient=True)
                         self._log.warning(
                             "Stale ViewState error page; skipping",
                             dept=opt.department,

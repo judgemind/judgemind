@@ -62,6 +62,12 @@ Semantics:
       tally.raise_if_all_failed(docs)
       self._mark_partial_failure(tally.partial_failure_message())
 
+- The raised :class:`AllFetchesFailed` carries a whole-run retry verdict
+  (#4713). ``BaseScraper.run()`` retries the fetch once only when every
+  failure was transient (see :func:`is_transient_fetch_error`, and
+  ``blocked(reason, transient=True)`` for a stale session) and the failed
+  attempt was short. Blocks, 4xx, parse errors and aborts are not retried.
+
 The semantics match the hand-rolled SD ROA counters from #4673 and #4687,
 which were the first user.
 """
@@ -71,9 +77,56 @@ from __future__ import annotations
 from collections.abc import Sized
 from typing import Any
 
-from .base import ScraperPreconditionFailure
+import httpx
+
+from .base import AllFetchesFailed
 
 _MAX_ERROR_LEN = 300
+
+# 5xx answers that mean "the server is struggling right now".  429 is left
+# out on purpose: retrying a rate limit seconds later makes it worse.
+_TRANSIENT_HTTP_STATUS = frozenset({500, 502, 503, 504})
+
+_TRANSIENT_HTTPX_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpx.ProxyError,
+)
+
+
+def _is_transient_one(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in _TRANSIENT_HTTP_STATUS
+    if isinstance(error, _TRANSIENT_HTTPX_ERRORS):
+        return True
+    # Builtin TimeoutError also covers asyncio.TimeoutError (3.11+).
+    if isinstance(error, TimeoutError | ConnectionError):
+        return True
+    # Playwright is optional here, so match its errors by module and name.
+    cls = type(error)
+    if cls.__module__.startswith("playwright"):
+        if cls.__name__ == "TimeoutError":
+            return True
+        # Chromium network failures: net::ERR_CONNECTION_RESET, ERR_TIMED_OUT...
+        return "net::ERR_" in str(error)
+    return False
+
+
+def is_transient_fetch_error(error: BaseException) -> bool:
+    """True when *error* looks like a network blip a retry might clear (#4713).
+
+    Transient: timeouts, connection and proxy errors, dropped connections,
+    HTTP 500/502/503/504, Playwright timeouts and ``net::ERR_*`` failures.
+    Everything else, including HTTP 4xx (403 block, 404 moved page, 429
+    rate limit) and parse errors from a layout change, is deterministic:
+    rerunning seconds later gets the same answer.  An error raised ``from``
+    a transient one counts as transient.
+    """
+    if _is_transient_one(error):
+        return True
+    cause = error.__cause__
+    return cause is not None and _is_transient_one(cause)
 
 
 def _describe(error: BaseException | str) -> str:
@@ -101,6 +154,9 @@ class FetchTally:
         self.n_attempted = 0
         self.n_failed = 0
         self.n_blocked = 0
+        # Failures / blocks a whole-run retry might clear (#4713).
+        self.n_transient_failed = 0
+        self.n_transient_blocked = 0
         self.last_error: str | None = None
         self.last_block_reason: str | None = None
         # Set by abort(): why the loop stopped and how many items it skipped.
@@ -131,12 +187,23 @@ class FetchTally:
         """Mark the current attempt as failed with *error*."""
         self._close_or_count()
         self.n_failed += 1
+        if isinstance(error, BaseException) and is_transient_fetch_error(error):
+            self.n_transient_failed += 1
         self.last_error = _describe(error)
 
-    def blocked(self, reason: str) -> None:
-        """Mark the current attempt as blocked (anti-bot page, expired session)."""
+    def blocked(self, reason: str, *, transient: bool = False) -> None:
+        """Mark the current attempt as blocked (anti-bot page, expired session).
+
+        Pass ``transient=True`` only for a block a fresh run clears by
+        construction, such as an expired session or stale ViewState that
+        ``fetch_documents`` re-acquires at its start.  Anti-bot and
+        access-denied pages, and responses of the wrong shape, stay
+        deterministic: a retry seconds later gets the same page (#4713).
+        """
         self._close_or_count()
         self.n_blocked += 1
+        if transient:
+            self.n_transient_blocked += 1
         self.last_block_reason = _describe(reason)
 
     def abort(self, reason: str, *, remaining: int) -> None:
@@ -161,6 +228,28 @@ class FetchTally:
     def all_failed(self) -> bool:
         """True when at least one attempt was made and none succeeded."""
         return self.n_attempted > 0 and self.n_ok <= 0
+
+    def no_retry_reason(self) -> str | None:
+        """Why a whole-run retry would repeat this failure, or None (#4713).
+
+        None means every failure looked transient, so ``BaseScraper.run()``
+        may run the fetch once more.
+        """
+        if self.aborted:
+            return "the loop aborted early (circuit breaker); rerunning would hit the same streak"
+        hard_blocked = self.n_blocked - self.n_transient_blocked
+        if hard_blocked:
+            return (
+                f"{hard_blocked} of {self.n_attempted} {self.what} were blocked; "
+                "block and access-denied pages do not clear in seconds"
+            )
+        hard_failed = self.n_failed - self.n_transient_failed
+        if hard_failed:
+            return (
+                f"{hard_failed} of {self.n_attempted} {self.what} failed with "
+                "errors that are not transient (HTTP 4xx, parse error, or unknown)"
+            )
+        return None
 
     def log_fields(self) -> dict[str, Any]:
         """Counts as structlog keyword arguments."""
@@ -218,13 +307,16 @@ class FetchTally:
     # ------------------------------------------------------------------
 
     def raise_if_all_failed(self, docs: Sized, *, message: str | None = None) -> None:
-        """Raise :class:`ScraperPreconditionFailure` if nothing was captured
-        and either every attempt failed or the loop aborted with items left.
+        """Raise :class:`AllFetchesFailed` if nothing was captured and either
+        every attempt failed or the loop aborted with items left.
 
         *message* replaces the default :meth:`failure_message` when a scraper
         has a more specific diagnosis (e.g. SD's anti-bot summary). It applies
         only to the all-failed case; an abort after some successes always
         reports :meth:`abort_message`.
+
+        The exception carries :meth:`no_retry_reason`, which
+        ``BaseScraper.run()`` uses to decide on a whole-run retry (#4713).
         """
         if len(docs) != 0:
             return
@@ -232,6 +324,6 @@ class FetchTally:
             text = message or self.failure_message()
             if self.aborted:
                 text += f"; {self.n_skipped} more skipped after abort"
-            raise ScraperPreconditionFailure(text)
+            raise AllFetchesFailed(text, no_retry_reason=self.no_retry_reason())
         if self.aborted:
-            raise ScraperPreconditionFailure(self.abort_message())
+            raise AllFetchesFailed(self.abort_message(), no_retry_reason=self.no_retry_reason())

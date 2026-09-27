@@ -22,7 +22,6 @@ from .models import (
     ScraperHealthEvent,
     ValidationStatus,
 )
-from .retry import retry_sync
 from .storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
@@ -44,6 +43,33 @@ class ScraperPreconditionFailure(RuntimeError):  # noqa: N818
     Canonical example: SF civil tentative scraper session acquisition (#2620).
     Introduced in #2667.
     """
+
+
+class AllFetchesFailed(ScraperPreconditionFailure):
+    """Every per-item fetch failed, or the loop aborted with nothing captured.
+
+    Raised by ``FetchTally.raise_if_all_failed`` (#4693).  It carries the
+    tally's whole-run retry verdict (#4713): ``no_retry_reason`` is ``None``
+    when every failure looked transient (timeouts, connection errors, 5xx,
+    a stale session) and a fresh run might succeed.  Otherwise it says why a
+    retry would only repeat the same failure (blocked pages, HTTP 4xx, parse
+    errors, a circuit-breaker abort).  ``BaseScraper.run()`` reads it to
+    decide whether to run ``fetch_documents`` again.
+    """
+
+    def __init__(self, message: str, *, no_retry_reason: str | None) -> None:
+        super().__init__(message)
+        self.no_retry_reason = no_retry_reason
+
+    @property
+    def retryable(self) -> bool:
+        return self.no_retry_reason is None
+
+
+# Exponential backoff for fetch failures other than AllFetchesFailed
+# (listing page, session acquisition), matching retry_sync's defaults.
+_RETRY_BASE_DELAY_SECONDS = 2.0
+_RETRY_MAX_DELAY_SECONDS = 60.0
 
 
 class BaseScraper(abc.ABC):
@@ -194,11 +220,7 @@ class BaseScraper(abc.ABC):
 
         try:
             try:
-                docs = retry_sync(
-                    self.fetch_documents,
-                    max_attempts=self.config.max_retries,
-                    exceptions=(Exception,),
-                )
+                docs = self._fetch_with_retry()
 
                 for doc in docs:
                     try:
@@ -263,6 +285,97 @@ class BaseScraper(abc.ABC):
                 self._log.warning("Failed to emit health event", error=str(exc))
 
         return health
+
+    def _fetch_with_retry(self) -> list[CapturedDocument]:
+        """Call ``fetch_documents``, retrying per the whole-run policy (#4713).
+
+        - An :class:`AllFetchesFailed` is retried at most once, and only
+          when its tally judged every failure transient AND the failed
+          attempt finished within ``config.all_failed_retry_budget_seconds``.
+          A blip that clears in seconds is worth one more pass; an outage
+          that outlasted the whole loop, a block page, a 4xx or a layout
+          change is not.  The next scheduled run is the retry for those.
+        - Any other exception (listing page, session acquisition) is one
+          cheap request, retried with exponential backoff as before.
+        - The total number of attempts never exceeds ``config.max_retries``.
+        """
+        max_attempts = max(self.config.max_retries, 1)
+        delay = _RETRY_BASE_DELAY_SECONDS
+        all_failed_retried = False
+        attempt = 0
+        while True:
+            attempt += 1
+            self._partial_failure = None
+            attempt_start = time.monotonic()
+            try:
+                return self.fetch_documents()
+            except AllFetchesFailed as exc:
+                elapsed = time.monotonic() - attempt_start
+                reason = self._all_failed_no_retry_reason(
+                    exc,
+                    elapsed=elapsed,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    already_retried=all_failed_retried,
+                )
+                if reason is not None:
+                    self._log.warning(
+                        "all_fetches_failed.no_retry",
+                        reason=reason,
+                        attempt=attempt,
+                        attempt_seconds=round(elapsed, 1),
+                        error=str(exc),
+                    )
+                    raise
+                all_failed_retried = True
+                wait = self.config.all_failed_retry_delay_seconds
+                self._log.warning(
+                    "all_fetches_failed.retrying",
+                    attempt=attempt,
+                    attempt_seconds=round(elapsed, 1),
+                    wait_seconds=wait,
+                    error=str(exc),
+                )
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    raise
+                wait = min(delay, _RETRY_MAX_DELAY_SECONDS)
+                delay *= 2
+                self._log.warning(
+                    "fetch_failed.retrying",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    wait_seconds=wait,
+                    error=str(exc),
+                )
+            time.sleep(wait)
+
+    def _all_failed_no_retry_reason(
+        self,
+        exc: AllFetchesFailed,
+        *,
+        elapsed: float,
+        attempt: int,
+        max_attempts: int,
+        already_retried: bool,
+    ) -> str | None:
+        """Why an all-items-failed attempt must not be retried, or None."""
+        if exc.no_retry_reason is not None:
+            return exc.no_retry_reason
+        if already_retried:
+            return "the one whole-run retry for an all-failed fetch was already used"
+        if attempt >= max_attempts:
+            return f"max_retries={self.config.max_retries} reached"
+        budget = self.config.all_failed_retry_budget_seconds
+        if budget <= 0:
+            return "all_failed_retry_budget_seconds is 0 (retry off)"
+        if elapsed > budget:
+            return (
+                f"the failed attempt took {elapsed:.0f}s, over the "
+                f"{budget:.0f}s retry budget: an outage that outlasted the "
+                "whole loop is not a blip; the next scheduled run is the retry"
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Internal helpers
