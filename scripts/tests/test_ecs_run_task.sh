@@ -492,6 +492,19 @@ JSON
             else
                 echo '{"events":[],"nextForwardToken":"f/2"}'
             fi
+        elif [[ "${MOCK_LOG_EMPTY_PAGES:-}" == "1" ]]; then
+            # Emulate GetLogEvents' documented "empty page, more events
+            # behind the token" behavior (#4791): after the first event,
+            # two empty pages each hand back a NEW forward token before a
+            # later event appears.  The end of the stream repeats its token.
+            token=$(arg_after --next-token "$@")
+            case "$token" in
+                "")    echo '{"events":[{"message":"first-event"}],"nextForwardToken":"f/1"}' ;;
+                "f/1") echo '{"events":[],"nextForwardToken":"f/2"}' ;;
+                "f/2") echo '{"events":[],"nextForwardToken":"f/3"}' ;;
+                "f/3") echo '{"events":[{"message":"later-event"}],"nextForwardToken":"f/4"}' ;;
+                *)     echo "{\"events\":[],\"nextForwardToken\":\"$token\"}" ;;
+            esac
         else
             echo '{"events":[{"message":"hello-from-task"}],"nextForwardToken":"f/1"}'
         fi
@@ -625,6 +638,129 @@ WRAP
     fi
 }
 
+test_ecs_run_task_empty_page_with_new_token_does_not_stall() {
+    local root fake_script output exit_code=0 first_count
+    root=$(make_temp_dir)
+    setup_full_mock "$root"
+    fake_script=$(make_fake_script)
+
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=4 \
+        MOCK_LOG_EMPTY_PAGES=1 ECS_RUN_TASK_POLL_INTERVAL=1 \
+        "$root/scripts/ecs-run-task.sh" "$fake_script" 2>&1
+    ) || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]] && echo "$output" | grep -q "later-event"; then
+        pass "log stream: advances past empty pages whose forward token changes"
+    else
+        fail "log stream: advances past empty pages whose forward token changes" "exit $exit_code; output: $output"
+    fi
+    first_count=$(echo "$output" | grep -c "first-event" || true)
+    if [[ "$first_count" -eq 1 ]]; then
+        pass "log stream: events are not re-printed while paging"
+    else
+        fail "log stream: events are not re-printed while paging" "first-event printed $first_count times; output: $output"
+    fi
+}
+
+# install_describe_failure <root> <stderr-text> — wrap the stub so every
+# describe-tasks call fails with the given AWS CLI error text (exit 255).
+install_describe_failure() {
+    local root="$1" err="$2"
+    mv "$root/bin/aws" "$root/bin/aws-real"
+    printf '%s\n' "$err" > "$root/state/describe.err"
+    cat > "$root/bin/aws" << 'WRAP'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "ecs describe-tasks" ]]; then
+    n=$(cat "$MOCK_STATE/describe_fail.count" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$MOCK_STATE/describe_fail.count"
+    cat "$MOCK_STATE/describe.err" >&2
+    exit 255
+fi
+exec "$(dirname "$0")/aws-real" "$@"
+WRAP
+    chmod +x "$root/bin/aws"
+}
+
+test_ecs_run_task_expired_token_fails_fast() {
+    local root fake_script output exit_code=0 calls
+    root=$(make_temp_dir)
+    setup_full_mock "$root"
+    fake_script=$(make_fake_script)
+    install_describe_failure "$root" \
+        "An error occurred (ExpiredTokenException) when calling the DescribeTasks operation: The security token included in the request is expired"
+
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=never \
+        ECS_RUN_TASK_POLL_INTERVAL=10 \
+        "$root/scripts/ecs-run-task.sh" --timeout 3600 "$fake_script" 2>&1
+    ) || exit_code=$?
+    calls=$(cat "$root/state/describe_fail.count" 2>/dev/null || echo 0)
+
+    if [[ $exit_code -eq 125 ]]; then
+        pass "describe auth error: exits 125 (status unknown), not 124"
+    else
+        fail "describe auth error: exits 125 (status unknown), not 124" "exit $exit_code; output: $output"
+    fi
+    if [[ "$calls" -eq 1 ]]; then
+        pass "describe auth error: fails fast without retrying"
+    else
+        fail "describe auth error: fails fast without retrying" "describe-tasks called $calls times"
+    fi
+    if echo "$output" | grep -q "ExpiredTokenException" && echo "$output" | grep -q "^Fix:"; then
+        pass "describe auth error: prints the AWS error and a Fix: block"
+    else
+        fail "describe auth error: prints the AWS error and a Fix: block" "output: $output"
+    fi
+    if echo "$output" | grep -q -e "Task still running" -e "do not relaunch"; then
+        fail "describe auth error: no 'still running' wording" "output: $output"
+    else
+        pass "describe auth error: no 'still running' wording"
+    fi
+    if [[ "$(cat "$root/tmp/last-ecs-task.arn" 2>/dev/null)" == "$LATE_TASK_ARN" ]]; then
+        pass "describe auth error: ARN saved for ecs-wait-task.sh"
+    else
+        fail "describe auth error: ARN saved for ecs-wait-task.sh" "file: $(cat "$root/tmp/last-ecs-task.arn" 2>/dev/null)"
+    fi
+}
+
+test_ecs_run_task_persistent_describe_errors_report_unknown() {
+    local root fake_script output exit_code=0 calls
+    root=$(make_temp_dir)
+    setup_full_mock "$root"
+    fake_script=$(make_fake_script)
+    install_describe_failure "$root" \
+        "An error occurred (ThrottlingException) when calling the DescribeTasks operation: Rate exceeded"
+
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=never \
+        ECS_RUN_TASK_POLL_INTERVAL=10 \
+        "$root/scripts/ecs-run-task.sh" --timeout 3600 "$fake_script" 2>&1
+    ) || exit_code=$?
+    calls=$(cat "$root/state/describe_fail.count" 2>/dev/null || echo 0)
+
+    if [[ $exit_code -eq 125 ]]; then
+        pass "persistent describe errors: exits 125 (status unknown), not 124"
+    else
+        fail "persistent describe errors: exits 125 (status unknown), not 124" "exit $exit_code; output: $output"
+    fi
+    if [[ "$calls" -eq 6 ]]; then
+        pass "persistent describe errors: gives up after 6 consecutive failures"
+    else
+        fail "persistent describe errors: gives up after 6 consecutive failures" "describe-tasks called $calls times"
+    fi
+    if echo "$output" | grep -qi "status unknown" && echo "$output" | grep -q "ThrottlingException"; then
+        pass "persistent describe errors: reports status unknown with the AWS error"
+    else
+        fail "persistent describe errors: reports status unknown with the AWS error" "output: $output"
+    fi
+    if echo "$output" | grep -q -e "Task still running" -e "do not relaunch"; then
+        fail "persistent describe errors: no 'still running' wording" "output: $output"
+    else
+        pass "persistent describe errors: no 'still running' wording"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_help_documents_max_runtime
@@ -642,6 +778,9 @@ test_ecs_run_task_finds_late_sorting_log_stream
 test_ecs_run_task_timeout_reports_still_running
 test_ecs_run_task_survives_transient_describe_failure
 test_ecs_run_task_empty_first_read_does_not_skip_events
+test_ecs_run_task_empty_page_with_new_token_does_not_stall
+test_ecs_run_task_expired_token_fails_fast
+test_ecs_run_task_persistent_describe_errors_report_unknown
 
 echo ""
 echo "────────────────────────────────────────────"
