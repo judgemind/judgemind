@@ -1248,7 +1248,6 @@ class TestRunScrapersParallel:
 
         Each scraper blocks on a barrier until all 4 have entered fetch_documents,
         proving that all 4 are executing in parallel and not sequentially.
-        The wall time must be significantly less than 4× a single scraper's sleep.
         """
         barrier = threading.Barrier(4, timeout=10)
         thread_ids: list[int] = []
@@ -1283,18 +1282,20 @@ class TestRunScrapersParallel:
             for i in range(4)
         ]
 
-        start = time.monotonic()
         with (
             _patch_registry(entries),
             patch.dict(os.environ, {"SCRAPER_RUNNER_PARALLEL": "4"}),
         ):
             exit_code = run_scrapers()
-        elapsed = time.monotonic() - start
 
+        # The barrier is the concurrency proof: run serially, the first
+        # scraper's barrier.wait() times out, it fails, and exit_code != 0.
+        # There is deliberately no wall-clock bound here. conftest's
+        # _fast_retry_sleeps makes time.sleep a no-op, and a bound like
+        # "< 0.18s" failed on a loaded machine when two worktrees ran the
+        # suite at once (#4812).
         assert exit_code == 0
         assert len(thread_ids) == 4
-        # All 4 ran in parallel — wall time < 4 × 0.05s sleep (i.e., < 0.18s)
-        assert elapsed < 0.18, f"Expected parallel execution but elapsed={elapsed:.3f}s"
         # All 4 scrapers ran in distinct threads
         assert len(set(thread_ids)) == 4, "Expected 4 distinct thread IDs"
 

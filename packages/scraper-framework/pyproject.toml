@@ -47,6 +47,7 @@ dev = [
     "diff-cover>=9.0",   # pre-push diff-coverage gate (#4719)
     "pytest-testmon>=2.1",
     "pytest-xdist>=3.5",
+    "pytest-timeout>=2.3", # per-test timeout fails a stuck test instead of hanging pre-push (#4812)
     "ruff>=0.3",
     "respx>=0.21",       # httpx mocking
     "moto[s3]>=5.0",     # AWS mocking
@@ -75,6 +76,10 @@ known-first-party = ["framework", "courts", "validation", "ingestion"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
 addopts = "--cov=framework --cov=courts --cov=validation --cov=ingestion --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"
+# pytest-timeout: a test still running after this many seconds fails with
+# its stack printed, instead of stalling pre-push or CI (#4812). The slowest
+# test takes ~30 s alone and ~150 s with two suites running at once.
+timeout = 300
 markers = [
     "regression: scraper regression tests against archived fixtures",
     "normalization_integration: contract tests for normalize_motion_type vs scraper outputs",
