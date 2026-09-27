@@ -745,9 +745,63 @@ def test_reingest_missed_hearing_date_keeps_stored_values_in_search() -> None:
 
 def test_worker_indexes_nothing_when_no_ruling_row_committed() -> None:
     """#4785: with no committed ruling row there is nothing to mirror, so the
-    worker does not fall back to raw event values."""
-    os_mock, _ = _run_worker_with_stored_row(_make_event(), None)
+    worker does not fall back to raw event values.  #4783: any search doc
+    left over for that id is removed, so search cannot return it."""
+    event = _make_event()
+    os_mock, _ = _run_worker_with_stored_row(event, None)
     os_mock.index.assert_not_called()
+    os_mock.delete.assert_called_once()
+    assert os_mock.delete.call_args.kwargs["id"] == event["document_id"]
+
+
+def test_supersede_not_indexed_and_stale_search_doc_removed() -> None:
+    """#4783: a document superseded by content-hash dedup has no ruling row.
+
+    The worker must not index it, and must delete any search doc already
+    stored under its id.  Otherwise ``searchRulings`` returns a hit whose
+    ``rulingId`` falls back to the document id and the card's link leads
+    nowhere (the 30 ``orphan_in_os`` docs on dev).  Drives the real
+    ``insert_ruling`` supersede path through ``process_event``.
+    """
+    loser_id = "0039916f-245f-5609-8b68-7264accb867d"
+    winner_id = "bbbbbbbb-0000-0000-0000-000000000002"
+    event = _make_event(document_id=loser_id)
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.rowcount = 1
+
+    def execute_side_effect(sql: str, *args: object, **kwargs: object) -> None:
+        if "INSERT INTO rulings" in sql:
+            exc = psycopg.errors.UniqueViolation("duplicate key")
+            raise exc
+
+    mock_cur.execute.side_effect = execute_side_effect
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"),
+        patch(
+            "ingestion.worker.upsert_case_returning_title",
+            return_value=("case-uuid-1", event.get("case_title")),
+        ),
+        # Postgres holds no ruling row for the superseded document.
+        patch("framework.search.ruling_doc.fetch_ruling_search_rows", return_value={}),
+        patch.object(worker, "_llm_split_document", return_value=False),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # upsert_court
+            (False,),  # insert_document: not new
+            (winner_id,),  # supersede: winner lookup
+            ("Ventura", "ca/ventura/raw/x.pdf"),  # supersede: county/s3_key
+        ]
+        worker.process_event(event)
+
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "status = 'superseded'" in all_sql
+    mock_conn.commit.assert_called_once()
+    os_mock.index.assert_not_called()
+    os_mock.delete.assert_called_once()
+    assert os_mock.delete.call_args.kwargs["id"] == loser_id
 
 
 def test_worker_skips_indexing_when_stored_row_read_fails() -> None:
@@ -771,6 +825,9 @@ def test_worker_skips_indexing_when_stored_row_read_fails() -> None:
 
     mock_conn.commit.assert_called_once()
     os_mock.index.assert_not_called()
+    # A failed read proves nothing about the ruling row, so the existing
+    # search doc must stay (#4783): only a successful empty read deletes.
+    os_mock.delete.assert_not_called()
 
 
 def test_worker_and_reindex_script_build_identical_docs() -> None:

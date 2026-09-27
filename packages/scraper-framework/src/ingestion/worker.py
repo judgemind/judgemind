@@ -3851,6 +3851,12 @@ class IngestionWorker:
         search doc (#4712).  Best-effort, like the indexer itself: the
         Postgres write is already committed and the index is derivable from
         ``derived.*``.
+
+        When the read succeeds but finds no ruling row (the document was
+        superseded by content-hash dedup in ``insert_ruling``), any search
+        doc stored under this id is deleted, so search cannot return a hit
+        whose ruling does not exist (#4783).  A failed read proves nothing,
+        so it leaves the index alone.
         """
         try:
             events = load_search_events(conn, [document_id])
@@ -3859,7 +3865,7 @@ class IngestionWorker:
                 "Search indexing skipped: could not read the committed ruling",
                 extra={"document_id": document_id, "error": str(exc)},
             )
-            events = {}
+            return
         finally:
             # End the read transaction (autocommit is off) so the persistent
             # connection is not left idle in transaction.
@@ -3872,11 +3878,14 @@ class IngestionWorker:
         if event is None:
             # No committed ruling row for this document (e.g. it was
             # superseded by content-hash dedup), so there is nothing to
-            # mirror.  Removing a stale search doc here is #4783.
+            # mirror.  Drop any search doc a previous run left under this
+            # id, or search returns a ruling that does not exist (#4783).
             logger.info(
-                "Search indexing skipped: document has no committed ruling",
+                "Search indexing skipped: document has no committed ruling; "
+                "removing any stale search doc",
                 extra={"document_id": document_id},
             )
+            self._indexer.delete_documents([document_id])
             return
         self._indexer.index_document(event)
 
