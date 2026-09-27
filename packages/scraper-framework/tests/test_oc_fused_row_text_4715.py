@@ -20,6 +20,10 @@ the same way.
   S3 ``ca/orange/superior_court/raw/15bb9e58...pdf``.  There the LLM dropped
   entry 13's caption (Carrillo vs. Bryant) entirely, and its ruling followed
   entry 12's "OFF CALENDAR" in the Cadence Bank row.
+* ``oc_cadence_repeated_caption_page_rows.json`` is a later fresh extraction
+  of the same PDF (the cache entry above expired) from the dev per-page cache.
+  This time the LLM copied "Cadence Bank N.A. vs. Richardson Carrillo vs.
+  Bryant" onto both entry 12 ("OFF CALENDAR") and entry 13 (the ruling).
 """
 
 from __future__ import annotations
@@ -34,7 +38,9 @@ import pytest
 from framework.llm_extractor import (
     _apply_pdf_cache_hit_filters,
     _apply_pdf_post_join_filters,
+    _assign_repeated_fused_captions,
     _join_page_rows,
+    _second_caption,
     _split_fused_row_texts,
     _split_leading_stub_segments,
 )
@@ -47,6 +53,7 @@ N16_PDF = FIXTURES / "oc_gaffney_n16_fused_row.pdf"
 N16_RULINGS = FIXTURES / "oc_gaffney_n16_fused_row_llm_rulings.json"
 N16_PAGE_ROWS = FIXTURES / "oc_gaffney_n16_fused_row_page_rows.json"
 CADENCE_RULINGS = FIXTURES / "oc_cadence_lost_caption_llm_rulings.json"
+CADENCE_PAGE_ROWS = FIXTURES / "oc_cadence_repeated_caption_page_rows.json"
 
 # A phrase that appears only in the Mosqueda ruling.
 MOSQUEDA_DISPOSITION = "Giselle Mosqueda"
@@ -157,6 +164,54 @@ def test_fused_row_text_lost_caption_keeps_ruling_off_the_wrong_case() -> None:
     assert len(out) == len(before)
     assert not _by_title(out, "Cadence Bank").ruling_text
     assert not any("Carrillo" in (r.ruling_text or "") for r in out)
+
+
+def test_fused_row_text_repeated_caption_gives_carrillo_its_own_ruling() -> None:
+    """Fresh extraction: entries 12 and 13 share one fused caption."""
+    rows = json.loads(CADENCE_PAGE_ROWS.read_text())
+    fused = "Cadence Bank N.A. vs. Richardson Carrillo vs. Bryant"
+    assert [r["entry_number"] for r in rows if r.get("case_info") == fused] == [12, 13]
+
+    out = _join_page_rows(rows)
+
+    carrillo = _by_title(out, "Carrillo vs. Bryant")
+    assert carrillo.entry_number == 13
+    assert "Curtis Bryant" in carrillo.ruling_text
+    assert not any(
+        "Curtis Bryant" in (r.ruling_text or "")
+        for r in out
+        if (r.extracted_case_title or "").startswith("Cadence")
+    )
+    # A cache hit on the stored result changes nothing.
+    again = _apply_pdf_cache_hit_filters([r.model_copy() for r in out], content_key="x" * 64)
+    assert [r.model_dump() for r in again] == [r.model_dump() for r in out]
+
+
+def test_fused_row_text_second_caption() -> None:
+    assert (
+        _second_caption("Cadence Bank N.A. vs. Richardson Carrillo vs. Bryant")
+        == "Carrillo vs. Bryant"
+    )
+    assert _second_caption("Cadence Bank N.A. vs. Richardson") is None
+    assert _second_caption("A v. B C v. D E v. F") is None
+
+
+def test_fused_row_text_repeated_caption_guard_rails() -> None:
+    fused = "Smith vs. Jones Brown vs. Green"
+    rows = [
+        _ruling(text="OFF CALENDAR", entry=4, title=fused),
+        _ruling(text="Ruling GRANTED.", entry=5, title=fused),
+    ]
+    out = _assign_repeated_fused_captions(rows)
+    assert out[1].extracted_case_title == "Brown vs. Green"
+    assert out[0].extracted_case_title == fused
+    # Non-consecutive entries, a single caption, or the same case number: unchanged.
+    gap = [rows[0], rows[1].model_copy(update={"entry_number": 7})]
+    assert _assign_repeated_fused_captions(gap) == gap
+    plain = [r.model_copy(update={"extracted_case_title": "Smith vs. Jones"}) for r in rows]
+    assert _assign_repeated_fused_captions(plain) == plain
+    same_case = [r.model_copy(update={"extracted_case_number": "2026-01500000"}) for r in rows]
+    assert _assign_repeated_fused_captions(same_case) == same_case
 
 
 # ---------------------------------------------------------------------------
