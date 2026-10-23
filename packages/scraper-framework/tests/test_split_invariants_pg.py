@@ -53,15 +53,7 @@ def test_postgres_is_configured_when_required() -> None:
         pytest.fail("REQUIRE_PG_TESTS=1 but TEST_DATABASE_URL is not set")
 
 
-_OPEN_BUGS = pytest.mark.xfail(
-    reason="#4845: the worker's split write path breaks invariants until PR 3 lands",
-    raises=harness.InvariantError,
-    strict=False,
-)
-
-
 @_needs_pg
-@_OPEN_BUGS
 @pytest.mark.parametrize("seed", _seeds())
 def test_invariants_hold(seed: int) -> None:
     harness.run_seed(_DSN, seed, _RUN)
@@ -71,28 +63,22 @@ def test_invariants_hold(seed: int) -> None:
 # Reproductions of filed bugs
 # ---------------------------------------------------------------------------
 
-
-def _open(bug: str) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(
-        reason=f"#{bug} open until #4845 PR 3 lands",
-        raises=harness.InvariantError,
-        strict=True,
-    )
-
-
-#: (bug, seed, invariant the seed breaks).  Found by the sweep; each run
+#: (bug, seed, invariant the seed broke).  Found by the sweep; each run
 #: enforces only that invariant, so an unrelated bug cannot mask or fake the
-#: reproduction.  All of them failed before #4845 (PR 1's CI run records the
-#: failures).
+#: reproduction.  All of them failed before #4845 (PR #4846's CI run records
+#: the failures as strict xfails).
 _BUG_SEEDS = [
-    # A textless row at slot 0 shifts every ruling one slot right; the
-    # write of slot j+1 finds its ruling on the earlier, never-dispatched
-    # slot j, dedup supersedes j+1 and deletes j+1's ruling.
-    pytest.param("4836", 9, "gap", marks=_open("4836")),
-    pytest.param("4836", 11, "gap", marks=_open("4836")),
-    # A ruling moves off its holder slot, whose own write is then rejected
-    # by validation: the holder keeps a search doc with no ruling behind it.
-    pytest.param("4837", 69, "search", marks=_open("4837")),
+    # A textless row at slot 0 shifted every ruling one slot right; the
+    # write of slot j+1 found its ruling on the earlier, never-dispatched
+    # slot j, dedup superseded j+1 and deleted j+1's ruling.  Fixed by
+    # writing the split set in one transaction, matching rows by content.
+    pytest.param("4836", 9, "gap"),
+    pytest.param("4836", 11, "gap"),
+    # A ruling moved off its holder slot, whose own write was then rejected
+    # by validation: the holder kept a search doc with no ruling behind it.
+    # Fixed: a rejected child's row is removed with the split set's stale
+    # rows, and dropped from search.
+    pytest.param("4837", 69, "search"),
     # DB-row reingest wrote hearing_date with no hearing_date_source.  Fixed
     # by the one write path: DB-row mode now runs through the worker.
     pytest.param("4839", 13, "date_source"),

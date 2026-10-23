@@ -3708,10 +3708,41 @@ class TestSplitSetChange:
     """#4700: a prefix reingest after a split-set change replaces the
     document's derived rows (surplus children removed, case links re-derived)."""
 
+    @staticmethod
+    def _split_write_patches(worker: Any, delete: Any, conn: Any | None = None) -> list[Any]:
+        """Patches that let ``_write_split_batch`` run without a database:
+        the per-child row resolution, the document and ruling writes, and
+        indexing are stubbed; *delete* stands in for the stale-row cleanup."""
+        mock_psycopg = MagicMock()
+        if conn is not None:
+            mock_psycopg.connect.return_value = conn
+        return [
+            patch("ingestion.worker.psycopg", mock_psycopg),
+            patch("ingestion.worker.delete_stale_split_children", side_effect=delete),
+            patch("ingestion.worker.insert_document", return_value=True),
+            patch("ingestion.worker.write_split_rulings", return_value={}),
+            patch.object(worker, "_prepare_ruling_write", return_value=("court", "case", None)),
+            patch.object(worker, "_link_ruling_rows"),
+            patch.object(worker, "_index_committed_ruling"),
+        ]
+
+    @staticmethod
+    def _collecting_dispatch(worker: Any, order: list[str]) -> Any:
+        """A ``process_event`` stand-in that queues each child in the open
+        split batch, the way the real child write does (#4845)."""
+
+        def _dispatch(ev: dict[str, Any]) -> None:
+            order.append(f"dispatch:{ev['_split_index']}")
+            worker._split_batch.children.append(MagicMock(document_id=ev["document_id"]))
+
+        return _dispatch
+
     def test_split_set_change_deterministic_split_removes_surplus_children(self) -> None:
-        """The deterministic Santa Clara split path cleans stale children
-        AFTER dispatching the children (#4820: a stale slot's ruling can move
-        to its new slot first), with exactly the new child ids."""
+        """The deterministic Santa Clara split path removes stale children
+        after every child is extracted, in the same transaction as the
+        child writes (#4820, #4845), with exactly the new child ids."""
+        from contextlib import ExitStack
+
         from courts.ca.sc_tentatives import SplitRuling
 
         worker = _split_set_change_worker()
@@ -3730,15 +3761,20 @@ class TestSplitSetChange:
             calls.append((s3_key, list(valid_ids), kwargs))
             return 8
 
-        def _fake_dispatch(ev: dict[str, Any]) -> None:
-            order.append(f"dispatch:{ev['_split_index']}")
-
-        with (
-            patch("courts.ca.sc_tentatives._split_rulings", return_value=new_split),
-            patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
-            patch("ingestion.worker.psycopg"),
-            patch.object(worker, "process_event", side_effect=_fake_dispatch),
-        ):
+        conn = MagicMock()
+        conn.closed = False
+        conn.commit.side_effect = lambda: order.append("commit")
+        with ExitStack() as stack:
+            for p in self._split_write_patches(worker, _fake_delete, conn):
+                stack.enter_context(p)
+            stack.enter_context(
+                patch("courts.ca.sc_tentatives._split_rulings", return_value=new_split)
+            )
+            stack.enter_context(
+                patch.object(
+                    worker, "process_event", side_effect=self._collecting_dispatch(worker, order)
+                )
+            )
             handled = worker._llm_split_document(
                 event,
                 parent_id,
@@ -3749,7 +3785,7 @@ class TestSplitSetChange:
             )
 
         assert handled is True
-        assert order == ["dispatch:0", "dispatch:1", "cleanup"]
+        assert order == ["dispatch:0", "dispatch:1", "cleanup", "commit"]
         assert len(calls) == 1
         s3_key, valid_ids, kwargs = calls[0]
         assert s3_key == event["s3_key"]
@@ -3761,7 +3797,11 @@ class TestSplitSetChange:
         assert kwargs.get("parent_document_id") == parent_id
 
     def test_split_set_change_removed_children_leave_search_index(self) -> None:
-        """Removed children are dropped from OpenSearch too."""
+        """Removed children are dropped from OpenSearch too, after commit."""
+        from contextlib import ExitStack
+
+        from ingestion.worker import _SplitBatch
+
         worker = _split_set_change_worker()
         worker._indexer = MagicMock()
         event = _sc_prefix_event()
@@ -3770,31 +3810,64 @@ class TestSplitSetChange:
             kwargs["deleted_ids"].extend(["stale-1", "stale-2"])
             return 2
 
-        with (
-            patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
-            patch("ingestion.worker.psycopg"),
-        ):
-            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+        batch = _SplitBatch(parent_document_id=event["document_id"], replace=True)
+        batch.children.append(MagicMock(document_id="keep"))
+        with ExitStack() as stack:
+            for p in self._split_write_patches(worker, _fake_delete):
+                stack.enter_context(p)
+            worker._write_split_batch(event, event["document_id"], batch)
 
         worker._indexer.delete_documents.assert_called_once_with(["stale-1", "stale-2"])
 
-    def test_split_set_change_cleanup_failure_rolls_back(self) -> None:
-        """A failed cleanup rolls the connection back so the child inserts
-        that follow do not run in an aborted transaction."""
+    def test_split_set_change_all_children_rejected_warns(self, caplog: Any) -> None:
+        """A split whose every child was rejected still replaces the split
+        set (the old rows are stale), and says so with a warning."""
+        from contextlib import ExitStack
+
+        from ingestion.worker import _SplitBatch
+
         worker = _split_set_change_worker()
         worker._indexer = MagicMock()
         event = _sc_prefix_event()
 
-        with (
-            patch("ingestion.worker.delete_stale_split_children", side_effect=RuntimeError("x")),
-            patch("ingestion.worker.psycopg") as mock_psycopg,
-        ):
-            conn = MagicMock()
-            conn.closed = False
-            mock_psycopg.connect.return_value = conn
-            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+        def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+            assert valid_ids == []
+            kwargs["deleted_ids"].extend(["stale-1"])
+            return 1
+
+        batch = _SplitBatch(parent_document_id=event["document_id"], replace=True)
+        with ExitStack() as stack, caplog.at_level("WARNING"):
+            for p in self._split_write_patches(worker, _fake_delete):
+                stack.enter_context(p)
+            worker._write_split_batch(event, event["document_id"], batch)
+
+        assert "every child was rejected" in caplog.text
+        worker._indexer.delete_documents.assert_called_once_with(["stale-1"])
+
+    def test_split_set_change_cleanup_failure_rolls_back(self) -> None:
+        """A failed cleanup rolls back the whole split write and raises, so
+        the key keeps its previous split set and the event is retried
+        (#4845: the split set is replaced atomically)."""
+        from contextlib import ExitStack
+
+        from ingestion.worker import _SplitBatch
+
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = _sc_prefix_event()
+        conn = MagicMock()
+        conn.closed = False
+
+        batch = _SplitBatch(parent_document_id=event["document_id"], replace=True)
+        batch.children.append(MagicMock(document_id="keep"))
+        with ExitStack() as stack:
+            for p in self._split_write_patches(worker, RuntimeError("x"), conn):
+                stack.enter_context(p)
+            with pytest.raises(RuntimeError):
+                worker._write_split_batch(event, event["document_id"], batch)
 
         conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
         worker._indexer.delete_documents.assert_not_called()
 
     def test_split_set_change_split_child_ids(self) -> None:
@@ -4053,6 +4126,10 @@ def _run_worker_capture(
         patch("ingestion.worker.resolve_judge", return_value=None),
         patch("ingestion.worker.batch_upsert_parties"),
         patch("ingestion.worker.insert_document_and_ruling", side_effect=_fake_insert),
+        # A worker split writes its document rows with ``insert_document``
+        # and its rulings with one ``write_split_rulings`` call (#4845).
+        patch("ingestion.worker.insert_document", side_effect=_fake_insert),
+        patch("ingestion.worker.write_split_rulings", return_value={}),
         patch("ingestion.worker.delete_stale_split_children", side_effect=_fake_delete),
     ):
         mock_psycopg.connect.return_value = mock_conn
@@ -4103,13 +4180,32 @@ class TestPreSplitIdParity:
     def test_non_content_parent_cleanup_does_not_own_key(self) -> None:
         """A split whose parent is not the key's content parent keeps the
         #4788 own-rows-only scope."""
+        from contextlib import ExitStack
+
+        from ingestion.worker import _SplitBatch
+
         worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
         event = {**_sc_prefix_event(), "content_hash": "d" * 64}
-        with (
-            patch("ingestion.worker.delete_stale_split_children", return_value=0) as mock_del,
-            patch("ingestion.worker.psycopg"),
-        ):
-            worker._cleanup_stale_split_children(event, event["document_id"], ["keep"])
+        batch = _SplitBatch(parent_document_id=event["document_id"], replace=True)
+        batch.children.append(MagicMock(document_id="keep"))
+        with ExitStack() as stack:
+            write = stack.enter_context(
+                patch("ingestion.worker.write_split_rulings", return_value={})
+            )
+            mock_del = stack.enter_context(
+                patch("ingestion.worker.delete_stale_split_children", return_value=0)
+            )
+            stack.enter_context(patch("ingestion.worker.psycopg"))
+            stack.enter_context(patch("ingestion.worker.insert_document", return_value=True))
+            stack.enter_context(
+                patch.object(worker, "_prepare_ruling_write", return_value=("court", "case", None))
+            )
+            stack.enter_context(patch.object(worker, "_link_ruling_rows"))
+            stack.enter_context(patch.object(worker, "_index_committed_ruling"))
+            worker._write_split_batch(event, event["document_id"], batch)
+        # Neither the ruling matching nor the cleanup may treat the key as owned.
+        assert write.call_args.kwargs["owns_key"] is False
         assert mock_del.call_args.kwargs["owns_key"] is False
 
     def _pre_split_event(self, **extra: Any) -> dict[str, Any]:

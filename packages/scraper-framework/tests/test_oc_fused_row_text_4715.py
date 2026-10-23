@@ -342,8 +342,7 @@ def _make_worker() -> IngestionWorker:
     return worker
 
 
-@patch("ingestion.worker.delete_stale_split_children", return_value=0)
-def test_fused_row_text_worker_dispatches_mosqueda_at_its_own_slot(mock_delete: MagicMock) -> None:
+def test_fused_row_text_worker_dispatches_mosqueda_at_its_own_slot() -> None:
     worker = _make_worker()
     multimodal = MagicMock()
     multimodal.extract_from_pdf.return_value = _apply_pdf_cache_hit_filters(
@@ -361,7 +360,10 @@ def test_fused_row_text_worker_dispatches_mosqueda_at_its_own_slot(mock_delete: 
         "hearing_date": "2026-09-09",
     }
 
-    with patch.object(worker, "process_event") as dispatch:
+    with (
+        patch.object(worker, "process_event") as dispatch,
+        patch.object(IngestionWorker, "_write_split_batch", autospec=True) as write_batch,
+    ):
         worker._llm_split_document(
             event, event["document_id"], "", "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
         )
@@ -372,7 +374,7 @@ def test_fused_row_text_worker_dispatches_mosqueda_at_its_own_slot(mock_delete: 
     assert 1 not in by_index
     assert MOSQUEDA_DISPOSITION in by_index[2]["ruling_text"]
     assert by_index[2]["document_id"] == make_split_document_id(event["document_id"], 2)
-    # Herrera's old child id is not in the valid set, so the stale row is removed.
-    valid_ids = mock_delete.call_args.args[2]
-    assert make_split_document_id(event["document_id"], 1) not in valid_ids
-    assert make_split_document_id(event["document_id"], 2) in valid_ids
+    # The split replaces the key's split set (#4845): only the children that
+    # are written stay, so Herrera's old slot-1 row is removed as stale.
+    write_batch.assert_called_once()
+    assert write_batch.call_args.args[3].replace is True

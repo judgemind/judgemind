@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,6 +30,38 @@ def _no_split_sibling_move() -> Iterator[None]:
     sibling-ruling lookup is covered by ``test_split_shift_move*``."""
     with patch("ingestion.db._move_split_sibling_ruling", return_value=False):
         yield
+
+
+@pytest.fixture(autouse=True)
+def split_rulings_write() -> Iterator[MagicMock]:
+    """A worker split writes its rulings with one ``write_split_rulings``
+    call (#4845).  The mocked cursors here feed fixed ``fetchone``
+    sequences for the court / case / document upserts; the content matching
+    inside ``write_split_rulings`` is covered against real Postgres by
+    ``test_split_write_pg.py``.  Returning ``{}`` keeps every child on
+    the case its extraction upserted."""
+    with patch("ingestion.worker.write_split_rulings", return_value={}) as mock_write:
+        yield mock_write
+
+
+@contextmanager
+def _capture_split_writes() -> Iterator[MagicMock]:
+    """Patch ``IngestionWorker._write_split_batch`` and yield the mock.
+
+    Each call's ``args`` are ``(worker, event_data, parent_document_id,
+    batch)``; ``batch.children`` holds the ``_RulingWrite`` of every child
+    the split extracted (#4845).  For tests about what a split dispatches,
+    not how it is written.
+    """
+    with patch.object(IngestionWorker, "_write_split_batch", autospec=True) as mock_write:
+        yield mock_write
+
+
+def _split_children(mock_write_batch: MagicMock) -> list:
+    """The ``_RulingWrite`` children of the single split write recorded by
+    ``_capture_split_writes``."""
+    mock_write_batch.assert_called_once()
+    return mock_write_batch.call_args.args[3].children
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +182,12 @@ class TestLlmExtractionPath:
         mock_psycopg: MagicMock,
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
+        split_rulings_write: MagicMock,
     ) -> None:
-        """LLM extractor splits a multi-ruling document into individual events."""
+        """LLM extractor splits a multi-ruling document into individual events.
+
+        Both rulings are written in one transaction (#4845).
+        """
         worker, _ = _make_worker()
 
         mock_conn, mock_cur = _make_mock_conn()
@@ -187,8 +224,11 @@ class TestLlmExtractionPath:
 
         # The extractor should have been called once.
         mock_extractor.extract.assert_called_once()
-        # Two rulings should result in two commit calls (one per ruling).
-        assert mock_conn.commit.call_count == 2
+        # Two rulings are written as one split set with one commit (#4845).
+        split_rulings_write.assert_called_once()
+        children = split_rulings_write.call_args.kwargs["children"]
+        assert [c.ruling_text for c in children] == ["Motion GRANTED.", "Motion DENIED."]
+        assert mock_conn.commit.call_count == 1
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -753,6 +793,7 @@ class TestCountyExtractionPath:
                 "framework.extraction_config.get_county_extraction_config",
             ) as mock_get_config,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
 
@@ -815,6 +856,7 @@ class TestCountyExtractionPath:
             ) as mock_get_config,
             patch("ingestion.worker.LlmExtractor") as mock_cls,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
 
@@ -874,6 +916,7 @@ class TestCountyExtractionPath:
                 "framework.extraction_config.get_county_extraction_config",
             ) as mock_get_config,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import (
                 SAN_BERNARDINO_SYSTEM_PROMPT,
@@ -964,6 +1007,7 @@ class TestCountyExtractionPath:
                 "framework.extraction_config.get_county_extraction_config",
             ) as mock_get_config,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import (
                 SAN_BERNARDINO_SYSTEM_PROMPT,
@@ -1034,6 +1078,7 @@ class TestCountyExtractionPath:
                 "framework.extraction_config.get_county_extraction_config",
             ) as mock_get_config,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import (
                 SAN_FRANCISCO_SYSTEM_PROMPT,
@@ -1127,6 +1172,7 @@ class TestCountyExtractionPath:
                 "framework.extraction_config.get_county_extraction_config",
             ) as mock_get_config,
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             from framework.extraction_config import (
                 SAN_FRANCISCO_SYSTEM_PROMPT,
@@ -1185,7 +1231,7 @@ class TestMultiCasePdfAttribution:
     """
 
     @patch("ingestion.worker.batch_upsert_parties")
-    @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
+    @patch("ingestion.worker.insert_document", return_value=True)
     @patch(
         "ingestion.worker.upsert_case_returning_title",
         side_effect=[
@@ -1205,14 +1251,15 @@ class TestMultiCasePdfAttribution:
         mock_upsert_case: MagicMock,
         mock_insert_doc_and_ruling: MagicMock,
         mock_batch_upsert: MagicMock,
+        split_rulings_write: MagicMock,
     ) -> None:
         """Each ruling from a multi-case PDF gets its own case row (#2195).
 
         This is the primary regression test: when the LLM extractor splits a
         multi-case document into 3 rulings, each with a different case_number,
         the worker must call ``upsert_case_returning_title`` with different
-        case numbers and pass the resulting case_ids to
-        ``insert_document_and_ruling``.
+        case numbers and write each ruling with its own case_id (one
+        ``write_split_rulings`` call for the split set, #4845).
         """
         worker, _ = _make_worker()
 
@@ -1264,17 +1311,20 @@ class TestMultiCasePdfAttribution:
             "30-2025-01450123",
         ]
 
-        # --- insert_document_and_ruling called 3 times with different case_ids ---
+        # --- each document row and each ruling gets its own case_id ---
         assert mock_insert_doc_and_ruling.call_count == 3
-        case_ids_used = [
-            call.kwargs["case_id"] for call in mock_insert_doc_and_ruling.call_args_list
+        assert [c.kwargs["case_id"] for c in mock_insert_doc_and_ruling.call_args_list] == [
+            "case-uuid-1",
+            "case-uuid-2",
+            "case-uuid-3",
         ]
+        split_rulings_write.assert_called_once()
+        children = split_rulings_write.call_args.kwargs["children"]
+        case_ids_used = [c.case_id for c in children]
         assert case_ids_used == ["case-uuid-1", "case-uuid-2", "case-uuid-3"]
 
         # --- Each ruling has a unique document_id (split IDs are deterministic) ---
-        doc_ids_used = [
-            call.kwargs["document_id"] for call in mock_insert_doc_and_ruling.call_args_list
-        ]
+        doc_ids_used = [c.document_id for c in children]
         assert len(set(doc_ids_used)) == 3, f"Expected 3 unique document_ids, got {doc_ids_used}"
 
         # --- The document_ids should all be different from the original ---
@@ -1283,7 +1333,7 @@ class TestMultiCasePdfAttribution:
             assert doc_id != original_doc_id, "Split document_id should not match original"
 
     @patch("ingestion.worker.batch_upsert_parties")
-    @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
+    @patch("ingestion.worker.insert_document", return_value=True)
     @patch(
         "ingestion.worker.upsert_case_returning_title",
         side_effect=[
@@ -1302,6 +1352,7 @@ class TestMultiCasePdfAttribution:
         mock_upsert_case: MagicMock,
         mock_insert_doc_and_ruling: MagicMock,
         mock_batch_upsert: MagicMock,
+        split_rulings_write: MagicMock,
     ) -> None:
         """Two rulings with the same case_number share one case row.
 
@@ -1340,11 +1391,12 @@ class TestMultiCasePdfAttribution:
         assert case_numbers == ["30-2024-01380242", "30-2024-01380242"]
 
         # Both rulings should get the same case_id
-        case_ids = [call.kwargs["case_id"] for call in mock_insert_doc_and_ruling.call_args_list]
+        children = split_rulings_write.call_args.kwargs["children"]
+        case_ids = [c.case_id for c in children]
         assert case_ids == ["case-uuid-1", "case-uuid-1"]
 
         # But they should still have different document_ids (split IDs)
-        doc_ids = [call.kwargs["document_id"] for call in mock_insert_doc_and_ruling.call_args_list]
+        doc_ids = [c.document_id for c in children]
         assert len(set(doc_ids)) == 2
 
 
@@ -1816,17 +1868,20 @@ class TestStaleSplitChildCleanup:
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
     @patch("ingestion.worker.psycopg")
-    def test_cleanup_failure_does_not_block_processing(
+    def test_cleanup_failure_rolls_back_the_whole_split(
         self,
         mock_psycopg: MagicMock,
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
         mock_delete_stale: MagicMock,
     ) -> None:
-        """If cleanup fails, processing should continue normally.
+        """A failed stale-row cleanup rolls back the whole split write and
+        raises, so the event is retried.
 
-        The cleanup is a best-effort operation — a failure should not prevent
-        the new rulings from being inserted.
+        The split set is replaced atomically (#4845): children and cleanup
+        commit together or not at all.  Before, the cleanup was a separate
+        best-effort transaction, and a failure left the key holding the new
+        children next to the old split's stale rows.
         """
         worker, _ = _make_worker()
 
@@ -1865,11 +1920,11 @@ class TestStaleSplitChildCleanup:
             ruling_text="Calendar with multiple rulings...",
             s3_key="ca/orange/superior_court/raw/abc123.pdf",
         )
-        # Should not raise — cleanup failure is caught and logged
-        worker.process_event(event)
+        with pytest.raises(Exception, match="DB connection error"):
+            worker.process_event(event)
 
-        # Despite cleanup failure, the split events should still be processed
-        assert mock_conn.commit.call_count == 2
+        mock_conn.commit.assert_not_called()
+        mock_conn.rollback.assert_called()
 
     @patch("ingestion.worker.delete_stale_split_children", return_value=0)
     @patch("ingestion.worker.batch_upsert_parties")
@@ -2305,7 +2360,7 @@ class TestSDCalendarDeterministicSplit:
         """
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-san_diego",
                 state="CA",
@@ -2332,7 +2387,7 @@ class TestSDCalendarDeterministicSplit:
         """Live ``ca-sd-calendar`` captures also route through the splitter."""
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="ca-sd-calendar",
                 state="CA",
@@ -2360,7 +2415,7 @@ class TestSDCalendarDeterministicSplit:
         """
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-san_diego",
                 state="CA",
@@ -2401,7 +2456,7 @@ class TestSDCalendarDeterministicSplit:
         so downstream per-field LLM calls are skipped."""
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-san_diego",
                 state="CA",
@@ -2449,6 +2504,7 @@ class TestSDCalendarDeterministicSplit:
                 return_value=None,
             ),
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             mock_cls.return_value = mock_extractor
             event = _make_event(
@@ -2506,7 +2562,7 @@ class TestLADeterministicSplit:
         la_html = self._load_fixture()
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-los_angeles",
                 state="CA",
@@ -2542,7 +2598,7 @@ class TestLADeterministicSplit:
         la_html = self._load_fixture()
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="ca-la-tentatives-civil",
                 state="CA",
@@ -2569,7 +2625,7 @@ class TestLADeterministicSplit:
         la_html = self._load_fixture()
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-los_angeles",
                 state="CA",
@@ -2599,7 +2655,7 @@ class TestLADeterministicSplit:
         la_html = self._load_fixture()
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-los_angeles",
                 state="CA",
@@ -2650,6 +2706,7 @@ class TestLADeterministicSplit:
                 return_value=None,
             ),
             patch.object(worker, "process_event") as mock_process,
+            _capture_split_writes(),
         ):
             mock_cls.return_value = mock_extractor
             event = _make_event(
@@ -2707,7 +2764,7 @@ class TestFresnoPdfSplit:
         ruling_text = self._load_fixture_text("fresno_403_20260310_d019042f.pdf")
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-fresno",
                 state="CA",
@@ -2738,7 +2795,7 @@ class TestFresnoPdfSplit:
         ruling_text = self._load_fixture_text("fresno_403_20260310_d019042f.pdf")
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="ca-fresno-tentatives-civil",
                 state="CA",
@@ -2821,7 +2878,7 @@ class TestFresnoPdfSplit:
         ruling_text = self._load_fixture_text("fresno_403_20260310_d019042f.pdf")
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-fresno",
                 state="CA",
@@ -3022,7 +3079,7 @@ class TestFresnoPdfSplit:
         ruling_text = self._load_fixture_text("fresno_403_20260310_d019042f.pdf")
         worker, _ = _make_worker()
 
-        with patch.object(worker, "process_event") as mock_process:
+        with patch.object(worker, "process_event") as mock_process, _capture_split_writes():
             event = _make_event(
                 scraper_id="rebuild-ca-fresno",
                 state="CA",
