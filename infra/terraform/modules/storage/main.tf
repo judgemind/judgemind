@@ -92,21 +92,15 @@ resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
     }
   }
 
-  # LLM extraction cache: expire after 90 days. These are derived results
-  # that can be regenerated from source content + current prompt. Prevents
-  # unbounded accumulation of stale cache entries as prompts evolve.
-  rule {
-    id     = "llm-cache-ttl"
-    status = "Enabled"
-
-    filter {
-      prefix = "llm-cache/"
-    }
-
-    expiration {
-      days = 90
-    }
-  }
+  # LLM extraction cache (llm-cache/): deliberately has NO expiration rule.
+  # Entries are kept indefinitely (#4831). An expired entry makes the next
+  # reingest/rebuild re-run the LLM, which can split a PDF differently and
+  # shift positional split-child ids, undoing the bytes-only cache keys of
+  # #4815. A rebuild of derived.* must not depend on a fresh LLM run. Entries
+  # are ~100 KB each, so keeping them costs little. Do not add a TTL or a
+  # noncurrent-version expiration here: noncurrent versions are the only way
+  # to recover an entry overwritten by --bust-llm-cache. See
+  # docs/agent/llm-cache.md.
 
   # Spotcheck results: regenerable anytime by re-running the spotcheck script.
   rule {
