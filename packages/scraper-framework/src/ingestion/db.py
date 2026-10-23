@@ -29,6 +29,8 @@ import psycopg.errors
 from framework.party_utils import is_contaminated_party_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import psycopg
 
 logger = logging.getLogger(__name__)
@@ -2291,6 +2293,10 @@ class SplitSet:
     ``child_ids`` is every document id the split writes, in position order
     (the order the children are written in).  ``parent_document_id`` is the
     document that was split.
+
+    Only for scraper pre-split children, which arrive as separate events and
+    are written one at a time.  A split the worker makes itself is written
+    in one transaction by ``write_split_rulings`` (#4845).
     """
 
     parent_document_id: str
@@ -2641,6 +2647,322 @@ def _own_split_rows(parent_document_id: str, candidate_ids: list[str]) -> list[s
     own = {parent_document_id}
     own.update(make_split_document_id(parent_document_id, i) for i in range(bound))
     return [cid for cid in candidate_ids if cid in own]
+
+
+@dataclass(frozen=True)
+class SplitChildRuling:
+    """One ruling of a split set, ready to write (#4845).
+
+    ``case_id`` is the case the extraction linked this child to (already
+    upserted); ``write_split_rulings`` decides the case the ruling ends on.
+    The other fields are the ``insert_ruling`` columns.
+    """
+
+    document_id: str
+    case_id: str
+    court_id: str
+    hearing_date: date | None
+    ruling_text: str | None
+    ruling_text_html: str | None = None
+    department: str | None = None
+    judge_id: str | None = None
+    outcome: str | None = None
+    motion_type: str | None = None
+    summary: str | None = None
+    summary_model: str | None = None
+    summary_generated_at: datetime | None = None
+    hearing_date_source: str | None = None
+
+
+@dataclass
+class _HeldRuling:
+    ruling_id: str
+    document_id: str
+    case_id: str
+    text_hash: str | None
+    placeholder: bool
+
+
+def _is_placeholder_case_number(case_number: str | None) -> bool:
+    if not isinstance(case_number, str) or not case_number.strip():
+        return True
+    return case_number.startswith(_PLACEHOLDER_CASE_PREFIX)
+
+
+def _owned_rows_on_key(
+    conn: psycopg.Connection, s3_key: str, parent_document_id: str, *, owns_key: bool
+) -> list[str]:
+    """The document rows on *s3_key* that a split of *parent_document_id*
+    replaces: the UUIDv5 rows this parent owns, or every UUIDv5 row on the
+    key when the parent is the key's content parent (#4788, #4796).  The
+    same rows ``delete_stale_split_children`` may remove."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text FROM documents WHERE s3_key = %s AND substring(id::text, 15, 1) = '5'",
+            (s3_key,),
+        )
+        on_key = [str(row[0]) for row in cur.fetchall()]
+    return on_key if owns_key else _own_split_rows(parent_document_id, on_key)
+
+
+def write_split_rulings(
+    conn: psycopg.Connection,
+    *,
+    s3_key: str | None,
+    parent_document_id: str,
+    owns_key: bool,
+    children: list[SplitChildRuling],
+    relink: bool,
+    protected_ids: frozenset[str] = frozenset(),
+) -> dict[str, str | None]:
+    """Write one split set's rulings, reusing the key's existing ruling rows.
+
+    The caller has upserted every child's case and document row, in this
+    transaction; it commits after this returns and after the stale-child
+    cleanup (``delete_stale_split_children``), so readers see the old split
+    set or the new one, never a mix (#4845).  Children are in split order.
+
+    The existing ruling rows on the key's split slots are matched to the
+    children by content, not by slot, so a ruling keeps its row (its id,
+    and the ``public.alert_events`` attached to it) however the split set
+    shifts (#4820, #4836):
+
+    1. the same text and case;
+    2. the same text on a different case (the case number was re-extracted);
+    3. the same slot and case (the text was re-extracted).
+
+    Each existing row matches at most one child, earliest child first, so a
+    true duplicate within the document keeps #2458 dedup: the later copy is
+    superseded by the earlier one.  A matched row is moved to its child's
+    slot.  Its case is:
+
+    - the child's case when they agree;
+    - the row's real case when the child found no case number
+      (``UNKNOWN-*``): a re-extraction that misses the case number must not
+      drop the one found before (#4788);
+    - the child's case when the row's case is a placeholder;
+    - for two different real case numbers, the child's case when *relink*
+      (a split-set replacement: reingest / rebuild, #4700) and the row's
+      case otherwise (a live write keeps an established link, #2475).
+
+    Existing rows that match no child are deleted, their alerts detached
+    (``ruling_id`` NULL), never deleted.  Rows on *protected_ids* (children
+    whose extraction failed this pass) are left alone.  Every child that
+    holds a ruling is active and linked to the ruling's case; a child whose
+    ruling is a content-hash duplicate of another capture is superseded by
+    ``insert_ruling`` (#2458).
+
+    Returns ``{child document id: the case its ruling is on}``, ``None`` for
+    a child left without a ruling (a dedup loser).
+    """
+    child_ids = [c.document_id for c in children]
+    owned = (
+        set(_owned_rows_on_key(conn, s3_key, parent_document_id, owns_key=owns_key))
+        if s3_key
+        else set()
+    )
+    owned = (owned | set(child_ids)) - set(protected_ids)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.id::text, r.document_id::text, r.case_id::text, r.ruling_text_hash, "
+            "c.case_number FROM rulings r JOIN cases c ON c.id = r.case_id "
+            "WHERE r.document_id = ANY(%s::uuid[]) ORDER BY r.document_id FOR UPDATE OF r",
+            (sorted(owned),),
+        )
+        held = [
+            _HeldRuling(
+                ruling_id=str(row[0]),
+                document_id=str(row[1]),
+                case_id=str(row[2]),
+                text_hash=row[3],
+                placeholder=_is_placeholder_case_number(row[4]),
+            )
+            for row in cur.fetchall()
+        ]
+        cur.execute(
+            "SELECT id::text, case_number FROM cases WHERE id = ANY(%s::uuid[])",
+            (sorted({c.case_id for c in children}),),
+        )
+        child_case_numbers = {str(row[0]): row[1] for row in cur.fetchall()}
+
+    hashes = [normalize_ruling_text_hash(_strip_nul(c.ruling_text)) for c in children]
+    free = list(held)
+    match: dict[int, _HeldRuling] = {}
+
+    def take(i: int, pred: Callable[[_HeldRuling], bool]) -> None:
+        # The row already on the child's own slot first: fewer moves.
+        own = children[i].document_id
+        for h in sorted(free, key=lambda h: h.document_id != own):
+            if pred(h):
+                match[i] = h
+                free.remove(h)
+                return
+
+    for i, c in enumerate(children):
+        if hashes[i] is not None:
+            take(i, lambda h, i=i, c=c: h.text_hash == hashes[i] and h.case_id == c.case_id)
+    for i, c in enumerate(children):
+        if i not in match and hashes[i] is not None:
+            take(i, lambda h, i=i: h.text_hash == hashes[i])
+    for i, c in enumerate(children):
+        if i not in match:
+            take(i, lambda h, c=c: h.document_id == c.document_id and h.case_id == c.case_id)
+
+    final_case: dict[int, str] = {}
+    for i, c in enumerate(children):
+        h = match.get(i)
+        if h is None or h.case_id == c.case_id:
+            final_case[i] = c.case_id
+            continue
+        child_placeholder = _is_placeholder_case_number(child_case_numbers.get(c.case_id))
+        if child_placeholder and not h.placeholder:
+            final_case[i] = h.case_id
+        elif h.placeholder or relink:
+            final_case[i] = c.case_id
+        else:
+            final_case[i] = h.case_id
+
+    # A later child with the case and text of an earlier one is a true
+    # duplicate within the document: it keeps no row, and ``insert_ruling``
+    # supersedes it by the earlier child (#2458), as a fresh ingest would.
+    claimed: set[tuple[str, str]] = set()
+    for i, c in enumerate(children):
+        if hashes[i] is None:
+            continue
+        if (final_case[i], hashes[i]) in claimed:
+            h = match.pop(i, None)
+            if h is not None:
+                free.append(h)
+            final_case[i] = c.case_id
+            continue
+        claimed.add((final_case[i], hashes[i]))
+
+    with conn.cursor() as cur:
+        # 1. Rows no child claims are removed; their alerts are detached.
+        stale = [h.ruling_id for h in free]
+        if stale:
+            cur.execute(
+                "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id = ANY(%s::uuid[])",
+                (stale,),
+            )
+            cur.execute("DELETE FROM rulings WHERE id = ANY(%s::uuid[])", (stale,))
+
+        # 2. Move each claimed row to its child's slot.  A slot is free once
+        # its row has moved on; a cycle of moves is broken by parking one
+        # row on a scratch document for the rest of this transaction.
+        location = {h.ruling_id: h.document_id for h in match.values()}
+        holder = {doc: rid for rid, doc in location.items()}
+        pending = {
+            h.ruling_id: children[i].document_id
+            for i, h in match.items()
+            if h.document_id != children[i].document_id
+        }
+        scratch: list[str] = []
+        while pending:
+            moved = False
+            for rid, target in list(pending.items()):
+                if target in holder:
+                    continue
+                cur.execute(
+                    "UPDATE rulings SET document_id = %s::uuid WHERE id = %s::uuid",
+                    (target, rid),
+                )
+                del holder[location[rid]]
+                holder[target] = rid
+                location[rid] = target
+                del pending[rid]
+                moved = True
+            if moved:
+                continue
+            rid = next(iter(pending))
+            park = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO documents (id, case_id, court_id, document_type, format, s3_key, "
+                "s3_bucket, content_hash, source_url, scraper_id, captured_at, status) "
+                "SELECT %s::uuid, case_id, court_id, document_type, format, s3_key, s3_bucket, "
+                "content_hash, source_url, scraper_id, captured_at, status "
+                "FROM documents WHERE id = %s::uuid",
+                (park, location[rid]),
+            )
+            cur.execute(
+                "UPDATE rulings SET document_id = %s::uuid WHERE id = %s::uuid", (park, rid)
+            )
+            del holder[location[rid]]
+            holder[park] = rid
+            location[rid] = park
+            scratch.append(park)
+        if scratch:
+            cur.execute("DELETE FROM documents WHERE id = ANY(%s::uuid[])", (scratch,))
+        for rid, doc in location.items():
+            cur.execute(
+                "UPDATE alert_events SET document_id = %s::uuid WHERE ruling_id = %s::uuid",
+                (doc, rid),
+            )
+
+        # 3. A claimed row takes its final case.  If another capture already
+        # holds a ruling with that case and text, this child is a duplicate
+        # of it: the row is removed (alerts detached) and ``insert_ruling``
+        # below supersedes the child by that capture (#2458).
+        for i, h in list(match.items()):
+            if final_case[i] == h.case_id:
+                continue
+            cur.execute("SAVEPOINT split_ruling_case")
+            try:
+                cur.execute(
+                    "UPDATE rulings SET case_id = %s::uuid WHERE id = %s::uuid",
+                    (final_case[i], h.ruling_id),
+                )
+                cur.execute("RELEASE SAVEPOINT split_ruling_case")
+            except psycopg.errors.UniqueViolation:
+                cur.execute("ROLLBACK TO SAVEPOINT split_ruling_case")
+                cur.execute(
+                    "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id = %s::uuid",
+                    (h.ruling_id,),
+                )
+                cur.execute("DELETE FROM rulings WHERE id = %s::uuid", (h.ruling_id,))
+                del match[i]
+
+    # 4. Write every child's fields, in split order.  A claimed row is
+    # updated in place; an unclaimed child gets a new row, or loses
+    # content-hash dedup to an earlier holder of its case and text.
+    result: dict[str, str | None] = {}
+    for i, c in enumerate(children):
+        insert_ruling(
+            conn,
+            document_id=c.document_id,
+            case_id=final_case[i],
+            court_id=c.court_id,
+            hearing_date=c.hearing_date,
+            ruling_text=c.ruling_text,
+            ruling_text_html=c.ruling_text_html,
+            department=c.department,
+            judge_id=c.judge_id,
+            outcome=c.outcome,
+            motion_type=c.motion_type,
+            summary=c.summary,
+            summary_model=c.summary_model,
+            summary_generated_at=c.summary_generated_at,
+            hearing_date_source=c.hearing_date_source,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT case_id::text FROM rulings WHERE document_id = %s::uuid",
+                (c.document_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                result[c.document_id] = None
+                continue
+            result[c.document_id] = str(row[0])
+            # A document that holds a ruling is live (#4809) and linked to
+            # its ruling's case.
+            cur.execute(
+                "UPDATE documents SET status = 'active', change_type = NULL, "
+                "previous_version_id = NULL, case_id = %s::uuid WHERE id = %s::uuid",
+                (row[0], c.document_id),
+            )
+    return result
 
 
 def delete_stale_split_children(

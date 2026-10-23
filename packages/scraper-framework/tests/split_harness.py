@@ -27,7 +27,7 @@ moves between split slots, or is relinked to a better case, is still tracked.
 The extractor is stubbed: each step decides the rows the multimodal
 extractor returns for the key's PDF.  Everything downstream of it (the
 worker's split dispatch, validation, the case/document/ruling writes, the
-sibling move, content-hash dedup, stale-child cleanup, search indexing) is
+split-set write, content-hash dedup, stale-child cleanup, search indexing) is
 the production code.
 
 Step kinds:
@@ -727,19 +727,36 @@ class KeyHarness:
                 )
 
     def _check_alerts(self, key: Key, rows: list[DocRow]) -> None:
+        """Every ruling that survives a step keeps its alert.
+
+        Rulings are matched by identity, and one identity can be held by
+        several rulings (the same text on two synthetic ``UNKNOWN`` cases), so
+        the check counts: with *k* rulings of an identity left, at least
+        ``min(k, alerts)`` of that identity's alerts must still point at one.
+        An alert whose ruling is gone was rightly detached and is retired; a
+        later step that brings the text back makes a new ruling, not that one.
+        """
         present = ruling_identities(rows)
+        by_identity: dict[tuple[str, str], list[str]] = {}
+        for alert_id, (s3_key, identity) in self._alerts.items():
+            if s3_key == key.s3_key:
+                by_identity.setdefault(identity, []).append(alert_id)
         with self.checker.cursor() as cur:
-            for alert_id, (s3_key, identity) in self._alerts.items():
-                if s3_key != key.s3_key or not present[identity]:
-                    continue
-                cur.execute(
-                    "SELECT r.ruling_text, c.case_number FROM alert_events a "
-                    "LEFT JOIN rulings r ON r.id = a.ruling_id "
-                    "LEFT JOIN cases c ON c.id = r.case_id WHERE a.id = %s::uuid",
-                    (alert_id,),
-                )
-                text, case_number = cur.fetchone()
-                if (text, _norm_case(case_number)) != identity:
+            for identity, alert_ids in by_identity.items():
+                attached = []
+                for alert_id in alert_ids:
+                    cur.execute(
+                        "SELECT r.ruling_text, c.case_number FROM alert_events a "
+                        "LEFT JOIN rulings r ON r.id = a.ruling_id "
+                        "LEFT JOIN cases c ON c.id = r.case_id WHERE a.id = %s::uuid",
+                        (alert_id,),
+                    )
+                    text, case_number = cur.fetchone()
+                    if (text, _norm_case(case_number)) == identity:
+                        attached.append(alert_id)
+                    else:
+                        del self._alerts[alert_id]
+                if len(attached) < min(present[identity], len(alert_ids)):
                     self._fail(
                         "alert",
                         f"alert on ruling {(identity[0] or '')[:24]!r} ({identity[1]}) lost "
@@ -812,10 +829,13 @@ def run_steps(
             harness.run_step(key, step, f"step {n + 1}/{len(steps)}")
 
         final = steps[-1]
-        if final.kind == "live":
+        no_rows = not read_key(harness.checker, key.s3_key)
+        if final.kind == "live" or (final.kind == "db" and no_rows):
             # A live write keeps an established case link (preserve-first,
-            # #2475), so its result may depend on history by design.  A
-            # split-set replacement must not: re-ingest the same bytes.
+            # #2475), so its result may depend on history by design, and a
+            # DB-row reingest only re-ingests keys that have rows.  A
+            # split-set replacement must not depend on history: re-ingest
+            # the same bytes.
             settle = Step("reingest", final.rows, final.specs, ("settle",))
             harness.run_step(key, settle, "settle")
         history = normalized(key, read_key(harness.checker, key.s3_key))

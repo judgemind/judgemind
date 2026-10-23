@@ -679,13 +679,19 @@ class TestFirstChildExhaustionDoesNotAbortSiblings:
         event = _make_llm_event()
         # Call the top-level process_event which will trigger _llm_split_document.
         # The first call is the outer (non-split) event.
-        worker.process_event(event)
+        with patch.object(IngestionWorker, "_write_split_batch", autospec=True) as mock_write:
+            worker.process_event(event)
 
         # All 3 split children were dispatched (first raised, but loop continued).
         split_calls = [c for c in call_log if c.get("_split_processed")]
         assert len(split_calls) == 3, f"Expected 3 split dispatch calls, got {len(split_calls)}"
-        # Children 2 and 3 committed successfully (2 commits from 2 successful children).
-        assert mock_conn.commit.call_count == 2
+        # Children 2 and 3 are written as the split set (#4845); child 1's
+        # slot is protected, so its existing rows survive the transient failure.
+        mock_write.assert_called_once()
+        batch = mock_write.call_args.args[3]
+        ids = [c["document_id"] for c in split_calls]
+        assert [w.document_id for w in batch.children] == ids[1:]
+        assert batch.keep_ids == {ids[0]}
 
 
 # ---------------------------------------------------------------------------

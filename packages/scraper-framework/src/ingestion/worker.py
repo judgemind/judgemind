@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -68,17 +69,20 @@ from validation.issue_filer import file_validation_issue
 
 from .case_type_resolver import resolve_case_type
 from .db import (
+    SplitChildRuling,
     SplitSet,
     _expand_single_word_judge_surname,
     _looks_like_valid_judge_name,
     batch_upsert_parties,
     delete_stale_split_children,
+    insert_document,
     insert_document_and_ruling,
     resolve_judge,
     resolve_judge_from_department,
     upsert_case_judge,
     upsert_case_returning_title,
     upsert_court,
+    write_split_rulings,
 )
 from .department_normalize import normalize_department
 from .doc_timing import DocTiming, emit_via_stdlib_logger
@@ -1260,6 +1264,61 @@ _SCHEMA_CONSTRAINT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
+@dataclass
+class _RulingWrite:
+    """Everything one ruling's database write needs, as extracted by
+    ``_process_event_timed``.  ``_prepare_ruling_write`` updates the case
+    number, title and judge name with its corrections."""
+
+    event_data: dict[str, Any]
+    document_id: str
+    state: str
+    county: str
+    court_name: str
+    case_number: str | None
+    case_title: str | None
+    case_type: str | None
+    judge_name: str | None
+    department: str | None
+    hearing_dt: date | None
+    hearing_date_source: str | None
+    outcome: str | None
+    motion_type: str | None
+    parties_data: list[dict[str, str]]
+    content_format: str
+    content_hash: str
+    s3_key: str | None
+    s3_bucket: str | None
+    source_url: str
+    scraper_id: str
+    captured_at: datetime
+    ruling_text: str | None
+    ruling_text_html: str | None
+    summary: str | None
+    summary_model: str | None
+    summary_generated_at: datetime | None
+    validation_result: ValidationResult | None
+    extraction_methods: dict[str, str]
+    effective_case_number: str = ""
+
+
+@dataclass
+class _SplitBatch:
+    """The children of one worker split, collected while they are extracted
+    and written together by ``IngestionWorker._write_split_batch`` (#4845).
+
+    ``replace`` is set once the split has decided its child set (so the
+    key's rows are replaced even when every child is dropped).
+    ``keep_ids`` are children whose extraction failed this pass: their
+    existing rows are left untouched rather than removed.
+    """
+
+    parent_document_id: str
+    children: list[_RulingWrite] = field(default_factory=list)
+    keep_ids: set[str] = field(default_factory=set)
+    replace: bool = False
+
+
 class InfrastructureError(Exception):
     """Raised when a message processing failure is caused by infrastructure,
     not by bad message data.
@@ -1619,6 +1678,10 @@ class IngestionWorker:
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
         self._la_dept_map: dict[str, str] | None = None
+
+        # The worker split being extracted, if any: its children are
+        # collected here and written together (#4845).
+        self._split_batch: _SplitBatch | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -3726,255 +3789,463 @@ class IngestionWorker:
                 f"{content_hash}:ruling:{split_index}".encode()
             ).hexdigest()
 
-        # PHASE: db_write_ms (#4116) — boundary-marked rather than wrapped
-        # in a ``with timing.phase(...)`` to avoid re-indenting the ~170-
-        # line transaction body.  ``add_ms`` is called in the ``finally`` /
-        # ``except`` arms so a raised exception still records the time
-        # spent in the failed transaction.
+        write = _RulingWrite(
+            event_data=event_data,
+            document_id=document_id,
+            state=state,
+            county=county,
+            court_name=court_name,
+            case_number=case_number,
+            case_title=case_title,
+            case_type=case_type,
+            judge_name=judge_name,
+            department=department,
+            hearing_dt=hearing_dt,
+            hearing_date_source=hearing_date_source,
+            outcome=outcome,
+            motion_type=motion_type,
+            parties_data=parties_data,
+            content_format=content_format,
+            content_hash=content_hash,
+            s3_key=s3_key,
+            s3_bucket=s3_bucket,
+            source_url=source_url,
+            scraper_id=scraper_id,
+            captured_at=capture_ts or datetime.now(UTC),
+            ruling_text=cleaned_ruling_text,
+            ruling_text_html=ruling_text_html,
+            summary=summary,
+            summary_model=summary_model,
+            summary_generated_at=summary_generated_at,
+            validation_result=validation_result,
+            extraction_methods=extraction_methods,
+        )
+
+        # A worker split writes all of its children in one transaction, after
+        # the last one is extracted (``_write_split_batch``, #4845).
+        batch = self._split_batch
+        if (
+            batch is not None
+            and is_split
+            and event_data.get("_original_document_id") == batch.parent_document_id
+        ):
+            batch.children.append(write)
+            return
+
+        # PHASE: db_write_ms (#4116).  ``add_ms`` is called on both the
+        # success and the failure arm so a raised exception still records
+        # the time spent in the failed transaction.
         _db_write_t0 = time.perf_counter()
-        conn = self._get_connection()
         try:
-            # 1. Ensure court exists
-            court_id = upsert_court(conn, state, county, court_name)
+            self._write_one_ruling(write)
+        finally:
+            timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
-            # 1b. Enrichment — resolve extracted fields against DB data (#1576).
-            # Skip enrichment when case_number is empty/synthetic, as there is
-            # insufficient data for meaningful matching.  hearing_date being
-            # None does NOT skip enrichment — the case_number is the primary
-            # lookup key (#2215).
-            _skip_enrichment = not case_number or case_number.startswith("UNKNOWN-")
-            if not _skip_enrichment:
-                enrichment_engine = EnrichmentEngine(conn)
-                party_names = [p.get("name") for p in parties_data if p.get("name")]
-                enrich_result = enrichment_engine.enrich(
-                    case_number=case_number,
-                    court_id=court_id,
-                    judge_name=judge_name,
-                    department=department,
-                    hearing_date=hearing_dt,
-                    parties=party_names,
-                )
+    # ------------------------------------------------------------------
+    # Ruling writes (#4845)
+    # ------------------------------------------------------------------
 
-                # Apply case number correction from fuzzy match.
-                if (
-                    enrich_result.case_match is not None
-                    and enrich_result.case_match.match_type == "fuzzy"
-                ):
-                    original_case_number = case_number
-                    case_number = enrich_result.case_match.case_number
-                    logger.info(
-                        "Enrichment corrected case_number via fuzzy match",
-                        extra={
-                            "document_id": document_id,
-                            "original_case_number": original_case_number,
-                            "corrected_case_number": case_number,
-                            "confidence": enrich_result.case_match.confidence,
-                            "levenshtein_distance": enrich_result.case_match.levenshtein_distance,
-                            "party_overlap": enrich_result.case_match.party_overlap,
-                        },
-                    )
+    def _prepare_ruling_write(
+        self, conn: psycopg.Connection, w: _RulingWrite
+    ) -> tuple[str, str, str | None]:
+        """Resolve a ruling's court, case and judge rows before it is written.
 
-                # Capture original judge name before any enrichment updates so
-                # that all log messages consistently reference the scraper's
-                # original extracted value, not a post-enrichment canonical name.
-                _original_judge_name = judge_name
+        Upserts the court, applies the enrichment engine's case-number and
+        judge-alias corrections (#1576), upserts the case (adopting an
+        existing title when the ruling has none, #2006) and resolves the
+        judge.  Updates *w* with the corrected values.  Returns
+        ``(court_id, case_id, judge_id)``.  Runs in the caller's
+        transaction and commits nothing.
+        """
+        document_id = w.document_id
+        state = w.state
+        county = w.county
+        court_name = w.court_name
+        case_number = w.case_number
+        case_title = w.case_title
+        case_type = w.case_type
+        judge_name = w.judge_name
+        department = w.department
+        hearing_dt = w.hearing_dt
+        parties_data = w.parties_data
+        scraper_id = w.scraper_id
+        extraction_methods = w.extraction_methods
 
-                # Apply judge name resolution from alias match.
-                if (
-                    enrich_result.judge_resolution is not None
-                    and enrich_result.judge_resolution.match_type == "alias"
-                    and enrich_result.judge_resolution.canonical_name
-                ):
-                    judge_name = enrich_result.judge_resolution.canonical_name
-                    if _original_judge_name != judge_name:
-                        logger.info(
-                            "Enrichment resolved judge via alias",
-                            extra={
-                                "document_id": document_id,
-                                "original_judge_name": _original_judge_name,
-                                "canonical_name": judge_name,
-                                "confidence": enrich_result.judge_resolution.confidence,
-                            },
-                        )
+        # 1. Ensure court exists
+        court_id = upsert_court(conn, state, county, court_name)
 
-                # Log directory mismatches as warnings (do NOT override judge).
-                if (
-                    enrich_result.judge_resolution is not None
-                    and enrich_result.judge_resolution.directory_mismatch
-                ):
-                    logger.warning(
-                        "Enrichment: judge/directory mismatch — flagged for review",
-                        extra={
-                            "document_id": document_id,
-                            "extracted_judge": _original_judge_name,
-                            "directory_judge": enrich_result.judge_resolution.directory_judge,
-                            "department": department,
-                        },
-                    )
-
-                # Log enrichment flags for human review.
-                if enrich_result.flags:
-                    logger.info(
-                        "Enrichment flags for human review",
-                        extra={
-                            "document_id": document_id,
-                            "flags": enrich_result.flags,
-                        },
-                    )
-
-            # 2. Ensure case exists — use document_id as synthetic case_number if absent
-            effective_case_number = case_number or f"UNKNOWN-{document_id}"
-            if effective_case_number.startswith("UNKNOWN-"):
-                logger.warning(
-                    "No case_number extractable for document — using synthetic UNKNOWN identifier",
-                    extra={"document_id": document_id},
-                )
-            # 2b. Cross-case title lookup via upsert (#2006).
-            # Use upsert_case_returning_title to get the effective title after
-            # COALESCE — if the DB already has a title from a prior ruling and
-            # this ingestion has no title, the existing title is preserved and
-            # returned.  This prevents future null-title warnings for cases
-            # that have already been titled.
-            #
-            # A synthetic ``UNKNOWN-<document_id>`` case belongs to this one
-            # document, so its incoming title wins (#4715).  A split child's
-            # id is positional: when a re-split moves a different ruling into
-            # the slot (a fused row's text given to its own case), the
-            # preserve-first upsert kept the previous ruling's caption on it.
-            synthetic_case = effective_case_number == f"UNKNOWN-{document_id}"
-            case_id, effective_title = upsert_case_returning_title(
-                conn,
-                effective_case_number,
-                court_id,
-                case_title=case_title,
-                case_type=case_type,
-                force_update=synthetic_case,
+        # 1b. Enrichment — resolve extracted fields against DB data (#1576).
+        # Skip enrichment when case_number is empty/synthetic, as there is
+        # insufficient data for meaningful matching.  hearing_date being
+        # None does NOT skip enrichment — the case_number is the primary
+        # lookup key (#2215).
+        _skip_enrichment = not case_number or case_number.startswith("UNKNOWN-")
+        if not _skip_enrichment:
+            enrichment_engine = EnrichmentEngine(conn)
+            party_names = [p.get("name") for p in parties_data if p.get("name")]
+            enrich_result = enrichment_engine.enrich(
+                case_number=case_number,
+                court_id=court_id,
+                judge_name=judge_name,
+                department=department,
+                hearing_date=hearing_dt,
+                parties=party_names,
             )
-            if not case_title and effective_title:
-                case_title = effective_title
-                extraction_methods.setdefault("case_title", "db_lookup")
+
+            # Apply case number correction from fuzzy match.
+            if (
+                enrich_result.case_match is not None
+                and enrich_result.case_match.match_type == "fuzzy"
+            ):
+                original_case_number = case_number
+                case_number = enrich_result.case_match.case_number
                 logger.info(
-                    "Populated case_title from existing DB record",
+                    "Enrichment corrected case_number via fuzzy match",
                     extra={
                         "document_id": document_id,
-                        "case_number": effective_case_number,
-                        "case_title": effective_title,
+                        "original_case_number": original_case_number,
+                        "corrected_case_number": case_number,
+                        "confidence": enrich_result.case_match.confidence,
+                        "levenshtein_distance": enrich_result.case_match.levenshtein_distance,
+                        "party_overlap": enrich_result.case_match.party_overlap,
                     },
                 )
 
-            # 2c. LA County single-word JUDGE/DEPT surname expansion (#4297).
-            #
-            # LA tentative-ruling HTML uses a ``JUDGE/DEPT: <Surname>/<dept>``
-            # form-layout header that genuinely carries only the surname.
-            # ``resolve_judge`` rejects single-word names via
-            # ``_looks_like_valid_judge_name`` (defensive guard against
-            # truncated/garbage entries), so without expansion the ruling
-            # stores ``judge_id = NULL``.  Expand via the directory snapshot
-            # / ``judges`` surname-suffix lookup chain before resolving.
+            # Capture original judge name before any enrichment updates so
+            # that all log messages consistently reference the scraper's
+            # original extracted value, not a post-enrichment canonical name.
+            _original_judge_name = judge_name
+
+            # Apply judge name resolution from alias match.
             if (
-                judge_name
-                and not _looks_like_valid_judge_name(judge_name)
-                and len(judge_name.strip().split()) == 1
-                and department
-                and state == "CA"
-                and county == "Los Angeles"
+                enrich_result.judge_resolution is not None
+                and enrich_result.judge_resolution.match_type == "alias"
+                and enrich_result.judge_resolution.canonical_name
             ):
-                expanded = _expand_single_word_judge_surname(
-                    conn,
-                    court_id,
-                    judge_name,
-                    department,
-                    hearing_date=hearing_dt,
-                )
-                if expanded:
+                judge_name = enrich_result.judge_resolution.canonical_name
+                if _original_judge_name != judge_name:
                     logger.info(
-                        "Expanded single-word JUDGE/DEPT surname",
+                        "Enrichment resolved judge via alias",
                         extra={
                             "document_id": document_id,
-                            "department": department,
-                            "original_surname": judge_name,
-                            "expanded_judge_name": expanded,
+                            "original_judge_name": _original_judge_name,
+                            "canonical_name": judge_name,
+                            "confidence": enrich_result.judge_resolution.confidence,
                         },
                     )
-                    judge_name = expanded
-                    extraction_methods["judge_name"] = "single_word_surname_expansion"
 
-            # 3. Resolve judge name to canonical judge record
-            judge_id: str | None = None
-            if judge_name:
-                judge_id = resolve_judge(
-                    conn,
-                    judge_name,
-                    court_id,
-                    source=scraper_id or "scraper",
+            # Log directory mismatches as warnings (do NOT override judge).
+            if (
+                enrich_result.judge_resolution is not None
+                and enrich_result.judge_resolution.directory_mismatch
+            ):
+                logger.warning(
+                    "Enrichment: judge/directory mismatch — flagged for review",
+                    extra={
+                        "document_id": document_id,
+                        "extracted_judge": _original_judge_name,
+                        "directory_judge": enrich_result.judge_resolution.directory_judge,
+                        "department": department,
+                    },
                 )
+
+            # Log enrichment flags for human review.
+            if enrich_result.flags:
+                logger.info(
+                    "Enrichment flags for human review",
+                    extra={
+                        "document_id": document_id,
+                        "flags": enrich_result.flags,
+                    },
+                )
+
+        # 2. Ensure case exists — use document_id as synthetic case_number if absent
+        effective_case_number = case_number or f"UNKNOWN-{document_id}"
+        if effective_case_number.startswith("UNKNOWN-"):
+            logger.warning(
+                "No case_number extractable for document — using synthetic UNKNOWN identifier",
+                extra={"document_id": document_id},
+            )
+        # 2b. Cross-case title lookup via upsert (#2006).
+        # Use upsert_case_returning_title to get the effective title after
+        # COALESCE — if the DB already has a title from a prior ruling and
+        # this ingestion has no title, the existing title is preserved and
+        # returned.  This prevents future null-title warnings for cases
+        # that have already been titled.
+        #
+        # A synthetic ``UNKNOWN-<document_id>`` case belongs to this one
+        # document, so its incoming title wins (#4715).  A split child's
+        # id is positional: when a re-split moves a different ruling into
+        # the slot (a fused row's text given to its own case), the
+        # preserve-first upsert kept the previous ruling's caption on it.
+        synthetic_case = effective_case_number == f"UNKNOWN-{document_id}"
+        case_id, effective_title = upsert_case_returning_title(
+            conn,
+            effective_case_number,
+            court_id,
+            case_title=case_title,
+            case_type=case_type,
+            force_update=synthetic_case,
+        )
+        if not case_title and effective_title:
+            case_title = effective_title
+            extraction_methods.setdefault("case_title", "db_lookup")
+            logger.info(
+                "Populated case_title from existing DB record",
+                extra={
+                    "document_id": document_id,
+                    "case_number": effective_case_number,
+                    "case_title": effective_title,
+                },
+            )
+
+        # 2c. LA County single-word JUDGE/DEPT surname expansion (#4297).
+        #
+        # LA tentative-ruling HTML uses a ``JUDGE/DEPT: <Surname>/<dept>``
+        # form-layout header that genuinely carries only the surname.
+        # ``resolve_judge`` rejects single-word names via
+        # ``_looks_like_valid_judge_name`` (defensive guard against
+        # truncated/garbage entries), so without expansion the ruling
+        # stores ``judge_id = NULL``.  Expand via the directory snapshot
+        # / ``judges`` surname-suffix lookup chain before resolving.
+        if (
+            judge_name
+            and not _looks_like_valid_judge_name(judge_name)
+            and len(judge_name.strip().split()) == 1
+            and department
+            and state == "CA"
+            and county == "Los Angeles"
+        ):
+            expanded = _expand_single_word_judge_surname(
+                conn,
+                court_id,
+                judge_name,
+                department,
+                hearing_date=hearing_dt,
+            )
+            if expanded:
+                logger.info(
+                    "Expanded single-word JUDGE/DEPT surname",
+                    extra={
+                        "document_id": document_id,
+                        "department": department,
+                        "original_surname": judge_name,
+                        "expanded_judge_name": expanded,
+                    },
+                )
+                judge_name = expanded
+                extraction_methods["judge_name"] = "single_word_surname_expansion"
+
+        # 3. Resolve judge name to canonical judge record
+        judge_id: str | None = None
+        if judge_name:
+            judge_id = resolve_judge(
+                conn,
+                judge_name,
+                court_id,
+                source=scraper_id or "scraper",
+            )
+
+        w.case_number = case_number
+        w.case_title = case_title
+        w.judge_name = judge_name
+        w.effective_case_number = effective_case_number
+        return court_id, case_id, judge_id
+
+    def _write_one_ruling(self, w: _RulingWrite) -> None:
+        """Write one ruling document (a non-split document, or a scraper
+        pre-split child that arrives as its own event) and index it."""
+        conn = self._get_connection()
+        try:
+            court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
 
             # 4. Insert document + ruling via shared helper (#1790).
             # The helper guarantees the same document_id is passed to both
             # insert_document and insert_ruling, preventing FK divergence (#1775).
             insert_document_and_ruling(
                 conn,
-                document_id=document_id,
+                document_id=w.document_id,
                 case_id=case_id,
                 court_id=court_id,
-                content_format=content_format,
-                content_hash=content_hash,
-                s3_key=s3_key,
-                s3_bucket=s3_bucket,
-                source_url=source_url,
-                scraper_id=scraper_id,
-                captured_at=capture_ts or datetime.now(UTC),
-                hearing_date=hearing_dt,
-                ruling_text=cleaned_ruling_text,
-                ruling_text_html=ruling_text_html,
-                department=department,
+                content_format=w.content_format,
+                content_hash=w.content_hash,
+                s3_key=w.s3_key,
+                s3_bucket=w.s3_bucket,
+                source_url=w.source_url,
+                scraper_id=w.scraper_id,
+                captured_at=w.captured_at,
+                hearing_date=w.hearing_dt,
+                ruling_text=w.ruling_text,
+                ruling_text_html=w.ruling_text_html,
+                department=w.department,
                 judge_id=judge_id,
-                outcome=outcome,
-                motion_type=motion_type,
-                summary=summary,
-                summary_model=summary_model,
-                summary_generated_at=summary_generated_at,
+                outcome=w.outcome,
+                motion_type=w.motion_type,
+                summary=w.summary,
+                summary_model=w.summary_model,
+                summary_generated_at=w.summary_generated_at,
                 # A split child's id names a slot in the split, not a case:
                 # when a reingest/rebuild replaces the split set, the
                 # re-derived case wins (#4700).  Live writes and retries,
                 # non-split documents, and placeholder cases stay
                 # preserve-first, so a re-process that misses the case
                 # number cannot delete a correct ruling (#4788).
-                relink_case=_should_relink_split_case(event_data, effective_case_number),
-                hearing_date_source=hearing_date_source,
-                # A shifted split set moves its rulings between slots
-                # instead of superseding them (#4820).
-                split_set=split_set_for_event(event_data),
+                relink_case=_should_relink_split_case(w.event_data, w.effective_case_number),
+                hearing_date_source=w.hearing_date_source,
+                # A pre-split child whose split shifted takes its ruling
+                # from the sibling slot that holds it (#4820).
+                split_set=split_set_for_event(w.event_data),
             )
-
-            # 5. Link case to judge
-            if judge_id is not None:
-                upsert_case_judge(conn, case_id, judge_id, hearing_dt)
-
-            # 6. Create party records and link to case (batched — O(1) queries)
-            batch_upsert_parties(conn, case_id, parties_data)
-
-            # 7. Log validation result (if validation was run).
-            if validation_result is not None:
-                insert_validation_result(
-                    conn,
-                    document_id=document_id,
-                    ruling_id=None,
-                    result=validation_result,
-                    county=county,
-                    scraper_id=scraper_id,
-                    s3_key=s3_key,
-                    hearing_date_source=hearing_date_source,
-                )
-
+            self._link_ruling_rows(conn, w, case_id, judge_id)
             conn.commit()
         except Exception:
             conn.rollback()
-            timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
             raise
-        timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
-        self._index_committed_ruling(conn, document_id)
+        self._index_committed_ruling(conn, w.document_id)
+
+    def _link_ruling_rows(
+        self, conn: psycopg.Connection, w: _RulingWrite, case_id: str, judge_id: str | None
+    ) -> None:
+        """Steps 5-7 of a ruling write: judge link, parties, validation row."""
+        # 5. Link case to judge
+        if judge_id is not None:
+            upsert_case_judge(conn, case_id, judge_id, w.hearing_dt)
+
+        # 6. Create party records and link to case (batched — O(1) queries)
+        batch_upsert_parties(conn, case_id, w.parties_data)
+
+        # 7. Log validation result (if validation was run).
+        if w.validation_result is not None:
+            insert_validation_result(
+                conn,
+                document_id=w.document_id,
+                ruling_id=None,
+                result=w.validation_result,
+                county=w.county,
+                scraper_id=w.scraper_id,
+                s3_key=w.s3_key,
+                hearing_date_source=w.hearing_date_source,
+            )
+
+    def _write_split_batch(
+        self, event_data: dict[str, Any], parent_document_id: str, batch: _SplitBatch
+    ) -> None:
+        """Write a worker split's children and remove the key's rows the
+        split no longer produces, in one transaction (#4845).
+
+        Readers see the key's previous split set until the commit and the new
+        one after it, never a mix, so no ruling is missing in between.
+        ``db.write_split_rulings`` matches the key's existing ruling rows to
+        the children by content, so a ruling keeps its row and its alerts
+        however the split set shifts; rows no child claims are removed, and
+        so are the document rows the split no longer writes (children
+        rejected by validation included).  Children whose extraction failed
+        this pass (``batch.keep_ids``) are left as they were.  Then every
+        child is indexed from its committed row and the removed rows are
+        dropped from search.
+        """
+        s3_key = event_data.get("s3_key")
+        content_hash = event_data.get("content_hash")
+        from .split_ids import derive_parent_document_id
+
+        # The content parent owns every row on its S3 key (#4796).
+        owns_key = bool(content_hash) and parent_document_id == derive_parent_document_id(
+            content_hash
+        )
+        written = [w.document_id for w in batch.children]
+        removed: list[str] = []
+        conn = self._get_connection()
+        try:
+            prepared: list[tuple[_RulingWrite, str, str, str | None]] = []
+            for w in batch.children:
+                court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
+                insert_document(
+                    conn,
+                    document_id=w.document_id,
+                    case_id=case_id,
+                    court_id=court_id,
+                    content_format=w.content_format,
+                    content_hash=w.content_hash,
+                    s3_key=w.s3_key,
+                    s3_bucket=w.s3_bucket,
+                    source_url=w.source_url,
+                    scraper_id=w.scraper_id,
+                    captured_at=w.captured_at,
+                    hearing_date=w.hearing_dt,
+                )
+                prepared.append((w, court_id, case_id, judge_id))
+
+            final_cases = write_split_rulings(
+                conn,
+                s3_key=s3_key,
+                parent_document_id=parent_document_id,
+                owns_key=owns_key,
+                children=[
+                    SplitChildRuling(
+                        document_id=w.document_id,
+                        case_id=case_id,
+                        court_id=court_id,
+                        hearing_date=w.hearing_dt,
+                        ruling_text=w.ruling_text,
+                        ruling_text_html=w.ruling_text_html,
+                        department=w.department,
+                        judge_id=judge_id,
+                        outcome=w.outcome,
+                        motion_type=w.motion_type,
+                        summary=w.summary,
+                        summary_model=w.summary_model,
+                        summary_generated_at=w.summary_generated_at,
+                        hearing_date_source=w.hearing_date_source,
+                    )
+                    for w, court_id, case_id, judge_id in prepared
+                ],
+                # A split-set replacement (reingest / rebuild) re-derives the
+                # case of a reused slot; a live write keeps an established
+                # link (#4700, #4788).
+                relink=event_data.get(REPLACE_SPLIT_SET_KEY) is True,
+                protected_ids=frozenset(batch.keep_ids),
+            )
+            for w, _court_id, case_id, judge_id in prepared:
+                self._link_ruling_rows(conn, w, final_cases.get(w.document_id) or case_id, judge_id)
+
+            if s3_key:
+                delete_stale_split_children(
+                    conn,
+                    s3_key,
+                    written + sorted(batch.keep_ids),
+                    parent_document_id=parent_document_id,
+                    deleted_ids=removed,
+                    owns_key=owns_key,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        if removed and not written and not batch.keep_ids:
+            # Every child of this split was rejected (validation, all-NULL
+            # guard): the key now holds no rulings.  Worth a look when it
+            # happens to a key that had some.
+            logger.warning(
+                "Split set replaced by an empty one: every child was rejected",
+                extra={"document_id": parent_document_id, "s3_key": s3_key, "stale_ids": removed},
+            )
+        elif removed:
+            logger.info(
+                "Replaced the split set: removed %d row(s) the new split no longer writes",
+                len(removed),
+                extra={
+                    "document_id": parent_document_id,
+                    "s3_key": s3_key,
+                    "new_split_count": len(written),
+                    "stale_ids": removed,
+                },
+            )
+        for document_id in written:
+            self._index_committed_ruling(conn, document_id)
+        if removed:
+            self._indexer.delete_documents(removed)
 
     def _index_committed_ruling(self, conn: psycopg.Connection, document_id: str) -> None:
         """Index the ruling *document_id* exactly as Postgres committed it.
@@ -4034,66 +4305,6 @@ class IngestionWorker:
     # LLM extraction path (#1473, #1475)
     # ------------------------------------------------------------------
 
-    def _cleanup_stale_split_children(
-        self,
-        event_data: dict[str, Any],
-        document_id: str,
-        valid_ids: list[str],
-    ) -> None:
-        """Remove this S3 key's split-child rows that the new split no longer
-        writes, and drop them from the search index (#2295, #4700).
-
-        Best-effort: a failure is logged and processing continues, since the
-        new children are still written correctly.
-        """
-        s3_key = event_data.get("s3_key")
-        if not s3_key:
-            return
-        from .split_ids import derive_parent_document_id
-
-        # The content parent owns every row on its S3 key (#4796).
-        content_hash = event_data.get("content_hash")
-        owns_key = bool(content_hash) and document_id == derive_parent_document_id(content_hash)
-        removed: list[str] = []
-        try:
-            conn = self._get_connection()
-            deleted = delete_stale_split_children(
-                conn,
-                s3_key,
-                valid_ids,
-                parent_document_id=document_id,
-                deleted_ids=removed,
-                owns_key=owns_key,
-            )
-            if deleted:
-                conn.commit()
-                logger.info(
-                    "Cleaned up %d stale split-child document(s)",
-                    deleted,
-                    extra={
-                        "document_id": document_id,
-                        "s3_key": s3_key,
-                        "new_split_count": len(valid_ids),
-                        "stale_ids": removed,
-                    },
-                )
-        except Exception as exc:
-            logger.warning(
-                "Failed to clean up stale split children — continuing",
-                extra={
-                    "document_id": document_id,
-                    "s3_key": s3_key,
-                    "error": str(exc),
-                },
-            )
-            try:
-                self._get_connection().rollback()
-            except Exception:  # noqa: BLE001
-                pass
-            return
-        if removed:
-            self._indexer.delete_documents(removed)
-
     def _llm_split_document(
         self,
         event_data: dict[str, Any],
@@ -4104,31 +4315,35 @@ class IngestionWorker:
         *,
         raw_pdf_bytes: bytes | None = None,
     ) -> bool:
-        """Split *document_id* and write its children (``_split_document``),
-        then remove the key's split-child rows the new split no longer
-        writes (#4700).
+        """Split *document_id* (``_split_document``), then write its children
+        and replace the key's previous split set in one transaction
+        (``_write_split_batch``, #4845).
 
-        The cleanup runs after the children are written, not before
-        (#4820): when the split set shifts, a stale slot can hold a ruling
-        the new split writes at another slot, and the child write moves it
-        there (``db._move_split_sibling_ruling``).  Deleting the stale slot
-        first deleted that ruling, and its alerts' link, until the child
-        re-created it.
+        Each child is extracted, enriched and validated by its own
+        ``process_event`` call as before, but its database write is
+        deferred until the whole split is known.  Writing child by child
+        let readers see a half-replaced split, and a shifted split set
+        dedup-superseded and deleted rulings between the child commits
+        (#4820, #4836).
         """
-        stale_cleanups: list[list[str]] = []
+        batch = _SplitBatch(parent_document_id=document_id)
+        outer = self._split_batch
+        self._split_batch = batch
         try:
-            return self._split_document(
+            split = self._split_document(
                 event_data,
                 document_id,
                 ruling_text,
                 state,
                 county,
                 raw_pdf_bytes=raw_pdf_bytes,
-                stale_cleanups=stale_cleanups,
+                batch=batch,
             )
         finally:
-            for valid_ids in stale_cleanups:
-                self._cleanup_stale_split_children(event_data, document_id, valid_ids)
+            self._split_batch = outer
+        if split and batch.replace:
+            self._write_split_batch(event_data, document_id, batch)
+        return split
 
     def _split_document(
         self,
@@ -4139,7 +4354,7 @@ class IngestionWorker:
         county: str,
         *,
         raw_pdf_bytes: bytes | None = None,
-        stale_cleanups: list[list[str]],
+        batch: _SplitBatch,
     ) -> bool:
         """Use the framework LlmExtractor to split and extract a document.
 
@@ -4186,16 +4401,12 @@ class IngestionWorker:
             return False
 
         # Every deterministic splitter below dispatches its children through
-        # ``dispatch_child``.  The first child schedules the removal of the
-        # split-child rows of this S3 key that the new split no longer
-        # produces (#4700), run by ``_llm_split_document`` once the children
-        # are written (#4820).  Doing it here covers every splitter, current
-        # and future; previously only the framework-LLM path below cleaned
-        # up, so an LLM split -> deterministic split change left surplus
-        # children.
+        # ``dispatch_child``.  A dispatched child means the split replaces
+        # the key's split set (#4700): ``_llm_split_document`` writes the
+        # children and removes the rows the new split no longer produces.
+        # Doing it here covers every splitter, current and future.
         def dispatch_child(split_event: dict[str, Any]) -> None:
-            if not stale_cleanups:
-                stale_cleanups.append(split_child_ids_for_event(split_event, document_id))
+            batch.replace = True
             self.process_event(split_event)
 
         # ------------------------------------------------------------------
@@ -4674,29 +4885,15 @@ class IngestionWorker:
                     exc_info=True,
                 )
 
-        # Clean up stale split-child documents from a previous processing run
-        # that produced more rulings than this run (#2295).  The new split IDs
-        # will be upserted cleanly; any old IDs beyond the new count are
-        # orphans.  ``_llm_split_document`` runs it after the split events
-        # are written, so a ruling on a stale slot can move to its new slot
-        # first (#4820).
-        #
-        # This also handles the case where a previous multi-ruling run is
-        # re-processed as a single ruling: the single ruling keeps the parent
-        # id, so every ``make_split_document_id(parent, i)`` row is stale.
+        # The split replaces the key's split set (#4700, #4845):
+        # ``_llm_split_document`` writes the children in one transaction and
+        # removes the key's rows this split does not write.  That includes a
+        # previous multi-ruling run re-processed as a single ruling (the
+        # single ruling keeps the parent id) and the slots of textless
+        # multimodal rows, which are skipped below and never written (#4714).
         # Only this parent's own rows are eligible; other v5 rows on the same
         # key (scraper pre-split siblings) are kept (#4788).
-        #
-        # Textless multimodal rows are skipped by the dispatch loop below
-        # (#4714) and never written, so a row left at their slot by an
-        # earlier run is stale too (#4700).
-        stale_cleanups.append(
-            [
-                cr.document_id
-                for cr in converted
-                if not (extraction_method == "multimodal" and not (cr.ruling_text or "").strip())
-            ]
-        )
+        batch.replace = True
 
         # ------------------------------------------------------------------
         # Document-level deterministic validation: duplicate ruling text
@@ -4897,6 +5094,9 @@ class IngestionWorker:
 
                 if not isinstance(_exc, LlmEnrichmentExhaustedError):
                     raise
+                # A transient failure: keep whatever this slot holds rather
+                # than remove it with the split set's stale rows.
+                batch.keep_ids.add(cr.document_id)
                 logger.critical(
                     "per-child enrichment exhausted on LLM split — ruling permanently lost",
                     extra={
