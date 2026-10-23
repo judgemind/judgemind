@@ -85,7 +85,7 @@ Pass `--bust-llm-cache` to `scripts/reingest_from_s3.py` (#2424) when any of the
 Example invocation:
 
 ```
-scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --county orange --bust-llm-cache
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --county Orange --bust-llm-cache
 scripts/ecs-wait-task.sh     # re-run while it exits 124 (#4835)
 ```
 

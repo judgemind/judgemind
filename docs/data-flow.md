@@ -119,9 +119,9 @@ The Next.js app (`packages/web/`) is a GraphQL client. It server-renders pages f
 
 ## Reingestion
 
-Historical documents can be reprocessed through the full three-tier extraction pipeline using `scripts/reingest_from_s3.py`. This reads archived documents from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. Used after extraction logic improvements or to backfill fields for documents ingested before LLM extraction was available.
+Historical documents can be reprocessed through the full three-tier extraction pipeline using `scripts/reingest_from_s3.py`. It reads archived objects from S3, builds an ingestion event for each, and runs it through `IngestionWorker.process_event`, the one write path live capture and `rebuild_db.py` also use (#4845). Used after extraction logic improvements or to backfill fields for documents ingested before LLM extraction was available.
 
-**Important:** `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead, which discovers documents directly from S3 keys without requiring pre-existing database records.
+**Important:** by default (DB-row mode) `reingest_from_s3.py` selects the S3 keys of **existing database records only** — it queries the `documents` table for them. If you run it for a county with no records in the `documents` table, it re-ingests 0 keys. `--prefix` lists the objects in S3 instead. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead, which discovers documents directly from S3 keys without requiring pre-existing database records.
 
 ---
 

@@ -163,7 +163,6 @@ if [[ $violations -gt 0 ]]; then
     echo "     logger = logging.getLogger(__name__)"
     echo ""
     echo "  Reference implementations:"
-    echo "    - scripts/drain_splitter_carry_forward_clusters.py (post-#4368)"
     echo "    - scripts/audit_correctly_labeled_s3_orphans.py (post-#4373)"
     echo ""
     echo "  If your script genuinely cannot use configure_structlog (e.g.,"
