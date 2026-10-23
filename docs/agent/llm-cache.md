@@ -20,7 +20,7 @@ llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_hash}.json
 
 Local development reads are served from `S3_CACHE_DIR` via `CachedS3Client` (fast disk reads). On ECS, reads and writes go directly to S3. The cache is shared across environments.
 
-**Retention: entries are kept indefinitely (#4831).** The archive bucket has no expiration rule on `llm-cache/`. Until #4831 a 90-day `llm-cache-ttl` rule expired entries. An expired entry made the next reingest or rebuild call the LLM again, and the new run could split a PDF differently and shift positional split-child ids. Any `get_object` failure is a cache miss, so do not add a TTL or a noncurrent-version expiration on this prefix. The bucket is versioned, so an entry overwritten by `--bust-llm-cache` keeps its old version as a noncurrent version.
+**Retention: entries are kept indefinitely (#4831).** The archive bucket has no expiration rule on `llm-cache/`. Until #4831 a 90-day `llm-cache-ttl` rule expired entries. An expired entry made the next reingest or rebuild call the LLM again, and the new run could split a PDF differently and shift positional split-child ids. Any `get_object` failure is a cache miss, so do not add a TTL or a noncurrent-version expiration on this prefix. The bucket is versioned, so an entry overwritten by `--bust-llm-cache` keeps its old version as a noncurrent version. On 2026-10-23, after the rule was removed, `scripts/restore_llm_cache_delete_markers_4831.py` removed the 31,467 delete markers the rule had left on dev, which made the original entries current again. It skipped 14 entries whose versions had already moved to GLACIER.
 
 ### Per-page entries (multimodal PDF path, #4716)
 
