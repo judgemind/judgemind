@@ -1345,6 +1345,26 @@ class TestNonExhaustionExceptionsReraise:
             assert child["ruling_text"] == fake_rulings[idx].ruling_text
 
 
+def test_sc_split_child_without_case_number_does_not_inherit_doc_case_number() -> None:
+    """#4726: a live SC event carries the PDF's FIRST case number (the
+    scraper's ``parse_all_case_numbers(text)[0]``).  A split child with no
+    case number of its own must stay without one — inheriting the doc-level
+    number would file another case's ruling under it.  Same for the title."""
+    from courts.ca.sc_tentatives import SplitRuling
+    from ingestion.worker import _try_sc_pdf_split
+
+    rulings = [
+        SplitRuling(1, "25CV111111", "first ruling", "Foo v. Bar"),
+        SplitRuling(2, None, "second ruling, case number not printed", None),
+    ]
+    event = _make_sc_event(case_number="25CV111111", case_title="Foo v. Bar")
+    captured: list[dict] = []
+    with patch("courts.ca.sc_tentatives._split_rulings", return_value=rulings):
+        assert _try_sc_pdf_split(event, event["document_id"], event["ruling_text"], captured.append)
+    assert [c["case_number"] for c in captured] == ["25CV111111", None]
+    assert [c["case_title"] for c in captured] == ["Foo v. Bar", None]
+
+
 class TestScPdfSplitDept12:
     """#4681: a real Dept 12 PDF is split deterministically — one child per
     case with a real case number — instead of falling through to the LLM

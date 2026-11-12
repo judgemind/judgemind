@@ -2335,7 +2335,7 @@ class TestSantaClaraDept12Helpers:
         monkeypatch.setattr(
             sc,
             "_dept12_table_entries",
-            lambda _b: {
+            lambda _b, headerless=False: {
                 "24CV000001": SplitRuling(0, "24CV000001", "GRANTED", "A v. B"),
                 "24CV000002": SplitRuling(0, "24CV000002", "", "C v. D"),
                 "24CV000003": SplitRuling(0, "24CV000003", "DENIED", "E v. F"),
@@ -2355,7 +2355,7 @@ class TestSantaClaraDept12Helpers:
         monkeypatch.setattr(
             sc,
             "_dept12_table_entries",
-            lambda _b: {"24CV000001": SplitRuling(0, "24CV000001", "", "A v. B")},
+            lambda _b, headerless=False: {"24CV000001": SplitRuling(0, "24CV000001", "", "A v. B")},
         )
         text = (
             "LINE # CASE # CASE TITLE RULING\n"
@@ -2695,3 +2695,315 @@ def test_format_a_case_no_header_with_consolidated_note() -> None:
         f"{body}\nLine 2\nCase Name: C v. D\nCase No.: 24CV000002\n{body}\n"
     )
     assert [r.case_number for r in _split_rulings(text)] == ["21CV384705", "24CV000002"]
+
+
+# ---------------------------------------------------------------------------
+# #4726: case numbers outside the headed table layout
+# ---------------------------------------------------------------------------
+#
+# Fixtures (trimmed real dev-S3 raws, public court records):
+#   sc_format_a_4726_dept16_old_style.txt — Dept 16, Aug 7 2026 (raw 3507b998…),
+#       Lines 6-8 bodies cut to 10 lines; Line 7 is ``Case No.: 2008-1-CV-131533``.
+#   sc_format_a_4726_dept16_ranges.txt    — Dept 16, Jul 31 2026 (raw ed4bfb50…):
+#       ``Line 1-2`` / ``Line 5 & 6`` bodies and ``Case No. 22CV408177`` (no colon).
+#   sc_headerless_4726_dept1.pdf          — Dept 1, pages 1-3 and 9-11 of raw
+#       d06893ce…: the table without its ``LINE # | CASE #`` header row.  Line 2's
+#       body prints ``Case No. 24CV44065`` (a digit short); the table has 24CV440065.
+#   sc_headerless_4726_dept1_old_style.pdf — Dept 1, pages 2-4 of raw 31485b38…:
+#       a CASE # cell ``2010-1-CV-\n171215``.
+#   sc_format_b_4726_dept6.pdf            — Dept 6, pages 1-4 and 8 of raw c70aceec…:
+#       the format-B table continues on page 3 without a header; row 1's CASE NO.
+#       is ``25CV46061`` (a digit short) and row 24's is ``24CV44820``.
+
+
+def _fixture_split(name: str) -> list[SplitRuling]:
+    path = FIXTURES / name
+    if path.suffix == ".pdf":
+        pdf_bytes = path.read_bytes()
+        return _split_rulings(extract_pdf_text(pdf_bytes), pdf_bytes=pdf_bytes)
+    return _split_rulings(path.read_text())
+
+
+class TestSantaClaraOldStyleCaseNumber4726:
+    def test_old_style_case_number_dept16_format_a(self) -> None:
+        """Dept 16 Line 7 prints ``Case No.: 2008-1-CV-131533``; before #4726
+        the entry had no case number (an ``UNKNOWN-`` drop downstream)."""
+        rulings = _fixture_split("sc_format_a_4726_dept16_old_style.txt")
+        assert [(r.ruling_index, r.case_number) for r in rulings] == [
+            (6, "24CV444941"),
+            (7, "2008-1-CV-131533"),
+            (8, "18CV329214"),
+        ]
+        assert rulings[1].case_title == "First Resolution Investment Corp. v. Richard J. Torres"
+
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            ("Case No.: 2008-1-CV-131533", "2008-1-CV-131533"),
+            ("Case No.: 2000-7-CV-401591", "2000-7-CV-401591"),
+            ("Case No. 2014-1-PR-174505", "2014-1-PR-174505"),
+            ("Case No. 2007-1-CV- 079117", "2007-1-CV-079117"),
+            ("Case No. 22CV408177", "22CV408177"),
+            ("Case No. 24 CV451675", "24CV451675"),
+            ("Case No.: 26-CV-484120", "26CV484120"),
+        ],
+    )
+    def test_old_style_case_number_head_line_formats(self, line: str, expected: str) -> None:
+        body = "y" * 120
+        text = f"Line 1\nCase Name: A v. B\n{line}\n{body}\nLine 2\nCase No.: 24CV000002\n{body}\n"
+        assert [r.case_number for r in _split_rulings(text)] == [expected, "24CV000002"]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "Case No.: 24CV44932",  # a digit short — a court typo
+            "Case No.: 2008-1-CV-13153",
+            "Case No.: 1-08-CV-131533",
+            "Case No. PB267041",
+        ],
+    )
+    def test_old_style_case_number_never_guessed(self, line: str) -> None:
+        body = "y" * 120
+        text = f"Line 1\n{line}\n{body}\nLine 2\nCase No.: 24CV000002\n{body}\n"
+        assert [r.case_number for r in _split_rulings(text)] == [None, "24CV000002"]
+
+    def test_old_style_case_number_only_from_entry_head(self) -> None:
+        """A colon-less ``Case No.`` deep in the ruling body cites another
+        case; it is not the entry's own number."""
+        body = "y" * 120
+        text = (
+            f"Line 1\nCase Name: A v. B\n{body}\na\nb\nc\nd\nCase No. 23CV000009\n"
+            f"Line 2\nCase No.: 24CV000002\n{body}\n"
+        )
+        assert [r.case_number for r in _split_rulings(text)] == [None, "24CV000002"]
+
+
+class TestSantaClaraFormatARanges4726:
+    def test_format_a_line_range_headings_are_boundaries(self) -> None:
+        """``Line 1-2`` and ``Line 5 & 6`` start their own entries; before,
+        their bodies were glued onto the entry above (so Line 1 carried GN's
+        ruling and Line 4 carried Kwong's)."""
+        rulings = _fixture_split("sc_format_a_4726_dept16_ranges.txt")
+        assert [r.case_number for r in rulings] == [
+            "25CV469792",
+            "25CV473552",
+            "24CV453655",
+            "23CV417160",
+            "24CV445397",
+            "22CV394951",
+            "22CV408177",
+        ]
+        assert "Milpitas" not in rulings[0].ruling_text
+        assert "Kwong" not in rulings[3].ruling_text
+
+    def test_format_a_choice_uses_bare_line_boundaries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A format-B PDF with one bare ``Line 3`` and one ``Line 6-8`` body
+        stays on format B: the range heading alone must not flip it to format A."""
+        import courts.ca.sc_tentatives as sc
+
+        rows = [SplitRuling(i, f"24CV00000{i}", "x") for i in range(1, 7)]
+        monkeypatch.setattr(sc, "_split_rulings_format_b", lambda t, b: rows)
+        body = "y" * 120
+        text = f"LINE CASE NO. CASE TITLE TENTATIVE RULING\nLine 3\n{body}\nLine 6-8\n{body}\n"
+        assert sc._split_rulings(text, pdf_bytes=b"%PDF") == rows
+
+
+class TestSantaClaraHeaderlessTable4726:
+    def test_headerless_table_dept1_one_entry_per_case(self) -> None:
+        rulings = _fixture_split("sc_headerless_4726_dept1.pdf")
+        assert [r.case_number for r in rulings] == [
+            "23CV414045",
+            "24CV440065",
+            "24CV451853",
+            "25CV457823",
+            "25CV468852",
+            "25CV478112",
+            "26CV493370",
+        ]
+        assert [r.ruling_index for r in rulings] == list(range(1, 8))
+        for r in rulings:
+            assert r.case_title and r.ruling_text, r.case_number
+
+    def test_headerless_table_body_typo_attaches_by_cross_reference(self) -> None:
+        """Line 2's body prints ``Case No. 24CV44065`` (a digit short): the
+        table's 24CV440065 is kept and the body attaches through ``Scroll
+        down to Line 2``."""
+        by_cn = {r.case_number: r for r in _fixture_split("sc_headerless_4726_dept1.pdf")}
+        assert "24CV44065" not in by_cn
+        assert "Calendar Line # 2" in by_cn["24CV440065"].ruling_text
+        assert "Calendar Lines # 1 & 7" in by_cn["23CV414045"].ruling_text
+
+    def test_headerless_table_old_style_case_number_cell(self) -> None:
+        rulings = _fixture_split("sc_headerless_4726_dept1_old_style.pdf")
+        assert rulings[0].case_number == "2010-1-CV-171215"
+        assert rulings[0].case_title == "Citibank (South Dakota), N.A. vs T. Schaffer"
+        assert "Case No. 2010-1-CV-171215" in rulings[0].ruling_text
+        assert len(rulings) == 10
+        assert all(r.case_number for r in rulings)
+
+    def test_headerless_table_requires_pdf_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without a pdfplumber calendar table the flattened ``LINE`` rows
+        alone are not trusted: no deterministic split."""
+        import courts.ca.sc_tentatives as sc
+
+        monkeypatch.setattr(sc, "_dept12_table_entries", lambda b, headerless=False: {})
+        text = "LINE 1 24CV429115 Kristin Hoffman vs Motion\nLINE 2 24CV449353 Edgar v Ford\n"
+        assert sc._split_rulings(text, pdf_bytes=b"%PDF") == []
+
+    @pytest.mark.parametrize(
+        ("heading", "first"),
+        [("Calendar Lines # 1", 1), ("Calendar Lines # 3-4", 3), ("Calendar Lines # 1 & 7", 1)],
+    )
+    def test_headerless_table_body_heading_with_hash(self, heading: str, first: int) -> None:
+        from courts.ca.sc_tentatives import _dept12_body_sections
+
+        text = f"{heading}\nCase Name Foo vs Bar\nCase No. 24CV000001\n" + "x" * 100 + "\n"
+        sections = _dept12_body_sections(text)
+        assert [(s.first_line, s.case_number) for s in sections] == [(first, "24CV000001")]
+
+    def test_table_body_empty_case_name_is_not_title(self) -> None:
+        """``Case Name:`` with nothing after it must not take the next line
+        (``Case No.:``) as the title."""
+        from courts.ca.sc_tentatives import _dept12_body_sections
+
+        text = "Calendar Line 7\nCase Name:\nCase No.:\n" + "x" * 100 + "\n"
+        assert _dept12_body_sections(text)[0].case_title is None
+
+    def test_table_malformed_case_number_row_is_not_a_continuation(self) -> None:
+        from courts.ca.sc_tentatives import _is_malformed_cn_row
+
+        assert _is_malformed_cn_row(["LINE 8", "25CV47984", "Pedram Bigdeli", "Hearing"])
+        assert not _is_malformed_cn_row(["LINE 8", "25CV479845", "Pedram Bigdeli", "Hearing"])
+        assert not _is_malformed_cn_row(["", None, None, "continuation text"])
+
+
+class TestSantaClaraFormatB4726:
+    def test_format_b_dept6_continuation_page_and_typo_rows(self) -> None:
+        """Format A found only ``Line 1`` and ``LINE 27`` (no case number);
+        the format-B table names every case, across two pages."""
+        rulings = _fixture_split("sc_format_b_4726_dept6.pdf")
+        cns = [r.case_number for r in rulings]
+        assert all(cns)
+        # Row 1's cell is ``25CV46061``; its ``See Line Item 1`` body prints
+        # ``Case No.: 25CV460651``, which names the case.
+        assert cns[0] == "25CV460651"
+        # Page 3, which repeats no header row.
+        assert {"24CV443183", "25CV467732", "25CV435775", "24CV435775"} <= set(cns)
+        # Row 24's ``24CV44820`` names no case: dropped, not glued onto row 22-23.
+        huynh = next(r for r in rulings if r.case_number == "24CV443183")
+        assert "Skelley" not in (huynh.case_title or "")
+        assert "Request for Admissions admitted" not in huynh.ruling_text
+        assert [r.ruling_index for r in rulings] == list(range(1, len(rulings) + 1))
+
+    def test_format_b_row_case_number_classification(self) -> None:
+        from courts.ca.sc_tentatives import _row_case_number
+
+        assert _row_case_number("24CV 443183") == ("24CV443183", True)
+        assert _row_case_number("24cv435775") == ("24CV435775", True)
+        assert _row_case_number("2010-1-CV- 171215") == ("2010-1-CV-171215", True)
+        assert _row_case_number("25CV46061") == (None, True)
+        assert _row_case_number("25CV4692022") == (None, True)
+        assert _row_case_number("") == (None, False)
+        assert _row_case_number("General Motors, LLC") == (None, False)
+
+    def test_format_b_used_when_format_a_entries_lack_case_numbers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import courts.ca.sc_tentatives as sc
+
+        rows = [SplitRuling(1, "24CV000001", "a"), SplitRuling(2, "24CV000002", "b")]
+        monkeypatch.setattr(sc, "_split_rulings_format_b", lambda t, b: rows)
+        body = "y" * 120
+        text = (
+            "LINE CASE NO. CASE TITLE TENTATIVE RULING\n"
+            f"Line 1\nCase No.: 24CV000001\n{body}\nLine 2\n{body}\n"
+        )
+        assert sc._split_rulings(text, pdf_bytes=b"%PDF") == rows
+
+    def test_format_b_not_used_when_it_misses_a_format_a_case(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No existing case number may disappear: format A stays when the
+        table lacks one of its cases."""
+        import courts.ca.sc_tentatives as sc
+
+        rows = [SplitRuling(1, "24CV000003", "a"), SplitRuling(2, "24CV000002", "b")]
+        monkeypatch.setattr(sc, "_split_rulings_format_b", lambda t, b: rows)
+        body = "y" * 120
+        text = (
+            "LINE CASE NO. CASE TITLE TENTATIVE RULING\n"
+            f"Line 1\nCase No.: 24CV000001\n{body}\nLine 2\n{body}\n"
+        )
+        assert [r.case_number for r in sc._split_rulings(text, pdf_bytes=b"%PDF")] == [
+            "24CV000001",
+            None,
+        ]
+
+
+class _FakePage:
+    def __init__(self, tables: list[list[list[str | None]]]) -> None:
+        self._tables = tables
+
+    def extract_tables(self) -> list[list[list[str | None]]]:
+        return self._tables
+
+
+class _FakePdf:
+    def __init__(self, pages: list[_FakePage]) -> None:
+        self.pages = pages
+
+    def __enter__(self) -> _FakePdf:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _table_entries(monkeypatch: pytest.MonkeyPatch, pages: list, headerless: bool) -> dict:
+    import courts.ca.sc_tentatives as sc
+
+    monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage(t) for t in pages]))
+    return sc._dept12_table_entries(b"%PDF", headerless=headerless)
+
+
+class TestSantaClaraTableEntries4726:
+    def test_table_entries_ruling_only_table_continues_case_above(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A RULING cell that runs onto the next page arrives as a table
+        whose first three columns are empty."""
+        pages = [
+            [[["LINE 2", "23CV423546", "Buckvar v. Buckvar", "OFF CALENDAR. This matter"]]],
+            [[["", "", "", "will be heard by Judge Pegg."]]],
+        ]
+        entries = _table_entries(monkeypatch, pages, headerless=True)
+        assert entries["23CV423546"].ruling_text == (
+            "OFF CALENDAR. This matter\nwill be heard by Judge Pegg."
+        )
+
+    def test_table_entries_malformed_row_ends_case_above(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pages = [
+            [
+                [
+                    ["LINE 7", "25CV479084", "Pal v. Denodo", "Petition Compel Arbitration"],
+                    ["LINE 8", "25CV47984", "Bigdeli v. Jaguar", "Hearing: Petition"],
+                    [None, None, "Land Rover", "Parties to appear."],
+                ]
+            ]
+        ]
+        entries = _table_entries(monkeypatch, pages, headerless=True)
+        assert list(entries) == ["25CV479084"]
+        assert entries["25CV479084"].ruling_text == "Petition Compel Arbitration"
+        assert entries["25CV479084"].case_title == "Pal v. Denodo"
+
+    def test_table_entries_headerless_skips_tables_without_line_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A table in a ruling body that cites a case number is not a
+        calendar table."""
+        pages = [[[["Exhibit", "24CV000001", "Smith v. Jones", "cited case"]]]]
+        assert _table_entries(monkeypatch, pages, headerless=True) == {}

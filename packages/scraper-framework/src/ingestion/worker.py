@@ -1204,8 +1204,12 @@ def _try_sc_pdf_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": None,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            # No doc-level fallback (#4726): the live event's case_number /
+            # case_title are the PDF's FIRST case, so a child without its own
+            # would be filed under another case.  A missing number stays
+            # missing (``UNKNOWN-``) unless the child's own text yields one.
+            "case_number": sr.case_number,
+            "case_title": sr.case_title,
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
@@ -1225,7 +1229,7 @@ def _try_sc_pdf_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": sr.case_number,
                     "error": str(_exc),
                 },
             )
