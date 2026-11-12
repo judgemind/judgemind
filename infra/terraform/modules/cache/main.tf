@@ -41,6 +41,15 @@ resource "aws_security_group" "redis" {
 }
 
 # ─── ElastiCache Redis Cluster ─────────────────────────────────────────────
+#
+# Eviction policy: `default.redis7` sets maxmemory-policy = volatile-lru, and
+# that is intentional (#4474). Only keys with a TTL can be evicted: the API's
+# rate-limit and judge-analytics cache keys. The event-bus streams have no
+# TTL, so Redis never silently evicts them. At maxmemory it rejects XADD
+# instead, which behaves like noeviction for the streams while letting the
+# expendable cache keys make room first. Stream memory is bounded in code:
+# the ingestion worker trims acknowledged entries, and every XADD carries a
+# MAXLEN backstop (framework/events.py).
 
 resource "aws_elasticache_cluster" "redis" {
   cluster_id           = "judgemind-${var.environment}"

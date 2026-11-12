@@ -989,6 +989,45 @@ resource "aws_cloudwatch_log_metric_filter" "case_title_unrecoverable" {
   }
 }
 
+# ─── Event-Bus Stream Length ─────────────────────────────────────────────────
+# The ingestion worker trims acknowledged entries from `document.captured`
+# once a minute and logs the remaining length:
+#   packages/scraper-framework/src/ingestion/worker.py
+#       _maybe_trim_consumed_entries -> logger.info("Event stream trim pass",
+#           extra={"stream_length": ..., "trimmed": ...})
+# After trimming, the stream holds only the unconsumed backlog, so a rising
+# StreamLength means the worker is behind or down. Dashboard-only (#4474):
+# it feeds the judgemind-<env>-event-bus dashboard in the cache module and
+# has no alarm.
+
+resource "aws_cloudwatch_log_metric_filter" "event_bus_stream_length" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-event-bus-stream-length-${var.environment}"
+  pattern        = "{ $.event = \"Event stream trim pass\" }"
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name      = "StreamLength"
+    namespace = "Judgemind/EventBus"
+    value     = "$.stream_length"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "event_bus_trimmed" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-event-bus-trimmed-${var.environment}"
+  pattern        = "{ $.event = \"Event stream trim pass\" }"
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name      = "EntriesTrimmed"
+    namespace = "Judgemind/EventBus"
+    value     = "$.trimmed"
+  }
+}
+
 # ─── Scraper Redis Emit Failure Alerts ───────────────────────────────────────
 # CloudWatch alarm that fires when scrapers fail to emit `document.captured`
 # events to the Redis Streams event bus. This is the upstream signal that

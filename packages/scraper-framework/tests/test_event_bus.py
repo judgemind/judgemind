@@ -12,7 +12,7 @@ import redis
 
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
 from framework.event_bus import RedisEventBus
-from framework.events import DEFAULT_STREAM_MAXLEN, EventBus
+from framework.events import DEFAULT_HEALTH_STREAM_MAXLEN, DEFAULT_STREAM_MAXLEN, EventBus
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -344,7 +344,7 @@ class TestStreamMaxlen:
         bus.emit_health(health)
 
         call_args = mock_redis.xadd.call_args
-        assert call_args.kwargs["maxlen"] == DEFAULT_STREAM_MAXLEN
+        assert call_args.kwargs["maxlen"] == DEFAULT_HEALTH_STREAM_MAXLEN
         assert call_args.kwargs["approximate"] is True
 
     def test_custom_maxlen_via_constructor(self) -> None:
@@ -374,8 +374,8 @@ class TestStreamMaxlen:
         assert call_args.kwargs["maxlen"] == 5000
 
     def test_default_stream_maxlen_value(self) -> None:
-        """The default MAXLEN should be 50_000."""
-        assert DEFAULT_STREAM_MAXLEN == 50_000
+        """The default document.captured MAXLEN backstop is 20_000 (#4474)."""
+        assert DEFAULT_STREAM_MAXLEN == 20_000
 
     @pytest.mark.parametrize(
         "maxlen_str,expected",
