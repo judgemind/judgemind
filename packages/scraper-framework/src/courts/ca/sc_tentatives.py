@@ -246,6 +246,9 @@ class SantaClaraCourtDirectory(CourtDirectory):
     mapping is stored in the ``court_directory_snapshots`` DB table.
     """
 
+    # Read by framework.runner._fetch_rosters for the per-run roster prefetch (#4732).
+    COURT_ID: str = "ca_santa_clara"
+
     def fetch_current(self) -> tuple[bytes, dict[str, str]]:
         """Fetch the live landing page and extract the dept-to-judge mapping.
 
