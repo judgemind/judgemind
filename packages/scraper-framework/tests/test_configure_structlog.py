@@ -342,3 +342,51 @@ class TestStdlibBridge:
                 return
 
         pytest.fail("No ProcessorFormatter found on root logger")
+
+
+class TestConfigureIngestionLogging:
+    """configure_ingestion_logging(): the setup every IngestionWorker driver uses (#4860)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_root_handlers(self) -> None:  # type: ignore[return]
+        original_handlers = list(logging.root.handlers)
+        original_level = logging.root.level
+        yield
+        logging.root.handlers = original_handlers
+        logging.root.setLevel(original_level)
+
+    def test_routes_stdlib_info_with_extras_as_json(self) -> None:
+        from framework.logging import configure_ingestion_logging
+
+        with patch("framework.logging.sys") as mock_sys:
+            mock_sys.stderr.isatty.return_value = True  # JSON even on a TTY
+            configure_ingestion_logging()
+
+        handlers = [
+            h
+            for h in logging.root.handlers
+            if isinstance(getattr(h, "formatter", None), structlog.stdlib.ProcessorFormatter)
+        ]
+        assert len(handlers) == 1
+        stream = io.StringIO()
+        capture = logging.StreamHandler(stream)
+        capture.setFormatter(handlers[0].formatter)
+        worker_logger = logging.getLogger("ingestion.worker")
+        worker_logger.addHandler(capture)
+        try:
+            worker_logger.info("reingest_doc_timing", extra={"total_ms": 12})
+        finally:
+            worker_logger.removeHandler(capture)
+
+        record = json.loads(stream.getvalue().strip())
+        assert record["event"] == "reingest_doc_timing"
+        assert record["level"] == "info"
+        assert record["total_ms"] == 12
+
+    def test_contextvars_passthrough(self) -> None:
+        from framework.logging import configure_ingestion_logging
+
+        configure_ingestion_logging(contextvars=True)
+        assert structlog.get_config()["processors"][0] is structlog.contextvars.merge_contextvars
+        configure_ingestion_logging()
+        assert structlog.contextvars.merge_contextvars not in structlog.get_config()["processors"]

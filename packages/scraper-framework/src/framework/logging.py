@@ -12,6 +12,7 @@ Usage::
     configure_structlog()           # JSON in ECS, console locally
     configure_structlog(json=True)  # Always JSON (e.g. ingestion worker)
     configure_structlog(json=True, stdlib_bridge=True)  # Also route stdlib logging
+    configure_ingestion_logging()   # Anything that runs IngestionWorker (#4860)
 
 See issues #1806 and #1827 for motivation.
 """
@@ -99,6 +100,29 @@ def configure_structlog(
 
     if stdlib_bridge:
         _setup_stdlib_bridge(json=json, level=level)
+
+
+def configure_ingestion_logging(*, contextvars: bool = False) -> None:
+    """Configure logging for anything that runs ``IngestionWorker``.
+
+    The ingestion-worker service (``ingestion/__main__.py``) and the oneshot
+    scripts that drive the same worker (``scripts/reingest_from_s3.py``,
+    ``scripts/rebuild_db.py``) all call this, so a oneshot logs exactly what
+    the live worker logs (#4860).
+
+    The worker logs through stdlib ``logging.getLogger``, so the stdlib
+    bridge is required: without it, the worker's INFO events (for example
+    ``santa_clara_placeholder_skipped`` and ``reingest_doc_timing``) and
+    their ``extra=`` fields never reach CloudWatch.  Output is always JSON,
+    as CloudWatch Logs Insights needs it.
+
+    Parameters
+    ----------
+    contextvars:
+        Passed to :func:`configure_structlog`.  The scripts set it so that
+        context bound with ``structlog.contextvars`` reaches their own lines.
+    """
+    configure_structlog(json=True, contextvars=contextvars, stdlib_bridge=True)
 
 
 def _setup_stdlib_bridge(*, json: bool, level: int) -> None:
