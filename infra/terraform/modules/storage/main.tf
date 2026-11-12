@@ -54,11 +54,20 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "document_archive"
 
 # Lifecycle rules implement the tiered storage strategy from Architecture Spec
 # §4.4:
-#   Current objects:    Standard → Standard-IA at 90 days → Glacier at 365 days
-#   Noncurrent objects: Standard → Standard-IA at 30 days → Glacier at 90 days
+#   Current objects:    Standard → Standard-IA at 90 days → Glacier-IR at 365 days
+#   Noncurrent objects: Standard → Standard-IA at 30 days → Glacier-IR at 90 days
 #
 # Noncurrent versions (prior snapshots of updated documents) transition faster
 # because they exist only for auditing; they are rarely accessed.
+#
+# The cold tier is GLACIER_IR (Glacier Instant Retrieval), not GLACIER
+# (Flexible Retrieval). GetObject reads a GLACIER_IR object directly, but a
+# GLACIER object needs a restore request first and otherwise fails with
+# InvalidObjectState. S3 is the source of truth: rebuild_db.py and
+# reingest_from_s3.py must read year-old captures, and the LLM cache treats
+# any get_object error as a miss (operator decision on #4854). Do not switch
+# back to GLACIER or DEEP_ARCHIVE. Lifecycle cannot move objects already in
+# GLACIER to GLACIER_IR; scripts/move_glacier_to_glacier_ir_4854.py does that.
 resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
   bucket = aws_s3_bucket.document_archive.id
 
@@ -78,7 +87,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
 
     transition {
       days          = 365
-      storage_class = "GLACIER"
+      storage_class = "GLACIER_IR"
     }
 
     noncurrent_version_transition {
@@ -88,7 +97,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
 
     noncurrent_version_transition {
       noncurrent_days = 90
-      storage_class   = "GLACIER"
+      storage_class   = "GLACIER_IR"
     }
   }
 
