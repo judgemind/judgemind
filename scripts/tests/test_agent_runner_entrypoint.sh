@@ -2745,8 +2745,13 @@ printf 'ddddddd1 iteration one subject\n' > "$t24_seed"
 printf 'ddddddd2 iteration two subject\n' >> "$t24_seed"
 printf 'ddddddd3 iteration three subject\n' >> "$t24_seed"
 
+# 10s window (#4857): the watcher persists all three seeded commits in
+# one tick, and each persist runs several git/psql stub calls. On the
+# ubuntu-26.04 CI runner a 3s window ended after the second commit.
+# The watcher is stopped by SIGTERM either way, so a longer window only
+# adds wall time.
 set +e
-t24_out=$(run_watcher_test "$t24_workspace" "$t24_commits" "$t24_seed" 3 1 "")
+t24_out=$(run_watcher_test "$t24_workspace" "$t24_commits" "$t24_seed" 10 1 "")
 t24_rc=$?
 set -e
 
