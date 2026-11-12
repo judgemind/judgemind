@@ -19,3 +19,7 @@ This pattern applies across all subsystems:
 - **CI flakes** — capture reproduction artifacts before adding retries.
 - **Infra timeouts** — log the operation timeline before tuning limits.
 - **Frontend / data-quality anomalies** — capture the raw DOM or query result before patching the rendering layer.
+
+## Attributing validation fails
+
+To trace `telemetry.validation_results` fails (including split children, which never get a `derived.documents` row) back to the raw S3 key, county and rule, use `scripts/attribute_validation_fails.py`. See [observability.md](observability.md#attributing-validation-fails-to-raw-s3-keys). Do not recompute split-child uuid5 ids by hand for rows written after 2026-09-26.
