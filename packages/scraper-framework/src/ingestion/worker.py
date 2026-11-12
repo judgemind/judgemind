@@ -1042,6 +1042,26 @@ def _try_sf_pdf_split(
     return True
 
 
+#: Log message (and ``telemetry_event``) for a skipped Santa Clara
+#: "rulings not available" placeholder (#4725).
+SC_PLACEHOLDER_SKIPPED_EVENT = "santa_clara_placeholder_skipped"
+
+
+def _is_sc_placeholder(event_data: dict[str, Any], ruling_text: str | None) -> bool:
+    """True when the event is a Santa Clara PDF whose text is the court's
+    "tentative rulings are not available" placeholder notice (#4725).
+
+    Same county + format gate as ``_try_sc_pdf_split``.
+    """
+    if (event_data.get("county") or "").upper() != "SANTA CLARA":
+        return False
+    if event_data.get("content_format") != "pdf":
+        return False
+    from courts.ca.sc_tentatives import is_placeholder_notice
+
+    return is_placeholder_notice(ruling_text)
+
+
 def _try_sc_pdf_split(
     event_data: dict[str, Any],
     document_id: str,
@@ -1311,12 +1331,16 @@ class _SplitBatch:
     key's rows are replaced even when every child is dropped).
     ``keep_ids`` are children whose extraction failed this pass: their
     existing rows are left untouched rather than removed.
+    ``no_rulings_reason`` is set when the document is known to hold no
+    rulings (e.g. a Santa Clara placeholder notice, #4725): the split is
+    empty by design, not because every child was rejected.
     """
 
     parent_document_id: str
     children: list[_RulingWrite] = field(default_factory=list)
     keep_ids: set[str] = field(default_factory=set)
     replace: bool = False
+    no_rulings_reason: str | None = None
 
 
 class InfrastructureError(Exception):
@@ -4223,7 +4247,20 @@ class IngestionWorker:
             conn.rollback()
             raise
 
-        if removed and not written and not batch.keep_ids:
+        if removed and batch.no_rulings_reason:
+            # The document holds no rulings (#4725): rows an older run wrote
+            # for it were wrong, and are gone now.
+            logger.info(
+                "Removed %d row(s) from a document that holds no rulings",
+                len(removed),
+                extra={
+                    "document_id": parent_document_id,
+                    "s3_key": s3_key,
+                    "reason": batch.no_rulings_reason,
+                    "stale_ids": removed,
+                },
+            )
+        elif removed and not written and not batch.keep_ids:
             # Every child of this split was rejected (validation, all-NULL
             # guard): the key now holds no rulings.  Worth a look when it
             # happens to a key that had some.
@@ -4399,6 +4436,29 @@ class IngestionWorker:
         """
         if not ruling_text and not raw_pdf_bytes:
             return False
+
+        # ------------------------------------------------------------------
+        # Santa Clara "rulings not available" placeholder (#4725)
+        # ------------------------------------------------------------------
+        # A legitimate "no rulings today" notice, not a ruling document: the
+        # LLM invented rulings from it that failed as ``UNKNOWN-``.  Skip it
+        # before any extraction, and replace the key's split set with the
+        # empty one so rows an older run wrote for it are removed.
+        if _is_sc_placeholder(event_data, ruling_text):
+            logger.info(
+                SC_PLACEHOLDER_SKIPPED_EVENT,
+                extra={
+                    "telemetry_event": SC_PLACEHOLDER_SKIPPED_EVENT,
+                    "document_id": document_id,
+                    "s3_key": event_data.get("s3_key"),
+                    "county": county,
+                    "scraper_id": event_data.get("scraper_id"),
+                    "text_len": len((ruling_text or "").strip()),
+                },
+            )
+            batch.replace = True
+            batch.no_rulings_reason = "santa_clara_placeholder"
+            return True
 
         # Every deterministic splitter below dispatches its children through
         # ``dispatch_child``.  A dispatched child means the split replaces

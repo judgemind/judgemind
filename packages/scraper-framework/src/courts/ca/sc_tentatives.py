@@ -372,6 +372,45 @@ def extract_pdf_links_from_dept_page(html: str, base_url: str = BASE_URL) -> lis
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# "Rulings not available" placeholder notice (#4725)
+# ---------------------------------------------------------------------------
+#
+# Before a department posts its rulings, Santa Clara serves a one-line PDF at
+# the ruling URL: "The tentative rulings are not available at this time.
+# Please check back later."  It is a legitimate "no rulings today" signal, not
+# a ruling document.  Sent to the LLM it produced invented rulings that the
+# case-number rule rejected as ``UNKNOWN-`` fails.  On 2026-11-12, 12 of the
+# 485 SC raws in dev S3 were this notice, each extracting to exactly 78
+# characters; the shortest real document extracts to 1,150.
+
+#: The notice must lead the document.
+_PLACEHOLDER_NOTICE_RE = re.compile(
+    r"^the\s+tentative\s+rulings?\s+(?:are|is)\s+not\s+(?:currently\s+|yet\s+)?available\b",
+    re.IGNORECASE,
+)
+
+#: Longest whitespace-normalised text still treated as a placeholder.  The real
+#: notice is 78 characters; a document that quotes it inside real rulings is far
+#: longer and stays on the ruling path.
+PLACEHOLDER_NOTICE_MAX_CHARS = 200
+
+
+def is_placeholder_notice(text: str | None) -> bool:
+    """Return True when *text* is Santa Clara's "rulings not available" notice.
+
+    *text* is the PDF's extracted text.  Both conditions must hold: the
+    whitespace-normalised text starts with the notice and is at most
+    ``PLACEHOLDER_NOTICE_MAX_CHARS`` long.
+    """
+    if not text:
+        return False
+    normalized = " ".join(text.split())
+    if len(normalized) > PLACEHOLDER_NOTICE_MAX_CHARS:
+        return False
+    return bool(_PLACEHOLDER_NOTICE_RE.match(normalized))
+
+
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     """Extract full text from a PDF using pdfplumber."""
     import io
