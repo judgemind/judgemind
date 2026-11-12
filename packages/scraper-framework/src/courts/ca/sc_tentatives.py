@@ -28,7 +28,9 @@ PDF structure (all departments):
   Date:    "DATE: Month DD, YYYY", "DATE: MM/DD/YYYY" (dept 12, #4667),
            or "Month DD, YYYY" (standalone header line)
   Cases:   "LINE N  CASENO  CaseTitle  MotionType" followed by ruling text
-  Case numbers: DD{CV,PR}DDDDDD format (e.g. 24CV443183, 25PR199782)
+  Case numbers: DD{CV,PR}DDDDDD format (e.g. 24CV443183, 25PR199782); cases
+           filed under the old numbering print YYYY-D-{CV,PR}-DDDDDD
+           (e.g. 2008-1-CV-131533 — #4726)
 
 Judge-to-department mapping is extracted from the landing page, where both
 "Dept. N" and "Judge Name" links share the same URL.
@@ -721,10 +723,33 @@ def parse_case_title(text: str) -> str | None:
 # Negative lookahead for ``Line\s+\d+\s*$`` followed by another ``Line\s+\d+\s*$``
 # (a trailing index label) is unnecessary because we filter on body length
 # below.
-_SC_RULING_ENTRY_RE = re.compile(
+_SC_RULING_ENTRY_STRICT_RE = re.compile(
     r"^(?P<num>Line\s+\d{1,3})\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+
+# Once format A is chosen (on ``_SC_RULING_ENTRY_STRICT_RE`` boundaries, see
+# ``_split_rulings``), ``Line 1-2`` / ``Line 5 & 6`` (one body for several
+# calendar lines, Dept 16) and ``LINE ITEM 2`` (Dept 6) are boundaries too
+# (#4726); before, their bodies were glued onto the previous entry.
+_SC_RULING_ENTRY_RE = re.compile(
+    r"^(?P<num>Line(?:[ \t]+Item)?[ \t]+\d{1,3}"
+    r"(?:[ \t]*(?:-|–|&|,|and)[ \t]*\d{1,3})*)[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Santa Clara case numbers (#4726).  The current form is ``24CV443183`` /
+# ``25PR199782``; ``24 CV451675`` and ``26-CV-484120`` are printed variants of
+# it.  Cases filed before the current numbering keep their old form:
+# ``2008-1-CV-131533`` / ``2014-1-PR-174505`` / ``2000-7-CV-401591`` (Dept 16
+# ``Case No.:`` lines, Dept 1 CASE # cells, which pdfplumber may wrap after
+# ``CV-``).  ``_normalize_case_number`` gives the canonical spelling of both.
+# Numbers with a digit missing (``24CV44932``) match neither: they are court
+# typos, and a wrong case number is worse than none.
+_SC_CN_NEW = r"\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6}"
+_SC_CN_OLD = r"(?:19|20)\d{2}[ \t]*-[ \t]*\d[ \t]*-[ \t]*(?:CV|PR)[ \t]*-[ \t]*\d{6}"
+_SC_CN = rf"(?:{_SC_CN_OLD}|{_SC_CN_NEW})\b"
+_SC_CN_CANONICAL_RE = re.compile(r"^(?:\d{2}(?:CV|PR)\d{6}|(?:19|20)\d{2}-\d-(?:CV|PR)-\d{6})$")
 
 # Within an entry, the structured per-case headers Santa Clara uses in the
 # expanded format.  These are deterministic enough to extract case_number
@@ -735,6 +760,21 @@ _SC_CASE_NO_HEADER_RE = re.compile(
     r"^Case\s+No\.?:\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\b(?:\s+\([^\n]*)?\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+
+# The entry's own header block (its first ``_SC_ENTRY_HEAD_LINES`` lines) may
+# also print ``Case No. 22CV408177`` (no colon) or an old-style number
+# (#4726).  Only the head is searched for these, so a case cited in the ruling
+# body is never taken for the entry's own.
+_SC_ENTRY_HEAD_CASE_NO_RE = re.compile(
+    rf"^[ \t]*Case\s+No\.?:?[ \t]*(?P<case_number>{_SC_CN})[ \t]*(?:\([^\n]*)?$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_SC_ENTRY_HEAD_LINES = 6
+
+
+def _entry_head(body: str) -> str:
+    return "\n".join(body.splitlines()[:_SC_ENTRY_HEAD_LINES])
+
 
 _SC_CASE_NAME_HEADER_RE = re.compile(
     r"^Case\s+Name:\s*(?P<case_title>[^\n]+)$",
@@ -804,14 +844,30 @@ _SC_FORMAT_B_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Format-B per-row case number column.  pdfplumber may emit the case
-# number with internal whitespace (e.g. ``"24CV 443183"``) so we strip
-# whitespace before matching.  ``\d{2}(CV|PR)\d{6}`` is the canonical SC
-# case-number shape (see ``_CASE_NUMBER_RE``).
-_SC_FORMAT_B_CASE_NO_RE = re.compile(
-    r"^\s*(?P<case_number>\d{2}(?:CV|PR)\d{6})\s*$",
-    re.IGNORECASE,
+# Format-B per-row case number column: ``_row_case_number`` below.
+# pdfplumber may emit the case number with internal whitespace (e.g.
+# ``"24CV 443183"``), which ``_normalize_case_number`` strips.
+
+# A CASE NO. cell that is meant as a case number but is not a valid one —
+# a digit short or long (``24CV44932``, Dept 6, #4726).  Such a row is still a
+# new case: gluing it onto the row above would hand that case another case's
+# ruling.  Matched against the ``_normalize_case_number`` form.
+_SC_MALFORMED_CN_RE = re.compile(
+    r"^(?:\d{2}(?:CV|PR)\d{3,8}|(?:19|20)\d{2}-?\d-?(?:CV|PR)-?\d{3,8})$"
 )
+
+
+def _row_case_number(cell: str) -> tuple[str | None, bool]:
+    """``(case_number, is_case_row)`` for a CASE NO. cell (#4726).
+
+    A valid number gives ``(number, True)``; a malformed one ``(None, True)``;
+    anything else (empty, a continuation line) ``(None, False)``.
+    """
+    cn = _normalize_case_number(cell)
+    if _SC_CN_CANONICAL_RE.match(cn):
+        return cn, True
+    return None, bool(_SC_MALFORMED_CN_RE.match(cn))
+
 
 # Cross-reference inside a format-B summary-table cell:
 # ``See Line N below`` / ``see Line N above`` / ``See Line Item N below``.
@@ -850,14 +906,16 @@ def _is_format_b_header_row(row: list[str | None]) -> bool:
     return True
 
 
-def _split_rulings_format_a(text: str) -> list[SplitRuling]:
+def _split_rulings_format_a(text: str, strict: bool = False) -> list[SplitRuling]:
     """Format-A splitter — the original ``Line N`` boundary regex (#4303).
 
     See module docstring §A for the exact pre-conditions.  Returns an
     empty list when no ``Line N`` boundaries are present (typical of
-    compact summary-table PDFs and single-ruling PDFs).
+    compact summary-table PDFs and single-ruling PDFs).  ``strict`` uses
+    only the original bare ``Line N`` boundaries (#4726).
     """
-    matches = list(_SC_RULING_ENTRY_RE.finditer(text))
+    entry_re = _SC_RULING_ENTRY_STRICT_RE if strict else _SC_RULING_ENTRY_RE
+    matches = list(entry_re.finditer(text))
     if not matches:
         return []
 
@@ -888,9 +946,15 @@ def _split_rulings_format_a(text: str) -> list[SplitRuling]:
         # insensitive and tolerant of the headers appearing anywhere in
         # the body (the dept 16 format has them as the first two lines
         # after ``Line N``; other departments may emit them later).
-        case_no_match = _SC_CASE_NO_HEADER_RE.search(body)
+        # The entry's head block wins (#4726); the whole-body search is
+        # the original #4303 behavior, kept as the fallback.
+        case_no_match = _SC_ENTRY_HEAD_CASE_NO_RE.search(_entry_head(body))
+        if case_no_match is None:
+            case_no_match = _SC_CASE_NO_HEADER_RE.search(body)
         case_name_match = _SC_CASE_NAME_HEADER_RE.search(body)
-        case_number = case_no_match.group("case_number").upper() if case_no_match else None
+        case_number = (
+            _normalize_case_number(case_no_match.group("case_number")) if case_no_match else None
+        )
         case_title = (
             " ".join(case_name_match.group("case_title").split()) if case_name_match else None
         )
@@ -972,31 +1036,44 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
 
     rulings: list[SplitRuling] = []
     next_index = 1
+    seen_header = False
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 tables = page.extract_tables() or []
                 for table in tables:
-                    if not table or not _is_format_b_header_row(table[0]):
+                    if not table:
+                        continue
+                    if _is_format_b_header_row(table[0]):
+                        seen_header = True
+                        body_rows = table[1:]
+                    elif seen_header and any(
+                        row and len(row) > 1 and _row_case_number(_normalize_table_cell(row[1]))[1]
+                        for row in table
+                    ):
+                        # The summary table continues on the next page as a
+                        # table with no header row (Dept 6, #4726).
+                        body_rows = table
+                    else:
                         continue
                     current: SplitRuling | None = None
-                    for row in table[1:]:
+                    for row in body_rows:
                         if not row:
                             continue
                         # Case-no column (col 1).
                         cn_raw = _normalize_table_cell(row[1] if len(row) > 1 else None)
-                        cn_normalized = cn_raw.replace(" ", "").upper()
-                        cn_match = _SC_FORMAT_B_CASE_NO_RE.match(cn_normalized)
-                        if cn_match:
+                        row_cn, is_case_row = _row_case_number(cn_raw)
+                        if is_case_row:
                             # New case row — flush the previous case (if any)
-                            # and start fresh.
+                            # and start fresh.  A malformed number starts a
+                            # case too (``row_cn`` is None); see below.
                             if current is not None:
                                 rulings.append(current)
                             title = _normalize_table_cell(row[2] if len(row) > 2 else None)
                             ruling_chunk = _normalize_table_cell(row[3] if len(row) > 3 else None)
                             current = SplitRuling(
                                 ruling_index=next_index,
-                                case_number=cn_match.group("case_number").upper(),
+                                case_number=row_cn,
                                 ruling_text=ruling_chunk,
                                 case_title=title or None,
                             )
@@ -1049,8 +1126,24 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
             section = _format_a_body_section(text, line_num)
             if section:
                 r.ruling_text = f"{r.ruling_text}\n\n{section}"
+                if r.case_number is None:
+                    # Malformed CASE NO. cell: the cross-referenced body
+                    # section's own ``Case No.:`` header names the case
+                    # (#4726).  Never guessed from anything else.
+                    head = _SC_ENTRY_HEAD_CASE_NO_RE.search(_entry_head(section))
+                    if head:
+                        r.case_number = _normalize_case_number(head.group("case_number"))
 
-    return rulings
+    # A row whose case number is still unknown is dropped: an entry without a
+    # case number becomes an ``UNKNOWN-`` case downstream (#4726).
+    kept: list[SplitRuling] = []
+    for r in rulings:
+        if r.case_number is None:
+            logger.info("format_b_row_without_case_number_dropped", case_title=r.case_title)
+            continue
+        r.ruling_index = len(kept) + 1
+        kept.append(r)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -1112,7 +1205,7 @@ _SC_DEPT12_HEADER_RE = re.compile(
 )
 
 _SC_DEPT12_TIME_ONLY_RE = re.compile(r"^\d{1,2}:\d{2}$")
-_SC_DEPT12_CN_RE = re.compile(r"^\d{2}(?:CV|PR)\d{6}$", re.IGNORECASE)
+_SC_DEPT12_CN_RE = _SC_CN_CANONICAL_RE
 
 # A summary-table row in the flattened text: optional ``9:01`` / ``LINE 1`` /
 # ``LINES 3-5`` / ``LINE 8 & LINE 9`` labels, then the case number.
@@ -1121,41 +1214,52 @@ _SC_DEPT12_TEXT_ROW_RE = re.compile(
     r"(?:[ \t]*(?:-|&|,|and)[ \t]*(?:LINE[ \t]*)?\d{1,3})*)[ \t]+)*"
     # Not ``25PR200738)``: the tail of a ``(lead case, consolidated with …)``
     # note wrapped onto its own line inside a CASE # cell (Dept 2).
-    r"(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b(?!\))",
+    rf"(?P<cn>{_SC_CN})(?!\))",
     re.MULTILINE | re.IGNORECASE,
 )
 
 # A CASE # cell that leads with its case number: ``24CV450440`` or Dept 2's
 # ``Case No. 23PR194562 (lead case, consolidated with 25PR200738)``.
 _SC_DEPT12_CN_CELL_RE = re.compile(
-    r"^(?:Case\s+No\.?:?\s*)?(?P<cn>\d{2}\s*-?\s*(?:CV|PR)\s*-?\s*\d{6})\b",
+    rf"^(?:Case\s+No\.?:?\s*)?(?P<cn>{_SC_CN})",
     re.IGNORECASE,
 )
+
+# The same table without its ``LINE # | CASE # | …`` header row (Dept 1,
+# #4726): the flattened text has only the rows, ``LINE 1 24CV429115 Kristin
+# Hoffman vs Motion for …`` / ``LINES`` + ``3-4`` on the next line, followed
+# by ``Calendar Lines # 1`` bodies.  Upper-case, at the start of a line;
+# ``LINE # 1: MOTION …`` (a heading inside a ruling) is not a row.
+_SC_HEADERLESS_ROW_RE = re.compile(r"^[ \t]*LINES?\b(?![ \t]*#)", re.MULTILINE)
+_SC_HEADERLESS_LABEL_RE = re.compile(r"^LINES?\b", re.IGNORECASE)
 
 # Body-section boundary, on its own line: ``Calendar Line 7`` /
 # ``Calendar line 9 & 10`` / ``Calendar Line 3 - 4`` / ``Calendar Line 6/7`` /
 # ``Calendar Lines 3 through 8`` / ``Calendar Lines 4 – 5`` /
 # ``Calendar Line 8, 9, and 10`` / ``Calendar line 1 – Tentative Ruling`` /
 # ``Calendar Line 1 Calendar Lines 1-2`` (pdfplumber doubles some headings),
-# or Dept 19's ``Line 1 (Calendar Lines 1-14)`` (#4696).  Only the first
-# number is captured; it is what the summary rows cross-reference.
+# or Dept 19's ``Line 1 (Calendar Lines 1-14)`` (#4696), or Dept 1's
+# ``Calendar Lines # 1 & 7`` (#4726).  Only the first number is captured; it
+# is what the summary rows cross-reference.
 _SC_DEPT12_BODY_RE = re.compile(
-    r"^[ \t]*(?:Calendar\s+Lines?\s+(?:Nos?\.?\s+)?(?P<first>\d{1,3})\b"
-    r"(?:[ \t]*(?:[-–—&/,:]|and\b|through\b|thru\b|to\b|Calendar\b|Lines?\b|Nos?\.?"
+    r"^[ \t]*(?:Calendar\s+Lines?\s+(?:Nos?\.?\s+|#[ \t]*)?(?P<first>\d{1,3})\b"
+    r"(?:[ \t]*(?:[-–—&/,:#]|and\b|through\b|thru\b|to\b|Calendar\b|Lines?\b|Nos?\.?"
     r"|Tentative\b|Ruling\b|\d{1,3}\b))*"
     r"|Line\s+(?P<paren>\d{1,3})[ \t]*\(Calendar\s+Lines?\s+[\d \t,&–—-]+\))[ \t]*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
 # ``Case No.: 24CV450440`` / ``Case No. 26CV483739`` / ``Case No.: 26-CV-484120``
-# or a bare case number on its own line.
+# / ``Case No. 2010-1-CV-171215`` or a bare case number on its own line.
 _SC_DEPT12_BODY_CASE_NO_RE = re.compile(
-    r"^[ \t]*(?:Case\s+No\.?:?\s*(?P<cn>\d{2}[ \t]*-?[ \t]*(?:CV|PR)[ \t]*-?[ \t]*\d{6})\b"
+    rf"^[ \t]*(?:Case\s+No\.?:?\s*(?P<cn>{_SC_CN})"
     r"|(?P<bare>\d{2}-?(?:CV|PR)-?\d{6})[ \t]*$)",
     re.MULTILINE | re.IGNORECASE,
 )
+# Same line only: an empty ``Case Name:`` must not take the ``Case No.:``
+# line below it as the title (#4726).
 _SC_DEPT12_BODY_CASE_NAME_RE = re.compile(
-    r"^[ \t]*Case\s+Name:\s*(?P<title>[^\n]+)$",
+    r"^[ \t]*Case[ \t]+Name:[ \t]*(?P<title>[^\n]+)$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -1171,7 +1275,13 @@ _SC_DEPT12_CROSSREF_RE = re.compile(
 
 
 def _normalize_case_number(raw: str) -> str:
-    return re.sub(r"[\s-]", "", raw).upper()
+    """Canonical case number: ``24CV443183``, or ``2008-1-CV-131533`` for the
+    old form (hyphens kept — that is how it is stored, #4726)."""
+    compact = re.sub(r"\s", "", raw).upper()
+    old = re.fullmatch(r"((?:19|20)\d{2})-(\d)-(CV|PR)-(\d{6})", compact)
+    if old:
+        return "-".join(old.groups())
+    return compact.replace("-", "")
 
 
 def _one_char_apart(a: str, b: str) -> bool:
@@ -1228,8 +1338,16 @@ def _append_text(r: SplitRuling, extra: str, sep: str = "\n") -> None:
         r.ruling_text = f"{r.ruling_text}{sep}{extra}" if r.ruling_text else extra
 
 
-def _dept12_table_entries(pdf_bytes: bytes) -> dict[str, SplitRuling]:
+def _is_malformed_cn_row(row: list[str | None]) -> bool:
+    """True when the CASE # column holds a malformed case number (#4726)."""
+    return any(_row_case_number(_dept12_cell(c)) == (None, True) for c in row[1:3])
+
+
+def _dept12_table_entries(pdf_bytes: bytes, headerless: bool = False) -> dict[str, SplitRuling]:
     """Parse the pdfplumber tables into ``{case_number: SplitRuling}`` (ordered).
+
+    ``headerless`` (#4726): the PDF prints no header row, so instead every
+    table with at least one ``LINE N | <case #> | …`` row is a calendar table.
 
     Raises whatever pdfplumber raises; the caller handles it.
     """
@@ -1245,6 +1363,25 @@ def _dept12_table_entries(pdf_bytes: bytes) -> dict[str, SplitRuling]:
                 rows = [row for row in table if row and len(row) >= 3]
                 if not rows:
                     continue
+                if (
+                    in_table
+                    and current is not None
+                    and len(rows[0]) >= 4
+                    and all(not any(_dept12_cell(c) for c in r[:3]) for r in rows)
+                ):
+                    # Only the RULING column: the case above continues onto
+                    # this page (#4726).
+                    for r in rows:
+                        _append_text(current, "\n".join(c for c in map(_dept12_cell, r[3:]) if c))
+                    continue
+                if headerless:
+                    if not any(
+                        _SC_HEADERLESS_LABEL_RE.match(_normalize_table_cell(r[0]))
+                        and _dept12_parse_row(r)[1] is not None
+                        for r in rows
+                    ):
+                        continue
+                    in_table = True
                 if any(_is_dept12_header_row(r) for r in rows):
                     in_table = True
                 if not in_table:
@@ -1260,6 +1397,13 @@ def _dept12_table_entries(pdf_bytes: bytes) -> dict[str, SplitRuling]:
                         current, title_open = None, False
                         continue
                     label, cn, title, ruling = _dept12_parse_row(row)
+                    if cn is None and _is_malformed_cn_row(row):
+                        # A new case whose number is a typo (``24CV44932``):
+                        # not a continuation of the case above.  Its body
+                        # section, if any, still attaches by cross-reference
+                        # or by its own ``Case No.:`` line.
+                        current, title_open = None, False
+                        continue
                     if cn is not None:
                         existing = entries.get(cn)
                         if existing is None:
@@ -1291,18 +1435,20 @@ def _dept12_table_entries(pdf_bytes: bytes) -> dict[str, SplitRuling]:
     return entries
 
 
-def _dept12_text_rows(text: str) -> dict[str, str]:
+def _dept12_text_rows(text: str, headerless: bool = False) -> dict[str, str]:
     """Summary rows in the flattened text: ``{case_number: row_text}`` (ordered).
 
-    Only the region between the table header and the first ``Calendar Line``
-    body is scanned.  A row's text runs to the next row (or the end of the
-    region); rows sharing a case number are concatenated.
+    Only the region between the table header (``headerless``: the first
+    ``LINE`` row, #4726) and the first ``Calendar Line`` body is scanned.  A
+    row's text runs to the next row (or the end of the region); rows sharing
+    a case number are concatenated.
     """
-    header = _SC_DEPT12_HEADER_RE.search(text)
+    header = (_SC_HEADERLESS_ROW_RE if headerless else _SC_DEPT12_HEADER_RE).search(text)
     if not header:
         return {}
-    first_body = _SC_DEPT12_BODY_RE.search(text, header.end())
-    region = text[header.end() : first_body.start() if first_body else len(text)]
+    start = header.start() if headerless else header.end()
+    first_body = _SC_DEPT12_BODY_RE.search(text, start)
+    region = text[start : first_body.start() if first_body else len(text)]
     matches = list(_SC_DEPT12_TEXT_ROW_RE.finditer(region))
     rows: dict[str, str] = {}
     for i, m in enumerate(matches):
@@ -1401,22 +1547,30 @@ def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
             target.case_title = s.case_title
 
 
-def _split_rulings_dept12(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
+def _split_rulings_dept12(
+    text: str, pdf_bytes: bytes, headerless: bool = False
+) -> list[SplitRuling]:
     """Dept-12 splitter — see the block comment above (#4681).
 
     Returns one ``SplitRuling`` per distinct case number, in table order,
     with ``ruling_index`` 1..N.  Entries that end up with no ruling text at
     all are dropped (there is nothing to extract from them).  Returns ``[]``
     on a pdfplumber error so the caller can fall back.
+
+    ``headerless`` (#4726): the table has no header row.  The pdfplumber
+    table must then yield at least one entry, or ``[]`` is returned — the
+    flattened text alone is not trusted to identify the layout.
     """
     try:
-        entries = _dept12_table_entries(pdf_bytes)
+        entries = _dept12_table_entries(pdf_bytes, headerless=headerless)
     except Exception as exc:  # noqa: BLE001
         logger.warning("dept12_table_parse_error", error=str(exc))
         return []
+    if headerless and not entries:
+        return []
 
     rulings = list(entries.values())
-    text_rows = _dept12_text_rows(text)
+    text_rows = _dept12_text_rows(text, headerless=headerless)
     for cn, row_text in text_rows.items():
         if cn not in entries:
             r = SplitRuling(ruling_index=0, case_number=cn, ruling_text=row_text)
@@ -1456,13 +1610,16 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRulin
       headings.  When this path returns >= 2 entries, those are used
       verbatim.
     * **Format B** — pdfplumber ``extract_tables()`` on the original PDF
-      bytes.  Only attempted when format A returns < 2 entries AND the
-      flattened text contains the literal
-      ``LINE CASE NO. CASE TITLE TENTATIVE RULING`` header AND
+      bytes.  Only attempted when format A returns < 2 entries (or entries
+      without a case number, #4726) AND the flattened text contains the
+      literal ``LINE CASE NO. CASE TITLE TENTATIVE RULING`` header AND
       ``pdf_bytes`` is supplied.  Each row of the summary table whose
       CASE NO. column is non-empty becomes one ``SplitRuling``; the
       TENTATIVE RULING column (plus continuation rows and any
       cross-referenced format-A body sections) becomes ``ruling_text``.
+    * **Headerless table** (#4726) — the table layout with no header row
+      (Dept 1).  Tried last, when the text has ``LINE`` rows and no
+      format-B header.
 
     Backward compat: callers that pass only ``text`` (the original
     signature) still work — they get the format-A behavior, which is
@@ -1520,20 +1677,43 @@ def _split_rulings(text: str, pdf_bytes: bytes | None = None) -> list[SplitRulin
             return table
 
     # Format A runs next.  When it produces a usable multi-entry
-    # result, return it verbatim.
-    format_a = _split_rulings_format_a(text)
-    if len(format_a) >= 2:
+    # result, return it verbatim — unless some of its entries have no case
+    # number and the format-B table names every case format A found and
+    # more (Dept 6, #4726: format A splits on the few ``Line N`` bodies,
+    # most of which print no ``Case No.:``, and misses the inline rulings
+    # in the table).
+    #
+    # Whether format A applies is decided on its original bare ``Line N``
+    # boundaries; the extended ones (``Line 6-8``) would otherwise pull
+    # format-B PDFs into format A (#4726).
+    format_b_bytes = pdf_bytes if _SC_FORMAT_B_HEADER_RE.search(text) else None
+    strict_a = _split_rulings_format_a(text, strict=True)
+    if len(strict_a) >= 2:
+        format_a = _split_rulings_format_a(text)
+        if format_b_bytes is not None and any(not r.case_number for r in format_a):
+            format_b = _split_rulings_format_b(text, format_b_bytes)
+            a_cns = {r.case_number for r in format_a if r.case_number}
+            b_cns = {r.case_number for r in format_b}
+            if len(format_b) >= 2 and a_cns <= b_cns:
+                return format_b
         return format_a
 
     # Format B is conditional: needs the PDF bytes AND the literal
     # summary-table header in the flattened text.  Otherwise we fall
     # back to whatever format A produced (likely empty or single-entry).
-    if pdf_bytes is not None and _SC_FORMAT_B_HEADER_RE.search(text):
-        format_b = _split_rulings_format_b(text, pdf_bytes)
+    if format_b_bytes is not None:
+        format_b = _split_rulings_format_b(text, format_b_bytes)
         if len(format_b) >= 2:
             return format_b
+    elif pdf_bytes is not None and _SC_HEADERLESS_ROW_RE.search(text):
+        # The table layout without its header row (Dept 1, #4726).  These
+        # PDFs used to go whole to the LLM, which dropped or mistyped case
+        # numbers.  As with the headed table, a single entry is returned.
+        table = _split_rulings_dept12(text, pdf_bytes, headerless=True)
+        if table:
+            return table
 
-    return format_a
+    return strict_a
 
 
 # ---------------------------------------------------------------------------
