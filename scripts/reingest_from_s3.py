@@ -129,7 +129,7 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
-from framework.logging import configure_structlog  # noqa: E402
+from framework.logging import configure_ingestion_logging  # noqa: E402
 from framework.storage import (  # noqa: E402
     capture_provenance_from_s3_object,
     capture_timestamp_from_s3_object,
@@ -138,7 +138,11 @@ from ingestion.db import _looks_like_valid_judge_name, resolve_judge  # noqa: E4
 from ingestion.extract import extract_judge_name  # noqa: E402
 from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
 
-configure_structlog(contextvars=True)
+# The same logging setup as the ingestion-worker service, so the worker's
+# stdlib INFO events and their extra= fields reach the log (#4860).  It runs
+# at import time, so the per-key worker processes get it too (inherited on
+# fork; re-run when a spawned child imports this module).
+configure_ingestion_logging(contextvars=True)
 logger = structlog.get_logger()
 
 

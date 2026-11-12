@@ -101,6 +101,7 @@ from typing import Any
 import psycopg
 import structlog
 
+from framework.logging import configure_ingestion_logging
 from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
 from framework.storage import (
@@ -108,12 +109,11 @@ from framework.storage import (
     capture_timestamp_from_s3_object,
 )
 
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.dev.ConsoleRenderer(),
-    ],
-)
+# The same logging setup as the ingestion-worker service, so the worker's
+# stdlib INFO events and their extra= fields reach the log (#4860).  It runs
+# at import time, so the per-key worker processes get it too (inherited on
+# fork; re-run when a spawned child imports this module).
+configure_ingestion_logging(contextvars=True)
 logger = structlog.get_logger(__name__)
 
 BUCKET = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")

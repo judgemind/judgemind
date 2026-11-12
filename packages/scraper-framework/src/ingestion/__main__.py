@@ -27,7 +27,7 @@ import sys
 import redis
 import structlog
 
-from framework.logging import configure_structlog
+from framework.logging import configure_ingestion_logging
 from framework.opensearch_client import make_opensearch_client
 from framework.s3_cache import make_s3_client
 
@@ -45,11 +45,10 @@ from .worker import (
 print("ingestion-worker starting", flush=True)
 
 # Configure structlog for its own loggers (structlog.get_logger()) AND route
-# standard-library logging (logging.getLogger()) through structlog.
-# json=True forces JSON output regardless of terminal — the ingestion worker
-# always runs in ECS where CloudWatch needs structured JSON.
-# stdlib_bridge=True installs a ProcessorFormatter on the root stdlib logger.
-configure_structlog(json=True, stdlib_bridge=True)
+# standard-library logging (logging.getLogger()) through structlog, as JSON.
+# The reingest and rebuild scripts call the same function so they log exactly
+# what this service logs (#4860).
+configure_ingestion_logging()
 
 logger = structlog.get_logger(__name__)
 
