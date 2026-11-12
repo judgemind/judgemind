@@ -46,6 +46,7 @@ from courts.ca.la_dept_judges import (
     lookup_judge_for_department,
 )
 from framework.enrichment import EnrichmentEngine
+from framework.events import trim_consumed_entries
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
@@ -1416,6 +1417,11 @@ PENDING_RECLAIM_MIN_IDLE_MS = 30_000
 # main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
 PENDING_RECLAIM_INTERVAL = 12
 
+# How often (seconds) the worker trims already-acknowledged entries from the
+# stream.  Without this, the only retention was the producer's MAXLEN, so the
+# stream kept 50 000 consumed entries (1.1 GB) and filled ElastiCache (#4474).
+STREAM_TRIM_INTERVAL_S = 60.0
+
 
 def redis_socket_timeout_for_block(block_ms: int) -> float:
     """Return a Redis client socket read timeout that outlasts an XREADGROUP block.
@@ -1595,6 +1601,8 @@ class IngestionWorker:
         self._heartbeat_log_level: int = getattr(logging, heartbeat_level_env, logging.INFO)
         self._empty_polls: int = 0
         self._last_event_time: float = time.monotonic()
+        # Monotonic time of the last consumed-entry trim; None = never (#4474).
+        self._last_trim_time: float | None = None
 
         # Ruling formatting — uses a dedicated client (provider resolved
         # from LLM_PROVIDER env var), separate from the field extraction
@@ -2569,6 +2577,8 @@ class IngestionWorker:
                     # been abandoned by other consumers that crashed.
                     if self._empty_polls > 0 and self._empty_polls % PENDING_RECLAIM_INTERVAL == 0:
                         self._reclaim_pending_messages()
+
+                    self._maybe_trim_consumed_entries()
                 except KeyboardInterrupt:
                     logger.info("Ingestion worker stopped")
                     break
@@ -5245,6 +5255,37 @@ class IngestionWorker:
                 "deleted": deleted,
             },
         )
+
+    def _maybe_trim_consumed_entries(self) -> int:
+        """Trim acknowledged entries if ``STREAM_TRIM_INTERVAL_S`` has elapsed.
+
+        Best-effort: a failure is logged and the consumer loop carries on.
+        Returns the number of entries trimmed (0 when skipped or failed).
+        """
+        now = time.monotonic()
+        if self._last_trim_time is not None and now - self._last_trim_time < STREAM_TRIM_INTERVAL_S:
+            return 0
+        self._last_trim_time = now
+        try:
+            trimmed, floor = trim_consumed_entries(self._redis, STREAM_DOCUMENT_CAPTURED)
+            length = self._redis.xlen(STREAM_DOCUMENT_CAPTURED)
+        except Exception as exc:
+            logger.warning("Stream trim failed: %s", exc)
+            return 0
+        # Logged on every trim pass (once a minute) so the stream length is
+        # always visible in the log; a growing length here means the backlog
+        # is unconsumed, not dead weight.  CloudWatch metric filter
+        # judgemind-event-bus-stream-length reads stream_length (#4474).
+        logger.info(
+            "Event stream trim pass",
+            extra={
+                "stream": STREAM_DOCUMENT_CAPTURED,
+                "trimmed": trimmed,
+                "stream_length": int(length or 0),
+                "floor_id": floor,
+            },
+        )
+        return trimmed
 
     def _reclaim_pending_messages(self, batch_size: int = 100) -> int:
         """Reclaim abandoned pending messages from dead consumers.
