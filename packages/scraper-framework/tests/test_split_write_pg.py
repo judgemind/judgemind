@@ -28,6 +28,7 @@ from ingestion.db import (
     write_split_rulings,
 )
 from ingestion.split_ids import derive_parent_document_id, make_split_document_id
+from validation.gate import ValidationResult, insert_validation_result
 
 _DSN = os.environ.get("TEST_DATABASE_URL", "")
 
@@ -283,3 +284,74 @@ def test_protected_slot_is_left_alone(conn: object) -> None:
         owns_key=True,
     )
     assert key.rulings()[key.slot(1)] == before[key.slot(1)]
+
+
+def _validation_fail(conn: object, key: Key, document_id: str) -> str:
+    """Log a validation FAIL for *document_id* the way the worker's fail
+    paths do: the row carries the event's attribution, and the child is then
+    left out of the split set it would have joined."""
+    insert_validation_result(
+        conn,
+        document_id=document_id,
+        ruling_id=None,
+        result=ValidationResult(
+            result="fail",
+            reason="unknown_and_null_title_fail",
+            model="deterministic",
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+        ),
+        county="Split Write",
+        scraper_id="reingest-ca-test",
+        s3_key=key.s3_key,
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text FROM validation_results WHERE document_id = %s::uuid "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (document_id,),
+        )
+        return cur.fetchone()[0]
+
+
+def _validation_rows(conn: object, document_id: str) -> dict[str, tuple[str, str, str, str]]:
+    """``{row id: (result, county, scraper_id, s3_key)}`` for one document."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text, result, county, scraper_id, s3_key FROM validation_results "
+            "WHERE document_id = %s::uuid",
+            (document_id,),
+        )
+        return {row[0]: tuple(row[1:]) for row in cur.fetchall()}
+
+
+def test_rejected_child_keeps_its_validation_results_fail_row(conn: object) -> None:
+    """#4879: on a reingest a previously valid child now fails validation.
+    The worker logs the fail and leaves the child out of the split set, so
+    the child's old document row is stale and removed.  The fail row logged
+    for it in the same run is telemetry (not rebuildable from S3) and must
+    survive, still attributed to its county, scraper and raw S3 key."""
+    key = Key(conn)
+    key.write([("30-H-1", _text(1)), ("30-H-2", _text(2)), ("30-H-3", _text(3))])
+    rejected = key.slot(1)
+    assert rejected in key.statuses()
+
+    fail_id = _validation_fail(conn, key, rejected)
+    key.write([("30-H-1", _text(1)), None, ("30-H-3", _text(3))])
+
+    assert rejected not in key.statuses()  # the stale document row is gone
+    rows = _validation_rows(conn, rejected)
+    assert list(rows) == [fail_id]
+    assert rows[fail_id] == ("fail", "Split Write", "reingest-ca-test", key.s3_key)
+
+
+def test_stale_child_cleanup_keeps_earlier_validation_results_rows(conn: object) -> None:
+    """#4879: a split set that shrinks removes the dropped child's document,
+    not the validation history logged for it on earlier runs."""
+    key = Key(conn)
+    key.write([("30-I-1", _text(1)), ("30-I-2", _text(2))])
+    old_fail = _validation_fail(conn, key, key.slot(1))
+    key.write([("30-I-1", _text(1))])
+    assert key.slot(1) not in key.statuses()
+    assert list(_validation_rows(conn, key.slot(1))) == [old_fail]

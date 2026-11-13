@@ -2998,8 +2998,11 @@ def delete_stale_split_children(
       3. Its ``id`` is NOT in the ``valid_document_ids`` list (the new set
          of split IDs that will be created/upserted by this processing run).
 
-    Deletes dependent ``derived.*`` / telemetry rows in ``rulings`` and
-    ``validation_results``.  ``public.alert_events`` is authoritative user
+    Deletes the dependent ``derived.rulings`` rows.  ``telemetry.validation_results``
+    rows are never deleted: telemetry is not rebuildable from S3, the table
+    has no FK to ``documents``, and a child rejected by validation in this
+    run is stale here, so deleting would erase the fail row the run just
+    logged for it (#4879).  ``public.alert_events`` is authoritative user
     state and its FKs to ``documents`` / ``rulings`` do not cascade, so
     alerts are never deleted here (#4700): ``ruling_id`` is set to NULL and
     ``document_id`` is re-pointed at ``parent_document_id`` (the stable
@@ -3071,10 +3074,10 @@ def delete_stale_split_children(
             "WHERE previous_version_id = ANY(%s::uuid[])",
             (stale_ids,),
         )
-        cur.execute(
-            "DELETE FROM validation_results WHERE document_id = ANY(%s::uuid[])",
-            (stale_ids,),
-        )
+        # ``telemetry.validation_results`` rows are kept (#4879): the table
+        # has no FK to ``documents``, and a rejected child's fail row, which
+        # this same run committed moments ago, is the only record of the
+        # failure.  It carries its own county / scraper_id / s3_key (#4706).
         cur.execute(
             "DELETE FROM rulings WHERE document_id = ANY(%s::uuid[])",
             (stale_ids,),

@@ -22,6 +22,10 @@ properties that must hold for any sequence of re-splits:
 - ``kept``: a split child whose per-child LLM enrichment is exhausted keeps
   the document and ruling its slot already held (#4878).  Checked by
   :func:`run_enrichment_failure`, which drives each deterministic splitter.
+- ``telemetry``: a ``telemetry.validation_results`` row for the key, once
+  committed, is never deleted, including a fail row the same step logged
+  for a child it then dropped as stale (#4879).  ``telemetry.*`` is not
+  rebuildable from S3.
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -80,6 +84,7 @@ INVARIANTS = (
     "synthetic_title",
     "converge",
     "kept",
+    "telemetry",
     "error",
 )
 
@@ -450,6 +455,8 @@ class KeyHarness:
         self._key: Key | None = None
         self._step_label = ""
         self._snapshots: list[Counter[tuple[str, str]]] = []
+        #: ``validation_results`` ids for the key seen committed this step.
+        self._validation_seen: set[str] = set()
         self._pending: InvariantError | None = None
         self.conn = _CheckedConn(self.real, self._after_commit)
         #: alert id -> (s3_key, ruling identity)
@@ -520,6 +527,7 @@ class KeyHarness:
         self._attach_alerts(key)
         before = ruling_identities(read_key(self.checker, key.s3_key))
         self._snapshots = []
+        self._validation_seen = self._validation_ids(key)
         self._pending = None
         self.extractor.rulings = extracted_rulings(step)
         try:
@@ -543,6 +551,7 @@ class KeyHarness:
         self._guard("gap", self._check_gap, before, after)
         self._guard("alert", self._check_alerts, key, after_rows)
         self._guard("search", self._check_search, key, after_rows)
+        self._guard("telemetry", self._check_telemetry, key)
         if step.kind != "db":
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
@@ -607,6 +616,7 @@ class KeyHarness:
             return
         rows = read_key(self.checker, key.s3_key)
         self._snapshots.append(ruling_identities(rows))
+        self._validation_seen |= self._validation_ids(key)
         try:
             self._guard("superseded", self._check_supersede, key, rows)
             self._guard("date_source", self._check_date_source, key, rows)
@@ -622,7 +632,26 @@ class KeyHarness:
                     "and no hearing_date_source",
                 )
 
+    def _validation_ids(self, key: Key) -> set[str]:
+        """Committed ``validation_results`` row ids for *key*: rows that
+        carry its S3 key, or name one of its document ids."""
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT id::text FROM validation_results "
+                "WHERE s3_key = %s OR document_id = ANY(%s::uuid[])",
+                (key.s3_key, [key.parent, *key.slots]),
+            )
+            return {row[0] for row in cur.fetchall()}
+
     # -- invariants -----------------------------------------------------
+
+    def _check_telemetry(self, key: Key) -> None:
+        gone = self._validation_seen - self._validation_ids(key)
+        if gone:
+            self._fail(
+                "telemetry",
+                f"{len(gone)} committed validation_results row(s) were deleted: {sorted(gone)}",
+            )
 
     def _check_gap(self, before: Counter[tuple[str, str]], after: Counter[tuple[str, str]]) -> None:
         kept = set(before) & set(after)
