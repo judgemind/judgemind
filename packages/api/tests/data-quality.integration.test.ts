@@ -683,6 +683,35 @@ describe('rosterFreshness', () => {
     );
   });
 
+  // EMPTY_SNAP: good snapshot 3 days ago, then each run saved an empty
+  // mapping just before recording its empty_roster failure (pre-#4880 rows).
+  const EMPTY_SNAP = 'test_roster_empty_snapshot';
+  beforeAll(async () => {
+    await pool.query(
+      `INSERT INTO derived.court_directory_snapshots (court_id, captured_at, s3_key, mapping, content_hash)
+       VALUES ($1, NOW() - INTERVAL '3 days', 'directories/good.html', '{"1": "Judge D"}', 'h4')`,
+      [EMPTY_SNAP],
+    );
+    for (const [hours, hash] of [
+      [2, 'h5'],
+      [1, 'h6'],
+    ] as const) {
+      await pool.query(
+        `INSERT INTO derived.court_directory_snapshots (court_id, captured_at, s3_key, mapping, content_hash)
+         VALUES ($1, NOW() - make_interval(hours => $2) - INTERVAL '1 second',
+                 'directories/empty.html', '{}', $3)`,
+        [EMPTY_SNAP, hours, hash],
+      );
+      await pool.query(
+        `INSERT INTO telemetry.roster_fetch_attempts
+           (court_id, directory_class, attempted_at, outcome, department_count, error_class, error_message)
+         VALUES ($1, 'EmptyDirectory', NOW() - make_interval(hours => $2), 'failure', 0,
+                 'empty_roster', 'EmptyRosterError: 0 departments')`,
+        [EMPTY_SNAP, hours],
+      );
+    }
+  });
+
   afterAll(async () => {
     await cleanupRoster();
   });
@@ -735,5 +764,14 @@ describe('rosterFreshness', () => {
     expect(recovered.status).toBe('ok');
     expect(recovered.consecutiveFailures).toBe(0);
     expect(recovered.lastSuccessAt).toBe(recovered.lastSnapshotAt);
+
+    // Empty-mapping snapshots are not successes: the court shows as failing,
+    // with every empty_roster run counted since the last good snapshot.
+    const emptySnap = byCourt.get(EMPTY_SNAP)!;
+    expect(emptySnap.status).toBe('failing');
+    expect(emptySnap.lastErrorClass).toBe('empty_roster');
+    expect(emptySnap.consecutiveFailures).toBe(2);
+    expect(emptySnap.ageHours as number).toBeGreaterThan(70);
+    expect(emptySnap.lastSuccessAt).toBe(emptySnap.lastSnapshotAt);
   });
 });

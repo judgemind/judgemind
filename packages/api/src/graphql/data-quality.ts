@@ -732,9 +732,12 @@ export const ROSTER_FRESHNESS_SQL = `
     WHERE outcome = 'success'
     GROUP BY court_id
   ),
+  -- Empty-mapping snapshots are failed parses, not successes (#4880). The
+  -- scraper no longer writes them, but older rows may still exist.
   last_snapshot AS (
     SELECT court_id, MAX(captured_at) AS captured_at
     FROM derived.court_directory_snapshots
+    WHERE mapping <> '{}'::jsonb
     GROUP BY court_id
   ),
   -- Failures since the newer of the last successful attempt and the last

@@ -342,3 +342,92 @@ def test_runner_fetch_rosters_survives_real_directory_failure() -> None:
     assert row[2] == "failure"
     assert row[5] == ERROR_OTHER
     assert "directory page layout changed" in row[7]
+
+
+# ---------------------------------------------------------------------------
+# Empty parses never become the newest snapshot (#4880)
+# ---------------------------------------------------------------------------
+
+
+class _SnapshotDb(_FakeDb):
+    """_FakeDb that also records every SQL statement and commit."""
+
+    def __init__(self) -> None:
+        super().__init__(snapshot_ids=[7, 7])
+        self.statements: list[str] = []
+        self.commits = 0
+
+    def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+        self.statements.append(sql)
+        super().execute(sql, params)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def snapshot_inserts(self) -> list[str]:
+        return [s for s in self.statements if "INSERT INTO court_directory_snapshots" in s]
+
+
+class _EmptyParseDirectory(CourtDirectory):
+    """Page bytes change on every fetch (nonce) but parse to nothing."""
+
+    COURT_ID = "ca_test"
+
+    def fetch_current(self) -> tuple[bytes, dict[str, str]]:
+        return (b"<html>changed bytes nonce=8f3a</html>", {})
+
+
+def test_empty_parse_writes_no_snapshot_and_records_empty_roster() -> None:
+    """The previous snapshot stays newest; the attempt is an empty_roster failure."""
+    mod = types.ModuleType("empty_mod")
+    mod.FakeCourtDirectory = _EmptyParseDirectory  # type: ignore[attr-defined]
+    db = _SnapshotDb()
+    s3 = MagicMock()
+    with patch("framework.roster_health.importlib.import_module", return_value=mod):
+        result = fetch_roster(
+            "empty_mod",
+            "FakeCourtDirectory",
+            "ca_test",
+            s3_client=s3,
+            bucket="bucket",
+            db_conn=db,
+        )
+
+    assert db.snapshot_inserts() == []
+    assert db.commits == 0
+    s3.put_object.assert_not_called()
+    assert result.outcome == "failure"
+    assert result.error_class == ERROR_EMPTY_ROSTER
+    assert result.department_count == 0
+
+
+def test_empty_parse_fetch_and_snapshot_returns_empty_without_saving() -> None:
+    """Callers (tentatives scrapers, rebuild_db) still get the empty mapping back."""
+    directory = _EmptyParseDirectory(s3_client=MagicMock(), s3_bucket="b", db_conn=_SnapshotDb())
+    with patch.object(_EmptyParseDirectory, "save_snapshot") as save:
+        assert directory.fetch_and_snapshot("ca_test") == {}
+    save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module_path", "class_name", "raw"),
+    [
+        # Both override save_snapshot, so the guard must sit above it.
+        ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory", b"%PDF-1.7 changed"),
+        ("courts.ca.sf_dept_judges", "SFCourtDirectory", b"%PDF-1.7 changed"),
+        ("courts.ca.sf_dept_judges", "SFCourtDirectory", b"<article>changed</article>"),
+    ],
+)
+def test_empty_parse_save_snapshot_overrides_are_not_called(
+    module_path: str, class_name: str, raw: bytes
+) -> None:
+    import importlib
+
+    cls = getattr(importlib.import_module(module_path), class_name)
+    db = _SnapshotDb()
+    s3 = MagicMock()
+    directory = cls(s3_client=s3, s3_bucket="b", db_conn=db)
+    with patch.object(cls, "fetch_current", return_value=(raw, {})):
+        assert directory.fetch_and_snapshot() == {}
+    assert db.snapshot_inserts() == []
+    s3.put_object.assert_not_called()
