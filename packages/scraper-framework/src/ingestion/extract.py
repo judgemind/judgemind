@@ -1114,6 +1114,15 @@ def case_number_supported_by_text(case_number: str | None, *texts: str | None) -
     ``30-2024-01393434`` matches ``30 - 2024 -\\n01393434``.  A digit run
     of at least six digits in the number also counts as support on its
     own, for numbers the LLM re-formatted.
+
+    PDFs that fake bold type by drawing every glyph twice extract with each
+    character doubled (``22002255--0011448899880077`` for
+    ``2025-01489807``, Orange Dept C23); the doubled spelling counts too.
+
+    A number wrapped inside a narrow table column extracts in pieces with
+    the neighbouring column's words between them (``30-`` / ``2018-`` /
+    ``009968 were approved by ...`` / ``52``, Orange Dept CX103); pieces
+    that spell the number in order, close together, count too.
     """
     if not case_number:
         return False
@@ -1121,15 +1130,52 @@ def case_number_supported_by_text(case_number: str | None, *texts: str | None) -
     if not normalized:
         return False
     runs = [r for r in _DIGIT_RUN_RE.findall(case_number) if len(r) >= _MIN_SUPPORTING_DIGIT_RUN]
+    needles = [normalized, *runs]
+    needles += [_double_chars(n) for n in needles]
     for text in texts:
         if not text:
             continue
-        haystack = _NON_ALNUM_RE.sub("", text.upper())
-        if normalized in haystack:
+        upper = text.upper()
+        haystack = _NON_ALNUM_RE.sub("", upper)
+        if any(needle in haystack for needle in needles):
             return True
-        if any(run in haystack for run in runs):
+        if _spelled_by_wrapped_pieces(normalized, _ALNUM_TOKEN_RE.findall(upper)):
             return True
     return False
+
+
+_ALNUM_TOKEN_RE = re.compile(r"[A-Z0-9]+")
+
+# Wrapped-piece matching: at most this many pieces, each within this many
+# tokens of the previous one (the other column's words on the same lines).
+_MAX_WRAPPED_PIECES = 6
+_WRAPPED_PIECE_WINDOW = 60
+
+
+def _spelled_by_wrapped_pieces(target: str, tokens: list[str]) -> bool:
+    """Return True when consecutive-ish *tokens* concatenate to *target*."""
+
+    def extend(remaining: str, after: int, pieces: int) -> bool:
+        if not remaining:
+            return True
+        if pieces >= _MAX_WRAPPED_PIECES:
+            return False
+        for j in range(after + 1, min(after + 1 + _WRAPPED_PIECE_WINDOW, len(tokens))):
+            if remaining.startswith(tokens[j]) and extend(
+                remaining[len(tokens[j]) :], j, pieces + 1
+            ):
+                return True
+        return False
+
+    for i, token in enumerate(tokens):
+        if len(token) >= 2 and target.startswith(token) and token != target:
+            if extend(target[len(token) :], i, 1):
+                return True
+    return False
+
+
+def _double_chars(value: str) -> str:
+    return "".join(ch * 2 for ch in value)
 
 
 # ---------------------------------------------------------------------------
