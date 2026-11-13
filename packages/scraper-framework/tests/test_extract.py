@@ -3934,6 +3934,28 @@ class TestCaseNumberSupportedByText:
     def test_long_digit_run_supports_a_reformatted_number(self) -> None:
         assert case_number_supported_by_text("2025-1521814", "Case 25-1521814")
 
+    def test_fake_bold_doubled_characters_support(self) -> None:
+        """Orange Dept C23 PDFs draw each glyph twice; pdfplumber extracts
+        ``2025-01489807`` as ``22002255--0011448899880077``."""
+        assert case_number_supported_by_text("2025-01489807", "22002255--0011448899880077  OOnn")
+        assert not case_number_supported_by_text("2025-00912345", "22002255--0011448899880077")
+
+    def test_number_wrapped_in_a_narrow_column_supports(self) -> None:
+        """Orange Dept CX103: the case-number column wraps, and the ruling
+        column's words land between the pieces."""
+        text = (
+            "1 30- The settlement administrator has confirmed that the distribution of the\n"
+            "2018- settlement funds has been made in accordance with the settlement terms that\n"
+            "009968 were approved by the court and that the amount of the uncashed checks from\n"
+            "52\nthe settlement has been transmitted to the State Controller's Office's\n"
+        )
+        assert case_number_supported_by_text("2018-00996852", text)
+        assert case_number_supported_by_text("30-2018-00996852", text)
+        assert not case_number_supported_by_text("2018-00912345", text)
+
+    def test_empty_tokens_text_does_not_crash(self) -> None:
+        assert not case_number_supported_by_text("23STCV01234", "!!! ---")
+
     def test_any_text_may_support(self) -> None:
         assert case_number_supported_by_text("24CV412345", None, "", "x 24CV412345")
 
