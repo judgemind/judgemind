@@ -1,22 +1,35 @@
-"""Tests for source-authority arbitration in resolve_judge (issue #3484 / #3503).
+"""Tests for source-authority arbitration in resolve_judge (#3484 / #3503 / #4922).
 
 Covers:
   - Roster typo loses to corroborated calendar spelling
   - Typo retained as alias for historical lookups
-  - Single non-roster source does not override multi-source roster
-  - Repeated same-source calls do not count as independent
-  - Existing two-source corroboration promotes on third call
-  - Two-call sequence: second call promotes via Step 1 arbitration (#3503)
-  - Multi-source bootstrap: two calls from different sources flip canonical (#3503)
+  - A better-corroborated canonical is not overridden (#4922)
+  - Step 1 arbitration promotes a better-corroborated spelling (#3503)
   - Step 1 arbitration skips when canonical already matches (#3503)
   - Step 3b fall-through stores caller source instead of roster_match (#3503)
+  - Spelling choice: family corroboration, then "First M. Last" completeness
+  - Real Postgres: the same observations in any order settle on one name
+    with at most one rename (#4922)
 """
 
 from __future__ import annotations
 
+import os
+import random
+import uuid
 from unittest.mock import MagicMock
 
-from ingestion.db import clear_roster_cache, resolve_judge
+import pytest
+
+from ingestion.db import (
+    _choose_canonical_spelling,
+    _spelling_completeness,
+    clear_roster_cache,
+    resolve_judge,
+)
+
+_DSN = os.environ.get("TEST_DATABASE_URL", "")
+_needs_pg = pytest.mark.skipif(not _DSN, reason="TEST_DATABASE_URL not set")
 
 
 def _make_mock_conn() -> tuple[MagicMock, MagicMock]:
@@ -203,12 +216,11 @@ class TestRosterTypoArbitration:
         # No demotion alias for the roster name: promotion did not happen.
         assert not any("'roster_match'" in c and "INSERT INTO judge_aliases" in c for c in sql)
 
-    def test_single_non_roster_source_does_not_override_yet(self) -> None:
-        """A single-source contradiction with no corroboration leaves canonical untouched.
+    def test_better_corroborated_canonical_is_not_overridden(self) -> None:
+        """A spelling with less document support than the canonical does not win (#4922).
 
-        When the incoming call IS the first non-roster source and the existing
-        canonical already has multi-source support (not just roster_match),
-        we should NOT promote.
+        The stored canonical is read from two non-roster sources; the incoming
+        spelling only from the caller's.  The canonical stays.
         """
         mock_conn, mock_cur = _make_mock_conn()
 
@@ -221,15 +233,15 @@ class TestRosterTypoArbitration:
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
-            # Arbitration: NO existing non-roster aliases -> empty
-            [],
+            # Arbitration: the stored spelling has two non-roster sources
+            [("Mattew C. Braner", "sd_roa"), ("Mattew C. Braner", "sd_tentatives")],
         ]
 
         result = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_calendar")
 
         assert result == "existing-judge-uuid"
 
-        # Should NOT have issued UPDATE judges (no corroboration)
+        # Should NOT have issued UPDATE judges (canonical better corroborated)
         all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
         update_calls = [c for c in all_sql_calls if "UPDATE judges" in c]
         assert len(update_calls) == 0, (
@@ -335,119 +347,69 @@ class TestStep1ArbitrationWireUp:
     even after Step 1 short-circuits Step 3b.
     """
 
-    def test_two_call_sequence_promotes_on_second_call(self) -> None:
-        """Two calls with the same source flip canonical on the second call.
+    def test_uncorroborated_roster_canonical_loses_on_first_sighting(self) -> None:
+        """A document spelling beats a canonical no document has printed (#4922).
 
         Scenario:
-        - Judge exists as 'Mattew C. Braner' (roster typo).
-        - Call 1: raw_name='MATTHEW C. BRANER', source='sd_calendar'.
-          No alias exists yet → goes through Step 3b → no corroboration →
-          fall-through INSERT stores source='sd_calendar' alias.
-        - Call 2: raw_name='MATTHEW C. BRANER', source='sd_calendar'.
-          Step 1 finds the alias inserted in call 1, matched canonical is
-          'Mattew C. Braner' != 'Matthew C. Braner' → _maybe_arbitrate runs →
-          finds sd_calendar alias → promotes canonical to 'Matthew C. Braner'.
+        - Judge exists as 'Mattew C. Braner' (roster typo, no document evidence).
+        - Call 1: raw_name='MATTHEW C. BRANER', source='sd_calendar' goes through
+          Step 3b; the caller's alias is recorded and is the only document
+          evidence, so the canonical becomes 'Matthew C. Braner'.
+        - Call 2: same spelling, Step 1 alias hit on the renamed judge: the
+          spelling already is the canonical, so no second rename.
         """
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
-        # Clear the roster cache so call 1 populates it (call 2 reuses it).
+        mock_conn, mock_cur = _make_mock_conn()
         clear_roster_cache("court-uuid-1")
 
-        # fetchone side_effect across both resolve_judge calls:
-        # --- Call 1 ---
-        # Step 1: no alias yet
-        # Step 2: no exact canonical 'Matthew C. Braner'
-        # _get_roster_names: court_code lookup
-        # _get_roster_names: snapshot lookup
-        # Step 3b: judge with 'Mattew C. Braner' exists
-        # --- Call 2 ---
-        # Step 1: alias found, matched canonical is 'Mattew C. Braner'
         mock_cur.fetchone.side_effect = [
             None,  # Call1 Step1: no alias
             None,  # Call1 Step2: no exact canonical
             ("ca-san_diego",),  # Call1 _get_roster_names: court_code
             ({"D1": "Mattew C. Braner"},),  # Call1 _get_roster_names: snapshot
             ("existing-judge-uuid",),  # Call1 Step3b: judge exists
-            ("existing-judge-uuid", "Mattew C. Braner"),  # Call2 Step1: alias hit
+            ("existing-judge-uuid", "Matthew C. Braner"),  # Call2 Step1: alias hit
         ]
-
-        # fetchall side_effect across both calls:
-        # --- Call 1 ---
-        # Step3 near-dup: empty
-        # _maybe_arbitrate in Step3b: no existing aliases yet
-        # --- Call 2 ---
-        # _maybe_arbitrate in Step1: sd_calendar alias from call1 exists
         mock_cur.fetchall.side_effect = [
             [],  # Call1 Step3 near-dup
-            [],  # Call1 _maybe_arbitrate: no corroboration yet
-            [("matthew c. braner", "sd_calendar")],  # Call2 _maybe_arbitrate: promotes!
+            [],  # Call1 _maybe_arbitrate: no other document evidence
         ]
 
         result1 = resolve_judge(
             mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_calendar"
         )
-        result2 = resolve_judge(
-            mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_calendar"
-        )
+        result2 = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-1", source="sd_roa")
 
         assert result1 == "existing-judge-uuid"
         assert result2 == "existing-judge-uuid"
 
-        # Call 2 must have issued UPDATE judges to promote the incoming spelling
         all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
         update_calls = [c for c in all_sql_calls if "UPDATE judges" in c]
-        assert len(update_calls) == 1, (
-            f"Expected 1 UPDATE judges call on second call, got: {update_calls}"
-        )
+        assert len(update_calls) == 1, f"Expected exactly 1 UPDATE judges, got: {update_calls}"
         assert "Matthew C. Braner" in update_calls[0]
+        # Call 2 still records its evidence under its own source.
+        assert "sd_roa" in all_sql_calls[-1]
+        assert "INSERT INTO judge_aliases" in all_sql_calls[-1]
 
-    def test_multi_source_bootstrap_promotes(self) -> None:
-        """Two calls from different sources flip the canonical.
+    def test_step1_alias_hit_promotes_better_corroborated_spelling(self) -> None:
+        """Step 1 runs arbitration when the alias's judge has another canonical (#3503).
 
-        Scenario:
-        - Judge exists as 'Mattew C. Braner' (roster typo).
-        - Call 1: source='sd_calendar' → fall-through inserts sd_calendar alias.
-        - Call 2: source='sd_roa' → Step 1 finds the alias from call 1,
-          sees canonical mismatch, calls _maybe_arbitrate which finds the
-          sd_calendar alias → promotes canonical to 'Matthew C. Braner'.
+        The judge is stored as 'Mattew C. Braner'; the alias for 'MATTHEW C.
+        BRANER' exists and two sources read that spelling, so it wins.
         """
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
-        clear_roster_cache("court-uuid-2")
-
+        mock_conn, mock_cur = _make_mock_conn()
         mock_cur.fetchone.side_effect = [
-            None,  # Call1 Step1: no alias
-            None,  # Call1 Step2: no exact canonical
-            ("ca-san_diego",),  # Call1 _get_roster_names: court_code
-            ({"D1": "Mattew C. Braner"},),  # Call1 _get_roster_names: snapshot
-            ("existing-judge-uuid",),  # Call1 Step3b: judge exists
-            ("existing-judge-uuid", "Mattew C. Braner"),  # Call2 Step1: alias hit
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step1: alias hit
         ]
         mock_cur.fetchall.side_effect = [
-            [],  # Call1 Step3 near-dup
-            [],  # Call1 _maybe_arbitrate: no corroboration yet
-            [("matthew c. braner", "sd_calendar")],  # Call2 _maybe_arbitrate: sd_calendar present
+            [("Mattew C. Braner", "scraper"), ("matthew c. braner", "sd_calendar")],
         ]
 
-        result1 = resolve_judge(
-            mock_conn, "MATTHEW C. BRANER", "court-uuid-2", source="sd_calendar"
-        )
-        result2 = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-2", source="sd_roa")
+        result = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-2", source="sd_roa")
 
-        assert result1 == "existing-judge-uuid"
-        assert result2 == "existing-judge-uuid"
-
+        assert result == "existing-judge-uuid"
         all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
         update_calls = [c for c in all_sql_calls if "UPDATE judges" in c]
-        assert len(update_calls) == 1, (
-            f"Expected 1 UPDATE judges call on second call, got: {update_calls}"
-        )
+        assert len(update_calls) == 1, f"Expected 1 UPDATE judges call, got: {update_calls}"
         assert "Matthew C. Braner" in update_calls[0]
 
     def test_step1_arbitration_skips_when_canonical_matches(self) -> None:
@@ -504,7 +466,8 @@ class TestStep1ArbitrationWireUp:
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step3 near-dup
-            [],  # _maybe_arbitrate: no corroboration yet
+            # _maybe_arbitrate: the stored spelling is better corroborated
+            [("Mattew C. Braner", "sd_roa"), ("Mattew C. Braner", "sd_tentatives")],
         ]
 
         result = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-4", source="sd_calendar")
@@ -856,7 +819,8 @@ class TestRenamedJudgeIds:
 
     def test_step1_arbitration_promotion_is_reported(self) -> None:
         mock_conn, mock_cur = _make_mock_conn()
-        mock_cur.fetchone.side_effect = [("judge-sc", "H. Shaina Clover")]  # Step 1 hit
+        # Step 1 hit on a judge stored under a spelling no document printed.
+        mock_cur.fetchone.side_effect = [("judge-sc", "H. Shaina Colover")]
         mock_cur.fetchall.side_effect = [[("shaina clover", "rebuild-ca-orange")]]
         mock_cur.rowcount = 1
         renamed: set[str] = set()
@@ -871,3 +835,212 @@ class TestRenamedJudgeIds:
 
         assert result == "judge-sc"
         assert renamed == {"judge-sc"}
+
+
+class TestChooseCanonicalSpelling:
+    """The spelling choice behind arbitration (#4922)."""
+
+    def test_more_complete_spelling_wins_within_a_family(self) -> None:
+        evidence = [
+            ("Shaina Clover", "rebuild-ca-orange"),
+            ("Shaina Clover", "reingest-ca-orange"),
+            ("H. Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "reingest-ca-orange"),
+        ]
+        for current in ("Shaina Clover", "H. Shaina Clover"):
+            winner, _ = _choose_canonical_spelling(current, evidence)
+            assert winner == "H. Shaina Clover"
+
+    def test_dotted_initial_wins_over_bare_initial(self) -> None:
+        evidence = [("Craig L Griffin", "rebuild-ca-orange"), ("Craig L. Griffin", "scraper")]
+        for current in ("Craig L Griffin", "Craig L. Griffin"):
+            assert _choose_canonical_spelling(current, evidence)[0] == "Craig L. Griffin"
+
+    def test_first_m_last_preferred_over_leading_initial(self) -> None:
+        """Same words, same initials: the "First M. Last" form wins."""
+        evidence = [("H. Shaina Clover", "a"), ("Shaina H. Clover", "b")]
+        assert _choose_canonical_spelling("H. Shaina Clover", evidence)[0] == "Shaina H. Clover"
+        assert _spelling_completeness("Shaina H. Clover") > _spelling_completeness(
+            "H. Shaina Clover"
+        )
+
+    def test_middle_initial_not_dropped_for_a_less_complete_spelling(self) -> None:
+        """'Joseph Widman' no longer demotes 'Joseph B. Widman' (13:12Z on dev)."""
+        evidence = [("Joseph Widman", "scraper")]
+        assert _choose_canonical_spelling("Joseph B. Widman", evidence)[0] == "Joseph B. Widman"
+
+    def test_better_corroborated_family_beats_more_complete_typo(self) -> None:
+        evidence = [
+            ("H. Shaina Colover", "scraper"),
+            ("Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "reingest-ca-orange"),
+        ]
+        assert _choose_canonical_spelling("H. Shaina Colover", evidence)[0] == "H. Shaina Clover"
+
+    def test_case_variants_are_one_spelling(self) -> None:
+        evidence = [("CRAIG L. GRIFFIN", "a"), ("craig l. griffin", "b")]
+        winner, sources = _choose_canonical_spelling("Craig L. Griffin", evidence)
+        assert winner == "Craig L. Griffin"
+        assert sources["craig l. griffin"] == {"a", "b"}
+
+    def test_unusable_evidence_is_ignored(self) -> None:
+        evidence = [("", "a"), ("Craig Griffin", None), ("First M. Last", "b")]
+        assert _choose_canonical_spelling("Craig L. Griffin", evidence)[0] == "Craig L. Griffin"
+
+
+# ---------------------------------------------------------------------------
+# Real Postgres: order independence (#4922)
+# ---------------------------------------------------------------------------
+
+
+class _PgCourt:
+    """A fresh court with one judge, for resolve_judge against real Postgres."""
+
+    def __init__(self, canonical: str, aliases: list[tuple[str, str]]) -> None:
+        import psycopg
+
+        self.conn = psycopg.connect(_DSN, autocommit=False)
+        code = f"ca-arb4922-{uuid.uuid4().hex[:12]}"
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO courts (state, county, court_name, court_code) "
+                "VALUES ('CA', 'Arb4922', 'Superior Court', %s) RETURNING id",
+                (code,),
+            )
+            self.court_id = str(cur.fetchone()[0])
+            cur.execute(
+                "INSERT INTO judges (canonical_name, court_id) VALUES (%s, %s::uuid) RETURNING id",
+                (canonical, self.court_id),
+            )
+            self.judge_id = str(cur.fetchone()[0])
+            for raw, source in aliases:
+                cur.execute(
+                    "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence) "
+                    "VALUES (%s::uuid, %s, %s, 1.0)",
+                    (self.judge_id, raw, source),
+                )
+        self.conn.commit()
+        clear_roster_cache(self.court_id)
+
+    def observe(self, raw: str, source: str) -> bool:
+        """One document's judge resolution; True when it renamed the judge."""
+        renamed: set[str] = set()
+        judge_id = resolve_judge(
+            self.conn, raw, self.court_id, source=source, renamed_judge_ids=renamed
+        )
+        self.conn.commit()
+        assert judge_id == self.judge_id, f"{raw!r} resolved to another judge"
+        return bool(renamed)
+
+    def canonical(self) -> str:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT canonical_name FROM judges WHERE id = %s::uuid", (self.judge_id,))
+            return str(cur.fetchone()[0])
+
+    def close(self) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM judges WHERE court_id = %s::uuid", (self.court_id,))
+            cur.execute("DELETE FROM courts WHERE id = %s::uuid", (self.court_id,))
+        self.conn.commit()
+        self.conn.close()
+
+
+def _run_orders(
+    start: str,
+    seed_aliases: list[tuple[str, str]],
+    observations: list[tuple[str, str]],
+    orders: int = 12,
+) -> tuple[set[str], int]:
+    """Run *observations* in *orders* random orders; return final names and max renames."""
+    finals: set[str] = set()
+    max_renames = 0
+    for seed in range(orders):
+        order = list(observations)
+        random.Random(seed).shuffle(order)
+        court = _PgCourt(start, seed_aliases)
+        try:
+            renames = sum(court.observe(raw, source) for raw, source in order)
+            finals.add(court.canonical())
+            max_renames = max(max_renames, renames)
+        finally:
+            court.close()
+    return finals, max_renames
+
+
+@_needs_pg
+class TestArbitrationOrderIndependencePg:
+    """The same observed spellings settle on one name in any order (#4922).
+
+    On dev, judge fb070234 (Orange, 254 rulings) flipped between 'Shaina
+    Clover' and 'H. Shaina Clover' three times in an hour: both spellings
+    had non-roster aliases, so every document with the other spelling
+    promoted it.  Each flip re-indexed all of the judge's rulings.
+    """
+
+    # Dev state before the fix: both spellings read by the rebuild, plus the
+    # roster's spelling linked to the judge.
+    _CLOVER_SEED = [
+        ("Shaina Clover", "rebuild-ca-orange"),
+        ("H. Shaina Clover", "rebuild-ca-orange"),
+        ("H. Shaina Colover", "roster_match"),
+    ]
+    _CLOVER_OBS = [
+        ("Shaina Clover", "reingest-ca-orange"),
+        ("H. Shaina Clover", "reingest-ca-orange"),
+        ("Shaina Clover", "ca-orange"),
+        ("H. Shaina Clover", "ca-orange"),
+    ] * 2
+
+    @pytest.mark.parametrize("start", ["Shaina Clover", "H. Shaina Clover"])
+    def test_clover_spellings_settle_with_at_most_one_rename(self, start: str) -> None:
+        finals, max_renames = _run_orders(start, self._CLOVER_SEED, self._CLOVER_OBS)
+        assert finals == {"H. Shaina Clover"}
+        assert max_renames <= 1
+        if start == "H. Shaina Clover":
+            assert max_renames == 0
+
+    def test_alternating_clover_spellings_rename_at_most_once(self) -> None:
+        """The issue's AC: alternating documents leave the name alone after one rename."""
+        court = _PgCourt("Shaina Clover", self._CLOVER_SEED)
+        try:
+            renames = [
+                court.observe(raw, "reingest-ca-orange")
+                for raw in ["H. Shaina Clover", "Shaina Clover"] * 4
+            ]
+            assert sum(renames) == 1
+            assert court.canonical() == "H. Shaina Clover"
+        finally:
+            court.close()
+
+    @pytest.mark.parametrize("start", ["Craig L Griffin", "Craig L. Griffin"])
+    def test_griffin_spellings_settle_with_at_most_one_rename(self, start: str) -> None:
+        seed = [
+            ("Craig L Griffin", "rebuild-ca-orange"),
+            ("Craig L. Griffin", "rebuild-ca-orange"),
+            ("Craig L. Griffin", "roster_match"),
+        ]
+        obs = [
+            ("Craig L Griffin", "reingest-ca-orange"),
+            ("Craig L. Griffin", "reingest-ca-orange"),
+            ("Craig L Griffin", "scraper"),
+            ("Craig L. Griffin", "scraper"),
+        ] * 2
+        finals, max_renames = _run_orders(start, seed, obs)
+        assert finals == {"Craig L. Griffin"}
+        assert max_renames <= 1
+
+    def test_roster_only_start_converges_to_one_name(self) -> None:
+        """From a canonical no document printed, every order ends on the same name."""
+        seed = [
+            ("Shaina Clover", "roster_match"),
+            ("H. Shaina Clover", "roster_match"),
+            ("H. Shaina Colover", "roster_match"),
+        ]
+        obs = [
+            ("Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "reingest-ca-orange"),
+            ("Shaina Clover", "reingest-ca-orange"),
+            ("H. Shaina Colover", "scraper"),
+        ]
+        finals, _ = _run_orders("H. Shaina Colover", seed, obs, orders=24)
+        assert finals == {"H. Shaina Clover"}

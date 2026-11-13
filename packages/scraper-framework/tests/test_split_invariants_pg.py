@@ -353,27 +353,30 @@ def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
     """Arbitration (``_maybe_arbitrate``) promoting a corroborated spelling
     over the stored canonical re-indexes the judge's other rulings too
     (#4920).  This is the path that flipped Orange's "Craig L. Griffin"
-    (469 rulings) during the #4907 reingest."""
+    (469 rulings) during the #4907 reingest.  Since #4922 only a spelling
+    with more document support than the stored one is promoted, so the
+    stored name here is a typo one source read and the promoted one is
+    read by two."""
     tag = f"{_RUN}-b4920arb"
     h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
     try:
         first = harness.make_key(f"{tag}-a", county_tag=tag)
         second = harness.make_key(f"{tag}-b", county_tag=tag)
-        h.run_step(first, _judge_ruling_step("live", tag, 1, "Shaina H. Clover"), "stored")
-        assert _judge_canonical(h, first) == ["Shaina H. Clover"]
-        # An earlier run read the judge as "Shaina Clover": a non-roster
+        h.run_step(first, _judge_ruling_step("live", tag, 1, "Craig L. Grifin"), "stored")
+        assert _judge_canonical(h, first) == ["Craig L. Grifin"]
+        # An earlier run read the judge as "Craig L. Griffin": a non-roster
         # alias corroborating that spelling.
         with h.checker.cursor() as cur:
             cur.execute(
                 "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified) "
-                "SELECT r.judge_id, 'Shaina Clover', 'rebuild-ca-harness', 1.0, FALSE "
+                "SELECT r.judge_id, 'Craig L. Griffin', 'rebuild-ca-harness', 1.0, FALSE "
                 "FROM rulings r WHERE r.document_id = %s::uuid",
                 (first.parent,),
             )
 
-        h.run_step(second, _judge_ruling_step("reingest", tag, 2, "Shaina Clover"), "arbitrate")
+        h.run_step(second, _judge_ruling_step("reingest", tag, 2, "Craig L. Griffin"), "arbitrate")
 
-        assert _judge_canonical(h, first) == ["Shaina Clover"]
-        assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Shaina Clover"}
+        assert _judge_canonical(h, first) == ["Craig L. Griffin"]
+        assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Craig L. Griffin"}
     finally:
         h.close()
