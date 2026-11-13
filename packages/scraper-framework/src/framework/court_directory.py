@@ -88,7 +88,8 @@ class CourtDirectory(abc.ABC):
     ) -> bool:
         """Archive a directory snapshot to S3 and DB.
 
-        Uses content-addressed S3 keys (``directories/{court_id}/{content_hash}.html``)
+        Uses content-addressed S3 keys (``directories/{court_id}/{content_hash}.html``,
+        or ``.pdf`` with ``application/pdf`` when ``raw`` is a PDF)
         so the same directory content always maps to the same key, making
         uploads idempotent. A HeadObject check skips the upload when the
         content is already archived.
@@ -112,7 +113,11 @@ class CourtDirectory(abc.ABC):
         """
         content_hash = sha256_hex(raw)
         now = datetime.now(UTC)
-        s3_key = f"directories/{court_id}/{content_hash}.html"
+        # PDF directories (e.g. LA's weekly Judicial Directory, #4874) keep a
+        # .pdf key and content type so the archived raw opens as what it is.
+        is_pdf = raw.startswith(b"%PDF")
+        extension, content_type = ("pdf", "application/pdf") if is_pdf else ("html", "text/html")
+        s3_key = f"directories/{court_id}/{content_hash}.{extension}"
 
         # Archive raw to S3 only if not already present (content-addressed).
         try:
@@ -131,7 +136,7 @@ class CourtDirectory(abc.ABC):
                 Bucket=self._bucket,
                 Key=s3_key,
                 Body=raw,
-                ContentType="text/html",
+                ContentType=content_type,
                 Metadata={
                     "court-id": court_id,
                     "content-hash": content_hash,

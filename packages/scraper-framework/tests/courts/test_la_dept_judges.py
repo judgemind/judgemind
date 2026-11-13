@@ -1,8 +1,13 @@
-"""Tests for LA department-to-judge mapping — built against real-format fixture HTML.
+"""Tests for LA department-to-judge mapping — built against real-format fixtures.
 
 Fixtures:
     la_judicial_officers.html — representative HTML table matching the structure
-    of https://www.lacourt.ca.gov/judicialofficers/ui/SearchResult.aspx
+    of the retired https://www.lacourt.ca.gov/judicialofficers/ui/SearchResult.aspx
+    (still parsed for archived S3 snapshots).
+    la_judicial_directory_trimmed.pdf — six pages of the real weekly "Judicial
+    Assignment and Directory" PDF (Week of 11/9/2026): Stanley Mosk p1, East LA /
+    Metropolitan / Edelman p5, Compton / Norwalk p20, Santa Monica p25, the first
+    alphabetical index page, and the location legend (#4874).
 """
 
 from __future__ import annotations
@@ -17,14 +22,17 @@ import respx
 from botocore.exceptions import ClientError
 
 from courts.ca.la_dept_judges import (
-    JUDICIAL_OFFICERS_URL,
+    JUDICIAL_DIRECTORY_PDF_URL,
+    DirectoryOfficer,
     JudicialOfficer,
     LACourtDirectory,
     _parse_combined_name,
     build_department_judge_map,
+    clean_officer_name,
     fetch_department_judge_mapping,
     lookup_judge_for_department,
     normalize_department,
+    parse_judicial_directory_pdf,
     parse_judicial_officers_html,
 )
 from courts.ca.la_tentatives import LATentativeRulingsScraper, default_config
@@ -38,6 +46,18 @@ FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 def _load(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+DIRECTORY_PDF = "la_judicial_directory_trimmed.pdf"
+
+
+def _load_pdf() -> bytes:
+    return (FIXTURES / DIRECTORY_PDF).read_bytes()
+
+
+@pytest.fixture(scope="module")
+def directory_officers() -> list[DirectoryOfficer]:
+    return parse_judicial_directory_pdf(_load_pdf())
 
 
 # ---------------------------------------------------------------------------
@@ -338,26 +358,209 @@ class TestLookupJudgeForDepartment:
 
 
 # ---------------------------------------------------------------------------
+# clean_officer_name — directory PDF officer cells (#4874)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanOfficerName:
+    @pytest.mark.parametrize(
+        ("cell", "expected"),
+        [
+            ("Judge William H. Forman", ("Judge", "William H. Forman")),
+            ("Commissioner Naomi R. Cohen", ("Commissioner", "Naomi R. Cohen")),
+            ("Judge Shelley Kaufman (SJ)", ("Judge", "Shelley Kaufman")),
+            ("Judge Jonathan L. Rosenbloom (ASJ)", ("Judge", "Jonathan L. Rosenbloom")),
+            ("Judge Annabelle G. Cortez (STJ)", ("Judge", "Annabelle G. Cortez")),
+            # Multi-line role note, joined from two PDF lines.
+            ("Judge Brenda J. Penny (SJ- Probate/Mental Health)", ("Judge", "Brenda J. Penny")),
+            ("Judge Akemi Arakaki (SJ-Juvenile Del/Dep)", ("Judge", "Akemi Arakaki")),
+            # A note left open (its second line missing) is still stripped.
+            ("Judge Brenda J. Penny (SJ-", ("Judge", "Brenda J. Penny")),
+            # Generational suffixes stay at the end.
+            ("Judge Charles Q. Clay III", ("Judge", "Charles Q. Clay III")),
+            ("Judge Edward B. Moreton Jr.", ("Judge", "Edward B. Moreton Jr.")),
+            ("Judge Sergio C. Tapia II", ("Judge", "Sergio C. Tapia II")),
+            ("  Judge   Ruben   Garcia ", ("Judge", "Ruben Garcia")),
+        ],
+    )
+    def test_cleans_cell(self, cell: str, expected: tuple[str, str]) -> None:
+        assert clean_officer_name(cell) == expected
+
+    @pytest.mark.parametrize(
+        "cell", ["", "Judicial Officer", "California 90012", "Judge", "Presiding Judge's Office"]
+    )
+    def test_non_officer_cell_returns_empty(self, cell: str) -> None:
+        assert clean_officer_name(cell) == ("", "")
+
+
+# ---------------------------------------------------------------------------
+# parse_judicial_directory_pdf — real weekly PDF pages (#4874)
+# ---------------------------------------------------------------------------
+
+
+def _by_dept(officers: list[DirectoryOfficer], dept: str) -> list[DirectoryOfficer]:
+    return [o for o in officers if o.department == dept]
+
+
+class TestParseJudicialDirectoryPdf:
+    def test_parses_every_officer_row(self, directory_officers: list[DirectoryOfficer]) -> None:
+        # 26 Stanley Mosk + 21 East LA/Metropolitan/Edelman + 23 Compton/Norwalk
+        # + 8 Santa Monica rows. The index and legend pages contribute nothing.
+        assert len(directory_officers) == 78
+
+    def test_first_row_fields(self, directory_officers: list[DirectoryOfficer]) -> None:
+        assert directory_officers[0] == DirectoryOfficer(
+            department="215",
+            full_name="Shelley Kaufman",  # "(SJ)" stripped
+            title="Judge",
+            courthouse="Stanley Mosk",
+            region="CENTRAL",
+            primary_assignment="Family Law",
+        )
+
+    def test_multi_officer_department_keeps_every_row(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        dept_217 = _by_dept(directory_officers, "217")
+        # The first officer's "(SJ- / Probate/Mental Health)" note wraps onto a second line.
+        assert [o.full_name for o in dept_217] == ["Brenda J. Penny", "Kristen A. Williams"]
+        assert [o.full_name for o in _by_dept(directory_officers, "245")] == [
+            "Naomi R. Cohen",
+            "Sarah Reisman",
+        ]
+        assert {o.title for o in _by_dept(directory_officers, "245")} == {"Commissioner"}
+
+    def test_wrapped_name_is_joined(self, directory_officers: list[DirectoryOfficer]) -> None:
+        # "Commissioner LaTonya Hadnot" / "Prioleau" spans two PDF lines.
+        [officer] = _by_dept(directory_officers, "105")
+        assert officer.full_name == "LaTonya Hadnot Prioleau"
+        assert officer.courthouse == "Compton"
+
+    def test_wrapped_role_note_is_stripped(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        names = [o.full_name for o in _by_dept(directory_officers, "400")]
+        assert "Akemi Arakaki" in names  # "(SJ-Juvenile" / "Del/Dep)"
+        assert "Annabelle G. Cortez" in names  # "(STJ)"
+
+    def test_no_title_or_parenthetical_left_in_names(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        for officer in directory_officers:
+            assert "(" not in officer.full_name and ")" not in officer.full_name
+            assert not officer.full_name.startswith(("Judge ", "Commissioner "))
+            assert len(officer.full_name.split()) >= 2
+
+    def test_rows_attributed_to_their_courthouse(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        courthouses = {o.courthouse for o in _by_dept(directory_officers, "400")}
+        assert courthouses == {"Metropolitan", "Edmund D. Edelman Children's Court"}
+        # Norwalk's block starts mid-page after a SOUTHEAST region heading.
+        norwalk = [o for o in directory_officers if o.courthouse == "Norwalk"]
+        assert [o.department for o in norwalk] == ["A", "B", "C", "D"]
+        assert {o.region for o in norwalk} == {"SOUTHEAST"}
+
+    def test_row_without_phone_or_room(self, directory_officers: list[DirectoryOfficer]) -> None:
+        # Santa Monica "V   V   Judge Robert S. Draper Civil" has no phone column.
+        [officer] = _by_dept(directory_officers, "V")
+        assert officer.full_name == "Robert S. Draper"
+        assert officer.primary_assignment == "Civil"
+
+    def test_banner_index_and_legend_are_ignored(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        names = {o.full_name for o in directory_officers}
+        # Presiding Judge banner line on every page.
+        assert not any("Tapia" in n for n in names)
+        # Index-only officers (page 26 of the full PDF).
+        assert not any("Berle" in n or "Bershon" in n for n in names)
+
+    def test_invalid_pdf_returns_empty(self) -> None:
+        assert parse_judicial_directory_pdf(b"%PDF-1.4 not really a pdf") == []
+
+    def test_mapping_from_pdf(self, directory_officers: list[DirectoryOfficer]) -> None:
+        dept_map = build_department_judge_map(directory_officers, prefer_assignment="Civil")
+        assert len(dept_map) == 62
+        # Unpadded keys, like the HTML-era mapping.
+        assert dept_map["14"] == "Ashley Price"
+        assert dept_map["71"] == "Rene C. Gilbertson"
+        assert "014" not in dept_map
+        # Multi-officer departments keep the first officer listed.
+        assert dept_map["217"] == "Brenda J. Penny"
+        assert dept_map["245"] == "Naomi R. Cohen"
+        assert dept_map["601"] == "Jacqueline Phillips"
+        assert dept_map["215"] == "Shelley Kaufman"
+        assert dept_map["308"] == "Charles Q. Clay III"
+
+    def test_civil_officer_wins_department_collision(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        dept_map = build_department_judge_map(directory_officers, prefer_assignment="Civil")
+        # "M": Compton Family Law listed first; Santa Monica Civil wins.
+        assert dept_map["M"] == "Mark A. Young"
+        # "C": Compton Criminal listed first; Norwalk Civil wins.
+        assert dept_map["C"] == "Lee W. Tsao"
+        # "A": both Compton and Norwalk listed; the first Civil one (Compton) wins.
+        assert dept_map["A"] == "Elizabeth L. Bradley"
+        # No Civil officer anywhere: first listed wins.
+        assert dept_map["400"] == "David J. Cowan"
+
+    def test_without_preference_first_listed_wins(
+        self, directory_officers: list[DirectoryOfficer]
+    ) -> None:
+        dept_map = build_department_judge_map(directory_officers)
+        assert dept_map["M"] == "Kimberly Dotson"
+        assert dept_map["C"] == "Kelvin D. Filer"
+
+
+# ---------------------------------------------------------------------------
 # fetch_department_judge_mapping — mocked HTTP
 # ---------------------------------------------------------------------------
 
 
+def _mock_directory_pdf(status: int = 200, content: bytes | None = None) -> None:
+    respx.get(JUDICIAL_DIRECTORY_PDF_URL).mock(
+        return_value=httpx.Response(
+            status,
+            content=_load_pdf() if content is None else content,
+            headers={"content-type": "application/pdf"},
+        )
+    )
+
+
+def test_directory_url_is_weekly_pdf() -> None:
+    assert JUDICIAL_DIRECTORY_PDF_URL == (
+        "http://mycourtservices.lacourt.org:90/lineupreports/judicial%20directory.pdf"
+    )
+
+
 @respx.mock
 def test_fetch_mapping_with_fixture() -> None:
-    """fetch_department_judge_mapping returns a correct map from fixture HTML."""
-    html = _load("la_judicial_officers.html")
-    respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+    """fetch_department_judge_mapping returns a correct map from the fixture PDF."""
+    _mock_directory_pdf()
     dept_map = fetch_department_judge_mapping()
-    assert len(dept_map) == 14
-    assert dept_map["3"] == "William A. Crowfoot"
-    assert dept_map["52"] == "Jerrold Abeles"
+    assert len(dept_map) == 62
+    assert dept_map["224"] == "William H. Forman"
+    # Civil preference is applied on the live path.
+    assert dept_map["M"] == "Mark A. Young"
 
 
 @respx.mock
 def test_fetch_mapping_http_error_raises() -> None:
     """fetch_department_judge_mapping raises on HTTP errors."""
-    respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(503))
+    _mock_directory_pdf(status=503, content=b"")
     with pytest.raises(httpx.HTTPStatusError):
+        fetch_department_judge_mapping()
+
+
+@respx.mock
+def test_fetch_mapping_non_pdf_response_raises() -> None:
+    """An HTML page served with 200 (moved report) fails loudly, naming the URL."""
+    respx.get(JUDICIAL_DIRECTORY_PDF_URL).mock(
+        return_value=httpx.Response(200, text="<html>Not Found</html>")
+    )
+    with pytest.raises(ValueError, match="not a PDF"):
         fetch_department_judge_mapping()
 
 
@@ -391,9 +594,8 @@ class TestLACourtDirectory:
 
     @respx.mock
     def test_fetch_current_returns_raw_and_mapping(self) -> None:
-        """fetch_current() returns (raw_bytes, dept_map) from the live page."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        """fetch_current() returns (raw_pdf, dept_map) from the live PDF."""
+        _mock_directory_pdf()
 
         directory = LACourtDirectory(
             s3_client=self._make_mock_s3(),
@@ -405,15 +607,14 @@ class TestLACourtDirectory:
         assert isinstance(raw, bytes)
         assert len(raw) > 0
         assert isinstance(mapping, dict)
-        assert len(mapping) == 14
-        assert mapping["3"] == "William A. Crowfoot"
-        assert mapping["52"] == "Jerrold Abeles"
+        assert len(mapping) == 62
+        assert mapping["224"] == "William H. Forman"
+        assert mapping["105"] == "LaTonya Hadnot Prioleau"
 
     @respx.mock
     def test_fetch_and_snapshot_archives_to_s3(self) -> None:
-        """fetch_and_snapshot() uploads raw HTML to S3."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        """fetch_and_snapshot() uploads the raw PDF to S3."""
+        _mock_directory_pdf()
 
         mock_s3 = self._make_mock_s3()
         mock_db = self._make_mock_db()
@@ -425,22 +626,22 @@ class TestLACourtDirectory:
         )
 
         mapping = directory.fetch_and_snapshot()
-        assert len(mapping) == 14
-        assert mapping["3"] == "William A. Crowfoot"
+        assert len(mapping) == 62
+        assert mapping["224"] == "William H. Forman"
 
         # Verify S3 put_object was called
         mock_s3.put_object.assert_called_once()
         call_kwargs = mock_s3.put_object.call_args
         assert call_kwargs.kwargs["Bucket"] == "test-bucket"
         assert call_kwargs.kwargs["Key"].startswith("directories/ca_los_angeles/")
-        assert call_kwargs.kwargs["ContentType"] == "text/html"
+        assert call_kwargs.kwargs["ContentType"] == "application/pdf"
+        assert call_kwargs.kwargs["Key"].endswith(".pdf")
         assert len(call_kwargs.kwargs["Body"]) > 0
 
     @respx.mock
     def test_fetch_and_snapshot_inserts_into_db(self) -> None:
         """fetch_and_snapshot() inserts mapping into the DB when content is new."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        _mock_directory_pdf()
 
         mock_s3 = self._make_mock_s3()
         mock_db = self._make_mock_db()
@@ -453,7 +654,7 @@ class TestLACourtDirectory:
         )
 
         mapping = directory.fetch_and_snapshot()
-        assert len(mapping) == 14
+        assert len(mapping) == 62
 
         # The cursor should have been called for both _is_duplicate check
         # and the INSERT.  The INSERT call contains the mapping JSON.
@@ -466,8 +667,7 @@ class TestLACourtDirectory:
     @respx.mock
     def test_fetch_and_snapshot_deduplicates(self) -> None:
         """fetch_and_snapshot() skips DB insert when content hash matches."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        _mock_directory_pdf()
 
         mock_s3 = self._make_mock_s3()
         mock_db = self._make_mock_db()
@@ -476,7 +676,7 @@ class TestLACourtDirectory:
         # Simulate existing snapshot with same content hash
         from framework.hashing import sha256_hex
 
-        content_hash = sha256_hex(html.encode("utf-8"))
+        content_hash = sha256_hex(_load_pdf())
         mock_cursor.fetchone.return_value = (content_hash,)
 
         directory = LACourtDirectory(
@@ -486,7 +686,7 @@ class TestLACourtDirectory:
         )
 
         mapping = directory.fetch_and_snapshot()
-        assert len(mapping) == 14
+        assert len(mapping) == 62
 
         # S3 upload happens because HeadObject returns 404 (content-addressed key not yet in S3)
         mock_s3.put_object.assert_called_once()
@@ -497,7 +697,7 @@ class TestLACourtDirectory:
     @respx.mock
     def test_fetch_current_http_error_raises(self) -> None:
         """fetch_current() propagates HTTP errors."""
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(503))
+        _mock_directory_pdf(status=503, content=b"")
 
         directory = LACourtDirectory(
             s3_client=self._make_mock_s3(),
@@ -508,6 +708,23 @@ class TestLACourtDirectory:
         with pytest.raises(httpx.HTTPStatusError):
             directory.fetch_current()
 
+    @respx.mock
+    def test_fetch_and_snapshot_never_saves_empty_roster(self) -> None:
+        """A PDF that parses to 0 departments is not archived or inserted (#4880)."""
+        import pymupdf
+
+        blank = pymupdf.open()
+        blank.new_page()
+        _mock_directory_pdf(content=blank.tobytes())
+
+        mock_s3 = self._make_mock_s3()
+        mock_db = self._make_mock_db()
+        directory = LACourtDirectory(s3_client=mock_s3, s3_bucket="test-bucket", db_conn=mock_db)
+
+        assert directory.fetch_and_snapshot() == {}
+        mock_s3.put_object.assert_not_called()
+        mock_db.commit.assert_not_called()
+
     def test_court_id_default(self) -> None:
         """LACourtDirectory.COURT_ID is 'ca_los_angeles'."""
         assert LACourtDirectory.COURT_ID == "ca_los_angeles"
@@ -515,8 +732,7 @@ class TestLACourtDirectory:
     @respx.mock
     def test_fetch_and_snapshot_uses_default_court_id(self) -> None:
         """fetch_and_snapshot() without args uses COURT_ID."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        _mock_directory_pdf()
 
         mock_s3 = self._make_mock_s3()
         mock_db = self._make_mock_db()
@@ -547,8 +763,7 @@ class TestScraperCourtDirectoryIntegration:
     def test_fetch_documents_snapshots_directory(self) -> None:
         """When court_directory is provided, fetch_documents calls
         fetch_and_snapshot and populates dept_judge_map."""
-        html = _load("la_judicial_officers.html")
-        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+        _mock_directory_pdf()
 
         mock_s3 = MagicMock()
         mock_s3.head_object.side_effect = _head_object_404
@@ -589,8 +804,8 @@ class TestScraperCourtDirectoryIntegration:
         mock_s3.put_object.assert_called_once()
 
         # Verify the dept_judge_map was populated
-        assert len(scraper._dept_judge_map) == 14
-        assert scraper._dept_judge_map["3"] == "William A. Crowfoot"
+        assert len(scraper._dept_judge_map) == 62
+        assert scraper._dept_judge_map["224"] == "William H. Forman"
 
 
 # ---------------------------------------------------------------------------

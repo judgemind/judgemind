@@ -54,8 +54,9 @@ aws scheduler get-schedule --name judgemind-scraper-dev --region us-west-2 \
 
 > **Use the scraper security group, not another service's.** Other services'
 > security groups (for example the ingestion-worker SG) lack the
-> residential-proxy egress rule (`scraper_proxy_egress` in
-> `infra/terraform/modules/compute/main.tf`) that the proxied scrapers
+> residential-proxy egress rule (the inline `Residential proxy` egress block on
+> `aws_security_group.scraper` in `infra/terraform/modules/compute/main.tf`)
+> that the proxied scrapers
 > (`ca-sd-*`, `ca-sf-*`) need. A scraper launched with them fails with network
 > timeouts that look like a court-site outage, not a configuration error.
 
