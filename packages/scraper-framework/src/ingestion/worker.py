@@ -201,6 +201,12 @@ def _markdown_to_html(text: str) -> str:
 #: Live scraper events never carry it (#4788).
 REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 
+#: Event key set on split children whose ``case_number`` a deterministic
+#: splitter read from the source document (a CASE # cell, a ``Case No.:``
+#: header).  The enrichment step's fuzzy case-number correction is skipped
+#: for them (#4866).
+CASE_NUMBER_FROM_SOURCE_KEY = "_case_number_from_source"
+
 
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
     """Decide whether a split child's write may move it to a different case.
@@ -1210,6 +1216,7 @@ def _try_sc_pdf_split(
             # would be filed under another case.  A missing number stays
             # missing (``UNKNOWN-``) unless the child's own text yields one.
             "case_number": sr.case_number,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "case_title": sr.case_title,
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
@@ -3930,10 +3937,14 @@ class IngestionWorker:
                 parties=party_names,
             )
 
-            # Apply case number correction from fuzzy match.
+            # Apply case number correction from fuzzy match — never to a
+            # number a deterministic splitter read from the source (#4866):
+            # the near-miss it would move to is typically an older case an
+            # LLM created from a court typo, or another case entirely.
             if (
                 enrich_result.case_match is not None
                 and enrich_result.case_match.match_type == "fuzzy"
+                and w.event_data.get(CASE_NUMBER_FROM_SOURCE_KEY) is not True
             ):
                 original_case_number = case_number
                 case_number = enrich_result.case_match.case_number

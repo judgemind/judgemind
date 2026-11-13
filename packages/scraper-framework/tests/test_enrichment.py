@@ -595,6 +595,35 @@ class TestMatchCaseNumberFederalGenericPartyRegression:
         assert result.case_id == ""
 
 
+class TestMatchCaseNumberRoleLiteralParties4866:
+    """#4866: ``Plaintiff`` / ``Defendant`` are role words, not parties.  The
+    SC reingest moved Ahluwalia v. Children's Discovery Museum (24CV449505)
+    onto Wells Fargo v. Wright (24CV449597) on an overlap of role words."""
+
+    def _match(self, extracted: list[str], candidate: list[str]) -> str:
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = [("case-uuid-wright", "24CV449597", candidate)]
+        engine = EnrichmentEngine(conn)
+        return engine.match_case_number(
+            "24CV449505", "court-uuid", extracted_parties=extracted
+        ).match_type
+
+    def test_role_literal_parties_only_do_not_fuzzy_match(self) -> None:
+        assert self._match(["Plaintiff", "Defendant"], ["plaintiff", "defendant"]) == "new"
+
+    def test_role_literal_parties_ignored_in_overlap(self) -> None:
+        candidate = ["plaintiff", "defendant", "republic of palau"]
+        assert self._match(["Plaintiff", "Defendant"], candidate) == "new"
+        assert self._match(["Plaintiffs", "Cross-Defendant", "Acme"], candidate) == "new"
+
+    def test_role_literal_parties_real_overlap_still_matches(self) -> None:
+        candidate = ["plaintiff", "teyhuan ahluwalia", "children's discovery museum"]
+        extracted = ["Teyhuan Ahluwalia", "Children's Discovery Museum", "Defendant"]
+        assert self._match(extracted, candidate) == "fuzzy"
+
+
 # ---------------------------------------------------------------------------
 # EnrichmentEngine — Fuzzy candidate query filtering
 # ---------------------------------------------------------------------------

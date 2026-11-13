@@ -206,6 +206,50 @@ def test_enrichment_fuzzy_match_updates_case_number(
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.EnrichmentEngine")
 @patch("ingestion.worker.psycopg")
+def test_enrichment_fuzzy_skipped_for_case_number_from_source(
+    mock_psycopg: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """#4866: a case number a deterministic splitter read from the source
+    (``_case_number_from_source``) is kept; the fuzzy match would move the
+    ruling onto an older near-miss case."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+
+    mock_engine = MagicMock()
+    mock_engine.enrich.return_value = EnrichmentResult(
+        case_match=CaseMatch(
+            case_id="case-uuid-existing",
+            case_number="23STCV12346",
+            match_type="fuzzy",
+            confidence=0.9,
+            corrected_from="23STCV12345",
+            levenshtein_distance=1,
+            party_overlap=1.0,
+        ),
+        judge_resolution=JudgeResolution(
+            judge_id=None, canonical_name=None, match_type="new", confidence=0.0
+        ),
+        party_resolutions=[],
+        flags=[],
+    )
+    mock_engine_cls.return_value = mock_engine
+
+    worker.process_event(_make_event(case_number="23STCV12345", _case_number_from_source=True))
+
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INTO cases" in str(c)]
+    assert case_calls
+    assert "23STCV12345" in case_calls[0][0][1]
+    assert "23STCV12346" not in case_calls[0][0][1]
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.EnrichmentEngine")
+@patch("ingestion.worker.psycopg")
 def test_enrichment_alias_match_updates_judge_name(
     mock_psycopg: MagicMock,
     mock_engine_cls: MagicMock,
