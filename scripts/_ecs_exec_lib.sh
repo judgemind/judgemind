@@ -23,6 +23,20 @@
 # Matches GNU timeout(1) so callers can reason about it the same way.
 ECS_EXEC_TIMEOUT_RC=124
 
+# The watchdog ticks with the real sleep binary, not whatever `sleep` is
+# first on PATH. Several helper tests put a no-op `sleep` stub on PATH to
+# fast-forward their poll loops; the watchdog must keep counting real
+# seconds under those stubs or it would kill every call at once (#4850).
+if [[ -z "${ECS_EXEC_SLEEP_BIN:-}" ]]; then
+    if [[ -x /bin/sleep ]]; then
+        ECS_EXEC_SLEEP_BIN=/bin/sleep
+    elif [[ -x /usr/bin/sleep ]]; then
+        ECS_EXEC_SLEEP_BIN=/usr/bin/sleep
+    else
+        ECS_EXEC_SLEEP_BIN="sleep"
+    fi
+fi
+
 # ecs_exec_run_with_timeout <secs> <cmd> [args...]
 #
 # Runs <cmd> with a hard wall-clock deadline of <secs> seconds (#4665). If the
@@ -60,18 +74,33 @@ ecs_exec_run_with_timeout() {
                 : > "$marker"
                 pkill -TERM -P "$cmd_pid" 2>/dev/null
                 kill -TERM "$cmd_pid" 2>/dev/null
-                sleep 2
+                "$ECS_EXEC_SLEEP_BIN" 2
                 pkill -KILL -P "$cmd_pid" 2>/dev/null
                 kill -KILL "$cmd_pid" 2>/dev/null
                 exit 0
             fi
-            sleep 1
+            # Counting ticks (not reading the clock) means time the host
+            # spends asleep is not counted: a laptop sleep is not a hang.
+            "$ECS_EXEC_SLEEP_BIN" 1
             waited=$((waited + 1))
         done
     ) </dev/null >/dev/null 2>&1 &
+    local watchdog_pid=$!
 
     local rc=0
     wait "$cmd_pid" 2>/dev/null || rc=$?
+
+    # Stop the watchdog now rather than letting it notice on its next tick.
+    # While bash runs a function with redirections it keeps saved copies of
+    # the caller's stdout/stderr on high fds, and the watchdog and its
+    # `sleep 1` child inherit them. Inside a caller's $(...), a lingering
+    # watchdog held the capture pipe open for up to a second after every
+    # call (#4850). Kill the sleep child first (so it is not orphaned still
+    # holding the pipe), then the watchdog. Reaping it with `wait` keeps
+    # bash from printing a "Terminated" job notice on stderr.
+    pkill -P "$watchdog_pid" 2>/dev/null || true
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
 
     if [[ -e "$marker" ]]; then
         rm -rf "$marker_dir"

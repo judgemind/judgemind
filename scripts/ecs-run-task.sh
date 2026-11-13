@@ -835,6 +835,14 @@ fi
 
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
+# Every aws call in the wait below runs under a per-call timeout sized to
+# what is left of TIMEOUT (counted from script start), and calls slower than
+# 30s are logged as "slow call: ..." (#4850).  A hung call is killed and
+# counted as a failed poll, so the attached wait still ends on time.
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "${SCRIPT_DIR}/_wait_budget_lib.sh"
+wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
+
 ELAPSED=0
 LAST_STATUS=""
 CURRENT_STATUS=""
@@ -874,7 +882,8 @@ EXIT_STATUS_UNKNOWN=125
 # ID sorted later was never found (#4723).
 # Returns the stream name, or empty string if not found yet.
 find_log_stream() {
-    aws logs describe-log-streams \
+    wait_budget_call "aws logs describe-log-streams" \
+        aws logs describe-log-streams \
         --log-group-name "$LOG_GROUP" \
         --log-stream-name-prefix "oneshot/oneshot/${TASK_ID}" \
         --region "$REGION" \
@@ -924,7 +933,7 @@ stream_new_logs() {
         fi
 
         local result
-        result=$(aws "${args[@]}") || {
+        result=$(wait_budget_call "aws logs get-log-events" aws "${args[@]}") || {
             echo "WARNING: failed to fetch log events during live streaming" >&2
             return 0
         }
@@ -1024,7 +1033,8 @@ exit_status_unknown() {
 # clock also covers launch time and slow AWS calls, so the whole call stays
 # inside the Bash tool's cap (#4835).
 wait_budget_left() {
-    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]]
+    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]] \
+        && ! wait_budget_exhausted
 }
 
 while wait_budget_left; do
@@ -1034,7 +1044,7 @@ while wait_budget_left; do
     _describe=""
     _status=""
     _err=""
-    if _describe=$(aws ecs describe-tasks \
+    if _describe=$(wait_budget_call "aws ecs describe-tasks" aws ecs describe-tasks \
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
@@ -1054,7 +1064,7 @@ else:
     fi
     if [[ -z "$_status" ]]; then
         _err=$(tr '\n' ' ' < "$DESCRIBE_ERR_FILE" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//') || _err=""
-        DESCRIBE_LAST_ERROR="${_err:-describe-tasks failed with no error output}"
+        DESCRIBE_LAST_ERROR="${_err:-describe-tasks failed with no error output (or hung past its per-call limit, #4850)}"
         DESCRIBE_CONSECUTIVE_ERRORS=$((DESCRIBE_CONSECUTIVE_ERRORS + 1))
         if describe_error_is_fatal "$DESCRIBE_LAST_ERROR"; then
             exit_status_unknown "describe-tasks failed with an auth/permission/parameter error that retrying will not fix." \
@@ -1110,8 +1120,10 @@ done
 # Final log flush — capture any events that arrived after the last poll.
 # If we never found the log stream during the poll loop (e.g. for very
 # short-lived tasks), retry a few times with a brief delay — CloudWatch
-# may still be creating the stream.
-if [[ "$LOG_STREAMING" == "false" ]]; then
+# may still be creating the stream.  Only for a STOPPED task: when the wait
+# ran out on a running task, these retries would push the call past its
+# budget (#4850), and ecs-wait-task.sh / --logs pick the logs up later.
+if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
     for _stream_wait in 3 5 7 10; do
         sleep "$_stream_wait"
         LOG_STREAM_NAME=$(find_log_stream)

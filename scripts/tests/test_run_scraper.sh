@@ -241,6 +241,7 @@ fi
 SANDBOX="$TMPDIR_TEST/sandbox"
 mkdir -p "$SANDBOX/bin" "$SANDBOX/scripts" "$SANDBOX/state"
 cp "$RUN_SCRAPER" "$SANDBOX/scripts/run-scraper.sh"
+cp "$SCRIPT_DIR/_wait_budget_lib.sh" "$SCRIPT_DIR/_ecs_exec_lib.sh" "$SANDBOX/scripts/"
 cp "$SCRIPT_DIR/ecs-wait-task.sh" "$SANDBOX/scripts/ecs-wait-task.sh"
 cat > "$SANDBOX/scripts/ecs-logs.sh" << 'LOGS_EOF'
 #!/usr/bin/env bash
@@ -265,6 +266,11 @@ case "$1 $2" in
         echo '{"tasks":[{"taskArn":"arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/scrapetask1"}],"failures":[]}'
         ;;
     "ecs describe-tasks")
+        if [[ "${MOCK_DESCRIBE_HANG:-0}" == "1" ]]; then
+            # A call that never returns (#4850). The real sleep binary:
+            # the sandbox's `sleep` is a no-op stub.
+            exec /bin/sleep 3600
+        fi
         if [[ "${MOCK_DESCRIBE_FAIL:-0}" == "1" ]]; then
             echo "An error occurred (ExpiredTokenException): token expired" >&2
             exit 255
@@ -338,6 +344,29 @@ run_capturing_exit env PATH="$SANDBOX/bin:$PATH" MOCK_STATE="$SANDBOX/state" MOC
 assert_exit_code "describe-tasks failures exit 125" 125 "$RUN_EC"
 assert_output_contains "status unknown shows the AWS error" "ExpiredTokenException" "$RUN_OUTPUT"
 assert_output_contains "status unknown says not to re-run" "Do NOT re-run this command" "$RUN_OUTPUT"
+
+# ─── Test 15: a hung describe-tasks cannot hold the wait past budget (#4850) ─
+
+_hang_start=$SECONDS
+run_capturing_exit env PATH="$SANDBOX/bin:$PATH" MOCK_STATE="$SANDBOX/state" MOCK_DESCRIBE_HANG=1 \
+    RUN_SCRAPER_POLL_INTERVAL=1 \
+    "$SANDBOX/scripts/run-scraper.sh" --timeout 5 ca-la-tentatives-civil
+_hang_took=$(( SECONDS - _hang_start ))
+TESTS=$((TESTS + 1))
+if [[ "$RUN_EC" == "124" || "$RUN_EC" == "125" ]]; then
+    echo "PASS: hung describe-tasks exits 124/125 (got $RUN_EC)"
+else
+    echo "FAIL: hung describe-tasks exits 124/125 (got $RUN_EC): $RUN_OUTPUT"
+    FAILURES=$((FAILURES + 1))
+fi
+TESTS=$((TESTS + 1))
+if [[ $_hang_took -le 15 ]]; then
+    echo "PASS: hung describe-tasks ends within budget + 10s (${_hang_took}s)"
+else
+    echo "FAIL: hung describe-tasks ends within budget + 10s (${_hang_took}s)"
+    FAILURES=$((FAILURES + 1))
+fi
+assert_output_contains "hung describe-tasks is reported as timed out" "timed out: aws ecs describe-tasks" "$RUN_OUTPUT"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 

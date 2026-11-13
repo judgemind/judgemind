@@ -274,6 +274,14 @@ fi
 
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
+# Every aws call in the wait below runs under a per-call timeout sized to
+# what is left of TIMEOUT (counted from script start), and calls slower than
+# 30s are logged as "slow call: ..." (#4850).  A hung call is killed and
+# counted as a failed poll, so the attached wait still ends on time.
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "${SCRIPT_DIR}/_wait_budget_lib.sh"
+wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
+
 ELAPSED=0
 LAST_STATUS=""
 CURRENT_STATUS=""
@@ -286,7 +294,8 @@ LOG_NEXT_TOKEN=""
 LOG_STREAMING=false
 
 find_log_stream() {
-    aws logs describe-log-streams \
+    wait_budget_call "aws logs describe-log-streams" \
+        aws logs describe-log-streams \
         --log-group-name "$LOG_GROUP" \
         --log-stream-name-prefix "scraper/scraper/" \
         --order-by LogStreamName \
@@ -316,7 +325,7 @@ stream_new_logs() {
     fi
 
     local result
-    result=$(aws "${args[@]}") || {
+    result=$(wait_budget_call "aws logs get-log-events" aws "${args[@]}") || {
         echo "WARNING: failed to fetch log events during live streaming" >&2
         return 0
     }
@@ -353,15 +362,17 @@ print(data.get('nextForwardToken', ''))
 # wait_budget_left — true while both the counted poll time and the real
 # wall-clock time since the script started are under TIMEOUT (#4835).
 wait_budget_left() {
-    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]]
+    [[ $ELAPSED -lt $TIMEOUT && $(( SECONDS - SCRIPT_START_SECS )) -lt $TIMEOUT ]] \
+        && ! wait_budget_exhausted
 }
 
 while wait_budget_left; do
     # A failed describe-tasks must not abort the wait under `set -e`, and
     # must not be reported as a scraper failure: the task may be running.
+    # A call killed by its per-call timeout counts as a failed poll (#4850).
     _describe=""
     _status=""
-    if _describe=$(aws ecs describe-tasks \
+    if _describe=$(wait_budget_call "aws ecs describe-tasks" aws ecs describe-tasks \
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
@@ -416,8 +427,10 @@ while wait_budget_left; do
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 
-# Final log flush
-if [[ "$LOG_STREAMING" == "false" ]]; then
+# Final log flush.  The stream-discovery retries only run for a STOPPED
+# task: after the wait ran out they would push the call past its budget
+# (#4850), and the re-attach path picks the logs up later.
+if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
     for _retry in 1 2 3; do
         sleep 3
         LOG_STREAM_NAME=$(find_log_stream)

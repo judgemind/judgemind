@@ -451,6 +451,8 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completenes
 | `scripts/ecs-redeploy.sh <service>` | The deployment it forced | `scripts/ecs-redeploy.sh <service> <cluster> --deployment-id <id>`, as printed |
 | `scripts/ecs-logs.sh <group> --follow` | New log events | The same command (it re-prints the last N lines) |
 
+**Each `gh` / `aws` call inside these waits has its own time limit (#4850).** The limit is `min(60s, time left)`, so a single hung call cannot hold a helper past its budget. The helper kills the call and treats it as a failed poll; several in a row give exit `125`. Any call slower than 30s is logged to stderr as `slow call: <call> took Ns`, and a killed one as `timed out: <call> ...`. If a slow call's wall time is longer than its limit and it was not killed, the laptop was asleep during the call. The shared code lives in `scripts/_wait_budget_lib.sh`.
+
 Re-running only reads state; none of them relaunches work. `scripts/wait-for-rollout.sh`, which CI deploy jobs call directly, keeps a 900s default but uses the same `124` / `125` exits.
 
 **Large-county rebuilds need memory override.** `rebuild_db.py --county <name>` holds per-worker OpenSearch/Postgres clients and LLM batch state for every document in the county. At the default 4096 MB, counties with thousands of documents (Los Angeles, Santa Clara, Orange) can exit 137 (OOM). Use `--cpu 2048 --memory 8192` for these rebuilds (see #2481):

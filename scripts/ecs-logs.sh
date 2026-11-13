@@ -37,6 +37,12 @@ POLL_INTERVAL="${ECS_LOGS_POLL_INTERVAL:-5}"
 # 600s cap (#4835).  0 = follow until interrupted (terminal use only).
 FOLLOW_MAX_SECS="${ECS_LOGS_FOLLOW_MAX_SECS:-480}"
 
+# Per-call timeouts + slow-call logging for get-log-events in --follow mode
+# (#4850): one hung call can no longer hold --follow past FOLLOW_MAX_SECS.
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_wait_budget_lib.sh"
+wait_budget_init unlimited
+
 # ─── Usage ─────────────────────────────────────────────────────────────────
 
 usage() {
@@ -117,13 +123,19 @@ if [[ -z "$LOG_GROUP" ]]; then
     exit 1
 fi
 
+# --follow: the FOLLOW_MAX_SECS budget covers the whole call, stream lookup
+# included, and every aws call is capped to the time left (#4850).
+if [[ "$FOLLOW" == true && "$FOLLOW_MAX_SECS" -gt 0 ]]; then
+    wait_budget_init "$FOLLOW_MAX_SECS"
+fi
+
 # ─── Validate a log stream is accessible ─────────────────────────────────
 
 validate_stream() {
     # Try to fetch 1 event from the stream to confirm it's accessible.
     # Returns 0 if the stream is readable, 1 if stale/inaccessible.
     local stream_name="$1"
-    aws logs get-log-events \
+    wait_budget_call "aws logs get-log-events" aws logs get-log-events \
         --log-group-name "$LOG_GROUP" \
         --log-stream-name "$stream_name" \
         --region "$REGION" \
@@ -153,7 +165,7 @@ find_stream() {
         # thousands of streams alphabetically and misses most tasks (#4723).
         for prefix in "oneshot/oneshot/${TASK_FILTER}" "ecs/" "ingestion-worker/" "scraper/"; do
             local prefix_streams
-            prefix_streams=$(aws logs describe-log-streams \
+            prefix_streams=$(wait_budget_call "aws logs describe-log-streams" aws logs describe-log-streams \
                 --log-group-name "$LOG_GROUP" \
                 --log-stream-name-prefix "$prefix" \
                 --order-by LogStreamName \
@@ -171,7 +183,7 @@ find_stream() {
         # Fall back to LastEventTime ordering (catches non-standard prefixes)
         if [[ -z "$match" ]]; then
             local streams
-            streams=$(aws logs describe-log-streams \
+            streams=$(wait_budget_call "aws logs describe-log-streams" aws logs describe-log-streams \
                 --log-group-name "$LOG_GROUP" \
                 --order-by LastEventTime \
                 --descending \
@@ -200,7 +212,7 @@ find_stream() {
         # We request several candidates so we can fall back if the top
         # stream is stale or inaccessible (expired retention, etc.).
         local raw_streams
-        raw_streams=$(aws logs describe-log-streams \
+        raw_streams=$(wait_budget_call "aws logs describe-log-streams" aws logs describe-log-streams \
             --log-group-name "$LOG_GROUP" \
             --order-by LastEventTime \
             --descending \
@@ -265,7 +277,7 @@ fetch_events() {
     fi
 
     local result
-    result=$(aws "${args[@]}" 2>/dev/null) || {
+    result=$(wait_budget_call "aws logs get-log-events" aws "${args[@]}" 2>/dev/null) || {
         echo "Error: failed to fetch log events" >&2
         return 1
     }
@@ -298,18 +310,24 @@ print(data.get('nextForwardToken', ''))
 }
 
 # Initial fetch
-fetch_events
+# Without --follow a failed fetch is fatal.  With --follow it is one missed
+# poll: the follow loop retries and still stops on its budget (#4850).
+if ! fetch_events; then
+    [[ "$FOLLOW" == true ]] || exit 1
+fi
 
 # Follow mode: poll for new events
 if [[ "$FOLLOW" == true ]]; then
     echo "--- following (Ctrl+C to stop) ---" >&2
-    _follow_start=$SECONDS
+    # The budget started right after argument parsing (see above).
     while true; do
-        if [[ "$FOLLOW_MAX_SECS" -gt 0 && $(( SECONDS - _follow_start )) -ge "$FOLLOW_MAX_SECS" ]]; then
+        if [[ "$FOLLOW_MAX_SECS" -gt 0 ]] && { [[ $(wait_budget_remaining) -le 0 ]] || wait_budget_exhausted; }; then
             echo "--- stopped following after ${FOLLOW_MAX_SECS}s (exit 124; nothing is wrong). Re-run the same command to keep following. ---" >&2
             exit 124
         fi
-        sleep "$POLL_INTERVAL"
-        fetch_events
+        wait_budget_sleep "$POLL_INTERVAL"
+        # A failed or timed-out fetch is just a missed poll while following;
+        # the loop's deadline check still ends the call on time (#4850).
+        fetch_events || true
     done
 fi

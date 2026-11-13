@@ -50,8 +50,12 @@
 #   Exits 124 when the wait ran out while the task is still running.
 #     This is NOT a task failure. Re-run the same command to keep waiting.
 #   Exits 125 when the task's status could not be read (describe-tasks
-#     failed, e.g. expired credentials). The task may still be running.
-#     Refresh credentials, then re-run the same command.
+#     failed, e.g. expired credentials, or hung past its per-call limit 3
+#     times in a row). The task may still be running. Refresh credentials,
+#     then re-run the same command.
+#   Each describe-tasks call runs under a per-call timeout sized to the
+#     time left, and calls slower than 30s are logged as "slow call: ..."
+#     on stderr (#4850).
 #   Exits 3 on usage error (bad arg, ARN parse failure, missing AWS CLI,
 #     or ECS has no record of the ARN).
 #   A container can also exit 124 or 125 itself. The stdout summary line
@@ -155,6 +159,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARN_SENTINEL_FILE="${REPO_ROOT}/tmp/last-ecs-task.arn"
+
+# Per-call timeouts + slow-call logging for describe-tasks (#4850).
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "${SCRIPT_DIR}/_wait_budget_lib.sh"
+# Consecutive timed-out describe-tasks calls before exiting 125.
+MAX_CONSECUTIVE_TIMEOUTS=3
 
 # If no ARN was passed, fall back to the sentinel written by ecs-run-task.sh --detach.
 if [[ -z "$TASK_ARN" ]]; then
@@ -289,6 +299,12 @@ fi
 ELAPSED_SECS=0
 # Wall-clock start: describe-tasks time counts against the budget too.
 WAIT_START_SECS=$SECONDS
+if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+    wait_budget_init "$TIMEOUT_SECS" "$WAIT_START_SECS"
+else
+    wait_budget_init unlimited "$WAIT_START_SECS"
+fi
+CONSECUTIVE_TIMEOUTS=0
 
 if [[ "$QUIET" == "false" ]]; then
     if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
@@ -299,11 +315,19 @@ if [[ "$QUIET" == "false" ]]; then
 fi
 
 poll_once() {
-    if ! aws ecs describe-tasks \
+    local rc=0
+    wait_budget_call "aws ecs describe-tasks" \
+        aws ecs describe-tasks \
         --cluster "$CLUSTER_FROM_ARN" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json > "$DESCRIBE_PATH" 2>"${TMP_DIR}/describe.err"; then
+        --output json > "$DESCRIBE_PATH" 2>"${TMP_DIR}/describe.err" || rc=$?
+    if [[ $rc -eq $WAIT_CALL_TIMEOUT_RC ]]; then
+        # A hung call is a failed poll, not a verdict (#4850). The caller
+        # retries until the budget or the timeout streak runs out.
+        return "$WAIT_CALL_TIMEOUT_RC"
+    fi
+    if [[ $rc -ne 0 ]]; then
         echo "Error: task status unknown: aws ecs describe-tasks failed." >&2
         echo "AWS error: $(tr '\n' ' ' < "${TMP_DIR}/describe.err" 2>/dev/null)" >&2
         echo "The task may still be running. Do not relaunch it." >&2
@@ -345,15 +369,26 @@ emit_progress() {
 while true; do
     _poll_rc=0
     poll_once || _poll_rc=$?
-    if [[ "$_poll_rc" -ne 0 ]]; then
+    if [[ "$_poll_rc" -eq "$WAIT_CALL_TIMEOUT_RC" ]]; then
+        CONSECUTIVE_TIMEOUTS=$((CONSECUTIVE_TIMEOUTS + 1))
+        if [[ "$CONSECUTIVE_TIMEOUTS" -ge "$MAX_CONSECUTIVE_TIMEOUTS" ]] && ! wait_budget_exhausted; then
+            echo "Error: task status unknown: aws ecs describe-tasks hung ${CONSECUTIVE_TIMEOUTS} times in a row." >&2
+            echo "The task may still be running. Do not relaunch it." >&2
+            echo "Fix: check AWS connectivity / credentials, then re-run:" >&2
+            echo "  scripts/ecs-wait-task.sh ${TASK_ARN}" >&2
+            exit 125
+        fi
+        LAST_STATUS="${LAST_STATUS:-UNKNOWN}"
+    elif [[ "$_poll_rc" -ne 0 ]]; then
         exit "$_poll_rc"
-    fi
+    else
+        CONSECUTIVE_TIMEOUTS=0
+        emit_progress
 
-    emit_progress
-
-    LAST_STATUS=$(parse_field last_status)
-    if [[ "$LAST_STATUS" == "STOPPED" ]]; then
-        break
+        LAST_STATUS=$(parse_field last_status)
+        if [[ "$LAST_STATUS" == "STOPPED" ]]; then
+            break
+        fi
     fi
 
     # Budget check (skipped when the budget is 0 = unlimited). Counts both
@@ -362,7 +397,9 @@ while true; do
     if [[ "$_wall_elapsed" -gt "$ELAPSED_SECS" ]]; then
         ELAPSED_SECS="$_wall_elapsed"
     fi
-    if [[ "$TIMEOUT_SECS" -gt 0 && "$ELAPSED_SECS" -ge "$TIMEOUT_SECS" ]]; then
+    # Also stop when too little is left for another call to finish inside
+    # the budget (#4850).
+    if [[ "$TIMEOUT_SECS" -gt 0 ]] && { [[ "$ELAPSED_SECS" -ge "$TIMEOUT_SECS" ]] || wait_budget_exhausted; }; then
         echo "Still waiting: task ${TASK_ID_FROM_ARN} is still ${LAST_STATUS} after ${TIMEOUT_SECS}s. This is NOT a task failure." >&2
         echo "Task ARN: ${TASK_ARN}" >&2
         echo "Re-run the same command to keep waiting (it only reads status; nothing is relaunched):" >&2

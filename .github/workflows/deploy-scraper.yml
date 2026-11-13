@@ -11,6 +11,8 @@ on:
       # action. Changes to the shared script must trigger this deploy so the
       # fix is exercised against a real rollout on its own PR (see #2592).
       - "scripts/wait-for-rollout.sh"
+      - "scripts/_wait_budget_lib.sh"
+      - "scripts/_ecs_exec_lib.sh"
       # scripts/ecs-post-deploy-healthcheck.sh is invoked by the
       # post-deploy-health-check job below. Same paths-filter contract as
       # wait-for-rollout.sh — changes to the shared health-check script

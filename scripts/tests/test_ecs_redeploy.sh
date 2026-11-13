@@ -64,6 +64,7 @@ make_sandbox() {
     mkdir -p "$root/bin" "$root/scripts" "$root/state"
     cp "$REDEPLOY" "$root/scripts/ecs-redeploy.sh"
     cp "$SCRIPT_DIR/wait-for-rollout.sh" "$root/scripts/wait-for-rollout.sh"
+    cp "$SCRIPT_DIR/_wait_budget_lib.sh" "$SCRIPT_DIR/_ecs_exec_lib.sh" "$root/scripts/"
     cat > "$root/bin/aws" << 'AWS_EOF'
 #!/usr/bin/env bash
 state="${MOCK_STATE:?}"

@@ -254,6 +254,7 @@ test_missing_arn_no_sentinel_exits_3() {
     local fake_repo="$tmpdir/repo"
     mkdir -p "$fake_repo/scripts"
     cp "$SCRIPT_UNDER_TEST" "$fake_repo/scripts/ecs-wait-task.sh"
+    cp "$REPO_ROOT/scripts/_wait_budget_lib.sh" "$REPO_ROOT/scripts/_ecs_exec_lib.sh" "$fake_repo/scripts/"
     chmod +x "$fake_repo/scripts/ecs-wait-task.sh"
 
     local output exit_code=0
@@ -277,6 +278,7 @@ test_sentinel_fallback() {
     local fake_repo="$tmpdir/repo"
     mkdir -p "$fake_repo/scripts" "$fake_repo/tmp"
     cp "$SCRIPT_UNDER_TEST" "$fake_repo/scripts/ecs-wait-task.sh"
+    cp "$REPO_ROOT/scripts/_wait_budget_lib.sh" "$REPO_ROOT/scripts/_ecs_exec_lib.sh" "$fake_repo/scripts/"
     chmod +x "$fake_repo/scripts/ecs-wait-task.sh"
 
     printf '%s\n' "$ARN" > "$fake_repo/tmp/last-ecs-task.arn"
