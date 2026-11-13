@@ -233,22 +233,24 @@ def _rulings_with_alerts(h: harness.KeyHarness, key: harness.Key) -> list[tuple]
         return cur.fetchall()
 
 
-def _run_misread_then_reingest(stored: str, *, tag: str) -> list[tuple]:
+def _run_misread_then_reingest(stored: str, *, tag: str, text: str | None = None) -> list[tuple]:
     """Store a ruling under *stored* the way a run before #4907 did (no
     usable document text, so no check), then reingest the key with the
     document text printing ``_PRINTED`` while the LLM reads ``_MISREAD``
-    again.  Returns ``(ruling id, case number, alert ruling id)`` before and
-    after, concatenated."""
+    again.  *text* is the child's ruling text (the LLM's transcription).
+    Returns ``(ruling id, case number, alert ruling id)`` before and after,
+    concatenated."""
     h = harness.KeyHarness(_DSN, _RUN, -1)
     try:
         key = harness.make_key(f"{_RUN}-{tag}")
-        old = harness.Spec(0, stored, harness._title(0), harness._text(tag, 0))
+        text = text or harness._text(tag, 0)
+        old = harness.Spec(0, stored, harness._title(0), text)
         h.run_step(key, harness.Step("reingest", (harness.Row("ruling", 0),), (old,)), "old run")
         h._attach_alerts(key)
         before = _rulings_with_alerts(h, key)
 
         h.event_extra = {"ruling_text": _calendar_text(_PRINTED)}
-        misread = harness.Spec(0, _MISREAD, harness._title(0), harness._text(tag, 0))
+        misread = harness.Spec(0, _MISREAD, harness._title(0), text)
         h.run_step(key, harness.Step("reingest", (harness.Row("ruling", 0),), (misread,)), "fix")
         return before + _rulings_with_alerts(h, key)
     finally:
@@ -280,3 +282,19 @@ def test_supported_case_never_relinks_to_placeholder() -> None:
     )
     assert old_case == _PRINTED
     assert (new_id, new_case, new_alert) == (old_id, _PRINTED, old_id)
+
+
+@_needs_pg
+def test_misread_repeated_in_llm_transcription_still_relinks() -> None:
+    """The LLM's transcription of the ruling can repeat its own misread
+    (dev: ``2024-0139388`` in the ruling text, ``30-2024-01399388`` in the
+    PDF).  That text is not evidence: the number still leaves its case
+    (#4915).  Before the fix the child's text counted as support, so the
+    guard kept the misread and the ruling stayed on it."""
+    text = f"The motion to consolidate with case number 30-{_MISREAD} is DENIED. " * 2
+    (old_id, old_case, _), (new_id, new_case, new_alert) = _run_misread_then_reingest(
+        _MISREAD, tag="b4915llm", text=text
+    )
+    assert old_case == _MISREAD
+    assert new_case.startswith("UNKNOWN-")
+    assert new_id == old_id and new_alert == old_id
