@@ -1002,6 +1002,13 @@ def _format_a_body_section(text: str, line_num: int) -> str | None:
         section_start = b_end
         section_end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
         section = text[section_start:section_end].strip()
+        # A ``Calendar Line M`` heading ends the section too (#4905): Dept 6
+        # prints ``Line 1`` over ``Calendar Line 1``, and the bodies after it
+        # carry no bare ``Line N``, so the section used to run on through
+        # every later ``Calendar Line`` body — another case's ruling.
+        later = next((m for m in _SC_DEPT12_BODY_RE.finditer(section) if m.start() > 0), None)
+        if later is not None:
+            section = section[: later.start()].rstrip()
         if len(section) < _SC_MIN_ENTRY_BODY_LEN:
             return None
         return section
@@ -1030,6 +1037,9 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
       format-A body section for ``Line N``, when present, to be
       appended after the table cell — preserving the long-form ruling
       content the summary table cross-references.
+    * ``Calendar Line N`` body sections (rows that say only ``See below.``)
+      attach as in the table layout, via ``_attach_dept12_bodies`` with the
+      rows' LINE cells (#4905).
 
     ``ruling_index`` is assigned 1..N in the order rows are seen; this
     is independent of the printed ``LINE`` column (which can be
@@ -1043,6 +1053,7 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
     import io
 
     rulings: list[SplitRuling] = []
+    line_labels: dict[int, set[int]] = {}
     next_index = 1
     seen_header = False
     try:
@@ -1086,6 +1097,9 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
                                 case_title=title or None,
                                 raw_case_number=None if row_cn else cn_raw,
                             )
+                            line_labels[id(current)] = _line_label_numbers(
+                                _normalize_table_cell(row[0])
+                            )
                             next_index += 1
                         elif current is not None:
                             # Continuation row — append the TENTATIVE RULING
@@ -1124,6 +1138,7 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
     # cell points at a format-A body section, append that section to the
     # row's ruling_text so the per-entry LLM enrichment sees the full
     # long-form ruling, not just the cross-reference.
+    cell_texts = {id(r): r.ruling_text for r in rulings}
     for r in rulings:
         if not r.ruling_text:
             continue
@@ -1142,6 +1157,15 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
                     head = _SC_ENTRY_HEAD_CASE_NO_RE.search(_entry_head(section))
                     if head:
                         r.case_number = _normalize_case_number(head.group("case_number"))
+
+    # ``Calendar Line N`` bodies (#4905).  Many format-B PDFs print ``See
+    # below.`` in the row and head the long-form ruling ``Calendar Line N`` /
+    # ``Case Name:`` / ``Case No.:``, the table layout's body form.  Before,
+    # those bodies reached no entry and the row was stored as ``See below.``.
+    # They attach as in the table layout: by the body's own ``Case No.:``, by
+    # cross-reference, and — for a row with a malformed CASE NO. — by its
+    # LINE cell together with a number one character from the body's.
+    _attach_dept12_bodies(rulings, text, line_labels=line_labels, ref_texts=cell_texts)
 
     # A row whose case number is still unknown is kept with no number (#4881):
     # it is a real ruling, and downstream it becomes an ``UNKNOWN-`` case that
@@ -1560,7 +1584,40 @@ def _dept12_body_sections(text: str) -> list[_Dept12BodySection]:
     return sections
 
 
-def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
+def _one_edit_apart(a: str, b: str) -> bool:
+    """True when *a* and *b* differ by one substituted, dropped or added character."""
+    if len(a) == len(b):
+        return _one_char_apart(a, b)
+    if abs(len(a) - len(b)) != 1:
+        return False
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
+
+
+def _line_label_numbers(label: str) -> set[int]:
+    """Calendar line numbers in a format-B LINE cell (#4905).
+
+    ``3`` / ``1,2`` / ``3-5``; a leading session time is not a line number
+    (``9:00 3`` is line 3).
+    """
+    numbers: set[int] = set()
+    label = re.sub(r"\b\d{1,2}:\d{2}\b", " ", label)
+    for m in re.finditer(r"(\d{1,3})(?:[ \t]*[-–][ \t]*(\d{1,3}))?", label):
+        first = int(m.group(1))
+        last = int(m.group(2)) if m.group(2) else first
+        if first <= last <= first + 30:
+            numbers.update(range(first, last + 1))
+        else:
+            numbers.update({first, last})
+    return numbers
+
+
+def _attach_dept12_bodies(
+    rulings: list[SplitRuling],
+    text: str,
+    line_labels: dict[int, set[int]] | None = None,
+    ref_texts: dict[int, str] | None = None,
+) -> None:
     """Attach each ``Calendar Line N`` body section to its ruling, in place.
 
     A section attaches to the ruling with the same case number (from its
@@ -1573,32 +1630,81 @@ def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
     section's number (#4881); otherwise it becomes a new ruling (the table
     and the summary rows both missed it).  A section's ``Case Name:`` replaces the
     table's (often truncated / line-wrapped) CASE TITLE.
+
+    Format B (#4905) also passes ``line_labels`` — ``{id(ruling): numbers in
+    its printed LINE cell}`` — and ``ref_texts``, the row's own cell text to
+    search for cross-references (its ``ruling_text`` may already hold a
+    long-form body).  With ``line_labels``:
+
+    * several rows sharing the section's case number (one per motion, or a
+      table typo) — the one whose LINE cell is the section's line wins;
+    * a row with a malformed CASE NO. points at the section when its LINE
+      cell is the section's line *and* its printed number is one character
+      away from the section's ``Case No.:`` (``24CV44162`` vs ``24CV444162``).
+      Both must hold; a row's number is never taken from a section on the
+      line label alone.
     """
-    by_cn = {r.case_number: r for r in rulings}
     has_body: set[int] = set()
+    labels = line_labels or {}
     refs = {
-        id(r): {int(m.group("num")) for m in _SC_DEPT12_CROSSREF_RE.finditer(r.ruling_text or "")}
+        id(r): {
+            int(m.group("num"))
+            for m in _SC_DEPT12_CROSSREF_RE.finditer(
+                (ref_texts or {}).get(id(r), r.ruling_text) or ""
+            )
+        }
         for r in rulings
     }
+
+    def by_case_number(s: _Dept12BodySection) -> SplitRuling | None:
+        same = [r for r in rulings if r.case_number == s.case_number]
+        if len(same) <= 1:
+            return same[0] if same else None
+        # Duplicate case numbers only happen in format B (the table layout
+        # merges rows per case): one row per motion, or a row whose CASE NO.
+        # repeats the row above by mistake.  The row whose LINE cell or
+        # cross-reference names the section wins; then a row that already
+        # holds a body of this case (a case's second ``Calendar Line``);
+        # then the first row.
+        for pick in (
+            lambda r: s.first_line in labels.get(id(r), set()),
+            lambda r: s.first_line in refs.get(id(r), set()),
+        ):
+            chosen = [r for r in same if pick(r)]
+            if len(chosen) == 1:
+                return chosen[0]
+        return next((r for r in same if id(r) in has_body), same[0])
+
+    def points_at(r: SplitRuling, s: _Dept12BodySection) -> bool:
+        if s.first_line in refs.get(id(r), set()):
+            return True
+        return (
+            s.first_line in labels.get(id(r), set())
+            and r.raw_case_number is not None
+            and s.case_number is not None
+            and _one_edit_apart(_normalize_case_number(r.raw_case_number), s.case_number)
+        )
+
     for s in _dept12_body_sections(text):
+        holder = next((r for r in rulings if s.text[:200] in (r.ruling_text or "")), None)
+        if holder is not None:
+            # Already attached — format B's ``See Line N`` expansion took it
+            # (Dept 6 prints ``Line 1`` over ``Calendar Line 1``, #4905).
+            has_body.add(id(holder))
+            continue
         target: SplitRuling | None = None
         if s.case_number is not None:
-            target = by_cn.get(s.case_number)
+            target = by_case_number(s)
             if target is None:
                 # A row with a malformed CASE # that points at this section:
                 # the section's own ``Case No.:`` names the row's case (#4881),
                 # as in format B.
                 target = next(
-                    (
-                        r
-                        for r in rulings
-                        if r.case_number is None and s.first_line in refs.get(id(r), set())
-                    ),
+                    (r for r in rulings if r.case_number is None and points_at(r, s)),
                     None,
                 )
                 if target is not None:
                     target.case_number = s.case_number
-                    by_cn[s.case_number] = target
             if target is None:
                 # One mistyped digit between the table and the body (e.g.
                 # table ``24CV469611``, body ``25CV469611``): the table's
@@ -1615,7 +1721,6 @@ def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
             if target is None:
                 target = SplitRuling(ruling_index=0, case_number=s.case_number, ruling_text="")
                 rulings.append(target)
-                by_cn[s.case_number] = target
         else:
             target = next((r for r in rulings if s.first_line in refs.get(id(r), set())), None)
         if target is None:
