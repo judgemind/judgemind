@@ -7,6 +7,7 @@ import { ErrorBanner } from '@/components/ErrorBanner';
 import { OverviewGrid } from './OverviewGrid';
 import { MetricsChart } from './MetricsChart';
 import { CountyDetail } from './CountyDetail';
+import { RosterHealthPanel } from './RosterHealthPanel';
 import {
   DATA_QUALITY_OVERVIEW_QUERY,
   DATA_QUALITY_METRICS_QUERY,
@@ -131,6 +132,9 @@ export function DataQualityDashboard() {
         onCountyClick={setSelectedCounty}
         selectedCounty={selectedCounty}
       />
+
+      {/* Per-court judge roster fetch health (#4872) */}
+      <RosterHealthPanel />
 
       {/* Truncation warning */}
       {!metricsLoading && metricsTruncated && (

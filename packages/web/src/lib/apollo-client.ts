@@ -148,6 +148,10 @@ export function createApolloClient(): ApolloClient<unknown> {
         DataQualityOverview: {
           keyFields: ['county'],
         },
+        // Per-court roster freshness on /admin/data-quality (#4872).
+        RosterFreshness: {
+          keyFields: ['courtId'],
+        },
         OutcomeCount: {
           keyFields: ['outcome'],
         },

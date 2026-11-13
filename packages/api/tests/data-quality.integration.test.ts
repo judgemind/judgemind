@@ -604,3 +604,136 @@ describe('dataQualityOverview', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests — rosterFreshness (issue #4872)
+// ---------------------------------------------------------------------------
+
+describe('rosterFreshness', () => {
+  // Court ids are prefixed so they never collide with real roster courts.
+  const OK = 'test_roster_ok';
+  const STALE = 'test_roster_stale';
+  const FAILING = 'test_roster_failing';
+
+  async function cleanupRoster(): Promise<void> {
+    await pool.query(`DELETE FROM telemetry.roster_fetch_attempts WHERE court_id LIKE 'test_roster_%'`);
+    await pool.query(`DELETE FROM derived.court_directory_snapshots WHERE court_id LIKE 'test_roster_%'`);
+  }
+
+  beforeAll(async () => {
+    await cleanupRoster();
+    // OK: deduplicated success an hour ago; the snapshot itself is old.
+    await pool.query(
+      `INSERT INTO derived.court_directory_snapshots (court_id, captured_at, s3_key, mapping, content_hash)
+       VALUES ($1, NOW() - INTERVAL '60 days', 'directories/x.html', '{"1": "Judge A"}', 'h1')`,
+      [OK],
+    );
+    await pool.query(
+      `INSERT INTO telemetry.roster_fetch_attempts
+         (court_id, directory_class, attempted_at, outcome, department_count, snapshot_changed)
+       VALUES ($1, 'OkDirectory', NOW() - INTERVAL '1 hour', 'success', 12, false)`,
+      [OK],
+    );
+    // STALE: snapshot months old, three failures since, last one a 503.
+    await pool.query(
+      `INSERT INTO derived.court_directory_snapshots (court_id, captured_at, s3_key, mapping, content_hash)
+       VALUES ($1, NOW() - INTERVAL '120 days', 'directories/y.html', '{"1": "Judge B"}', 'h2')`,
+      [STALE],
+    );
+    for (const hours of [26, 13, 1]) {
+      await pool.query(
+        `INSERT INTO telemetry.roster_fetch_attempts
+           (court_id, directory_class, attempted_at, outcome, error_class, http_status, error_message)
+         VALUES ($1, 'StaleDirectory', NOW() - make_interval(hours => $2), 'failure',
+                 'http_5xx', 503, 'HTTPStatusError: 503 Service Unavailable')`,
+        [STALE, hours],
+      );
+    }
+    // FAILING: succeeded yesterday, failed once since.
+    await pool.query(
+      `INSERT INTO telemetry.roster_fetch_attempts
+         (court_id, directory_class, attempted_at, outcome, department_count, snapshot_changed)
+       VALUES ($1, 'FailingDirectory', NOW() - INTERVAL '20 hours', 'success', 30, true)`,
+      [FAILING],
+    );
+    await pool.query(
+      `INSERT INTO telemetry.roster_fetch_attempts
+         (court_id, directory_class, attempted_at, outcome, error_class, error_message)
+       VALUES ($1, 'FailingDirectory', NOW() - INTERVAL '2 hours', 'failure', 'network', 'ConnectTimeout')`,
+      [FAILING],
+    );
+  });
+
+  // RECOVERED: two failures, then a manual fetch wrote a newer snapshot.
+  const RECOVERED = 'test_roster_recovered';
+  beforeAll(async () => {
+    for (const hours of [30, 20]) {
+      await pool.query(
+        `INSERT INTO telemetry.roster_fetch_attempts
+           (court_id, directory_class, attempted_at, outcome, error_class, error_message)
+         VALUES ($1, 'RecoveredDirectory', NOW() - make_interval(hours => $2), 'failure',
+                 'empty_roster', 'EmptyRosterError: 0 departments')`,
+        [RECOVERED, hours],
+      );
+    }
+    await pool.query(
+      `INSERT INTO derived.court_directory_snapshots (court_id, captured_at, s3_key, mapping, content_hash)
+       VALUES ($1, NOW() - INTERVAL '5 hours', 'directories/z.html', '{"1": "Judge C"}', 'h3')`,
+      [RECOVERED],
+    );
+  });
+
+  afterAll(async () => {
+    await cleanupRoster();
+  });
+
+  const QUERY = `{
+    rosterFreshness {
+      courtId status isStale lastSuccessAt lastSnapshotAt lastAttemptAt lastOutcome
+      lastErrorClass lastHttpStatus lastErrorMessage lastDepartmentCount
+      consecutiveFailures ageHours staleThresholdHours
+    }
+  }`;
+
+  it('rejects non-admin users', async () => {
+    const body = await gql(QUERY, undefined, userToken);
+    expect(body.errors?.[0].extensions?.code).toBe('FORBIDDEN');
+  });
+
+  it('returns per-court freshness with stale and failing courts flagged', async () => {
+    const body = await gql(QUERY, undefined, adminToken);
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.rosterFreshness as Array<Record<string, unknown>>;
+    const byCourt = new Map(rows.map((r) => [r.courtId, r]));
+
+    const ok = byCourt.get(OK)!;
+    expect(ok.status).toBe('ok');
+    expect(ok.isStale).toBe(false);
+    expect(ok.lastOutcome).toBe('success');
+    expect(ok.lastDepartmentCount).toBe(12);
+    expect(ok.ageHours as number).toBeLessThan(2);
+    expect(ok.staleThresholdHours).toBe(168);
+
+    const stale = byCourt.get(STALE)!;
+    expect(stale.status).toBe('stale');
+    expect(stale.isStale).toBe(true);
+    expect(stale.lastOutcome).toBe('failure');
+    expect(stale.lastErrorClass).toBe('http_5xx');
+    expect(stale.lastHttpStatus).toBe(503);
+    expect(stale.consecutiveFailures).toBe(3);
+    expect(stale.lastSuccessAt).toBe(stale.lastSnapshotAt);
+
+    const failing = byCourt.get(FAILING)!;
+    expect(failing.status).toBe('failing');
+    expect(failing.isStale).toBe(false);
+    expect(failing.lastErrorClass).toBe('network');
+    expect(failing.consecutiveFailures).toBe(1);
+    expect(failing.lastSnapshotAt).toBeNull();
+
+    // Failures older than the newest snapshot don't count against the court.
+    const recovered = byCourt.get(RECOVERED)!;
+    expect(recovered.status).toBe('ok');
+    expect(recovered.consecutiveFailures).toBe(0);
+    expect(recovered.lastSuccessAt).toBe(recovered.lastSnapshotAt);
+  });
+});
