@@ -298,6 +298,14 @@ class CourtDirectory(abc.ABC):
         Convenience method that calls ``fetch_current()``, then
         ``save_snapshot()``, and returns the parsed mapping.
 
+        A mapping with zero departments is never saved (#4880). The page
+        fetched but parsed to nothing (usually a layout change), so saving it
+        would make an empty roster the court's newest snapshot and wipe judge
+        attribution. Lookups keep using the last good snapshot, and
+        ``framework.roster_health.fetch_roster`` records the attempt as an
+        ``empty_roster`` failure. The check lives here rather than in
+        ``save_snapshot`` because subclasses (SF, SB) override that.
+
         Parameters
         ----------
         court_id : str
@@ -307,9 +315,17 @@ class CourtDirectory(abc.ABC):
         -------
         dict[str, str]
             The parsed {department: judge_name} mapping from the live
-            directory.
+            directory (empty when the page parsed to nothing).
         """
         raw, mapping = self.fetch_current()
+        if not mapping:
+            logger.warning(
+                "Directory parsed to 0 departments; not saving snapshot",
+                court_id=court_id,
+                raw_bytes=len(raw),
+                content_hash=sha256_hex(raw)[:12],
+            )
+            return mapping
         self.save_snapshot(raw, mapping, court_id)
         return mapping
 
