@@ -234,8 +234,40 @@ jobs:
         run: |
           "${GITHUB_WORKSPACE}/scripts/wait-for-rollout.sh"
 
+      - name: Read service desired count
+        id: desired-count
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+        run: |
+          # The v2 daemon is intentionally scaled to desired_count = 0 in
+          # infra/terraform/environments/dev/main.tf (#4668, v1-only mode).
+          # With no task running, no startup log line can ever appear, so
+          # the SHA health check below would always time out (#4771).
+          # Read desiredCount from ECS at run time (never hardcode it) and
+          # skip the health check ONLY on an exact read of 0. Any other
+          # outcome — >= 1, an empty read, "None", or an AWS CLI error —
+          # leaves the health check enabled so a broken deploy still fails.
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --no-cli-pager \
+            --output text \
+            --query 'services[0].desiredCount' || true)
+          echo "desiredCount for $ECS_SERVICE: '${DESIRED_COUNT}'"
+
+          if [ "$DESIRED_COUNT" = "0" ]; then
+            MSG="Health check skipped: service $ECS_SERVICE scaled to 0 (intentional, #4668). Image pushed; no task is running to boot it."
+            echo "::notice title=Dispatcher health check skipped::$MSG"
+            echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+            echo "skip_health_check=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_health_check=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Health check — confirm daemon booted with new SHA
         id: health-check
+        if: steps.desired-count.outputs.skip_health_check != 'true'
         env:
           LOG_GROUP: ${{ env.LOG_GROUP }}
           SHA_TAG: ${{ needs.build-and-push.outputs.sha_tag }}
