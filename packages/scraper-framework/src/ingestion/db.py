@@ -2330,6 +2330,7 @@ def insert_document_and_ruling(
     relink_case: bool = False,
     hearing_date_source: str | None = None,
     split_set: SplitSet | None = None,
+    move_ruling_case: bool = False,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
 
@@ -2386,9 +2387,21 @@ def insert_document_and_ruling(
     treated as a separate capture that wins content-hash dedup.  See
     ``_move_split_sibling_ruling``.
 
+    ``move_ruling_case`` (default False) moves this document's existing
+    ruling to *case_id* in place, placeholder or not, and links the
+    document to it (#4915).  The caller sets it only when the ruling's
+    current case number is absent from the document text, so it was never
+    this document's case.  The ruling keeps its row, so its
+    ``public.alert_events`` keep their ``ruling_id``; if another capture
+    already holds a ruling with that case and text, this one is removed
+    (alerts detached) and ``insert_ruling`` dedups it, as on any write.
+
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).
     """
+    if move_ruling_case:
+        _move_document_ruling_to_case(conn, document_id, case_id)
+        relink_case = False
     if relink_case and _is_placeholder_case(conn, case_id):
         logger.info(
             "insert_document_and_ruling: relink skipped, target case is a placeholder",
@@ -2609,6 +2622,42 @@ def _move_split_sibling_ruling(
 #: extracted (``UNKNOWN-<document_id>``).  Mirrors
 #: ``ruling_guards._UNKNOWN_CASE_NUMBER_PREFIX``.
 _PLACEHOLDER_CASE_PREFIX = "UNKNOWN-"
+
+
+def _move_document_ruling_to_case(conn: psycopg.Connection, document_id: str, case_id: str) -> None:
+    """Move *document_id*'s ruling and document row to *case_id* (#4915).
+
+    See ``insert_document_and_ruling(move_ruling_case=True)``.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SAVEPOINT move_ruling_case")
+        try:
+            cur.execute(
+                "UPDATE rulings SET case_id = %s::uuid WHERE document_id = %s::uuid "
+                "AND case_id <> %s::uuid",
+                (case_id, document_id, case_id),
+            )
+            cur.execute("RELEASE SAVEPOINT move_ruling_case")
+        except psycopg.errors.UniqueViolation:
+            cur.execute("ROLLBACK TO SAVEPOINT move_ruling_case")
+            cur.execute(
+                "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
+                "(SELECT id FROM rulings WHERE document_id = %s::uuid)",
+                (document_id,),
+            )
+            cur.execute("DELETE FROM rulings WHERE document_id = %s::uuid", (document_id,))
+        cur.execute(
+            "UPDATE documents SET case_id = %s::uuid WHERE id = %s::uuid",
+            (case_id, document_id),
+        )
+    logger.info(
+        "insert_document_and_ruling: ruling moved off a case its document does not print",
+        extra={
+            "document_id": document_id,
+            "case_id": case_id,
+            "telemetry_event": "ruling_left_unsupported_case",
+        },
+    )
 
 
 def _is_placeholder_case(conn: psycopg.Connection, case_id: str) -> bool:

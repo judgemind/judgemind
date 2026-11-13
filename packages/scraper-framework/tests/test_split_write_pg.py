@@ -355,3 +355,73 @@ def test_stale_child_cleanup_keeps_earlier_validation_results_rows(conn: object)
     key.write([("30-I-1", _text(1))])
     assert key.slot(1) not in key.statuses()
     assert list(_validation_rows(conn, key.slot(1))) == [old_fail]
+
+
+# ---------------------------------------------------------------------------
+# insert_document_and_ruling(move_ruling_case=True) (#4915)
+# ---------------------------------------------------------------------------
+
+
+def _write_whole(key: Key, number: str | None, text: str, *, move: bool = False) -> str:
+    """Write *key*'s whole document (one ruling, the parent id) on *number*."""
+    from ingestion.db import insert_document_and_ruling
+
+    case_id = key.case(number, key.parent)
+    insert_document_and_ruling(
+        key.conn,
+        document_id=key.parent,
+        case_id=case_id,
+        court_id=key.court_id,
+        content_format="pdf",
+        content_hash=key.hash,
+        s3_key=key.s3_key,
+        s3_bucket="b",
+        source_url="",
+        scraper_id="t",
+        captured_at=datetime(2026, 9, 1),
+        hearing_date=date(2026, 9, 4),
+        ruling_text=text,
+        hearing_date_source="llm",
+        move_ruling_case=move,
+    )
+    return case_id
+
+
+def test_move_ruling_case_keeps_ruling_row_and_alert(conn: object) -> None:
+    """A whole document's ruling filed under a number the document does not
+    print moves to the printed one in place: same row, alert intact, and
+    the document follows it (#4915)."""
+    key = Key(conn)
+    _write_whole(key, "CVRI2401073", _text(1))
+    ((ruling_id, _, number, _),) = key.rulings().values()
+    assert number == "CVRI2401073"
+    alert = _alert(conn, ruling_id, key.parent)
+
+    # Without the move the preserve-first write keeps the old case.
+    _write_whole(key, "CVRI2401570", _text(1))
+    assert key.rulings()[key.parent][2] == "CVRI2401073"
+
+    new_case = _write_whole(key, "CVRI2401570", _text(1), move=True)
+    assert key.rulings()[key.parent][:3] == (ruling_id, _text(1), "CVRI2401570")
+    assert _alert_target(conn, alert) == (ruling_id, key.parent)
+    with conn.cursor() as cur:
+        cur.execute("SELECT case_id::text FROM documents WHERE id = %s::uuid", (key.parent,))
+        assert cur.fetchone()[0] == new_case
+
+
+def test_move_ruling_case_onto_a_duplicate_dedups(conn: object) -> None:
+    """When another capture already holds the target case's ruling with the
+    same text, the moved ruling is a duplicate: it is removed (its alert
+    detached, never deleted) and the document is superseded (#2458)."""
+    key = Key(conn)
+    other = Key(conn)
+    other.court_id = key.court_id
+    _write_whole(other, "CVRI2401570", _text(2))
+    _write_whole(key, "CVRI2401073", _text(2))
+    ((ruling_id, *_),) = key.rulings().values()
+    alert = _alert(conn, ruling_id, key.parent)
+
+    _write_whole(key, "CVRI2401570", _text(2), move=True)
+    assert key.rulings() == {}
+    assert _alert_target(conn, alert)[0] is None
+    assert len(other.rulings()) == 1
