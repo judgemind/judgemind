@@ -33,10 +33,18 @@
 #         timed_out, ...), or a usage error
 #   124   still running when --timeout-secs ran out. NOT a failure. Re-run
 #         the same command to keep waiting.
-#   125   `gh run view` failed 3 times in a row, so the run's state is
-#         unknown. Check `gh auth status`, then re-run the same command.
+#   125   `gh run view` failed (or hung past its per-call limit) 3 times in
+#         a row, so the run's state is unknown. Check `gh auth status`,
+#         then re-run the same command.
+#
+# Each `gh run view` call is bounded by a per-call timeout sized to the time
+# left, and calls slower than 30s are logged as "slow call: ..." on stderr
+# (#4850), so one hung call cannot hold this past its budget.
 
 set -euo pipefail
+
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_wait_budget_lib.sh"
 
 REPO="judgemind/judgemind"
 TIMEOUT_SECS=480
@@ -96,6 +104,7 @@ for _pair in "timeout-secs:$TIMEOUT_SECS" "poll-interval:$POLL_INTERVAL"; do
 done
 
 START_SECS=$SECONDS
+wait_budget_init "$TIMEOUT_SECS" "$START_SECS"
 CONSECUTIVE_ERRORS=0
 LAST_STATUS=""
 
@@ -104,7 +113,8 @@ echo "Waiting for run ${RUN_ID} in ${REPO} (timeout: ${TIMEOUT_SECS}s, poll: ${P
 while true; do
     ELAPSED=$(( SECONDS - START_SECS ))
     VIEW=""
-    if VIEW=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
+    if VIEW=$(wait_budget_call "gh run view ${RUN_ID}" \
+            gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
             -q '.status + " " + (.conclusion // "")' 2>&1); then
         CONSECUTIVE_ERRORS=0
         STATUS="${VIEW%% *}"
@@ -137,7 +147,9 @@ while true; do
     fi
 
     ELAPSED=$(( SECONDS - START_SECS ))
-    if [[ $ELAPSED -ge $TIMEOUT_SECS ]]; then
+    # Exit once the budget is spent, or when too little is left for another
+    # call to finish inside it (#4850).
+    if [[ $ELAPSED -ge $TIMEOUT_SECS ]] || wait_budget_exhausted; then
         echo "STILL WAITING: run ${RUN_ID} is still ${LAST_STATUS:-running} after ${TIMEOUT_SECS}s. This is not a failure." >&2
         echo "Re-run the same command to keep waiting (it only reads state):" >&2
         echo "  scripts/wait-for-run.sh ${ORIG_ARGS[*]}" >&2

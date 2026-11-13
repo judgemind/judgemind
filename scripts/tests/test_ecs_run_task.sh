@@ -390,6 +390,7 @@ setup_full_mock() {
     local root="$1"
     mkdir -p "$root/bin" "$root/scripts" "$root/state"
     cp "$ECS_RUN_TASK" "$root/scripts/ecs-run-task.sh"
+    cp "$SCRIPT_DIR/_wait_budget_lib.sh" "$SCRIPT_DIR/_ecs_exec_lib.sh" "$root/scripts/"
     # Post-hoc fallback stub that always fails, so the assertions below can
     # only pass if the wait loop's own live streaming found the stream.
     cat > "$root/scripts/ecs-logs.sh" << 'MOCK_LOGS'
@@ -441,6 +442,11 @@ JSON
         echo '{"tasks":[{"taskArn":"arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/f585c2568b50450699e715cae36a4e98"}],"failures":[]}'
         ;;
     "ecs describe-tasks")
+        if [[ "${MOCK_DESCRIBE_HANG:-}" == "1" ]]; then
+            # A call that never returns (#4850).  The real sleep binary:
+            # the sandbox's `sleep` is a no-op stub.
+            exec /bin/sleep 3600
+        fi
         n=$(cat "$state/describe.count" 2>/dev/null || echo 0)
         n=$((n + 1)); echo "$n" > "$state/describe.count"
         if [[ "${MOCK_STOP_AFTER}" != "never" && "$n" -gt "${MOCK_STOP_AFTER}" ]]; then
@@ -536,6 +542,38 @@ test_ecs_run_task_finds_late_sorting_log_stream() {
         pass "log stream: queried with the task-specific prefix"
     else
         fail "log stream: queried with the task-specific prefix" "prefixes: $(cat "$root/state/prefixes.log" 2>/dev/null)"
+    fi
+}
+
+# A describe-tasks call that never returns must not hold the attached wait
+# past its budget (#4850): the call is killed and the script exits 124/125
+# within budget + 10s.
+test_ecs_run_task_hung_describe_respects_budget() {
+    local root fake_script output exit_code=0 start took
+    root=$(make_temp_dir)
+    setup_full_mock "$root"
+    fake_script=$(make_fake_script)
+    start=$SECONDS
+    output=$(
+        PATH="$root/bin:$PATH" MOCK_STATE="$root/state" MOCK_STOP_AFTER=never \
+        MOCK_DESCRIBE_HANG=1 ECS_RUN_TASK_POLL_INTERVAL=1 \
+        "$root/scripts/ecs-run-task.sh" --timeout 5 "$fake_script" 2>&1
+    ) || exit_code=$?
+    took=$((SECONDS - start))
+    if [[ $exit_code -eq 124 || $exit_code -eq 125 ]]; then
+        pass "hung describe-tasks: exits 124/125 (got $exit_code)"
+    else
+        fail "hung describe-tasks: exits 124/125" "exit $exit_code; output: $output"
+    fi
+    if [[ $took -le 15 ]]; then
+        pass "hung describe-tasks: ends within budget + 10s (${took}s)"
+    else
+        fail "hung describe-tasks: ends within budget + 10s" "took ${took}s"
+    fi
+    if echo "$output" | grep -q "timed out: aws ecs describe-tasks"; then
+        pass "hung describe-tasks: the killed call is named on stderr"
+    else
+        fail "hung describe-tasks: the killed call is named on stderr" "output: $output"
     fi
 }
 
@@ -807,6 +845,7 @@ test_ecs_run_task_timeout_max_runtime_does_not_stretch_wait
 test_ecs_run_task_timeout_explicit_wins
 test_ecs_run_task_timeout_invalid_rejected
 test_ecs_run_task_finds_late_sorting_log_stream
+test_ecs_run_task_hung_describe_respects_budget
 test_ecs_run_task_timeout_reports_still_running
 test_ecs_run_task_reattach_after_still_running_does_not_relaunch
 test_ecs_run_task_survives_transient_describe_failure

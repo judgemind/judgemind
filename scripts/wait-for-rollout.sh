@@ -57,10 +57,20 @@
 #       (#4835). Not a failure verdict. Re-running with the same env vars
 #       resumes the wait on the same deployment; it never redeploys.
 #       CI callers treat any non-zero exit as a failed deploy step.
-#   125 — aws ecs describe-services failed, so the rollout state is
-#       unknown (same convention as scripts/ecs-run-task.sh, #4791).
+#   125 — aws ecs describe-services failed (or hung past its per-call
+#       limit 3 times in a row), so the rollout state is unknown (same
+#       convention as scripts/ecs-run-task.sh, #4791).
+#
+# Each describe-services call runs under a per-call timeout sized to the
+# time left in ROLLOUT_TIMEOUT_SECS, and calls slower than 30s are logged as
+# "slow call: ..." (#4850). This script sources scripts/_wait_budget_lib.sh
+# and scripts/_ecs_exec_lib.sh, so both are part of the paths-filter
+# contract above.
 
 set -euo pipefail
+
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_wait_budget_lib.sh"
 
 : "${ECS_CLUSTER:?ECS_CLUSTER is required}"
 : "${ECS_SERVICE:?ECS_SERVICE is required}"
@@ -93,27 +103,46 @@ fi
 
 echo "Waiting for $SELECTOR_DESC to roll out on ${ECS_CLUSTER}/${ECS_SERVICE} (timeout: ${ROLLOUT_TIMEOUT_SECS}s, poll every ${ROLLOUT_POLL_INTERVAL}s)..."
 
-START_TS=$(date +%s)
+START_TS=$SECONDS
 DEADLINE=$((START_TS + ROLLOUT_TIMEOUT_SECS))
+wait_budget_init "$ROLLOUT_TIMEOUT_SECS" "$START_TS"
 LAST_STATE=""
 LAST_COUNTS=""
+SERVICE_JSON='{}'
+CONSECUTIVE_TIMEOUTS=0
+MAX_CONSECUTIVE_TIMEOUTS=3
 
 while true; do
-  NOW_TS=$(date +%s)
+  NOW_TS=$SECONDS
   ELAPSED=$((NOW_TS - START_TS))
 
-  if ! SERVICE_JSON=$("$AWS_CLI" ecs describe-services \
+  DESCRIBE_RC=0
+  DESCRIBE_OUT=$(wait_budget_call "aws ecs describe-services" \
+        "$AWS_CLI" ecs describe-services \
         --cluster "$ECS_CLUSTER" \
         --services "$ECS_SERVICE" \
-        --output json); then
+        --output json) || DESCRIBE_RC=$?
+  if [ "$DESCRIBE_RC" -eq "$WAIT_CALL_TIMEOUT_RC" ]; then
+    # A hung call is a failed poll, not a verdict (#4850).
+    CONSECUTIVE_TIMEOUTS=$((CONSECUTIVE_TIMEOUTS + 1))
+    if [ "$CONSECUTIVE_TIMEOUTS" -ge "$MAX_CONSECUTIVE_TIMEOUTS" ] && ! wait_budget_exhausted; then
+      echo "ERROR: aws ecs describe-services hung ${CONSECUTIVE_TIMEOUTS} times in a row after ${ELAPSED}s; rollout state unknown."
+      exit 125
+    fi
+    DEPLOYMENT=""
+  elif [ "$DESCRIBE_RC" -ne 0 ]; then
     echo "ERROR: aws ecs describe-services failed after ${ELAPSED}s; rollout state unknown."
     exit 125
+  else
+    CONSECUTIVE_TIMEOUTS=0
+    SERVICE_JSON="$DESCRIBE_OUT"
+    DEPLOYMENT=$(echo "$SERVICE_JSON" | jq --arg sel "$JQ_SELECT_ARG" \
+      "$JQ_SELECT_FILTER")
   fi
 
-  DEPLOYMENT=$(echo "$SERVICE_JSON" | jq --arg sel "$JQ_SELECT_ARG" \
-    "$JQ_SELECT_FILTER")
-
-  if [ -z "$DEPLOYMENT" ]; then
+  if [ "$DESCRIBE_RC" -ne 0 ]; then
+    echo "[${ELAPSED}s] describe-services timed out, retrying..."
+  elif [ -z "$DEPLOYMENT" ]; then
     # Our deployment has not yet been registered in the deployments list.
     # Give ECS a moment — retry.
     echo "[${ELAPSED}s] Deployment for $SELECTOR_DESC not yet visible, retrying..."
@@ -161,7 +190,10 @@ while true; do
     LAST_STATE="$ROLLOUT_STATE"
   fi
 
-  if [ "$NOW_TS" -ge "$DEADLINE" ]; then
+  # Re-read the clock (the call above may have been slow) and stop when too
+  # little is left for another call to finish inside the budget (#4850).
+  NOW_TS=$SECONDS
+  if [ "$NOW_TS" -ge "$DEADLINE" ] || wait_budget_exhausted; then
     echo "ERROR: Timed out after ${ROLLOUT_TIMEOUT_SECS}s waiting for $SELECTOR_DESC to stabilize (still rolling out)."
     echo "Last observed state: ${LAST_STATE:-<none>} (${LAST_COUNTS:-<no counts>})"
     echo "Full service JSON snapshot:"
@@ -170,5 +202,5 @@ while true; do
     exit 124
   fi
 
-  sleep "$ROLLOUT_POLL_INTERVAL"
+  wait_budget_sleep "$ROLLOUT_POLL_INTERVAL"
 done

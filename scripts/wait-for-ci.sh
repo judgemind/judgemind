@@ -98,6 +98,17 @@
 #       terminal state. Not a failure. Re-run the same command to keep
 #       waiting (#4835). The flake auto-rerun sentinel is keyed on the
 #       head SHA, so a re-run never fires a second `gh run rerun`.
+#   125 — Status unknown: the check-runs read failed (or hung past its
+#       per-call limit) 3 polls in a row. Check `gh auth status`, then
+#       re-run the same command.
+#
+# ── Per-call time limit (#4850) ─────────────────────────────────────────────
+#
+# Every `gh` call runs under a per-call timeout sized to the time left in
+# --timeout-secs (see scripts/_wait_budget_lib.sh), so one hung call cannot
+# hold the script past its budget and the Bash tool's 600s cap. A killed
+# call counts as a failed poll. Any call slower than 30s is logged to stderr
+# as `slow call: <call> took Ns`, so the next slow poll names its culprit.
 #   3 — REBASE_REQUIRED (#4412): CI is green (`ci-passed=success`, no latest
 #       failures) but `mergeStateStatus=DIRTY` — a concurrent merge landed on
 #       origin/main that conflicts with this PR's diff. There is no path
@@ -164,6 +175,12 @@ AUTO_RERUN=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLASSIFIER="$SCRIPT_DIR/classify-ci-flake.sh"
 
+# Per-call timeouts + slow-call logging for every gh call (#4850).
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "$SCRIPT_DIR/_wait_budget_lib.sh"
+# Consecutive failed (or timed-out) check-runs reads before exiting 125.
+MAX_CONSECUTIVE_ERRORS=3
+
 # Default flake telemetry log path — `<repo-or-worktree-root>/tmp/wait-for-ci-flakes.jsonl`.
 # `SCRIPT_DIR` is `<root>/scripts`, so the parent is the root itself. Tests
 # override via `WAIT_FOR_CI_FLAKE_LOG` to point at a per-test tmpdir.
@@ -182,7 +199,7 @@ print_help() {
     grep '^#   --' "$0" | sed 's/^# //'
     echo ""
     grep '^# Exit codes:' "$0" | sed 's/^# //'
-    grep -E '^#   (0|1|3|124) ' "$0" | sed 's/^# //'
+    grep -E '^#   (0|1|3|124|125) ' "$0" | sed 's/^# //'
 }
 
 # Kept verbatim so the exit-124 message can print the exact re-run command.
@@ -278,7 +295,8 @@ gh_pr_view_with_rest_fallback() {
     pr_view_stdout=$(mktemp)
 
     set +e
-    gh pr view "$PR_NUMBER" --repo "$REPO" --json "$field" -q ".$field" \
+    wait_budget_call "gh pr view --json ${field}" \
+        gh pr view "$PR_NUMBER" --repo "$REPO" --json "$field" -q ".$field" \
         > "$pr_view_stdout" 2> "$pr_view_stderr"
     pr_view_exit=$?
     set -e
@@ -339,17 +357,61 @@ gh_pr_view_with_rest_fallback() {
 
     # Single REST call. Don't suppress stderr here — if REST also fails (e.g.
     # core quota exhausted, auth broken), the operator needs the diagnostic.
-    if ! gh api "/repos/${REPO}/pulls/${PR_NUMBER}" --jq "$rest_jq"; then
+    local rest_rc=0
+    wait_budget_call "gh api pulls/${PR_NUMBER}" \
+        gh api "/repos/${REPO}/pulls/${PR_NUMBER}" --jq "$rest_jq" || rest_rc=$?
+    if [ "$rest_rc" -ne 0 ]; then
         echo "ERROR: REST fallback for '$field' also failed." >&2
-        return 1
+        return "$rest_rc"
     fi
     return 0
 }
 
 # ── Resolve PR head SHA ───────────────────────────────────────────────────────
 
+# The budget starts here so the SHA lookup counts against --timeout-secs too.
+START_TS=$SECONDS
+wait_budget_init "$TIMEOUT_SECS" "$START_TS"
+
+# print_still_waiting — the exit-124 message ("re-run the same command").
+print_still_waiting() {
+    echo ""
+    echo "STILL WAITING: CI on PR #${PR_NUMBER} is still running after ${TIMEOUT_SECS}s. This is not a failure." >&2
+    echo "Last state: pending=${PENDING_COUNT:-?} passed=${PASSED_COUNT:-?} failed=${FAILED_COUNT:-?} cancelled=${CANCELLED_COUNT:-?}" >&2
+    echo "ci-passed conclusion: ${CI_PASSED_CONCLUSION:-(not yet present)}" >&2
+    echo "Re-run the same command to keep waiting (it only reads state; nothing is re-triggered):" >&2
+    echo "  scripts/wait-for-ci.sh ${ORIG_ARGS[*]}" >&2
+}
+
+# print_status_unknown <what> — the exit-125 message.
+print_status_unknown() {
+    echo "" >&2
+    echo "ERROR: CI status of PR #${PR_NUMBER} is unknown: $1 failed ${MAX_CONSECUTIVE_ERRORS} times in a row." >&2
+    echo "Fix: check 'gh auth status' and GitHub's status page, then re-run:" >&2
+    echo "  scripts/wait-for-ci.sh ${ORIG_ARGS[*]}" >&2
+}
+
 echo "Resolving head SHA for PR #${PR_NUMBER} in ${REPO}..."
-SHA=$(gh_pr_view_with_rest_fallback headRefOid)
+# A lookup killed by its per-call timeout is retried (#4850); any other
+# failure (PR not found, auth) still falls through to the exit-1 below.
+SHA=""
+SHA_TIMEOUTS=0
+while true; do
+    SHA_RC=0
+    SHA=$(gh_pr_view_with_rest_fallback headRefOid) || SHA_RC=$?
+    if [ "$SHA_RC" -ne "$WAIT_CALL_TIMEOUT_RC" ]; then
+        break
+    fi
+    SHA_TIMEOUTS=$((SHA_TIMEOUTS + 1))
+    if wait_budget_exhausted; then
+        print_still_waiting
+        exit 124
+    fi
+    if [ "$SHA_TIMEOUTS" -ge "$MAX_CONSECUTIVE_ERRORS" ]; then
+        print_status_unknown "the head-SHA lookup"
+        exit 125
+    fi
+done
 
 if [ -z "$SHA" ]; then
     echo "ERROR: Could not resolve head SHA for PR #${PR_NUMBER}." >&2
@@ -443,16 +505,38 @@ emit_flake_telemetry() {
 
 # ── Poll loop ─────────────────────────────────────────────────────────────────
 
-START_TS=$(date +%s)
 DEADLINE=$((START_TS + TIMEOUT_SECS))
+CONSECUTIVE_ERRORS=0
 
 while true; do
-    NOW_TS=$(date +%s)
+    NOW_TS=$SECONDS
     ELAPSED=$((NOW_TS - START_TS))
 
     # Fetch check-runs with filter=latest (one entry per check name, deduped).
-    CHECK_RUNS_JSON=$(gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100&filter=latest" \
-        | jq '.check_runs')
+    # A failed or timed-out read is a failed poll, not a CI verdict (#4850).
+    CHECK_RUNS_RC=0
+    CHECK_RUNS_RAW=$(wait_budget_call "gh api check-runs" \
+        gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100&filter=latest") \
+        || CHECK_RUNS_RC=$?
+    CHECK_RUNS_JSON=""
+    if [ "$CHECK_RUNS_RC" -eq 0 ]; then
+        CHECK_RUNS_JSON=$(printf '%s' "$CHECK_RUNS_RAW" | jq '.check_runs' 2>/dev/null) || CHECK_RUNS_RC=1
+    fi
+    if [ "$CHECK_RUNS_RC" -ne 0 ] || [ -z "$CHECK_RUNS_JSON" ] || [ "$CHECK_RUNS_JSON" = "null" ]; then
+        CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
+        echo "[${ELAPSED}s] WARNING: check-runs read failed (${CONSECUTIVE_ERRORS}/${MAX_CONSECUTIVE_ERRORS}, rc=${CHECK_RUNS_RC})." >&2
+        if wait_budget_exhausted || [ $((SECONDS - START_TS)) -ge "$TIMEOUT_SECS" ]; then
+            print_still_waiting
+            exit 124
+        fi
+        if [ "$CONSECUTIVE_ERRORS" -ge "$MAX_CONSECUTIVE_ERRORS" ]; then
+            print_status_unknown "the check-runs read"
+            exit 125
+        fi
+        wait_budget_sleep "$POLL_INTERVAL"
+        continue
+    fi
+    CONSECUTIVE_ERRORS=0
 
     # Count pending, passed, failed (hard), and cancelled checks.
     #
@@ -525,7 +609,10 @@ while true; do
                 # is grep-based so size is fine for typical CI logs <10MB).
                 # Suppress stderr — `gh` may print a non-fatal warning about
                 # log truncation that we don't want polluting stdout.
-                JOB_LOG=$(gh run view "$CANDIDATE_RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || echo "")
+                # Logs can be large, so this call gets a longer per-call
+                # limit (still never past the budget, #4850).
+                JOB_LOG=$(wait_budget_call --max 120 "gh run view --log-failed" \
+                    gh run view "$CANDIDATE_RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || echo "")
 
                 CLASSIFICATION=$(printf '%s' "$JOB_LOG" | "$CLASSIFIER" 2>/dev/null || echo "real")
                 if [ "${CLASSIFICATION#flake/}" != "$CLASSIFICATION" ]; then
@@ -548,7 +635,8 @@ EOF
 
                 echo ""
                 echo "flake detected: ${FLAKE_LABEL} (run ${FLAKE_RUN_ID}) — auto-rerunning failed jobs and continuing to poll."
-                if gh run rerun "$FLAKE_RUN_ID" --repo "$REPO" --failed >/dev/null 2>&1; then
+                if wait_budget_call "gh run rerun" \
+                        gh run rerun "$FLAKE_RUN_ID" --repo "$REPO" --failed >/dev/null 2>&1; then
                     record_rerun_fired "$FLAKE_RUN_ID"
                     # Append one structured JSONL line so downstream tooling
                     # can aggregate flake frequencies (#4163). Best-effort —
@@ -556,7 +644,11 @@ EOF
                     emit_flake_telemetry "$PR_NUMBER" "$SHA" "$FLAKE_RUN_ID" "$FLAKE_LABEL" "$FLAKE_CHECK_NAME"
                     # Sleep one poll interval so the new run has a moment to
                     # register before the next check-runs fetch.
-                    sleep "$POLL_INTERVAL"
+                    wait_budget_sleep "$POLL_INTERVAL"
+                    if wait_budget_exhausted; then
+                        print_still_waiting
+                        exit 124
+                    fi
                     continue
                 else
                     echo "ERROR: gh run rerun failed for run ${FLAKE_RUN_ID}; exiting 1." >&2
@@ -637,7 +729,7 @@ EOF
     # zero pending.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$PENDING_COUNT" -eq 0 ]; then
         # Secondary guard: verify mergeStateStatus is CLEAN or UNSTABLE.
-        MERGE_STATE=$(gh_pr_view_with_rest_fallback mergeStateStatus)
+        MERGE_STATE=$(gh_pr_view_with_rest_fallback mergeStateStatus || echo "UNKNOWN")
         if [ "$MERGE_STATE" = "CLEAN" ] || [ "$MERGE_STATE" = "UNSTABLE" ]; then
             echo ""
             echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE}, cancelled=${CANCELLED_COUNT} non-blocking)."
@@ -647,22 +739,15 @@ EOF
         fi
     fi
 
-    # Check timeout before sleeping.
-    if [ "$NOW_TS" -ge "$DEADLINE" ]; then
-        echo ""
-        echo "STILL WAITING: CI on PR #${PR_NUMBER} is still running after ${TIMEOUT_SECS}s. This is not a failure." >&2
-        echo "Last state: pending=${PENDING_COUNT} passed=${PASSED_COUNT} failed=${FAILED_COUNT} cancelled=${CANCELLED_COUNT}" >&2
-        echo "ci-passed conclusion: ${CI_PASSED_CONCLUSION:-(not yet present)}" >&2
-        echo "Re-run the same command to keep waiting (it only reads state; nothing is re-triggered):" >&2
-        echo "  scripts/wait-for-ci.sh ${ORIG_ARGS[*]}" >&2
+    # Check timeout before sleeping. Re-read the clock: the calls above may
+    # have taken a while (#4850). Also stop when too little is left for
+    # another poll to finish inside the budget.
+    NOW_TS=$SECONDS
+    if [ "$NOW_TS" -ge "$DEADLINE" ] || wait_budget_exhausted; then
+        print_still_waiting
         exit 124
     fi
 
     # Never sleep past the deadline, so the call ends on time (#4835).
-    _sleep_for="$POLL_INTERVAL"
-    _remaining=$((DEADLINE - NOW_TS))
-    if [ "$_remaining" -lt "$_sleep_for" ]; then
-        _sleep_for="$_remaining"
-    fi
-    sleep "$_sleep_for"
+    wait_budget_sleep "$POLL_INTERVAL"
 done

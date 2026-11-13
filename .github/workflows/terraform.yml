@@ -13,6 +13,8 @@ on:
       # path on its own merge — otherwise regressions surface on the
       # next unrelated apply.
       - "scripts/wait-for-rollout.sh"
+      - "scripts/_wait_budget_lib.sh"
+      - "scripts/_ecs_exec_lib.sh"
       # scripts/check-no-nonascii-tf-descriptions.sh is invoked by the
       # `Check no non-ASCII in tf descriptions` step. Same paths-filter
       # contract — a regression in the hygiene check would otherwise
@@ -24,6 +26,8 @@ on:
       - "infra/terraform/**"
       - ".github/workflows/terraform.yml"
       - "scripts/wait-for-rollout.sh"
+      - "scripts/_wait_budget_lib.sh"
+      - "scripts/_ecs_exec_lib.sh"
       - "scripts/check-no-nonascii-tf-descriptions.sh"
 
 jobs:
