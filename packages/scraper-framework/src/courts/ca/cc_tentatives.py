@@ -591,6 +591,14 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
             links = _cc_extract_links(response.text, BASE_URL)
             self._log.info("Found PDF links", count=len(links))
+            # The index keeps past PDFs for every department, so it is never
+            # legitimately empty: no links means a layout change (#4736).
+            self._check_listing(
+                links,
+                what="CC tentative-ruling PDF links",
+                url=INDEX_URL,
+                body=response.text,
+            )
 
             # Only fetch the most recent PDF per department (tentative rulings
             # are ephemeral — we want current rulings, not historical ones).

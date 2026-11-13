@@ -739,7 +739,7 @@ def test_ventura_run_fails_when_every_search_returns_a_block_page() -> None:
     assert health.records_captured == 0
     message = health.error_message or ""
     assert "all 2 Ventura date searches and document fetches were blocked" in message
-    assert "not a tentative-rulings search result" in message
+    assert "empty listing: Ventura search results for 9/27/2026" in message
 
 
 @respx.mock

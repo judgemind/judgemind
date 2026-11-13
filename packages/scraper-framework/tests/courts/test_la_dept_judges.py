@@ -36,7 +36,7 @@ from courts.ca.la_dept_judges import (
     parse_judicial_officers_html,
 )
 from courts.ca.la_tentatives import LATentativeRulingsScraper, default_config
-from framework import ContentFormat
+from framework import ContentFormat, EmptyListing
 from framework.models import CapturedDocument
 
 pytestmark = pytest.mark.regression
@@ -798,7 +798,10 @@ class TestScraperCourtDirectoryIntegration:
             return_value=httpx.Response(200, text=empty_page)
         )
 
-        scraper.fetch_documents()
+        # An option-less page with no empty-state marker is an empty
+        # listing (#4736); the snapshot happens before that check.
+        with pytest.raises(EmptyListing):
+            scraper.fetch_documents()
 
         # Verify directory was snapshotted (S3 upload happened)
         mock_s3.put_object.assert_called_once()

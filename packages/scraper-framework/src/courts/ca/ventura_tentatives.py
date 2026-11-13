@@ -523,18 +523,18 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         self._log.info("Found results", date=date_str, count=len(results))
 
         docs: list[CapturedDocument] = []
-        if not results:
-            if is_no_results_page(response.text):
-                tally.ok()
-            else:
-                # No results table and no "No results found" marker: a block
-                # page or a layout change, not an empty date (#4748).
-                tally.blocked("search response is not a tentative-rulings search result")
-                self._log.error(
-                    "ventura.unexpected_search_response",
-                    date=date_str,
-                    body_prefix=response.text[:200],
-                )
+        # No results table and no "No results found" marker is a block page
+        # or a layout change, not an empty date (#4748, #4736). Each date is
+        # its own listing, so the outcome goes on the tally rather than
+        # failing the run outright.
+        self._check_listing(
+            results,
+            what=f"Ventura search results for {date_str}",
+            url=SEARCH_URL,
+            body=response.text,
+            empty_state=is_no_results_page(response.text),
+            tally=tally,
+        )
         for result in results:
             time.sleep(self.config.request_delay_seconds)
             try:

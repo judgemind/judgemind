@@ -5,8 +5,9 @@ from __future__ import annotations
 import abc
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sized
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import httpx
 import structlog
@@ -23,6 +24,9 @@ from .models import (
     ValidationStatus,
 )
 from .storage import S3Archiver
+
+if TYPE_CHECKING:
+    from .fetch_tally import FetchTally
 
 logger = structlog.get_logger(__name__)
 
@@ -66,6 +70,20 @@ class AllFetchesFailed(ScraperPreconditionFailure):
         return self.no_retry_reason is None
 
 
+class EmptyListing(ScraperPreconditionFailure):
+    """An index / listing page loaded but parsed to zero items (#4736).
+
+    Raised by ``BaseScraper._check_listing`` when the page carries no
+    marker the scraper recognizes as a legitimate "no rulings posted" state.
+    That is the classic layout-change failure: the court changes its HTML,
+    the selector matches nothing, and without this guard the run makes no
+    attempts and records ``success=True`` with 0 records.
+
+    Not retried within the run: a layout change or block page gives the
+    same answer seconds later.  The next scheduled run is the retry.
+    """
+
+
 # Exponential backoff for fetch failures other than AllFetchesFailed
 # (listing page, session acquisition), matching retry_sync's defaults.
 _RETRY_BASE_DELAY_SECONDS = 2.0
@@ -92,6 +110,14 @@ class BaseScraper(abc.ABC):
         documents, call ``self._require_precondition(cond, msg)`` instead of
         returning ``[]``.  Returning ``[]`` would be recorded by ``run()`` as a
         successful zero-records run and mask silent outages — see #2620.
+
+    Listing pages:
+        A scraper that parses an index / landing page into a list of items
+        (dropdown options, department links, PDF links, search results)
+        passes that list to ``self._check_listing(...)`` before iterating.
+        An empty list on a page with no recognized "no rulings posted"
+        marker fails the run with :class:`EmptyListing` instead of making
+        zero attempts and recording success/0 (#4736).
 
     Per-item fetch loops:
         A loop that catches and logs each item's exception must count the
@@ -309,6 +335,9 @@ class BaseScraper(abc.ABC):
             attempt_start = time.monotonic()
             try:
                 return self.fetch_documents()
+            except EmptyListing as exc:
+                self._log.warning("empty_listing.no_retry", attempt=attempt, error=str(exc))
+                raise
             except AllFetchesFailed as exc:
                 elapsed = time.monotonic() - attempt_start
                 reason = self._all_failed_no_retry_reason(
@@ -402,6 +431,65 @@ class BaseScraper(abc.ABC):
         """
         if not cond:
             raise ScraperPreconditionFailure(msg)
+
+    def _check_listing(
+        self,
+        items: Sized,
+        *,
+        what: str,
+        url: str,
+        body: str,
+        empty_state: bool = False,
+        tally: FetchTally | None = None,
+    ) -> bool:
+        """Gate the items parsed from an index / listing page (#4736).
+
+        Call this right after parsing a listing page, before iterating its
+        items.  *what* names the listing in logs and in the run error, e.g.
+        ``"LA civil ruling dropdown options"``.  *empty_state* is True when
+        the scraper positively recognized the court's "no rulings posted"
+        marker on the page (the LA Appellate empty state, a Ventura "No
+        results found" page).
+
+        - Items found: logs ``listing.discovered`` and returns True.
+        - No items, *empty_state* True: a legitimately empty listing.  Logs
+          ``listing.empty_state`` and returns False; the run stays green.
+        - No items, no marker: a layout change or block page.  Raises
+          :class:`EmptyListing`, so the run records ``success=False`` with
+          an error naming the listing.
+
+        A scraper that walks several listings in one run (one Ventura search
+        per date) passes its :class:`FetchTally` as *tally*.  The empty
+        state then counts as one ``ok()`` and the unrecognized empty listing
+        as one ``blocked()``, so one bad listing does not discard the docs
+        captured from the others; ``tally.raise_if_all_failed`` fails the
+        run when every listing came back that way.  Returns False in both
+        cases.
+        """
+        count = len(items)
+        self._log.info("listing.discovered", listing=what, count=count, url=url)
+        if count:
+            return True
+        if empty_state:
+            self._log.info("listing.empty_state", listing=what, url=url, context="empty_state")
+            if tally is not None:
+                tally.ok()
+            return False
+        message = (
+            f"empty listing: {what} parsed to 0 items on {url} and no "
+            "'no rulings posted' marker was recognized (likely a layout change "
+            "or block page)"
+        )
+        self._log.error(
+            "listing.empty_unrecognized",
+            listing=what,
+            url=url,
+            body_prefix=body[:200],
+        )
+        if tally is not None:
+            tally.blocked(message)
+            return False
+        raise EmptyListing(message)
 
     def _mark_partial_failure(self, message: str | None) -> None:
         """Record that ``fetch_documents`` is returning docs but skipped items.
