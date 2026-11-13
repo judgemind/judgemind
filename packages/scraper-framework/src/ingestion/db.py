@@ -1424,6 +1424,7 @@ def _maybe_arbitrate(
     roster_normalized: str,
     source: str,
     confidence: float = 1.0,
+    renamed_judge_ids: set[str] | None = None,
 ) -> bool:
     """Check corroborating evidence and promote incoming_canonical if warranted.
 
@@ -1431,6 +1432,9 @@ def _maybe_arbitrate(
     If >=1 distinct non-roster source already corroborates the incoming spelling,
     promotes it to the new canonical name, demotes the roster name as an alias,
     and inserts the caller's raw name under the caller's source.
+
+    A promotion renames the judge, so *judge_id* is added to
+    *renamed_judge_ids* (see :func:`resolve_judge`).
 
     Returns True if promotion occurred, False otherwise.
     """
@@ -1478,6 +1482,8 @@ def _maybe_arbitrate(
             roster_normalized,
         )
         return False
+    if renamed_judge_ids is not None:
+        renamed_judge_ids.add(judge_id)
     # Preserve the demoted roster name as an alias
     cur.execute(
         """
@@ -1517,11 +1523,21 @@ def resolve_judge(
     court_id: str,
     *,
     source: str | None = None,
+    renamed_judge_ids: set[str] | None = None,
 ) -> str | None:
     """Resolve a raw judge name to a canonical judge record, returning the judge UUID.
 
     Returns ``None`` if the raw name is invalid (garbage, too short, etc.)
     instead of creating a bad judge record.
+
+    Two steps can rename an existing judge (``UPDATE judges SET
+    canonical_name``): the near-duplicate step (a longer spelling wins) and
+    arbitration (a corroborated spelling wins).  A rename changes the
+    ``judge_name`` of every search doc of that judge's rulings, not only the
+    ruling being written, so the id of each renamed judge is added to
+    *renamed_judge_ids* when the caller passes a set.  The caller re-indexes
+    those judges' rulings once its transaction commits
+    (``framework.search.ruling_doc.reindex_judge_rulings``, #4920).
 
     Lookup strategy:
       1. Normalize the raw name and validate it.
@@ -1585,6 +1601,7 @@ def resolve_judge(
                     incoming_canonical=canonical,
                     roster_normalized=matched_canonical,
                     source=source,
+                    renamed_judge_ids=renamed_judge_ids,
                 )
             return judge_id
 
@@ -1640,6 +1657,8 @@ def resolve_judge(
                         """,
                         (canonical, judge_id),
                     )
+                    if renamed_judge_ids is not None:
+                        renamed_judge_ids.add(judge_id)
                     logger.info(
                         "resolve_judge: updated canonical name %r -> %r for judge %s",
                         existing_canonical,
@@ -1723,6 +1742,7 @@ def resolve_judge(
                                 roster_normalized=roster_normalized,
                                 source=source,
                                 confidence=confidence,
+                                renamed_judge_ids=renamed_judge_ids,
                             )
                         ):
                             return judge_id

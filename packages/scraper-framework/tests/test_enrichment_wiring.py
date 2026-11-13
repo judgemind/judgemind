@@ -359,7 +359,11 @@ def test_enrichment_alias_match_updates_judge_name(
 
     # Verify resolve_judge was called with canonical name and source label
     mock_resolve_judge.assert_called_once_with(
-        mock_conn, "Smith, Jonathan A.", "court-uuid-1", source="ca-la-tentatives-civil"
+        mock_conn,
+        "Smith, Jonathan A.",
+        "court-uuid-1",
+        source="ca-la-tentatives-civil",
+        renamed_judge_ids=set(),
     )
 
     # The canonical name reaches OpenSearch through the judge row that
@@ -419,7 +423,11 @@ def test_enrichment_directory_mismatch_logs_warning_no_override(
 
     # Judge name should NOT be changed to directory judge
     mock_resolve_judge.assert_called_once_with(
-        mock_conn, "Smith, John A.", "court-uuid-1", source="ca-la-tentatives-civil"
+        mock_conn,
+        "Smith, John A.",
+        "court-uuid-1",
+        source="ca-la-tentatives-civil",
+        renamed_judge_ids=set(),
     )
 
     # Verify directory mismatch warning was logged
@@ -675,7 +683,11 @@ def test_enrichment_no_db_api_changes(
 
     # Verify resolve_judge is called with the source label from scraper_id
     mock_resolve_judge.assert_called_once_with(
-        mock_conn, "Smith, John A.", "court-uuid-1", source="ca-la-tentatives-civil"
+        mock_conn,
+        "Smith, John A.",
+        "court-uuid-1",
+        source="ca-la-tentatives-civil",
+        renamed_judge_ids=set(),
     )
 
     # Verify commit was called (transaction completed)
@@ -776,7 +788,11 @@ def test_enrichment_invalid_judge_name_handled_gracefully(
 
     # Judge name should remain unchanged — enrichment did not resolve it
     mock_resolve_judge.assert_called_once_with(
-        mock_conn, "XYZ Invalid", "court-uuid-1", source="ca-la-tentatives-civil"
+        mock_conn,
+        "XYZ Invalid",
+        "court-uuid-1",
+        source="ca-la-tentatives-civil",
+        renamed_judge_ids=set(),
     )
     mock_conn.commit.assert_called_once()
 

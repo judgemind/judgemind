@@ -767,3 +767,107 @@ class TestStep3bBootstrapPrefersIncomingSpelling:
             "Expected INSERT to NOT use roster typo 'Mattew C. Braner', "
             f"got: {insert_judge_calls[0]}"
         )
+
+
+class TestRenamedJudgeIds:
+    """``resolve_judge`` reports the judges it renamed (#4920).
+
+    A rename changes the search ``judge_name`` of every ruling of that
+    judge, so the caller re-indexes them after its commit.
+    """
+
+    def test_near_duplicate_rename_is_reported(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [None, None]  # Step 1, Step 2: no match
+        mock_cur.fetchall.side_effect = [[("judge-sj", "Rafael Sivilla-Jones")]]
+        renamed: set[str] = set()
+
+        result = resolve_judge(
+            mock_conn, "Rafael A. Sivilla-Jones", "court-4920", renamed_judge_ids=renamed
+        )
+
+        assert result == "judge-sj"
+        assert renamed == {"judge-sj"}
+
+    def test_near_duplicate_without_rename_is_not_reported(self) -> None:
+        """The stored name is already the longer one: no UPDATE, no report."""
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [None, None]
+        mock_cur.fetchall.side_effect = [[("judge-sj", "Rafael A. Sivilla-Jones")]]
+        renamed: set[str] = set()
+
+        result = resolve_judge(
+            mock_conn, "Rafael Sivilla-Jones", "court-4920", renamed_judge_ids=renamed
+        )
+
+        assert result == "judge-sj"
+        assert renamed == set()
+
+    def test_arbitration_promotion_is_reported(self) -> None:
+        clear_roster_cache("court-4920-arb")
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # Step 3b: court_code
+            ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
+            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+            [("matthew c. braner", "sd_calendar")],  # corroborated
+        ]
+        mock_cur.rowcount = 1
+        renamed: set[str] = set()
+
+        resolve_judge(
+            mock_conn,
+            "MATTHEW C. BRANER",
+            "court-4920-arb",
+            source="sd_calendar",
+            renamed_judge_ids=renamed,
+        )
+
+        assert renamed == {"existing-judge-uuid"}
+
+    def test_skipped_arbitration_is_not_reported(self) -> None:
+        clear_roster_cache("court-4920-skip")
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [
+            None,
+            None,
+            ("ca-san_diego",),
+            ({"D1": "Mattew C. Braner"},),
+            ("existing-judge-uuid",),
+        ]
+        mock_cur.fetchall.side_effect = [[], [("matthew c. braner", "sd_calendar")]]
+        mock_cur.rowcount = 0  # the name is held by another judge
+        renamed: set[str] = set()
+
+        resolve_judge(
+            mock_conn,
+            "MATTHEW C. BRANER",
+            "court-4920-skip",
+            source="sd_calendar",
+            renamed_judge_ids=renamed,
+        )
+
+        assert renamed == set()
+
+    def test_step1_arbitration_promotion_is_reported(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("judge-sc", "H. Shaina Clover")]  # Step 1 hit
+        mock_cur.fetchall.side_effect = [[("shaina clover", "rebuild-ca-orange")]]
+        mock_cur.rowcount = 1
+        renamed: set[str] = set()
+
+        result = resolve_judge(
+            mock_conn,
+            "Shaina Clover",
+            "court-4920-s1",
+            source="reingest-ca-orange",
+            renamed_judge_ids=renamed,
+        )
+
+        assert result == "judge-sc"
+        assert renamed == {"judge-sc"}

@@ -573,6 +573,7 @@ def _seed_judges_from_keys(
     *,
     parse_timeout: float,
     concurrency: int,
+    renamed_judge_ids: set[str] | None = None,
 ) -> dict[str, int]:
     """Walk S3 keys once and seed full-name judges into ``derived.judges``.
 
@@ -639,6 +640,11 @@ def _seed_judges_from_keys(
         ``_extract_text_from_content``.
     concurrency:
         Thread pool size for parallel S3 fetches inside the pre-pass.
+    renamed_judge_ids:
+        When given, collects the ids of existing judges ``resolve_judge``
+        renamed (a longer spelling wins).  Those judges' rulings outside the
+        key list keep the old name in search until re-indexed, so the
+        caller re-indexes them after the pre-pass commits (#4920).
 
     Returns
     -------
@@ -759,7 +765,12 @@ def _seed_judges_from_keys(
                 continue
 
             try:
-                judge_id = resolve_judge(conn, judge_name, target["court_id"])
+                judge_id = resolve_judge(
+                    conn,
+                    judge_name,
+                    target["court_id"],
+                    renamed_judge_ids=renamed_judge_ids,
+                )
             except Exception:
                 logger.warning(
                     "judge prepass: resolve_judge failed",
@@ -991,6 +1002,51 @@ def _process_prefix_document(
             "hash_mismatch": hash_mismatch,
             "error_class": type(exc).__name__,
         }
+
+
+def _reindex_renamed_judges(
+    dsn: str, os_url: str, bucket: str, judge_ids: set[str]
+) -> None:
+    """Re-index the rulings of judges the pre-pass renamed (#4920).
+
+    A rename changes the ``judge_name`` of every search doc of the judge,
+    including rulings on keys this run does not reingest.  Runs after the
+    pre-pass committed.  Best-effort: the index is derivable from
+    ``derived.*``, so a failure is logged with the repair command.
+    """
+    if not judge_ids:
+        return
+    if not os_url:
+        logger.warning(
+            "judge_prepass_renamed_judges_not_reindexed",
+            reason="OPENSEARCH_URL not set",
+            judge_ids=sorted(judge_ids),
+        )
+        return
+    try:
+        from framework.opensearch_client import make_opensearch_client
+        from framework.s3_cache import make_s3_client
+        from framework.search.indexer import IndexingConsumer
+        from framework.search.ruling_doc import reindex_judge_rulings
+
+        indexer = IndexingConsumer(
+            make_opensearch_client(os_url), make_s3_client(), bucket, ensure_index=False
+        )
+        with psycopg.connect(dsn) as conn:
+            count = reindex_judge_rulings(conn, indexer, judge_ids)
+    except Exception:
+        logger.warning(
+            "judge_prepass_renamed_judges_reindex_failed — run "
+            "scripts/reindex_search_from_db.py --apply to repair",
+            judge_ids=sorted(judge_ids),
+            exc_info=True,
+        )
+        return
+    logger.info(
+        "judge_prepass_renamed_judges_reindexed",
+        judge_ids=sorted(judge_ids),
+        rulings=count,
+    )
 
 
 def run_reingest_from_prefix(
@@ -1295,6 +1351,7 @@ def _reingest_keys(
         )
     else:
         prepass_t0 = time.monotonic()
+        renamed_judge_ids: set[str] = set()
         with psycopg.connect(dsn) as prepass_conn:
             prepass_stats = _seed_judges_from_keys(
                 prepass_conn,
@@ -1304,7 +1361,9 @@ def _reingest_keys(
                 court_ids,
                 parse_timeout=parse_timeout,
                 concurrency=concurrency,
+                renamed_judge_ids=renamed_judge_ids,
             )
+        _reindex_renamed_judges(dsn, os_url, bucket, renamed_judge_ids)
         logger.info(
             "judge_prepass_complete",
             mode=mode,

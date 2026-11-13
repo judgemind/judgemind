@@ -5,6 +5,7 @@ OpenSearch is fully derivable from ``derived.*``.  Every writer of the
 actually kept — never from raw scraper or extraction values:
 
 * the ingestion worker, right after it commits a ruling;
+* ``reindex_judge_rulings``, after a write renamed a judge (#4920);
 * ``scripts/reindex_search_from_db.py``, when it audits or repairs the index.
 
 The ruling upsert is not a plain overwrite.  ``case_id`` and ``judge_id``
@@ -111,3 +112,45 @@ def load_search_events(conn: Any, document_ids: Iterable[str]) -> dict[str, dict
         doc_id: build_search_event(row)
         for doc_id, row in fetch_ruling_search_rows(conn, document_ids).items()
     }
+
+
+JUDGE_RULING_DOCUMENTS_SQL = """
+    SELECT DISTINCT r.document_id::text
+    FROM derived.rulings r
+    WHERE r.judge_id = ANY(%s::uuid[])
+    ORDER BY 1
+"""
+
+REINDEX_BATCH = 200
+
+
+def reindex_judge_rulings(
+    conn: Any, indexer: Any, judge_ids: Iterable[str], *, batch_size: int = REINDEX_BATCH
+) -> int:
+    """Re-index every ruling of *judge_ids* from its committed row.
+
+    A search doc carries its judge's ``canonical_name`` as ``judge_name``.
+    When ``resolve_judge`` renames a judge (a longer or corroborated
+    spelling wins), every search doc of that judge's rulings goes stale, not
+    only the ruling being written.  Callers run this after the transaction
+    that renamed the judges commits, so every ruling of the judge committed
+    before then is re-indexed here, and a ruling committed later is indexed
+    with the new name by its own writer (#4920).
+
+    The docs are written with ``force=True`` through the bulk API, one
+    request per *batch_size* rulings: the rename is known to change every
+    one of them, so the per-doc idempotency read would only add round
+    trips.  Returns the number of docs the indexer reports written.
+    """
+    ids = sorted(set(_valid_uuids(judge_ids)))
+    if not ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(JUDGE_RULING_DOCUMENTS_SQL, (ids,))
+        document_ids = [rec[0] for rec in cur.fetchall() or ()]
+    indexed = 0
+    for start in range(0, len(document_ids), batch_size):
+        events = load_search_events(conn, document_ids[start : start + batch_size])
+        if events:
+            indexed += indexer.index_batch(list(events.values()), force=True)
+    return indexed

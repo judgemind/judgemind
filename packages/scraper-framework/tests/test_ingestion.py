@@ -8255,3 +8255,35 @@ def test_llm_enrich_fields_returns_empty_when_first_pass_has_data_but_strict_ret
     assert result is None
     assert status == "empty"
     assert worker._strict_retry_fields_for_last_call == set()
+
+
+# ---------------------------------------------------------------------------
+# Renamed judges are re-indexed after the commit (#4920)
+# ---------------------------------------------------------------------------
+
+
+class TestReindexRenamedJudges:
+    def test_no_renamed_judges_does_nothing(self) -> None:
+        worker, _ = _make_worker()
+        conn = MagicMock()
+        with patch("ingestion.worker.reindex_judge_rulings") as mock_reindex:
+            worker._reindex_renamed_judges(conn, set())
+        mock_reindex.assert_not_called()
+        conn.rollback.assert_not_called()
+
+    def test_renamed_judges_are_reindexed_and_transaction_ended(self) -> None:
+        worker, _ = _make_worker()
+        conn = MagicMock()
+        with patch("ingestion.worker.reindex_judge_rulings", return_value=4) as mock_reindex:
+            worker._reindex_renamed_judges(conn, {"judge-1"})
+        mock_reindex.assert_called_once_with(conn, worker._indexer, {"judge-1"})
+        conn.rollback.assert_called_once()
+
+    def test_reindex_failure_is_best_effort(self) -> None:
+        """The Postgres write is committed; a search failure must not raise."""
+        worker, _ = _make_worker()
+        conn = MagicMock()
+        conn.rollback.side_effect = RuntimeError("connection gone")
+        with patch("ingestion.worker.reindex_judge_rulings", side_effect=RuntimeError("os down")):
+            worker._reindex_renamed_judges(conn, {"judge-1"})
+        conn.rollback.assert_called_once()

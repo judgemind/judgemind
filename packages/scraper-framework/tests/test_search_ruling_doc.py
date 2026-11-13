@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from framework.search import (
     build_search_event,
@@ -107,3 +107,62 @@ def test_search_doc_metadata_matches_indexed_fields() -> None:
     assert tuple(meta) == INDEXED_METADATA_FIELDS
     assert meta["hearing_date"] == "2026-07-28"
     assert meta["content_hash"] == ""
+
+
+# ---------------------------------------------------------------------------
+# reindex_judge_rulings (#4920)
+# ---------------------------------------------------------------------------
+
+J1 = "bbbbbbbb-0000-0000-0000-000000000001"
+
+
+def test_reindex_judge_rulings_indexes_every_ruling_of_the_judges() -> None:
+    from framework.search.ruling_doc import JUDGE_RULING_DOCUMENTS_SQL, reindex_judge_rulings
+
+    cur = MagicMock()
+    cur.fetchall.return_value = [(D1,), (D2,), (D3,)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    indexer = MagicMock()
+    indexer.index_batch.side_effect = lambda events, force: len(events)
+    loaded: list[list[str]] = []
+
+    def load(_conn: object, ids: list[str]) -> dict[str, dict]:
+        loaded.append(list(ids))
+        return {i: {"document_id": i, "judge_name": "New Name"} for i in ids}
+
+    with patch("framework.search.ruling_doc.load_search_events", side_effect=load):
+        count = reindex_judge_rulings(conn, indexer, [J1, J1, "junk"], batch_size=2)
+
+    assert count == 3
+    sql, params = cur.execute.call_args.args
+    assert sql == JUDGE_RULING_DOCUMENTS_SQL
+    assert "r.judge_id = ANY" in sql
+    assert params == ([J1],)
+    assert loaded == [[D1, D2], [D3]]
+    assert all(c.kwargs == {"force": True} for c in indexer.index_batch.call_args_list)
+
+
+def test_reindex_judge_rulings_with_no_valid_ids_does_nothing() -> None:
+    from framework.search.ruling_doc import reindex_judge_rulings
+
+    conn = MagicMock()
+    indexer = MagicMock()
+
+    assert reindex_judge_rulings(conn, indexer, ["junk"]) == 0
+    conn.cursor.assert_not_called()
+    indexer.index_batch.assert_not_called()
+
+
+def test_reindex_judge_rulings_skips_batches_with_no_rulings() -> None:
+    from framework.search.ruling_doc import reindex_judge_rulings
+
+    cur = MagicMock()
+    cur.fetchall.return_value = [(D1,)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    indexer = MagicMock()
+
+    with patch("framework.search.ruling_doc.load_search_events", return_value={}):
+        assert reindex_judge_rulings(conn, indexer, [J1]) == 0
+    indexer.index_batch.assert_not_called()

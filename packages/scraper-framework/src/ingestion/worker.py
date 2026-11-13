@@ -50,7 +50,7 @@ from framework.events import trim_consumed_entries
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
-from framework.search.ruling_doc import load_search_events
+from framework.search.ruling_doc import load_search_events, reindex_judge_rulings
 from validation.deterministic import (
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
@@ -1490,6 +1490,9 @@ class _RulingWrite:
     #: extracted text (and the child's own) when it can settle that, else
     #: empty (``_case_number_check_texts``, #4915).
     case_number_texts: tuple[str | None, ...] = ()
+    #: Judges ``resolve_judge`` renamed while preparing this write; their
+    #: rulings are re-indexed once it commits (#4920).
+    renamed_judge_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -4302,6 +4305,7 @@ class IngestionWorker:
                 judge_name,
                 court_id,
                 source=scraper_id or "scraper",
+                renamed_judge_ids=w.renamed_judge_ids,
             )
 
         w.case_number = case_number
@@ -4362,6 +4366,7 @@ class IngestionWorker:
             raise
 
         self._index_committed_ruling(conn, w.document_id)
+        self._reindex_renamed_judges(conn, w.renamed_judge_ids)
 
     def _link_ruling_rows(
         self, conn: psycopg.Connection, w: _RulingWrite, case_id: str, judge_id: str | None
@@ -4524,6 +4529,45 @@ class IngestionWorker:
             self._index_committed_ruling(conn, document_id)
         if removed:
             self._indexer.delete_documents(removed)
+        self._reindex_renamed_judges(
+            conn, set().union(*(w.renamed_judge_ids for w in batch.children))
+        )
+
+    def _reindex_renamed_judges(self, conn: psycopg.Connection, judge_ids: set[str]) -> None:
+        """Re-index every ruling of the judges this write renamed.
+
+        ``resolve_judge`` renames a judge when a longer or corroborated
+        spelling arrives, which changes the ``judge_name`` of every search
+        doc of that judge's rulings, on every document, not only the one
+        just written.  Run after the commit, so the rename is visible and
+        every ruling committed before it is re-indexed (#4920).  Without
+        this, a reingest that renamed a judge left the judge's other search
+        docs on the old name until ``reindex_search_from_db.py --apply``.
+
+        Best-effort, like ``_index_committed_ruling``: the Postgres write is
+        committed and the index is derivable from ``derived.*``.
+        """
+        if not judge_ids:
+            return
+        try:
+            count = reindex_judge_rulings(conn, self._indexer, judge_ids)
+        except Exception as exc:  # noqa: BLE001 — search indexing is best-effort
+            logger.warning(
+                "Search re-index of renamed judges failed; run "
+                "scripts/reindex_search_from_db.py --apply to repair",
+                extra={"judge_ids": sorted(judge_ids), "error": str(exc)},
+            )
+            return
+        finally:
+            # End the read transaction (autocommit is off).
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info(
+            "Re-indexed the rulings of renamed judges",
+            extra={"judge_ids": sorted(judge_ids), "rulings": count},
+        )
 
     def _index_committed_ruling(self, conn: psycopg.Connection, document_id: str) -> None:
         """Index the ruling *document_id* exactly as Postgres committed it.
