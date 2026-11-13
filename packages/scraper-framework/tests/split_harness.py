@@ -154,6 +154,19 @@ def _case_number(idx: int) -> str:
     return f"30-2026-{str(idx % 10) * 5}"
 
 
+#: Case-number shapes for counties whose format validation checks
+#: (``case_number_matches_county_format``, #4907); repeated digits keep every
+#: pair beyond the fuzzy matcher's reach.
+_COUNTY_CASE_NUMBERS: dict[str, Callable[[int], str]] = {
+    "Santa Clara": lambda idx: f"26CV{str(idx % 10) * 6}",
+    "San Francisco": lambda idx: f"CGC-26-{str(idx % 10) * 6}",
+}
+
+
+def _county_case_number(county: str, idx: int) -> str:
+    return _COUNTY_CASE_NUMBERS.get(county, _case_number)(idx)
+
+
 def _title(idx: int, variant: int = 0) -> str:
     plaintiff = _PLAINTIFFS[idx % len(_PLAINTIFFS)]
     defendant = _DEFENDANTS[(idx + variant) % len(_DEFENDANTS)]
@@ -1059,7 +1072,7 @@ def run_enrichment_failure(
     specs = [
         Spec(
             idx=i,
-            case_number=_case_number(i),
+            case_number=_county_case_number(splitter.county, i),
             title=None if rng.random() < 0.3 else _title(i),
             text=_text(token, i),
         )
