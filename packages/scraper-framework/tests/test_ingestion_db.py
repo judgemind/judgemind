@@ -3482,8 +3482,8 @@ class TestDeleteStaleSplitChildren:
 
         # Should have executed queries: SELECT stale, 2x UPDATE alert_events
         # (detach, #4700), UPDATE documents.previous_version_id,
-        # DELETE validation_results, DELETE rulings, DELETE documents
-        assert cur.execute.call_count == 7
+        # DELETE rulings, DELETE documents (validation_results kept, #4879)
+        assert cur.execute.call_count == 6
 
     def test_no_stale_children_returns_zero(self) -> None:
         """Should return 0 and not delete when no stale children found."""
@@ -3531,7 +3531,8 @@ class TestDeleteStaleSplitChildren:
         cur.execute.assert_not_called()
 
     def test_cascades_to_dependent_tables(self) -> None:
-        """Detaches alert_events, then deletes validation_results, rulings, documents."""
+        """Detaches alert_events, then deletes rulings and documents.
+        ``telemetry.validation_results`` rows are kept (#4879)."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         stale_id = _kid(2)
@@ -3547,13 +3548,13 @@ class TestDeleteStaleSplitChildren:
 
         # Extract SQL from execute calls (after the SELECT)
         sql_calls = [" ".join(call[0][0].split()) for call in cur.execute.call_args_list[1:]]
-        assert len(sql_calls) == 6
+        assert len(sql_calls) == 5
         assert sql_calls[0].startswith("UPDATE alert_events SET ruling_id = NULL")
         assert sql_calls[1].startswith("UPDATE alert_events SET document_id")
         assert sql_calls[2].startswith("UPDATE documents SET previous_version_id = NULL")
-        assert "DELETE FROM validation_results" in sql_calls[3]
-        assert "DELETE FROM rulings" in sql_calls[4]
-        assert "DELETE FROM documents" in sql_calls[5]
+        assert "DELETE FROM rulings" in sql_calls[3]
+        assert "DELETE FROM documents" in sql_calls[4]
+        assert not any("validation_results" in sql for sql in sql_calls)
 
     def test_split_set_change_never_deletes_alert_events(self) -> None:
         """#4700: ``public.alert_events`` is authoritative user state.  Stale

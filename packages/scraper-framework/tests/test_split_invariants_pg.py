@@ -142,6 +142,51 @@ def test_exhausted_enrichment_keeps_child_ruling(
     harness.run_enrichment_failure(_DSN, splitter, seed, _RUN)
 
 
+def _bug_4879_steps() -> list[harness.Step]:
+    specs = tuple(
+        harness.Spec(i, harness._case_number(i), harness._title(i), harness._text("b4879", i))
+        for i in range(3)
+    )
+    # On the reingest, ruling 1 has lost its case number and caption, so it
+    # fails deterministic validation (``unknown_and_null_title_fail``).
+    rejected = harness.Spec(1, None, None, specs[1].text)
+    rows = tuple(harness.Row("ruling", i) for i in range(3))
+    return [
+        harness.Step("reingest", rows, specs),
+        harness.Step("reingest", rows, (specs[0], rejected, specs[2])),
+    ]
+
+
+@_needs_pg
+def test_known_bug_4879_rejected_child_keeps_validation_fail_row() -> None:
+    """A reingest where a previously valid child now fails validation must
+    leave that child's ``validation_results`` fail row in place, attributed
+    to the key (#4879).  Before the fix the split-set write removed the
+    rejected child's old document as stale and deleted the fail row the same
+    run had just committed for it."""
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"telemetry"}))
+    try:
+        key = harness.make_key(f"{_RUN}-bug4879")
+        first, second = _bug_4879_steps()
+        h.run_step(key, first, "valid split")
+        rejected = next(doc for doc, label in key.slots.items() if label == "S1")
+        assert rejected in {r.id for r in harness.read_key(h.checker, key.s3_key)}
+
+        h.run_step(key, second, "child 1 rejected")
+
+        assert rejected not in {r.id for r in harness.read_key(h.checker, key.s3_key)}
+        with h.checker.cursor() as cur:
+            cur.execute(
+                "SELECT document_id::text, county, scraper_id, s3_key "
+                "FROM validation_results WHERE s3_key = %s AND result = 'fail'",
+                (key.s3_key,),
+            )
+            fails = cur.fetchall()
+        assert fails == [(rejected, key.county, "reingest-ca-harness", key.s3_key)]
+    finally:
+        h.close()
+
+
 @_needs_pg
 def test_known_bug_4838_db_mode_keeps_stale_children() -> None:
     """DB-row reingest of a document that now parses as one ruling must not
