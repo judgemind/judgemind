@@ -101,9 +101,12 @@ def _is_placeholder_judge(name: str | None) -> bool:
 # CV-prefixed: CV + 2-4 letter location code + 6-8 digits (e.g. CVPS2306157)
 # Location-prefixed: RIC, MCC, PSC, SWC, INC + 0-4 letters + 6-10 digits
 # Additional prefixes (#2192): CIV (civil), MVC (motor vehicle collision),
-#   TEC (Temecula), UDPS (unlawful detainer Palm Springs)
+#   TEC (Temecula)
+# Unlawful detainer (#4868): UD + 2-4 letter location code, like CV
+#   (UDPS Palm Springs, UDME Menifee).  A split entry whose number the regex
+#   missed is left without one, so a missing prefix drops the ruling.
 _CASE_NUMBER_RE = re.compile(
-    r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC|UDPS)[A-Z]{0,4})\d{6,10}\b",
+    r"\b(?:(?:CV|UD)[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC)[A-Z]{0,4})\d{6,10}\b",
     re.IGNORECASE,
 )
 

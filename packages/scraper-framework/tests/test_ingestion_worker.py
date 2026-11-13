@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1365,6 +1366,128 @@ def test_sc_split_child_without_case_number_does_not_inherit_doc_case_number() -
     assert [c["case_title"] for c in captured] == ["Foo v. Bar", None]
     # #4866: only the child whose number the splitter read is marked.
     assert [c.get("_case_number_from_source") for c in captured] == [True, False]
+
+
+def _two_rulings(module: str) -> list:
+    """A splitter result whose second entry has no case number of its own."""
+    if module == "sd_calendar":
+        from courts.ca.sd_calendar import SDSplitRuling as Cls
+    elif module == "la_tentatives":
+        from courts.ca.la_tentatives import LASplitRuling as Cls
+    elif module == "fresno_tentatives":
+        from courts.ca.fresno_tentatives import SplitRuling as Cls
+    elif module == "riverside_tentatives":
+        from courts.ca.riverside_tentatives import SplitRuling as Cls
+    else:
+        from courts.ca.sf_tentatives import SplitRuling as Cls
+    extra: dict = {}
+    if module == "fresno_tentatives":
+        extra = {"motion_type": None, "outcome": None, "hearing_date": None}
+    return [
+        Cls(
+            ruling_index=0,
+            case_number="FIRST-1",
+            ruling_text="first ruling",
+            case_title="A v. B",
+            **extra,
+        ),
+        Cls(
+            ruling_index=1, case_number=None, ruling_text="second ruling", case_title=None, **extra
+        ),
+    ]
+
+
+_DETERMINISTIC_SPLITTERS = [
+    ("_try_sd_calendar_split", "sd_calendar", "is_sd_calendar_html", _make_sd_event),
+    ("_try_la_html_split", "la_tentatives", "is_la_html", _make_la_event),
+    ("_try_fresno_pdf_split", "fresno_tentatives", None, _make_fresno_event),
+    ("_try_riverside_pdf_split", "riverside_tentatives", None, _make_riverside_event),
+    ("_try_sf_pdf_split", "sf_tentatives", None, _make_sf_event),
+]
+
+
+@pytest.mark.parametrize(("fn_name", "module", "detector", "make_event"), _DETERMINISTIC_SPLITTERS)
+def test_case_number_from_source_split_child_does_not_inherit_doc_case(
+    fn_name: str, module: str, detector: str | None, make_event: object
+) -> None:
+    """#4868: a live event carries the document's FIRST case number (and,
+    for SF, its first caption).  A child of a multi-case split without a
+    case number of its own stays without one instead of being filed under
+    the first case; only a number the splitter read is marked as from the
+    source (#4866)."""
+    import ingestion.worker as worker_mod
+
+    event = make_event(case_number="FIRST-1", case_title="A v. B")  # type: ignore[operator]
+    captured: list[dict] = []
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(f"courts.ca.{module}._split_rulings", return_value=_two_rulings(module))
+        )
+        if detector:
+            stack.enter_context(patch(f"courts.ca.{module}.{detector}", return_value=True))
+        split = getattr(worker_mod, fn_name)
+        assert split(event, event["document_id"], event["ruling_text"], captured.append)
+    assert [c["case_number"] for c in captured] == ["FIRST-1", None]
+    assert [c["case_title"] for c in captured] == ["A v. B", None]
+    assert [c["_case_number_from_source"] for c in captured] == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("fn_name", "module", "detector", "make_event"), _DETERMINISTIC_SPLITTERS[:2]
+)
+def test_case_number_from_source_single_split_keeps_event_case(
+    fn_name: str, module: str, detector: str | None, make_event: object
+) -> None:
+    """A split into one ruling is the document itself: with no number of its
+    own it keeps the event's, unmarked (the splitter did not read it)."""
+    import ingestion.worker as worker_mod
+
+    event = make_event(case_number="ONLY-1", case_title="C v. D")  # type: ignore[operator]
+    captured: list[dict] = []
+    with (
+        patch(f"courts.ca.{module}._split_rulings", return_value=_two_rulings(module)[1:]),
+        patch(f"courts.ca.{module}.{detector}", return_value=True),
+    ):
+        split = getattr(worker_mod, fn_name)
+        assert split(event, event["document_id"], event["ruling_text"], captured.append)
+    assert [(c["case_number"], c["case_title"]) for c in captured] == [("ONLY-1", "C v. D")]
+    assert captured[0]["_case_number_from_source"] is False
+
+
+@patch("ingestion.worker.psycopg")
+def test_llm_split_child_without_case_number_does_not_inherit_doc_case(
+    mock_psycopg: MagicMock,
+) -> None:
+    """#4868: the LLM split path has the same rule.  A multi-ruling child the
+    LLM returned without a case number does not take the event's (the
+    document's first case); an LLM-read number is never marked as from the
+    source, so the fuzzy correction still applies to it."""
+    worker, _ = _make_worker()
+    mock_conn, _cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    rulings = _make_fake_extracted_rulings()
+    rulings[1].extracted_case_number = None
+    rulings[1].extracted_case_title = None
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+    worker._get_framework_extractor = lambda: mock_extractor  # type: ignore[method-assign]
+
+    captured: list[dict] = []
+    original = worker.process_event
+
+    def capture(event_data: dict) -> None:
+        if event_data.get("_split_processed"):
+            captured.append(event_data)
+            return
+        original(event_data)
+
+    worker.process_event = capture  # type: ignore[method-assign]
+    event = _make_llm_event(case_number="2024-00000", case_title="LLM Case 0")
+    with patch.object(IngestionWorker, "_write_split_batch", autospec=True):
+        worker.process_event(event)
+    assert [c["case_number"] for c in captured] == ["2024-00000", None, "2024-00002"]
+    assert [c["case_title"] for c in captured] == ["LLM Case 0", None, "LLM Case 2"]
+    assert [c["_case_number_from_source"] for c in captured] == [False, False, False]
 
 
 class TestScPdfSplitDept12:

@@ -208,6 +208,39 @@ REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 CASE_NUMBER_FROM_SOURCE_KEY = "_case_number_from_source"
 
 
+def _split_child_case_fields(
+    child_case_number: str | None,
+    child_case_title: str | None,
+    event_data: dict[str, Any],
+    split_count: int,
+) -> tuple[str | None, str | None]:
+    """Return a split child's ``(case_number, case_title)``.
+
+    A child of a multi-case split keeps only what its own entry yields
+    (#4726, #4868).  The parent event's ``case_number`` / ``case_title`` are
+    document-level values: on a live capture they are the document's FIRST
+    case (``PdfLinkScraper.parse_document`` takes the first match, the LA
+    scraper the first ``Case Number:``), so a child without its own number
+    that took them was filed under another case.  It stays case-less
+    instead: the worker's regex fallback reads its own text, else it gets
+    an ``UNKNOWN-`` placeholder that validation drops.
+
+    A split into a single ruling is the document itself, so it may still
+    fall back to the event's values.
+
+    Deterministic splitters mark a number they read from the document with
+    ``CASE_NUMBER_FROM_SOURCE_KEY`` (``bool(sr.case_number)``), so the
+    enrichment step's fuzzy case-number correction cannot move it (#4866);
+    the LLM split path never does.
+    """
+    if split_count == 1:
+        return (
+            child_case_number or event_data.get("case_number"),
+            child_case_title or event_data.get("case_title"),
+        )
+    return child_case_number, child_case_title
+
+
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
     """Decide whether a split child's write may move it to a different case.
 
@@ -439,6 +472,9 @@ def _try_sd_calendar_split(
         child_hearing_date, child_hearing_date_source = _child_hearing_date(
             hearing_date_value, event_data
         )
+        case_number, case_title = _split_child_case_fields(
+            sr.case_number, sr.case_title, event_data, len(split_rulings)
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -449,8 +485,9 @@ def _try_sd_calendar_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": None,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            "case_number": case_number,
+            "case_title": case_title,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "judge_name": sr.judge_name or event_data.get("judge_name"),
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
@@ -472,7 +509,7 @@ def _try_sd_calendar_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": split_event["case_number"],
                     "error": str(_exc),
                 },
             )
@@ -556,6 +593,9 @@ def _try_la_html_split(
         child_hearing_date, child_hearing_date_source = _child_hearing_date(
             hearing_date_value, event_data
         )
+        case_number, case_title = _split_child_case_fields(
+            sr.case_number, sr.case_title, event_data, len(split_rulings)
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -566,8 +606,9 @@ def _try_la_html_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": sr.ruling_text_html,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            "case_number": case_number,
+            "case_title": case_title,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
@@ -589,7 +630,7 @@ def _try_la_html_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": split_event["case_number"],
                     "error": str(_exc),
                 },
             )
@@ -697,6 +738,9 @@ def _try_fresno_pdf_split(
         child_hearing_date, child_hearing_date_source = _child_hearing_date(
             hearing_date_value, event_data
         )
+        case_number, case_title = _split_child_case_fields(
+            sr.case_number, sr.case_title, event_data, len(split_rulings)
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -707,8 +751,9 @@ def _try_fresno_pdf_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": None,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            "case_number": case_number,
+            "case_title": case_title,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
@@ -728,7 +773,7 @@ def _try_fresno_pdf_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": split_event["case_number"],
                     "error": str(_exc),
                 },
             )
@@ -851,6 +896,9 @@ def _try_riverside_pdf_split(
         child_hearing_date, child_hearing_date_source = _child_hearing_date(
             hearing_date_value, event_data
         )
+        case_number, case_title = _split_child_case_fields(
+            sr.case_number, sr.case_title, event_data, len(split_rulings)
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -860,8 +908,9 @@ def _try_riverside_pdf_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": None,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            "case_number": case_number,
+            "case_title": case_title,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
@@ -881,7 +930,7 @@ def _try_riverside_pdf_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": split_event["case_number"],
                     "error": str(_exc),
                 },
             )
@@ -1011,6 +1060,9 @@ def _try_sf_pdf_split(
         child_hearing_date, child_hearing_date_source = _child_hearing_date(
             hearing_date_value, event_data
         )
+        case_number, case_title = _split_child_case_fields(
+            sr.case_number, sr.case_title, event_data, len(split_rulings)
+        )
         split_event: dict[str, Any] = {
             **event_data,
             "document_id": split_doc_id,
@@ -1020,8 +1072,9 @@ def _try_sf_pdf_split(
             "_split_count": len(split_rulings),
             "ruling_text": sr.ruling_text,
             "ruling_text_html": None,
-            "case_number": sr.case_number or event_data.get("case_number"),
-            "case_title": sr.case_title or event_data.get("case_title"),
+            "case_number": case_number,
+            "case_title": case_title,
+            CASE_NUMBER_FROM_SOURCE_KEY: bool(sr.case_number),
             "department": sr.department or event_data.get("department"),
             "motion_type": sr.motion_type or event_data.get("motion_type"),
             "outcome": sr.outcome or event_data.get("outcome"),
@@ -1041,7 +1094,7 @@ def _try_sf_pdf_split(
                     "document_id": document_id,
                     "_split_index": idx,
                     "_split_count": len(split_rulings),
-                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "case_number": split_event["case_number"],
                     "error": str(_exc),
                 },
             )
@@ -5149,6 +5202,9 @@ class IngestionWorker:
             child_hearing_date, child_hearing_date_source = _llm_child_hearing_date(
                 cr.hearing_date, event_data
             )
+            case_number, case_title = _split_child_case_fields(
+                cr.case_number, cr.case_title, event_data, cr.split_count
+            )
             split_event: dict[str, Any] = {
                 **event_data,
                 "document_id": cr.document_id,
@@ -5160,8 +5216,11 @@ class IngestionWorker:
                 # Fields from LLM extraction (fall back to event_data):
                 "ruling_text": ruling_text_for_event,
                 "ruling_text_html": ruling_text_html_for_event,
-                "case_number": cr.case_number or event_data.get("case_number"),
-                "case_title": cr.case_title or event_data.get("case_title"),
+                # An LLM-read number is not from the source (#4866), and a
+                # multi-ruling child never takes the parent's (#4868).
+                "case_number": case_number,
+                "case_title": case_title,
+                CASE_NUMBER_FROM_SOURCE_KEY: False,
                 "judge_name": cr.judge_name or event_data.get("judge_name"),
                 "department": cr.department or event_data.get("department"),
                 "motion_type": cr.motion_type or event_data.get("motion_type"),
@@ -5188,7 +5247,7 @@ class IngestionWorker:
                         "document_id": document_id,
                         "_split_index": cr.split_index,
                         "_split_count": cr.split_count,
-                        "case_number": cr.case_number or event_data.get("case_number"),
+                        "case_number": split_event["case_number"],
                         "error": str(_exc),
                     },
                 )
