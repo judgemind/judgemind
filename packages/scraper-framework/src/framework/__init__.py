@@ -1,6 +1,6 @@
 """Judgemind scraper framework — public API."""
 
-from .base import AllFetchesFailed, BaseScraper, ScraperPreconditionFailure
+from .base import AllFetchesFailed, BaseScraper, EmptyListing, ScraperPreconditionFailure
 from .browser import apply_stealth
 from .court_directory import CourtDirectory
 from .css_inliner import inline_css
@@ -71,6 +71,7 @@ from .turnstile_solver import solve_turnstile
 __all__ = [
     "AllFetchesFailed",
     "BaseScraper",
+    "EmptyListing",
     "ScraperPreconditionFailure",
     "FetchTally",
     "is_transient_fetch_error",

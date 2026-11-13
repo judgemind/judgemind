@@ -1878,17 +1878,16 @@ class SCTentativeRulingsScraper(BaseScraper):
                         dept_info.judge_name = self._dir_mapping[dept_info.department]
 
             self._log.info("Found departments", count=len(departments))
-            if not departments:
-                # The landing page always lists the civil departments (10 on
-                # 2026-09-25). A 200 with none is a block page or a layout
-                # change, not a quiet day: without this the run makes zero
-                # attempts and records success/0 (#4748).
-                tally.blocked("landing page lists no departments")
-                self._log.error(
-                    "sc.unexpected_landing_page",
-                    url=LANDING_URL,
-                    body_prefix=response.text[:200],
-                )
+            # The landing page always lists the civil departments (10 on
+            # 2026-09-25). A 200 with none is a block page or a layout
+            # change, not a quiet day: without this the run makes zero
+            # attempts and records success/0 (#4748, #4736).
+            self._check_listing(
+                departments,
+                what="SC landing page department links",
+                url=LANDING_URL,
+                body=response.text,
+            )
 
             # Step 2: For each department, fetch the page and find PDF links
             for dept_info in departments:

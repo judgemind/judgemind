@@ -1234,6 +1234,16 @@ class LATentativeRulingsScraper(BaseScraper):
             tokens = _extract_aspnet_tokens(response.text)
             options = _parse_dropdown_options(response.text)
             self._log.info("Found dropdown options", count=len(options))
+            # A main page with no options and no "No rulings have been
+            # published" marker is a layout change, not a quiet day (#4736).
+            # Civil and appellate share the portal and its NoRuling table.
+            self._check_listing(
+                options,
+                what="LA civil ruling dropdown options",
+                url=CIVIL_URL,
+                body=response.text,
+                empty_state=_has_no_rulings_appellate(response.text),
+            )
 
             use_llm = _la_llm_enabled()
             if use_llm:
@@ -1455,6 +1465,14 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
             tokens = _extract_aspnet_tokens(response.text)
             options = _parse_appellate_dropdown_options(response.text)
             self._log.info("Found appellate dropdown options", count=len(options))
+            # The empty state returned above; no options without it is a
+            # layout change (#4736).
+            self._check_listing(
+                options,
+                what="LA appellate ruling dropdown options",
+                url=APPELLATE_URL,
+                body=response.text,
+            )
 
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)

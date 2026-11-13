@@ -1052,7 +1052,7 @@ def test_sc_run_fails_when_landing_page_lists_no_departments() -> None:
     health = SCTentativeRulingsScraper(config=config).run()
 
     assert health.success is False
-    assert "landing page lists no departments" in (health.error_message or "")
+    assert "empty listing: SC landing page department links" in (health.error_message or "")
 
 
 @respx.mock
