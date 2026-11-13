@@ -9,6 +9,7 @@ import pytest
 
 from ingestion.extract import (
     _looks_like_person_name,
+    case_number_supported_by_text,
     clean_case_title,
     extract_case_number,
     extract_case_type_from_motion_type,
@@ -3908,3 +3909,34 @@ class TestEmptyCaseTitle:
         """Whitespace-only string fails plausibility."""
         assert is_plausible_case_title("   ") is False
         assert is_plausible_case_title("\t\n") is False
+
+
+# ---------------------------------------------------------------------------
+# case_number_supported_by_text (#4907)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseNumberSupportedByText:
+    def test_number_in_text(self) -> None:
+        assert case_number_supported_by_text("24CV412345", "Case No.: 24CV412345 ruling")
+
+    def test_ignores_case_whitespace_and_punctuation(self) -> None:
+        assert case_number_supported_by_text("30-2024-01393434", "30 - 2024 -\n01393434")
+        assert case_number_supported_by_text("CIVSB2600093", "civsb 2600093")
+
+    def test_invented_number_is_unsupported(self) -> None:
+        assert not case_number_supported_by_text("23STCV01234", "See below.")
+
+    def test_short_digit_run_alone_is_not_support(self) -> None:
+        """``01234`` is too generic: only the whole number counts."""
+        assert not case_number_supported_by_text("23STCV01234", "Exhibit 01234 is excluded.")
+
+    def test_long_digit_run_supports_a_reformatted_number(self) -> None:
+        assert case_number_supported_by_text("2025-1521814", "Case 25-1521814")
+
+    def test_any_text_may_support(self) -> None:
+        assert case_number_supported_by_text("24CV412345", None, "", "x 24CV412345")
+
+    @pytest.mark.parametrize("case_number", [None, "", " - "])
+    def test_empty_number_is_unsupported(self, case_number: str | None) -> None:
+        assert not case_number_supported_by_text(case_number, "anything")

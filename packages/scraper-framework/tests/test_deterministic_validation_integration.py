@@ -564,6 +564,13 @@ def test_det_validation_flag_rollback_error_does_not_crash(
 _CONVERT_MOCK = "ingestion.worker.convert_extracted_rulings"
 _DELETE_STALE_MOCK = "ingestion.worker.delete_stale_split_children"
 
+# The split documents below carry every case number their rulings use: an
+# LLM-read number absent from the document text is dropped (#4907).
+_SPLIT_DOC_TEXT = "Full document text here " * 20 + (
+    "22CECG00930 23CECG00266 23CV1111 23CV2222 23STCV10000 23STCV12340 "
+    "23STCV12341 23STCV12342 23STCV20000 25CECG01111 25CECG03271"
+)
+
 
 @patch("ingestion.worker.insert_validation_result")
 @patch(_DELETE_STALE_MOCK, return_value=0)
@@ -627,7 +634,7 @@ def test_det_validation_flag_duplicate_ruling_text_lengths(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -715,7 +722,7 @@ def test_det_validation_pass_distinct_ruling_text_lengths(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -790,7 +797,7 @@ def test_det_validation_duplicate_flag_db_error_does_not_crash(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             # Should not raise despite DB error during flag logging
             worker.process_event(event)
@@ -872,7 +879,7 @@ def test_det_validation_flag_cross_case_ruling_text(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -960,7 +967,7 @@ def test_det_validation_pass_no_cross_case_references(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -1045,7 +1052,7 @@ def test_det_validation_cross_case_db_error_does_not_crash(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             # Should not raise despite DB error during flag logging.
             worker.process_event(event)
@@ -1140,7 +1147,7 @@ def test_det_validation_flag_case_number_marker_mismatch(
             # case_number — so the county used to reach the code path does
             # not affect what is being asserted.
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -1242,7 +1249,7 @@ def test_det_validation_pass_case_number_marker_matches(
 
             # Use default LA county so the framework extractor path runs.
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -1328,7 +1335,7 @@ def test_det_validation_case_number_marker_db_error_does_not_crash(
 
             # Use default LA county so the framework extractor path runs.
             event = _make_event(
-                ruling_text="Full document text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             # Should not raise despite DB error during flag logging.
             worker.process_event(event)
@@ -1435,7 +1442,7 @@ def test_det_validation_multi_case_empty_text_split_rejected(
             worker._framework_extractor = extractor_mock
 
             event = _make_event(
-                ruling_text="Full parent-PDF text here " * 20,
+                ruling_text=_SPLIT_DOC_TEXT,
             )
             worker.process_event(event)
 
@@ -1840,7 +1847,7 @@ def test_validation_result_county_on_split_document_flags(
         for i, text in enumerate(texts)
     ]
 
-    event = _make_event(ruling_text="Full document text here " * 20)
+    event = _make_event(ruling_text=_SPLIT_DOC_TEXT)
     with patch(_CONVERT_MOCK, return_value=converted):
         with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
             extractor_mock = MagicMock()

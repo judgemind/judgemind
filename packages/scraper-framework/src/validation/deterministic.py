@@ -605,6 +605,55 @@ def check_ruling_text_case_number_marker(
     return DeterministicRuleResult(rule="ruling_text_case_number_marker", result="pass")
 
 
+# Case-number formats per county, keyed by the normalised county name
+# (lowercase, ``_`` → space).  Only counties whose every real number on dev
+# fits these patterns are listed (#4907): a missing county is not checked.
+# Extend a county only after confirming its formats against dev, since a
+# mismatch fails the ruling.
+_COUNTY_CASE_NUMBER_FORMATS: dict[str, tuple[re.Pattern[str], ...]] = {
+    # 26CV484550, 21PR190362, 25EA000076; old 2010-1-CV-163328.
+    "santa clara": (
+        re.compile(r"\d{2}[A-Z]{2}\d{6}"),
+        re.compile(r"\d{4}-\d-[A-Z]{2}-\d{6}"),
+    ),
+    # FDI-24-799917, FPT-25-378678, CGC-24-612345.
+    "san francisco": (re.compile(r"[A-Z]{3}-\d{2}-\d{6}"),),
+}
+
+
+def _normalize_county(county: str | None) -> str:
+    return (county or "").strip().lower().replace("_", " ")
+
+
+def check_case_number_matches_county_format(
+    case_number: str | None,
+    county: str | None,
+) -> DeterministicRuleResult:
+    """Fail a case number that does not fit its county's format (#4907).
+
+    An LLM that invents a number tends to produce another county's shape
+    (``23STCV01234``, Los Angeles, on a Santa Clara ruling).  Stored, it
+    files the ruling under a case that does not exist and lets content-hash
+    dedup merge unrelated rulings onto it.  Counties without a registered
+    format, and ``UNKNOWN-`` placeholders, pass.
+    """
+    rule = "case_number_matches_county_format"
+    formats = _COUNTY_CASE_NUMBER_FORMATS.get(_normalize_county(county))
+    if not formats or not case_number or case_number.startswith("UNKNOWN-"):
+        return DeterministicRuleResult(rule=rule, result="pass")
+    candidate = case_number.strip().upper()
+    if any(pattern.fullmatch(candidate) for pattern in formats):
+        return DeterministicRuleResult(rule=rule, result="pass")
+    return DeterministicRuleResult(
+        rule=rule,
+        result="fail",
+        reason=(
+            f"case_number {case_number!r} does not match the {county} case-number "
+            "format — likely invented or misread by the LLM"
+        ),
+    )
+
+
 def check_ruling_text_reasonable_length(ruling_text: str | None) -> DeterministicRuleResult:
     """Check that ruling_text length is not exactly the truncation sentinel.
 
@@ -635,6 +684,7 @@ def run_deterministic_rules(
     captured_at: date | None,
     other_case_numbers: list[str] | None = None,
     hearing_date_source: str | None = None,
+    county: str | None = None,
 ) -> DeterministicValidationResult:
     """Run all deterministic validation rules on a ruling.
 
@@ -661,6 +711,9 @@ def run_deterministic_rules(
         A structured source turns an out-of-window ``hearing_date_in_range``
         result into a non-blocking flag (#4793).  ``None`` keeps the 180-day
         fail.
+    county : str | None
+        The ruling's county.  Enables ``case_number_matches_county_format``
+        for counties with a registered case-number format (#4907).
 
     Returns
     -------
@@ -676,6 +729,7 @@ def run_deterministic_rules(
         check_unknown_and_null_title_fail(case_number, case_title),
         check_ruling_text_reasonable_length(ruling_text),
         check_ruling_text_case_number_marker(ruling_text, case_number),
+        check_case_number_matches_county_format(case_number, county),
     ]
 
     # Cross-case contamination check only runs when the caller supplies

@@ -1967,3 +1967,145 @@ def _make_mock_conn() -> tuple[MagicMock, MagicMock]:
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     return mock_conn, mock_cur
+
+
+# ---------------------------------------------------------------------------
+# #4907: an LLM-read case number must appear in the text the LLM read
+# ---------------------------------------------------------------------------
+
+
+def _sc_case_less_child(ruling_text: str) -> dict:
+    """A Santa Clara split child the deterministic splitter left case-less."""
+    return _make_sc_event(
+        document_id="aaaaaaaa-0000-0000-0000-000000004907",
+        ruling_text=ruling_text,
+        case_number=None,
+        case_title="Juan Allca-Taipe vs. Lyft",
+        _split_processed=True,
+        _original_document_id="aaaaaaaa-0000-0000-0000-000000000007",
+        _split_index=1,
+        _split_count=2,
+        _case_number_from_source=False,
+    )
+
+
+def _process_with_llm_case_number(event: dict, llm_case_number: str) -> list:
+    """Run *event* through ``process_event`` with the per-field LLM returning
+    *llm_case_number*; return the ``_RulingWrite`` objects it would write."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+    mock_conn, _cur = _make_mock_conn()
+    writes: list = []
+    llm_result = LLMExtractionResult(
+        case_count=1,
+        rulings=[LLMRulingResult(case_number=llm_case_number, case_title="Allca-Taipe v. Lyft")],
+    )
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.extract_fields_llm", return_value=llm_result),
+        patch.object(
+            IngestionWorker,
+            "_write_one_ruling",
+            autospec=True,
+            side_effect=lambda _self, write: writes.append(write),
+        ),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        worker.process_event(event)
+    return writes
+
+
+def test_llm_case_number_not_in_child_text_is_stored_as_unknown() -> None:
+    """#4907: the per-field LLM invented ``23STCV01234`` for a Santa Clara
+    child whose whole text was ``See below.``.  A number absent from the
+    child's own text is discarded and the child keeps ``UNKNOWN-``."""
+    event = _sc_case_less_child("See below.")
+    writes = _process_with_llm_case_number(event, "23STCV01234")
+
+    assert len(writes) == 1
+    # No number: the write files it under ``UNKNOWN-<document_id>``.
+    assert writes[0].case_number is None
+    assert "case_number" not in writes[0].extraction_methods
+
+
+def test_llm_case_number_in_child_text_is_kept() -> None:
+    """A number the child's text carries, even formatted differently, is
+    kept as the LLM read it."""
+    event = _sc_case_less_child(
+        "Case 24 CV 412345: the demurrer is OVERRULED.  Defendant shall answer within 10 days."
+    )
+    writes = _process_with_llm_case_number(event, "24CV412345")
+
+    assert len(writes) == 1
+    assert writes[0].case_number == "24CV412345"
+    assert writes[0].extraction_methods["case_number"] == "llm"
+
+
+def _llm_split_children(document_text: str, case_numbers: list[str | None]) -> list[dict]:
+    """Run the LLM split path on *document_text* with the extractor
+    returning one ruling per entry of *case_numbers*; return the dispatched
+    child events."""
+    worker, _ = _make_worker()
+    mock_conn, _cur = _make_mock_conn()
+    texts = [
+        "Motion GRANTED for the moving party in full.",
+        "Motion DENIED; the opposition is well taken and persuasive.",
+        "Motion CONTINUED to allow supplemental briefing on the merits by both sides.",
+    ]
+    rulings = [
+        ExtractedRuling(
+            extracted_case_number=cn,
+            extracted_case_title=f"Party{i} v. Other{i}",
+            ruling_text=texts[i],
+            outcome=ExtractionOutcome.GRANTED,
+        )
+        for i, cn in enumerate(case_numbers)
+    ]
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+    worker._get_framework_extractor = lambda: mock_extractor  # type: ignore[method-assign]
+    captured: list[dict] = []
+    original = worker.process_event
+
+    def capture(event_data: dict) -> None:
+        if event_data.get("_split_processed"):
+            captured.append(event_data)
+            return
+        original(event_data)
+
+    worker.process_event = capture  # type: ignore[method-assign]
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch.object(IngestionWorker, "_write_split_batch", autospec=True),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        worker.process_event(_make_llm_event(ruling_text=document_text))
+    return captured
+
+
+_OC_DOCUMENT_TEXT = (
+    "SUPERIOR COURT OF CALIFORNIA, COUNTY OF ORANGE — TENTATIVE RULINGS\n"
+    "1  Smith v. Jones            2024-01393434   Motion GRANTED for the moving party.\n"
+    "2  Doe v. Roe                2023- 01329371  Motion DENIED; the opposition is well taken.\n"
+    "6  Cheu v. RED SUN, LLC                      Motion CONTINUED for supplemental briefing.\n"
+)
+
+
+def test_llm_split_drops_case_number_absent_from_document_text() -> None:
+    """#4907: the multimodal prompt's example number ``2025-00912345``
+    came back for an Orange row that prints no case number.  A number the
+    document's extracted text does not carry is dropped; numbers it does
+    carry (even wrapped across a line) are kept."""
+    children = _llm_split_children(
+        _OC_DOCUMENT_TEXT, ["2024-01393434", "2023-01329371", "2025-00912345"]
+    )
+    assert [c["case_number"] for c in children] == ["2024-01393434", "2023-01329371", None]
+
+
+def test_llm_split_keeps_case_number_when_document_has_no_text_layer() -> None:
+    """A scanned PDF has no extracted text to check against, so the LLM's
+    number stands."""
+    children = _llm_split_children("Page 1", ["2024-01393434", "2025-00912345", None])
+    assert [c["case_number"] for c in children] == ["2024-01393434", "2025-00912345", None]

@@ -1090,6 +1090,48 @@ def is_valid_case_number(value: str) -> bool:
     return True
 
 
+_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+# A digit run of this length or longer inside a case number is specific
+# enough that finding it in the text supports the number even when the
+# LLM re-formatted the rest (``2025-1521814`` for a printed
+# ``25-1521814``).  Shorter runs (``01234``) must match as part of the
+# whole number.
+_MIN_SUPPORTING_DIGIT_RUN = 6
+
+
+def case_number_supported_by_text(case_number: str | None, *texts: str | None) -> bool:
+    """Return True when *case_number* appears in at least one of *texts*.
+
+    An LLM can invent a case number that is nowhere in the document: a
+    prompt example (``2025-00912345``) or a made-up placeholder
+    (``23STCV01234`` for a split child whose whole text was ``See
+    below.``, #4907).  A number the document really carries is in its
+    text, so a number found in none of *texts* is unsupported.
+
+    The comparison ignores case, whitespace and punctuation, so
+    ``30-2024-01393434`` matches ``30 - 2024 -\\n01393434``.  A digit run
+    of at least six digits in the number also counts as support on its
+    own, for numbers the LLM re-formatted.
+    """
+    if not case_number:
+        return False
+    normalized = _NON_ALNUM_RE.sub("", case_number.upper())
+    if not normalized:
+        return False
+    runs = [r for r in _DIGIT_RUN_RE.findall(case_number) if len(r) >= _MIN_SUPPORTING_DIGIT_RUN]
+    for text in texts:
+        if not text:
+            continue
+        haystack = _NON_ALNUM_RE.sub("", text.upper())
+        if normalized in haystack:
+            return True
+        if any(run in haystack for run in runs):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Case type extraction from scraper ID
 # ---------------------------------------------------------------------------
