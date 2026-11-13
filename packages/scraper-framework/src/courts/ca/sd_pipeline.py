@@ -162,6 +162,11 @@ class SDPipelineScraper(BaseScraper):
         )
 
         if not case_numbers:
+            # Not a listing gate: Phase 1 (SDCalendarScraper) already passes
+            # every calendar page through _check_listing, so an unrecognized
+            # empty page has been counted as blocked there. Reaching here
+            # means the pages loaded and held no motion hearings. Phase 2 is
+            # per-case lookups with no index page of its own (#4912).
             self._log.info("No case numbers from Phase 1 — skipping Phase 2")
             return []
 

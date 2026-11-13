@@ -154,17 +154,59 @@ class PdfLinkScraper(BaseScraper):
         """
         return bool(_NO_RULINGS_RE.match(text))
 
-    def _handle_no_pdf_links(self, html: str) -> None:
-        """Hook called when the index page yields zero PDF links.
+    def _empty_index_block_reason(self, html: str) -> str | None:
+        """Explain why an index with no ruling PDF links is not a quiet day.
 
-        A zero-link index is ambiguous: the court may legitimately list no
-        judicial officers (empty state), or the page layout may have changed
-        so links are no longer discoverable (silent outage).  Subclasses that
-        can tell the two apart should override this to log the empty state
-        explicitly and raise on a layout change so the run records
-        ``status=failure`` instead of a quiet ``records=0`` success (#4654).
-        The base implementation does nothing.
+        Called only when the index yields no ruling PDF links.  Returns
+        ``None`` when the page carries the court's recognized "nothing
+        posted" marker, which ``_check_listing`` takes as ``empty_state``.
+        Otherwise returns a one-line reason that goes into the
+        ``EmptyListing`` run error (#4654, #4912).
+
+        The base implementation always returns a reason.  The OC civil and
+        probate, Fresno, Riverside, SB and SF Family Law indexes keep weeks
+        of past PDFs (6 to 37 ruling links each on 2026-11-13), so none has
+        a legitimately empty index.  A court that does must recognize a
+        marker taken from a real capture (#4800); OC Family Law's empty
+        Family Law Panel is the example.
         """
+        return "this court's index has no recognized empty state"
+
+    def _ruling_links(self, links: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Drop index links that are not tentative-ruling PDFs.
+
+        Two per-court filters, each logged per skipped link:
+
+        - ``link_text_re`` on the link text (#1845).  Ruling PDFs carry text
+          like "Department X - Honorable Y"; other PDFs on the page (escheat
+          notices, admin orders, claim forms) do not.  Courts whose link text
+          is unpredictable (Fresno, CC) opt out via ``filter_by_link_text``.
+        - ``href_filter_re`` on the URL (#2644).  Used where the link text
+          is uninformative (Fresno "March 10, 2026") but the filename is
+          strict ("dept-NNN.pdf"), to skip e-Court notices, holiday closure
+          banners and other admin PDFs that would become all-NULL rows.
+        """
+        pc = self._pdf_config
+        kept: list[tuple[str, str]] = []
+        for href, link_text in links:
+            if pc.filter_by_link_text and not pc.link_text_re.search(link_text):
+                self._log.warning(
+                    "Skipping PDF link — text does not match expected pattern",
+                    link_text=link_text,
+                    url=href,
+                    pattern=pc.link_text_re.pattern,
+                )
+                continue
+            if pc.href_filter_re is not None and not pc.href_filter_re.search(href):
+                self._log.warning(
+                    "Skipping PDF link — URL does not match expected pattern",
+                    link_text=link_text,
+                    url=href,
+                    pattern=pc.href_filter_re.pattern,
+                )
+                continue
+            kept.append((href, link_text))
+        return kept
 
     def fetch_documents(self) -> list[CapturedDocument]:
         pc = self._pdf_config
@@ -184,43 +226,29 @@ class PdfLinkScraper(BaseScraper):
 
             links = _extract_pdf_links(response.text, pc.index_url, pc.pdf_base_url)
             self._log.info("Found PDF links", count=len(links))
-            if not links:
-                self._handle_no_pdf_links(response.text)
+            ruling_links = self._ruling_links(links)
+            # The listing is the links that survive the filters: a renamed
+            # link-text or filename pattern skips every link, which is the
+            # same silent success/0 as an anchor selector matching nothing
+            # (#4912).  Only the court's own empty-state marker makes an
+            # empty listing a quiet day.
+            reason = None if ruling_links else self._empty_index_block_reason(response.text)
+            if links and not ruling_links:
+                # PDF links are present but every one was filtered out: the
+                # court relabelled them, whatever the empty-state hook says.
+                reason = f"{len(links)} PDF link(s), none matching the ruling-link filters" + (
+                    f"; {reason}" if reason else ""
+                )
+            self._check_listing(
+                ruling_links,
+                what=f"{self.config.scraper_id} index PDF links",
+                url=pc.index_url,
+                body=response.text,
+                empty_state=not ruling_links and reason is None,
+                detail=reason,
+            )
 
-            for href, link_text in links:
-                # Filter: skip links whose text does not match the expected
-                # pattern (#1845).  All legitimate ruling PDFs have link text
-                # matching link_text_re (e.g. "Department X - Honorable Y").
-                # Non-matching links are unrelated documents (escheat notices,
-                # admin orders, claim forms) that happen to be on the same page.
-                # Some courts (Fresno, CC) use link text that doesn't follow
-                # a predictable pattern — they opt out via filter_by_link_text=False.
-                if pc.filter_by_link_text and not pc.link_text_re.search(link_text):
-                    self._log.warning(
-                        "Skipping PDF link — text does not match expected pattern",
-                        link_text=link_text,
-                        url=href,
-                        pattern=pc.link_text_re.pattern,
-                    )
-                    continue
-
-                # Filter: skip links whose URL does not match the expected
-                # filename pattern (#2644).  Used by courts where link text
-                # is uninformative (e.g. Fresno "March 10, 2026") but the URL
-                # filename follows a strict format (e.g. "dept-NNN.pdf").
-                # Non-matching URLs are e-Court transition notices, holiday
-                # closure announcements, and other admin PDFs posted to the
-                # same index page — they must be skipped to avoid emitting
-                # all-NULL-metadata noise rows.
-                if pc.href_filter_re is not None and not pc.href_filter_re.search(href):
-                    self._log.warning(
-                        "Skipping PDF link — URL does not match expected pattern",
-                        link_text=link_text,
-                        url=href,
-                        pattern=pc.href_filter_re.pattern,
-                    )
-                    continue
-
+            for href, link_text in ruling_links:
                 time.sleep(self.config.request_delay_seconds)
                 tally.attempt()
                 try:

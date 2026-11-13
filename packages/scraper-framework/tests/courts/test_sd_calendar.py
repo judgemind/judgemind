@@ -595,13 +595,13 @@ class TestSDCalendarScraper:
 
         assert docs == []
 
-        warning_events = [e for e in cap_logs if e.get("event") == "Skipping empty calendar page"]
-        # One warning per division URL (4 divisions, 1 day each)
-        assert len(warning_events) == 4
-        # Each warning carries division and url keys
-        for entry in warning_events:
-            assert entry.get("log_level") == "warning"
-            assert "division" in entry
+        # The shared listing guard logs one empty_state event per division
+        # URL (4 divisions, 1 day each) (#4912).
+        empty_events = [e for e in cap_logs if e.get("event") == "listing.empty_state"]
+        assert len(empty_events) == 4
+        for entry in empty_events:
+            assert entry.get("context") == "empty_state"
+            assert entry["listing"].startswith("SD ")
             assert "url" in entry
 
     def test_parse_document_passthrough_with_ruling_text(self) -> None:

@@ -154,8 +154,8 @@ EXCLUSIONS: set[str] = {
     # "Family Law Panel" index on or about 2026-07-21 (Wayback-confirmed), so
     # there is nothing to capture — the last two linked PDFs were stale since
     # 2025-12 / 2026-05. The scraper now positively detects the empty panel
-    # (logs context=empty_state) and raises OCFamilyLawIndexLayoutError
-    # (status=failure) if officers reappear without discoverable PDF links,
+    # (logs context=empty_state) and raises EmptyListing (status=failure,
+    # #4912) if officers reappear without discoverable PDF links,
     # so a zero-record streak here is the expected steady state, not a
     # silent outage. Remove this exclusion if the panel is repopulated. #4654.
     "ca-oc-tentatives-family-law",

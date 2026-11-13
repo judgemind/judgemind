@@ -561,23 +561,19 @@ class SDCalendarScraper(BaseScraper):
 
                     hearings = parse_calendar_page(html)
 
-                    if len(hearings) == 0:
-                        block_reason = _empty_calendar_block_reason(html)
-                        if block_reason is not None:
-                            tally.blocked(block_reason)
-                            self._log.error(
-                                "sd_calendar.unexpected_page",
-                                division=division_name,
-                                url=url,
-                                reason=block_reason,
-                                body_prefix=html[:200],
-                            )
-                            continue
-                        self._log.warning(
-                            "Skipping empty calendar page",
-                            division=division_name,
-                            url=url,
-                        )
+                    # Each calendar page is its own listing, so the outcome
+                    # goes on the tally: only the live "No Events for Today"
+                    # page is a quiet day (#4748, #4912).
+                    block_reason = None if hearings else _empty_calendar_block_reason(html)
+                    if not self._check_listing(
+                        hearings,
+                        what=f"SD {division_name} calendar hearings",
+                        url=url,
+                        body=html,
+                        empty_state=not hearings and block_reason is None,
+                        tally=tally,
+                        detail=block_reason,
+                    ):
                         continue
 
                     motion_hearings = [h for h in hearings if _is_motion_event(h.event_type)]

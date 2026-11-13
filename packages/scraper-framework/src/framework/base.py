@@ -441,6 +441,7 @@ class BaseScraper(abc.ABC):
         body: str,
         empty_state: bool = False,
         tally: FetchTally | None = None,
+        detail: str | None = None,
     ) -> bool:
         """Gate the items parsed from an index / listing page (#4736).
 
@@ -465,6 +466,11 @@ class BaseScraper(abc.ABC):
         captured from the others; ``tally.raise_if_all_failed`` fails the
         run when every listing came back that way.  Returns False in both
         cases.
+
+        *detail* is the scraper's own one-line explanation of why the page
+        is not a recognized empty state (e.g. "response is not a civil
+        calendar page").  It replaces the generic "likely a layout change or
+        block page" at the end of the error (#4912).
         """
         count = len(items)
         self._log.info("listing.discovered", listing=what, count=count, url=url)
@@ -475,15 +481,18 @@ class BaseScraper(abc.ABC):
             if tally is not None:
                 tally.ok()
             return False
+        # The URL goes last: FetchTally truncates a block reason to 300
+        # characters, and the URL is also in the log event below.
         message = (
-            f"empty listing: {what} parsed to 0 items on {url} and no "
-            "'no rulings posted' marker was recognized (likely a layout change "
-            "or block page)"
+            f"empty listing: {what} parsed to 0 items and no "
+            "'no rulings posted' marker was recognized "
+            f"({detail or 'likely a layout change or block page'}); url: {url}"
         )
         self._log.error(
             "listing.empty_unrecognized",
             listing=what,
             url=url,
+            detail=detail,
             body_prefix=body[:200],
         )
         if tally is not None:

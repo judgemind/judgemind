@@ -1021,9 +1021,15 @@ def test_fetch_documents_logs_error_when_no_judges() -> None:
         with pytest.raises(ScraperPreconditionFailure, match="judge dropdown not found"):
             scraper.fetch_documents()
 
-    no_judges_events = [e for e in cap if e.get("event") == "cc_portal.no_judges_found"]
+    # The shared listing guard logs the empty dropdown (#4912).
+    no_judges_events = [
+        e
+        for e in cap
+        if e.get("event") == "listing.empty_unrecognized"
+        and e.get("listing") == "CC portal judge dropdown options"
+    ]
     assert len(no_judges_events) == 1, (
-        f"Expected 1 cc_portal.no_judges_found event, got {len(no_judges_events)}: "
+        f"Expected 1 listing.empty_unrecognized event, got {len(no_judges_events)}: "
         f"{no_judges_events}"
     )
     assert no_judges_events[0].get("log_level") == "error"
@@ -1490,8 +1496,9 @@ def test_changed_listing_for_one_judge_does_not_hide_the_other_judges_rulings() 
 
     assert health.success is True
     events = [e["event"] for e in logs]
-    assert "cc_portal.unexpected_listing_page" in events
-    assert "cc_portal.empty_listing" in events
+    # The shared listing guard logs both outcomes (#4912).
+    assert "listing.empty_unrecognized" in events
+    assert "listing.empty_state" in events
 
 
 # ---------------------------------------------------------------------------

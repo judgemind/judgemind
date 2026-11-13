@@ -469,6 +469,17 @@ class GovernorAppointmentsScraper(BaseScraper):
             response.raise_for_status()
 
             results = extract_search_results(response.text, search_url)
+            if pages_fetched == 0:
+                # The first search page always lists appointment releases
+                # (the governor announces judges every few weeks and older
+                # releases stay in the results). None means the result
+                # markup or the URL filter no longer matches (#4912).
+                self._check_listing(
+                    results,
+                    what="governor judicial-appointment search results (page 1)",
+                    url=search_url,
+                    body=response.text,
+                )
             for r in results:
                 if r["url"] not in seen_urls:
                     seen_urls.add(r["url"])
