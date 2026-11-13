@@ -4420,8 +4420,9 @@ class IngestionWorker:
             for w in batch.children:
                 if batch.case_number_texts:
                     # The LLM split read the child's number from the whole
-                    # document (#4915).
-                    w.case_number_texts = (*batch.case_number_texts, w.ruling_text)
+                    # document; the child's text is the LLM's own
+                    # transcription, so it is no evidence (#4915).
+                    w.case_number_texts = batch.case_number_texts
                 court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
                 insert_document(
                     conn,
@@ -5391,11 +5392,14 @@ class IngestionWorker:
                 cr.hearing_date, event_data
             )
             # The LLM read the number from the whole document, so the
-            # document's extracted text must carry it (#4907).
+            # document's extracted text must carry it (#4907).  The child's
+            # own text is the LLM's transcription, not evidence: it can
+            # repeat the misread (#4915, ``2024-0139388`` for a printed
+            # ``30-2024-01399388``).
             llm_case_number = cr.case_number
             if _llm_case_number_unsupported(
                 llm_case_number,
-                (ruling_text, cr.ruling_text),
+                (ruling_text,),
                 min_text_len=_MIN_TEXT_TO_CHECK_CASE_NUMBER,
             ):
                 logger.warning(
