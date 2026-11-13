@@ -2672,6 +2672,11 @@ class SplitChildRuling:
     summary_model: str | None = None
     summary_generated_at: datetime | None = None
     hearing_date_source: str | None = None
+    #: The document text a case number on this child's slot must appear in
+    #: to be kept when this child found none (#4915).  Empty when the
+    #: document's text cannot settle it (no text layer, or a split path
+    #: whose case numbers can come from outside the text).
+    case_number_texts: tuple[str | None, ...] = ()
 
 
 @dataclass
@@ -2681,12 +2686,23 @@ class _HeldRuling:
     case_id: str
     text_hash: str | None
     placeholder: bool
+    case_number: str | None = None
 
 
 def _is_placeholder_case_number(case_number: str | None) -> bool:
     if not isinstance(case_number, str) or not case_number.strip():
         return True
     return case_number.startswith(_PLACEHOLDER_CASE_PREFIX)
+
+
+def _held_case_number_unsupported(held: _HeldRuling, child: SplitChildRuling) -> bool:
+    """Return True when *held*'s case number is in none of *child*'s
+    ``case_number_texts`` (#4915).  False when the child gives no texts."""
+    if not child.case_number_texts or not any(child.case_number_texts):
+        return False
+    from .extract import case_number_supported_by_text
+
+    return not case_number_supported_by_text(held.case_number, *child.case_number_texts)
 
 
 def _owned_rows_on_key(
@@ -2739,7 +2755,10 @@ def write_split_rulings(
     - the child's case when they agree;
     - the row's real case when the child found no case number
       (``UNKNOWN-*``): a re-extraction that misses the case number must not
-      drop the one found before (#4788);
+      drop the one found before (#4788).  The exception is a *relink* whose
+      child gives ``case_number_texts`` that do not carry the row's number:
+      the number is not in the document, so an LLM invented or misread it,
+      and the row moves to the child's placeholder case (#4915);
     - the child's case when the row's case is a placeholder;
     - for two different real case numbers, the child's case when *relink*
       (a split-set replacement: reingest / rebuild, #4700) and the row's
@@ -2777,6 +2796,7 @@ def write_split_rulings(
                 case_id=str(row[2]),
                 text_hash=row[3],
                 placeholder=_is_placeholder_case_number(row[4]),
+                case_number=row[4],
             )
             for row in cur.fetchall()
         ]
@@ -2817,7 +2837,22 @@ def write_split_rulings(
             continue
         child_placeholder = _is_placeholder_case_number(child_case_numbers.get(c.case_id))
         if child_placeholder and not h.placeholder:
-            final_case[i] = h.case_id
+            if relink and _held_case_number_unsupported(h, c):
+                # The row's number is not in the document at all, so the
+                # row was filed under a case an LLM invented or misread:
+                # it moves to the child's placeholder case (#4915).
+                logger.info(
+                    "write_split_rulings: ruling leaves a case number absent from its document",
+                    extra={
+                        "document_id": c.document_id,
+                        "ruling_id": h.ruling_id,
+                        "unsupported_case_number": h.case_number,
+                        "telemetry_event": "split_ruling_left_unsupported_case",
+                    },
+                )
+                final_case[i] = c.case_id
+            else:
+                final_case[i] = h.case_id
         elif h.placeholder or relink:
             final_case[i] = c.case_id
         else:
