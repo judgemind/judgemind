@@ -26,14 +26,25 @@ interface AuthContext {
   cookieHeader: string;
 }
 
+// Messages are explicit because the web register/login pages show the first
+// issue's message verbatim, and zod's default wording changes between majors
+// (zod 4 says "Too small: expected string to have >=8 characters").
 const registerSchema = z.object({
-  email: z.string().email().max(255),
-  password: z.string().min(8).max(128),
-  displayName: z.string().max(100).optional(),
+  email: z.email({ error: 'Invalid email address' }).max(255, {
+    error: 'Email must be at most 255 characters',
+  }),
+  password: z
+    .string()
+    .min(8, { error: 'Password must be at least 8 characters' })
+    .max(128, { error: 'Password must be at most 128 characters' }),
+  displayName: z
+    .string()
+    .max(100, { error: 'Display name must be at most 100 characters' })
+    .optional(),
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.email({ error: 'Invalid email address' }),
   password: z.string(),
 });
 

@@ -12,11 +12,21 @@ interface AlertContext {
 
 const MAX_FILTERS_LEN = 4096;
 
+// z.guid() accepts any 8-4-4-4-12 hex id, matching zod 3's z.string().uuid().
+// zod 4's z.uuid() also checks the RFC 9562 version/variant bits, which would
+// newly reject ids Postgres happily stores in a uuid column.
+const idField = z.guid({ error: 'Invalid uuid' });
+
 const filterSchemas = {
-  judge_ruling:   z.object({ judge_id: z.string().uuid() }).strict(),
-  case_docket:    z.object({ case_id:  z.string().uuid() }).strict(),
-  keyword:        z.object({ keyword:  z.string().min(1).max(200) }).strict(),
-  party_attorney: z.object({ party_id: z.string().uuid() }).strict(),
+  judge_ruling:   z.strictObject({ judge_id: idField }),
+  case_docket:    z.strictObject({ case_id:  idField }),
+  keyword:        z.strictObject({
+    keyword: z
+      .string()
+      .min(1, { error: 'keyword must not be empty' })
+      .max(200, { error: 'keyword must be at most 200 characters' }),
+  }),
+  party_attorney: z.strictObject({ party_id: idField }),
 } as const;
 
 const VALID_ALERT_TYPES = Object.keys(filterSchemas);
