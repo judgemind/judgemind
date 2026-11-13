@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 67 migrations.
+-- Generated from 68 migrations.
 
 
 
@@ -969,6 +969,41 @@ CREATE SEQUENCE telemetry.data_quality_metrics_id_seq
 ALTER SEQUENCE telemetry.data_quality_metrics_id_seq OWNED BY telemetry.data_quality_metrics.id;
 
 
+CREATE TABLE telemetry.roster_fetch_attempts (
+    id bigint NOT NULL,
+    court_id text NOT NULL,
+    directory_class text NOT NULL,
+    attempted_at timestamp with time zone DEFAULT now() NOT NULL,
+    outcome text NOT NULL,
+    department_count integer,
+    snapshot_changed boolean,
+    error_class text,
+    http_status integer,
+    error_message text,
+    CONSTRAINT roster_fetch_attempts_outcome_check CHECK ((outcome = ANY (ARRAY['success'::text, 'failure'::text])))
+);
+
+
+COMMENT ON TABLE telemetry.roster_fetch_attempts IS 'One row per court-directory (judge roster) fetch attempt, success or failure. Feeds per-court roster freshness on /admin/data-quality. Issue #4872.';
+
+
+COMMENT ON COLUMN telemetry.roster_fetch_attempts.snapshot_changed IS 'TRUE when the fetch inserted a new court_directory_snapshots row, FALSE when it matched the latest snapshot (dedup). NULL on failure.';
+
+
+COMMENT ON COLUMN telemetry.roster_fetch_attempts.error_class IS 'Failure bucket: http_403, http_4xx, http_5xx, redirect, network, empty_roster, missing_court_id, import_error, other. NULL on success.';
+
+
+CREATE SEQUENCE telemetry.roster_fetch_attempts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE telemetry.roster_fetch_attempts_id_seq OWNED BY telemetry.roster_fetch_attempts.id;
+
+
 CREATE TABLE telemetry.scraper_runs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     scraper_id text NOT NULL,
@@ -1062,6 +1097,9 @@ ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions ALTER COLUMN id SET D
 
 
 ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
+
+
+ALTER TABLE ONLY telemetry.roster_fetch_attempts ALTER COLUMN id SET DEFAULT nextval('telemetry.roster_fetch_attempts_id_seq'::regclass);
 
 
 ALTER TABLE ONLY derived.attorney_aliases
@@ -1250,6 +1288,10 @@ ALTER TABLE ONLY staging.ruled_items
 
 ALTER TABLE ONLY telemetry.data_quality_metrics
     ADD CONSTRAINT data_quality_metrics_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY telemetry.roster_fetch_attempts
+    ADD CONSTRAINT roster_fetch_attempts_pkey PRIMARY KEY (id);
 
 
 ALTER TABLE ONLY telemetry.scraper_runs
@@ -1459,6 +1501,9 @@ CREATE INDEX idx_staging_ruled_status ON staging.ruled_items USING btree (valida
 
 
 CREATE INDEX idx_dqm_county_metric_time ON telemetry.data_quality_metrics USING btree (county, metric_name, recorded_at DESC);
+
+
+CREATE INDEX idx_roster_fetch_attempts_court_time ON telemetry.roster_fetch_attempts USING btree (court_id, attempted_at DESC);
 
 
 CREATE INDEX idx_scraper_runs_scraper_id ON telemetry.scraper_runs USING btree (scraper_id, started_at DESC);
