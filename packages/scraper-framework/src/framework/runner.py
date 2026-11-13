@@ -35,6 +35,7 @@ import structlog
 
 from .event_bus import RedisEventBus
 from .models import ScraperConfig, ScraperHealthEvent
+from .roster_health import fetch_roster, record_roster_attempt
 from .s3_cache import make_s3_client
 from .storage import S3Archiver
 
@@ -167,16 +168,19 @@ def _connect_db() -> psycopg.Connection | None:  # type: ignore[type-arg]
         return None
 
 
+# (module_path, class_name, court_id). court_id is listed explicitly so a
+# failed fetch is recorded under the right court even when the class itself
+# is broken (e.g. missing COURT_ID, #4732).
 _ROSTER_DIRECTORIES = [
-    ("courts.ca.oc_dept_judges", "OCCourtDirectory"),
-    ("courts.ca.la_dept_judges", "LACourtDirectory"),
-    ("courts.ca.fresno_dept_judges", "FresnoCourtDirectory"),
-    ("courts.ca.kern_dept_judges", "KernCourtDirectory"),
-    ("courts.ca.sd_dept_judges", "SanDiegoCourtDirectory"),
-    ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory"),
-    ("courts.ca.ventura_dept_judges", "VenturaCourtDirectory"),
-    ("courts.ca.sf_dept_judges", "SFCourtDirectory"),
-    ("courts.ca.sc_tentatives", "SantaClaraCourtDirectory"),
+    ("courts.ca.oc_dept_judges", "OCCourtDirectory", "ca_orange"),
+    ("courts.ca.la_dept_judges", "LACourtDirectory", "ca_los_angeles"),
+    ("courts.ca.fresno_dept_judges", "FresnoCourtDirectory", "ca_fresno"),
+    ("courts.ca.kern_dept_judges", "KernCourtDirectory", "ca_kern"),
+    ("courts.ca.sd_dept_judges", "SanDiegoCourtDirectory", "ca_san_diego"),
+    ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory", "ca_san_bernardino"),
+    ("courts.ca.ventura_dept_judges", "VenturaCourtDirectory", "ca_ventura"),
+    ("courts.ca.sf_dept_judges", "SFCourtDirectory", "ca_san_francisco"),
+    ("courts.ca.sc_tentatives", "SantaClaraCourtDirectory", "ca_santa_clara"),
 ]
 
 
@@ -185,26 +189,38 @@ def _fetch_rosters(
     bucket: str,
     db_conn: psycopg.Connection,  # type: ignore[type-arg]
 ) -> None:
-    """Fetch all court directory rosters before running scrapers."""
-    import importlib
+    """Fetch all court directory rosters before running scrapers.
 
-    for module_path, class_name in _ROSTER_DIRECTORIES:
-        try:
-            mod = importlib.import_module(module_path)
-            cls = getattr(mod, class_name)
-            directory = cls(s3_client=s3_client, s3_bucket=bucket, db_conn=db_conn)
-            mapping = directory.fetch_and_snapshot(cls.COURT_ID)
+    Every attempt, success or failure, is recorded in
+    ``telemetry.roster_fetch_attempts`` so roster health is visible on
+    /admin/data-quality (#4872). A failure never stops the scraper run.
+    """
+    for module_path, class_name, court_id in _ROSTER_DIRECTORIES:
+        result = fetch_roster(
+            module_path,
+            class_name,
+            court_id,
+            s3_client=s3_client,
+            bucket=bucket,
+            db_conn=db_conn,
+        )
+        if result.outcome == "success":
             logger.info(
                 "Roster fetched",
-                court_id=cls.COURT_ID,
-                departments=len(mapping) if mapping else 0,
+                court_id=court_id,
+                departments=result.department_count,
+                snapshot_changed=result.snapshot_changed,
             )
-        except Exception as exc:
+        else:
             logger.warning(
                 "Roster fetch failed — continuing",
-                court_id=class_name,
-                error=str(exc),
+                court_id=court_id,
+                directory_class=class_name,
+                error_class=result.error_class,
+                http_status=result.http_status,
+                error=result.error_message,
             )
+        record_roster_attempt(db_conn, result)
         time.sleep(1)
 
 

@@ -51,6 +51,48 @@ export const DATA_QUALITY_METRICS_QUERY = gql`
   }
 `;
 
+export const ROSTER_FRESHNESS_QUERY = gql`
+  query RosterFreshness {
+    rosterFreshness {
+      courtId
+      status
+      isStale
+      lastSuccessAt
+      lastSnapshotAt
+      lastAttemptAt
+      lastOutcome
+      lastErrorClass
+      lastHttpStatus
+      lastErrorMessage
+      lastDepartmentCount
+      consecutiveFailures
+      ageHours
+      staleThresholdHours
+    }
+  }
+`;
+
+export interface RosterFreshnessItem {
+  courtId: string;
+  status: 'ok' | 'failing' | 'stale';
+  isStale: boolean;
+  lastSuccessAt: string | null;
+  lastSnapshotAt: string | null;
+  lastAttemptAt: string | null;
+  lastOutcome: 'success' | 'failure' | null;
+  lastErrorClass: string | null;
+  lastHttpStatus: number | null;
+  lastErrorMessage: string | null;
+  lastDepartmentCount: number | null;
+  consecutiveFailures: number;
+  ageHours: number | null;
+  staleThresholdHours: number;
+}
+
+export interface RosterFreshnessData {
+  rosterFreshness: RosterFreshnessItem[];
+}
+
 export interface DataQualityOverviewItem {
   county: string;
   healthStatus: 'green' | 'yellow' | 'red';

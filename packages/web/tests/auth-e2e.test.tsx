@@ -87,6 +87,7 @@ import type { AuthUser } from '@/lib/auth-mutations';
 import {
   DATA_QUALITY_OVERVIEW_QUERY,
   DATA_QUALITY_METRICS_QUERY,
+  ROSTER_FRESHNESS_QUERY,
 } from '@/lib/data-quality-queries';
 import { REFRESH_TOKEN_MUTATION } from '@/lib/auth-mutations';
 import {
@@ -192,6 +193,13 @@ function dataQualityOverviewMock(): MockedResponse {
         ],
       },
     },
+  };
+}
+
+function rosterFreshnessMock(): MockedResponse {
+  return {
+    request: { query: ROSTER_FRESHNESS_QUERY },
+    result: { data: { rosterFreshness: [] } },
   };
 }
 
@@ -487,6 +495,7 @@ describe('Auth lifecycle integration', () => {
         meQueryMock(adminUser),
         dataQualityOverviewMock(),
         dataQualityMetricsMock(),
+        rosterFreshnessMock(),
       ];
 
       renderWithProviders(<DataQualityDashboard />, mocks);

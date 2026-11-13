@@ -66,10 +66,13 @@ def test_all_discovered_roster_directories_have_court_id() -> None:
 
 
 def test_runner_roster_directories_have_court_id() -> None:
-    for module_path, class_name in runner._ROSTER_DIRECTORIES:
+    for module_path, class_name, court_id in runner._ROSTER_DIRECTORIES:
         cls = getattr(importlib.import_module(module_path), class_name)
         assert issubclass(cls, CourtDirectory)
         _assert_has_court_id(cls)
+        # The registry's court_id must match the class's own COURT_ID so
+        # telemetry rows and snapshots share one key (#4872).
+        assert cls.COURT_ID == court_id
 
 
 def test_santa_clara_directory_court_id() -> None:

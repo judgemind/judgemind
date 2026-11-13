@@ -330,6 +330,39 @@ const coreTypeDefs = `#graphql
     lastUpdated: String
   }
 
+  """Per-court judge-roster (court directory) fetch health. Issue #4872."""
+  type RosterFreshness {
+    """Court identifier, e.g. ca_los_angeles."""
+    courtId: String!
+    """One of: ok, failing (latest attempt failed, not yet stale), stale."""
+    status: String!
+    """True when there is no successful fetch within staleThresholdHours."""
+    isStale: Boolean!
+    """Newest of the latest successful fetch attempt and the latest snapshot (ISO-8601)."""
+    lastSuccessAt: String
+    """When the roster content last changed, i.e. the latest snapshot row (ISO-8601)."""
+    lastSnapshotAt: String
+    """When the latest fetch attempt finished (ISO-8601). Null if none is recorded."""
+    lastAttemptAt: String
+    """Outcome of the latest attempt: success or failure."""
+    lastOutcome: String
+    """Error class of the latest attempt, e.g. http_5xx, http_403, redirect,
+    network, empty_roster, missing_court_id, import_error, other."""
+    lastErrorClass: String
+    """HTTP status of the latest attempt when it failed with an HTTP error."""
+    lastHttpStatus: Int
+    """Exception text of the latest attempt when it failed."""
+    lastErrorMessage: String
+    """Departments parsed by the latest attempt."""
+    lastDepartmentCount: Int
+    """Failed attempts since the last successful attempt."""
+    consecutiveFailures: Int!
+    """Hours since lastSuccessAt."""
+    ageHours: Float
+    """Age in hours beyond which the roster counts as stale."""
+    staleThresholdHours: Float!
+  }
+
   type DataQualityMetricEdge {
     node: DataQualityMetric!
     cursor: String!
@@ -487,6 +520,9 @@ const coreTypeDefs = `#graphql
     """Per-county health status overview. Admin only.
     Computes green/yellow/red status from the latest metrics for each county."""
     dataQualityOverview: [DataQualityOverview!]!
+
+    """Per-court judge-roster fetch freshness. Admin only. Issue #4872."""
+    rosterFreshness: [RosterFreshness!]!
   }
 
   # ---------------------------------------------------------------------------

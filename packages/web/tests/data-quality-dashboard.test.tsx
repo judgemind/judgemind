@@ -59,6 +59,13 @@ vi.mock('recharts', () => ({
   Legend: () => <div />,
 }));
 
+// The roster panel runs its own useQuery; stub it so the overview/metrics
+// call-count parity above stays intact. It has its own tests in
+// roster-health-panel.test.tsx.
+vi.mock('../src/app/(main)/admin/data-quality/RosterHealthPanel', () => ({
+  RosterHealthPanel: () => <div data-testid="roster-health-panel" />,
+}));
+
 import { DataQualityDashboard } from '../src/app/(main)/admin/data-quality/DataQualityDashboard';
 
 // ---------------------------------------------------------------------------
@@ -178,6 +185,15 @@ describe('DataQualityDashboard', () => {
     expect(screen.getByText('Los Angeles')).toBeInTheDocument();
     expect(screen.getByText('Orange')).toBeInTheDocument();
     expect(screen.getByText('San Diego')).toBeInTheDocument();
+  });
+
+  it('renders the roster freshness panel on the overview', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.getByTestId('roster-health-panel')).toBeInTheDocument();
   });
 
   it('renders system health score', () => {

@@ -1,11 +1,12 @@
 /**
  * Data quality metrics resolvers and data access.
  *
- * Provides two queries:
+ * Provides three queries:
  * - dataQualityMetrics: time-series metrics with filtering
  * - dataQualityOverview: per-county health status summary
+ * - rosterFreshness: per-court judge-roster fetch health (#4872)
  *
- * Both queries are admin-only.
+ * All queries are admin-only.
  */
 
 import type { Pool } from 'pg';
@@ -608,6 +609,173 @@ async function queryOverview(pool: Pool): Promise<Row[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Data access — rosterFreshness (issue #4872)
+// ---------------------------------------------------------------------------
+
+/**
+ * A court's judge roster is stale when its last successful fetch is older
+ * than this. Rosters are fetched on every scraper run (several times a day),
+ * so a week without a success means the fetch has been broken for days.
+ */
+export const ROSTER_STALE_THRESHOLD_HOURS = 7 * 24;
+
+export type RosterStatus = 'ok' | 'failing' | 'stale';
+
+export interface RosterFreshness {
+  courtId: string;
+  status: RosterStatus;
+  isStale: boolean;
+  lastSuccessAt: string | null;
+  lastSnapshotAt: string | null;
+  lastAttemptAt: string | null;
+  lastOutcome: string | null;
+  lastErrorClass: string | null;
+  lastHttpStatus: number | null;
+  lastErrorMessage: string | null;
+  lastDepartmentCount: number | null;
+  consecutiveFailures: number;
+  ageHours: number | null;
+  staleThresholdHours: number;
+}
+
+function toIso(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const d = new Date(String(value));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function toIntOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Turn one row of the rosterFreshness query into the API shape.
+ *
+ * lastSuccessAt is the newer of the latest successful attempt in
+ * telemetry.roster_fetch_attempts and the latest court_directory_snapshots
+ * row. The snapshot fallback covers courts whose rosters were fetched before
+ * attempt telemetry existed (or by scripts/fetch_rosters.py).
+ *
+ * Status: 'stale' when there is no success or it is older than the threshold;
+ * otherwise 'failing' when the latest attempt failed after the last success;
+ * otherwise 'ok'.
+ */
+export function computeRosterFreshness(
+  row: Row,
+  now: Date,
+  staleThresholdHours: number = ROSTER_STALE_THRESHOLD_HOURS,
+): RosterFreshness {
+  const lastSuccessAttemptAt = toIso(row.last_success_attempt_at);
+  const lastSnapshotAt = toIso(row.last_snapshot_at);
+  const candidates = [lastSuccessAttemptAt, lastSnapshotAt].filter(
+    (v): v is string => v !== null,
+  );
+  const lastSuccessAt =
+    candidates.length > 0
+      ? candidates.reduce((a, b) => (new Date(a) > new Date(b) ? a : b))
+      : null;
+
+  const ageHours =
+    lastSuccessAt !== null
+      ? Math.max(0, (now.getTime() - new Date(lastSuccessAt).getTime()) / 3_600_000)
+      : null;
+  const isStale = ageHours === null || ageHours > staleThresholdHours;
+  const lastOutcome = (row.last_outcome as string | null | undefined) ?? null;
+  const lastAttemptAt = toIso(row.last_attempt_at);
+  // A failed attempt only counts if nothing succeeded after it (a manual
+  // scripts/fetch_rosters.py run writes a snapshot but no attempt row).
+  const failedSinceLastSuccess =
+    lastOutcome === 'failure' &&
+    (lastSuccessAt === null ||
+      (lastAttemptAt !== null && new Date(lastAttemptAt) > new Date(lastSuccessAt)));
+
+  let status: RosterStatus = 'ok';
+  if (isStale) status = 'stale';
+  else if (failedSinceLastSuccess) status = 'failing';
+
+  return {
+    courtId: String(row.court_id),
+    status,
+    isStale,
+    lastSuccessAt,
+    lastSnapshotAt,
+    lastAttemptAt,
+    lastOutcome,
+    lastErrorClass: (row.last_error_class as string | null | undefined) ?? null,
+    lastHttpStatus: toIntOrNull(row.last_http_status),
+    lastErrorMessage: (row.last_error_message as string | null | undefined) ?? null,
+    lastDepartmentCount: toIntOrNull(row.last_department_count),
+    consecutiveFailures: toIntOrNull(row.consecutive_failures) ?? 0,
+    ageHours: ageHours !== null ? Math.round(ageHours * 10) / 10 : null,
+    staleThresholdHours,
+  };
+}
+
+export const ROSTER_FRESHNESS_SQL = `
+  WITH courts AS (
+    SELECT court_id FROM telemetry.roster_fetch_attempts
+    UNION
+    SELECT court_id FROM derived.court_directory_snapshots
+  ),
+  last_attempt AS (
+    SELECT DISTINCT ON (court_id)
+      court_id, attempted_at, outcome, error_class, http_status,
+      error_message, department_count
+    FROM telemetry.roster_fetch_attempts
+    ORDER BY court_id, attempted_at DESC, id DESC
+  ),
+  last_success AS (
+    SELECT court_id, MAX(attempted_at) AS attempted_at
+    FROM telemetry.roster_fetch_attempts
+    WHERE outcome = 'success'
+    GROUP BY court_id
+  ),
+  last_snapshot AS (
+    SELECT court_id, MAX(captured_at) AS captured_at
+    FROM derived.court_directory_snapshots
+    GROUP BY court_id
+  ),
+  -- Failures since the newer of the last successful attempt and the last
+  -- snapshot, so the count matches lastSuccessAt (a manual fetch via
+  -- scripts/fetch_rosters.py writes a snapshot but no attempt row).
+  failure_streak AS (
+    SELECT a.court_id, COUNT(*) AS n
+    FROM telemetry.roster_fetch_attempts a
+    LEFT JOIN last_success s ON s.court_id = a.court_id
+    LEFT JOIN last_snapshot sn ON sn.court_id = a.court_id
+    WHERE a.outcome = 'failure'
+      AND a.attempted_at > COALESCE(
+        GREATEST(s.attempted_at, sn.captured_at), '-infinity'::timestamptz
+      )
+    GROUP BY a.court_id
+  )
+  SELECT
+    c.court_id,
+    la.attempted_at      AS last_attempt_at,
+    la.outcome           AS last_outcome,
+    la.error_class       AS last_error_class,
+    la.http_status       AS last_http_status,
+    la.error_message     AS last_error_message,
+    la.department_count  AS last_department_count,
+    ls.attempted_at      AS last_success_attempt_at,
+    sn.captured_at       AS last_snapshot_at,
+    COALESCE(fs.n, 0)    AS consecutive_failures
+  FROM courts c
+  LEFT JOIN last_attempt la ON la.court_id = c.court_id
+  LEFT JOIN last_success ls ON ls.court_id = c.court_id
+  LEFT JOIN last_snapshot sn ON sn.court_id = c.court_id
+  LEFT JOIN failure_streak fs ON fs.court_id = c.court_id
+  ORDER BY c.court_id
+`;
+
+async function queryRosterFreshness(pool: Pool, now: Date = new Date()): Promise<RosterFreshness[]> {
+  const { rows } = await pool.query<Row>(ROSTER_FRESHNESS_SQL);
+  return rows.map((row) => computeRosterFreshness(row, now));
+}
+
+// ---------------------------------------------------------------------------
 // Context type
 // ---------------------------------------------------------------------------
 
@@ -635,6 +803,11 @@ export const dataQualityResolvers = {
       requireAdmin(user);
       return queryOverview(pool);
     },
+
+    rosterFreshness: async (_: unknown, __: unknown, { pool, user }: DataQualityContext) => {
+      requireAdmin(user);
+      return queryRosterFreshness(pool);
+    },
   },
 
   DataQualityMetric: {
@@ -656,4 +829,4 @@ export const dataQualityResolvers = {
 };
 
 // Export for testing (non-function types and requireAdmin which is not inline-exported)
-export { requireAdmin, type CountyMetrics, type CountyThresholds, type CountyConfig, type MetricResolution };
+export { requireAdmin, queryRosterFreshness, type CountyMetrics, type CountyThresholds, type CountyConfig, type MetricResolution };
