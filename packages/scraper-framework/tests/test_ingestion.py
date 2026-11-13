@@ -2358,7 +2358,7 @@ def test_process_event_llm_extraction_populates_missing_fields(
         hearing_date=None,
         outcome=None,
         motion_type=None,
-        ruling_text="Some ruling text that LLM will parse",
+        ruling_text="Case Number: 24NNCV02551 Some ruling text that LLM will parse",
     )
     worker.process_event(event)
 
@@ -6262,7 +6262,7 @@ def test_process_event_rejects_implausible_llm_hearing_date(
         case_number=None,
         case_title=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 24NNCV02551 Some ruling text",
         capture_timestamp="2026-03-04T23:00:00",
     )
     # Skip the multi-ruling split path so we reach the single-doc per-field
@@ -6325,7 +6325,7 @@ def test_process_event_dedupes_repeated_title_segments(
         case_number=None,
         case_title=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 56-2024-00123456-CU-BC-VTA Some ruling text",
     )
     with patch.object(worker, "_llm_split_document", return_value=False):
         worker.process_event(event)
@@ -6389,7 +6389,7 @@ def test_process_event_strips_trailing_case_number_from_title(
         case_number=None,
         case_title=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 202200570654PRLP Some ruling text",
     )
     with patch.object(worker, "_llm_split_document", return_value=False):
         worker.process_event(event)
@@ -6452,7 +6452,7 @@ def test_process_event_strips_oc_prefix_suffix_from_title(
         case_number=None,
         case_title=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 2025-01498771 Some ruling text",
     )
     with patch.object(worker, "_llm_split_document", return_value=False):
         worker.process_event(event)
@@ -6518,7 +6518,7 @@ def test_process_event_oc_prefix_suffix_not_stripped_when_prefix_none(
         case_number=None,
         case_title=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 24NNCV02551 Some ruling text",
     )
     with patch.object(worker, "_llm_split_document", return_value=False):
         worker.process_event(event)
@@ -6624,7 +6624,7 @@ def test_process_event_rejects_probate_decedent_as_judge(
         case_title=None,
         judge_name=None,
         hearing_date=None,
-        ruling_text="Some ruling text",
+        ruling_text="Case No. 202200570654PRLP Some ruling text",
     )
     with patch.object(worker, "_llm_split_document", return_value=False):
         worker.process_event(event)

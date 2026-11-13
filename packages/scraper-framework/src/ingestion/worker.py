@@ -88,6 +88,7 @@ from .db import (
 from .department_normalize import normalize_department
 from .doc_timing import DocTiming, emit_via_stdlib_logger
 from .extract import (
+    case_number_supported_by_text,
     clean_case_title,
     dedupe_repeated_title,
     extract_case_number,
@@ -239,6 +240,41 @@ def _split_child_case_fields(
             child_case_title or event_data.get("case_title"),
         )
     return child_case_number, child_case_title
+
+
+#: Below this many non-blank characters a document's extracted text cannot
+#: confirm or refute an LLM-read case number (a scanned PDF with no text
+#: layer, read by the multimodal LLM from page images).
+_MIN_TEXT_TO_CHECK_CASE_NUMBER = 200
+
+
+def _llm_case_number_unsupported(
+    case_number: str | None,
+    texts: tuple[str | None, ...],
+    *,
+    min_text_len: int = 0,
+) -> bool:
+    """Return True when an LLM-read *case_number* appears in none of *texts*.
+
+    An LLM can return a case number the document does not carry: a prompt
+    example (``2025-00912345`` on an Orange row with no number), a misread
+    (``CVRI2501911`` for a printed ``CVRI2501831``) or an invented
+    placeholder (``23STCV01234`` for a Santa Clara split child whose whole
+    text was ``See below.``, #4907).  Such a number must not be stored: the
+    ruling would be filed under, and dedup-merged into, a case it does not
+    belong to.
+
+    ``texts[0]`` is the text the LLM read; the rest only add support.  The
+    check is skipped (False) when ``texts[0]`` cannot settle it: no number,
+    a synthetic ``UNKNOWN-`` one, raw PDF bytes instead of text, or fewer
+    than *min_text_len* non-blank characters.
+    """
+    if not case_number or case_number.startswith("UNKNOWN-") or not texts:
+        return False
+    primary = texts[0]
+    if not primary or is_pdf_binary(primary) or len(primary.strip()) < max(min_text_len, 1):
+        return False
+    return not case_number_supported_by_text(case_number, *texts)
 
 
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
@@ -3047,11 +3083,15 @@ class IngestionWorker:
                 if ruling is not None:
                     if ruling.case_number_prefix:
                         case_number_prefix = ruling.case_number_prefix
+                    # The LLM saw only ``ruling_text`` (and, for a whole
+                    # document, its link text), so a number it returns that
+                    # is in neither was invented (#4907).  A split child's
+                    # link text belongs to the parent document.
+                    supporting_texts: tuple[str | None, ...] = (ruling_text,)
+                    if not event_data.get("_split_processed"):
+                        supporting_texts += (metadata.get("link_text"),)
                     if not case_number and ruling.case_number:
-                        if is_valid_case_number(ruling.case_number):
-                            case_number = ruling.case_number
-                            extraction_methods["case_number"] = "llm"
-                        else:
+                        if not is_valid_case_number(ruling.case_number):
                             # LLM returned a case title as case_number —
                             # use it as case_title instead (#1524).
                             logger.warning(
@@ -3065,6 +3105,20 @@ class IngestionWorker:
                             if not case_title:
                                 case_title = ruling.case_number
                                 extraction_methods["case_title"] = "llm_redirect"
+                        elif _llm_case_number_unsupported(ruling.case_number, supporting_texts):
+                            logger.warning(
+                                "Discarded LLM case_number absent from the document text",
+                                extra={
+                                    "document_id": document_id,
+                                    "county": county,
+                                    "rejected_case_number": ruling.case_number[:80],
+                                    "split_child": bool(event_data.get("_split_processed")),
+                                    "telemetry_event": "llm_case_number_unsupported",
+                                },
+                            )
+                        else:
+                            case_number = ruling.case_number
+                            extraction_methods["case_number"] = "llm"
                     if not case_title and ruling.case_title:
                         case_title = ruling.case_title
                         extraction_methods["case_title"] = "llm"
@@ -3580,6 +3634,7 @@ class IngestionWorker:
                 hearing_date=hearing_dt,
                 captured_at=captured_at_date,
                 hearing_date_source=hearing_date_source,
+                county=county,
             )
 
         if det_result.overall != "pass":
@@ -5224,8 +5279,28 @@ class IngestionWorker:
             child_hearing_date, child_hearing_date_source = _llm_child_hearing_date(
                 cr.hearing_date, event_data
             )
+            # The LLM read the number from the whole document, so the
+            # document's extracted text must carry it (#4907).
+            llm_case_number = cr.case_number
+            if _llm_case_number_unsupported(
+                llm_case_number,
+                (ruling_text, cr.ruling_text),
+                min_text_len=_MIN_TEXT_TO_CHECK_CASE_NUMBER,
+            ):
+                logger.warning(
+                    "Discarded LLM case_number absent from the document text",
+                    extra={
+                        "document_id": document_id,
+                        "split_document_id": cr.document_id,
+                        "county": county,
+                        "rejected_case_number": (llm_case_number or "")[:80],
+                        "split_child": True,
+                        "telemetry_event": "llm_case_number_unsupported",
+                    },
+                )
+                llm_case_number = None
             case_number, case_title = _split_child_case_fields(
-                cr.case_number, cr.case_title, event_data, cr.split_count
+                llm_case_number, cr.case_title, event_data, cr.split_count
             )
             split_event: dict[str, Any] = {
                 **event_data,

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from validation.deterministic import (
+    check_case_number_matches_county_format,
     check_case_number_not_unknown,
     check_hearing_date_in_range,
     check_no_cross_case_ruling_text,
@@ -916,7 +919,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         assert result.overall == "pass"
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert all(r.result == "pass" for r in result.rules)
         assert result.failed_rules == []
         assert result.flagged_rules == []
@@ -1071,7 +1074,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         # Without other_case_numbers, no cross-case rule added.
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -1085,7 +1088,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=[],
         )
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -1099,7 +1102,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999", "23STCV88888"],
         )
-        assert len(result.rules) == 9
+        assert len(result.rules) == 10
         assert result.overall == "flag"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert len(cross_rules) == 1
@@ -1116,7 +1119,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999"],
         )
-        assert len(result.rules) == 9
+        assert len(result.rules) == 10
         assert result.overall == "pass"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert cross_rules[0].result == "pass"
@@ -1146,7 +1149,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         # No siblings given, so cross-case rule not present; base 8 rules.
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert result.overall == "flag"
         marker_rules = [r for r in result.rules if r.rule == "ruling_text_case_number_marker"]
         assert len(marker_rules) == 1
@@ -1167,3 +1170,65 @@ class TestRunDeterministicRules:
         assert result.overall == "pass"
         marker_rules = [r for r in result.rules if r.rule == "ruling_text_case_number_marker"]
         assert marker_rules[0].result == "pass"
+
+
+# ---------------------------------------------------------------------------
+# case_number_matches_county_format (#4907)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseNumberMatchesCountyFormat:
+    """An LLM-invented number in another county's shape fails."""
+
+    @pytest.mark.parametrize(
+        "case_number",
+        ["26CV484550", "21PR190362", "25EA000076", "2010-1-CV-163328", " 24cv443183 "],
+    )
+    def test_santa_clara_formats_pass(self, case_number: str) -> None:
+        result = check_case_number_matches_county_format(case_number, "Santa Clara")
+        assert result.rule == "case_number_matches_county_format"
+        assert result.result == "pass"
+
+    @pytest.mark.parametrize("case_number", ["23STCV01234", "24CV12345", "CVRI2401570"])
+    def test_santa_clara_out_of_format_fails(self, case_number: str) -> None:
+        result = check_case_number_matches_county_format(case_number, "Santa Clara")
+        assert result.result == "fail"
+        assert case_number in (result.reason or "")
+        assert "Santa Clara" in (result.reason or "")
+
+    def test_county_name_is_normalised(self) -> None:
+        assert check_case_number_matches_county_format("23STCV01234", "santa_clara").result == (
+            "fail"
+        )
+
+    def test_san_francisco(self) -> None:
+        assert check_case_number_matches_county_format("FDI-24-799917", "San Francisco").result == (
+            "pass"
+        )
+        assert check_case_number_matches_county_format("23STCV01234", "San Francisco").result == (
+            "fail"
+        )
+
+    @pytest.mark.parametrize(
+        ("case_number", "county"),
+        [
+            ("UNKNOWN-abc", "Santa Clara"),
+            (None, "Santa Clara"),
+            ("23STCV01234", "Los Angeles"),
+            ("anything", None),
+        ],
+    )
+    def test_unchecked_inputs_pass(self, case_number: str | None, county: str | None) -> None:
+        assert check_case_number_matches_county_format(case_number, county).result == "pass"
+
+    def test_aggregator_fails_out_of_format_number(self) -> None:
+        result = run_deterministic_rules(
+            ruling_text="See below.",
+            case_number="23STCV01234",
+            case_title="Juan Allca-Taipe vs. Lyft",
+            hearing_date=None,
+            captured_at=None,
+            county="Santa Clara",
+        )
+        assert result.overall == "fail"
+        assert [r.rule for r in result.failed_rules] == ["case_number_matches_county_format"]
