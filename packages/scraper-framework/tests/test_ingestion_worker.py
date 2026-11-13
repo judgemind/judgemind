@@ -351,6 +351,44 @@ def _make_fake_extracted_rulings() -> list[ExtractedRuling]:
 # ---------------------------------------------------------------------------
 
 
+class TestDispatchSplitChildProtectsFailedSlot:
+    """#4878: every split path dispatches its children through
+    ``_dispatch_split_child``, which protects the slot of a child whose
+    per-child enrichment is exhausted so the split-set write keeps it."""
+
+    def _batch(self) -> object:
+        from ingestion.worker import _SplitBatch
+
+        return _SplitBatch(parent_document_id="parent")
+
+    def test_exhausted_child_is_kept_and_reraised(self) -> None:
+        worker, _ = _make_worker()
+        batch = self._batch()
+        worker.process_event = MagicMock(  # type: ignore[method-assign]
+            side_effect=LlmEnrichmentExhaustedError("exhausted")
+        )
+        with pytest.raises(LlmEnrichmentExhaustedError):
+            worker._dispatch_split_child(batch, {"document_id": "child-1"})
+        assert batch.keep_ids == {"child-1"}
+        assert batch.replace is True
+
+    def test_other_errors_do_not_protect_the_slot(self) -> None:
+        worker, _ = _make_worker()
+        batch = self._batch()
+        worker.process_event = MagicMock(side_effect=ValueError("bad"))  # type: ignore[method-assign]
+        with pytest.raises(ValueError):
+            worker._dispatch_split_child(batch, {"document_id": "child-1"})
+        assert batch.keep_ids == set()
+
+    def test_successful_child_is_not_protected(self) -> None:
+        worker, _ = _make_worker()
+        batch = self._batch()
+        worker.process_event = MagicMock(return_value=None)  # type: ignore[method-assign]
+        worker._dispatch_split_child(batch, {"document_id": "child-1"})
+        assert batch.keep_ids == set()
+        assert batch.replace is True
+
+
 class TestFirstChildExhaustionDoesNotAbortSiblings:
     """AC1: LlmEnrichmentExhaustedError on first child must not abort remaining siblings.
 

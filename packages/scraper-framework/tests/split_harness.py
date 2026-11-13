@@ -18,7 +18,10 @@ properties that must hold for any sequence of re-splits:
   case carries that ruling's own caption, never a previous slot occupant's;
 - ``converge``: re-ingesting the final bytes leaves the same rows as a fresh
   ingest of those bytes, and a fresh live capture and a fresh reingest of the
-  same bytes leave the same rows.
+  same bytes leave the same rows;
+- ``kept``: a split child whose per-child LLM enrichment is exhausted keeps
+  the document and ruling its slot already held (#4878).  Checked by
+  :func:`run_enrichment_failure`, which drives each deterministic splitter.
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -76,6 +79,7 @@ INVARIANTS = (
     "date_source",
     "synthetic_title",
     "converge",
+    "kept",
     "error",
 )
 
@@ -451,6 +455,9 @@ class KeyHarness:
         #: alert id -> (s3_key, ruling identity)
         self._alerts: dict[str, tuple[str, tuple[str, str]]] = {}
         self._user_sub: str | None = None
+        #: Fields merged into every step's event (a deterministic splitter's
+        #: county, format and text).
+        self.event_extra: dict[str, Any] = {}
         self.worker = self._make_worker()
 
     def close(self) -> None:
@@ -500,6 +507,7 @@ class KeyHarness:
         else:
             event["scraper_id"] = "reingest-ca-harness"
             event["_replace_split_set"] = True
+        event.update(self.event_extra)
         return event
 
     # -- running --------------------------------------------------------
@@ -912,3 +920,157 @@ def db_mode_driver(driver: DbModeDriver) -> Iterator[None]:
         yield
     finally:
         DB_MODE_DRIVER = saved
+
+
+# ---------------------------------------------------------------------------
+# Deterministic splitters: a child's enrichment is exhausted (#4878)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeterministicSplitter:
+    """One of the worker's deterministic splitters (``_try_*_split``).
+
+    The harness stubs the court module's ``_split_rulings`` (and, for the
+    HTML splitters, the content detector); the splitter's dispatch loop and
+    everything after it are the production code.  Its county and format
+    gates are real, so the event carries the real county.
+    """
+
+    name: str
+    county: str
+    content_format: str
+    module: str
+    detector: str | None = None
+
+
+DETERMINISTIC_SPLITTERS = (
+    DeterministicSplitter(
+        "sd", "San Diego", "html", "courts.ca.sd_calendar", "is_sd_calendar_html"
+    ),
+    DeterministicSplitter("la", "Los Angeles", "html", "courts.ca.la_tentatives", "is_la_html"),
+    DeterministicSplitter("fresno", "Fresno", "pdf", "courts.ca.fresno_tentatives"),
+    DeterministicSplitter("riverside", "Riverside", "pdf", "courts.ca.riverside_tentatives"),
+    DeterministicSplitter("sf", "San Francisco", "pdf", "courts.ca.sf_tentatives"),
+    DeterministicSplitter("sc", "Santa Clara", "pdf", "courts.ca.sc_tentatives"),
+)
+
+
+def _split_ruling(spec: Spec) -> Any:
+    """A court splitter's result for *spec* (the fields every splitter
+    reads).  ``outcome`` is left unset, so per-child enrichment runs."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        case_number=spec.case_number,
+        case_title=spec.title,
+        ruling_text=spec.text,
+        ruling_text_html=None,
+        hearing_date=HEARING,
+        department="1",
+        motion_type="demurrer",
+        outcome=None,
+        parties=[],
+        judge_name=None,
+    )
+
+
+@contextmanager
+def deterministic_split(
+    harness: KeyHarness,
+    splitter: DeterministicSplitter,
+    specs: list[Spec],
+    failing: Callable[[], set[str]],
+) -> Iterator[None]:
+    """Route the harness worker's events through *splitter*, which splits
+    each document into *specs*.  Per-child enrichment is exhausted for a
+    child whose text is in ``failing()`` at the time it runs."""
+    import importlib
+
+    module = importlib.import_module(splitter.module)
+
+    def enrich(ruling_text: str, _document_id: str) -> tuple[Any, str]:
+        if ruling_text in failing():
+            return None, "errored"
+        return None, "skipped_disabled"
+
+    patches = [
+        patch.object(module, "_split_rulings", lambda *_a, **_k: [_split_ruling(s) for s in specs]),
+        patch.object(harness.worker, "_llm_enrich_fields", enrich),
+    ]
+    if splitter.detector:
+        patches.append(patch.object(module, splitter.detector, lambda *_a, **_k: True))
+    harness.event_extra = {
+        "county": splitter.county,
+        "content_format": splitter.content_format,
+        "ruling_text": f"{splitter.name} harness document",
+    }
+    try:
+        for p in patches:
+            p.start()
+        yield
+    finally:
+        for p in reversed(patches):
+            p.stop()
+        harness.event_extra = {}
+
+
+def run_enrichment_failure(
+    dsn: str, splitter: DeterministicSplitter, seed: int, run_token: str
+) -> None:
+    """Ingest a key through *splitter* with enrichment healthy, then re-ingest
+    it while enrichment is exhausted for one random child (or, sometimes,
+    every child).  Each failed child must keep the document and ruling its
+    slot held (``kept``), and the step must hold the other invariants."""
+    from ingestion.split_ids import split_child_document_id
+
+    rng = random.Random(seed)
+    token = f"{run_token}-{splitter.name}-{seed}"
+    n_specs = rng.randint(2, 6)
+    specs = [
+        Spec(
+            idx=i,
+            case_number=_case_number(i),
+            title=None if rng.random() < 0.3 else _title(i),
+            text=_text(token, i),
+        )
+        for i in range(n_specs)
+    ]
+    rows = tuple(Row("ruling", i) for i in range(n_specs))
+    failed = list(range(n_specs)) if rng.random() < 0.25 else [rng.randrange(n_specs)]
+    kinds = [rng.choice(("live", "reingest")) for _ in range(2)]
+
+    harness = KeyHarness(dsn, run_token, seed)
+    failing: set[str] = set()
+    try:
+        key = replace(make_key(f"{token}-key"), county=splitter.county)
+        with deterministic_split(harness, splitter, specs, lambda: failing):
+            first = Step(kinds[0], rows, tuple(specs), (splitter.name,))
+            harness.run_step(key, first, "healthy")
+            before = {r.id: r for r in read_key(harness.checker, key.s3_key)}
+            child_ids = [split_child_document_id(key.parent, i, n_specs) for i in failed]
+            for i, doc_id in zip(failed, child_ids, strict=True):
+                held = before.get(doc_id)
+                if held is None or held.text != specs[i].text:
+                    raise InvariantError(
+                        "error",
+                        f"seed={seed} {splitter.name}: the healthy ingest did not write "
+                        f"ruling {i} to its slot (the scenario would prove nothing)",
+                    )
+
+            failing.update(specs[i].text for i in failed)
+            second = Step(kinds[1], rows, tuple(specs), (splitter.name, f"fail={failed}"))
+            harness.run_step(key, second, "enrichment exhausted")
+            after = {r.id: r for r in read_key(harness.checker, key.s3_key)}
+            for i, doc_id in zip(failed, child_ids, strict=True):
+                held, now = before[doc_id], after.get(doc_id)
+                if now is None or (now.ruling_id, now.text) != (held.ruling_id, held.text):
+                    raise InvariantError(
+                        "kept",
+                        f"seed={seed} {splitter.name} {second.describe()}: child {i} "
+                        f"({key.label(doc_id)}) failed enrichment and lost its ruling "
+                        f"(had {held.ruling_id}, now "
+                        f"{None if now is None else now.ruling_id})",
+                    )
+    finally:
+        harness.close()
