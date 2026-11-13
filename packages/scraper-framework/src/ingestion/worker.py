@@ -284,11 +284,62 @@ def _case_number_check_texts(document_text: str | None) -> tuple[str, ...]:
     PDF with no text layer, #4915)."""
     if (
         not document_text
-        or is_pdf_binary(document_text)
         or len(document_text.strip()) < _MIN_TEXT_TO_CHECK_CASE_NUMBER
+        or is_pdf_binary(document_text)
     ):
         return ()
     return (document_text,)
+
+
+def _fuzzy_correction_contradicts_text(
+    case_number: str | None,
+    corrected: str | None,
+    texts: tuple[str | None, ...],
+    link_text: str | None = None,
+) -> bool:
+    """Return True when *texts* carry *case_number* but not the fuzzy
+    match *corrected* the enrichment engine would replace it with (#4915).
+
+    The document printing a number is the strongest evidence of its case;
+    a near-miss it does not print is a different case.  False when there
+    are no texts to check.  *link_text* only adds support.
+    """
+    if not texts or not any(texts) or not case_number or not corrected:
+        return False
+    return case_number_supported_by_text(
+        case_number, *texts, link_text
+    ) and not case_number_supported_by_text(corrected, *texts, link_text)
+
+
+def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) -> bool:
+    """Decide whether a reingest moves this document's ruling to *case_id*
+    because its current case number is absent from the document (#4915).
+
+    Only for a whole document (a split child's text is not the whole
+    document; ``write_split_rulings`` handles LLM split children), only on a
+    reingest / rebuild (``REPLACE_SPLIT_SET_KEY``), only when the document
+    text can settle it, and only off a real case number neither the text
+    nor the link text carries.  A number the document prints keeps
+    preserve-first semantics (#2475, #4788).
+    """
+    if (
+        w.event_data.get("_split_processed")
+        or w.event_data.get(REPLACE_SPLIT_SET_KEY) is not True
+        or not w.case_number_texts
+    ):
+        return False
+    link_text = (w.event_data.get("extra") or {}).get("link_text")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.case_number FROM rulings r JOIN cases c ON c.id = r.case_id "
+            "WHERE r.document_id = %s::uuid AND r.case_id <> %s::uuid",
+            (w.document_id, case_id),
+        )
+        row = cur.fetchone()
+    current = row[0] if row else None
+    if not isinstance(current, str) or not current or current.startswith("UNKNOWN-"):
+        return False
+    return not case_number_supported_by_text(current, *w.case_number_texts, link_text)
 
 
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
@@ -1435,6 +1486,10 @@ class _RulingWrite:
     validation_result: ValidationResult | None
     extraction_methods: dict[str, str]
     effective_case_number: str = ""
+    #: The text the ruling's case number must appear in: the document's
+    #: extracted text (and the child's own) when it can settle that, else
+    #: empty (``_case_number_check_texts``, #4915).
+    case_number_texts: tuple[str | None, ...] = ()
 
 
 @dataclass
@@ -3993,6 +4048,7 @@ class IngestionWorker:
             summary_generated_at=summary_generated_at,
             validation_result=validation_result,
             extraction_methods=extraction_methods,
+            case_number_texts=_case_number_check_texts(cleaned_ruling_text),
         )
 
         # A worker split writes all of its children in one transaction, after
@@ -4070,7 +4126,31 @@ class IngestionWorker:
             # number a deterministic splitter read from the source (#4866):
             # the near-miss it would move to is typically an older case an
             # LLM created from a court typo, or another case entirely.
+            #
+            # Nor when the document text carries the number but not the
+            # correction (#4915): the near-miss is another, existing case,
+            # e.g. ``CVRI2401570`` printed, ``CVRI2401073`` matched.
+            case_match = enrich_result.case_match
             if (
+                case_match is not None
+                and case_match.match_type == "fuzzy"
+                and _fuzzy_correction_contradicts_text(
+                    case_number,
+                    case_match.case_number,
+                    w.case_number_texts,
+                    (w.event_data.get("extra") or {}).get("link_text"),
+                )
+            ):
+                logger.info(
+                    "Kept case_number the document prints over a fuzzy match it does not",
+                    extra={
+                        "document_id": document_id,
+                        "case_number": case_number,
+                        "rejected_case_number": case_match.case_number,
+                        "telemetry_event": "fuzzy_case_correction_unsupported",
+                    },
+                )
+            elif (
                 enrich_result.case_match is not None
                 and enrich_result.case_match.match_type == "fuzzy"
                 and w.event_data.get(CASE_NUMBER_FROM_SOURCE_KEY) is not True
@@ -4273,6 +4353,7 @@ class IngestionWorker:
                 # A pre-split child whose split shifted takes its ruling
                 # from the sibling slot that holds it (#4820).
                 split_set=split_set_for_event(w.event_data),
+                move_ruling_case=_should_move_off_unsupported_case(conn, w, case_id),
             )
             self._link_ruling_rows(conn, w, case_id, judge_id)
             conn.commit()
@@ -4337,6 +4418,10 @@ class IngestionWorker:
         try:
             prepared: list[tuple[_RulingWrite, str, str, str | None]] = []
             for w in batch.children:
+                if batch.case_number_texts:
+                    # The LLM split read the child's number from the whole
+                    # document (#4915).
+                    w.case_number_texts = (*batch.case_number_texts, w.ruling_text)
                 court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
                 insert_document(
                     conn,
@@ -4375,11 +4460,7 @@ class IngestionWorker:
                         summary_model=w.summary_model,
                         summary_generated_at=w.summary_generated_at,
                         hearing_date_source=w.hearing_date_source,
-                        case_number_texts=(
-                            (*batch.case_number_texts, w.ruling_text)
-                            if batch.case_number_texts
-                            else ()
-                        ),
+                        case_number_texts=w.case_number_texts if batch.case_number_texts else (),
                     )
                     for w, court_id, case_id, judge_id in prepared
                 ],

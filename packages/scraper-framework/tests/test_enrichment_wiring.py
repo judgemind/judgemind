@@ -247,6 +247,71 @@ def test_enrichment_fuzzy_skipped_for_case_number_from_source(
     assert "23STCV12346" not in case_calls[0][0][1]
 
 
+def _fuzzy_result(printed: str, near_miss: str) -> EnrichmentResult:
+    return EnrichmentResult(
+        case_match=CaseMatch(
+            case_id="case-uuid-existing",
+            case_number=near_miss,
+            match_type="fuzzy",
+            confidence=0.9,
+            corrected_from=printed,
+            levenshtein_distance=2,
+            party_overlap=1.0,
+        ),
+        judge_resolution=JudgeResolution(
+            judge_id=None, canonical_name=None, match_type="new", confidence=0.0
+        ),
+        party_resolutions=[],
+        flags=[],
+    )
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.EnrichmentEngine")
+@patch("ingestion.worker.psycopg")
+def test_enrichment_fuzzy_skipped_when_text_prints_number_but_not_match(
+    mock_psycopg: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """#4915: the document prints ``CVRI2401570``; the fuzzy matcher's
+    ``CVRI2401073`` (an existing, different case) is not in it, so the
+    printed number is kept.  On dev this filed rulings under another case."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+    mock_engine_cls.return_value.enrich.return_value = _fuzzy_result("CVRI2401570", "CVRI2401073")
+    text = "CVRI2401570 Smith v. Jones. " + "The motion is granted in part and denied. " * 6
+
+    worker.process_event(_make_event(case_number="CVRI2401570", ruling_text=text))
+
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INTO cases" in str(c)]
+    assert case_calls
+    assert "CVRI2401570" in case_calls[0][0][1]
+    assert "CVRI2401073" not in case_calls[0][0][1]
+
+
+@pytest.mark.parametrize(
+    ("printed", "near_miss", "text", "contradicts"),
+    [
+        ("CVRI2401570", "CVRI2401073", "x CVRI2401570 y", True),
+        # The text prints the match too: the correction may stand.
+        ("CVRI2401570", "CVRI2401073", "CVRI2401570 and CVRI2401073", False),
+        # The text prints neither: nothing to go on, the correction stands.
+        ("CVRI2401570", "CVRI2401073", "no number here", False),
+    ],
+)
+def test_fuzzy_correction_contradicts_text(
+    printed: str, near_miss: str, text: str, contradicts: bool
+) -> None:
+    from ingestion.worker import _fuzzy_correction_contradicts_text
+
+    assert _fuzzy_correction_contradicts_text(printed, near_miss, (text,)) is contradicts
+    assert _fuzzy_correction_contradicts_text(printed, near_miss, ()) is False
+
+
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.EnrichmentEngine")
 @patch("ingestion.worker.psycopg")
