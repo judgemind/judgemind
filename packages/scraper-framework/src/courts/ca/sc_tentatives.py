@@ -1159,11 +1159,16 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
 def _keep_case_less_row(r: SplitRuling, layout: str) -> bool:
     """Log a summary-table row whose CASE NO. cell is not a valid number (#4881).
 
-    The row is kept when it has ruling text; with none there is nothing to
-    extract, so it is dropped.  Either way the WARNING records it, so a
-    ruling never disappears without a trace.
+    The row is kept when it carries a ruling of its own (at least
+    ``_SC_MIN_ENTRY_BODY_LEN`` characters, after any cross-referenced body
+    is attached).  Shorter text is only a pointer (``See below.``, ``Please
+    scroll down to Line 1``) whose ruling, if any, lives in a body section:
+    a child built from it has nothing to extract, and per-entry enrichment
+    has invented a case number for one (``23STCV01234`` for ``See below.``,
+    #4881).  Either way the WARNING records the row, so a ruling never
+    disappears without a trace.
     """
-    keep = bool(r.ruling_text and r.ruling_text.strip())
+    keep = len((r.ruling_text or "").strip()) >= _SC_MIN_ENTRY_BODY_LEN
     logger.warning(
         "sc_split_row_without_case_number",
         layout=layout,
