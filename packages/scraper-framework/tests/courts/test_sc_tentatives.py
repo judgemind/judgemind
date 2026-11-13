@@ -3080,7 +3080,8 @@ class TestSantaClaraUnparseableCaseNumber4881:
     ) -> None:
         """The row's cross-referenced body has no ``Case No.:`` (it attaches,
         the row stays without a number); a body that names another row's
-        case attaches to that row, not to the malformed one."""
+        case attaches to that row, not to the malformed one, which is left
+        with only its pointer text and dropped."""
         import courts.ca.sc_tentatives as sc
 
         table = [
@@ -3098,10 +3099,10 @@ class TestSantaClaraUnparseableCaseNumber4881:
             f"Calendar Line 3\nCase No.: 24CV000001\nsecond body for case one {body}\n"
         )
         rulings = sc._split_rulings(text, pdf_bytes=b"%PDF")
-        assert [r.case_number for r in rulings] == ["24CV000001", None, None]
+        assert [r.case_number for r in rulings] == ["24CV000001", None]
         assert "no number printed" in rulings[1].ruling_text
         assert "second body for case one" in rulings[0].ruling_text
-        assert rulings[2].ruling_text == "Click Line 3"
+        assert rulings[1].case_title == "C v. D"
 
     def test_unparseable_case_number_text_row_does_not_run_into_row_above(self) -> None:
         from courts.ca.sc_tentatives import _dept12_text_rows
@@ -3129,7 +3130,8 @@ class TestSantaClaraUnparseableCaseNumber4881:
         monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
         text = (
             "LINE 1 24CV000001 A v. B Motion granted.\n"
-            "LINE 2 24CV00002 C v. D Demurrer overruled.\n"
+            "LINE 2 24CV00002 C v. D Demurrer overruled. The complaint states facts\n"
+            "sufficient to constitute a cause of action.\n"
         )
         rulings = sc._split_rulings(text, pdf_bytes=b"%PDF")
         assert [r.case_number for r in rulings] == ["24CV000001", None]
@@ -3139,18 +3141,25 @@ class TestSantaClaraUnparseableCaseNumber4881:
     def test_unparseable_case_number_row_logged_at_warning(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Kept or dropped (no text at all), the row is logged at WARNING
-        with its printed cell."""
+        """Kept or dropped, the row is logged at WARNING with its printed
+        cell.  A row with no ruling of its own — empty, or only a pointer
+        such as ``See below.`` — is dropped: per-entry enrichment invented
+        ``23STCV01234`` for such a child on dev."""
         import courts.ca.sc_tentatives as sc
 
         log = MagicMock()
         monkeypatch.setattr(sc, "logger", log)
+        denied = (
+            "Defendant's motion to compel further responses is DENIED. "
+            "The responses were complete and timely."
+        )
         table = [
             ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
             ["1", "24CV000001", "A v. B", "Granted."],
-            ["2", "24CV00002", "C v. D", "Denied."],
+            ["2", "24CV00002", "C v. D", denied],
             ["3", "24CV00003", "E v. F", ""],
-            ["4", "24CV000004", "G v. H", "Off calendar."],
+            ["4", "25CV47768", "Allca-Taipe v. Lyft", "See below."],
+            ["5", "24CV000004", "G v. H", "Off calendar."],
         ]
         monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
         rulings = sc._split_rulings_format_b("", b"%PDF")
@@ -3162,6 +3171,8 @@ class TestSantaClaraUnparseableCaseNumber4881:
         assert [(c.kwargs["raw_case_number"], c.kwargs["kept"]) for c in calls] == [
             ("24CV00002", True),
             ("24CV00003", False),
+            ("25CV47768", False),
         ]
+        assert calls[2].kwargs["text_head"] == "See below."
         assert calls[0].kwargs["layout"] == "format_b"
         assert calls[0].kwargs["case_title"] == "C v. D"
