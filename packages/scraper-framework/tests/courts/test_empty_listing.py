@@ -233,3 +233,322 @@ def test_unmodified_fixtures_are_not_empty_listings(fixture: str) -> None:
         "cc_index_page_mini.html": lambda h: _cc_extract_links(h, CC_BASE_URL),
     }
     assert len(parsers[fixture](html)) > 0
+
+
+# ---------------------------------------------------------------------------
+# PdfLinkScraper courts: OC civil, OC probate, OC Family Law, Fresno,
+# Riverside, San Bernardino, SF Family Law (#4912)
+# ---------------------------------------------------------------------------
+#
+# The listing is the index PDF links that survive the court's link-text /
+# filename filter, so each edit renames the part of the page that filter
+# keys on: a court relabelling its links skips every one of them.
+
+
+def _pdf_courts() -> dict[str, tuple[type, ScraperConfig, str, str, str]]:
+    """court -> (scraper class, config, fixture, old, new) for one layout edit."""
+    from courts.ca import (
+        fresno_tentatives,
+        oc_family_law_tentatives,
+        oc_probate_tentatives,
+        oc_tentatives,
+        riverside_tentatives,
+        sb_tentatives,
+        sf_tentatives,
+    )
+
+    return {
+        "oc-civil": (
+            oc_tentatives.OCTentativeRulingsScraper,
+            oc_tentatives.default_config(),
+            "oc_civil_page.html",
+            "Dept",
+            "Courtroom",
+        ),
+        "oc-probate": (
+            oc_probate_tentatives.OCProbateTentativeRulingsScraper,
+            oc_probate_tentatives.default_config(),
+            "oc_probate_page.html",
+            "Law and Motion",
+            "Probate Calendar",
+        ),
+        "oc-family-law": (
+            oc_family_law_tentatives.OCFamilyLawTentativeRulingsScraper,
+            oc_family_law_tentatives.default_config(),
+            "oc_family_law_page.html",
+            ".pdf",
+            ".aspx",
+        ),
+        "fresno": (
+            fresno_tentatives.FresnoTentativeRulingsScraper,
+            fresno_tentatives.default_config(),
+            "fresno_index_page.html",
+            "-dept-",
+            "-courtroom-",
+        ),
+        "riverside": (
+            riverside_tentatives.RiversideTentativeRulingsScraper,
+            riverside_tentatives.default_config(),
+            "riv_page.html",
+            ">Department ",
+            ">Courtroom ",
+        ),
+        "sb": (
+            sb_tentatives.SBTentativeRulingsScraper,
+            sb_tentatives.default_config(),
+            "sb_iframe_page.html",
+            ">CV",
+            ">CIV",
+        ),
+        "sf-family-law": (
+            sf_tentatives.SFTentativeRulingsScraper,
+            sf_tentatives.default_config(),
+            "sf_family_law_page.html",
+            " Tentative Rulings ",
+            " Rulings ",
+        ),
+    }
+
+
+@pytest.mark.parametrize("court", list(_pdf_courts()))
+@respx.mock
+def test_pdf_link_court_empty_listing_fails_run(court: str) -> None:
+    """Every index link is relabelled, so none passes the court's filter."""
+    cls, config, fixture, old, new = _pdf_courts()[court]
+    scraper = cls(config=_fast(config))
+    html = _mutate(_load(fixture), old, new)
+    route = respx.get(scraper._pdf_config.index_url).mock(
+        return_value=httpx.Response(200, text=html)
+    )
+
+    health = scraper.run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert f"empty listing: {config.scraper_id} index PDF links" in message
+    # The reason survives in full ahead of the URL (#4912).
+    if court == "oc-family-law":
+        # Its links stopped ending in .pdf; the panel still names 2 officers.
+        assert "Family Law Panel lists 2 judicial officer entries" in message
+    else:
+        assert "PDF link(s), none matching the ruling-link filters" in message
+    # A layout change is not retried within the run, and no PDF was fetched.
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
+
+
+@pytest.mark.parametrize("court", list(_pdf_courts()))
+def test_pdf_link_court_unmodified_index_is_not_empty_listing(court: str) -> None:
+    """Companion: the real index parses to a non-empty ruling-link listing,
+    so the edit above is what empties it."""
+    from courts.ca.pdf_link_scraper import _extract_pdf_links
+
+    cls, config, fixture, _old, _new = _pdf_courts()[court]
+    scraper = cls(config=config)
+    pc = scraper._pdf_config
+    links = _extract_pdf_links(_load(fixture), pc.index_url, pc.pdf_base_url)
+    assert len(scraper._ruling_links(links)) > 0
+
+
+@respx.mock
+def test_oc_family_law_empty_panel_is_not_empty_listing_failure() -> None:
+    """The live empty Family Law Panel (since 2026-07-21) stays green."""
+    from courts.ca.oc_family_law_tentatives import (
+        INDEX_URL as OC_FL_INDEX_URL,
+    )
+    from courts.ca.oc_family_law_tentatives import (
+        OCFamilyLawTentativeRulingsScraper,
+    )
+    from courts.ca.oc_family_law_tentatives import default_config as oc_fl_config
+
+    respx.get(OC_FL_INDEX_URL).mock(
+        return_value=httpx.Response(200, text=_load("oc_family_law_page_empty_panel.html"))
+    )
+
+    health = OCFamilyLawTentativeRulingsScraper(config=_fast(oc_fl_config())).run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+# ---------------------------------------------------------------------------
+# SF civil: one listing per RulingID, on the tally (#4912)
+# ---------------------------------------------------------------------------
+
+
+def _sf_civil_body() -> str:
+    return _load("sf-human-captures/sf-civil-api-response-rid10-2026-03-23.json")
+
+
+@respx.mock
+def test_sf_civil_empty_listing_fails_run() -> None:
+    """The "Case Number:" row label is renamed: the API still reports 12
+    rulings but none parse, on every RulingID."""
+    from courts.ca.sf_civil_tentatives import CIVIL_REST_BASE, SFCivilTentativeRulingsScraper
+    from courts.ca.sf_civil_tentatives import default_config as sf_civil_config
+
+    body = _mutate(_sf_civil_body(), "Case Number:", "Case No.")
+    respx.get(url__startswith=CIVIL_REST_BASE).mock(return_value=httpx.Response(200, text=body))
+
+    health = SFCivilTentativeRulingsScraper(
+        config=_fast(sf_civil_config()), session_id="test-session-0123456789"
+    ).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "empty listing: SF civil rulings for RulingID" in message
+    assert "unexpected result: API reports 12 rulings but none parsed" in message
+    assert "test-session" not in message
+
+
+@respx.mock
+def test_sf_civil_documented_empty_answer_stays_green() -> None:
+    """``{"result": [0, ""]}`` on every RulingID is a quiet day."""
+    from courts.ca.sf_civil_tentatives import CIVIL_REST_BASE, SFCivilTentativeRulingsScraper
+    from courts.ca.sf_civil_tentatives import default_config as sf_civil_config
+
+    respx.get(url__startswith=CIVIL_REST_BASE).mock(
+        return_value=httpx.Response(200, text='{"result": [0, ""]}')
+    )
+
+    health = SFCivilTentativeRulingsScraper(
+        config=_fast(sf_civil_config()), session_id="test-session-0123456789"
+    ).run()
+
+    assert health.success is True
+
+
+def test_sf_civil_unmodified_response_is_not_empty_listing() -> None:
+    from courts.ca.sf_civil_tentatives import parse_api_response
+
+    assert len(parse_api_response(_sf_civil_body())) > 0
+
+
+# ---------------------------------------------------------------------------
+# SD calendar: one listing per calendar page, on the tally (#4912)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_sd_calendar_empty_listing_fails_run() -> None:
+    """The hearing-table class is renamed on every page: departments render
+    but no hearing rows parse."""
+    from courts.ca.sd_calendar import SDCalendarScraper
+    from courts.ca.sd_calendar import default_config as sd_cal_config
+
+    html = _mutate(_load("sd_calendar_central.html"), 'class="tables"', 'class="calendar-table"')
+    respx.get(url__regex=r"/calendar/").mock(return_value=httpx.Response(200, text=html))
+
+    health = SDCalendarScraper(config=_fast(sd_cal_config()), day_numbers=[1]).run()
+
+    assert health.success is False
+    message = health.error_message or ""
+    assert "empty listing: SD " in message
+    assert "calendar page has departments but no hearing rows parsed" in message
+
+
+def test_sd_calendar_unmodified_page_is_not_empty_listing() -> None:
+    from courts.ca.sd_calendar import parse_calendar_page
+
+    assert len(parse_calendar_page(_load("sd_calendar_central.html"))) > 0
+
+
+# ---------------------------------------------------------------------------
+# CC portal: judge dropdown (whole run) and per-judge listings (tally)
+# ---------------------------------------------------------------------------
+
+
+def _cc_portal_config() -> ScraperConfig:
+    from courts.ca.cc_tentatives_portal import default_config as cc_portal_config
+
+    return _fast(cc_portal_config())
+
+
+@respx.mock
+def test_cc_portal_judge_dropdown_empty_listing_fails_run() -> None:
+    """The judge ``<select>`` is renamed on the form page."""
+    from courts.ca.cc_tentatives_portal import FORM_URL, CCTentativesPortalScraper
+
+    html = _mutate(_load("cc_portal/form.html"), 'name="field_judge_target_id"', 'name="judge"')
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=html))
+
+    health = CCTentativesPortalScraper(config=_cc_portal_config()).run()
+
+    assert health.success is False
+    assert "empty listing: CC portal judge dropdown options" in (health.error_message or "")
+
+
+@respx.mock
+def test_cc_portal_listing_empty_listing_fails_run() -> None:
+    """Every judge's results ``<table>`` becomes a ``<div>``: the page is
+    populated but no rows parse, and there is no no-results marker."""
+    from courts.ca.cc_tentatives_portal import (
+        FORM_URL,
+        LISTING_URL,
+        CCTentativesPortalScraper,
+        _parse_judge_dropdown,
+    )
+
+    form = _load("cc_portal/form.html")
+    assert _parse_judge_dropdown(form)
+    listing = _mutate(
+        _load("cc_portal/listing_reyes_live.html"), '<table class="cols-2">', '<div class="cols-2">'
+    )
+    respx.get(LISTING_URL, params__contains={"field_judge_target_id": None}).mock(
+        return_value=httpx.Response(200, text=listing)
+    )
+    respx.get(FORM_URL).mock(return_value=httpx.Response(200, text=form))
+
+    health = CCTentativesPortalScraper(config=_cc_portal_config()).run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    message = health.error_message or ""
+    assert "empty listing: CC portal listing rows for judge" in message
+    # The full reason survives FetchTally's 300-char truncation (#4912).
+    assert "(no result rows, no no-results marker)" in message
+
+
+def test_cc_portal_unmodified_pages_are_not_empty_listings() -> None:
+    from courts.ca.cc_tentatives_portal import _parse_judge_dropdown, _parse_listing_table
+
+    assert len(_parse_judge_dropdown(_load("cc_portal/form.html"))) > 0
+    assert len(_parse_listing_table(_load("cc_portal/listing_reyes_live.html"))) > 0
+
+
+# ---------------------------------------------------------------------------
+# Governor appointments: first search page (#4912)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_governor_search_empty_listing_fails_run() -> None:
+    """Press releases move off gov.ca.gov, so no result passes the filter."""
+    from courts.ca.governor_appointments import GovernorAppointmentsScraper
+    from courts.ca.governor_appointments import default_config as gov_config
+
+    html = _mutate(
+        _load("governor_appointments/search_results_page1.html"),
+        "https://www.gov.ca.gov/20",
+        "https://www.ca.gov/newsroom/20",
+    )
+    respx.get(url__startswith="https://www.gov.ca.gov/").mock(
+        return_value=httpx.Response(200, text=html)
+    )
+
+    health = GovernorAppointmentsScraper(config=_fast(gov_config()), max_pages=1).run()
+
+    assert health.success is False
+    assert "empty listing: governor judicial-appointment search results" in (
+        health.error_message or ""
+    )
+
+
+def test_governor_unmodified_search_page_is_not_empty_listing() -> None:
+    from courts.ca.governor_appointments import SEARCH_URL as GOV_SEARCH_URL
+    from courts.ca.governor_appointments import extract_search_results
+
+    html = _load("governor_appointments/search_results_page1.html")
+    assert len(extract_search_results(html, GOV_SEARCH_URL)) > 0

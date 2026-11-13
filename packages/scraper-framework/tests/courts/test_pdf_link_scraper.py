@@ -608,9 +608,12 @@ def test_link_text_filter_logs_warning_for_skipped_links(caplog: pytest.LogCaptu
         wrapper_class=structlog.make_filtering_bound_logger(0),
     )
 
-    docs = scraper.fetch_documents()
+    from framework import EmptyListing
 
-    assert len(docs) == 0
+    # The only link is filtered out, so no ruling links remain: that is an
+    # empty listing, not a quiet day (#4912).
+    with pytest.raises(EmptyListing, match="test index PDF links"):
+        scraper.fetch_documents()
 
 
 @respx.mock

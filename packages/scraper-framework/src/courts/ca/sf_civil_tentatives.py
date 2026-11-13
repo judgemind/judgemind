@@ -865,21 +865,17 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     # Only the documented ``[0, ""]`` answer is a quiet day.
                     # A positive count whose table no longer parses (a
                     # layout change) or any other shape is blocked (#4789).
+                    # Each RulingID answer is its own listing, so the outcome
+                    # goes on the tally (#4912).
                     reason = _no_rulings_block_reason(result)
-                    if reason is not None:
-                        tally.blocked(f"unexpected result: {reason}")
-                        self._log.warning(
-                            "sf_civil.unexpected_result",
-                            ruling_id=ruling_id,
-                            department=department,
-                            reason=reason,
-                            body_prefix=response.text[:200],
-                        )
-                        continue
-                    self._log.info(
-                        "No rulings for RulingID",
-                        ruling_id=ruling_id,
-                        department=department,
+                    self._check_listing(
+                        rulings,
+                        what=f"SF civil rulings for RulingID {ruling_id} (Dept {department})",
+                        url=api_url.replace(session_id, "<session>"),
+                        body=response.text,
+                        empty_state=reason is None,
+                        tally=tally,
+                        detail=None if reason is None else f"unexpected result: {reason}",
                     )
                     continue
 

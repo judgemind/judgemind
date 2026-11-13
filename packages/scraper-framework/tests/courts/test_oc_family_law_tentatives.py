@@ -20,7 +20,6 @@ import respx
 
 from courts.ca.oc_family_law_tentatives import (
     INDEX_URL,
-    OCFamilyLawIndexLayoutError,
     OCFamilyLawTentativeRulingsScraper,
     _oc_fl_case_title_from_text,
     _oc_fl_courthouse,
@@ -31,6 +30,7 @@ from courts.ca.oc_family_law_tentatives import (
 )
 from courts.ca.oc_family_law_tentatives import default_config as fl_default_config
 from courts.ca.pdf_link_scraper import _extract_pdf_text
+from framework import EmptyListing
 
 pytestmark = pytest.mark.regression
 
@@ -315,7 +315,7 @@ def test_oc_fl_run_officers_without_pdf_links_raises() -> None:
     html = _load_html("oc_family_law_page.html").replace(".pdf", ".aspx")
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
 
-    with pytest.raises(OCFamilyLawIndexLayoutError, match="2 judicial officer"):
+    with pytest.raises(EmptyListing, match="2 judicial officer entries but no PDF links"):
         _scraper().fetch_documents()
 
 
@@ -324,7 +324,7 @@ def test_oc_fl_run_missing_panel_container_raises() -> None:
     html = "<html><body><main><p>Redesigned page</p></main></body></html>"
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
 
-    with pytest.raises(OCFamilyLawIndexLayoutError, match="not found"):
+    with pytest.raises(EmptyListing, match="container .* not found"):
         _scraper().fetch_documents()
 
 

@@ -907,15 +907,15 @@ class CCTentativesPortalScraper(BaseScraper):
                 ) from exc
 
             judges = _parse_judge_dropdown(form_response.text)
-            if not judges:
-                self._log.error("cc_portal.no_judges_found", url=FORM_URL)
-                # A page with no judge dropdown is a layout change or an
-                # access-denied page, never a quiet day (#4591, #4693).
-                self._require_precondition(
-                    False, f"CC portal judge dropdown not found at {FORM_URL}"
-                )
-
-            self._log.info("cc_portal.judges_found", count=len(judges))
+            # A page with no judge dropdown is a layout change or an
+            # access-denied page, never a quiet day (#4591, #4693, #4912).
+            self._check_listing(
+                judges,
+                what="CC portal judge dropdown options",
+                url=FORM_URL,
+                body=form_response.text,
+                detail=f"CC portal judge dropdown not found at {FORM_URL}",
+            )
 
             # Listing and detail-page fetches. A run where every one of them
             # raises must fail, not record success/0 (#4693).
@@ -946,31 +946,23 @@ class CCTentativesPortalScraper(BaseScraper):
                     continue
 
                 rows = _parse_listing_table(listing_response.text)
-                if not rows and not _is_empty_listing_page(listing_response.text):
-                    # Only a page carrying the portal's explicit no-results
-                    # state is a quiet day. The judge dropdown renders on
-                    # every listing page, so a 200 with no rows and no
-                    # no-results marker is a block page or a changed results
-                    # table, not an empty listing (#4735, #4789).
-                    tally.blocked(
+                # Only a page carrying the portal's explicit no-results state
+                # is a quiet day. The judge dropdown renders on every listing
+                # page, so a 200 with no rows and no no-results marker is a
+                # block page or a changed results table (#4735, #4789). Each
+                # judge's listing goes on the tally (#4912).
+                if not self._check_listing(
+                    rows,
+                    what=f"CC portal listing rows for judge {judge_id} ({judge_name_dropdown})",
+                    url=str(listing_response.url),
+                    body=listing_response.text,
+                    empty_state=not rows and _is_empty_listing_page(listing_response.text),
+                    tally=tally,
+                    detail=(
                         "listing page is not a tentative-rulings listing "
                         "(no result rows, no no-results marker)"
-                    )
-                    self._log.error(
-                        "cc_portal.unexpected_listing_page",
-                        judge_id=judge_id,
-                        judge_name=judge_name_dropdown,
-                        has_judge_dropdown=bool(_parse_judge_dropdown(listing_response.text)),
-                        body_prefix=listing_response.text[:200],
-                    )
-                    continue
-                if not rows:
-                    tally.ok()  # the listing loaded and is genuinely empty
-                    self._log.info(
-                        "cc_portal.empty_listing",
-                        judge_id=judge_id,
-                        judge_name=judge_name_dropdown,
-                    )
+                    ),
+                ):
                     continue
                 attempts_before_rows = tally.n_attempted
 

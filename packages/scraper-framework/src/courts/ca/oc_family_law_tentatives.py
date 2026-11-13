@@ -31,8 +31,9 @@ Empty panel (2026-07-21 onward, #4654):
   Wayback Machine snapshots).  The page still renders the "Family Law Panel"
   heading with nothing beneath it, so every run finds zero PDF links.  The
   scraper logs this explicitly as ``context=empty_state``.  If the panel lists
-  officers but no PDF links are discoverable, that is a layout change and the
-  run raises ``OCFamilyLawIndexLayoutError`` so it records ``status=failure``.
+  officers but no PDF links are discoverable, or the panel is gone, that is a
+  layout change: ``_check_listing`` raises ``EmptyListing`` and the run records
+  ``status=failure`` (#4912).
 
 Investigation: #142
 """
@@ -188,10 +189,6 @@ _PANEL_SELECTOR = "div.jcc-body__main-text"
 _PANEL_OFFICER_RE = re.compile(r"\bDept\b\.?\s*\S+", re.IGNORECASE)
 
 
-class OCFamilyLawIndexLayoutError(RuntimeError):
-    """Index page no longer matches the expected Family Law Panel layout."""
-
-
 def _oc_fl_panel_officer_count(html: str) -> int | None:
     """Count judicial-officer entries in the Family Law Panel.
 
@@ -230,15 +227,19 @@ class OCFamilyLawTentativeRulingsScraper(PdfLinkScraper):
 
         return False
 
-    def _handle_no_pdf_links(self, html: str) -> None:
-        """Tell an empty Family Law Panel apart from a layout change (#4654)."""
+    def _empty_index_block_reason(self, html: str) -> str | None:
+        """Tell an empty Family Law Panel apart from a layout change (#4654, #4912).
+
+        Only a panel container that lists no judicial officers is the empty
+        state (returns ``None``).  A missing container, or a panel that names
+        officers whose PDF links were not found, is a layout change: the
+        returned reason goes into the ``EmptyListing`` run error.
+        """
         count = _oc_fl_panel_officer_count(html)
         if count is None:
-            raise OCFamilyLawIndexLayoutError(
-                f"Family Law Panel container ({_PANEL_SELECTOR}) not found on index page"
-            )
+            return f"Family Law Panel container ({_PANEL_SELECTOR}) not found on index page"
         if count > 0:
-            raise OCFamilyLawIndexLayoutError(
+            return (
                 f"Family Law Panel lists {count} judicial officer entries "
                 "but no PDF links were found"
             )
@@ -246,6 +247,7 @@ class OCFamilyLawTentativeRulingsScraper(PdfLinkScraper):
             "Family Law Panel lists no judicial officers",
             context="empty_state",
         )
+        return None
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
