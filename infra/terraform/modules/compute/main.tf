@@ -104,20 +104,34 @@ resource "aws_security_group" "scraper" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-}
 
-# When a residential proxy is configured, allow outbound traffic to the
-# proxy port so the scraper can route requests through it.
-resource "aws_security_group_rule" "scraper_proxy_egress" {
-  count = var.proxy_secret_arn != "" ? 1 : 0
+  # LA publishes its weekly Judicial Directory PDF only over plain http on
+  # port 90 (mycourtservices.lacourt.org:90, no https mirror). It is the LA
+  # judge-roster source since the legacy lacourt.ca.gov page was retired (#4874).
+  egress {
+    description = "LA court Judicial Directory PDF (http port 90)"
+    from_port   = 90
+    to_port     = 90
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
-  type              = "egress"
-  description       = "Residential proxy"
-  from_port         = var.proxy_port
-  to_port           = var.proxy_port
-  protocol          = "tcp"
-  cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.scraper.id
+  # When a residential proxy is configured, allow outbound traffic to the
+  # proxy port so the scraper can route requests through it.
+  #
+  # This must stay an inline block. Inline egress blocks are authoritative, so
+  # a standalone aws_security_group_rule on this group was revoked by every
+  # apply that touched the group and re-created by the next one (#4874).
+  dynamic "egress" {
+    for_each = var.proxy_secret_arn != "" ? [var.proxy_port] : []
+    content {
+      description = "Residential proxy"
+      from_port   = egress.value
+      to_port     = egress.value
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
 }
 
 # ─── Task Definition ───────────────────────────────────────────────────────
@@ -501,6 +515,17 @@ resource "aws_security_group" "ingestion_worker" {
     description = "PostgreSQL database"
     from_port   = 5432
     to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # The worker's LA dept-to-judge lookup and the ECS one-shots that share this
+  # security group (rebuild_db.py, fetch_rosters.py) download LA's weekly
+  # Judicial Directory PDF, served only over plain http on port 90 (#4874).
+  egress {
+    description = "LA court Judicial Directory PDF (http port 90)"
+    from_port   = 90
+    to_port     = 90
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }

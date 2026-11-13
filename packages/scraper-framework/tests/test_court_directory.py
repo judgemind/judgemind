@@ -118,6 +118,27 @@ class TestSaveSnapshot:
         assert call_kwargs["Body"] == RAW_HTML
         assert call_kwargs["ContentType"] == "text/html"
 
+    def test_pdf_raw_uses_pdf_key_and_content_type(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """A PDF directory (LA weekly directory, #4874) is archived as .pdf / application/pdf."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        raw_pdf = b"%PDF-1.7\n fake directory body"
+
+        directory.save_snapshot(raw_pdf, MAPPING, COURT_ID)
+
+        call_kwargs = s3_client.put_object.call_args.kwargs
+        assert call_kwargs["Key"] == f"directories/{COURT_ID}/{sha256_hex(raw_pdf)}.pdf"
+        assert call_kwargs["ContentType"] == "application/pdf"
+        inserts = [
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert len(inserts) == 1
+        assert inserts[0].args[1][2] == call_kwargs["Key"]
+
     def test_skips_s3_upload_when_already_exists(
         self, directory: _StubDirectory, s3_client: MagicMock
     ) -> None:

@@ -43,6 +43,12 @@ We investigated all available sources of judge metadata and biographical informa
 
 #### Los Angeles
 
+> **Update 2026-11 (#4874):** this page has returned IIS 503 since 2026-07; the
+> legacy app was retired in the lacourt.ca.gov redesign. `LACourtDirectory` now
+> parses the weekly "Judicial Assignment and Directory" PDF at
+> `http://mycourtservices.lacourt.org:90/lineupreports/judicial%20directory.pdf`
+> (about 557 officers, 328 departments). The notes below describe the retired page.
+
 **URL:** `https://www.lacourt.ca.gov/judicialofficers/ui/SearchResult.aspx`
 
 **Already scraped** -- we have `la_dept_judges.py` in production. This is the richest roster source with 560 officers and 7 columns: Name (Last, First), Title, Location (courthouse), Dept, Phone, Primary Assignment, Litigation Areas.
