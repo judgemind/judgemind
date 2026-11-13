@@ -87,8 +87,10 @@ from pathlib import Path
 
 # Fields that are loop-control / iteration internals, not part of the
 # per-ruling event payload.  These are intentionally excluded from the
-# propagation check.
-_INTERNAL_FIELDS: frozenset[str] = frozenset({"ruling_index"})
+# propagation check.  ``raw_case_number`` (Santa Clara, #4881) is the
+# malformed CASE NO. cell as printed: splitter-side logging only, never a
+# case number, so it must not reach the split event.
+_INTERNAL_FIELDS: frozenset[str] = frozenset({"ruling_index", "raw_case_number"})
 
 # Per-dataclass scope.  Keys are dataclass class names.  Each entry may
 # carry:

@@ -2714,6 +2714,12 @@ def test_format_a_case_no_header_with_consolidated_note() -> None:
 #   sc_format_b_4726_dept6.pdf            — Dept 6, pages 1-4 and 8 of raw c70aceec…:
 #       the format-B table continues on page 3 without a header; row 1's CASE NO.
 #       is ``25CV46061`` (a digit short) and row 24's is ``24CV44820``.
+#   sc_headerless_4881_dept1_typo_row.pdf — Dept 1, pages 2-3 of raw c38b30ec…:
+#       LINE 2's CASE # is ``24CV44160`` (a digit short); its RULING cell holds the
+#       whole Wells Fargo v. Ortiz summary-judgment ruling.
+#   sc_table_4881_dept12_typo_row.pdf     — Dept 12, pages 2 and 26 of raw 1e87ee70…:
+#       LINE 8's CASE # is ``25CV47984``; its ``Calendar Line 8`` body prints
+#       ``Case No.: 25CV479845``.
 
 
 def _fixture_split(name: str) -> list[SplitRuling]:
@@ -2872,11 +2878,13 @@ class TestSantaClaraHeaderlessTable4726:
         assert _dept12_body_sections(text)[0].case_title is None
 
     def test_table_malformed_case_number_row_is_not_a_continuation(self) -> None:
-        from courts.ca.sc_tentatives import _is_malformed_cn_row
+        from courts.ca.sc_tentatives import _malformed_cn_cell
 
-        assert _is_malformed_cn_row(["LINE 8", "25CV47984", "Pedram Bigdeli", "Hearing"])
-        assert not _is_malformed_cn_row(["LINE 8", "25CV479845", "Pedram Bigdeli", "Hearing"])
-        assert not _is_malformed_cn_row(["", None, None, "continuation text"])
+        assert _malformed_cn_cell(["LINE 8", "25CV47984", "Pedram Bigdeli", "Hearing"]) == (
+            "25CV47984"
+        )
+        assert _malformed_cn_cell(["LINE 8", "25CV479845", "Pedram Bigdeli", "Hearing"]) is None
+        assert _malformed_cn_cell(["", None, None, "continuation text"]) is None
 
 
 class TestSantaClaraFormatB4726:
@@ -2885,13 +2893,14 @@ class TestSantaClaraFormatB4726:
         the format-B table names every case, across two pages."""
         rulings = _fixture_split("sc_format_b_4726_dept6.pdf")
         cns = [r.case_number for r in rulings]
-        assert all(cns)
+        # Row 24 (``24CV44820``) is the only one with no number (#4881).
+        assert cns.count(None) == 1
         # Row 1's cell is ``25CV46061``; its ``See Line Item 1`` body prints
         # ``Case No.: 25CV460651``, which names the case.
         assert cns[0] == "25CV460651"
         # Page 3, which repeats no header row.
         assert {"24CV443183", "25CV467732", "25CV435775", "24CV435775"} <= set(cns)
-        # Row 24's ``24CV44820`` names no case: dropped, not glued onto row 22-23.
+        # Row 24's ``24CV44820`` names no case: not glued onto row 22-23.
         huynh = next(r for r in rulings if r.case_number == "24CV443183")
         assert "Skelley" not in (huynh.case_title or "")
         assert "Request for Admissions admitted" not in huynh.ruling_text
@@ -2996,7 +3005,6 @@ class TestSantaClaraTableEntries4726:
             ]
         ]
         entries = _table_entries(monkeypatch, pages, headerless=True)
-        assert list(entries) == ["25CV479084"]
         assert entries["25CV479084"].ruling_text == "Petition Compel Arbitration"
         assert entries["25CV479084"].case_title == "Pal v. Denodo"
 
@@ -3007,3 +3015,153 @@ class TestSantaClaraTableEntries4726:
         calendar table."""
         pages = [[[["Exhibit", "24CV000001", "Smith v. Jones", "cited case"]]]]
         assert _table_entries(monkeypatch, pages, headerless=True) == {}
+
+
+class TestSantaClaraUnparseableCaseNumber4881:
+    """A summary-table row whose CASE NO. cell is not a valid case number is a
+    real ruling: it is kept with no number (``UNKNOWN-`` downstream, where
+    validation records it), never dropped and never given another row's number."""
+
+    def test_unparseable_case_number_format_b_row_kept_without_number(self) -> None:
+        """Dept 6 row 24 prints ``24CV44820``; its ruling was dropped before."""
+        rulings = _fixture_split("sc_format_b_4726_dept6.pdf")
+        skelley = [r for r in rulings if r.case_number is None]
+        assert len(skelley) == 1
+        assert "Skelley" in (skelley[0].case_title or "")
+        assert "Request for" in skelley[0].ruling_text
+        assert skelley[0].raw_case_number == "24CV44820"
+
+    def test_unparseable_case_number_headerless_row_kept_without_number(self) -> None:
+        """Dept 1 LINE 2 prints ``24CV44160``; its RULING cell is the whole
+        summary-judgment ruling, which was dropped before."""
+        rulings = _fixture_split("sc_headerless_4881_dept1_typo_row.pdf")
+        assert [r.case_number for r in rulings] == ["24CV450570", None, "24CV449741"]
+        wells = rulings[1]
+        assert wells.case_title == "Wells Fargo Bank, N.A. vs Ismael Ortiz"
+        assert "motion for summary judgment is GRANTED" in wells.ruling_text
+        assert "Wells Faro Bank" not in rulings[0].ruling_text
+        assert "Wells Faro Bank" not in rulings[2].ruling_text
+        assert [r.ruling_index for r in rulings] == [1, 2, 3]
+
+    def test_unparseable_case_number_table_row_takes_cross_referenced_body_number(
+        self,
+    ) -> None:
+        """Dept 12 LINE 8 prints ``25CV47984`` and points at ``Calendar Line 8``,
+        whose own ``Case No.:`` is 25CV479845: one entry, with both texts."""
+        rulings = _fixture_split("sc_table_4881_dept12_typo_row.pdf")
+        assert all(r.case_number for r in rulings)
+        bigdeli = [r for r in rulings if r.case_number == "25CV479845"]
+        assert len(bigdeli) == 1
+        assert "Hearing: Petition Compel Arbitration" in bigdeli[0].ruling_text
+        assert "Song-Beverly" in bigdeli[0].ruling_text
+        pal = next(r for r in rulings if r.case_number == "25CV479084")
+        assert "Song-Beverly" not in pal.ruling_text
+
+    def test_unparseable_case_number_table_row_and_continuations_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pages = [
+            [
+                [
+                    ["LINE 7", "25CV479084", "Pal v. Denodo", "Petition Compel Arbitration"],
+                    ["LINE 8", "25CV47984", "Bigdeli v. Jaguar", "Hearing: Petition"],
+                    [None, None, "Land Rover", "Parties to appear."],
+                ]
+            ]
+        ]
+        entries = list(_table_entries(monkeypatch, pages, headerless=True).values())
+        assert [r.case_number for r in entries] == ["25CV479084", None]
+        assert entries[1].case_title == "Bigdeli v. Jaguar Land Rover"
+        assert entries[1].ruling_text == "Hearing: Petition\nParties to appear."
+        assert entries[1].raw_case_number == "25CV47984"
+
+    def test_unparseable_case_number_never_takes_a_sibling_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The row's cross-referenced body has no ``Case No.:`` (it attaches,
+        the row stays without a number); a body that names another row's
+        case attaches to that row, not to the malformed one."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE #", "CASE #", "CASE TITLE", "RULING"],
+            ["LINE 1", "24CV000001", "A v. B", "Click Line 1"],
+            ["LINE 2", "24CV00002", "C v. D", "Click Line 2"],
+            ["LINE 3", "24CV00003", "E v. F", "Click Line 3"],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        body = "x" * 100
+        text = (
+            "LINE # CASE # CASE TITLE RULING\n"
+            f"Calendar Line 1\nCase No.: 24CV000001\n{body}\n"
+            f"Calendar Line 2\nCase Name: C v. D\nno number printed {body}\n"
+            f"Calendar Line 3\nCase No.: 24CV000001\nsecond body for case one {body}\n"
+        )
+        rulings = sc._split_rulings(text, pdf_bytes=b"%PDF")
+        assert [r.case_number for r in rulings] == ["24CV000001", None, None]
+        assert "no number printed" in rulings[1].ruling_text
+        assert "second body for case one" in rulings[0].ruling_text
+        assert rulings[2].ruling_text == "Click Line 3"
+
+    def test_unparseable_case_number_text_row_does_not_run_into_row_above(self) -> None:
+        from courts.ca.sc_tentatives import _dept12_text_rows
+
+        text = (
+            "LINE 1 24CV450570 Star Union v. Capital Motion: Judgment on Pleadings\n"
+            "LINE 2 24CV44160 Wells Fargo v. Ortiz Motion for Summary Judgment GRANTED\n"
+            "LINE 3 24CV449741 Kraus v. Zola Motion to Compel\n"
+        )
+        rows = _dept12_text_rows(text, headerless=True)
+        assert "Wells Fargo" not in rows["24CV450570"]
+        assert [k for k in rows if k[0].isdigit()] == ["24CV450570", "24CV449741"]
+
+    def test_unparseable_case_number_three_column_table_uses_text_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pdfplumber missed the RULING column: the malformed row's ruling
+        comes from its own flattened row, not the row above."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE 1", "24CV000001", "A v. B"],
+            ["LINE 2", "24CV00002", "C v. D"],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        text = (
+            "LINE 1 24CV000001 A v. B Motion granted.\n"
+            "LINE 2 24CV00002 C v. D Demurrer overruled.\n"
+        )
+        rulings = sc._split_rulings(text, pdf_bytes=b"%PDF")
+        assert [r.case_number for r in rulings] == ["24CV000001", None]
+        assert "Demurrer overruled" in rulings[1].ruling_text
+        assert "Demurrer overruled" not in rulings[0].ruling_text
+
+    def test_unparseable_case_number_row_logged_at_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Kept or dropped (no text at all), the row is logged at WARNING
+        with its printed cell."""
+        import courts.ca.sc_tentatives as sc
+
+        log = MagicMock()
+        monkeypatch.setattr(sc, "logger", log)
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["1", "24CV000001", "A v. B", "Granted."],
+            ["2", "24CV00002", "C v. D", "Denied."],
+            ["3", "24CV00003", "E v. F", ""],
+            ["4", "24CV000004", "G v. H", "Off calendar."],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        rulings = sc._split_rulings_format_b("", b"%PDF")
+        assert [r.case_number for r in rulings] == ["24CV000001", None, "24CV000004"]
+        assert [r.ruling_index for r in rulings] == [1, 2, 3]
+        calls = [
+            c for c in log.warning.call_args_list if c.args[0] == "sc_split_row_without_case_number"
+        ]
+        assert [(c.kwargs["raw_case_number"], c.kwargs["kept"]) for c in calls] == [
+            ("24CV00002", True),
+            ("24CV00003", False),
+        ]
+        assert calls[0].kwargs["layout"] == "format_b"
+        assert calls[0].kwargs["case_title"] == "C v. D"
