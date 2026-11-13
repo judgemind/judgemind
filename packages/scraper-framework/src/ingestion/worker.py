@@ -277,6 +277,20 @@ def _llm_case_number_unsupported(
     return not case_number_supported_by_text(case_number, *texts)
 
 
+def _case_number_check_texts(document_text: str | None) -> tuple[str, ...]:
+    """Return ``(document_text,)`` when the text can confirm or refute a
+    case number, else ``()``: no text, raw PDF bytes, or fewer than
+    ``_MIN_TEXT_TO_CHECK_CASE_NUMBER`` non-blank characters (a scanned
+    PDF with no text layer, #4915)."""
+    if (
+        not document_text
+        or is_pdf_binary(document_text)
+        or len(document_text.strip()) < _MIN_TEXT_TO_CHECK_CASE_NUMBER
+    ):
+        return ()
+    return (document_text,)
+
+
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
     """Decide whether a split child's write may move it to a different case.
 
@@ -1444,6 +1458,11 @@ class _SplitBatch:
     keep_ids: set[str] = field(default_factory=set)
     replace: bool = False
     no_rulings_reason: str | None = None
+    #: Set by the LLM split: the document text every child's case number
+    #: must appear in (``db.SplitChildRuling.case_number_texts``, #4915).
+    #: Empty for deterministic splits and for documents whose text cannot
+    #: settle it.
+    case_number_texts: tuple[str, ...] = ()
 
 
 class InfrastructureError(Exception):
@@ -4356,6 +4375,11 @@ class IngestionWorker:
                         summary_model=w.summary_model,
                         summary_generated_at=w.summary_generated_at,
                         hearing_date_source=w.hearing_date_source,
+                        case_number_texts=(
+                            (*batch.case_number_texts, w.ruling_text)
+                            if batch.case_number_texts
+                            else ()
+                        ),
                     )
                     for w, court_id, case_id, judge_id in prepared
                 ],
@@ -5241,6 +5265,12 @@ class IngestionWorker:
         # own text + case_number — no sibling context is required.  Keeping
         # it in the aggregated per-ruling path avoids double-flagging the
         # same ruling (once here and once in the split recursion).
+
+        # The LLM read every child's case number from this document, so a
+        # number its text does not carry was invented or misread (#4907).
+        # A reingest moves a ruling off such a number even when the child
+        # found none this time (#4915).
+        batch.case_number_texts = _case_number_check_texts(ruling_text)
 
         for cr in converted:
             # Multimodal rows with no ruling body are not rulings (#4714).

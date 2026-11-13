@@ -201,3 +201,82 @@ def test_known_bug_4838_db_mode_keeps_stale_children() -> None:
         setup=_single_after_split_setup,
         invariants=frozenset({"converge"}),
     )
+
+
+# ---------------------------------------------------------------------------
+# #4915: a reingest moves a ruling off a case number its document lacks
+# ---------------------------------------------------------------------------
+
+#: The number the Orange PDF prints, and the LLM's misread of it (a dropped
+#: digit) that an older run stored (#4907, #4915).
+_PRINTED = "30-2024-01444459"
+_MISREAD = "2024-0144459"
+
+
+def _calendar_text(printed: str) -> str:
+    """The extracted text of a one-ruling calendar PDF printing *printed*,
+    long enough (200+ characters) for the case-number check."""
+    return (
+        f"SUPERIOR COURT OF CALIFORNIA, COUNTY OF ORANGE. Case No. {printed}. "
+        + "Tentative ruling on the motion; the court has read the papers. " * 4
+    )
+
+
+def _rulings_with_alerts(h: harness.KeyHarness, key: harness.Key) -> list[tuple]:
+    with h.checker.cursor() as cur:
+        cur.execute(
+            "SELECT r.id::text, c.case_number, a.ruling_id::text FROM rulings r "
+            "JOIN documents d ON d.id = r.document_id JOIN cases c ON c.id = r.case_id "
+            "LEFT JOIN alert_events a ON a.ruling_id = r.id WHERE d.s3_key = %s",
+            (key.s3_key,),
+        )
+        return cur.fetchall()
+
+
+def _run_misread_then_reingest(stored: str, *, tag: str) -> list[tuple]:
+    """Store a ruling under *stored* the way a run before #4907 did (no
+    usable document text, so no check), then reingest the key with the
+    document text printing ``_PRINTED`` while the LLM reads ``_MISREAD``
+    again.  Returns ``(ruling id, case number, alert ruling id)`` before and
+    after, concatenated."""
+    h = harness.KeyHarness(_DSN, _RUN, -1)
+    try:
+        key = harness.make_key(f"{_RUN}-{tag}")
+        old = harness.Spec(0, stored, harness._title(0), harness._text(tag, 0))
+        h.run_step(key, harness.Step("reingest", (harness.Row("ruling", 0),), (old,)), "old run")
+        h._attach_alerts(key)
+        before = _rulings_with_alerts(h, key)
+
+        h.event_extra = {"ruling_text": _calendar_text(_PRINTED)}
+        misread = harness.Spec(0, _MISREAD, harness._title(0), harness._text(tag, 0))
+        h.run_step(key, harness.Step("reingest", (harness.Row("ruling", 0),), (misread,)), "fix")
+        return before + _rulings_with_alerts(h, key)
+    finally:
+        h.close()
+
+
+@_needs_pg
+def test_unsupported_case_relinks_to_placeholder() -> None:
+    """A ruling filed under a number its document does not print leaves
+    that case on reingest, onto the child's ``UNKNOWN-`` case, even though
+    the guard discards the LLM's number again (#4915).  Before the fix the
+    #4788 "never relink onto a placeholder" rule kept it on the invented
+    case.  The ruling keeps its row, so its alert keeps its ``ruling_id``;
+    every harness invariant holds through both steps."""
+    (old_id, old_case, old_alert), (new_id, new_case, new_alert) = _run_misread_then_reingest(
+        _MISREAD, tag="b4915"
+    )
+    assert old_case == _MISREAD and old_alert == old_id
+    assert new_case.startswith("UNKNOWN-")
+    assert new_id == old_id and new_alert == old_id
+
+
+@_needs_pg
+def test_supported_case_never_relinks_to_placeholder() -> None:
+    """Control for #4915: a number the document does print keeps the #4788
+    protection when a reingest finds no number for the child."""
+    (old_id, old_case, _), (new_id, new_case, new_alert) = _run_misread_then_reingest(
+        _PRINTED, tag="b4915ok"
+    )
+    assert old_case == _PRINTED
+    assert (new_id, new_case, new_alert) == (old_id, _PRINTED, old_id)
