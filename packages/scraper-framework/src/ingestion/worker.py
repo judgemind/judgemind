@@ -504,7 +504,7 @@ def _try_sd_calendar_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on SD calendar split — ruling permanently lost",
+                "per-child enrichment exhausted on SD calendar split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -625,7 +625,7 @@ def _try_la_html_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on LA HTML split — ruling permanently lost",
+                "per-child enrichment exhausted on LA HTML split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -768,7 +768,7 @@ def _try_fresno_pdf_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on Fresno PDF split — ruling permanently lost",
+                "per-child enrichment exhausted on Fresno PDF split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -925,7 +925,7 @@ def _try_riverside_pdf_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on Riverside PDF split — ruling permanently lost",
+                "per-child enrichment exhausted on Riverside PDF split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -1089,7 +1089,7 @@ def _try_sf_pdf_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on SF PDF split — ruling permanently lost",
+                "per-child enrichment exhausted on SF PDF split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -1285,7 +1285,7 @@ def _try_sc_pdf_split(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on Santa Clara PDF split — ruling permanently lost",
+                "per-child enrichment exhausted on Santa Clara PDF split — slot keeps its rows",
                 extra={
                     "document_id": document_id,
                     "_split_index": idx,
@@ -1395,7 +1395,9 @@ class _SplitBatch:
     ``replace`` is set once the split has decided its child set (so the
     key's rows are replaced even when every child is dropped).
     ``keep_ids`` are children whose extraction failed this pass: their
-    existing rows are left untouched rather than removed.
+    existing rows are left untouched rather than removed.  Only
+    ``IngestionWorker._dispatch_split_child`` adds to it, for every split
+    path (#4878).
     ``no_rulings_reason`` is set when the document is known to hold no
     rulings (e.g. a Santa Clara placeholder notice, #4725): the split is
     empty by design, not because every child was rejected.
@@ -4460,6 +4462,28 @@ class IngestionWorker:
             self._write_split_batch(event_data, document_id, batch)
         return split
 
+    def _dispatch_split_child(self, batch: _SplitBatch, split_event: dict[str, Any]) -> None:
+        """Extract, enrich and validate one split child (``process_event``)
+        into *batch*.  Every split path dispatches its children here.
+
+        A dispatched child means the split replaces the key's split set
+        (#4700): ``_write_split_batch`` writes the children and removes the
+        rows the new split no longer produces.  A child whose per-child LLM
+        enrichment is exhausted is a transient failure, not a verdict on the
+        ruling: its slot goes in ``batch.keep_ids`` so the rows it already
+        holds are kept rather than removed as stale (#4878).  The error is
+        re-raised for the splitter to log and carry on with its siblings.
+        """
+        batch.replace = True
+        try:
+            self.process_event(split_event)
+        except Exception as exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if isinstance(exc, LlmEnrichmentExhaustedError):
+                batch.keep_ids.add(str(split_event["document_id"]))
+            raise
+
     def _split_document(
         self,
         event_data: dict[str, Any],
@@ -4539,13 +4563,11 @@ class IngestionWorker:
             return True
 
         # Every deterministic splitter below dispatches its children through
-        # ``dispatch_child``.  A dispatched child means the split replaces
-        # the key's split set (#4700): ``_llm_split_document`` writes the
-        # children and removes the rows the new split no longer produces.
-        # Doing it here covers every splitter, current and future.
+        # ``dispatch_child`` (``_dispatch_split_child``), as does the LLM
+        # split further down, so a failed child's slot is protected the same
+        # way on every split path (#4878).
         def dispatch_child(split_event: dict[str, Any]) -> None:
-            batch.replace = True
-            self.process_event(split_event)
+            self._dispatch_split_child(batch, split_event)
 
         # ------------------------------------------------------------------
         # San Diego calendar HTML deterministic split (#2447)
@@ -5232,17 +5254,14 @@ class IngestionWorker:
             }
 
             try:
-                self.process_event(split_event)
+                self._dispatch_split_child(batch, split_event)
             except Exception as _exc:
                 from framework.llm_enrichment import LlmEnrichmentExhaustedError
 
                 if not isinstance(_exc, LlmEnrichmentExhaustedError):
                     raise
-                # A transient failure: keep whatever this slot holds rather
-                # than remove it with the split set's stale rows.
-                batch.keep_ids.add(cr.document_id)
                 logger.critical(
-                    "per-child enrichment exhausted on LLM split — ruling permanently lost",
+                    "per-child enrichment exhausted on LLM split — slot keeps its rows",
                     extra={
                         "document_id": document_id,
                         "_split_index": cr.split_index,

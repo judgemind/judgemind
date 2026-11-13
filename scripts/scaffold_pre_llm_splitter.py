@@ -698,7 +698,7 @@ def _worker_function_content(
             if not isinstance(_exc, LlmEnrichmentExhaustedError):
                 raise
             logger.critical(
-                "per-child enrichment exhausted on {slug} {fmt_upper} split — ruling permanently lost",
+                "per-child enrichment exhausted on {slug} {fmt_upper} split — slot keeps its rows",
                 extra={{
                     "document_id": document_id,
                     "_split_index": idx,

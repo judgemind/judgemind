@@ -118,6 +118,30 @@ def _bug_4838_steps() -> list[harness.Step]:
 _BUG_4838_STEPS = _bug_4838_steps()
 
 
+def _enrichment_seeds() -> list[int]:
+    one = os.environ.get("SPLIT_HARNESS_SEED")
+    if one:
+        return [int(one)]
+    return list(range(int(os.environ.get("SPLIT_HARNESS_ENRICHMENT_SEEDS", "8"))))
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", _enrichment_seeds())
+@pytest.mark.parametrize(
+    "splitter",
+    harness.DETERMINISTIC_SPLITTERS,
+    ids=[s.name for s in harness.DETERMINISTIC_SPLITTERS],
+)
+def test_exhausted_enrichment_keeps_child_ruling(
+    splitter: harness.DeterministicSplitter, seed: int
+) -> None:
+    """A deterministic-split child whose per-child enrichment is exhausted
+    keeps its existing document and ruling (#4878).  Before the fix only
+    the LLM split path protected such a child; the six deterministic
+    splitters let the split-set write delete it as stale."""
+    harness.run_enrichment_failure(_DSN, splitter, seed, _RUN)
+
+
 @_needs_pg
 def test_known_bug_4838_db_mode_keeps_stale_children() -> None:
     """DB-row reingest of a document that now parses as one ruling must not
