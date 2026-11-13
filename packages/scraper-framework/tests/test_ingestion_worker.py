@@ -1363,6 +1363,8 @@ def test_sc_split_child_without_case_number_does_not_inherit_doc_case_number() -
         assert _try_sc_pdf_split(event, event["document_id"], event["ruling_text"], captured.append)
     assert [c["case_number"] for c in captured] == ["25CV111111", None]
     assert [c["case_title"] for c in captured] == ["Foo v. Bar", None]
+    # #4866: only the child whose number the splitter read is marked.
+    assert [c.get("_case_number_from_source") for c in captured] == [True, False]
 
 
 class TestScPdfSplitDept12:

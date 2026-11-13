@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from framework.title_heuristics import ROLE_LITERAL_SEGMENT_RE
+
 if TYPE_CHECKING:
     import psycopg
 
@@ -121,6 +123,15 @@ def levenshtein_distance(s1: str, s2: str) -> int:
                 curr_row.append(min(insertions, deletions, substitutions))
             prev_row = curr_row
         return prev_row[-1]
+
+
+def identifying_parties(names: list[str]) -> list[str]:
+    """Drop role words (``Plaintiff``, ``Defendants``, ``Cross-Respondent`` …).
+
+    The LLM writes them when it finds no party name, so many unrelated cases
+    share them; they say nothing about which case a ruling belongs to (#4866).
+    """
+    return [n for n in names if n.strip() and not ROLE_LITERAL_SEGMENT_RE.match(n)]
 
 
 def compute_party_overlap(parties_a: list[str], parties_b: list[str]) -> float:
@@ -402,8 +413,8 @@ class EnrichmentEngine:
         # validation collapses distinct rulings onto the same case_number
         # when near-duplicate numbers exist in the court.
         _parties_known = extracted_parties is not None
-        if extracted_parties is None:
-            extracted_parties = []
+        # Role words are not party identity on either side (#4866).
+        extracted_parties = identifying_parties(extracted_parties or [])
 
         candidates = self._fuzzy_case_candidates(db_normalized, court_id)
 
@@ -416,9 +427,10 @@ class EnrichmentEngine:
             if _parties_known:
                 # Reject when either side lacks parties — cannot validate
                 # identity without cross-check evidence (#2467).
-                if not extracted_parties or not cand_parties:
+                cand_identifying = identifying_parties(cand_parties or [])
+                if not extracted_parties or not cand_identifying:
                     continue
-                overlap = compute_party_overlap(extracted_parties, cand_parties)
+                overlap = compute_party_overlap(extracted_parties, cand_identifying)
                 if overlap < self._min_party_overlap:
                     continue
             else:
