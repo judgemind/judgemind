@@ -815,6 +815,7 @@ class SplitRuling:
         "outcome",
         "hearing_date",
         "department",
+        "raw_case_number",
     )
 
     def __init__(
@@ -827,6 +828,7 @@ class SplitRuling:
         outcome: str | None = None,
         hearing_date: Any = None,
         department: str | None = None,
+        raw_case_number: str | None = None,
     ) -> None:
         self.ruling_index = ruling_index
         self.case_number = case_number
@@ -836,6 +838,9 @@ class SplitRuling:
         self.outcome = outcome
         self.hearing_date = hearing_date
         self.department = department
+        # The CASE NO. cell as printed when it is not a valid number (#4881);
+        # for logs only, never used as the case number.
+        self.raw_case_number = raw_case_number
 
 
 # Format-B summary-table header anchor (#4341).  pdfplumber's
@@ -1079,6 +1084,7 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
                                 case_number=row_cn,
                                 ruling_text=ruling_chunk,
                                 case_title=title or None,
+                                raw_case_number=None if row_cn else cn_raw,
                             )
                             next_index += 1
                         elif current is not None:
@@ -1137,16 +1143,37 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
                     if head:
                         r.case_number = _normalize_case_number(head.group("case_number"))
 
-    # A row whose case number is still unknown is dropped: an entry without a
-    # case number becomes an ``UNKNOWN-`` case downstream (#4726).
+    # A row whose case number is still unknown is kept with no number (#4881):
+    # it is a real ruling, and downstream it becomes an ``UNKNOWN-`` case that
+    # validation records.  Dropping it lost the ruling with no trace.  It is
+    # never given a neighbouring row's number.
     kept: list[SplitRuling] = []
     for r in rulings:
-        if r.case_number is None:
-            logger.info("format_b_row_without_case_number_dropped", case_title=r.case_title)
+        if r.case_number is None and not _keep_case_less_row(r, layout="format_b"):
             continue
         r.ruling_index = len(kept) + 1
         kept.append(r)
     return kept
+
+
+def _keep_case_less_row(r: SplitRuling, layout: str) -> bool:
+    """Log a summary-table row whose CASE NO. cell is not a valid number (#4881).
+
+    The row is kept when it has ruling text; with none there is nothing to
+    extract, so it is dropped.  Either way the WARNING records it, so a
+    ruling never disappears without a trace.
+    """
+    keep = bool(r.ruling_text and r.ruling_text.strip())
+    logger.warning(
+        "sc_split_row_without_case_number",
+        layout=layout,
+        kept=keep,
+        raw_case_number=r.raw_case_number,
+        case_title=r.case_title,
+        text_len=len(r.ruling_text or ""),
+        text_head=(r.ruling_text or "")[:120],
+    )
+    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1244,10 @@ _SC_DEPT12_TEXT_ROW_RE = re.compile(
     r"(?:[ \t]*(?:-|&|,|and)[ \t]*(?:LINE[ \t]*)?\d{1,3})*)[ \t]+)*"
     # Not ``25PR200738)``: the tail of a ``(lead case, consolidated with …)``
     # note wrapped onto its own line inside a CASE # cell (Dept 2).
-    rf"(?P<cn>{_SC_CN})(?!\))",
+    rf"(?:(?P<cn>{_SC_CN})(?!\))"
+    # A malformed number (``24CV44932``) still starts a row (#4881): its text
+    # must not run on into the row above.
+    r"|(?P<bad>\d{2}(?:CV|PR)\d{3,8})\b(?!\)))",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -1341,9 +1371,18 @@ def _append_text(r: SplitRuling, extra: str, sep: str = "\n") -> None:
         r.ruling_text = f"{r.ruling_text}{sep}{extra}" if r.ruling_text else extra
 
 
-def _is_malformed_cn_row(row: list[str | None]) -> bool:
-    """True when the CASE # column holds a malformed case number (#4726)."""
-    return any(_row_case_number(_dept12_cell(c)) == (None, True) for c in row[1:3])
+def _malformed_cn_cell(row: list[str | None]) -> str | None:
+    """The CASE # cell when it holds a malformed case number (#4726), else None."""
+    for c in row[1:3]:
+        cell = _dept12_cell(c)
+        if _row_case_number(cell) == (None, True):
+            return cell
+    return None
+
+
+# ``_dept12_table_entries`` key prefix for a row with a malformed case number
+# (#4881); it can never equal a real case number.
+_CASE_LESS_KEY = "?case-less-"
 
 
 def _dept12_table_entries(pdf_bytes: bytes, headerless: bool = False) -> dict[str, SplitRuling]:
@@ -1400,12 +1439,22 @@ def _dept12_table_entries(pdf_bytes: bytes, headerless: bool = False) -> dict[st
                         current, title_open = None, False
                         continue
                     label, cn, title, ruling = _dept12_parse_row(row)
-                    if cn is None and _is_malformed_cn_row(row):
+                    raw_cn = _malformed_cn_cell(row)
+                    if cn is None and raw_cn is not None:
                         # A new case whose number is a typo (``24CV44932``):
-                        # not a continuation of the case above.  Its body
-                        # section, if any, still attaches by cross-reference
-                        # or by its own ``Case No.:`` line.
-                        current, title_open = None, False
+                        # not a continuation of the case above.  It is kept
+                        # as an entry with no number (#4881) — never given
+                        # another row's.  Its body section, if any, attaches
+                        # by cross-reference.
+                        current = SplitRuling(
+                            ruling_index=0,
+                            case_number=None,
+                            ruling_text=ruling,
+                            case_title=title or None,
+                            raw_case_number=raw_cn,
+                        )
+                        entries[f"{_CASE_LESS_KEY}{len(entries)}"] = current
+                        title_open = True
                         continue
                     if cn is not None:
                         existing = entries.get(cn)
@@ -1457,7 +1506,12 @@ def _dept12_text_rows(text: str, headerless: bool = False) -> dict[str, str]:
     for i, m in enumerate(matches):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(region)
         segment = region[m.start() : end].strip()
-        cn = _normalize_case_number(m.group("cn"))
+        if m.group("cn") is None:
+            # Malformed number: kept under a key no real case number can take,
+            # for the table entry of the same row (#4881).
+            cn = _CASE_LESS_KEY + _normalize_case_number(m.group("bad"))
+        else:
+            cn = _normalize_case_number(m.group("cn"))
         rows[cn] = f"{rows[cn]}\n{segment}" if cn in rows else segment
     return rows
 
@@ -1509,8 +1563,10 @@ def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
     one ruling matches that way), or — when the section has no case number — to the
     ruling whose RULING cell cross-references the section's first line
     number.  Each section attaches at most once.  A section with a case
-    number that matches no ruling becomes a new ruling (the table and the
-    summary rows both missed it).  A section's ``Case Name:`` replaces the
+    number that matches no ruling goes to a ruling without a number (a
+    malformed CASE #) whose RULING cell cross-references it, which takes the
+    section's number (#4881); otherwise it becomes a new ruling (the table
+    and the summary rows both missed it).  A section's ``Case Name:`` replaces the
     table's (often truncated / line-wrapped) CASE TITLE.
     """
     by_cn = {r.case_number: r for r in rulings}
@@ -1523,6 +1579,21 @@ def _attach_dept12_bodies(rulings: list[SplitRuling], text: str) -> None:
         target: SplitRuling | None = None
         if s.case_number is not None:
             target = by_cn.get(s.case_number)
+            if target is None:
+                # A row with a malformed CASE # that points at this section:
+                # the section's own ``Case No.:`` names the row's case (#4881),
+                # as in format B.
+                target = next(
+                    (
+                        r
+                        for r in rulings
+                        if r.case_number is None and s.first_line in refs.get(id(r), set())
+                    ),
+                    None,
+                )
+                if target is not None:
+                    target.case_number = s.case_number
+                    by_cn[s.case_number] = target
             if target is None:
                 # One mistyped digit between the table and the body (e.g.
                 # table ``24CV469611``, body ``25CV469611``): the table's
@@ -1555,9 +1626,10 @@ def _split_rulings_dept12(
 ) -> list[SplitRuling]:
     """Dept-12 splitter — see the block comment above (#4681).
 
-    Returns one ``SplitRuling`` per distinct case number, in table order,
-    with ``ruling_index`` 1..N.  Entries that end up with no ruling text at
-    all are dropped (there is nothing to extract from them).  Returns ``[]``
+    Returns one ``SplitRuling`` per distinct case number, plus one with no
+    number per row whose CASE # is malformed (#4881), in table order, with
+    ``ruling_index`` 1..N.  Entries that end up with no ruling text at all
+    are dropped (there is nothing to extract from them).  Returns ``[]``
     on a pdfplumber error so the caller can fall back.
 
     ``headerless`` (#4726): the table has no header row.  The pdfplumber
@@ -1575,20 +1647,30 @@ def _split_rulings_dept12(
     rulings = list(entries.values())
     text_rows = _dept12_text_rows(text, headerless=headerless)
     for cn, row_text in text_rows.items():
-        if cn not in entries:
+        if cn not in entries and not cn.startswith(_CASE_LESS_KEY):
             r = SplitRuling(ruling_index=0, case_number=cn, ruling_text=row_text)
             entries[cn] = r
             rulings.append(r)
+
+    # 3-column tables: pdfplumber missed the RULING column, so use the
+    # flattened summary row instead.  Done before the bodies attach so a
+    # malformed-number row's cross-reference is seen (#4881).
+    for r in rulings:
+        if not r.ruling_text and r.case_number is None and r.raw_case_number:
+            r.ruling_text = text_rows.get(
+                _CASE_LESS_KEY + _normalize_case_number(r.raw_case_number), ""
+            )
 
     _attach_dept12_bodies(rulings, text)
 
     kept: list[SplitRuling] = []
     for r in rulings:
         if not r.ruling_text and r.case_number in text_rows:
-            # 3-column tables: pdfplumber missed the RULING column, so use
-            # the flattened summary row instead.
             r.ruling_text = text_rows[r.case_number]
-        if not r.ruling_text:
+        if r.case_number is None:
+            if not _keep_case_less_row(r, layout="headerless_table" if headerless else "table"):
+                continue
+        elif not r.ruling_text:
             logger.info("dept12_entry_without_text_dropped", case_number=r.case_number)
             continue
         r.ruling_index = len(kept) + 1
