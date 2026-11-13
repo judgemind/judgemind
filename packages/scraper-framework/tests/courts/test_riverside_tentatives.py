@@ -1539,3 +1539,57 @@ class TestRiversideSplitRuling:
         assert r.outcome == "granted"
         assert r.hearing_date == datetime(2026, 3, 2)
         assert r.department == "PS1"
+
+
+# ---------------------------------------------------------------------------
+# #4868 — split entries without their own case number (real PDFs)
+# ---------------------------------------------------------------------------
+
+
+def test_split_rulings_reads_unlawful_detainer_case_numbers() -> None:
+    """#4868: UDME (Menifee unlawful detainer) entries carry their number in
+    the header.  The regex only knew UDPS, so the entry was left without a
+    number — and, before the worker fix, took the PDF's first case."""
+    text = _extract_pdf_text(_load_bytes("riv_ud_case_number_4868.pdf"))
+    assert [r.case_number for r in _split_rulings(text)] == ["CVME2513270", "UDME2501523"]
+
+
+@respx.mock
+def test_case_number_from_source_live_split_child_does_not_take_first_case() -> None:
+    """#4868: the live event's case number is the PDF's first regex match
+    (``PdfLinkScraper.parse_document``), here entry 2's CVPS2402032.  Entry 1
+    prints an Orange County number the Riverside regex does not read, so it
+    has no number of its own: it must not be filed under CVPS2402032."""
+    from ingestion.worker import _try_riverside_pdf_split
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=_load_bytes("riv_caseless_entry_4868.pdf"),
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {}
+    doc = scraper.parse_document(doc)
+    assert doc.case_number == "CVPS2402032"
+
+    event = {
+        "document_id": "aaaaaaaa-0000-0000-0000-000000004868",
+        "county": "Riverside",
+        "content_format": "pdf",
+        "case_number": doc.case_number,
+        "case_title": None,
+        "ruling_text": doc.ruling_text,
+    }
+    captured: list[dict[str, Any]] = []
+    assert _try_riverside_pdf_split(event, event["document_id"], doc.ruling_text, captured.append)
+    assert [c["case_number"] for c in captured] == [
+        None,
+        "CVPS2402032",
+        "CVRI2302682",
+        "CVRI2302682",
+        "CVRI2302682",
+    ]
+    assert [c["_case_number_from_source"] for c in captured] == [False, True, True, True, True]
