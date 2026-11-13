@@ -3176,3 +3176,212 @@ class TestSantaClaraUnparseableCaseNumber4881:
         assert calls[2].kwargs["text_head"] == "See below."
         assert calls[0].kwargs["layout"] == "format_b"
         assert calls[0].kwargs["case_title"] == "C v. D"
+
+
+# ---------------------------------------------------------------------------
+# #4905: format-B ``Calendar Line N`` bodies
+# ---------------------------------------------------------------------------
+#
+# Fixture (trimmed real dev-S3 raw, public court records):
+#   sc_format_b_4905_calendar_line_bodies.pdf — Dept 6-style format-B calendar,
+#       pages 3, 4, 17 and 21 of raw 0e4f93a3…: the summary table plus the
+#       first page of the ``Calendar Line 3`` (Ky v. Hernandez, ``Case No.:
+#       24CV444162``), ``Calendar Line 7`` (Zhan Ping Ye, ``26CV490111``) and
+#       ``Calendar Line 8`` (Citibank v. Chan, ``26CV489051``) bodies.  All
+#       three rows print only ``See below.``; rows 3 and 7 print mistyped
+#       numbers (``24CV44162``, ``26CV49011``).
+
+
+class TestSantaClaraFormatBCalendarLineBodies4905:
+    """A format-B row that says ``See below.`` takes the ``Calendar Line N``
+    body it points at: its text, and — for a row whose printed number is a
+    typo — the body's own ``Case No.:``."""
+
+    def test_format_b_calendar_line_body_attached_by_case_number(self) -> None:
+        """Citibank row 8 (``26CV489051``) was stored as just ``See below.``."""
+        rulings = _fixture_split("sc_format_b_4905_calendar_line_bodies.pdf")
+        citibank = [r for r in rulings if r.case_number == "26CV489051"]
+        assert len(citibank) == 1
+        assert citibank[0].ruling_text.startswith("See below.\n\nCalendar Line 8")
+        assert "Case No.: 26CV489051" in citibank[0].ruling_text
+        assert citibank[0].case_title == "Citibank, N.A. v. Chan"
+        others = [r for r in rulings if r is not citibank[0]]
+        assert not any("Calendar Line 8" in r.ruling_text for r in others)
+
+    def test_format_b_calendar_line_body_names_case_less_row(self) -> None:
+        """Ky (``24CV44162``) and Zhan (``26CV49011``) rows were dropped as
+        pointer-only; each now takes its body's printed number."""
+        rulings = _fixture_split("sc_format_b_4905_calendar_line_bodies.pdf")
+        assert all(r.case_number for r in rulings)
+        by_cn = {r.case_number: r for r in rulings}
+        ky = by_cn["24CV444162"]
+        assert ky.raw_case_number == "24CV44162"
+        assert "Calendar Line 3" in ky.ruling_text
+        assert ky.case_title == "Ky v. Hernandez, et al."
+        zhan = by_cn["26CV490111"]
+        assert zhan.raw_case_number == "26CV49011"
+        assert "Calendar Line 7" in zhan.ruling_text
+        assert len(rulings) == 12
+        assert [r.ruling_index for r in rulings] == list(range(1, 13))
+        # Every other row keeps its own inline ruling, untouched.
+        assert by_cn["23CV426734"].ruling_text.startswith("Plaintiff moves this court")
+        assert "Calendar Line" not in by_cn["23CV426734"].ruling_text
+
+    def test_format_b_calendar_line_body_line_label_alone_never_names_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Row 3's LINE cell matches the body, but its printed number is not
+        one character from the body's: the row keeps no number (and, being
+        pointer-only, is dropped); the body becomes its own entry."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["1", "24CV000001", "A v. B", "Granted."],
+            ["3", "24CV12345", "C v. D", "See below."],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        body = "x" * 120
+        text = f"Calendar Line 3\nCase Name: E v. F\nCase No.: 25CV999999\n{body}\n"
+        rulings = sc._split_rulings_format_b(text, b"%PDF")
+        assert [r.case_number for r in rulings] == ["24CV000001", "25CV999999"]
+        assert rulings[1].case_title == "E v. F"
+        assert body in rulings[1].ruling_text
+        assert rulings[1].raw_case_number is None
+
+    def test_format_b_calendar_line_body_duplicate_case_number_uses_line_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two rows print the same number (raw e8807c77…); the body goes to the
+        row whose LINE cell is the body's line, not to the last row."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["3", "24CV446086", "Diaz-Kelly v. Flowers", "See below."],
+            ["4", "24CV446086", "City of San Jose v. BM Macaw", "See below"],
+            ["5", "24CV000005", "G v. H", "Off calendar."],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        body = "y" * 120
+        text = "Calendar Line 4\nCase Name: City of San Jose v. BW Macaw\n"
+        text += f"Case No.: 24CV446086\n{body}\n"
+        rulings = sc._split_rulings_format_b(text, b"%PDF")
+        assert [r.ruling_text for r in rulings][0] == "See below."
+        assert body in rulings[1].ruling_text
+        assert rulings[1].case_title == "City of San Jose v. BW Macaw"
+        assert len(rulings) == 3
+
+    def test_format_b_calendar_line_body_crossref_not_read_from_attached_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``See Line N`` inside an already-attached long-form body is not
+        the row's own cross-reference: only the cell text counts."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["1", "24CV000001", "A v. B", "See Line 1 below."],
+            ["2", "24CV000002", "C v. D", "Granted."],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        filler = "z" * 100
+        text = (
+            f"Line 1\nCase No.: 24CV000001\nas noted, see Line 9 for the companion. {filler}\n"
+            "Line 2\n"
+            f"Calendar Line 9\nCase Name: no number printed\n{filler}\n"
+        )
+        rulings = sc._split_rulings_format_b(text, b"%PDF")
+        assert [r.case_number for r in rulings] == ["24CV000001", "24CV000002"]
+        assert "Calendar Line 9" not in rulings[0].ruling_text
+
+    def test_format_b_calendar_line_body_line_n_section_stops_at_next_calendar_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dept 6 (raw c70aceec…) prints ``Line 1`` over ``Calendar Line 1``;
+        row 1's ``See Line Item 1`` section used to run on through row 2's
+        ``Calendar Line 2`` body.  Each row now has only its own body, once."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["9:00", "25CV460651", "Espino v. GM", "See Line Item 1 below"],
+            ["9:00", "25CV474358", "Wei v. FCA", "See Line Item 2 below"],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        espino, wei = "e" * 100, "w" * 100
+        text = (
+            "Line 1\n"
+            f"Calendar Line 1\nCase Name: Espino v. GM\nCase No.: 25CV460651\n{espino}\n"
+            f"Calendar Line 2\nCase Name: Wei v. FCA\nCase No.: 25CV474358\n{wei}\n"
+        )
+        rulings = sc._split_rulings_format_b(text, b"%PDF")
+        assert [r.case_number for r in rulings] == ["25CV460651", "25CV474358"]
+        assert rulings[0].ruling_text.count("Calendar Line 1") == 1
+        assert wei not in rulings[0].ruling_text
+        assert wei in rulings[1].ruling_text
+
+    def test_format_b_calendar_line_body_second_body_joins_its_case(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Raw 184e3a94…: Alcantar has bodies on lines 3 and 4; row 7 repeats
+        Alcantar's number by mistake.  Both bodies go to row 3; Saigon's own
+        body (``25CV471826``) becomes its own entry."""
+        import courts.ca.sc_tentatives as sc
+
+        table = [
+            ["LINE", "CASE NO.", "CASE TITLE", "TENTATIVE RULING"],
+            ["9:00 3", "25CV461594", "Alcantar v. GM", "See Line Item 3 below."],
+            ["9:00 7", "25CV461594", "Saigon v. Brink's", "See Line Item 7 below"],
+        ]
+        monkeypatch.setattr(sc.pdfplumber, "open", lambda _f: _FakePdf([_FakePage([table])]))
+        a3, a4, s7 = "a" * 100, "b" * 100, "s" * 100
+        text = (
+            f"Calendar Line 3\nCase No.: 25CV461594\n{a3}\n"
+            f"Calendar Line 4\nCase No.: 25CV461594\n{a4}\n"
+            f"Calendar Line 7\nCase Name: Saigon v. Brink's\nCase No.: 25CV471826\n{s7}\n"
+        )
+        rulings = sc._split_rulings_format_b(text, b"%PDF")
+        assert [r.case_number for r in rulings] == ["25CV461594", "25CV461594", "25CV471826"]
+        assert a3 in rulings[0].ruling_text
+        assert a4 in rulings[0].ruling_text
+        assert rulings[1].ruling_text == "See Line Item 7 below"
+        assert s7 in rulings[2].ruling_text
+
+    @pytest.mark.parametrize(
+        ("label", "expected"),
+        [
+            ("3", {3}),
+            ("1,2", {1, 2}),
+            ("3-5", {3, 4, 5}),
+            ("1 – 2", {1, 2}),
+            (";", set()),
+            ("9:00 3", {3}),
+            ("9:01 5-6", {5, 6}),
+        ],
+    )
+    def test_format_b_line_label_numbers(self, label: str, expected: set[int]) -> None:
+        from courts.ca.sc_tentatives import _line_label_numbers
+
+        assert _line_label_numbers(label) == expected
+
+    def test_format_b_line_label_numbers_reversed_range(self) -> None:
+        from courts.ca.sc_tentatives import _line_label_numbers
+
+        assert _line_label_numbers("9-2") == {9, 2}
+
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            ("24CV44162", "24CV444162", True),
+            ("26CV49011", "26CV490111", True),
+            ("23CV415524", "23CV415624", True),
+            ("24CV12345", "25CV999999", False),
+            ("24CV4416", "24CV444162", False),
+            ("24CV444162", "24CV444162", False),
+        ],
+    )
+    def test_format_b_one_edit_apart(self, a: str, b: str, expected: bool) -> None:
+        from courts.ca.sc_tentatives import _one_edit_apart
+
+        assert _one_edit_apart(a, b) is expected
