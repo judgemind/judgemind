@@ -80,18 +80,39 @@ assert_bounded() {
     fi
 }
 
+
+# Every case below blocks on a hung call for ~5-10s, so they all run at once
+# (in the background) and are asserted afterwards. That keeps this file at
+# ~12s of wall clock inside the 10-minute shell-fast CI shard.
+RES_DIR="$TMP_ROOT/results"
+mkdir -p "$RES_DIR"
+
+# launch <id> <cmd...> — run <cmd> in the background, recording its exit
+# code, wall seconds and combined output under $RES_DIR.
+launch() {
+    local id="$1"
+    shift
+    (
+        start=$SECONDS
+        rc=0
+        "$@" > "$RES_DIR/$id.out" 2>&1 || rc=$?
+        echo "$rc $((SECONDS - start))" > "$RES_DIR/$id.rc"
+    ) &
+}
+
 RUN_RC=0
 RUN_OUT=""
 RUN_TOOK=0
-# run_timed <cmd...> — sets RUN_RC, RUN_OUT, RUN_TOOK.
-run_timed() {
-    local start=$SECONDS
-    RUN_RC=0
-    RUN_OUT=$("$@" 2>&1) || RUN_RC=$?
-    RUN_TOOK=$((SECONDS - start))
+# collect <id> — sets RUN_RC, RUN_TOOK and RUN_OUT from a finished launch.
+collect() {
+    local line
+    line=$(cat "$RES_DIR/$1.rc" 2>/dev/null || echo "missing 999")
+    RUN_RC="${line%% *}"
+    RUN_TOOK="${line##* }"
+    RUN_OUT=$(cat "$RES_DIR/$1.out" 2>/dev/null || true)
 }
 
-# ── Library unit tests ──────────────────────────────────────────────────────
+# ── Library probe ───────────────────────────────────────────────────────────
 
 LIB_PROBE="$TMP_ROOT/lib_probe.sh"
 cat > "$LIB_PROBE" << PROBE
@@ -124,60 +145,23 @@ esac
 PROBE
 chmod +x "$LIB_PROBE"
 
-run_timed "$LIB_PROBE" hang
-if grep -q "rc=124 out=partial" <<< "$RUN_OUT" && [[ $RUN_TOOK -le 10 ]]; then
-    pass "lib: a hung call returns 124 with its partial output, in time (${RUN_TOOK}s)"
-else
-    fail "lib: a hung call returns 124 with its partial output, in time" "took=${RUN_TOOK}s out=$RUN_OUT"
-fi
-if grep -q "timed out: probe hang" <<< "$RUN_OUT"; then
-    pass "lib: a killed call is logged by name"
-else
-    fail "lib: a killed call is logged by name" "out=$RUN_OUT"
-fi
-
-run_timed "$LIB_PROBE" ok
-if grep -q "rc=7 out=hello" <<< "$RUN_OUT"; then
-    pass "lib: a normal call passes its output and exit status through"
-else
-    fail "lib: a normal call passes its output and exit status through" "out=$RUN_OUT"
-fi
-
-run_timed "$LIB_PROBE" slow
-if grep -q "slow call: probe slow took 2s" <<< "$RUN_OUT"; then
-    pass "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration"
-else
-    fail "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration" "out=$RUN_OUT"
-fi
-
-RUN_RC=0
+launch lib_hang "$LIB_PROBE" hang
+launch lib_ok "$LIB_PROBE" ok
+launch lib_slow "$LIB_PROBE" slow
 # Budget 8s: one call's worth is min(5, 8/4) = 2s, so after 7s it is spent.
-RUN_OUT=$(PROBE_BUDGET=8 PROBE_SLEEP=7 "$LIB_PROBE" exhausted 2>&1) || RUN_RC=$?
-if grep -q "not-exhausted-at-start" <<< "$RUN_OUT" && grep -q "exhausted-late" <<< "$RUN_OUT" \
-    && ! grep -q "not-exhausted-late" <<< "$RUN_OUT"; then
-    pass "lib: exhausted once less than one call's worth of budget is left"
-else
-    fail "lib: exhausted once less than one call's worth of budget is left" "out=$RUN_OUT"
-fi
+launch lib_exhausted env PROBE_BUDGET=8 PROBE_SLEEP=7 "$LIB_PROBE" exhausted
 
-# The slow-call log must be greppable in the helpers the issue names.
-if grep -q "slow call" "$SCRIPT_DIR/_wait_budget_lib.sh" \
-    && grep -q "slow call" "$SCRIPT_DIR/wait-for-ci.sh"; then
-    pass "slow-call logging is documented in the lib and wait-for-ci.sh"
-else
-    fail "slow-call logging is documented in the lib and wait-for-ci.sh"
-fi
+# ── Helper cases ────────────────────────────────────────────────────────────
 
-# ── wait-for-ci.sh ──────────────────────────────────────────────────────────
-
+# wait-for-ci.sh: the head-SHA lookup hangs.
 BIN=$(make_bin ci_all)
 write_hang_stub "$BIN" gh
-run_timed env PATH="$BIN:$PATH" \
+launch ci_all env PATH="$BIN:$PATH" \
     WAIT_FOR_CI_RERUN_SENTINEL_FILE="$BIN/state/rerun" \
     WAIT_FOR_CI_FLAKE_LOG="$BIN/state/flakes.jsonl" \
     "$SCRIPT_DIR/wait-for-ci.sh" 42 --timeout-secs "$BUDGET" --poll-interval 1
-assert_bounded "wait-for-ci (head-SHA lookup hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh pr view"
 
+# wait-for-ci.sh: the SHA resolves, then the check-runs read hangs.
 BIN=$(make_bin ci_checks)
 cat > "$BIN/gh" << 'STUB'
 #!/usr/bin/env bash
@@ -187,60 +171,41 @@ esac
 exec /bin/sleep 3600
 STUB
 chmod +x "$BIN/gh"
-run_timed env PATH="$BIN:$PATH" \
+launch ci_checks env PATH="$BIN:$PATH" \
     WAIT_FOR_CI_RERUN_SENTINEL_FILE="$BIN/state/rerun" \
     WAIT_FOR_CI_FLAKE_LOG="$BIN/state/flakes.jsonl" \
     "$SCRIPT_DIR/wait-for-ci.sh" 42 --timeout-secs "$BUDGET" --poll-interval 1
-assert_bounded "wait-for-ci (check-runs read hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh api check-runs"
-
-# ── wait-for-run.sh ─────────────────────────────────────────────────────────
 
 BIN=$(make_bin run)
 write_hang_stub "$BIN" gh
-run_timed env PATH="$BIN:$PATH" \
+launch run env PATH="$BIN:$PATH" \
     "$SCRIPT_DIR/wait-for-run.sh" 12345 --timeout-secs "$BUDGET" --poll-interval 1
-assert_bounded "wait-for-run" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh run view"
-
-# ── ecs-wait-task.sh ────────────────────────────────────────────────────────
 
 BIN=$(make_bin wait_task)
 write_hang_stub "$BIN" aws
-run_timed env PATH="$BIN:$PATH" \
+launch wait_task env PATH="$BIN:$PATH" \
     "$SCRIPT_DIR/ecs-wait-task.sh" --timeout-secs "$BUDGET" --poll-interval 1 \
     arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
-assert_bounded "ecs-wait-task" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-tasks"
-
-# ── wait-for-rollout.sh ─────────────────────────────────────────────────────
 
 BIN=$(make_bin rollout)
 write_hang_stub "$BIN" aws
-run_timed env PATH="$BIN:$PATH" AWS_CLI="$BIN/aws" \
+launch rollout env PATH="$BIN:$PATH" AWS_CLI="$BIN/aws" \
     ECS_CLUSTER=c ECS_SERVICE=s NEW_DEPLOYMENT_ID=ecs-svc/123 \
     ROLLOUT_TIMEOUT_SECS="$BUDGET" ROLLOUT_POLL_INTERVAL=1 \
     "$SCRIPT_DIR/wait-for-rollout.sh"
-assert_bounded "wait-for-rollout" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-services"
-
-# ── ecs-redeploy.sh ─────────────────────────────────────────────────────────
 
 BIN=$(make_bin redeploy_attach)
 write_hang_stub "$BIN" aws
-run_timed env PATH="$BIN:$PATH" ROLLOUT_TIMEOUT_SECS="$BUDGET" ROLLOUT_POLL_INTERVAL=1 \
+launch redeploy_attach env PATH="$BIN:$PATH" ROLLOUT_TIMEOUT_SECS="$BUDGET" ROLLOUT_POLL_INTERVAL=1 \
     "$SCRIPT_DIR/ecs-redeploy.sh" my-svc my-cluster --deployment-id ecs-svc/123
-assert_bounded "ecs-redeploy --deployment-id" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-services"
 
 BIN=$(make_bin redeploy_update)
 write_hang_stub "$BIN" aws
-run_timed env PATH="$BIN:$PATH" ROLLOUT_TIMEOUT_SECS="$BUDGET" \
+launch redeploy_update env PATH="$BIN:$PATH" ROLLOUT_TIMEOUT_SECS="$BUDGET" \
     "$SCRIPT_DIR/ecs-redeploy.sh" my-svc my-cluster
-assert_bounded "ecs-redeploy (update-service hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs update-service"
-if grep -q -- "--deployment-id" <<< "$RUN_OUT"; then
-    pass "ecs-redeploy (update-service hangs): points at --deployment-id, not a blind re-run"
-else
-    fail "ecs-redeploy (update-service hangs): points at --deployment-id, not a blind re-run" "output=$RUN_OUT"
-fi
 
-# ── ecs-logs.sh --follow ────────────────────────────────────────────────────
-
+# ecs-logs.sh --follow: the stream lookup and first fetch work, later
+# fetches hang.
 BIN=$(make_bin logs_follow)
 cat > "$BIN/aws" << 'STUB'
 #!/usr/bin/env bash
@@ -263,8 +228,89 @@ esac
 exit 0
 STUB
 chmod +x "$BIN/aws"
-run_timed env PATH="$BIN:$PATH" ECS_LOGS_FOLLOW_MAX_SECS="$BUDGET" ECS_LOGS_POLL_INTERVAL=1 \
+launch logs_follow env PATH="$BIN:$PATH" ECS_LOGS_FOLLOW_MAX_SECS="$BUDGET" ECS_LOGS_POLL_INTERVAL=1 \
     "$SCRIPT_DIR/ecs-logs.sh" /ecs/judgemind-ingestion-worker-dev --task abc123 --follow
+
+wait
+
+# ── Library assertions ──────────────────────────────────────────────────────
+
+collect lib_hang
+if grep -q "rc=124 out=partial" <<< "$RUN_OUT" && [[ $RUN_TOOK -le 10 ]]; then
+    pass "lib: a hung call returns 124 with its partial output, in time (${RUN_TOOK}s)"
+else
+    fail "lib: a hung call returns 124 with its partial output, in time" "took=${RUN_TOOK}s out=$RUN_OUT"
+fi
+if grep -q "timed out: probe hang" <<< "$RUN_OUT"; then
+    pass "lib: a killed call is logged by name"
+else
+    fail "lib: a killed call is logged by name" "out=$RUN_OUT"
+fi
+
+collect lib_ok
+if grep -q "rc=7 out=hello" <<< "$RUN_OUT"; then
+    pass "lib: a normal call passes its output and exit status through"
+else
+    fail "lib: a normal call passes its output and exit status through" "out=$RUN_OUT"
+fi
+if [[ $RUN_TOOK -le 1 ]]; then
+    pass "lib: a fast call returns at once (no watchdog linger, ${RUN_TOOK}s)"
+else
+    fail "lib: a fast call returns at once (no watchdog linger)" "took ${RUN_TOOK}s"
+fi
+
+collect lib_slow
+if grep -q "slow call: probe slow took 2s" <<< "$RUN_OUT"; then
+    pass "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration"
+else
+    fail "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration" "out=$RUN_OUT"
+fi
+
+collect lib_exhausted
+if grep -q "not-exhausted-at-start" <<< "$RUN_OUT" && grep -q "exhausted-late" <<< "$RUN_OUT" \
+    && ! grep -q "not-exhausted-late" <<< "$RUN_OUT"; then
+    pass "lib: exhausted once less than one call's worth of budget is left"
+else
+    fail "lib: exhausted once less than one call's worth of budget is left" "out=$RUN_OUT"
+fi
+
+# The slow-call log must be greppable in the helpers the issue names.
+if grep -q "slow call" "$SCRIPT_DIR/_wait_budget_lib.sh" \
+    && grep -q "slow call" "$SCRIPT_DIR/wait-for-ci.sh"; then
+    pass "slow-call logging is documented in the lib and wait-for-ci.sh"
+else
+    fail "slow-call logging is documented in the lib and wait-for-ci.sh"
+fi
+
+# ── Helper assertions ───────────────────────────────────────────────────────
+
+collect ci_all
+assert_bounded "wait-for-ci (head-SHA lookup hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh pr view"
+
+collect ci_checks
+assert_bounded "wait-for-ci (check-runs read hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh api check-runs"
+
+collect run
+assert_bounded "wait-for-run" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "gh run view"
+
+collect wait_task
+assert_bounded "ecs-wait-task" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-tasks"
+
+collect rollout
+assert_bounded "wait-for-rollout" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-services"
+
+collect redeploy_attach
+assert_bounded "ecs-redeploy --deployment-id" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs describe-services"
+
+collect redeploy_update
+assert_bounded "ecs-redeploy (update-service hangs)" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws ecs update-service"
+if grep -q -- "--deployment-id" <<< "$RUN_OUT"; then
+    pass "ecs-redeploy (update-service hangs): points at --deployment-id, not a blind re-run"
+else
+    fail "ecs-redeploy (update-service hangs): points at --deployment-id, not a blind re-run" "output=$RUN_OUT"
+fi
+
+collect logs_follow
 assert_bounded "ecs-logs --follow" "$RUN_RC" "$RUN_TOOK" "$RUN_OUT" "aws logs get-log-events"
 if grep -q "first-line" <<< "$RUN_OUT"; then
     pass "ecs-logs --follow: still prints the events it did fetch"

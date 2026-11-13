@@ -85,9 +85,22 @@ ecs_exec_run_with_timeout() {
             waited=$((waited + 1))
         done
     ) </dev/null >/dev/null 2>&1 &
+    local watchdog_pid=$!
 
     local rc=0
     wait "$cmd_pid" 2>/dev/null || rc=$?
+
+    # Stop the watchdog now rather than letting it notice on its next tick.
+    # While bash runs a function with redirections it keeps saved copies of
+    # the caller's stdout/stderr on high fds, and the watchdog and its
+    # `sleep 1` child inherit them. Inside a caller's $(...), a lingering
+    # watchdog held the capture pipe open for up to a second after every
+    # call (#4850). Kill the sleep child first (so it is not orphaned still
+    # holding the pipe), then the watchdog. Reaping it with `wait` keeps
+    # bash from printing a "Terminated" job notice on stderr.
+    pkill -P "$watchdog_pid" 2>/dev/null || true
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
 
     if [[ -e "$marker" ]]; then
         rm -rf "$marker_dir"
