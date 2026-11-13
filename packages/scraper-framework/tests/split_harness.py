@@ -12,6 +12,11 @@ properties that must hold for any sequence of re-splits:
   ``previous_version_id`` cycle (``scripts/audit_supersede_integrity.py``);
 - ``search``: every document with a ruling has exactly one search doc, with
   that ruling's text, and no search doc exists without a ruling;
+- ``search_fields``: every search doc the worker wrote still carries the
+  metadata (judge name, case title, hearing date, ...) of the doc built
+  from ``derived.*`` now, for every key the harness has written, not only
+  the one the step touched.  A judge rename made by one key's write must
+  re-index the judge's rulings on other keys (#4920);
 - ``date_source``: a ruling with a ``hearing_date`` has a
   ``hearing_date_source``;
 - ``synthetic_title``: a ruling on its own synthetic ``UNKNOWN-<document id>``
@@ -66,6 +71,8 @@ from unittest.mock import MagicMock, patch
 import psycopg
 
 from framework.llm_schema import ExtractedRuling
+from framework.search.indexer import search_doc_metadata
+from framework.search.ruling_doc import load_search_events
 from ingestion.split_ids import derive_parent_document_id, make_split_document_id
 
 CAPTURED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
@@ -80,6 +87,7 @@ INVARIANTS = (
     "alert",
     "superseded",
     "search",
+    "search_fields",
     "date_source",
     "synthetic_title",
     "converge",
@@ -110,6 +118,8 @@ class Spec:
     case_number: str | None
     title: str | None
     text: str
+    #: The judge name the extraction reads for the ruling (#4920).
+    judge: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +294,7 @@ def extracted_rulings(step: Step) -> list[ExtractedRuling]:
             ExtractedRuling(
                 extracted_case_number=spec.case_number,
                 extracted_case_title=spec.title,
+                extracted_judge_name=spec.judge if is_ruling else None,
                 ruling_text=spec.text if is_ruling else "",
                 hearing_date=HEARING.isoformat(),
                 motion_type="demurrer" if is_ruling else None,
@@ -340,18 +351,28 @@ def ruling_identities(rows: list[DocRow]) -> Counter[tuple[str, str]]:
 
 
 class StubIndexer:
-    """Records the search index as ``{document id: indexed ruling text}``."""
+    """Records the search index as ``{document id: indexed ruling text}``,
+    and the indexed metadata of each doc as ``meta``."""
 
     def __init__(self) -> None:
         self.docs: dict[str, str | None] = {}
+        self.meta: dict[str, dict[str, Any]] = {}
 
     def index_document(self, event: dict[str, Any], *, force: bool = False) -> bool:
-        self.docs[str(event["document_id"])] = event.get("ruling_text")
+        doc_id = str(event["document_id"])
+        self.docs[doc_id] = event.get("ruling_text")
+        self.meta[doc_id] = search_doc_metadata(event)
         return True
+
+    def index_batch(self, events: list[dict[str, Any]], *, force: bool = False) -> int:
+        for event in events:
+            self.index_document(event, force=force)
+        return len(events)
 
     def delete_documents(self, document_ids: list[str]) -> int:
         for doc_id in document_ids:
             self.docs.pop(str(doc_id), None)
+            self.meta.pop(str(doc_id), None)
         return len(document_ids)
 
 
@@ -434,12 +455,15 @@ class Key:
         return self.slots.get(doc_id, f"X:{doc_id[:8]}")
 
 
-def make_key(tag: str) -> Key:
+def make_key(tag: str, county_tag: str | None = None) -> Key:
     content_hash = hashlib.sha256(tag.encode()).hexdigest()
     parent = derive_parent_document_id(content_hash)
     # Each key gets its own county (so its own court and case rows); the
     # slug is in the key, where the reingest script reads the county from.
-    county_slug = f"harness_{hashlib.sha1(tag.encode()).hexdigest()[:10]}"
+    # Keys made with the same *county_tag* share a county, so their rulings
+    # share a court and its judges (#4920).
+    county_seed = county_tag or tag
+    county_slug = f"harness_{hashlib.sha1(county_seed.encode()).hexdigest()[:10]}"
     return Key(
         s3_key=f"ca/{county_slug}/superior_court/raw/{content_hash}.pdf",
         content_hash=content_hash,
@@ -564,6 +588,7 @@ class KeyHarness:
         self._guard("gap", self._check_gap, before, after)
         self._guard("alert", self._check_alerts, key, after_rows)
         self._guard("search", self._check_search, key, after_rows)
+        self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
         if step.kind != "db":
             # A DB-row reingest only rewrites rows it selects, so it can
@@ -714,6 +739,28 @@ class KeyHarness:
                     "search",
                     f"search doc {key.label(doc_id)} exists without a ruling "
                     f"(holds {(indexed[doc_id] or '')[:24]!r})",
+                )
+
+    def _check_search_fields(self) -> None:
+        """Every search doc the worker wrote matches the doc built from
+        ``derived.*`` now, on every key, not only the one this step wrote:
+        a write that renames a judge changes the judge name of rulings it
+        never touched (#4920)."""
+        if not self.indexer.meta:
+            return
+        expected = load_search_events(self.checker, list(self.indexer.meta))
+        for doc_id, have in sorted(self.indexer.meta.items()):
+            event = expected.get(doc_id)
+            if event is None:
+                continue  # no ruling: the ``search`` invariant covers it
+            want = search_doc_metadata(event)
+            drift = sorted(f for f in want if want[f] != have.get(f))
+            if drift:
+                name = drift[0]
+                self._fail(
+                    "search_fields",
+                    f"search doc {doc_id[:8]} has {name}={have.get(name)!r}, "
+                    f"derived.* has {want[name]!r} (drifted fields: {drift})",
                 )
 
     def _check_rows(self, key: Key, rows: list[DocRow], step: Step) -> None:

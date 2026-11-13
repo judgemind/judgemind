@@ -298,3 +298,82 @@ def test_misread_repeated_in_llm_transcription_still_relinks() -> None:
     assert old_case == _MISREAD
     assert new_case.startswith("UNKNOWN-")
     assert new_id == old_id and new_alert == old_id
+
+
+# ---------------------------------------------------------------------------
+# #4920: a judge rename re-indexes the judge's rulings on other keys
+# ---------------------------------------------------------------------------
+
+
+def _judge_ruling_step(kind: str, tag: str, idx: int, judge: str) -> harness.Step:
+    spec = harness.Spec(
+        idx, harness._case_number(idx), harness._title(idx), harness._text(tag, idx), judge
+    )
+    return harness.Step(kind, (harness.Row("ruling", 0),), (spec,))
+
+
+def _judge_canonical(h: harness.KeyHarness, key: harness.Key) -> list[str]:
+    with h.checker.cursor() as cur:
+        cur.execute(
+            "SELECT j.canonical_name FROM rulings r JOIN documents d ON d.id = r.document_id "
+            "JOIN judges j ON j.id = r.judge_id WHERE d.s3_key = %s",
+            (key.s3_key,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+@_needs_pg
+def test_judge_rename_reindexes_rulings_on_other_keys() -> None:
+    """A write that lengthens a judge's canonical name (``resolve_judge``'s
+    near-duplicate step, "Rafael Sivilla-Jones" -> "Rafael A. Sivilla-Jones")
+    re-indexes that judge's rulings on every other key (#4920).  Before the
+    fix only the writing key's own doc was re-indexed, and the other key's
+    search doc kept the old name until ``reindex_search_from_db.py --apply``
+    (the Santa Clara #4905 reingest left 42 such docs)."""
+    tag = f"{_RUN}-b4920"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
+    try:
+        first = harness.make_key(f"{tag}-a", county_tag=tag)
+        second = harness.make_key(f"{tag}-b", county_tag=tag)
+        h.run_step(first, _judge_ruling_step("live", tag, 1, "Rafael Sivilla-Jones"), "short")
+        assert _judge_canonical(h, first) == ["Rafael Sivilla-Jones"]
+
+        h.run_step(
+            second, _judge_ruling_step("reingest", tag, 2, "Rafael A. Sivilla-Jones"), "long"
+        )
+
+        assert _judge_canonical(h, first) == ["Rafael A. Sivilla-Jones"]
+        assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Rafael A. Sivilla-Jones"}
+    finally:
+        h.close()
+
+
+@_needs_pg
+def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
+    """Arbitration (``_maybe_arbitrate``) promoting a corroborated spelling
+    over the stored canonical re-indexes the judge's other rulings too
+    (#4920).  This is the path that flipped Orange's "Craig L. Griffin"
+    (469 rulings) during the #4907 reingest."""
+    tag = f"{_RUN}-b4920arb"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
+    try:
+        first = harness.make_key(f"{tag}-a", county_tag=tag)
+        second = harness.make_key(f"{tag}-b", county_tag=tag)
+        h.run_step(first, _judge_ruling_step("live", tag, 1, "Shaina H. Clover"), "stored")
+        assert _judge_canonical(h, first) == ["Shaina H. Clover"]
+        # An earlier run read the judge as "Shaina Clover": a non-roster
+        # alias corroborating that spelling.
+        with h.checker.cursor() as cur:
+            cur.execute(
+                "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified) "
+                "SELECT r.judge_id, 'Shaina Clover', 'rebuild-ca-harness', 1.0, FALSE "
+                "FROM rulings r WHERE r.document_id = %s::uuid",
+                (first.parent,),
+            )
+
+        h.run_step(second, _judge_ruling_step("reingest", tag, 2, "Shaina Clover"), "arbitrate")
+
+        assert _judge_canonical(h, first) == ["Shaina Clover"]
+        assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Shaina Clover"}
+    finally:
+        h.close()

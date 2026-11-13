@@ -590,6 +590,7 @@ class TestReingestKeysPrePass:
         assert args[2] == [_SURNAME_KEY, _BOILERPLATE_KEY]
         assert args[3] == _PREFIX_BUCKET
         assert args[4] == _PREFIX_COURT_IDS
+        assert kwargs.pop("renamed_judge_ids") == set()
         assert kwargs == {"parse_timeout": 12.5, "concurrency": 2}
         assert pipe.submitted == [_SURNAME_KEY, _BOILERPLATE_KEY]
         assert stats["processed"] == 2
@@ -621,6 +622,112 @@ class TestReingestKeysPrePass:
         assert "judge_prepass_judges_seeded" not in stats
 
 
+class TestPrePassRenamedJudges:
+    """#4920: judges the pre-pass renames have their rulings re-indexed."""
+
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.extract_judge_name", return_value="KARINE A. MKRTCHYAN")
+    @patch("reingest_from_s3._extract_text_from_content", return_value="text")
+    @patch("reingest_from_s3._fetch_s3_content", return_value=b"raw")
+    def test_seed_passes_the_renamed_set_to_resolve_judge(
+        self,
+        _fetch: MagicMock,
+        _text: MagicMock,
+        _judge: MagicMock,
+        mock_resolve_judge: MagicMock,
+    ) -> None:
+        def rename(_conn: Any, _name: str, _court: str, **kwargs: Any) -> str:
+            kwargs["renamed_judge_ids"].add("judge-1")
+            return "judge-1"
+
+        mock_resolve_judge.side_effect = rename
+        renamed: set[str] = set()
+        with patch(
+            "reingest_from_s3._looks_like_valid_judge_name", side_effect=_looks_valid
+        ):
+            reingest._seed_judges_from_keys(
+                MagicMock(),
+                MagicMock(),
+                [_BOILERPLATE_KEY],
+                _PREFIX_BUCKET,
+                _PREFIX_COURT_IDS,
+                parse_timeout=1.0,
+                concurrency=1,
+                renamed_judge_ids=renamed,
+            )
+
+        assert renamed == {"judge-1"}
+
+    def test_reingest_reindexes_judges_the_prepass_renamed(self) -> None:
+        def seed(*_args: Any, **kwargs: Any) -> dict[str, int]:
+            kwargs["renamed_judge_ids"].add("judge-1")
+            return _PREPASS_STATS
+
+        with (
+            _Pipeline() as pipe,
+            patch("reingest_from_s3._reindex_renamed_judges") as mock_reindex,
+            patch.dict(os.environ, {"OPENSEARCH_URL": "https://os.example"}),
+        ):
+            pipe.seed_judges.side_effect = seed
+            _run_keys()
+
+        mock_reindex.assert_called_once_with(
+            "postgresql://test", "https://os.example", _PREFIX_BUCKET, {"judge-1"}
+        )
+
+    def test_no_renamed_judges_touches_nothing(self) -> None:
+        with patch("reingest_from_s3.psycopg") as mock_psycopg:
+            reingest._reindex_renamed_judges("dsn", "https://os", "b", set())
+        mock_psycopg.connect.assert_not_called()
+
+    def test_without_opensearch_logs_and_skips(self) -> None:
+        with (
+            patch("reingest_from_s3.psycopg") as mock_psycopg,
+            patch("reingest_from_s3.logger") as mock_logger,
+        ):
+            reingest._reindex_renamed_judges("dsn", "", "b", {"judge-1"})
+        mock_psycopg.connect.assert_not_called()
+        assert mock_logger.warning.call_args.args[0] == (
+            "judge_prepass_renamed_judges_not_reindexed"
+        )
+
+    def _framework_modules(self, reindex: MagicMock) -> dict[str, MagicMock]:
+        ruling_doc = MagicMock()
+        ruling_doc.reindex_judge_rulings = reindex
+        return {
+            "framework": MagicMock(),
+            "framework.opensearch_client": MagicMock(),
+            "framework.s3_cache": MagicMock(),
+            "framework.search": MagicMock(),
+            "framework.search.indexer": MagicMock(),
+            "framework.search.ruling_doc": ruling_doc,
+        }
+
+    def test_reindexes_the_renamed_judges(self) -> None:
+        reindex = MagicMock(return_value=3)
+        with (
+            patch.dict(sys.modules, self._framework_modules(reindex)),
+            patch("reingest_from_s3.psycopg") as mock_psycopg,
+            patch("reingest_from_s3.logger") as mock_logger,
+        ):
+            reingest._reindex_renamed_judges("dsn", "https://os", "b", {"judge-1"})
+
+        mock_psycopg.connect.assert_called_once_with("dsn")
+        assert reindex.call_args.args[2] == {"judge-1"}
+        assert mock_logger.info.call_args.kwargs["rulings"] == 3
+
+    def test_reindex_failure_is_logged_not_raised(self) -> None:
+        reindex = MagicMock(side_effect=RuntimeError("os down"))
+        with (
+            patch.dict(sys.modules, self._framework_modules(reindex)),
+            patch("reingest_from_s3.psycopg"),
+            patch("reingest_from_s3.logger") as mock_logger,
+        ):
+            reingest._reindex_renamed_judges("dsn", "https://os", "b", {"judge-1"})
+
+        assert "reindex_failed" in mock_logger.warning.call_args.args[0]
+
+
 class TestRunReingestPrePass:
     """DB-row mode reaches the pre-pass through ``_reingest_keys``."""
 
@@ -645,6 +752,7 @@ class TestRunReingestPrePass:
         args, kwargs = pipe.seed_judges.call_args
         assert args[2] == selected
         assert args[4] == _PREFIX_COURT_IDS
+        assert kwargs.pop("renamed_judge_ids") == set()
         assert kwargs == {"parse_timeout": 7.0, "concurrency": 3}
         assert pipe.submitted == selected
         assert stats["judge_prepass_judges_seeded"] == 1
@@ -691,6 +799,7 @@ class TestRunReingestFromPrefixPrePass:
         assert pipe.events == ["prepass", "pool"]
         args, kwargs = pipe.seed_judges.call_args
         assert args[2] == listed
+        assert kwargs.pop("renamed_judge_ids") == set()
         assert kwargs == {"parse_timeout": 9.0, "concurrency": 4}
         assert stats["judge_prepass_judges_seeded"] == 1
 
