@@ -395,8 +395,10 @@ GitHub's `mergeStateStatus` field — exposed by `gh pr view --json mergeStateSt
 **Correct merge gate** (use this, not `mergeStateStatus == CLEAN`):
 
 1. `mergeable == MERGEABLE` (GitHub can compute a merge commit — no conflicts), AND
-2. The **required** status check — `ci-passed` on this repo — has `conclusion: SUCCESS` on its latest run, AND
+2. The **required** status check — `ci-passed` on this repo — has `conclusion: SUCCESS` on its latest run, and no other `ci-passed` run on the head SHA is still in progress (#4965), AND
 3. No *latest* non-required check has `conclusion: FAILURE` (a failed required-ish check on the current SHA — distinct from a stale failed run already addressed by a rerun).
+
+`UNSTABLE` is not a blocker, but `BLOCKED` is: it means branch protection has not accepted the PR (typically a `ci-passed` run still in progress), and `gh pr merge` will refuse. Wait for it with `scripts/wait-for-ci.sh <N>`, which encodes this whole gate; never bypass it with the REST merge endpoint, which skips required checks for an admin token (#4965).
 
 `SKIPPED` is fine. `CANCELLED` on a non-required check is usually fine — it frequently comes from a Vercel / smoke-test concurrency guard superseding an older deploy (`Canceling since a higher priority waiting request exists`) and doesn't reflect a real failure. `UNSTABLE` with gates (1)-(3) satisfied is safe to merge.
 

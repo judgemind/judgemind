@@ -857,7 +857,7 @@ Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 scripts/wait-for-ci.sh <PR-N>
 ```
 
-This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 via either of two paths: (a) the canonical-merge-gate fast-path — `mergeable == MERGEABLE`, any `ci-passed` entry is `success`, no latest check has failed — fires immediately even if stale `in_progress` entries from a superseded CI run linger in the response (#4069); (b) the all-checks-complete fallback — `pending == 0`, `ci-passed` is `success`, no failures, `mergeStateStatus` is `CLEAN` or `UNSTABLE` — fires when CI legitimately drains to zero pending. Stdout names the path explicitly with `canonical merge gate green` or `all checks complete`. Exit 1 = failure.
+This polls the check-runs API with `filter=latest` and exits 0 only when the PR can merge through the protected path (#4965): no `ci-passed` check run on the head SHA is still in progress, the newest `ci-passed` run is `success`, no latest check has failed, and `mergeStateStatus` is `CLEAN`, `UNSTABLE` or `HAS_HOOKS`. `BLOCKED` keeps it waiting: branch protection has not accepted the PR yet, so `gh pr merge` would refuse. Pending entries from non-required checks (Vercel, smoke tests) and `cancelled` checks do not block (#4407). Stdout names the path with `canonical merge gate green` (mergeable is `MERGEABLE`) or `all checks complete` (mergeable could not be read, but every check has finished). Exit 1 = failure.
 
 **Exit 124 — still running (#4835).** The call's 480s budget ran out before CI finished. This is not a failure: re-run the exact command the script prints (`scripts/wait-for-ci.sh <PR-N>`). Re-running only reads check state; it never re-triggers CI (the flake auto-rerun fires at most once per run, tracked per head SHA). Keep re-running until it exits 0, 1 or 3. Do not raise `--timeout-secs` above 480: a call still running at 600s is moved to the background by the Bash tool.
 
@@ -901,62 +901,28 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 scripts/dispatcher/progress.sh "$AGENT_ID" merge "PR #<PR-N>" || true
 ```
 
-The PR has passed the ralph loop review (A.2) and CI is green. **Before merging, confirm the merge gate is green.** The gate is:
+The PR has passed the ralph loop review (A.2) and CI is green. **The merge gate is `scripts/wait-for-ci.sh <PR-N>` exiting 0** (A.5). It checks what branch protection checks:
 
-1. `mergeable == MERGEABLE` (GitHub can compute a merge commit — no conflicts), AND
-2. The required status check `ci-passed` has `conclusion: SUCCESS` on its latest run, AND
-3. No *latest* check has `conclusion: FAILURE`.
+1. No `ci-passed` check run on the head SHA is still in progress, and the newest `ci-passed` run is `SUCCESS`, AND
+2. No *latest* check has `conclusion: FAILURE`, AND
+3. `mergeStateStatus` is `CLEAN`, `UNSTABLE` or `HAS_HOOKS` (not `BLOCKED`), and `mergeable == MERGEABLE`.
 
-`SKIPPED` is fine, and `CANCELLED` on a non-required check (typically Vercel / Smoke Test concurrency cancellation) is fine. `mergeStateStatus == UNSTABLE` is **not** a blocker when the three gates above pass — see `docs/agent/code-standards.md` §Interpreting mergeStateStatus (UNSTABLE-but-green) for why. Use the one-line recipe:
+`SKIPPED` is fine, and `CANCELLED` on a non-required check (typically Vercel / Smoke Test concurrency cancellation) is fine. `mergeStateStatus == UNSTABLE` is **not** a blocker — see `docs/agent/code-standards.md` §Interpreting mergeStateStatus (UNSTABLE-but-green). `BLOCKED` **is** a blocker: it means a required check has not passed on the head SHA yet. To eyeball the state by hand:
 
 ```
 gh pr view <PR-N> --repo judgemind/judgemind \
-  --json mergeable,statusCheckRollup \
-  --jq '{mergeable, rollup: [.statusCheckRollup[] | {name, conclusion}]}'
+  --json mergeable,mergeStateStatus,statusCheckRollup \
+  --jq '{mergeable, mergeStateStatus, rollup: [.statusCheckRollup[] | {name, status, conclusion}]}'
 ```
 
-If `mergeable` is `MERGEABLE`, `ci-passed` is `SUCCESS`, and nothing is `FAILURE`, merge via the `gh-pr-with-retry.sh` wrapper (#4527). The wrapper invokes `gh pr merge` first and falls back to `gh api -X PUT /repos/.../pulls/<N>/merge` on the explicit `GraphQL: API rate limit already exceeded` stderr marker, plus a follow-up `DELETE /repos/.../git/refs/heads/<head>` when `--delete-branch` is passed (mirroring the one-shot semantic of native `gh pr merge`). The two #4058 / #4231 fallbacks documented below are unchanged — they handle different failure modes (`base branch policy prohibits the merge` and `5xx / 504 Gateway Timeout`) that the wrapper does NOT auto-recover from:
+Once the gate is green, merge via the `gh-pr-with-retry.sh` wrapper (#4527). It runs plain `gh pr merge` first. Only on the explicit `GraphQL: API rate limit already exceeded` stderr marker does it fall back to REST, and that fallback is guarded (#4965): it re-reads the PR, refuses unless `mergeable_state` is `clean`/`unstable`/`has_hooks`, and pins the merge to the checked head SHA (`-f sha=<head.sha>`):
 ```
 {worktree}/scripts/gh-pr-with-retry.sh merge <PR-N> --squash --delete-branch
 ```
 
-**Fallback — `gh pr merge` rejects with `base branch policy prohibits the merge` (#4058).**
+**If `gh pr merge` refuses with `base branch policy prohibits the merge`, do NOT bypass it.** That message means GitHub's branch protection is not satisfied: the required `ci-passed` has not passed on the head SHA yet. Go back to A.5, re-run `scripts/wait-for-ci.sh <PR-N>` until it exits 0, then retry the merge. Never merge by hand with `gh api .../pulls/<N>/merge -X PUT` and never pass `--admin`: the token belongs to a repo admin and `enforce_admins=false`, so the REST merge endpoint **skips** required checks rather than re-evaluating them. `gh pr merge --auto` is not available either ("Auto merge is not allowed for this repository").
 
-`gh pr merge` runs a stricter pre-flight than the underlying REST API: it consults `mergeStateStatus` (and a few related fields) directly and refuses to call `PUT /repos/.../pulls/N/merge` whenever GitHub returns `BLOCKED` — even when the actual branch-protection requirements are satisfied. The trigger is GitHub's PR-rollup cache lagging the per-check conclusion updates: after a CI rerun completes successfully, the latest `ci-passed` check is `SUCCESS` and the canonical merge gate (mergeable=MERGEABLE, ci-passed=SUCCESS, no FAILURE) is green, but `mergeStateStatus` can stay `BLOCKED` for several seconds (occasionally tens of seconds) before GitHub recomputes it. The REST `PUT /merge` endpoint re-evaluates branch protection at the moment of the call against the latest required-check conclusions and accepts the merge — it does not rely on the cached `mergeStateStatus`. `gh pr merge --auto` is also not a workaround on this repo: GitHub returns "Auto merge is not allowed for this repository."
-
-**Note (#4068, 2026-05):** an earlier version of this section attributed the BLOCKED state to "a phantom rollup entry: a check that registered on the SHA but never reported a final conclusion." That framing was incorrect — the rollup entries that look like phantoms in `gh pr view --json statusCheckRollup` (those with `conclusion: null`) are legitimate `StatusContext` entries from third-party commit-status integrations like Vercel and codecov/patch. `StatusContext` entries use the `state` field, not `conclusion`, by GraphQL schema design; they are not phantoms. The canonical CI rollup classifier in `scripts/dispatcher/phase_transitions.py` (`_ci_rollup_state`) has handled them correctly via `__typename` branching since PR #3200 (2025-12). Across 283 dispatcher-managed merges in the 14 days before #4068's investigation, this fallback fired zero times — the fallback is rarely needed in practice but kept here for the residual transient-rollup-lag case described above. See `docs/investigations/phantom-rollup-blocked-but-green-2026-05.md` for the full evidence chain.
-
-**Use the API-merge fallback only when the canonical merge gate above is green** — i.e. all three of:
-
-1. `mergeable == MERGEABLE`, AND
-2. The required `ci-passed` check has `conclusion: SUCCESS` on its latest run, AND
-3. No *latest* check has `conclusion: FAILURE`.
-
-If those three are green and `gh pr merge --squash --delete-branch` rejects with stderr containing `base branch policy prohibits the merge`, fall through to the REST API. Both calls below are write operations — they stay on `gh` (no MCP equivalents):
-
-```
-gh api /repos/judgemind/judgemind/pulls/<PR-N>/merge -X PUT -f merge_method=squash
-gh api /repos/judgemind/judgemind/git/refs/heads/<branch-name> -X DELETE
-```
-
-The first call performs the squash-merge; on success its JSON response includes `{"merged": true, "message": "Pull Request successfully merged", "sha": "..."}`. The second call deletes the head branch — `gh pr merge --delete-branch` does this automatically, the API path does not, so it is a separate explicit call. `<branch-name>` is the PR's `headRefName` from `mcp__github__get_pull_request` (the worktree branch — typically `worktree-agent-<id>` or the original ralph branch name).
-
-If the canonical merge gate above is **not** green, do NOT use this fallback — diagnose the failing check first. The fallback is for the transient-rollup-lag case where the REST endpoint is willing but `gh pr merge`'s pre-flight is not, not for bypassing real CI failures or branch-protection requirements.
-
-A worked example from #4053 (the PR that surfaced #4058):
-
-```
-$ gh pr merge 4053 --squash --delete-branch
-X Pull request judgemind/judgemind#4053 is not mergeable: the base branch policy prohibits the merge.
-
-$ gh pr view 4053 --json mergeable,mergeStateStatus --jq '{mergeable, mergeStateStatus}'
-{"mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE"}
-
-$ gh api /repos/judgemind/judgemind/pulls/4053/merge -X PUT -f merge_method=squash
-{"merged":true,"message":"Pull Request successfully merged","sha":"00396b68..."}
-
-$ gh api /repos/judgemind/judgemind/git/refs/heads/worktree-agent-... -X DELETE
-```
+**History (#4058 → #4965).** This section used to document a REST "merge anyway" fallback for that refusal (#4058), explained as a rare rollup-cache lag that "fired zero times" (#4068). The real cause was structural (#4965): `ci.yml` ran CI twice per PR commit (push + pull_request, in different concurrency groups), and `wait-for-ci.sh` exited as soon as the push run's `ci-passed` succeeded, while the pull_request run (the one that tests the merge with current main) was still in progress. GitHub correctly said `BLOCKED`, and the admin-token REST merge bypassed it. #4965 made CI run once per PR commit, made `wait-for-ci.sh` wait for every `ci-passed` run and for `mergeStateStatus` to leave `BLOCKED`, and deleted the fallback. See `docs/investigations/phantom-rollup-blocked-but-green-2026-05.md` §Correction.
 
 **Fallback — `gh pr merge` returns 5xx / 504 Gateway Timeout (#4231).**
 
@@ -970,15 +936,15 @@ mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
 
 Inspect the response:
 
-- **`state: "closed"` and `merged_at: "<timestamp>"` is set** → the squash succeeded. The 5xx was a response-side failure, not a merge-side failure. Skip re-running `gh pr merge` entirely. If the head branch still exists (check `headRefName` against `gh api /repos/judgemind/judgemind/git/refs/heads/<branch>`), delete it explicitly with the same call from the `#4058` recipe above:
+- **`state: "closed"` and `merged_at: "<timestamp>"` is set** → the squash succeeded. The 5xx was a response-side failure, not a merge-side failure. Skip re-running `gh pr merge` entirely. If the head branch still exists (check `headRefName` against `gh api /repos/judgemind/judgemind/git/refs/heads/<branch>`), delete it explicitly (`gh pr merge --delete-branch` did not get to run):
   ```
   gh api /repos/judgemind/judgemind/git/refs/heads/<branch-name> -X DELETE
   ```
   If that DELETE returns 422 / "Reference does not exist," the branch is already gone — no action needed. Continue to A.8.
-- **`state: "open"` and `merged_at: null`** → the merge truly did not happen. Diagnose the underlying GitHub 5xx (rate limit, GitHub Status incident, branch protection) and retry `gh pr merge` once. If the second attempt also returns 5xx **and** PR state is still open, fall through to the API-merge fallback above (`gh api .../pulls/<N>/merge -X PUT`) — the REST endpoint and GraphQL endpoints take different paths through GitHub's infra and the REST one usually succeeds when GraphQL is degraded.
+- **`state: "open"` and `merged_at: null`** → the merge truly did not happen. Diagnose the underlying GitHub 5xx (rate limit, GitHub Status incident, branch protection) and retry the wrapper merge once. If the second attempt also returns 5xx **and** PR state is still open, stop and report it (comment on the issue, leave the PR open). Do not merge by hand through `gh api .../pulls/<N>/merge -X PUT`: for this repo's admin token that endpoint bypasses required checks (#4965).
 - **`state: "closed"` with `merged_at: null`** → the PR was declined or auto-closed during the failed merge attempt; do not re-attempt. Comment on the issue explaining and stop.
 
-The dispatcher daemon takes a *different* path for this same failure mode — it pushes an empty commit to force a fresh rollup evaluation and re-enters `awaiting_ci` (#2641, see `docs/specs/dispatcher-v2-spec.md` §"Merge-phase stale-rollup auto-unstick"). That path exists because the daemon must drive the phase machine forward without operator intervention; the `/task` interactive path can take the simpler API-merge shortcut because the agent has already verified the canonical gate is green.
+For the `base branch policy prohibits the merge` refusal, the dispatcher daemon pushes an empty commit to force a fresh CI run and re-enters `awaiting_ci` (#2641, see `docs/specs/dispatcher-v2-spec.md` §"Merge-phase stale-rollup auto-unstick"). That path stays inside branch protection. The `/task` path simply waits with `wait-for-ci.sh` (see above); neither path bypasses the required check.
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 

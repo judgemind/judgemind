@@ -4,7 +4,47 @@
 **Issue:** #4068 (parent: #4058)
 **Status:** Resolved — root cause was already fixed in PR #3200 (2025-12); the
 "phantom" framing in #4058 is a misclassification of legitimate `StatusContext`
-entries.
+entries. **The BLOCKED-but-green conclusions below were wrong — see
+§Correction (2026-11, #4965).**
+
+## Correction (2026-11, #4965)
+
+The `StatusContext` analysis below still holds: there is no phantom rollup
+entry. But two other conclusions in this document were wrong, and the REST
+merge fallback they justified has been deleted.
+
+1. **BLOCKED-but-green was recurring, not rare.** The 14-day CloudWatch count
+   below only looked at the dispatcher daemon and agent-runner log groups.
+   The fallback ran in interactive `/task` sessions, which do not log there.
+   Audit #7 (#4965) found operator-session transcripts using the fallback on
+   13 PRs in one session: #4702, #4730, #4742, #4745, #4747, #4773, #4779,
+   #4814, #4859, #4914, #4925, #4936, #4963. "Fired zero times" was a
+   measurement gap.
+2. **The cause was structural, not a rollup-cache lag.** `.github/workflows/ci.yml`
+   triggered on both `pull_request` and `push` (all branches, #262). The
+   concurrency group `ci-${{ github.event.pull_request.number || github.ref }}`
+   resolved to `ci-<PR>` for one and `ci-refs/heads/<branch>` for the other,
+   so every PR commit ran CI twice. Example, PR #4963: run 43615993074
+   (`push`, ci-passed done 16:37:49Z) and run 43616014135 (`pull_request`,
+   ci-passed done 16:38:41Z). `scripts/wait-for-ci.sh` exited 0 as soon as
+   ANY `ci-passed` entry was success (usually the push run's) and called the
+   still-running pull_request run "superseded". GitHub correctly reported
+   `BLOCKED`, so `gh pr merge` refused.
+3. **The REST `PUT /pulls/N/merge` endpoint does not re-evaluate branch
+   protection for this repo's token.** Branch protection has
+   `enforce_admins=false` and the token belongs to a repo admin, so the REST
+   merge **bypassed** the required `ci-passed` check. It often merged before
+   the pull_request run (the one that tests the merge with current main) had
+   finished.
+
+Fix (#4965): CI runs once per PR commit (`push` is limited to `main`);
+`wait-for-ci.sh` exits 0 only when no `ci-passed` run on the head SHA is in
+progress, the newest is success, and `mergeStateStatus` is not `BLOCKED`;
+the manual REST fallback in `.claude/skills/task/SKILL.md` §A.7 is deleted;
+and the GraphQL-rate-limit REST path in `scripts/gh-pr-with-retry.sh` now
+refuses unless `mergeable_state` is clean/unstable/has_hooks and pins
+`sha=<head.sha>`. Sections 3, 4 and "Residual" below are kept as the
+original record.
 
 ## TL;DR
 
@@ -164,6 +204,10 @@ that actually decides "green vs pending" already handles `StatusContext`
 correctly via `__typename` branching, since #3200.
 
 ## Residual: the SKILL.md A.7 fallback
+
+> **Superseded (#4965).** The reasoning in this section is wrong: the REST
+> endpoint bypasses required checks for an admin token rather than
+> re-evaluating them, and the fallback was deleted. See §Correction.
 
 `.claude/skills/task/SKILL.md` §A.7 still documents a "phantom rollup entry"
 fallback that uses `gh api /repos/.../pulls/<N>/merge -X PUT` when

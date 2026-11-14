@@ -1,16 +1,25 @@
 name: CI
 
 on:
+  # One CI run per PR commit (#4965). PR branches run ONLY on pull_request:
+  # that run tests the merge result against current main, and it is the
+  # run whose `ci-passed` branch protection evaluates.
   pull_request:
     branches: [main]
-  # Push fires on all branches: main (for post-merge runs) and PR branches
-  # (as a fallback when GitHub drops pull_request/synchronize events).
-  # The concurrency group below deduplicates when both events fire.
+  # Push runs only on main (post-merge). Until #4965 push fired on every
+  # branch as a fallback for dropped pull_request/synchronize events (#262),
+  # but the push run landed in a different concurrency group
+  # (ci-refs/heads/<branch>, vs ci-<PR> for pull_request), so every PR commit
+  # ran CI twice, and agents merged on the push run's result while the
+  # pull_request run was still going. A dropped pull_request event now
+  # fails closed: no `ci-passed` on the head SHA means GitHub reports
+  # BLOCKED and nothing merges. Recover by pushing again (or close and
+  # reopen the PR, which fires pull_request/reopened).
   push:
+    branches: [main]
 
-# Cancel in-progress runs for the same branch/PR. When both push and
-# pull_request events fire for the same commit, the second cancels the first
-# so we never run duplicate CI.
+# Cancel in-progress runs for the same PR (ci-<PR>) or for main
+# (ci-refs/heads/main) when a newer commit arrives.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true

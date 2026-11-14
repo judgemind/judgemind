@@ -131,18 +131,9 @@ case "$ARGS" in
                 ;;
         esac
         ;;
-    *"headRefOid"*)
-        printf '%s\n' "$SHA_RESPONSE"
-        exit 0
-        ;;
-    *"mergeStateStatus"*)
-        printf '%s\n' "$MERGE_STATE_RESPONSE"
-        exit 0
-        ;;
-    *"mergeable"*)
-        printf '%s\n' "$MERGEABLE_RESPONSE"
-        exit 0
-        ;;
+    # The REST route must come before the generic field matches below: its
+    # --jq expression for mergeStateStatus mentions `mergeable_state`, which
+    # would otherwise match `*"mergeable"*` (#4965).
     "api /repos/"*"/pulls/"*)
         # REST fallback path (#4507). The wrapper invokes
         # `gh api /repos/<owner>/<repo>/pulls/<N> --jq '<expr>'`.
@@ -184,6 +175,18 @@ case "$ARGS" in
         else
             printf '%s\n' "$rest_json"
         fi
+        exit 0
+        ;;
+    *"headRefOid"*)
+        printf '%s\n' "$SHA_RESPONSE"
+        exit 0
+        ;;
+    *"mergeStateStatus"*)
+        printf '%s\n' "$MERGE_STATE_RESPONSE"
+        exit 0
+        ;;
+    *"mergeable"*)
+        printf '%s\n' "$MERGEABLE_RESPONSE"
         exit 0
         ;;
     *"run rerun"*)
@@ -396,16 +399,54 @@ write_in_progress_ci_passed_response() {
 JSON
 }
 
-# Write a check-runs response with TWO ci-passed entries (re-run + superseded).
-# This exercises the multi-entry jq selector that was the #4069 root cause.
+# Write a check-runs response with TWO concurrent CI runs on the same SHA
+# (#4965): the push run's ci-passed (id 100) already succeeded, the
+# pull_request run's ci-passed (id 200) is still in progress. This is the
+# exact state the script used to exit 0 on, after which `gh pr merge` was
+# refused with BLOCKED. The script must keep waiting.
 write_double_ci_passed_response() {
     local file="$1"
     cat > "$file" << 'JSON'
 {
   "check_runs": [
-    {"name": "lint",       "status": "completed", "conclusion": "success", "details_url": "https://example.com/lint"},
-    {"name": "ci-passed",  "status": "completed", "conclusion": "success", "details_url": "https://example.com/ci-rerun"},
-    {"name": "ci-passed",  "status": "in_progress","conclusion": null,     "details_url": "https://example.com/ci-superseded"}
+    {"id": 90,  "name": "lint",       "status": "completed",  "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/1"},
+    {"id": 100, "name": "ci-passed",  "status": "completed",  "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/2"},
+    {"id": 150, "name": "lint",       "status": "in_progress","conclusion": null,      "details_url": "https://github.com/judgemind/judgemind/actions/runs/1002/job/3"},
+    {"id": 200, "name": "ci-passed",  "status": "queued",     "conclusion": null,      "details_url": "https://github.com/judgemind/judgemind/actions/runs/1002/job/4"}
+  ]
+}
+JSON
+}
+
+# Both concurrent runs finished green (#4965) — the follow-up poll to
+# write_double_ci_passed_response.
+write_double_ci_passed_both_green_response() {
+    local file="$1"
+    cat > "$file" << 'JSON'
+{
+  "check_runs": [
+    {"id": 90,  "name": "lint",       "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/1"},
+    {"id": 100, "name": "ci-passed",  "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/2"},
+    {"id": 150, "name": "lint",       "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1002/job/3"},
+    {"id": 200, "name": "ci-passed",  "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1002/job/4"}
+  ]
+}
+JSON
+}
+
+# Two ci-passed entries, both terminal. Args: <file> <older-conclusion>
+# <newer-conclusion>. The newer one (higher id) is what branch protection
+# evaluates (#4965). The fixture lists the newer entry FIRST so the test
+# proves the script orders by id, not by array position.
+write_two_terminal_ci_passed_response() {
+    local file="$1"
+    local older="$2"
+    local newer="$3"
+    cat > "$file" << JSON
+{
+  "check_runs": [
+    {"id": 200, "name": "ci-passed", "status": "completed", "conclusion": "$newer", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1002/job/4"},
+    {"id": 100, "name": "ci-passed", "status": "completed", "conclusion": "$older", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/2"}
   ]
 }
 JSON
@@ -704,33 +745,131 @@ test_no_regression_failure_short_circuits_fastpath() {
     fi
 }
 
-# Test 10 (#4069 root cause): when the filter=latest response contains TWO
-# ci-passed entries (re-run + superseded), the success-detection logic must
-# treat it as success — not silently break on multi-line jq output. This is
-# the exact condition that wedged wait-for-ci.sh on PR #4059.
-test_double_ci_passed_entries_resolves_success() {
+# Test 10 (#4965, replaces the #4069 assertion): two concurrent CI runs on
+# the head SHA — one ci-passed success, one ci-passed still queued. Even
+# with mergeable=MERGEABLE the script must NOT exit 0: the run still in
+# progress is the one branch protection evaluates. It keeps waiting and
+# exits 124 under a short budget.
+test_double_ci_passed_one_in_progress_keeps_waiting() {
     local tmpdir
     tmpdir=$(make_temp_dir)
     write_double_ci_passed_response "$tmpdir/responses/01.json"
 
-    local output exit_code start_ts end_ts elapsed
+    local output exit_code
     exit_code=0
-    start_ts=$(date +%s)
-    output=$(MERGEABLE_RESPONSE=MERGEABLE \
-        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 30 2>&1) || exit_code=$?
-    end_ts=$(date +%s)
-    elapsed=$((end_ts - start_ts))
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
 
-    if [ "$exit_code" -eq 0 ]; then
-        pass "double_ci_passed_entries: exits 0 when one of two ci-passed entries is success"
+    if [ "$exit_code" -eq 124 ]; then
+        pass "double_ci_passed_in_progress: keeps waiting (exit 124) while a second ci-passed is running"
     else
-        fail "double_ci_passed_entries: exits 0 when one of two ci-passed entries is success" "exit=$exit_code output=$output"
+        fail "double_ci_passed_in_progress: keeps waiting (exit 124) while a second ci-passed is running" "exit=$exit_code output=$output"
     fi
 
-    if [ "$elapsed" -lt 10 ]; then
-        pass "double_ci_passed_entries: exits in <10s (actual: ${elapsed}s)"
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        fail "double_ci_passed_in_progress: must NOT report success while a ci-passed run is in progress" "output=$output"
     else
-        fail "double_ci_passed_entries: exits in <10s" "elapsed=${elapsed}s"
+        pass "double_ci_passed_in_progress: does not report success"
+    fi
+
+    if echo "$output" | grep -q "ci-passed run(s) still running"; then
+        pass "double_ci_passed_in_progress: still-waiting message names the running ci-passed"
+    else
+        fail "double_ci_passed_in_progress: still-waiting message names the running ci-passed" "output=$output"
+    fi
+}
+
+# Test 10b (#4965): the same two runs, polled until the second finishes.
+# First poll: one ci-passed success + one queued → wait. Second poll: both
+# success → exit 0. Proves the script exits only once the run that branch
+# protection evaluates has finished.
+test_double_ci_passed_exits_when_both_green() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_double_ci_passed_response "$tmpdir/responses/01.json"
+    write_double_ci_passed_both_green_response "$tmpdir/responses/02.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "double_ci_passed_both_green: exits 0 once both ci-passed runs are green"
+    else
+        fail "double_ci_passed_both_green: exits 0 once both ci-passed runs are green" "exit=$exit_code output=$output"
+    fi
+
+    local calls
+    calls=$(cat "$tmpdir/counter")
+    if [ "$calls" -ge 2 ]; then
+        pass "double_ci_passed_both_green: polled past the first (one-run-green) response (calls=$calls)"
+    else
+        fail "double_ci_passed_both_green: polled past the first (one-run-green) response" "calls=$calls output=$output"
+    fi
+}
+
+# Test 10c (#4965): newest ci-passed cancelled, older one success. Branch
+# protection evaluates the newest run, so this is not green: keep waiting.
+test_newest_ci_passed_cancelled_keeps_waiting() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_two_terminal_ci_passed_response "$tmpdir/responses/01.json" success cancelled
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 124 ]; then
+        pass "newest_ci_passed_cancelled: keeps waiting (exit 124)"
+    else
+        fail "newest_ci_passed_cancelled: keeps waiting (exit 124)" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 10d (#4965): older ci-passed cancelled (superseded), newest success.
+# That is green: exit 0.
+test_older_ci_passed_cancelled_newest_green_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_two_terminal_ci_passed_response "$tmpdir/responses/01.json" cancelled success
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "older_ci_passed_cancelled: exits 0 when the newest ci-passed is success"
+    else
+        fail "older_ci_passed_cancelled: exits 0 when the newest ci-passed is success" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 10e (#4965): ci-passed is green but GitHub still reports
+# mergeStateStatus=BLOCKED. `gh pr merge` would refuse, so the script must
+# not report success — it keeps waiting and says why.
+test_blocked_merge_state_keeps_waiting() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_all_success_response "$tmpdir/responses/01.json"
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=BLOCKED \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 124 ]; then
+        pass "blocked_merge_state: keeps waiting (exit 124) while mergeStateStatus=BLOCKED"
+    else
+        fail "blocked_merge_state: keeps waiting (exit 124) while mergeStateStatus=BLOCKED" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "mergeStateStatus=BLOCKED"; then
+        pass "blocked_merge_state: output names mergeStateStatus=BLOCKED"
+    else
+        fail "blocked_merge_state: output names mergeStateStatus=BLOCKED" "output=$output"
     fi
 }
 
@@ -1493,7 +1632,11 @@ test_canonical_gate_fastpath_with_stale_pending
 test_all_checks_complete_path
 test_no_regression_in_progress_ci_passed
 test_no_regression_failure_short_circuits_fastpath
-test_double_ci_passed_entries_resolves_success
+test_double_ci_passed_one_in_progress_keeps_waiting
+test_double_ci_passed_exits_when_both_green
+test_newest_ci_passed_cancelled_keeps_waiting
+test_older_ci_passed_cancelled_newest_green_exits_0
+test_blocked_merge_state_keeps_waiting
 test_auto_rerun_on_postgres_startup_flake
 test_two_consecutive_flakes_exit_1
 test_real_failure_no_rerun

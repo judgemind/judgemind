@@ -62,24 +62,18 @@
 #   --help              Print this help and exit 0
 #
 # Exit codes:
-#   0 — Success. Reached via one of two paths, in priority order:
-#       (a) **Canonical-merge-gate fast-path** (#4069): `mergeable == MERGEABLE`,
-#           any `ci-passed` entry in the filter=latest response has
-#           conclusion=success, and no latest check has a hard-failure
-#           conclusion (failure, timed_out, action_required). Stdout names
-#           this path explicitly with the substring `canonical merge gate
-#           green`. This path exits immediately even if filter=latest still
-#           surfaces in_progress entries from a superseded CI run on the
-#           same SHA, or `cancelled` entries from a non-required check
-#           (e.g. Vercel's `Check major pages` `concurrency:
-#           cancel-in-progress` cancel) — the same gate documented in
-#           `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
-#           (UNSTABLE-but-green)" (#4407).
-#       (b) **All-checks-complete path:** filter=latest shows pending=0,
-#           ci-passed=success, no hard failures, and mergeStateStatus is
-#           CLEAN or UNSTABLE. `cancelled` checks count as terminal here —
-#           they do not block this path either. Stdout names this path with
-#           `all checks complete`.
+#   0 — Success: the PR is mergeable through the protected path. Requires
+#       ALL of (#4965): no `ci-passed` check run on the head SHA is still
+#       in progress, the newest `ci-passed` run is success, no latest check
+#       has a hard-failure conclusion (failure, timed_out, action_required),
+#       and mergeStateStatus is CLEAN, UNSTABLE or HAS_HOOKS (BLOCKED keeps
+#       waiting: GitHub's branch protection is not satisfied yet, so
+#       `gh pr merge` would refuse). Pending entries from other, non-required
+#       check names (Vercel, smoke tests) and `cancelled` checks do not
+#       block (#4407). Stdout names the path:
+#       (a) `canonical merge gate green` when mergeable == MERGEABLE;
+#       (b) `all checks complete` when mergeable cannot be resolved but
+#           every check has drained to a terminal state.
 #   1 — Early failure: one or more checks have a hard failed conclusion
 #       (failure, timed_out, action_required). Prints the failed check
 #       names and their details_url. **`cancelled` is NOT a hard failure**
@@ -660,15 +654,32 @@ EOF
         exit 1
     fi
 
-    # Determine whether `ci-passed` succeeded on its latest run. Use `any(...)`
-    # rather than `select(...) | .conclusion` because filter=latest dedupes
-    # within a workflow run but NOT across workflow re-runs on the same SHA —
-    # a re-run plus a superseded run can leave two `ci-passed` entries in the
-    # response, which would make a single jq `select()` print two lines and
-    # silently break the equality check that follows (#4069 root cause). The
-    # `any` form returns a single boolean string.
-    CI_PASSED_SUCCESS=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | any(.conclusion == "success")')
-    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed") | .conclusion] | (.[0] // "")')
+    # Determine whether the required `ci-passed` check is settled green.
+    #
+    # filter=latest dedupes within a workflow run but NOT across workflow runs
+    # on the same SHA, so the response can hold several `ci-passed` entries
+    # (#4069). Until #4965 every PR commit ran CI twice (push + pull_request,
+    # in different concurrency groups) and this script exited as soon as ANY
+    # `ci-passed` entry was success — usually the push run's, while the
+    # pull_request run (the one that tests the merge result against current
+    # main) was still in progress. GitHub correctly reported BLOCKED, so
+    # `gh pr merge` refused.
+    #
+    # The rule now mirrors what branch protection evaluates:
+    #   - no `ci-passed` entry on the head SHA may still be running, AND
+    #   - the newest `ci-passed` entry (highest check-run id) is success.
+    # A cancelled older run is fine (it is terminal); a cancelled newest run
+    # is not green.
+    CI_PASSED_PENDING=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.name == "ci-passed" and .status != "completed")] | length')
+    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | sort_by(.id // 0) | (last | .conclusion) // ""')
+    if [ "$CI_PASSED_PENDING" -eq 0 ] && [ "$CI_PASSED_CONCLUSION" = "success" ]; then
+        CI_PASSED_SUCCESS=true
+    else
+        CI_PASSED_SUCCESS=false
+    fi
+    if [ "$CI_PASSED_PENDING" -gt 0 ]; then
+        CI_PASSED_CONCLUSION="in_progress (${CI_PASSED_PENDING} ci-passed run(s) still running)"
+    fi
 
     # ── Rebase-required fast-path (#4412) ────────────────────────────────────
     # When CI is green (ci-passed=success, no latest failures) but
@@ -698,45 +709,49 @@ EOF
         fi
     fi
 
-    # ── Canonical-merge-gate fast-path (#4069, #4407) ────────────────────────
+    # ── Merge gate (#4069, #4407, #4965) ─────────────────────────────────────
     # Mirrors `docs/agent/code-standards.md` §"Interpreting mergeStateStatus
-    # (UNSTABLE-but-green)" and the `/task` skill's §A.7 merge gate. When
-    # `mergeable == MERGEABLE`, the required `ci-passed` check is success on
-    # its latest run, and no latest check is a hard failure, the PR is safe
-    # to merge regardless of any pending entries left over from a superseded
-    # CI run on the same SHA OR `cancelled` entries from a non-required
-    # Vercel/smoke-test concurrency cancel (#4407). Exit immediately so
-    # callers don't burn the full timeout watching phantom in_progress rows
-    # that will never complete OR fall through to a hand-rolled `gh pr view`
-    # gate every time Vercel cancels a deploy.
+    # (UNSTABLE-but-green)" and the `/task` skill's §A.7 merge gate. Exit 0
+    # only when ALL of:
+    #   1. the required `ci-passed` check is settled green (see above: no
+    #      `ci-passed` run on the head SHA still in progress, newest success),
+    #   2. no latest check is a hard failure, and
+    #   3. GitHub's own branch-protection verdict agrees: mergeStateStatus is
+    #      CLEAN, UNSTABLE or HAS_HOOKS. BLOCKED means a required check is not
+    #      yet satisfied, so `gh pr merge` would refuse; keep waiting (#4965).
+    # Pending entries from OTHER check names (Vercel, smoke tests) and
+    # `cancelled` non-required checks (#4407) do not block — they are not
+    # required by branch protection.
+    #
+    # Two success messages, kept for callers that grep them:
+    #   - `canonical merge gate green` when mergeable=MERGEABLE too;
+    #   - `all checks complete` when mergeable cannot be resolved (UNKNOWN,
+    #     API error) but every check has drained to a terminal state.
     if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ]; then
-        # No `2>/dev/null` — same rationale as the DIRTY branch above.
-        MERGEABLE=$(gh_pr_view_with_rest_fallback mergeable || echo "UNKNOWN")
-        if [ "$MERGEABLE" = "MERGEABLE" ]; then
-            echo ""
-            echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, ci-passed=success, failed=0; pending=${PENDING_COUNT} ignored as superseded; cancelled=${CANCELLED_COUNT} ignored as non-required)."
-            exit 0
-        fi
-    fi
-
-    # ── Existing all-checks-complete path ────────────────────────────────────
-    # When pending=0, every check has a terminal conclusion (success, skipped,
-    # neutral, or cancelled — cancelled counts as terminal here, see #4407).
-    # Combined with ci-passed=success, no hard failures, and a CLEAN/UNSTABLE
-    # mergeStateStatus, this is the original safe-to-merge signal. Kept as a
-    # fallback for the case where `mergeable` cannot be resolved (UNKNOWN,
-    # API error) so the script still exits when CI legitimately drained to
-    # zero pending.
-    if [ "$CI_PASSED_SUCCESS" = "true" ] && [ "$FAILED_COUNT" -eq 0 ] && [ "$PENDING_COUNT" -eq 0 ]; then
-        # Secondary guard: verify mergeStateStatus is CLEAN or UNSTABLE.
-        MERGE_STATE=$(gh_pr_view_with_rest_fallback mergeStateStatus || echo "UNKNOWN")
-        if [ "$MERGE_STATE" = "CLEAN" ] || [ "$MERGE_STATE" = "UNSTABLE" ]; then
-            echo ""
-            echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE}, cancelled=${CANCELLED_COUNT} non-blocking)."
-            exit 0
-        else
-            echo "  ci-passed=success but mergeStateStatus=${MERGE_STATE}, still waiting..."
-        fi
+        # Same condition as the DIRTY branch above, so reuse its read.
+        MERGE_STATE="$MERGE_STATE_FOR_DIRTY"
+        case "$MERGE_STATE" in
+            CLEAN|UNSTABLE|HAS_HOOKS)
+                MERGEABLE=$(gh_pr_view_with_rest_fallback mergeable || echo "UNKNOWN")
+                if [ "$MERGEABLE" = "MERGEABLE" ]; then
+                    echo ""
+                    echo "[${ELAPSED}s] canonical merge gate green — exiting (mergeable=MERGEABLE, mergeStateStatus=${MERGE_STATE}, ci-passed=success with no ci-passed run in progress, failed=0; pending=${PENDING_COUNT} non-required; cancelled=${CANCELLED_COUNT} non-required)."
+                    exit 0
+                fi
+                if [ "$PENDING_COUNT" -eq 0 ]; then
+                    echo ""
+                    echo "[${ELAPSED}s] all checks complete — CI passed (ci-passed=success, mergeStateStatus=${MERGE_STATE}, cancelled=${CANCELLED_COUNT} non-blocking)."
+                    exit 0
+                fi
+                echo "  ci-passed=success, mergeStateStatus=${MERGE_STATE}, mergeable=${MERGEABLE}; still waiting..."
+                ;;
+            BLOCKED)
+                echo "  ci-passed=success but mergeStateStatus=BLOCKED — branch protection is not satisfied yet, still waiting..."
+                ;;
+            *)
+                echo "  ci-passed=success but mergeStateStatus=${MERGE_STATE}, still waiting..."
+                ;;
+        esac
     fi
 
     # Check timeout before sleeping. Re-read the clock: the calls above may
