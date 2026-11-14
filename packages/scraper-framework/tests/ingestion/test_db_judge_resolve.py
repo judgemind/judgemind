@@ -27,10 +27,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from ingestion.db import (
+    JudgeVote,
     _choose_canonical_spelling,
     _decisive,
     _spelling_completeness,
     clear_roster_cache,
+    judge_vote_spelling,
+    record_judge_votes,
     resolve_judge,
 )
 
@@ -1395,6 +1398,158 @@ class TestDocumentEvidencePg:
             assert court.canonical() == "Craig L. Griffin"
         finally:
             court.close()
+
+
+class TestJudgeVoteSpelling:
+    """The spelling a document votes for (#4928, #4938)."""
+
+    def test_printed_spelling_wins_when_valid(self) -> None:
+        assert judge_vote_spelling("H. Shaina Colover", "Shaina Clover") == "Shaina Clover"
+
+    def test_unusable_printed_spelling_falls_back(self) -> None:
+        assert judge_vote_spelling("Craig L. Griffin", "Griffin") == "Craig L. Griffin"
+        assert judge_vote_spelling("Craig L. Griffin", None) == "Craig L. Griffin"
+
+
+@_needs_pg
+class TestSettledSplitVotesPg:
+    """A worker split votes once its split set is settled (#4938).
+
+    Each child used to vote while ``write_split_rulings`` had not yet
+    superseded the duplicates, so a ruling the LLM read twice cast two
+    votes, and one document printing a typo renamed the judge.
+    """
+
+    def test_resolve_without_arbitration_never_renames(self) -> None:
+        """Mid-split, the evidence still holds the previous split set: a
+        child resolves without renaming anyone, and casts no vote."""
+        court = _PgCourt("Craig L. Griffin", _GRIFFEN_ALIAS, evidence=[("Craig L. Griffen", 5)])
+        try:
+            renamed: set[str] = set()
+            judge_id = resolve_judge(
+                court.conn,
+                "Craig L. Griffen",
+                court.court_id,
+                source="ca-orange-tentatives",
+                renamed_judge_ids=renamed,
+                arbitrate=False,
+            )
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.canonical() == "Craig L. Griffin"
+            assert renamed == set()
+            assert len(court.evidence_rows()) == 5
+            # The same call with arbitration applies the evidence.
+            assert court.observe("Craig L. Griffen", "ca-orange-tentatives") is True
+        finally:
+            court.close()
+
+    def test_one_settled_child_does_not_rename(self) -> None:
+        """The issue's repro: the LLM read one ruling twice with a typo.  The
+        duplicate child is superseded, so only the surviving child votes,
+        and one document never renames the judge."""
+        court = _PgCourt("Shaina Colover", [("H. Shaina Colovr", "ca-orange")])
+        try:
+            keeper, duplicate = str(uuid.uuid4()), str(uuid.uuid4())
+            court.add_document(keeper)
+            court.add_document(duplicate, status="superseded")
+            renamed: set[str] = set()
+            record_judge_votes(
+                court.conn,
+                [JudgeVote(keeper, court.judge_id, "H. Shaina Colovr")],
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert court.canonical() == "Shaina Colover"
+            assert renamed == set()
+            assert court.evidence_rows() == [(keeper, "H. Shaina Colovr")]
+        finally:
+            court.close()
+
+    def test_two_settled_children_rename_once_and_report_it(self) -> None:
+        court = _PgCourt("Shaina Colover", [("Shaina Clover", "ca-orange")])
+        try:
+            children = [str(uuid.uuid4()), str(uuid.uuid4())]
+            for document_id in children:
+                court.add_document(document_id)
+            renamed: set[str] = set()
+            record_judge_votes(
+                court.conn,
+                [JudgeVote(d, court.judge_id, "Shaina Clover") for d in children],
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert court.canonical() == "Shaina Clover"
+            assert renamed == {court.judge_id}
+            assert sorted(court.evidence_rows()) == sorted((d, "Shaina Clover") for d in children)
+        finally:
+            court.close()
+
+
+class TestSettledSplitVotesMocked:
+    """``record_judge_votes`` and ``arbitrate=False`` without Postgres (#4938)."""
+
+    def test_no_votes_is_a_no_op(self) -> None:
+        conn = MagicMock()
+        record_judge_votes(conn, [])
+        conn.cursor.assert_not_called()
+
+    def test_resolve_without_arbitration_reads_no_evidence(self) -> None:
+        """Step 1 alias hit with a better-supported spelling on file: with
+        ``arbitrate=False`` the evidence is not even read, nothing renamed."""
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("existing-judge-uuid", "Mattew C. Braner")]
+        mock_cur.fetchall.side_effect = [[("matthew c. braner", 2)]]
+
+        result = resolve_judge(
+            mock_conn, "MATTHEW C. BRANER", "court-uuid-2", source="sd_roa", arbitrate=False
+        )
+
+        assert result == "existing-judge-uuid"
+        mock_cur.fetchall.assert_not_called()
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert not [c for c in sql if "UPDATE judges" in c]
+        assert not [c for c in sql if "INSERT INTO judge_name_evidence" in c]
+
+    def test_one_settled_vote_does_not_rename(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("Shaina Colover",)]
+        mock_cur.fetchall.side_effect = [[("H. Shaina Colovr", 1)]]
+        renamed: set[str] = set()
+
+        record_judge_votes(
+            mock_conn,
+            [JudgeVote("doc-1", "judge-1", "H. Shaina Colovr")],
+            renamed_judge_ids=renamed,
+        )
+
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert len([c for c in sql if "INSERT INTO judge_name_evidence" in c]) == 1
+        assert not [c for c in sql if "UPDATE judges" in c]
+        assert renamed == set()
+
+    def test_settled_votes_arbitrate_once_per_judge(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("Shaina Colover",)]
+        mock_cur.fetchall.side_effect = [[("Shaina Clover", 2)]]
+        mock_cur.rowcount = 1
+        renamed: set[str] = set()
+
+        record_judge_votes(
+            mock_conn,
+            [
+                JudgeVote("doc-1", "judge-1", "Shaina Clover"),
+                JudgeVote("doc-2", "judge-1", "Shaina Clover"),
+            ],
+            renamed_judge_ids=renamed,
+        )
+
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert len([c for c in sql if "INSERT INTO judge_name_evidence" in c]) == 2
+        # One arbitration for the judge: one evidence read, one rename.
+        assert mock_cur.fetchall.call_count == 1
+        assert len([c for c in sql if "UPDATE judges" in c]) == 1
+        assert renamed == {"judge-1"}
 
 
 # ---------------------------------------------------------------------------

@@ -63,14 +63,6 @@ def test_postgres_is_configured_when_required() -> None:
 #: bug reproduced (a strict xfail: when the fix lands it fails until the
 #: entry is removed).
 _OPEN_BUG_SEEDS: dict[int, tuple[str, str, bool]] = {
-    # A ruling the LLM repeats in one split votes once per copy in judge
-    # arbitration, so one document renames the judge (#4938).
-    41: ("4938", "judge_converge", False),
-    45: ("4938", "judge_converge", False),
-    120: ("4938", "judge_converge", False),
-    141: ("4938", "judge_converge", False),
-    146: ("4938", "judge_converge", False),
-    196: ("4938", "judge_converge", False),
     # A reused ruling row keeps the previous ruling's judge (#4939).
     925: ("4939", "judge_converge", False),
     # A whole-document reingest does not replace the key's split set
@@ -169,6 +161,12 @@ _BUG_SEEDS = [
     # ("H. Shaina Colovr") renamed the judge.  Fails on c1542b19, the parent
     # of the #4928 fix (5b7d6a5b).
     pytest.param("4928", 64, "judge_converge"),
+    # The LLM read one ruling twice, with a typo in the judge's name; both
+    # split children voted before the duplicate was superseded, so one
+    # document renamed the judge.  Fails on 7a82b210, the parent of the
+    # #4938 fix.  (41, 45, 120, 141, 146 and 196 fail the same way.)
+    pytest.param("4938", 702, "judge_converge"),
+    pytest.param("4938", 41, "judge_converge"),
 ]
 
 

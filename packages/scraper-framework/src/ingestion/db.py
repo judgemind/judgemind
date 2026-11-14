@@ -1653,6 +1653,7 @@ def _maybe_arbitrate(
     renamed_judge_ids: set[str] | None = None,
     document_id: str | None = None,
     vote_name: str | None = None,
+    arbitrate: bool = True,
 ) -> bool:
     """Weigh the judge's document evidence and rename the judge if it says so.
 
@@ -1672,6 +1673,10 @@ def _maybe_arbitrate(
     A promotion renames the judge, so *judge_id* is added to
     *renamed_judge_ids* (see :func:`resolve_judge`).
 
+    With *arbitrate* False only the alias is stored: a worker split
+    arbitrates once its split set is settled (:func:`record_judge_votes`,
+    #4938).
+
     Returns True if the judge was renamed, False otherwise.
     """
     cur.execute(
@@ -1684,8 +1689,35 @@ def _maybe_arbitrate(
         """,
         (judge_id, raw_name, source),
     )
+    if not arbitrate:
+        return False
     evidence = _read_name_evidence(cur, judge_id, vote_name or raw_name, document_id)
-    current = roster_normalized
+    return _arbitrate(
+        cur,
+        judge_id,
+        roster_normalized,
+        evidence,
+        incoming_canonical=incoming_canonical,
+        confidence=confidence,
+        renamed_judge_ids=renamed_judge_ids,
+    )
+
+
+def _arbitrate(
+    cur: psycopg.Cursor,
+    judge_id: str,
+    current: str,
+    evidence: list[tuple[str, int]],
+    *,
+    incoming_canonical: str | None = None,
+    confidence: float = 1.0,
+    renamed_judge_ids: set[str] | None = None,
+) -> bool:
+    """Rename *judge_id* from *current* when *evidence* picks another spelling.
+
+    The second half of :func:`_maybe_arbitrate`, shared with
+    :func:`record_judge_votes`.  Returns True if the judge was renamed.
+    """
     winner, docs = _choose_canonical_spelling(current, evidence)
     if winner.lower() == current.lower():
         logger.debug(
@@ -1748,6 +1780,67 @@ def _maybe_arbitrate(
     return True
 
 
+@dataclass(frozen=True)
+class JudgeVote:
+    """One document's judge-name vote, recorded after its split settles (#4938).
+
+    ``spelling`` is the spelling the document printed (see
+    :func:`judge_vote_spelling`).
+    """
+
+    document_id: str
+    judge_id: str
+    spelling: str
+
+
+def judge_vote_spelling(raw_name: str, printed_name: str | None) -> str:
+    """The spelling a document votes for: *printed_name* when it is a valid
+    judge name (the worker swapped a known alias for the judge's canonical
+    name, *raw_name*, before resolving), else *raw_name* (#4928)."""
+    raw_name = _strip_nul(raw_name) or raw_name
+    if printed_name:
+        printed_name = _strip_nul(printed_name) or printed_name
+        normalized_printed = normalize_judge_name(printed_name)
+        if normalized_printed is not None and _looks_like_valid_judge_name(normalized_printed):
+            return printed_name
+    return raw_name
+
+
+def record_judge_votes(
+    conn: psycopg.Connection,
+    votes: list[JudgeVote],
+    *,
+    renamed_judge_ids: set[str] | None = None,
+) -> None:
+    """Record a settled split's judge votes, then arbitrate once per judge (#4938).
+
+    A worker split resolves each child's judge without voting or
+    arbitrating (``resolve_judge(document_id=None, arbitrate=False)``),
+    because the split set is not settled yet: a ruling the LLM repeated is
+    a child that ``write_split_rulings`` supersedes as a duplicate a moment
+    later, and while it was still active its vote counted.  One ruling
+    printed once then renamed a judge.  Mid-split, the evidence table also
+    still holds the key's previous split set.  The caller passes the votes of the children that
+    keep a ruling, after ``write_split_rulings`` and the stale-child cleanup,
+    in the same transaction.  Each is recorded as its document's row in
+    ``derived.judge_name_evidence`` (one row per document), and each judge
+    they name is arbitrated once, over the settled active documents only.
+    So a ruling counts once however many times the LLM read it.  A renamed
+    judge's id is added to *renamed_judge_ids*.
+    """
+    if not votes:
+        return
+    with conn.cursor() as cur:
+        for vote in votes:
+            _record_name_evidence(cur, vote.document_id, vote.judge_id, vote.spelling)
+        for judge_id in sorted({vote.judge_id for vote in votes}):
+            # The judge was resolved in this transaction, so its row exists.
+            cur.execute("SELECT canonical_name FROM judges WHERE id = %s::uuid", (judge_id,))
+            current = str(cur.fetchone()[0])
+            evidence = _read_name_evidence(cur, judge_id, "", None)
+            _arbitrate(cur, judge_id, current, evidence, renamed_judge_ids=renamed_judge_ids)
+
+
 #: SQL predicate: judge ``j`` is the judge a roster name belongs to.  Its
 #: canonical name is the roster spelling (any case), or it holds the roster
 #: spelling as an alias under any source.  Takes the roster name twice.
@@ -1808,6 +1901,7 @@ def resolve_judge(
     renamed_judge_ids: set[str] | None = None,
     document_id: str | None = None,
     printed_name: str | None = None,
+    arbitrate: bool = True,
 ) -> str | None:
     """Resolve a raw judge name to a canonical judge record, returning the judge UUID.
 
@@ -1825,6 +1919,15 @@ def resolve_judge(
     alias for the judge's canonical name before resolving.  The vote is for
     the printed spelling; otherwise every alias spelling would count as
     support for whatever the canonical name is today.
+
+    *arbitrate* False resolves the name without arbitration: no judge is
+    renamed.  A worker split resolves its children that way, without
+    *document_id*, and records the votes of the children that keep a
+    ruling, then arbitrates, once the split set is settled
+    (:func:`record_judge_votes`, #4938).  Until then the evidence table
+    still holds the key's previous split set, and a ruling the LLM repeated
+    is a child about to be superseded as a duplicate: neither must decide a
+    judge's name.
 
     Only arbitration renames an existing judge (``UPDATE judges SET
     canonical_name``): the best-supported spelling wins, by distinct
@@ -1855,12 +1958,7 @@ def resolve_judge(
       9. If no match at all, create a new judge with ON CONFLICT handling.
     """
     raw_name = _strip_nul(raw_name) or raw_name
-    vote_name = raw_name
-    if printed_name:
-        printed_name = _strip_nul(printed_name) or printed_name
-        normalized_printed = normalize_judge_name(printed_name)
-        if normalized_printed is not None and _looks_like_valid_judge_name(normalized_printed):
-            vote_name = printed_name
+    vote_name = judge_vote_spelling(raw_name, printed_name)
     judge_id = _resolve_judge_unrecorded(
         conn,
         raw_name,
@@ -1869,6 +1967,7 @@ def resolve_judge(
         renamed_judge_ids=renamed_judge_ids,
         document_id=document_id,
         vote_name=vote_name,
+        arbitrate=arbitrate,
     )
     if judge_id is not None and document_id:
         with conn.cursor() as cur:
@@ -1885,6 +1984,7 @@ def _resolve_judge_unrecorded(
     renamed_judge_ids: set[str] | None,
     document_id: str | None,
     vote_name: str,
+    arbitrate: bool = True,
 ) -> str | None:
     """:func:`resolve_judge` without recording the document's evidence row."""
     raw_name = _strip_nul(raw_name) or raw_name
@@ -1938,6 +2038,7 @@ def _resolve_judge_unrecorded(
                     renamed_judge_ids=renamed_judge_ids,
                     document_id=document_id,
                     vote_name=vote_name,
+                    arbitrate=arbitrate,
                 )
             return judge_id
 
@@ -1973,6 +2074,7 @@ def _resolve_judge_unrecorded(
                     renamed_judge_ids=renamed_judge_ids,
                     document_id=document_id,
                     vote_name=vote_name,
+                    arbitrate=arbitrate,
                 )
             logger.debug(
                 "resolve_judge: found existing judge by canonical name %r -> %s",
@@ -2020,6 +2122,7 @@ def _resolve_judge_unrecorded(
                         renamed_judge_ids=renamed_judge_ids,
                         document_id=document_id,
                         vote_name=vote_name,
+                        arbitrate=arbitrate,
                     )
                 logger.debug(
                     "resolve_judge: near-duplicate match %r ~ %r -> %s",
@@ -2086,6 +2189,7 @@ def _resolve_judge_unrecorded(
                                 renamed_judge_ids=renamed_judge_ids,
                                 document_id=document_id,
                                 vote_name=vote_name,
+                                arbitrate=arbitrate,
                             )
                         ):
                             return judge_id

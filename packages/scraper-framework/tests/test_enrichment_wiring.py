@@ -499,6 +499,7 @@ def test_enrichment_alias_match_updates_judge_name(
         document_id="aaaaaaaa-0000-0000-0000-000000000001",
         # The vote is for the spelling the document printed (#4928).
         printed_name="J. Smith",
+        arbitrate=True,
     )
 
     # The canonical name reaches OpenSearch through the judge row that
@@ -565,6 +566,7 @@ def test_enrichment_directory_mismatch_logs_warning_no_override(
         renamed_judge_ids=set(),
         document_id="aaaaaaaa-0000-0000-0000-000000000001",
         printed_name=None,
+        arbitrate=True,
     )
 
     # Verify directory mismatch warning was logged
@@ -827,6 +829,7 @@ def test_enrichment_no_db_api_changes(
         renamed_judge_ids=set(),
         document_id="aaaaaaaa-0000-0000-0000-000000000001",
         printed_name=None,
+        arbitrate=True,
     )
 
     # Verify commit was called (transaction completed)
@@ -934,6 +937,7 @@ def test_enrichment_invalid_judge_name_handled_gracefully(
         renamed_judge_ids=set(),
         document_id="aaaaaaaa-0000-0000-0000-000000000001",
         printed_name=None,
+        arbitrate=True,
     )
     mock_conn.commit.assert_called_once()
 

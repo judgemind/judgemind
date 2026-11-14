@@ -84,6 +84,7 @@ from .case_evidence import (
 )
 from .case_type_resolver import resolve_case_type
 from .db import (
+    JudgeVote,
     SplitChildRuling,
     SplitSet,
     _expand_single_word_judge_surname,
@@ -92,7 +93,9 @@ from .db import (
     delete_stale_split_children,
     insert_document,
     insert_document_and_ruling,
+    judge_vote_spelling,
     lookup_court_id,
+    record_judge_votes,
     resolve_judge,
     resolve_judge_from_department,
     upsert_case_judge,
@@ -1494,6 +1497,10 @@ class _RulingWrite:
     #: (a case title, a judge rename, a court name); their rulings are
     #: re-indexed once it commits (#4920, #4935).
     shown_changes: ShownRowChanges = field(default_factory=ShownRowChanges)
+    #: A worker split child's judge vote, resolved but not yet recorded:
+    #: ``_write_split_batch`` records it only if the child keeps a ruling
+    #: once the split set is settled (#4938).
+    judge_vote: JudgeVote | None = None
 
 
 @dataclass
@@ -4112,7 +4119,7 @@ class IngestionWorker:
     # ------------------------------------------------------------------
 
     def _prepare_ruling_write(
-        self, conn: psycopg.Connection, w: _RulingWrite
+        self, conn: psycopg.Connection, w: _RulingWrite, *, defer_vote: bool = False
     ) -> tuple[str, str, str | None]:
         """Resolve a ruling's court, case and judge rows before it is written.
 
@@ -4122,6 +4129,11 @@ class IngestionWorker:
         judge.  Updates *w* with the corrected values.  Returns
         ``(court_id, case_id, judge_id)``.  Runs in the caller's
         transaction and commits nothing.
+
+        With *defer_vote* (a worker split's child) the judge is resolved
+        without arbitration and without the document's vote, which is left
+        on ``w.judge_vote`` for the caller to record once the split set is
+        settled (``db.record_judge_votes``, #4938).
         """
         document_id = w.document_id
         state = w.state
@@ -4355,10 +4367,21 @@ class IngestionWorker:
                 source=scraper_id or "scraper",
                 renamed_judge_ids=w.shown_changes.judge_ids,
                 # Arbitration counts one vote per document, for the
-                # spelling the document printed (#4928).
-                document_id=w.document_id,
+                # spelling the document printed (#4928).  A split child
+                # votes only once the split set is settled (#4938).
+                document_id=None if defer_vote else w.document_id,
                 printed_name=printed_judge_name,
+                arbitrate=not defer_vote,
             )
+        w.judge_vote = (
+            JudgeVote(
+                document_id=w.document_id,
+                judge_id=judge_id,
+                spelling=judge_vote_spelling(judge_name, printed_judge_name),
+            )
+            if defer_vote and judge_id is not None and judge_name
+            else None
+        )
 
         w.case_number = case_number
         w.case_title = case_title
@@ -4471,11 +4494,14 @@ class IngestionWorker:
         )
         written = [w.document_id for w in batch.children]
         removed: list[str] = []
+        split_changes = ShownRowChanges()
         conn = self._get_connection()
         try:
             prepared: list[tuple[_RulingWrite, str, str, str | None]] = []
             for w in batch.children:
-                court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
+                # The judge vote waits until the split set is settled: a
+                # child superseded as a duplicate must not vote (#4938).
+                court_id, case_id, judge_id = self._prepare_ruling_write(conn, w, defer_vote=True)
                 insert_document(
                     conn,
                     document_id=w.document_id,
@@ -4543,6 +4569,17 @@ class IngestionWorker:
                     deleted_ids=removed,
                     owns_key=owns_key,
                 )
+            # The split set is settled: only the children that keep a ruling
+            # vote, and each judge is arbitrated once for the split (#4938).
+            record_judge_votes(
+                conn,
+                [
+                    w.judge_vote
+                    for w in batch.children
+                    if w.judge_vote is not None and final_cases.get(w.document_id) is not None
+                ],
+                renamed_judge_ids=split_changes.judge_ids,
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -4584,7 +4621,7 @@ class IngestionWorker:
             self._index_committed_ruling(conn, document_id)
         if removed:
             self._indexer.delete_documents(removed)
-        changes = ShownRowChanges()
+        changes = split_changes
         for w in batch.children:
             changes.update(w.shown_changes)
         self._reindex_dependent_rulings(conn, changes, written=written)
