@@ -29,7 +29,7 @@ import psycopg.errors
 from framework.party_utils import is_contaminated_party_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Mapping
 
     import psycopg
 
@@ -1618,12 +1618,19 @@ def _read_name_evidence(
     The document being resolved counts once for *raw_name*, whatever its
     stored row says (it may be a new document, or a re-read with another
     spelling, or one that resolved to another judge before).
+
+    A stored row counts only while it describes its document's current
+    state: the document is active and its ruling is on *judge_id* (#4966).
+    :func:`record_judge_votes` removes rows that stop doing so in the
+    transaction that changes the document; the join keeps a row that some
+    other write left behind from voting.
     """
     cur.execute(
         """
         SELECT e.raw_name, COUNT(*)
         FROM judge_name_evidence e
         JOIN documents d ON d.id = e.document_id
+        JOIN rulings r ON r.document_id = e.document_id AND r.judge_id = e.judge_id
         WHERE e.judge_id = %s::uuid
           AND d.status = 'active'
           AND e.document_id IS DISTINCT FROM %s::uuid
@@ -1801,39 +1808,139 @@ def judge_vote_spelling(raw_name: str, printed_name: str | None) -> str:
     return raw_name
 
 
+def judge_votes_held(
+    conn: psycopg.Connection,
+    *,
+    s3_key: str | None = None,
+    document_ids: Iterable[str] = (),
+) -> dict[str, str]:
+    """``{document id: judge id}`` of the evidence rows a write may change.
+
+    The rows of every document on *s3_key* and of *document_ids*.  A write
+    reads them before it changes anything: a document it deletes takes its
+    row with it (the foreign key cascades, migration 70), and the judge that
+    row voted for must still be re-arbitrated (:func:`record_judge_votes`,
+    #4966).
+    """
+    ids = sorted(set(document_ids))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.document_id::text, e.judge_id::text
+            FROM judge_name_evidence e
+            WHERE e.document_id = ANY(%s::uuid[])
+               OR e.document_id IN (SELECT d.id FROM documents d WHERE d.s3_key = %s)
+            """,
+            (ids, s3_key),
+        )
+        return {str(row[0]): str(row[1]) for row in cur.fetchall()}
+
+
 def record_judge_votes(
     conn: psycopg.Connection,
     votes: list[JudgeVote],
     *,
     renamed_judge_ids: set[str] | None = None,
-) -> None:
-    """Record a settled split's judge votes, then arbitrate once per judge (#4938).
+    document_ids: Iterable[str] = (),
+    held: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Bring the touched documents' judge votes up to date, then arbitrate
+    every judge whose votes changed, once (#4938, #4966).
 
-    A worker split resolves each child's judge without voting or
-    arbitrating (``resolve_judge(document_id=None, arbitrate=False)``),
-    because the split set is not settled yet: a ruling the LLM repeated is
-    a child that ``write_split_rulings`` supersedes as a duplicate a moment
-    later, and while it was still active its vote counted.  One ruling
-    printed once then renamed a judge.  Mid-split, the evidence table also
-    still holds the key's previous split set.  The caller passes the votes of the children that
-    keep a ruling, after ``write_split_rulings`` and the stale-child cleanup,
-    in the same transaction.  Each is recorded as its document's row in
-    ``derived.judge_name_evidence`` (one row per document), and each judge
-    they name is arbitrated once, over the settled active documents only.
-    So a ruling counts once however many times the LLM read it.  A renamed
-    judge's id is added to *renamed_judge_ids*.
+    A document's vote is its row in ``derived.judge_name_evidence``: the
+    judge its ruling is on and the spelling it printed.  It must describe
+    the document as it is now, so this runs at the end of the write, in its
+    transaction, after the ruling rows, the dedup supersedes and the
+    stale-child cleanup are done:
+
+    1. *votes* are recorded, one row per document.  A worker write resolves
+       its judges without voting or arbitrating
+       (``resolve_judge(document_id=None, arbitrate=False)``): mid-write a
+       ruling the LLM repeated is a child about to be superseded as a
+       duplicate, and the table still holds the key's previous split set.
+       The caller passes the votes of the documents it wrote.
+    2. Every row of a touched document (*document_ids*, the vote documents,
+       the documents in *held*, and the documents a touched document
+       supersedes or is superseded by) that no longer describes its
+       document is removed: the document is gone, is not active, has no
+       ruling, or its ruling is on another judge (a reused slot whose new
+       ruling has no judge, a ruling that now resolves elsewhere).  A
+       touched document that cast no vote this time keeps a row that still
+       holds.
+    3. Every judge that gained or lost a vote is arbitrated over its
+       remaining evidence: the judges of *votes*, of the touched rows before
+       the write (*held*, read by :func:`judge_votes_held` before anything
+       changed, so it still names the judges of deleted documents), and of
+       the removed rows.  A judge that lost its votes is re-arbitrated,
+       rather than keeping a name its evidence no longer supports.
+
+    So a printed ruling is one vote however many times the LLM read it, and
+    a document that is retired, superseded, deleted or loses its judge stops
+    voting in the same transaction.  A renamed judge's id is added to
+    *renamed_judge_ids*, so the caller re-indexes its rulings
+    (``ShownRowChanges``, #4935).  Returns the ids of the judges arbitrated.
     """
-    if not votes:
-        return
+    held = dict(held or {})
+    touched = set(document_ids) | {vote.document_id for vote in votes} | set(held)
+    if not touched:
+        return set()
+    judges: set[str] = set(held.values()) | {vote.judge_id for vote in votes}
     with conn.cursor() as cur:
+        # A content-hash dedup links a loser to its winner; reviving or
+        # superseding one changes the other's standing too.
+        cur.execute(
+            "SELECT previous_version_id::text FROM documents "
+            "WHERE id = ANY(%s::uuid[]) AND previous_version_id IS NOT NULL "
+            "UNION SELECT id::text FROM documents WHERE previous_version_id = ANY(%s::uuid[])",
+            (sorted(touched), sorted(touched)),
+        )
+        touched.update(str(row[0]) for row in cur.fetchall())
+        ids = sorted(touched)
+        cur.execute(
+            "SELECT judge_id::text FROM judge_name_evidence WHERE document_id = ANY(%s::uuid[])",
+            (ids,),
+        )
+        judges.update(str(row[0]) for row in cur.fetchall())
         for vote in votes:
             _record_name_evidence(cur, vote.document_id, vote.judge_id, vote.spelling)
-        for judge_id in sorted({vote.judge_id for vote in votes}):
-            # The judge was resolved in this transaction, so its row exists.
+        cur.execute(
+            """
+            DELETE FROM judge_name_evidence e
+            WHERE e.document_id = ANY(%s::uuid[])
+              AND NOT EXISTS (
+                  SELECT 1 FROM documents d
+                  JOIN rulings r ON r.document_id = d.id
+                  WHERE d.id = e.document_id
+                    AND d.status = 'active'
+                    AND r.judge_id = e.judge_id
+              )
+            RETURNING e.document_id::text, e.judge_id::text
+            """,
+            (ids,),
+        )
+        retracted = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
+        judges.update(judge_id for _doc, judge_id in retracted)
+        if retracted:
+            logger.info(
+                "record_judge_votes: retracted %d vote(s) of documents that no longer "
+                "vote for that judge",
+                len(retracted),
+                extra={
+                    "telemetry_event": "judge_vote_retracted",
+                    "document_ids": sorted(doc for doc, _judge in retracted),
+                    "judge_ids": sorted({judge for _doc, judge in retracted}),
+                },
+            )
+        arbitrated: set[str] = set()
+        for judge_id in sorted(judges):
             cur.execute("SELECT canonical_name FROM judges WHERE id = %s::uuid", (judge_id,))
-            current = str(cur.fetchone()[0])
+            row = cur.fetchone()
+            if row is None:
+                continue  # the judge row is gone; its evidence went with it
             evidence = _read_name_evidence(cur, judge_id, "", None)
-            _arbitrate(cur, judge_id, current, evidence, renamed_judge_ids=renamed_judge_ids)
+            _arbitrate(cur, judge_id, str(row[0]), evidence, renamed_judge_ids=renamed_judge_ids)
+            arbitrated.add(judge_id)
+    return arbitrated
 
 
 #: SQL predicate: judge ``j`` is the judge a roster name belongs to.  Its
@@ -1916,10 +2023,10 @@ def resolve_judge(
     support for whatever the canonical name is today.
 
     *arbitrate* False resolves the name without arbitration: no judge is
-    renamed.  A worker split resolves its children that way, without
-    *document_id*, and records the votes of the children that keep a
-    ruling, then arbitrates, once the split set is settled
-    (:func:`record_judge_votes`, #4938).  Until then the evidence table
+    renamed.  Every worker write resolves its judges that way, without
+    *document_id*, and records the votes of the documents that keep a
+    ruling, then arbitrates, once its rulings are written
+    (:func:`record_judge_votes`, #4938, #4966).  Until then the evidence table
     still holds the key's previous split set, and a ruling the LLM repeated
     is a child about to be superseded as a duplicate: neither must decide a
     judge's name.

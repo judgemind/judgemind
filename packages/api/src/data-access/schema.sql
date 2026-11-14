@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 69 migrations.
+-- Generated from 70 migrations.
 
 
 
@@ -286,6 +286,9 @@ CREATE TABLE derived.judge_name_evidence (
 
 
 COMMENT ON TABLE derived.judge_name_evidence IS 'One row per document: the judge it resolved to and the spelling it printed. resolve_judge arbitration counts distinct active documents per spelling. Issue #4928.';
+
+
+COMMENT ON COLUMN derived.judge_name_evidence.document_id IS 'derived.documents.id of the document that printed the name. Cascades on delete; checked at commit. A row counts only while its document is active and its ruling is on judge_id. Issue #4966.';
 
 
 CREATE TABLE derived.judges (
@@ -1381,6 +1384,12 @@ CREATE INDEX idx_documents_hash ON derived.documents USING btree (content_hash);
 CREATE INDEX idx_documents_hearing_date ON derived.documents USING btree (hearing_date);
 
 
+CREATE INDEX idx_documents_previous_version_id ON derived.documents USING btree (previous_version_id) WHERE (previous_version_id IS NOT NULL);
+
+
+CREATE INDEX idx_documents_s3_key ON derived.documents USING btree (s3_key);
+
+
 CREATE UNIQUE INDEX idx_judge_aliases_judge_raw_source_uniq ON derived.judge_aliases USING btree (judge_id, lower(raw_name), source) WHERE (source IS NOT NULL);
 
 
@@ -1608,6 +1617,10 @@ ALTER TABLE ONLY derived.documents
 
 ALTER TABLE ONLY derived.judge_aliases
     ADD CONSTRAINT judge_aliases_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.judge_name_evidence
+    ADD CONSTRAINT judge_name_evidence_document_id_fkey FOREIGN KEY (document_id) REFERENCES derived.documents(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 ALTER TABLE ONLY derived.judge_name_evidence

@@ -52,7 +52,12 @@ properties that must hold for any sequence of re-splits:
   document never renames (#4928); and when the documents decide a judge's
   name (``_choose_canonical_spelling`` returns it whatever the current
   name), ingesting the same document in the opposite row order ends on
-  the same name (#4922).
+  the same name (#4922).  Votes count only from active documents that
+  still resolve to that judge: every active document on the harness's
+  keys whose ruling has a judge holds exactly one ``judge_name_evidence``
+  row, for that judge, and no other document holds one; and every judge
+  those rulings have been on keeps the name a recount of its votes gives
+  it, including a judge whose votes all moved away (#4966).
 - ``untouched``: a step whose extraction fails (every page's and chunk's
   API call failed, ``ExtractionIncompleteError``) leaves the key's rows and
   search docs exactly as they were: no whole-document ruling next to the
@@ -991,6 +996,10 @@ class KeyHarness:
         #: A failing step's extractors cannot be built (#4953), rather than
         #: built and failing every call (#4948).
         self.fail_unavailable = False
+        #: S3 keys this harness has run a step on.
+        self._keys: set[str] = set()
+        #: Every judge a ruling on those keys has been on (``_check_votes``).
+        self._judges_seen: set[str] = set()
         self.worker = self._make_worker()
 
     def close(self) -> None:
@@ -1099,6 +1108,7 @@ class KeyHarness:
         """Run one step on *key*; raise :class:`InvariantError` on a
         broken invariant."""
         self._key = key
+        self._keys.add(key.s3_key)
         self._step_label = f"seed={self.seed} {label} {step.describe()}"
         self._attach_alerts(key)
         self._ensure_roster(key, step.roster)
@@ -1208,6 +1218,8 @@ class KeyHarness:
             judges_after,
             spelling_before,
         )
+        self._judges_seen.update(j for _d, _t, j, _n in judges_before + judges_after)
+        self._guard("judge_converge", self._check_votes)
 
     def write_legacy_row(self, key: Key, document_id: str, spec: Spec) -> None:
         """Write one document + ruling on *key* directly, the way an older
@@ -1626,6 +1638,103 @@ class KeyHarness:
                     f"documents printing {dict(evidence)} decide roster judge {roster!r} is "
                     f"{winners.pop()!r}, but one row order leaves {sorted(names_a)} and the "
                     f"other {sorted(names_b)}",
+                )
+
+    def _check_votes(self) -> None:
+        """Each document votes exactly as it stands, and every judge's name
+        is what its votes give it (#4966).
+
+        On every key the harness wrote: a ``judge_name_evidence`` row exists
+        for each active document whose ruling has a judge, with that judge,
+        and for no other document (deleted, superseded, retired, or whose
+        ruling has no judge or another one).  And every judge a ruling on
+        those keys has been on, including one whose rulings all moved away,
+        keeps the name arbitration over its votes picks now:
+        ``_choose_canonical_spelling`` returns the current name, so a
+        recount from scratch would not rename it.  A judge that lost votes
+        and was not re-arbitrated keeps a name its evidence no longer
+        supports.
+        """
+        keys = sorted(self._keys)
+        with self.checker.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.document_id::text, e.judge_id::text, d.status::text, r.judge_id::text
+                FROM judge_name_evidence e
+                LEFT JOIN documents d ON d.id = e.document_id
+                LEFT JOIN rulings r ON r.document_id = e.document_id
+                WHERE (d.s3_key = ANY(%s) OR d.id IS NULL)
+                  AND (d.status IS DISTINCT FROM 'active' OR r.judge_id IS DISTINCT FROM e.judge_id)
+                  AND e.judge_id = ANY(%s::uuid[])
+                """,
+                (keys, sorted(self._judges_seen)),
+            )
+            stale = cur.fetchall()
+            cur.execute(
+                """
+                SELECT d.id::text, r.judge_id::text
+                FROM documents d JOIN rulings r ON r.document_id = d.id
+                WHERE d.s3_key = ANY(%s) AND d.status = 'active' AND r.judge_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM judge_name_evidence e
+                      WHERE e.document_id = d.id AND e.judge_id = r.judge_id
+                  )
+                """,
+                (keys,),
+            )
+            missing = cur.fetchall()
+        if stale:
+            doc, judge, status, ruling_judge = stale[0]
+            self._fail(
+                "judge_converge",
+                f"{len(stale)} stale judge vote(s): document {doc[:8]} votes for judge "
+                f"{judge[:8]} but is {status or 'deleted'} with its ruling on "
+                f"{(ruling_judge or 'no judge')[:8]}",
+            )
+        if missing:
+            doc, judge = missing[0]
+            self._fail(
+                "judge_converge",
+                f"{len(missing)} active document(s) with a judge cast no vote: document "
+                f"{doc[:8]}, judge {judge[:8]}",
+            )
+        if not self._judges_seen:
+            return
+        with self.checker.cursor() as cur:
+            cur.execute(
+                """
+                SELECT j.id::text, j.canonical_name, j.court_id::text, e.raw_name, COUNT(e.*)
+                FROM judges j
+                LEFT JOIN (
+                    judge_name_evidence e
+                    JOIN documents d ON d.id = e.document_id AND d.status = 'active'
+                    JOIN rulings r ON r.document_id = e.document_id AND r.judge_id = e.judge_id
+                ) ON e.judge_id = j.id
+                WHERE j.id = ANY(%s::uuid[])
+                GROUP BY j.id, j.canonical_name, j.court_id, e.raw_name
+                """,
+                (sorted(self._judges_seen),),
+            )
+            judges: dict[str, tuple[str, str, list[tuple[str, int]]]] = {}
+            for judge_id, name, court_id, raw, count in cur.fetchall():
+                entry = judges.setdefault(judge_id, (name, court_id, []))
+                if raw is not None:
+                    entry[2].append((raw, int(count)))
+            for judge_id, (name, court_id, evidence) in sorted(judges.items()):
+                winner, docs = _choose_canonical_spelling(name, evidence)
+                if winner.lower() == name.lower():
+                    continue
+                cur.execute(
+                    "SELECT 1 FROM judges WHERE court_id = %s::uuid AND canonical_name = %s "
+                    "AND id <> %s::uuid",
+                    (court_id, winner, judge_id),
+                )
+                if cur.fetchone() is not None:
+                    continue  # another judge holds the name; arbitration keeps it
+                self._fail(
+                    "judge_converge",
+                    f"judge {name!r} keeps a name its votes no longer give it: they pick "
+                    f"{winner!r} ({docs})",
                 )
 
     # -- alerts ---------------------------------------------------------

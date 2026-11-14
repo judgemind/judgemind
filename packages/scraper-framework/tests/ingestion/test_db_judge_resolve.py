@@ -15,6 +15,8 @@ Covers:
     renames a judge, a real majority renames it once (#4928)
   - Real Postgres: Step 3b finds the roster judge through its aliases after
     the judge was renamed away from the roster spelling (#4926)
+  - Real Postgres: a document's vote follows the document; a judge that
+    loses votes is re-arbitrated (#4966)
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from ingestion.db import (
     _spelling_completeness,
     clear_roster_cache,
     judge_vote_spelling,
+    judge_votes_held,
     record_judge_votes,
     resolve_judge,
 )
@@ -1033,6 +1036,13 @@ class _PgCourt:
                 (canonical, self.court_id),
             )
             self.judge_id = str(cur.fetchone()[0])
+            # Every document's ruling is on this case: a vote counts only
+            # while its document's ruling is on the judge (#4966).
+            cur.execute(
+                "INSERT INTO cases (court_id, case_number) VALUES (%s::uuid, %s) RETURNING id",
+                (self.court_id, f"ARB-{code}"),
+            )
+            self.case_id = str(cur.fetchone()[0])
             for raw, source in aliases:
                 cur.execute(
                     "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence) "
@@ -1053,6 +1063,7 @@ class _PgCourt:
         clear_roster_cache(self.court_id)
 
     def add_document(self, document_id: str, status: str = "active") -> None:
+        """A document of the court, with a ruling on the judge."""
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO documents (id, court_id, document_type, s3_key, s3_bucket, "
@@ -1060,6 +1071,12 @@ class _PgCourt:
                 "VALUES (%s::uuid, %s::uuid, 'tentative_ruling', %s, 'test', 'pdf', %s, "
                 "NOW(), %s::document_status) ON CONFLICT (id) DO NOTHING",
                 (document_id, self.court_id, f"test/{document_id}.pdf", document_id, status),
+            )
+            cur.execute(
+                "INSERT INTO rulings (document_id, case_id, court_id, judge_id, is_tentative) "
+                "VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, TRUE) "
+                "ON CONFLICT (document_id) DO NOTHING",
+                (document_id, self.case_id, self.court_id, self.judge_id),
             )
 
     def observe(self, raw: str, source: str, document_id: str | None = None) -> bool:
@@ -1100,7 +1117,9 @@ class _PgCourt:
 
     def close(self) -> None:
         with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM rulings WHERE court_id = %s::uuid", (self.court_id,))
             cur.execute("DELETE FROM documents WHERE court_id = %s::uuid", (self.court_id,))
+            cur.execute("DELETE FROM cases WHERE court_id = %s::uuid", (self.court_id,))
             # Deleting the judges cascades to their judge_name_evidence rows.
             cur.execute("DELETE FROM judges WHERE court_id = %s::uuid", (self.court_id,))
             cur.execute("DELETE FROM courts WHERE id = %s::uuid", (self.court_id,))
@@ -1486,6 +1505,132 @@ class TestSettledSplitVotesPg:
             court.close()
 
 
+@_needs_pg
+class TestVotesFollowDocumentsPg:
+    """A document's vote describes the document as it is now (#4966)."""
+
+    def _clear_judge(self, court: _PgCourt, document_id: str) -> None:
+        with court.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rulings SET judge_id = NULL WHERE document_id = %s::uuid", (document_id,)
+            )
+
+    def test_document_whose_ruling_lost_its_judge_stops_voting(self) -> None:
+        court = _PgCourt("Craig L. Griffin", [], evidence=[("Craig L. Griffin", 2)])
+        try:
+            loser = court.evidence_rows()[0][0]
+            self._clear_judge(court, loser)
+            arbitrated = record_judge_votes(court.conn, [], document_ids=[loser])
+            court.conn.commit()
+            assert loser not in {doc for doc, _ in court.evidence_rows()}
+            assert len(court.evidence_rows()) == 1
+            assert arbitrated == {court.judge_id}
+        finally:
+            court.close()
+
+    def test_superseded_document_stops_voting(self) -> None:
+        court = _PgCourt("Craig L. Griffin", [], evidence=[("Craig L. Griffin", 2)])
+        try:
+            loser = court.evidence_rows()[0][0]
+            with court.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid", (loser,)
+                )
+            record_judge_votes(court.conn, [], document_ids=[loser])
+            court.conn.commit()
+            assert loser not in {doc for doc, _ in court.evidence_rows()}
+        finally:
+            court.close()
+
+    def test_vote_for_another_judge_than_the_ruling_is_not_kept(self) -> None:
+        """A vote names the judge the ruling is on, or it is not kept."""
+        court = _PgCourt("Craig L. Griffin", [])
+        try:
+            document_id = str(uuid.uuid4())
+            court.add_document(document_id)
+            self._clear_judge(court, document_id)
+            record_judge_votes(
+                court.conn, [JudgeVote(document_id, court.judge_id, "Craig Griffin")]
+            )
+            court.conn.commit()
+            assert court.evidence_rows() == []
+        finally:
+            court.close()
+
+    def test_judge_that_loses_votes_is_rearbitrated(self) -> None:
+        """'Craig L. Grifin' (2 documents) holds against 'Craig L. Griffin' (3,
+        not decisive).  One Grifin document loses its judge: Griffin now leads
+        decisively, and the judge is renamed although no vote named it."""
+        court = _PgCourt(
+            "Craig L. Grifin", [], evidence=[("Craig L. Grifin", 2), ("Craig L. Griffin", 3)]
+        )
+        try:
+            loser = next(doc for doc, raw in court.evidence_rows() if raw == "Craig L. Grifin")
+            self._clear_judge(court, loser)
+            renamed: set[str] = set()
+            record_judge_votes(court.conn, [], document_ids=[loser], renamed_judge_ids=renamed)
+            court.conn.commit()
+            assert court.canonical() == "Craig L. Griffin"
+            assert renamed == {court.judge_id}
+        finally:
+            court.close()
+
+    def test_deleted_document_takes_its_vote_and_its_judge_is_rearbitrated(self) -> None:
+        """The row cascades with its document (migration 70); the judge it
+        voted for, read before the delete, is still re-arbitrated."""
+        court = _PgCourt(
+            "Craig L. Grifin", [], evidence=[("Craig L. Grifin", 2), ("Craig L. Griffin", 3)]
+        )
+        try:
+            loser = next(doc for doc, raw in court.evidence_rows() if raw == "Craig L. Grifin")
+            held = judge_votes_held(court.conn, document_ids=[loser])
+            assert held == {loser: court.judge_id}
+            with court.conn.cursor() as cur:
+                cur.execute("DELETE FROM rulings WHERE document_id = %s::uuid", (loser,))
+                cur.execute("DELETE FROM documents WHERE id = %s::uuid", (loser,))
+            assert loser not in {doc for doc, _ in court.evidence_rows()}
+            renamed: set[str] = set()
+            record_judge_votes(
+                court.conn, [], document_ids=[loser], held=held, renamed_judge_ids=renamed
+            )
+            court.conn.commit()
+            assert court.canonical() == "Craig L. Griffin"
+            assert renamed == {court.judge_id}
+        finally:
+            court.close()
+
+    def test_held_votes_are_read_by_s3_key(self) -> None:
+        court = _PgCourt("Craig L. Griffin", [], evidence=[("Craig L. Griffin", 1)])
+        try:
+            document_id = court.evidence_rows()[0][0]
+            assert judge_votes_held(court.conn, s3_key=f"test/{document_id}.pdf") == {
+                document_id: court.judge_id
+            }
+            assert judge_votes_held(court.conn, s3_key="test/none.pdf") == {}
+        finally:
+            court.close()
+
+    def test_vote_without_a_document_fails_at_commit(self) -> None:
+        """Migration 70's foreign key is checked at commit, so a vote may be
+        recorded before its document row in the same transaction, but never
+        left without one."""
+        import psycopg
+
+        court = _PgCourt("Craig L. Griffin", [])
+        try:
+            with court.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO judge_name_evidence (document_id, judge_id, raw_name) "
+                    "VALUES (%s::uuid, %s::uuid, 'Craig L. Griffin')",
+                    (str(uuid.uuid4()), court.judge_id),
+                )
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                court.conn.commit()
+            court.conn.rollback()
+        finally:
+            court.close()
+
+
 class TestSettledSplitVotesMocked:
     """``record_judge_votes`` and ``arbitrate=False`` without Postgres (#4938)."""
 
@@ -1514,7 +1659,8 @@ class TestSettledSplitVotesMocked:
     def test_one_settled_vote_does_not_rename(self) -> None:
         mock_conn, mock_cur = _make_mock_conn()
         mock_cur.fetchone.side_effect = [("Shaina Colover",)]
-        mock_cur.fetchall.side_effect = [[("H. Shaina Colovr", 1)]]
+        # Linked documents, held votes, retracted votes, then the evidence.
+        mock_cur.fetchall.side_effect = [[], [], [], [("H. Shaina Colovr", 1)]]
         renamed: set[str] = set()
 
         record_judge_votes(
@@ -1531,7 +1677,7 @@ class TestSettledSplitVotesMocked:
     def test_settled_votes_arbitrate_once_per_judge(self) -> None:
         mock_conn, mock_cur = _make_mock_conn()
         mock_cur.fetchone.side_effect = [("Shaina Colover",)]
-        mock_cur.fetchall.side_effect = [[("Shaina Clover", 2)]]
+        mock_cur.fetchall.side_effect = [[], [], [], [("Shaina Clover", 2)]]
         mock_cur.rowcount = 1
         renamed: set[str] = set()
 
@@ -1547,7 +1693,7 @@ class TestSettledSplitVotesMocked:
         sql = [str(c) for c in mock_cur.execute.call_args_list]
         assert len([c for c in sql if "INSERT INTO judge_name_evidence" in c]) == 2
         # One arbitration for the judge: one evidence read, one rename.
-        assert mock_cur.fetchall.call_count == 1
+        assert len([c for c in sql if "GROUP BY e.raw_name" in c]) == 1
         assert len([c for c in sql if "UPDATE judges" in c]) == 1
         assert renamed == {"judge-1"}
 

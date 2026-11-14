@@ -263,6 +263,33 @@ def _clear_roster_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _skip_judge_votes_on_mock_connections() -> Generator[None, None, None]:
+    """Skip the worker's ``record_judge_votes`` on a mocked connection.
+
+    Every worker write settles its documents' judge votes before it
+    commits (#4966).  Tests that drive the worker over a mocked psycopg
+    connection feed ``fetchone`` / ``fetchall`` side effects in a fixed
+    order that predates those queries.  On a ``Mock`` connection the call
+    is a no-op; on a real connection (the ``*_pg`` tests) it runs.  Tests
+    that check the call itself patch ``ingestion.worker.record_judge_votes``
+    themselves, which takes precedence.
+    """
+    from unittest.mock import Mock
+
+    from ingestion import db as db_mod
+
+    real = db_mod.record_judge_votes
+
+    def _record(conn: object, *args: object, **kwargs: object) -> set[str]:
+        if isinstance(conn, Mock):
+            return set()
+        return real(conn, *args, **kwargs)  # type: ignore[arg-type]
+
+    with patch("ingestion.worker.record_judge_votes", side_effect=_record):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _mock_enrichment_engine() -> Generator[None, None, None]:
     """Auto-mock ``EnrichmentEngine`` in the ingestion worker for all tests.
 
