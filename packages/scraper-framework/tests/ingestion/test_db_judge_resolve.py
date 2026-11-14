@@ -10,6 +10,8 @@ Covers:
   - Spelling choice: family corroboration, then "First M. Last" completeness
   - Real Postgres: the same observations in any order settle on one name
     with at most one rename (#4922)
+  - Real Postgres: Step 3b finds the roster judge through its aliases after
+    the judge was renamed away from the roster spelling (#4926)
 """
 
 from __future__ import annotations
@@ -75,7 +77,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical match for 'Matthew C. Braner'
             ("ca-san_diego",),  # Step 3b: court_code for _get_roster_names
             ({"D1": "Mattew C. Braner"},),  # Step 3b: roster snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -107,7 +109,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -157,7 +159,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -199,7 +201,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -229,7 +231,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -262,7 +264,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -312,7 +314,7 @@ class TestRosterTypoArbitration:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -366,7 +368,7 @@ class TestStep1ArbitrationWireUp:
             None,  # Call1 Step2: no exact canonical
             ("ca-san_diego",),  # Call1 _get_roster_names: court_code
             ({"D1": "Mattew C. Braner"},),  # Call1 _get_roster_names: snapshot
-            ("existing-judge-uuid",),  # Call1 Step3b: judge exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Call1 Step3b: judge exists
             ("existing-judge-uuid", "Matthew C. Braner"),  # Call2 Step1: alias hit
         ]
         mock_cur.fetchall.side_effect = [
@@ -462,7 +464,7 @@ class TestStep1ArbitrationWireUp:
             None,  # Step2: no exact canonical
             ("ca-san_diego",),  # _get_roster_names: court_code
             ({"D1": "Mattew C. Braner"},),  # _get_roster_names: snapshot
-            ("existing-judge-uuid",),  # Step3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step3 near-dup
@@ -774,7 +776,7 @@ class TestRenamedJudgeIds:
             None,  # Step 2: no exact canonical
             ("ca-san_diego",),  # Step 3b: court_code
             ({"D1": "Mattew C. Braner"},),  # Step 3b: snapshot
-            ("existing-judge-uuid",),  # Step 3b: judge with roster name exists
+            ("existing-judge-uuid", "Mattew C. Braner"),  # Step 3b: judge with roster name exists
         ]
         mock_cur.fetchall.side_effect = [
             [],  # Step 3: no near-duplicates
@@ -801,7 +803,7 @@ class TestRenamedJudgeIds:
             None,
             ("ca-san_diego",),
             ({"D1": "Mattew C. Braner"},),
-            ("existing-judge-uuid",),
+            ("existing-judge-uuid", "Mattew C. Braner"),
         ]
         mock_cur.fetchall.side_effect = [[], [("matthew c. braner", "sd_calendar")]]
         mock_cur.rowcount = 0  # the name is held by another judge
@@ -896,11 +898,20 @@ class TestChooseCanonicalSpelling:
 class _PgCourt:
     """A fresh court with one judge, for resolve_judge against real Postgres."""
 
-    def __init__(self, canonical: str, aliases: list[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        canonical: str,
+        aliases: list[tuple[str, str]],
+        roster: dict[str, str] | None = None,
+    ) -> None:
+        import json
+
         import psycopg
 
         self.conn = psycopg.connect(_DSN, autocommit=False)
         code = f"ca-arb4922-{uuid.uuid4().hex[:12]}"
+        # The roster snapshot is keyed by the court code in snapshot form.
+        self.snapshot_court = code.replace("-", "_")
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO courts (state, county, court_name, court_code) "
@@ -908,6 +919,13 @@ class _PgCourt:
                 (code,),
             )
             self.court_id = str(cur.fetchone()[0])
+            if roster is not None:
+                cur.execute(
+                    "INSERT INTO court_directory_snapshots "
+                    "(court_id, captured_at, s3_key, mapping, content_hash) "
+                    "VALUES (%s, NOW(), %s, %s::jsonb, %s)",
+                    (self.snapshot_court, f"test/{code}.json", json.dumps(roster), code),
+                )
             cur.execute(
                 "INSERT INTO judges (canonical_name, court_id) VALUES (%s, %s::uuid) RETURNING id",
                 (canonical, self.court_id),
@@ -941,8 +959,18 @@ class _PgCourt:
         with self.conn.cursor() as cur:
             cur.execute("DELETE FROM judges WHERE court_id = %s::uuid", (self.court_id,))
             cur.execute("DELETE FROM courts WHERE id = %s::uuid", (self.court_id,))
+            cur.execute(
+                "DELETE FROM court_directory_snapshots WHERE court_id = %s",
+                (self.snapshot_court,),
+            )
         self.conn.commit()
         self.conn.close()
+        clear_roster_cache(self.court_id)
+
+    def judge_count(self) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM judges WHERE court_id = %s::uuid", (self.court_id,))
+            return int(cur.fetchone()[0])
 
 
 def _run_orders(
@@ -1044,3 +1072,145 @@ class TestArbitrationOrderIndependencePg:
         ]
         finals, _ = _run_orders("H. Shaina Colover", seed, obs, orders=24)
         assert finals == {"H. Shaina Clover"}
+
+
+# ---------------------------------------------------------------------------
+# Real Postgres: Step 3b finds a renamed roster judge through its aliases (#4926)
+# ---------------------------------------------------------------------------
+
+
+@_needs_pg
+class TestRosterMatchFindsRenamedJudgePg:
+    """Step 3b must find the roster's judge after its canonical name moved off
+    the roster spelling (#4926).
+
+    On dev, judge fb070234 (Orange) is canonical 'H. Shaina Clover'; the
+    roster spelling 'H. Shaina Colover' is only a ``roster_match`` alias.
+    A document printing 'Shaina H. Colover' (never seen before) misses
+    Step 1, misses the near-duplicate step, roster-matches 'H. Shaina
+    Colover', and then found no judge with that *canonical* name, so Step 4
+    created a second judge row.
+    """
+
+    _ROSTER = {"C23": "H. Shaina Colover"}
+    _RENAMED_ALIASES = [
+        ("Shaina Clover", "rebuild-ca-orange"),
+        ("H. Shaina Clover", "reingest-ca-orange"),
+        ("H. Shaina Colover", "roster_match"),
+    ]
+
+    def test_new_roster_spelling_joins_renamed_judge(self) -> None:
+        court = _PgCourt("H. Shaina Clover", self._RENAMED_ALIASES, roster=self._ROSTER)
+        try:
+            renamed: set[str] = set()
+            judge_id = resolve_judge(
+                court.conn,
+                "Shaina H. Colover",
+                court.court_id,
+                source="reingest-ca-orange",
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.judge_count() == 1
+            # The better-supported Clover spelling keeps the name.
+            assert court.canonical() == "H. Shaina Clover"
+            assert renamed == set()
+        finally:
+            court.close()
+
+    def test_new_roster_spelling_without_source_joins_renamed_judge(self) -> None:
+        court = _PgCourt("H. Shaina Clover", self._RENAMED_ALIASES, roster=self._ROSTER)
+        try:
+            judge_id = resolve_judge(court.conn, "Shaina H. Colover", court.court_id)
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.judge_count() == 1
+            assert court.canonical() == "H. Shaina Clover"
+        finally:
+            court.close()
+
+    def test_roster_spelling_held_by_a_document_alias_is_found(self) -> None:
+        """The roster spelling may sit under any alias source, not only roster_match."""
+        aliases = [
+            ("Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "reingest-ca-orange"),
+            ("H. Shaina Colover", "scraper"),
+        ]
+        court = _PgCourt("H. Shaina Clover", aliases, roster=self._ROSTER)
+        try:
+            judge_id = resolve_judge(
+                court.conn, "Shaina H. Colover", court.court_id, source="ca-orange"
+            )
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.judge_count() == 1
+        finally:
+            court.close()
+
+    def test_rename_through_alias_match_is_reported(self) -> None:
+        """A rename reached through the alias match lands in renamed_judge_ids (#4920)."""
+        aliases = [
+            ("Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "rebuild-ca-orange"),
+            ("H. Shaina Clover", "reingest-ca-orange"),
+            ("H. Shaina Colover", "roster_match"),
+        ]
+        court = _PgCourt("Shaina Clover", aliases, roster=self._ROSTER)
+        try:
+            renamed: set[str] = set()
+            judge_id = resolve_judge(
+                court.conn,
+                "Shaina H. Colover",
+                court.court_id,
+                source="ca-orange",
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.judge_count() == 1
+            assert court.canonical() == "H. Shaina Clover"
+            assert renamed == {court.judge_id}
+        finally:
+            court.close()
+
+    def test_bootstrap_judge_found_by_its_roster_alias(self) -> None:
+        """A judge created under a non-roster spelling (#3858) is found by its roster alias.
+
+        The first document creates 'H. Shaina Clover' and stores the roster
+        spelling as a roster_match alias; the second, with a new spelling
+        that matches the roster, must join that judge.
+        """
+        court = _PgCourt("Zed Q. Other", [], roster=self._ROSTER)
+        try:
+            first = resolve_judge(court.conn, "H. Shaina Clover", court.court_id, source="a")
+            court.conn.commit()
+            second = resolve_judge(court.conn, "Shaina H. Colover", court.court_id, source="b")
+            court.conn.commit()
+            assert first is not None
+            assert second == first
+            assert court.judge_count() == 2
+        finally:
+            court.close()
+
+    def test_canonical_match_preferred_over_alias_match(self) -> None:
+        """A judge whose canonical is the roster spelling wins over another judge's alias."""
+        court = _PgCourt(
+            "Zed Q. Other", [("H. Shaina Colover", "roster_match")], roster=self._ROSTER
+        )
+        try:
+            with court.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO judges (canonical_name, court_id) "
+                    "VALUES ('H. Shaina Colover', %s::uuid) RETURNING id",
+                    (court.court_id,),
+                )
+                roster_judge = str(cur.fetchone()[0])
+            court.conn.commit()
+            # A typo of the roster name: misses Steps 1-3, roster-matches in 3b.
+            judge_id = resolve_judge(court.conn, "H. Shaina Collover", court.court_id)
+            court.conn.commit()
+            assert judge_id == roster_judge
+            assert court.judge_count() == 2
+        finally:
+            court.close()
