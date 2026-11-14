@@ -473,9 +473,17 @@ def _discover_courts(keys: list[str]) -> list[dict[str, str]]:
 
 
 def _seed_courts(
-    conn: psycopg.Connection, courts: list[dict[str, str]]
+    conn: psycopg.Connection,
+    courts: list[dict[str, str]],
+    *,
+    changed_court_ids: set[str] | None = None,
 ) -> dict[str, str]:
-    """Insert or update court records. Returns ``{court_code: court_id}``."""
+    """Insert or update court records. Returns ``{court_code: court_id}``.
+
+    Every search doc of a court's rulings shows its name, county and state.
+    The id of an existing court whose shown fields this changes is added to
+    *changed_court_ids*, for the caller to re-index once committed (#4935).
+    """
     court_ids: dict[str, str] = {}
     with conn.cursor() as cur:
         for court in courts:
@@ -487,7 +495,16 @@ def _seed_courts(
                     SET state = EXCLUDED.state,
                         county = EXCLUDED.county,
                         court_name = EXCLUDED.court_name
-                RETURNING id
+                RETURNING id,
+                    -- The sub-select sees the row as it was before this
+                    -- statement; an INSERT (xmax = 0) changes no doc.
+                    (NOT (xmax = 0) AND NOT EXISTS (
+                        SELECT 1 FROM courts prev
+                        WHERE prev.id = courts.id
+                          AND prev.state IS NOT DISTINCT FROM courts.state
+                          AND prev.county IS NOT DISTINCT FROM courts.county
+                          AND prev.court_name IS NOT DISTINCT FROM courts.court_name
+                    )) AS shown_changed
                 """,
                 (
                     court["state"],
@@ -499,6 +516,8 @@ def _seed_courts(
             )
             row = cur.fetchone()
             court_ids[court["court_code"]] = str(row[0])
+            if changed_court_ids is not None and len(row) > 1 and row[1] is True:
+                changed_court_ids.add(str(row[0]))
     conn.commit()
     return court_ids
 
@@ -1004,49 +1023,52 @@ def _process_prefix_document(
         }
 
 
-def _reindex_renamed_judges(
-    dsn: str, os_url: str, bucket: str, judge_ids: set[str]
+def _reindex_dependent_rulings(
+    dsn: str,
+    os_url: str,
+    bucket: str,
+    *,
+    judge_ids: set[str],
+    court_ids: set[str],
 ) -> None:
-    """Re-index the rulings of judges the pre-pass renamed (#4920).
+    """Re-index the rulings that show a row this run's setup changed.
 
-    A rename changes the ``judge_name`` of every search doc of the judge,
-    including rulings on keys this run does not reingest.  Runs after the
-    pre-pass committed.  Best-effort: the index is derivable from
+    The judge pre-pass can rename a judge (#4920) and court seeding can
+    rename a court (#4935); either changes a field every search doc of the
+    row's rulings shows, including rulings on keys this run does not
+    reingest.  Runs after both committed.  The per-key writes re-index what
+    they change themselves.  Best-effort: the index is derivable from
     ``derived.*``, so a failure is logged with the repair command.
     """
-    if not judge_ids:
+    if not (judge_ids or court_ids):
         return
+    ids = {"judge_ids": sorted(judge_ids), "court_ids": sorted(court_ids)}
     if not os_url:
         logger.warning(
-            "judge_prepass_renamed_judges_not_reindexed",
-            reason="OPENSEARCH_URL not set",
-            judge_ids=sorted(judge_ids),
+            "dependent_rulings_not_reindexed", reason="OPENSEARCH_URL not set", **ids
         )
         return
     try:
-        from framework.opensearch_client import make_opensearch_client
-        from framework.s3_cache import make_s3_client
-        from framework.search.indexer import IndexingConsumer
-        from framework.search.ruling_doc import reindex_judge_rulings
-
-        indexer = IndexingConsumer(
-            make_opensearch_client(os_url), make_s3_client(), bucket, ensure_index=False
+        from framework.search.ruling_doc import (
+            ShownRowChanges,
+            reindex_dependent_rulings_at,
         )
-        with psycopg.connect(dsn) as conn:
-            count = reindex_judge_rulings(conn, indexer, judge_ids)
+
+        count = reindex_dependent_rulings_at(
+            dsn,
+            os_url,
+            bucket,
+            ShownRowChanges(judge_ids=set(judge_ids), court_ids=set(court_ids)),
+        )
     except Exception:
         logger.warning(
-            "judge_prepass_renamed_judges_reindex_failed — run "
+            "dependent_rulings_reindex_failed — run "
             "scripts/reindex_search_from_db.py --apply to repair",
-            judge_ids=sorted(judge_ids),
             exc_info=True,
+            **ids,
         )
         return
-    logger.info(
-        "judge_prepass_renamed_judges_reindexed",
-        judge_ids=sorted(judge_ids),
-        rulings=count,
-    )
+    logger.info("dependent_rulings_reindexed", rulings=count, **ids)
 
 
 def run_reingest_from_prefix(
@@ -1335,9 +1357,11 @@ def _reingest_keys(
             "skipped": 0,
         }
 
+    changed_court_ids: set[str] = set()
     with psycopg.connect(dsn) as conn:
-        court_ids = _seed_courts(conn, courts)
+        court_ids = _seed_courts(conn, courts, changed_court_ids=changed_court_ids)
     logger.info("Courts seeded", court_ids=court_ids)
+    renamed_judge_ids: set[str] = set()
 
     # Step 2b: Judge pre-pass (#4408 / #4419) — seed full-name judges
     # before the per-doc ``ProcessPoolExecutor`` runs so single-word
@@ -1351,7 +1375,6 @@ def _reingest_keys(
         )
     else:
         prepass_t0 = time.monotonic()
-        renamed_judge_ids: set[str] = set()
         with psycopg.connect(dsn) as prepass_conn:
             prepass_stats = _seed_judges_from_keys(
                 prepass_conn,
@@ -1363,7 +1386,6 @@ def _reingest_keys(
                 concurrency=concurrency,
                 renamed_judge_ids=renamed_judge_ids,
             )
-        _reindex_renamed_judges(dsn, os_url, bucket, renamed_judge_ids)
         logger.info(
             "judge_prepass_complete",
             mode=mode,
@@ -1372,6 +1394,11 @@ def _reingest_keys(
             judges_skipped_invalid=prepass_stats["judges_skipped_invalid"],
             wall_time_seconds=round(time.monotonic() - prepass_t0, 2),
         )
+    # A court the seeding renamed or a judge the pre-pass renamed changes
+    # the search docs of its rulings on every key (#4920, #4935).
+    _reindex_dependent_rulings(
+        dsn, os_url, bucket, judge_ids=renamed_judge_ids, court_ids=changed_court_ids
+    )
 
     # Step 3: Process documents using child processes.
     # Uses ProcessPoolExecutor (like rebuild_db.py) because pdfplumber/pdfminer

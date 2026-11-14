@@ -478,3 +478,19 @@ def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
         assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Craig L. Griffin"}
     finally:
         h.close()
+
+
+# ---------------------------------------------------------------------------
+# #4935: a case retitle re-indexes the case's rulings on other keys
+# ---------------------------------------------------------------------------
+
+
+@_needs_pg
+@pytest.mark.parametrize("first_kind", ["live", "reingest"])
+@pytest.mark.parametrize("second_kind", ["live", "reingest"])
+def test_case_retitle_reindexes_rulings_on_other_keys(first_kind: str, second_kind: str) -> None:
+    """A write that gives a shared case its title re-indexes that case's
+    rulings on every other key (#4935).  Before the fix only the writing
+    key's docs were re-indexed: the Orange rebuild for #4926 left 21 docs
+    with a stale case title or type until ``reindex_search_from_db.py --apply``."""
+    harness.run_shared_case_retitle(_DSN, _RUN, first_kind, second_kind)

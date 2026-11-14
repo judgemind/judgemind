@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import date, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import psycopg
@@ -8258,25 +8259,35 @@ def test_llm_enrich_fields_returns_empty_when_first_pass_has_data_but_strict_ret
 
 
 # ---------------------------------------------------------------------------
-# Renamed judges are re-indexed after the commit (#4920)
+# Rulings showing a changed case / judge / court are re-indexed after the
+# commit (#4920, #4935)
 # ---------------------------------------------------------------------------
 
 
-class TestReindexRenamedJudges:
-    def test_no_renamed_judges_does_nothing(self) -> None:
+def _changes(**ids: set[str]) -> Any:
+    from framework.search.ruling_doc import ShownRowChanges
+
+    return ShownRowChanges(**ids)
+
+
+class TestReindexDependentRulings:
+    def test_no_changes_does_nothing(self) -> None:
         worker, _ = _make_worker()
         conn = MagicMock()
-        with patch("ingestion.worker.reindex_judge_rulings") as mock_reindex:
-            worker._reindex_renamed_judges(conn, set())
+        with patch("ingestion.worker.reindex_dependent_rulings") as mock_reindex:
+            worker._reindex_dependent_rulings(conn, _changes(), written=["doc-1"])
         mock_reindex.assert_not_called()
         conn.rollback.assert_not_called()
 
-    def test_renamed_judges_are_reindexed_and_transaction_ended(self) -> None:
+    def test_changes_are_reindexed_and_transaction_ended(self) -> None:
         worker, _ = _make_worker()
         conn = MagicMock()
-        with patch("ingestion.worker.reindex_judge_rulings", return_value=4) as mock_reindex:
-            worker._reindex_renamed_judges(conn, {"judge-1"})
-        mock_reindex.assert_called_once_with(conn, worker._indexer, {"judge-1"})
+        changes = _changes(case_ids={"case-1"}, judge_ids={"judge-1"})
+        with patch("ingestion.worker.reindex_dependent_rulings", return_value=4) as mock_reindex:
+            worker._reindex_dependent_rulings(conn, changes, written=["doc-1"])
+        mock_reindex.assert_called_once_with(
+            conn, worker._indexer, changes, skip_document_ids=["doc-1"]
+        )
         conn.rollback.assert_called_once()
 
     def test_reindex_failure_is_best_effort(self) -> None:
@@ -8284,6 +8295,69 @@ class TestReindexRenamedJudges:
         worker, _ = _make_worker()
         conn = MagicMock()
         conn.rollback.side_effect = RuntimeError("connection gone")
-        with patch("ingestion.worker.reindex_judge_rulings", side_effect=RuntimeError("os down")):
-            worker._reindex_renamed_judges(conn, {"judge-1"})
+        with patch(
+            "ingestion.worker.reindex_dependent_rulings", side_effect=RuntimeError("os down")
+        ):
+            worker._reindex_dependent_rulings(conn, _changes(court_ids={"c"}), written=[])
         conn.rollback.assert_called_once()
+
+
+def _prepared_write(document_id: str, **ids: set[str]) -> MagicMock:
+    """A ``_RulingWrite`` stand-in whose preparation recorded *ids*."""
+    w = MagicMock()
+    w.document_id = document_id
+    w.event_data = {}
+    w.shown_changes = _changes(**ids)
+    return w
+
+
+class TestWritePathsReindexDependents:
+    """Each write path hands the rows it changed to the one re-index (#4935)."""
+
+    def test_single_write_reindexes_after_commit(self) -> None:
+        worker, _ = _make_worker()
+        conn = MagicMock()
+        w = _prepared_write("doc-1", case_ids={"case-1"})
+        calls: list[str] = []
+        conn.commit.side_effect = lambda: calls.append("commit")
+        with (
+            patch.object(worker, "_get_connection", return_value=conn),
+            patch.object(worker, "_prepare_ruling_write", return_value=("ct", "case-1", None)),
+            patch.object(worker, "_link_ruling_rows"),
+            patch.object(worker, "_index_committed_ruling"),
+            patch("ingestion.worker.insert_document_and_ruling"),
+            patch("ingestion.worker._should_move_off_unsupported_case", return_value=False),
+            patch.object(
+                worker,
+                "_reindex_dependent_rulings",
+                side_effect=lambda *_a, **_k: calls.append("reindex"),
+            ) as mock_reindex,
+        ):
+            worker._write_one_ruling(w)
+        assert calls == ["commit", "reindex"]
+        mock_reindex.assert_called_once_with(conn, w.shown_changes, written=["doc-1"])
+
+    def test_split_write_reindexes_every_childs_changes(self) -> None:
+        worker, _ = _make_worker()
+        conn = MagicMock()
+        children = [
+            _prepared_write("doc-1", case_ids={"case-1"}),
+            _prepared_write("doc-2", judge_ids={"judge-1"}, court_ids={"court-1"}),
+        ]
+        batch = MagicMock(children=children, keep_ids=set(), no_rulings_reason=None)
+        with (
+            patch.object(worker, "_get_connection", return_value=conn),
+            patch.object(worker, "_prepare_ruling_write", return_value=("ct", "case-1", None)),
+            patch.object(worker, "_link_ruling_rows"),
+            patch.object(worker, "_index_committed_ruling"),
+            patch("ingestion.worker.insert_document"),
+            patch("ingestion.worker.write_split_rulings", return_value={}),
+            patch("ingestion.worker.delete_stale_split_children"),
+            patch.object(worker, "_reindex_dependent_rulings") as mock_reindex,
+        ):
+            worker._write_split_batch({"s3_key": "k"}, "parent", batch)
+        _conn, changes = mock_reindex.call_args.args
+        assert changes == _changes(
+            case_ids={"case-1"}, judge_ids={"judge-1"}, court_ids={"court-1"}
+        )
+        assert mock_reindex.call_args.kwargs == {"written": ["doc-1", "doc-2"]}

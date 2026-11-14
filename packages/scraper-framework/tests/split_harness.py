@@ -16,7 +16,8 @@ properties that must hold for any sequence of re-splits:
   metadata (judge name, case title, hearing date, ...) of the doc built
   from ``derived.*`` now, for every key the harness has written, not only
   the one the step touched.  A judge rename made by one key's write must
-  re-index the judge's rulings on other keys (#4920);
+  re-index the judge's rulings on other keys (#4920), and so must a case
+  retitle (:func:`run_shared_case_retitle`, #4935);
 - ``date_source``: a ruling with a ``hearing_date`` has a
   ``hearing_date_source``;
 - ``synthetic_title``: a ruling on its own synthetic ``UNKNOWN-<document id>``
@@ -956,6 +957,50 @@ def run_steps(
                 "converge",
                 f"seed={seed}: a fresh live capture leaves {_fmt(fresh['live'])}, a "
                 f"fresh reingest of the same bytes leaves {_fmt(fresh['reingest'])}",
+            )
+    finally:
+        harness.close()
+
+
+def run_shared_case_retitle(
+    dsn: str, run_token: str, first_kind: str, second_kind: str, *, name: str = "retitle"
+) -> None:
+    """Two keys in one county each write a ruling of one shared case; the
+    first has no caption, the second gives the case its title (#4935).
+
+    The second key's write changes ``cases.case_title``, which every search
+    doc of the case shows, so the first key's search doc must follow: the
+    ``search_fields`` invariant checks every key the harness wrote.  The
+    second key's extraction holds two rulings (a split batch); the first
+    key's holds one.  Raises :class:`InvariantError` on a broken invariant.
+    """
+    tag = f"{run_token}-{name}-{first_kind}-{second_kind}"
+    shared = 7
+    harness = KeyHarness(dsn, run_token, -1, frozenset({"search", "search_fields"}))
+    try:
+        first = make_key(f"{tag}-a", county_tag=tag)
+        second = make_key(f"{tag}-b", county_tag=tag)
+        untitled = Spec(shared, _case_number(shared), None, _text(f"{tag}-a", shared))
+        harness.run_step(first, Step(first_kind, (Row("ruling", 0),), (untitled,)), "untitled")
+        titled = (
+            Spec(shared, _case_number(shared), _title(shared), _text(f"{tag}-b", shared)),
+            Spec(1, _case_number(1), _title(1), _text(f"{tag}-b", 1)),
+        )
+        harness.run_step(
+            second,
+            Step(second_kind, (Row("ruling", 0), Row("ruling", 1)), titled, ("retitle_shared",)),
+            "retitle",
+        )
+        titles = {
+            meta.get("case_title")
+            for doc_id, meta in harness.indexer.meta.items()
+            if doc_id == first.parent or doc_id in first.slots
+        }
+        if titles != {_title(shared)}:
+            raise InvariantError(
+                "search_fields",
+                f"{tag}: the first key's search doc shows case titles {titles}, "
+                f"the shared case is titled {_title(shared)!r}",
             )
     finally:
         harness.close()

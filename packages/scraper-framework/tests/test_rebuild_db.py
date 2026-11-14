@@ -559,6 +559,38 @@ class TestDiscoverCourts:
 # ---------------------------------------------------------------------------
 
 
+class TestReindexRenamedCourts:
+    """#4935: rulings of a court ``seed_courts`` renamed are re-indexed."""
+
+    def test_no_renamed_courts_or_no_opensearch_does_nothing(self) -> None:
+        with patch("framework.search.ruling_doc.reindex_dependent_rulings_at") as reindex:
+            rebuild_db.reindex_renamed_courts("dsn", "https://os", "b", set())
+            rebuild_db.reindex_renamed_courts("dsn", "", "b", {"court-1"})
+        reindex.assert_not_called()
+
+    def test_renamed_courts_are_reindexed(self) -> None:
+        from framework.search.ruling_doc import ShownRowChanges
+
+        with patch(
+            "framework.search.ruling_doc.reindex_dependent_rulings_at", return_value=7
+        ) as reindex:
+            rebuild_db.reindex_renamed_courts("dsn", "https://os", "b", {"court-1"})
+        reindex.assert_called_once_with(
+            "dsn", "https://os", "b", ShownRowChanges(court_ids={"court-1"})
+        )
+
+    def test_failure_is_logged_not_raised(self) -> None:
+        with (
+            patch(
+                "framework.search.ruling_doc.reindex_dependent_rulings_at",
+                side_effect=RuntimeError("os down"),
+            ),
+            patch.object(rebuild_db, "logger") as mock_logger,
+        ):
+            rebuild_db.reindex_renamed_courts("dsn", "https://os", "b", {"court-1"})
+        assert "reindex_failed" in mock_logger.warning.call_args.args[0]
+
+
 class TestMainSummary:
     """Tests that main() reports hearing_date skip counts in the summary."""
 

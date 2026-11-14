@@ -110,59 +110,126 @@ def test_search_doc_metadata_matches_indexed_fields() -> None:
 
 
 # ---------------------------------------------------------------------------
-# reindex_judge_rulings (#4920)
+# reindex_dependent_rulings (#4920, #4935)
 # ---------------------------------------------------------------------------
 
 J1 = "bbbbbbbb-0000-0000-0000-000000000001"
+C1 = "cccccccc-0000-0000-0000-000000000001"
+CT1 = "dddddddd-0000-0000-0000-000000000001"
 
 
-def test_reindex_judge_rulings_indexes_every_ruling_of_the_judges() -> None:
-    from framework.search.ruling_doc import JUDGE_RULING_DOCUMENTS_SQL, reindex_judge_rulings
-
+def _ids_conn(rows: list[tuple[str]]) -> tuple[MagicMock, MagicMock]:
     cur = MagicMock()
-    cur.fetchall.return_value = [(D1,), (D2,), (D3,)]
+    cur.fetchall.return_value = rows
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
+    return conn, cur
+
+
+def test_reindex_dependent_rulings_indexes_every_ruling_of_the_rows() -> None:
+    from framework.search.ruling_doc import (
+        DEPENDENT_RULING_DOCUMENTS_SQL,
+        ShownRowChanges,
+        reindex_dependent_rulings,
+    )
+
+    conn, cur = _ids_conn([(D1,), (D2,), (D3,)])
     indexer = MagicMock()
     indexer.index_batch.side_effect = lambda events, force: len(events)
     loaded: list[list[str]] = []
 
     def load(_conn: object, ids: list[str]) -> dict[str, dict]:
         loaded.append(list(ids))
-        return {i: {"document_id": i, "judge_name": "New Name"} for i in ids}
+        return {i: {"document_id": i, "case_title": "New"} for i in ids}
 
+    changes = ShownRowChanges(case_ids={C1, "junk"}, judge_ids={J1}, court_ids={CT1})
     with patch("framework.search.ruling_doc.load_search_events", side_effect=load):
-        count = reindex_judge_rulings(conn, indexer, [J1, J1, "junk"], batch_size=2)
+        count = reindex_dependent_rulings(conn, indexer, changes, batch_size=2)
 
     assert count == 3
     sql, params = cur.execute.call_args.args
-    assert sql == JUDGE_RULING_DOCUMENTS_SQL
-    assert "r.judge_id = ANY" in sql
-    assert params == ([J1],)
+    assert sql == DEPENDENT_RULING_DOCUMENTS_SQL
+    for column in ("r.case_id", "r.judge_id", "r.court_id"):
+        assert f"{column} = ANY" in sql
+    assert params == ([C1], [J1], [CT1])
     assert loaded == [[D1, D2], [D3]]
     assert all(c.kwargs == {"force": True} for c in indexer.index_batch.call_args_list)
 
 
-def test_reindex_judge_rulings_with_no_valid_ids_does_nothing() -> None:
-    from framework.search.ruling_doc import reindex_judge_rulings
+def test_reindex_dependent_rulings_skips_docs_the_writer_indexed() -> None:
+    from framework.search.ruling_doc import ShownRowChanges, reindex_dependent_rulings
+
+    conn, _cur = _ids_conn([(D1,), (D2,)])
+    indexer = MagicMock()
+    loaded: list[list[str]] = []
+
+    def load(_conn: object, ids: list[str]) -> dict[str, dict]:
+        loaded.append(list(ids))
+        return {i: {"document_id": i} for i in ids}
+
+    with patch("framework.search.ruling_doc.load_search_events", side_effect=load):
+        reindex_dependent_rulings(
+            conn, indexer, ShownRowChanges(case_ids={C1}), skip_document_ids=[D1]
+        )
+    assert loaded == [[D2]]
+
+
+def test_reindex_dependent_rulings_with_no_valid_ids_does_nothing() -> None:
+    from framework.search.ruling_doc import ShownRowChanges, reindex_dependent_rulings
 
     conn = MagicMock()
     indexer = MagicMock()
 
-    assert reindex_judge_rulings(conn, indexer, ["junk"]) == 0
+    assert reindex_dependent_rulings(conn, indexer, ShownRowChanges(judge_ids={"junk"})) == 0
     conn.cursor.assert_not_called()
     indexer.index_batch.assert_not_called()
 
 
-def test_reindex_judge_rulings_skips_batches_with_no_rulings() -> None:
-    from framework.search.ruling_doc import reindex_judge_rulings
+def test_reindex_dependent_rulings_skips_batches_with_no_rulings() -> None:
+    from framework.search.ruling_doc import ShownRowChanges, reindex_dependent_rulings
 
-    cur = MagicMock()
-    cur.fetchall.return_value = [(D1,)]
-    conn = MagicMock()
-    conn.cursor.return_value.__enter__.return_value = cur
+    conn, _cur = _ids_conn([(D1,)])
     indexer = MagicMock()
 
     with patch("framework.search.ruling_doc.load_search_events", return_value={}):
-        assert reindex_judge_rulings(conn, indexer, [J1]) == 0
+        assert reindex_dependent_rulings(conn, indexer, ShownRowChanges(judge_ids={J1})) == 0
     indexer.index_batch.assert_not_called()
+
+
+def test_shown_row_changes_merge_and_truthiness() -> None:
+    from framework.search.ruling_doc import ShownRowChanges
+
+    changes = ShownRowChanges()
+    assert not changes
+    changes.update(ShownRowChanges(case_ids={C1}))
+    changes.update(ShownRowChanges(judge_ids={J1}, court_ids={CT1}))
+    assert changes
+    assert changes.summary() == {"case_ids": [C1], "judge_ids": [J1], "court_ids": [CT1]}
+
+
+def test_reindex_dependent_rulings_at_with_no_changes_connects_nothing() -> None:
+    from framework.search.ruling_doc import ShownRowChanges, reindex_dependent_rulings_at
+
+    with patch("psycopg.connect") as mock_connect:
+        assert reindex_dependent_rulings_at("dsn", "https://os", "b", ShownRowChanges()) == 0
+    mock_connect.assert_not_called()
+
+
+def test_reindex_dependent_rulings_at_opens_a_connection_and_indexer() -> None:
+    from framework.search.ruling_doc import ShownRowChanges, reindex_dependent_rulings_at
+
+    changes = ShownRowChanges(court_ids={CT1})
+    with (
+        patch("psycopg.connect") as mock_connect,
+        patch("framework.opensearch_client.make_opensearch_client") as mock_os,
+        patch("framework.s3_cache.make_s3_client"),
+        patch("framework.search.indexer.IndexingConsumer") as mock_consumer,
+        patch(
+            "framework.search.ruling_doc.reindex_dependent_rulings", return_value=5
+        ) as mock_reindex,
+    ):
+        assert reindex_dependent_rulings_at("dsn", "https://os", "bucket", changes) == 5
+    mock_connect.assert_called_once_with("dsn")
+    mock_os.assert_called_once_with("https://os")
+    conn = mock_connect.return_value.__enter__.return_value
+    mock_reindex.assert_called_once_with(conn, mock_consumer.return_value, changes)

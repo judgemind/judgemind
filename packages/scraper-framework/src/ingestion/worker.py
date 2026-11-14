@@ -51,7 +51,11 @@ from framework.events import trim_consumed_entries
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
-from framework.search.ruling_doc import load_search_events, reindex_judge_rulings
+from framework.search.ruling_doc import (
+    ShownRowChanges,
+    load_search_events,
+    reindex_dependent_rulings,
+)
 from validation.deterministic import (
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
@@ -88,6 +92,7 @@ from .db import (
     delete_stale_split_children,
     insert_document,
     insert_document_and_ruling,
+    lookup_court_id,
     resolve_judge,
     resolve_judge_from_department,
     upsert_case_judge,
@@ -1485,9 +1490,10 @@ class _RulingWrite:
     #: there is none that can settle it (``_case_number_evidence``, #4927).
     #: Never LLM output.
     case_number_evidence: tuple[str, ...] = ()
-    #: Judges ``resolve_judge`` renamed while preparing this write; their
-    #: rulings are re-indexed once it commits (#4920).
-    renamed_judge_ids: set[str] = field(default_factory=set)
+    #: The case, judge and court rows this write changed a shown field of
+    #: (a case title, a judge rename, a court name); their rulings are
+    #: re-indexed once it commits (#4920, #4935).
+    shown_changes: ShownRowChanges = field(default_factory=ShownRowChanges)
 
 
 @dataclass
@@ -3608,7 +3614,11 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         if not judge_name and department and state == "CA":
             conn = self._get_connection()
-            court_id_for_dept = upsert_court(conn, state, county, court_name)
+            # Read-only when the court exists: a court-name change is made,
+            # and re-indexed, by the ruling write (#4935).
+            court_id_for_dept = lookup_court_id(conn, state, county) or upsert_court(
+                conn, state, county, court_name
+            )
             dept_judge = resolve_judge_from_department(
                 conn, court_id_for_dept, department, hearing_date=hearing_dt
             )
@@ -4130,7 +4140,9 @@ class IngestionWorker:
         printed_judge_name: str | None = None
 
         # 1. Ensure court exists
-        court_id = upsert_court(conn, state, county, court_name)
+        court_id = upsert_court(
+            conn, state, county, court_name, changed_court_ids=w.shown_changes.court_ids
+        )
 
         # 1b. Enrichment — resolve extracted fields against DB data (#1576).
         # Skip enrichment when case_number is empty/synthetic, as there is
@@ -4280,6 +4292,9 @@ class IngestionWorker:
             case_title=case_title,
             case_type=case_type,
             force_update=synthetic_case,
+            # A title or type this write gives the case shows on every
+            # ruling of it, on other keys too (#4935).
+            changed_case_ids=w.shown_changes.case_ids,
         )
         if not case_title and effective_title:
             case_title = effective_title
@@ -4338,7 +4353,7 @@ class IngestionWorker:
                 judge_name,
                 court_id,
                 source=scraper_id or "scraper",
-                renamed_judge_ids=w.renamed_judge_ids,
+                renamed_judge_ids=w.shown_changes.judge_ids,
                 # Arbitration counts one vote per document, for the
                 # spelling the document printed (#4928).
                 document_id=w.document_id,
@@ -4403,7 +4418,7 @@ class IngestionWorker:
             raise
 
         self._index_committed_ruling(conn, w.document_id)
-        self._reindex_renamed_judges(conn, w.renamed_judge_ids)
+        self._reindex_dependent_rulings(conn, w.shown_changes, written=[w.document_id])
 
     def _link_ruling_rows(
         self, conn: psycopg.Connection, w: _RulingWrite, case_id: str, judge_id: str | None
@@ -4569,33 +4584,40 @@ class IngestionWorker:
             self._index_committed_ruling(conn, document_id)
         if removed:
             self._indexer.delete_documents(removed)
-        self._reindex_renamed_judges(
-            conn, set().union(*(w.renamed_judge_ids for w in batch.children))
-        )
+        changes = ShownRowChanges()
+        for w in batch.children:
+            changes.update(w.shown_changes)
+        self._reindex_dependent_rulings(conn, changes, written=written)
 
-    def _reindex_renamed_judges(self, conn: psycopg.Connection, judge_ids: set[str]) -> None:
-        """Re-index every ruling of the judges this write renamed.
+    def _reindex_dependent_rulings(
+        self, conn: psycopg.Connection, changes: ShownRowChanges, *, written: list[str]
+    ) -> None:
+        """Re-index every ruling that shows a row this write changed.
 
-        ``resolve_judge`` renames a judge when a longer or corroborated
-        spelling arrives, which changes the ``judge_name`` of every search
-        doc of that judge's rulings, on every document, not only the one
-        just written.  Run after the commit, so the rename is visible and
-        every ruling committed before it is re-indexed (#4920).  Without
-        this, a reingest that renamed a judge left the judge's other search
-        docs on the old name until ``reindex_search_from_db.py --apply``.
+        A search doc shows fields of rows other rulings share: the case's
+        title and type, the judge's name, the court's name.  When this write
+        changed one (a case gets its title, ``resolve_judge`` renames a
+        judge), every search doc of that row's rulings is stale, on every
+        document, not only the ones just written (*written*, already indexed
+        and skipped here).  Run after the commit, so the change is visible
+        and every ruling committed before it is re-indexed (#4920, #4935).
+        Without this, a reingest left those docs on the old value until
+        ``reindex_search_from_db.py --apply``.
 
         Best-effort, like ``_index_committed_ruling``: the Postgres write is
         committed and the index is derivable from ``derived.*``.
         """
-        if not judge_ids:
+        if not changes:
             return
         try:
-            count = reindex_judge_rulings(conn, self._indexer, judge_ids)
+            count = reindex_dependent_rulings(
+                conn, self._indexer, changes, skip_document_ids=written
+            )
         except Exception as exc:  # noqa: BLE001 — search indexing is best-effort
             logger.warning(
-                "Search re-index of renamed judges failed; run "
+                "Search re-index of rulings showing changed rows failed; run "
                 "scripts/reindex_search_from_db.py --apply to repair",
-                extra={"judge_ids": sorted(judge_ids), "error": str(exc)},
+                extra={**changes.summary(), "error": str(exc)},
             )
             return
         finally:
@@ -4605,8 +4627,8 @@ class IngestionWorker:
             except Exception:  # noqa: BLE001
                 pass
         logger.info(
-            "Re-indexed the rulings of renamed judges",
-            extra={"judge_ids": sorted(judge_ids), "rulings": count},
+            "Re-indexed the rulings showing changed rows",
+            extra={**changes.summary(), "rulings": count},
         )
 
     def _index_committed_ruling(self, conn: psycopg.Connection, document_id: str) -> None:

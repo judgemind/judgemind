@@ -665,65 +665,100 @@ class TestPrePassRenamedJudges:
 
         with (
             _Pipeline() as pipe,
-            patch("reingest_from_s3._reindex_renamed_judges") as mock_reindex,
+            patch("reingest_from_s3._reindex_dependent_rulings") as mock_reindex,
             patch.dict(os.environ, {"OPENSEARCH_URL": "https://os.example"}),
         ):
             pipe.seed_judges.side_effect = seed
             _run_keys()
 
         mock_reindex.assert_called_once_with(
-            "postgresql://test", "https://os.example", _PREFIX_BUCKET, {"judge-1"}
+            "postgresql://test",
+            "https://os.example",
+            _PREFIX_BUCKET,
+            judge_ids={"judge-1"},
+            court_ids=set(),
         )
 
-    def test_no_renamed_judges_touches_nothing(self) -> None:
-        with patch("reingest_from_s3.psycopg") as mock_psycopg:
-            reingest._reindex_renamed_judges("dsn", "https://os", "b", set())
-        mock_psycopg.connect.assert_not_called()
+    def test_reingest_reindexes_courts_the_seeding_renamed(self) -> None:
+        """#4935: a court the seeding renamed is re-indexed even when the
+        judge pre-pass is skipped."""
+
+        def seed_courts(*_args: Any, **kwargs: Any) -> dict[str, str]:
+            kwargs["changed_court_ids"].add("court-1")
+            return _PREFIX_COURT_IDS
+
+        with (
+            _Pipeline(),
+            patch("reingest_from_s3._seed_courts", side_effect=seed_courts),
+            patch("reingest_from_s3._reindex_dependent_rulings") as mock_reindex,
+            patch.dict(os.environ, {"OPENSEARCH_URL": "https://os.example"}),
+        ):
+            _run_keys(skip_judge_prepass=True)
+
+        assert mock_reindex.call_args.kwargs == {
+            "judge_ids": set(),
+            "court_ids": {"court-1"},
+        }
+
+    def test_no_changes_touches_nothing(self) -> None:
+        reindex = MagicMock()
+        with patch.dict(sys.modules, self._framework_modules(reindex)):
+            reingest._reindex_dependent_rulings(
+                "dsn", "https://os", "b", judge_ids=set(), court_ids=set()
+            )
+        reindex.assert_not_called()
 
     def test_without_opensearch_logs_and_skips(self) -> None:
+        reindex = MagicMock()
         with (
-            patch("reingest_from_s3.psycopg") as mock_psycopg,
+            patch.dict(sys.modules, self._framework_modules(reindex)),
             patch("reingest_from_s3.logger") as mock_logger,
         ):
-            reingest._reindex_renamed_judges("dsn", "", "b", {"judge-1"})
-        mock_psycopg.connect.assert_not_called()
-        assert mock_logger.warning.call_args.args[0] == (
-            "judge_prepass_renamed_judges_not_reindexed"
+            reingest._reindex_dependent_rulings(
+                "dsn", "", "b", judge_ids={"judge-1"}, court_ids=set()
+            )
+        reindex.assert_not_called()
+        assert (
+            mock_logger.warning.call_args.args[0] == "dependent_rulings_not_reindexed"
         )
 
     def _framework_modules(self, reindex: MagicMock) -> dict[str, MagicMock]:
         ruling_doc = MagicMock()
-        ruling_doc.reindex_judge_rulings = reindex
+        ruling_doc.reindex_dependent_rulings_at = reindex
+        ruling_doc.ShownRowChanges = lambda **ids: ids
         return {
             "framework": MagicMock(),
-            "framework.opensearch_client": MagicMock(),
-            "framework.s3_cache": MagicMock(),
             "framework.search": MagicMock(),
-            "framework.search.indexer": MagicMock(),
             "framework.search.ruling_doc": ruling_doc,
         }
 
-    def test_reindexes_the_renamed_judges(self) -> None:
+    def test_reindexes_the_renamed_judges_and_courts(self) -> None:
         reindex = MagicMock(return_value=3)
         with (
             patch.dict(sys.modules, self._framework_modules(reindex)),
-            patch("reingest_from_s3.psycopg") as mock_psycopg,
             patch("reingest_from_s3.logger") as mock_logger,
         ):
-            reingest._reindex_renamed_judges("dsn", "https://os", "b", {"judge-1"})
+            reingest._reindex_dependent_rulings(
+                "dsn", "https://os", "b", judge_ids={"judge-1"}, court_ids={"court-1"}
+            )
 
-        mock_psycopg.connect.assert_called_once_with("dsn")
-        assert reindex.call_args.args[2] == {"judge-1"}
+        assert reindex.call_args.args == (
+            "dsn",
+            "https://os",
+            "b",
+            {"judge_ids": {"judge-1"}, "court_ids": {"court-1"}},
+        )
         assert mock_logger.info.call_args.kwargs["rulings"] == 3
 
     def test_reindex_failure_is_logged_not_raised(self) -> None:
         reindex = MagicMock(side_effect=RuntimeError("os down"))
         with (
             patch.dict(sys.modules, self._framework_modules(reindex)),
-            patch("reingest_from_s3.psycopg"),
             patch("reingest_from_s3.logger") as mock_logger,
         ):
-            reingest._reindex_renamed_judges("dsn", "https://os", "b", {"judge-1"})
+            reingest._reindex_dependent_rulings(
+                "dsn", "https://os", "b", judge_ids={"judge-1"}, court_ids=set()
+            )
 
         assert "reindex_failed" in mock_logger.warning.call_args.args[0]
 
