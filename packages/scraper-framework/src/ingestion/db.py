@@ -1437,66 +1437,183 @@ def _spelling_completeness(name: str) -> tuple[int, int, int]:
     return (len(words), dotted_initials, starts_with_full_name)
 
 
+#: A spelling needs at least this many documents before it can take a
+#: judge's name, and before it counts as well supported (#4928).
+_RENAME_MIN_DOCUMENTS = 2
+#: A challenger must lead the spelling it replaces by at least this many
+#: documents ...
+_RENAME_MIN_LEAD = 2
+#: ... and by at least this factor (#4928).
+_RENAME_MIN_RATIO = 2
+
+
+def _decisive(challenger_docs: int, incumbent_docs: int) -> bool:
+    """True when *challenger_docs* documents clearly outnumber *incumbent_docs*.
+
+    The challenger needs at least :data:`_RENAME_MIN_DOCUMENTS` documents,
+    :data:`_RENAME_MIN_LEAD` more than the incumbent, and
+    :data:`_RENAME_MIN_RATIO` times as many.  So one document never renames
+    a judge, and a spelling printed on 250 documents loses its place only to
+    one printed on 500 (#4928).
+    """
+    return (
+        challenger_docs >= _RENAME_MIN_DOCUMENTS
+        and challenger_docs >= incumbent_docs + _RENAME_MIN_LEAD
+        and challenger_docs >= _RENAME_MIN_RATIO * incumbent_docs
+    )
+
+
 def _choose_canonical_spelling(
-    current: str, evidence: list[tuple[str, str]]
-) -> tuple[str, dict[str, set[str]]]:
+    current: str, evidence: list[tuple[str, int]]
+) -> tuple[str, dict[str, int]]:
     """Pick the canonical spelling for one judge from its document evidence.
 
-    *evidence* is the judge's non-roster aliases as ``(raw_name, source)``
-    pairs.  Each raw name is normalized; spellings that differ only in case
-    are one spelling.  *current* (the judge's canonical name today) is
-    always a candidate, even with no evidence.
+    *evidence* is ``(raw_name, documents)`` pairs: how many distinct active
+    documents printed each raw spelling for this judge
+    (``derived.judge_name_evidence``).  Each raw name is normalized;
+    spellings that differ only in case are one spelling.  *current* (the
+    judge's canonical name today) is always a candidate, even when no
+    document printed it (a roster-only name).
 
     Spellings are grouped into families by ``_normalize_for_comparison``
     (initials and punctuation dropped, word order ignored), so ``Shaina
     Clover``, ``H. Shaina Clover`` and ``Shaina H. Clover`` are one family
-    and ``H. Shaina Colover`` is another.  The winner is the spelling with,
-    in order:
+    and ``H. Shaina Colover`` is another.
 
-    1. the most distinct non-roster sources across its family: a typo
-       family loses to the family more documents agree on;
-    2. the most complete form (:func:`_spelling_completeness`): within a
-       family every member has the same family count, so the fullest
-       spelling wins whatever order the documents arrived in;
-    3. the most distinct non-roster sources for the spelling itself;
-    4. the lexically smallest spelling, so the choice is a total order.
+    1. **Family.**  The name leaves the current family only for a family
+       whose document count is decisive (:func:`_decisive`) over every
+       other family.  A one-document typo (``Craig L. Griffen``) never
+       moves a judge; a roster-only name yields to a spelling printed on
+       two documents.
+    2. **Spelling.**  Within the chosen family, the well-supported
+       spellings are those with at least :data:`_RENAME_MIN_DOCUMENTS`
+       documents that the family's best-supported spelling does not
+       decisively outnumber: a real tie.  Among those, the most complete
+       form (:func:`_spelling_completeness`, the "First M. Last" form) wins,
+       then the most documents, then the lexically smallest spelling.  A
+       spelling outside that set (``Craig L. M. Griffin`` on one document)
+       never wins on completeness.  The current spelling is replaced only
+       when it is itself part of the tie, or when the winner decisively
+       outnumbers it.
 
-    The result depends only on the set of evidence, never on which document
-    arrived last (#4922).  Returns the winner and, for logging, the sources
-    behind each candidate spelling (keyed by lowercased spelling).
+    The rule depends only on document counts, never on which pipeline (a
+    ``source``) read a document: a county has about four sources, so the
+    count of sources measured which pipelines ran, not how many documents
+    agree (#4928).  When one family leads decisively and its spellings are
+    either decisively led or a real tie, the result does not depend on the
+    current name, so every arrival order ends on the same name.  Close
+    counts keep the current name, so a name does not swap back and forth as
+    they move (#4922).
+
+    Returns the winner and, for logging, the documents behind each candidate
+    spelling (keyed by lowercased spelling).
     """
-    display: dict[str, str] = {current.lower(): current}
-    own: dict[str, set[str]] = {current.lower(): set()}
-    for raw, source in evidence:
-        if not raw or source is None:
+    cur_key = current.lower()
+    display: dict[str, str] = {cur_key: current}
+    docs: dict[str, int] = {cur_key: 0}
+    for raw, count in evidence:
+        if not raw or not count or count <= 0:
             continue
         spelling = normalize_judge_name(raw)
-        if spelling is None:
+        if spelling is None or not _looks_like_valid_judge_name(spelling):
             continue
         key = spelling.lower()
         # Keep one display form per spelling; prefer the stored canonical,
         # else the lexically smallest normalized form.
-        if key not in display or (key != current.lower() and spelling < display[key]):
+        if key not in display or (key != cur_key and spelling < display[key]):
             display[key] = spelling
-        own.setdefault(key, set()).add(source)
+        docs[key] = docs.get(key, 0) + int(count)
 
-    family: dict[str, set[str]] = {}
-    for key, sources in own.items():
-        family.setdefault(_normalize_for_comparison(display[key]), set()).update(sources)
+    family_of = {key: _normalize_for_comparison(display[key]) for key in docs}
+    family_docs: dict[str, int] = {}
+    for key, count in docs.items():
+        family_docs[family_of[key]] = family_docs.get(family_of[key], 0) + count
 
-    def rank(key: str) -> tuple:
-        name = display[key]
-        completeness = _spelling_completeness(name)
-        return (
-            -len(family[_normalize_for_comparison(name)]),
-            tuple(-c for c in completeness),
-            -len(own[key]),
-            key,
-            name,
-        )
+    current_family = family_of[cur_key]
+    target_family = current_family
+    leader = min(family_docs, key=lambda fam: (-family_docs[fam], fam))
+    if leader != current_family and all(
+        _decisive(family_docs[leader], count) for fam, count in family_docs.items() if fam != leader
+    ):
+        target_family = leader
 
-    best = min(own, key=rank)
-    return display[best], own
+    members = [key for key in docs if family_of[key] == target_family]
+    top = max(docs[key] for key in members)
+    tied = [
+        key
+        for key in members
+        if docs[key] >= _RENAME_MIN_DOCUMENTS and not _decisive(top, docs[key])
+    ]
+
+    def fullest(key: str) -> tuple:
+        return (tuple(-c for c in _spelling_completeness(display[key])), -docs[key], key)
+
+    if target_family != current_family:
+        if tied:
+            best = min(tied, key=fullest)
+        else:
+            # Spread thin (e.g. two documents, two spellings): the most
+            # printed spelling, then the fullest.
+            best = min(members, key=lambda key: (-docs[key], fullest(key)))
+        return display[best], docs
+
+    if not tied:
+        return current, docs
+    best = min(tied, key=fullest)
+    if best == cur_key:
+        return current, docs
+    if cur_key in tied or _decisive(docs[best], docs[cur_key]):
+        return display[best], docs
+    return current, docs
+
+
+def _record_name_evidence(
+    cur: psycopg.Cursor, document_id: str, judge_id: str, raw_name: str
+) -> None:
+    """Record that *document_id* printed *raw_name* for *judge_id* (#4928).
+
+    One row per document: re-processing a document replaces its row, so a
+    document is one vote however many times a pipeline reads it, and a
+    document that now resolves to another judge moves its vote there.
+    """
+    cur.execute(
+        """
+        INSERT INTO judge_name_evidence (document_id, judge_id, raw_name)
+        VALUES (%s::uuid, %s::uuid, %s)
+        ON CONFLICT (document_id) DO UPDATE
+            SET judge_id = EXCLUDED.judge_id,
+                raw_name = EXCLUDED.raw_name,
+                updated_at = NOW()
+        """,
+        (document_id, judge_id, raw_name),
+    )
+
+
+def _read_name_evidence(
+    cur: psycopg.Cursor, judge_id: str, raw_name: str, document_id: str | None
+) -> list[tuple[str, int]]:
+    """Per-spelling active-document counts for *judge_id*, with this document's vote.
+
+    The document being resolved counts once for *raw_name*, whatever its
+    stored row says (it may be a new document, or a re-read with another
+    spelling, or one that resolved to another judge before).
+    """
+    cur.execute(
+        """
+        SELECT e.raw_name, COUNT(*)
+        FROM judge_name_evidence e
+        JOIN documents d ON d.id = e.document_id
+        WHERE e.judge_id = %s::uuid
+          AND d.status = 'active'
+          AND e.document_id IS DISTINCT FROM %s::uuid
+        GROUP BY e.raw_name
+        """,
+        (judge_id, document_id),
+    )
+    evidence = [(str(row[0]), int(row[1])) for row in cur.fetchall() if row[0] is not None]
+    if document_id:
+        evidence.append((raw_name, 1))
+    return evidence
 
 
 def _maybe_arbitrate(
@@ -1508,22 +1625,23 @@ def _maybe_arbitrate(
     source: str,
     confidence: float = 1.0,
     renamed_judge_ids: set[str] | None = None,
+    document_id: str | None = None,
+    vote_name: str | None = None,
 ) -> bool:
-    """Record *raw_name* as evidence and rename the judge if the evidence says so.
+    """Weigh the judge's document evidence and rename the judge if it says so.
 
     *roster_normalized* is the judge's current canonical name.  The caller's
-    raw name is first stored as an alias under *source* (so the evidence
-    accumulates whichever spelling wins).  Then every non-roster alias of
-    the judge is read and :func:`_choose_canonical_spelling` picks the
-    canonical spelling.  The judge is renamed only when that spelling
-    differs from the current one, i.e. when it ranks strictly higher.
+    raw name is stored as an alias under *source*, so later documents with
+    this spelling resolve through Step 1.  Then the judge's per-document
+    evidence (``derived.judge_name_evidence``, with *document_id* counted for
+    *vote_name*, the spelling the document printed, which defaults to
+    *raw_name*) goes to :func:`_choose_canonical_spelling`.  The judge is
+    renamed only when that picks a spelling other than the current one.
 
-    Because the choice is a function of the stored evidence only, the same
-    set of observed spellings settles on the same name in any arrival
-    order, and two well-supported spellings no longer swap the name back
-    and forth with every document (#4922).  Before, any spelling with one
-    prior non-roster alias was promoted over the current one, so the name
-    was whichever spelling a document carried last.
+    Evidence is counted in documents, not in sources: a source is a
+    pipeline, so it says nothing about how many documents agree (#4928).
+    A call without *document_id* adds no evidence, so it can only apply
+    what earlier documents already established.
 
     A promotion renames the judge, so *judge_id* is added to
     *renamed_judge_ids* (see :func:`resolve_judge`).
@@ -1540,21 +1658,9 @@ def _maybe_arbitrate(
         """,
         (judge_id, raw_name, source),
     )
-    cur.execute(
-        """
-        SELECT raw_name, source
-        FROM judge_aliases
-        WHERE judge_id = %s::uuid
-          AND source IS NOT NULL
-          AND source NOT IN ('roster_match', 'roster')
-        """,
-        (judge_id,),
-    )
-    evidence = [(str(row[0]), str(row[1])) for row in cur.fetchall() if row[1] is not None]
-    # The alias just written is evidence even when the read cannot see it.
-    evidence.append((raw_name, source))
+    evidence = _read_name_evidence(cur, judge_id, vote_name or raw_name, document_id)
     current = roster_normalized
-    winner, sources = _choose_canonical_spelling(current, evidence)
+    winner, docs = _choose_canonical_spelling(current, evidence)
     if winner.lower() == current.lower():
         logger.debug(
             "resolve_judge: arbitration keeps %r over %r for judge %s",
@@ -1606,12 +1712,12 @@ def _maybe_arbitrate(
         (judge_id, current, confidence),
     )
     logger.info(
-        "resolve_judge: arbitration promoted %r over roster typo %r "
-        "(corroborated by sources=%r) for judge %s",
-        winner,
-        current,
-        sources.get(winner.lower(), set()),
+        "resolve_judge: arbitration renamed judge %s from %r (%d documents) to %r (%d documents)",
         judge_id,
+        current,
+        docs.get(current.lower(), 0),
+        winner,
+        docs.get(winner.lower(), 0),
     )
     return True
 
@@ -1674,16 +1780,31 @@ def resolve_judge(
     *,
     source: str | None = None,
     renamed_judge_ids: set[str] | None = None,
+    document_id: str | None = None,
+    printed_name: str | None = None,
 ) -> str | None:
     """Resolve a raw judge name to a canonical judge record, returning the judge UUID.
 
     Returns ``None`` if the raw name is invalid (garbage, too short, etc.)
     instead of creating a bad judge record.
 
-    Two steps can rename an existing judge (``UPDATE judges SET
-    canonical_name``): the near-duplicate step (a more complete spelling
-    wins) and arbitration (the best-supported spelling wins, see
-    :func:`_choose_canonical_spelling`).  A rename changes the
+    *document_id* is the document that printed *raw_name*.  When given, the
+    resolution is recorded as that document's vote in
+    ``derived.judge_name_evidence`` (one row per document), which is the
+    evidence arbitration counts (#4928).  A call without it (the reingest
+    judge prepass, archive scripts) resolves the name but adds no evidence.
+
+    *printed_name* is the spelling the document printed when the caller
+    passes another *raw_name*: the worker's enrichment step swaps a known
+    alias for the judge's canonical name before resolving.  The vote is for
+    the printed spelling; otherwise every alias spelling would count as
+    support for whatever the canonical name is today.
+
+    Only arbitration renames an existing judge (``UPDATE judges SET
+    canonical_name``): the best-supported spelling wins, by distinct
+    documents and with a margin (see :func:`_choose_canonical_spelling`).
+    The near-duplicate step (a spelling with another middle initial) goes
+    through the same arbitration (#4928).  A rename changes the
     ``judge_name`` of every search doc of that judge's rulings, not only the
     ruling being written, so the id of each renamed judge is added to
     *renamed_judge_ids* when the caller passes a set.  The caller re-indexes
@@ -1697,7 +1818,8 @@ def resolve_judge(
       4. Check judges table for exact (canonical_name, court_id) match.
       5. If found, create an alias and return the existing judge_id.
       6. Check for near-duplicates (missing middle initial) at the same court.
-      7. If near-match found, link to existing judge (prefer more complete name).
+      7. If near-match found, link to existing judge; a more complete name
+         takes over only through arbitration (#4928).
       8. Fuzzy-match against court directory roster names (#2140).
          If a roster match is found AND a judge holds the roster name, as its
          canonical name or as an alias (#4926), link via alias. If no
@@ -1705,6 +1827,39 @@ def resolve_judge(
          store the roster name as a roster_match alias (#3858).
       9. If no match at all, create a new judge with ON CONFLICT handling.
     """
+    raw_name = _strip_nul(raw_name) or raw_name
+    vote_name = raw_name
+    if printed_name:
+        printed_name = _strip_nul(printed_name) or printed_name
+        normalized_printed = normalize_judge_name(printed_name)
+        if normalized_printed is not None and _looks_like_valid_judge_name(normalized_printed):
+            vote_name = printed_name
+    judge_id = _resolve_judge_unrecorded(
+        conn,
+        raw_name,
+        court_id,
+        source=source,
+        renamed_judge_ids=renamed_judge_ids,
+        document_id=document_id,
+        vote_name=vote_name,
+    )
+    if judge_id is not None and document_id:
+        with conn.cursor() as cur:
+            _record_name_evidence(cur, document_id, judge_id, vote_name)
+    return judge_id
+
+
+def _resolve_judge_unrecorded(
+    conn: psycopg.Connection,
+    raw_name: str,
+    court_id: str,
+    *,
+    source: str | None,
+    renamed_judge_ids: set[str] | None,
+    document_id: str | None,
+    vote_name: str,
+) -> str | None:
+    """:func:`resolve_judge` without recording the document's evidence row."""
     raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_judge_name(raw_name)
 
@@ -1741,11 +1896,11 @@ def resolve_judge(
             judge_id: str = str(row[0])
             matched_canonical: str = str(row[1])
             logger.debug("resolve_judge: found existing alias for %r -> %s", raw_name, judge_id)
-            # Step 1 arbitration (#3503): if the matched judge's canonical differs
-            # from the incoming canonical and a source is provided, run arbitration
-            # so that corroborating evidence accumulated across calls can promote
-            # the incoming spelling even after Step 1 short-circuits future steps.
-            if source and matched_canonical.lower() != canonical.lower():
+            # Step 1 arbitration (#3503): weigh the judge's document evidence,
+            # this document included, even after Step 1 short-circuits the
+            # later steps.  It runs for the current spelling too: a document
+            # can complete a real tie that the fuller spelling wins (#4928).
+            if source:
                 _maybe_arbitrate(
                     cur,
                     judge_id,
@@ -1754,19 +1909,8 @@ def resolve_judge(
                     roster_normalized=matched_canonical,
                     source=source,
                     renamed_judge_ids=renamed_judge_ids,
-                )
-            elif source:
-                # Same spelling as the canonical: only record the evidence,
-                # which can only strengthen the current name (#4922).
-                cur.execute(
-                    """
-                    INSERT INTO judge_aliases
-                        (judge_id, raw_name, source, confidence, is_verified)
-                    VALUES (%s::uuid, %s, %s, 1.0, FALSE)
-                    ON CONFLICT (judge_id, lower(raw_name), source)
-                        WHERE source IS NOT NULL DO NOTHING
-                    """,
-                    (judge_id, raw_name, source),
+                    document_id=document_id,
+                    vote_name=vote_name,
                 )
             return judge_id
 
@@ -1791,6 +1935,18 @@ def resolve_judge(
                 """,
                 (judge_id, raw_name, source or "scraper"),
             )
+            if source:
+                _maybe_arbitrate(
+                    cur,
+                    judge_id,
+                    raw_name,
+                    incoming_canonical=canonical,
+                    roster_normalized=canonical,
+                    source=source,
+                    renamed_judge_ids=renamed_judge_ids,
+                    document_id=document_id,
+                    vote_name=vote_name,
+                )
             logger.debug(
                 "resolve_judge: found existing judge by canonical name %r -> %s",
                 canonical,
@@ -1813,25 +1969,6 @@ def resolve_judge(
             existing_stripped = _strip_middle_initials(existing_canonical)
             if candidate_stripped.lower() == existing_stripped.lower():
                 judge_id = str(existing_id)
-                # If the new name is more complete, update canonical.  Same
-                # completeness order as arbitration (#4922), so the two
-                # renaming steps never pull the name in opposite directions.
-                if _spelling_completeness(canonical) > _spelling_completeness(existing_canonical):
-                    cur.execute(
-                        """
-                        UPDATE judges SET canonical_name = %s, updated_at = NOW()
-                        WHERE id = %s::uuid
-                        """,
-                        (canonical, judge_id),
-                    )
-                    if renamed_judge_ids is not None:
-                        renamed_judge_ids.add(judge_id)
-                    logger.info(
-                        "resolve_judge: updated canonical name %r -> %r for judge %s",
-                        existing_canonical,
-                        canonical,
-                        judge_id,
-                    )
                 # Create alias for the new raw name
                 cur.execute(
                     """
@@ -1841,6 +1978,22 @@ def resolve_judge(
                     """,
                     (judge_id, raw_name, source or "scraper"),
                 )
+                # A more complete spelling takes the name only on the same
+                # document evidence as arbitration (#4928): before, one
+                # document with an extra initial renamed the judge.
+                if source:
+                    _maybe_arbitrate(
+                        cur,
+                        judge_id,
+                        raw_name,
+                        incoming_canonical=canonical,
+                        roster_normalized=str(existing_canonical),
+                        source=source,
+                        confidence=0.9,
+                        renamed_judge_ids=renamed_judge_ids,
+                        document_id=document_id,
+                        vote_name=vote_name,
+                    )
                 logger.debug(
                     "resolve_judge: near-duplicate match %r ~ %r -> %s",
                     canonical,
@@ -1887,9 +2040,10 @@ def resolve_judge(
                         current_canonical = str(row[1])
                         # Step 3b arbitration (#3484/#3503): when the incoming
                         # canonical differs from the judge's current canonical,
-                        # record the incoming spelling as evidence and let
-                        # _maybe_arbitrate rename the judge if the evidence
-                        # favours another spelling (#4922).
+                        # let _maybe_arbitrate rename the judge if the document
+                        # evidence favours another spelling.  This document is
+                        # one vote, so a never-seen spelling cannot rename the
+                        # judge on its own (#4928).
                         incoming_canonical = canonical  # the normalized incoming name
                         if (
                             incoming_canonical.lower() != current_canonical.lower()
@@ -1903,6 +2057,8 @@ def resolve_judge(
                                 source=source,
                                 confidence=confidence,
                                 renamed_judge_ids=renamed_judge_ids,
+                                document_id=document_id,
+                                vote_name=vote_name,
                             )
                         ):
                             return judge_id

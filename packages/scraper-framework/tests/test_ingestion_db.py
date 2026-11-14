@@ -1446,18 +1446,35 @@ class TestResolveJudgeNearDuplicate:
         assert result == "existing-judge-id"
 
     def test_updates_canonical_when_new_is_more_complete(self) -> None:
-        """'Carmen R. Luege' should update canonical from 'Carmen Luege'."""
+        """'Carmen R. Luege' takes over from 'Carmen Luege' on two documents' evidence."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         cur.fetchone.side_effect = [None, None]
-        cur.fetchall.return_value = [
-            ("existing-judge-id", "Carmen Luege"),
+        cur.fetchall.side_effect = [
+            [("existing-judge-id", "Carmen Luege")],  # Step 3: near-duplicate
+            [("Carmen R. Luege", 2)],  # arbitration: documents per spelling
         ]
-        resolve_judge(conn, "Carmen R. Luege", "court-1")
+        resolve_judge(conn, "Carmen R. Luege", "court-1", source="ca-orange")
         # Should include an UPDATE to canonical_name
         update_calls = [c for c in cur.execute.call_args_list if "UPDATE judges" in c[0][0]]
         assert len(update_calls) == 1
         assert update_calls[0][0][1][0] == "Carmen R. Luege"
+
+    def test_one_document_with_a_fuller_name_does_not_rename(self) -> None:
+        """A single document no longer lengthens the canonical name (#4928)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, None]
+        cur.fetchall.side_effect = [[("existing-judge-id", "Carmen Luege")], []]
+        resolve_judge(
+            conn,
+            "Carmen R. Luege",
+            "court-1",
+            source="ca-orange",
+            document_id="44444444-4444-4444-4444-444444444444",
+        )
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE judges" in c[0][0]]
+        assert update_calls == []
 
     def test_no_update_when_existing_is_more_complete(self) -> None:
         """When existing name is more complete, don't update canonical."""

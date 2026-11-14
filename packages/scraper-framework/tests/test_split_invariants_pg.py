@@ -367,6 +367,34 @@ def _judge_canonical(h: harness.KeyHarness, key: harness.Key) -> list[str]:
         return [row[0] for row in cur.fetchall()]
 
 
+def _add_name_evidence(h: harness.KeyHarness, key: harness.Key, spelling: str, count: int) -> None:
+    """Record *count* other documents that printed *spelling* for *key*'s judge.
+
+    Arbitration counts documents (#4928): a rename needs a spelling printed
+    on more documents than the stored one, so the tests seed earlier ones.
+    """
+    with h.checker.cursor() as cur:
+        cur.execute(
+            """
+            WITH docs AS (
+                INSERT INTO documents (court_id, document_type, s3_key, s3_bucket, format,
+                                       content_hash, captured_at)
+                SELECT d.court_id, 'tentative_ruling',
+                       'test/evidence/' || gen_random_uuid()::text, 'test', 'pdf',
+                       md5(random()::text), NOW()
+                FROM documents d, generate_series(1, %s)
+                WHERE d.id = %s::uuid
+                RETURNING id
+            )
+            INSERT INTO judge_name_evidence (document_id, judge_id, raw_name)
+            SELECT docs.id, r.judge_id, %s
+            FROM docs, rulings r
+            WHERE r.document_id = %s::uuid
+            """,
+            (count, key.parent, spelling, key.parent),
+        )
+
+
 @_needs_pg
 def test_judge_rename_reindexes_rulings_on_other_keys() -> None:
     """A write that lengthens a judge's canonical name (``resolve_judge``'s
@@ -374,7 +402,9 @@ def test_judge_rename_reindexes_rulings_on_other_keys() -> None:
     re-indexes that judge's rulings on every other key (#4920).  Before the
     fix only the writing key's own doc was re-indexed, and the other key's
     search doc kept the old name until ``reindex_search_from_db.py --apply``
-    (the Santa Clara #4905 reingest left 42 such docs)."""
+    (the Santa Clara #4905 reingest left 42 such docs).  Since #4928 the
+    longer spelling needs the support of more documents than the stored one,
+    so two earlier documents printed it."""
     tag = f"{_RUN}-b4920"
     h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
     try:
@@ -382,6 +412,7 @@ def test_judge_rename_reindexes_rulings_on_other_keys() -> None:
         second = harness.make_key(f"{tag}-b", county_tag=tag)
         h.run_step(first, _judge_ruling_step("live", tag, 1, "Rafael Sivilla-Jones"), "short")
         assert _judge_canonical(h, first) == ["Rafael Sivilla-Jones"]
+        _add_name_evidence(h, first, "Rafael A. Sivilla-Jones", 2)
 
         h.run_step(
             second, _judge_ruling_step("reingest", tag, 2, "Rafael A. Sivilla-Jones"), "long"
@@ -394,14 +425,33 @@ def test_judge_rename_reindexes_rulings_on_other_keys() -> None:
 
 
 @_needs_pg
+def test_one_document_with_a_longer_name_does_not_rename() -> None:
+    """#4928: before, one document with an extra initial lengthened the name
+    and re-indexed every ruling of the judge."""
+    tag = f"{_RUN}-b4928"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
+    try:
+        first = harness.make_key(f"{tag}-a", county_tag=tag)
+        second = harness.make_key(f"{tag}-b", county_tag=tag)
+        h.run_step(first, _judge_ruling_step("live", tag, 1, "Rafael Sivilla-Jones"), "short")
+        h.run_step(
+            second, _judge_ruling_step("reingest", tag, 2, "Rafael A. Sivilla-Jones"), "long"
+        )
+        assert _judge_canonical(h, first) == ["Rafael Sivilla-Jones"]
+        assert _judge_canonical(h, second) == ["Rafael Sivilla-Jones"]
+    finally:
+        h.close()
+
+
+@_needs_pg
 def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
-    """Arbitration (``_maybe_arbitrate``) promoting a corroborated spelling
+    """Arbitration (``_maybe_arbitrate``) promoting a better-supported spelling
     over the stored canonical re-indexes the judge's other rulings too
     (#4920).  This is the path that flipped Orange's "Craig L. Griffin"
-    (469 rulings) during the #4907 reingest.  Since #4922 only a spelling
-    with more document support than the stored one is promoted, so the
-    stored name here is a typo one source read and the promoted one is
-    read by two."""
+    (469 rulings) during the #4907 reingest.  Since #4928 only a spelling
+    printed on decisively more documents than the stored one is promoted:
+    the stored name here is a typo one document printed, the promoted one
+    is printed on three."""
     tag = f"{_RUN}-b4920arb"
     h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
     try:
@@ -409,8 +459,10 @@ def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
         second = harness.make_key(f"{tag}-b", county_tag=tag)
         h.run_step(first, _judge_ruling_step("live", tag, 1, "Craig L. Grifin"), "stored")
         assert _judge_canonical(h, first) == ["Craig L. Grifin"]
-        # An earlier run read the judge as "Craig L. Griffin": a non-roster
-        # alias corroborating that spelling.
+        # An earlier run read the judge as "Craig L. Griffin" on two
+        # documents.  The alias routes that spelling to the judge (and
+        # enrichment swaps it for the canonical name before resolve_judge,
+        # which must still count the printed spelling).
         with h.checker.cursor() as cur:
             cur.execute(
                 "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified) "
@@ -418,6 +470,7 @@ def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
                 "FROM rulings r WHERE r.document_id = %s::uuid",
                 (first.parent,),
             )
+        _add_name_evidence(h, first, "Craig L. Griffin", 2)
 
         h.run_step(second, _judge_ruling_step("reingest", tag, 2, "Craig L. Griffin"), "arbitrate")
 
