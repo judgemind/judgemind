@@ -228,6 +228,25 @@ REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 #: replaced like any re-split's.
 WHOLE_DOCUMENT_KEY = "_whole_document"
 
+#: ``telemetry_event`` of the warning logged when a document's split
+#: extraction failed (#4948): an extractor's API call failed, so the result
+#: says nothing about the document.
+SPLIT_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
+
+
+class SplitExtractionFailedError(RuntimeError):
+    """A split-set replacement event (``REPLACE_SPLIT_SET_KEY``: a prefix
+    reingest or a rebuild) whose extraction failed (#4948).
+
+    A failed call is not a verdict on the document, so the key's rows are
+    left exactly as they are: nothing is written and nothing is removed.
+    The error reaches the reingest's per-key handler, which counts the key
+    as failed, so ``--write-failed-manifest`` retries it.  Before, the
+    worker wrote the whole document as one ruling on the parent row, next
+    to the key's split children.
+    """
+
+
 #: Event key set on split children whose ``case_number`` a deterministic
 #: splitter read from the source document (a CASE # cell, a ``Case No.:``
 #: header).  The enrichment step's fuzzy case-number correction is skipped
@@ -1532,6 +1551,12 @@ class _SplitBatch:
     a verdict on the document (a complete extraction, or a county whose
     scraper extracts every field): the document is then the split's one
     child (``WHOLE_DOCUMENT_KEY``, #4940).
+    ``extraction_failed`` names the extraction call that failed (an
+    ``ExtractionIncompleteError`` or any other error from the extractor):
+    not a verdict, so the key's rows are left alone (#4948).  It stays
+    unset when no extractor is configured (regex-only extraction, e.g. a
+    local run without LLM keys), where the single-document fallback is the
+    extraction.
     """
 
     parent_document_id: str
@@ -1540,6 +1565,7 @@ class _SplitBatch:
     replace: bool = False
     no_rulings_reason: str | None = None
     whole_document: bool = False
+    extraction_failed: str | None = None
 
 
 class InfrastructureError(Exception):
@@ -3016,8 +3042,11 @@ class IngestionWorker:
         # structured field extraction.  The legacy regex splitter framework
         # was removed in #1475.  When the split finds no rulings and that is
         # a verdict on the document, ``_llm_split_document`` writes the
-        # document as the split's one child (#4940); a failed extraction
-        # returns False and the document is written below as before.
+        # document as the split's one child (#4940).  A failed extraction
+        # leaves the key's rows alone (#4948): a reingest / rebuild raises
+        # ``SplitExtractionFailedError``, a live capture of a key that holds
+        # rows writes nothing, and a live capture of a new key returns False
+        # and is written below.
         if not event_data.get("_split_processed") and not event_data.get(WHOLE_DOCUMENT_KEY):
             llm_split = self._llm_split_document(
                 event_data,
@@ -3028,9 +3057,10 @@ class IngestionWorker:
                 raw_pdf_bytes=raw_pdf_bytes,
             )
             if llm_split:
-                # LLM extractor returned results — recurse with split events.
+                # Handled: the split was written, or the key was left alone.
                 return
-            # LLM extractor failed or returned nothing — continue with
+            # No extractor configured, nothing to extract, or a live
+            # capture of a new key whose extraction failed — continue with
             # single-document processing and per-field extraction below.
 
         # Parse timestamps
@@ -4418,9 +4448,11 @@ class IngestionWorker:
     def _write_one_ruling(self, w: _RulingWrite) -> None:
         """Write one ruling document and index it: a scraper pre-split child
         that arrives as its own event, or a document written whole because
-        its extraction failed or it had nothing to extract.  A document the
+        no extractor is configured, it had nothing to extract, or (a live
+        capture of a new key only) its extraction failed.  A document the
         extractor found no rulings in is a split set of one, written by
-        ``_write_split_batch`` (#4940)."""
+        ``_write_split_batch`` (#4940); a reingest whose extraction failed
+        writes nothing (#4948)."""
         conn = self._get_connection()
         try:
             court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
@@ -4794,9 +4826,20 @@ class IngestionWorker:
         with no rows, as a fresh ingest does.  Before, it was written on its
         own and kept whatever earlier splits had left on the key.
 
+        A failed extraction (an extractor call raised, e.g.
+        ``ExtractionIncompleteError``) is not a verdict, so the key's rows
+        are left exactly as they are (#4948): on a split-set replacement
+        (reingest / rebuild) nothing is written and
+        ``SplitExtractionFailedError`` reports the key as failed, so the
+        reingest retries it.  Before, the caller wrote the whole document
+        as one ruling on the parent row, next to the key's split children.
+        A live capture of a key with no rows yet still writes the document
+        on its own (the per-field extraction fallback); a live capture of a
+        key that already holds rows writes nothing.
+
         Returns False only when the caller must write the document itself:
-        the extraction failed (the key's rows are left alone, since a failed
-        LLM call is not a verdict), or there is nothing to extract.
+        no extractor is configured, there is nothing to extract, or a live
+        capture of a new key failed extraction.
         """
         batch = _SplitBatch(parent_document_id=document_id)
         outer = self._split_batch
@@ -4821,7 +4864,64 @@ class IngestionWorker:
             self._split_batch = outer
         if split and batch.replace:
             self._write_split_batch(event_data, document_id, batch)
-        return split
+            return True
+        if split:
+            return True
+        if batch.extraction_failed is not None:
+            return self._leave_key_after_failed_extraction(
+                event_data, document_id, county, batch.extraction_failed
+            )
+        return False
+
+    def _leave_key_after_failed_extraction(
+        self, event_data: dict[str, Any], document_id: str, county: str, reason: str
+    ) -> bool:
+        """Leave the key's rows alone after a failed extraction (#4948).
+
+        Logs ``SPLIT_EXTRACTION_FAILED_EVENT``.  On a split-set replacement,
+        raises ``SplitExtractionFailedError`` so the reingest counts the key
+        as failed (``--write-failed-manifest``).  On a live capture, returns
+        True (write nothing) when the key already holds rows, and False
+        (the caller writes the document on its own) when it holds none.
+        """
+        s3_key = event_data.get("s3_key")
+        replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
+        key_has_rows = not replace_set and bool(s3_key) and self._key_has_rows(str(s3_key))
+        if replace_set:
+            action = "reported_failed"
+        elif key_has_rows:
+            action = "left_key_alone"
+        else:
+            action = "single_document_fallback"
+        logger.warning(
+            "Split extraction failed — the key's rows are left as they are",
+            extra={
+                "telemetry_event": SPLIT_EXTRACTION_FAILED_EVENT,
+                "document_id": document_id,
+                "s3_key": s3_key,
+                "county": county,
+                "scraper_id": event_data.get("scraper_id"),
+                "reason": reason[:500],
+                "action": action,
+            },
+        )
+        if replace_set:
+            raise SplitExtractionFailedError(
+                f"extraction failed for {s3_key or document_id}: {reason[:500]}"
+            )
+        if key_has_rows:
+            # Nothing is written for this event: end the transaction the
+            # read opened, keeping the best-effort telemetry rows logged
+            # for the document (``zero_ruling_extraction``).
+            self._get_connection().commit()
+        return key_has_rows
+
+    def _key_has_rows(self, s3_key: str) -> bool:
+        """Whether any document row is stored for *s3_key*."""
+        conn = self._get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM documents WHERE s3_key = %s LIMIT 1", (s3_key,))
+            return cur.fetchone() is not None
 
     def _dispatch_split_child(self, batch: _SplitBatch, split_event: dict[str, Any]) -> None:
         """Extract, enrich and validate one split child (``process_event``)
@@ -5067,6 +5167,9 @@ class IngestionWorker:
         t0 = time.monotonic()
         extracted_rulings = None
         extraction_method = "llm"  # Track which path was used for logging.
+        # Why the multimodal extraction produced no result, if it ran and
+        # failed (#4948).
+        multimodal_error: str | None = None
 
         # Resolve the extraction strategy once (#4081).  Counties with
         # ExtractionMethod.LLM (e.g. Ventura) have custom text-based prompts
@@ -5144,6 +5247,7 @@ class IngestionWorker:
                         },
                     )
                     extracted_rulings = None
+                    multimodal_error = f"multimodal: {type(exc).__name__}: {exc}"
         elif raw_pdf_bytes is not None and not use_multimodal:
             logger.debug(
                 "Skipping multimodal extraction — county uses text-based LLM",
@@ -5184,6 +5288,9 @@ class IngestionWorker:
                     extraction_method = "llm_county"
 
             if extractor is None:
+                # No text extractor to fall back on: a failed multimodal
+                # call is still a failed extraction (#4948).
+                batch.extraction_failed = multimodal_error
                 return False
             try:
                 extracted_rulings = extractor.extract(
@@ -5204,6 +5311,8 @@ class IngestionWorker:
                         "extraction_method": extraction_method,
                     },
                 )
+                text_error = f"text: {type(exc).__name__}: {exc}"
+                batch.extraction_failed = "; ".join(e for e in (multimodal_error, text_error) if e)
                 return False
 
         llm_latency_ms = round((time.monotonic() - t0) * 1000)
@@ -5302,12 +5411,14 @@ class IngestionWorker:
             # A complete extraction (every page or chunk answered) that
             # found no rulings is a verdict: the document is one ruling, the
             # key's only split child (#4940).  A failed one (``None``, or
-            # text with nothing to read) is not, and the caller writes the
-            # document without touching the key's other rows.
+            # text with nothing to read after a failed multimodal call) is
+            # not: the key's rows are left alone (#4948).
             if extracted_rulings is not None and (
                 extraction_method == "multimodal" or (ruling_text or "").strip()
             ):
                 batch.whole_document = True
+            else:
+                batch.extraction_failed = multimodal_error
             return False
 
         logger.info(

@@ -39,7 +39,12 @@ from framework.llm_extractor import (
 from framework.llm_schema import ExtractedRuling
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig
 from ingestion.split_ids import make_split_document_id
-from ingestion.worker import WHOLE_DOCUMENT_KEY, IngestionWorker
+from ingestion.worker import (
+    REPLACE_SPLIT_SET_KEY,
+    WHOLE_DOCUMENT_KEY,
+    IngestionWorker,
+    SplitExtractionFailedError,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PDF_FIXTURE = FIXTURES / "oc_mccartney_c61_fused_tail.pdf"
@@ -395,44 +400,124 @@ def test_worker_zero_ruling_pdf_with_text_is_the_split_s_one_child() -> None:
     assert batch.whole_document is True
 
 
-def test_worker_failed_pdf_extraction_leaves_the_split_set_alone() -> None:
-    """A failed extraction (every page's API call failed) is not a verdict on
-    the document: the caller writes it on its own, as before, and the key's
-    split set is not replaced (#4940)."""
+def _failing_extractors(worker: IngestionWorker) -> MagicMock:
+    """Make every extraction call fail: the multimodal page calls and the
+    text fallback both raise ``ExtractionIncompleteError``."""
     from framework.llm_extractor import ExtractionIncompleteError
 
-    worker = _make_worker()
     multimodal = MagicMock()
     multimodal.extract_from_pdf.side_effect = ExtractionIncompleteError("PDF pages [0] failed")
     worker._multimodal_extractor = multimodal
     text = MagicMock()
     text.extract.side_effect = ExtractionIncompleteError("text extraction failed")
-    event = _event()
+    return text
+
+
+_DOC_TEXT = "Case No. 2024-01234567 The motion is GRANTED."
+
+
+def test_worker_failed_pdf_extraction_on_reingest_writes_nothing() -> None:
+    """A reingest whose extraction failed (every page's API call failed, then
+    the text fallback's) is not a verdict on the document: no ruling write
+    happens, neither a split-set write nor the whole document as a ruling of
+    its own, and the key is reported as failed (#4948).  Before, the worker
+    wrote the whole document on the parent row, next to the key's split
+    children."""
+    worker = _make_worker()
+    text = _failing_extractors(worker)
+    event = {**_event(), "ruling_text": _DOC_TEXT, REPLACE_SPLIT_SET_KEY: True}
 
     with (
         patch.object(worker, "_get_framework_extractor", return_value=text),
         patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_fetch_raw_pdf_from_s3", return_value=b"%PDF-1.7"),
         patch.object(worker, "_dispatch_split_child") as dispatch,
-        patch.object(worker, "_write_split_batch") as write,
+        patch.object(worker, "_write_split_batch") as split_write,
+        patch.object(worker, "_write_one_ruling") as single_write,
+        pytest.raises(SplitExtractionFailedError, match="PDF pages.*text extraction failed"),
     ):
-        handled = worker._llm_split_document(
-            event,
-            event["document_id"],
-            "Case No. 2024-01234567 The motion is GRANTED.",
-            "CA",
-            "Orange",
-            raw_pdf_bytes=b"%PDF-1.7",
-        )
+        worker.process_event(event)
 
-    assert handled is False
+    assert worker._multimodal_extractor.extract_from_pdf.call_args.kwargs["strict"] is True
     assert text.extract.call_args.kwargs["strict"] is True
     dispatch.assert_not_called()
-    write.assert_not_called()
+    split_write.assert_not_called()
+    single_write.assert_not_called()
+
+
+def test_worker_failed_text_extraction_on_reingest_writes_nothing() -> None:
+    """The same for a county extracted from text only (no multimodal call):
+    the text extractor's failed chunk is reported, nothing is written
+    (#4948)."""
+    from framework.llm_extractor import ExtractionIncompleteError
+
+    worker = _make_worker()
+    text = MagicMock()
+    text.extract.side_effect = ExtractionIncompleteError("text extraction failed on chunks [1]")
+    event = {
+        **_event(),
+        "county": "Ventura",
+        "scraper_id": "ca-ventura-tentatives",
+        "content_format": "html",
+        "s3_key": "ca/ventura/superior_court/raw/abc.html",
+        "ruling_text": _DOC_TEXT,
+        REPLACE_SPLIT_SET_KEY: True,
+    }
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_write_split_batch") as split_write,
+        patch.object(worker, "_write_one_ruling") as single_write,
+        pytest.raises(SplitExtractionFailedError, match="chunks"),
+    ):
+        worker.process_event(event)
+
+    assert text.extract.call_args.kwargs["strict"] is True
+    split_write.assert_not_called()
+    single_write.assert_not_called()
+
+
+@pytest.mark.parametrize(("key_has_rows", "written"), [(True, False), (False, True)])
+def test_worker_failed_extraction_on_live_capture(key_has_rows: bool, written: bool) -> None:
+    """A live capture whose extraction failed does not raise.  It leaves a
+    key that already holds rows alone, and writes a new key's document on
+    its own through the single-document fallback, as before (#4948)."""
+    worker = _make_worker()
+    text = _failing_extractors(worker)
+    event = {**_event(), "ruling_text": _DOC_TEXT}
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_fetch_raw_pdf_from_s3", return_value=b"%PDF-1.7"),
+        patch.object(worker, "_key_has_rows", return_value=key_has_rows) as has_rows,
+        patch.object(worker, "_write_split_batch") as split_write,
+        patch.object(worker, "_write_one_ruling") as single_write,
+    ):
+        worker.process_event(event)
+
+    has_rows.assert_called_once_with(event["s3_key"])
+    split_write.assert_not_called()
+    assert single_write.called is written
+    # A key left alone ends the read's transaction.
+    assert worker._get_connection().commit.called is not written
+
+
+def test_worker_key_has_rows_reads_the_documents_on_the_key() -> None:
+    worker = _make_worker()
+    cur = worker._get_connection().cursor.return_value.__enter__.return_value
+    cur.fetchone.return_value = None
+    assert worker._key_has_rows("ca/orange/k.pdf") is False
+    assert cur.execute.call_args.args[1] == ("ca/orange/k.pdf",)
+    cur.fetchone.return_value = (1,)
+    assert worker._key_has_rows("ca/orange/k.pdf") is True
 
 
 def test_worker_text_with_nothing_to_read_is_not_a_verdict() -> None:
     """Multimodal failed and the fallback text is blank: the empty result says
-    nothing about the document, so no whole-document split (#4940)."""
+    nothing about the document, so no whole-document split (#4940); on a
+    reingest the key is reported as failed (#4948)."""
     from framework.llm_extractor import ExtractionIncompleteError
 
     worker = _make_worker()
@@ -441,19 +526,60 @@ def test_worker_text_with_nothing_to_read_is_not_a_verdict() -> None:
     worker._multimodal_extractor = multimodal
     text = MagicMock()
     text.extract.return_value = []
-    event = _event()
+    event = {**_event(), REPLACE_SPLIT_SET_KEY: True}
 
     with (
         patch.object(worker, "_get_framework_extractor", return_value=text),
         patch.object(worker, "_get_county_extractor", return_value=text),
         patch.object(worker, "_dispatch_split_child") as dispatch,
+        pytest.raises(SplitExtractionFailedError, match="no PDF page rendered"),
     ):
-        handled = worker._llm_split_document(
+        worker._llm_split_document(
             event, event["document_id"], "   ", "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
         )
 
-    assert handled is False
     dispatch.assert_not_called()
+
+
+def test_worker_failed_multimodal_with_no_text_extractor_is_a_failure() -> None:
+    """Multimodal failed and no text extractor is configured to fall back
+    on: still a failed extraction, reported on a reingest (#4948)."""
+    worker = _make_worker()
+    _failing_extractors(worker)
+    event = {**_event(), REPLACE_SPLIT_SET_KEY: True}
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=None),
+        patch.object(worker, "_get_county_extractor", return_value=None),
+        pytest.raises(SplitExtractionFailedError),
+    ):
+        worker._llm_split_document(
+            event, event["document_id"], _DOC_TEXT, "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
+        )
+
+
+def test_worker_with_no_extractor_configured_falls_back_to_the_single_document() -> None:
+    """No extractor configured (a run without LLM keys) is not a failed
+    extraction: the single-document fallback (per-field and regex
+    extraction) is the extraction, as before (#4948)."""
+    worker = _make_worker()
+    event = {
+        **_event(),
+        "county": "Ventura",
+        "content_format": "html",
+        "ruling_text": _DOC_TEXT,
+        REPLACE_SPLIT_SET_KEY: True,
+    }
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=None),
+        patch.object(worker, "_get_county_extractor", return_value=None),
+    ):
+        handled = worker._llm_split_document(
+            event, event["document_id"], _DOC_TEXT, "CA", "Ventura"
+        )
+
+    assert handled is False
 
 
 # ---------------------------------------------------------------------------

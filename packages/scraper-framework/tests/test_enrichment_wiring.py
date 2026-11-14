@@ -74,6 +74,10 @@ def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[Ingestion
     # Disable enrichment client by default so process_event tests don't trigger
     # live LLM calls that now raise LlmEnrichmentExhaustedError (#3549).
     worker._enrichment_client = None
+    # These events are live captures of new keys: when their split
+    # extraction fails (no LLM key in tests), the document is written on its
+    # own.  A key that already holds rows would be left alone (#4948).
+    worker._key_has_rows = lambda _s3_key: False  # type: ignore[method-assign]
     return worker, os_mock
 
 

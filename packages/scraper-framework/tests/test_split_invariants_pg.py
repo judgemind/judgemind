@@ -100,8 +100,10 @@ def test_open_bug(seed: int, bug: str, invariant: str, whole: bool) -> None:
 #: off a number its document lacks, and the gate refusing a fuzzy
 #: correction.  Since #4940 a whole document's reingest moves a held ruling
 #: by the split-set write too (``split_ruling_left_unsupported_case``);
-#: ``ruling_left_unsupported_case`` is left to a document written after a
-#: failed extraction, which the harness does not generate.
+#: ``ruling_left_unsupported_case`` is left to a document written whole with
+#: no extractor configured (regex-only), which the harness does not
+#: generate.  Since #4948 a reingest writes nothing after a failed
+#: extraction.
 _EVIDENCE_PATH_SEEDS = {
     "case_number_unsupported": 3,
     "split_ruling_left_unsupported_case": 8,
@@ -235,6 +237,45 @@ def test_exhausted_enrichment_keeps_child_ruling(
     the LLM split path protected such a child; the six deterministic
     splitters let the split-set write delete it as stale."""
     harness.run_enrichment_failure(_DSN, splitter, seed, _RUN)
+
+
+def _extraction_failure_seeds() -> list[int]:
+    one = os.environ.get("SPLIT_HARNESS_SEED")
+    if one:
+        return [int(one)]
+    return list(range(int(os.environ.get("SPLIT_HARNESS_FAILURE_SEEDS", "24"))))
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_failed_extraction_leaves_the_key_untouched(seed: int) -> None:
+    """A re-ingest whose extraction fails (every API call failed) after a
+    generated history leaves the key's rows and search docs exactly as they
+    were (``untouched``, #4948).  Before the fix the worker wrote the whole
+    document as a ruling of its own, next to the key's split children."""
+    harness.run_extraction_failure(_DSN, seed, _RUN)
+
+
+def _three_child_split() -> list[harness.Step]:
+    specs = tuple(
+        harness.Spec(i, harness._case_number(i), harness._title(i), harness._text("b4948", i))
+        for i in range(3)
+    )
+    rows = tuple(harness.Row("ruling", i) for i in range(3))
+    doc = harness.document_text(rows, specs, "text")
+    return [harness.Step("reingest", rows, specs, doc=doc)]
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "db", "live"])
+def test_known_bug_4948_failed_extraction_keeps_the_three_child_split(kind: str) -> None:
+    """A key holding a three-child split set, re-ingested while the
+    extraction raises ``ExtractionIncompleteError``, keeps exactly its three
+    rulings and gains no whole-document ruling on the parent row (#4948).
+    A prefix or DB-row reingest reports the key as failed."""
+    harness.run_extraction_failure(
+        _DSN, -1, _RUN, name=f"bug4948-{kind}", steps=_three_child_split(), kind=kind
+    )
 
 
 def _bug_4879_steps() -> list[harness.Step]:
