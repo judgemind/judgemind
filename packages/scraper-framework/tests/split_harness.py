@@ -103,8 +103,11 @@ Step kinds:
   Costa, Los Angeles) emits one event per ruling it extracted, each with
   ``extra["pre_split"]`` and its fields filled (#4967).  Each event is
   written on its own, one commit per ruling, as a split set of one.  The
-  events carry no document text, so the step's ``evidence`` check has
-  nothing to read; and a child cannot see its siblings, so a ruling whose
+  events carry the LLM's transcription, not the page text: the worker reads
+  the archived page (the step's ``doc``) from S3 as the case-number
+  evidence (#4976), so ``evidence`` is checked as on a live step, against
+  the LLM's numbers, misreads and inventions included.  A child cannot
+  see its siblings, so a ruling whose
   slot a sibling takes before its own event arrives is retired and written
   again (its alert detached, a gap between the two commits): ``gap`` and
   ``alert`` are not checked on these steps.  ``alert_case`` is: a retired
@@ -118,6 +121,7 @@ and the step, so a failing seed is its own reproduction:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import random
@@ -1000,6 +1004,9 @@ class KeyHarness:
         self._keys: set[str] = set()
         #: Every judge a ruling on those keys has been on (``_check_votes``).
         self._judges_seen: set[str] = set()
+        #: The archived raw object of each S3 key, which the worker's S3
+        #: client returns (a pre-split child's page, #4976).
+        self.raw_objects: dict[str, bytes] = {}
         self.worker = self._make_worker()
 
     def close(self) -> None:
@@ -1025,6 +1032,11 @@ class KeyHarness:
         worker._get_connection = lambda: self.conn  # type: ignore[method-assign]
         worker._indexer = self.indexer
         worker._fetch_raw_pdf_from_s3 = lambda *_a, **_k: b"%PDF-1.4 harness"  # type: ignore[method-assign]
+
+        def get_object(*, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803 — boto3's names
+            return {"Body": io.BytesIO(self.raw_objects[Key])}
+
+        worker._s3_client.get_object.side_effect = get_object
 
         def extractor(*_a: Any, **_k: Any) -> FakeExtractor | None:
             return None if self.extractor.unavailable else self.extractor
@@ -1078,6 +1090,11 @@ class KeyHarness:
         from ingestion.split_ids import split_child_document_id
 
         rulings = [r for r in extracted_rulings(step) if r.ruling_text]
+        # The page the scraper archived; its text is the step's doc.  A real
+        # key names its content (its hash), so the worker caches a page per
+        # key; the harness gives one key new bytes each step.
+        self.raw_objects[key.s3_key] = step.doc.encode()
+        self.worker._page_text_cache.clear()
         events = []
         for position, ruling in enumerate(rulings):
             event = self._event(key, "live")
@@ -1199,9 +1216,7 @@ class KeyHarness:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
             self._guard("synthetic_title", self._check_rows, key, after_rows, step)
-        if step.kind == "presplit":
-            doc = ""  # pre-split events carry no document text
-        elif step.kind == "db":
+        if step.kind in ("presplit", "db"):
             doc = step.doc
         else:
             doc = self.event_extra.get("ruling_text", step.doc)
@@ -1483,7 +1498,7 @@ class KeyHarness:
             number = r.case_number
             if not r.ruling_id or not number or number.startswith("UNKNOWN-"):
                 continue
-            if step.kind == "live" and (r.ruling_id, number) in held:
+            if step.kind in ("live", "presplit") and (r.ruling_id, number) in held:
                 continue
             if not case_number_supported_by_text(number, doc):
                 self._fail(
