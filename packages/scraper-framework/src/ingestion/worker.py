@@ -425,10 +425,12 @@ def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -
 
     - An LLM split child carries its evidence on the event
       (``CASE_NUMBER_EVIDENCE_KEY``): the parent document's text.  Its own
-      ``ruling_text`` is the LLM's transcription and never counts.
-    - A scraper's pre-split child whose fields the scraper filled with an
-      LLM (``extra["_llm_extracted"]``) has none: its text is that LLM's
-      transcription.
+      ``ruling_text`` is the LLM's transcription and never counts.  So
+      does a scraper's pre-split child whose fields the scraper filled
+      with an LLM (``extra["_llm_extracted"]``): the worker reads its
+      archived page (``_with_pre_split_evidence``, #4976).
+    - Such a pre-split child whose page could not be read has none: its
+      text is the LLM's transcription.
     - Any other split child (a deterministic splitter's, a scraper's
       pre-split child) is checked against its own text, at any length.
     - A whole document is checked against its extracted text and link text,
@@ -1912,6 +1914,10 @@ class IngestionWorker:
         self._conn: psycopg.Connection | None = None
         self._s3_client = s3_client
         self._archive_bucket = archive_bucket
+        # The archived page text of the last few pre-split parents (#4976):
+        # a scraper emits one event per ruling of a page, back to back, so
+        # each page is read from S3 once.
+        self._page_text_cache: dict[tuple[str, str], str | None] = {}
         # When True, every LlmExtractor this worker constructs (multimodal +
         # framework) is created with ``bust_cache=True``, so cache reads are
         # skipped on every extraction call.  Cache *writes* still happen, so
@@ -2261,6 +2267,79 @@ class IngestionWorker:
                 )
                 return None
         return self._multimodal_extractors.get(cache_key)
+
+    def _with_pre_split_evidence(self, event_data: dict[str, Any]) -> dict[str, Any]:
+        """Give a scraper pre-split child its case-number evidence (#4976).
+
+        A Contra Costa / Los Angeles scraper whose LLM split a page emits
+        one event per ruling, its fields the LLM's and its ``ruling_text``
+        the LLM's transcription, which is never evidence.  The page the
+        scraper archived is: the child gets ``CASE_NUMBER_EVIDENCE_KEY``
+        from it, exactly as the worker's own LLM split gives its children
+        when a reingest splits the same key (``_llm_split_document``): the
+        same text (``_archived_page_text``), the same ``document_evidence``
+        rule, the link text only for a split into one ruling.  The gate
+        then checks the child's number like an LLM split child's, so a
+        live capture and a reingest of one key judge it the same way.
+
+        A page with too little text (a scanned PDF) gives no evidence, so
+        the number stays (#4927).  A page that cannot be read leaves the
+        event unchanged.  Any other event is returned unchanged.
+        """
+        extra = event_data.get("extra")
+        if (
+            CASE_NUMBER_EVIDENCE_KEY in event_data
+            or not event_data.get("_split_processed")
+            or not isinstance(extra, dict)
+            or not extra.get("pre_split")
+            or not extra.get("_llm_extracted")
+        ):
+            return event_data
+        page = self._archived_page_text(event_data)
+        if page is None:
+            return event_data
+        single = int(event_data.get("_split_count") or 1) == 1
+        evidence = document_evidence(page, extra.get("link_text") if single else None)
+        return {**event_data, CASE_NUMBER_EVIDENCE_KEY: evidence}
+
+    def _archived_page_text(self, event_data: dict[str, Any]) -> str | None:
+        """The text of the event's archived raw object, as a reingest of the
+        key gives the worker: an HTML / text page decoded as UTF-8
+        (``reingest_from_s3._build_prefix_event``), a PDF's extracted text
+        (``extract_text_from_pdf``, as ``_process_event_timed`` extracts
+        the reingest event's bytes).  ``None`` when there is no key, the
+        read fails or the format has no text.  Cached per key."""
+        s3_key = event_data.get("s3_key")
+        if not s3_key:
+            return None
+        bucket = event_data.get("s3_bucket") or self._archive_bucket
+        cache_key = (str(bucket), str(s3_key))
+        if cache_key in self._page_text_cache:
+            return self._page_text_cache[cache_key]
+        content_format = event_data.get("content_format")
+        text: str | None = None
+        try:
+            raw = self._s3_client.get_object(Bucket=bucket, Key=s3_key)["Body"].read()
+            if not isinstance(raw, bytes):
+                raise TypeError(f"S3 body is {type(raw).__name__}, not bytes")
+            if content_format in ("html", "txt"):
+                text = raw.decode("utf-8", errors="replace")
+            elif content_format == "pdf":
+                text = extract_text_from_pdf(raw)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read a pre-split child's archived page",
+                extra={
+                    "document_id": event_data.get("document_id"),
+                    "s3_key": s3_key,
+                    "error": str(exc),
+                },
+            )
+            return None
+        if len(self._page_text_cache) >= 8:
+            self._page_text_cache.pop(next(iter(self._page_text_cache)))
+        self._page_text_cache[cache_key] = text
+        return text
 
     def _unwrap_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
         """Resolve a CC portal JSON envelope into ruling text and fields (#4753).
@@ -3116,6 +3195,8 @@ class IngestionWorker:
         # A scraper pre-split child is one ruling, not a parent to split
         # again (#4796).
         event_data = as_pre_split_child(event_data)
+        # Its LLM's number is checked against the archived page (#4976).
+        event_data = self._with_pre_split_evidence(event_data)
 
         document_id: str = event_data["document_id"]
         state: str = event_data["state"]

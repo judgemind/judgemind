@@ -786,3 +786,88 @@ def test_presplit_motions_of_one_case_swap_slots(presplit: Any) -> None:
         assert _harness_alert_ruling(h, alert) in (by_text[text], None)
     # The ruling the first write took from its sibling slot keeps its alert.
     assert _harness_alert_ruling(h, alerts[_SECOND]) == by_text[_SECOND]
+
+
+_PRINTED_FIRST = "30-2026-11111111"
+_PRINTED_SECOND = "30-2026-22222222"
+#: The page the scraper archived: a text layer printing both rulings'
+#: numbers, long enough to settle a case number.
+_PAGE = (
+    "SUPERIOR COURT OF CALIFORNIA. TENTATIVE RULINGS FOR DEPARTMENT 9.\n"
+    f"1. {_PRINTED_FIRST} Alder v. Acme Corp. {_FIRST}\n"
+    f"2. {_PRINTED_SECOND} Birch v. Beta LLC. {_SECOND}\n"
+    "Parties who wish to argue must notify the court by 4:00 p.m.\n"
+)
+
+
+def _capture_presplit(h: Any, key: Any, first_number: str | None) -> list[dict[str, Any] | None]:
+    """A two-ruling pre-split capture whose LLM read *first_number* for the
+    first ruling and the printed number for the second."""
+    numbered = [(_FIRST, first_number, "Alder v. Acme Corp"), (_SECOND, _PRINTED_SECOND, None)]
+    for position, (text, number, title) in enumerate(numbered):
+        h.worker.process_event(
+            _presplit_event(
+                h,
+                key,
+                position,
+                2,
+                text=text,
+                case_number=number,
+                title=title or "Birch v. Beta LLC",
+                judge="Jane Q. Alpha",
+                outcome="granted",
+            )
+        )
+    return [_slot_ruling(h, split_child_document_id(key.parent, i, 2)) for i in range(2)]
+
+
+def test_presplit_invented_case_number_is_refuted_by_the_page(presplit: Any) -> None:
+    """#4976: a pre-split child's LLM number that its page does not print.
+
+    The event carries only the scraper LLM's transcription, so the gate had
+    no source text and kept the invented number.  The worker now reads the
+    archived page from S3, as a reingest does, and the gate files the
+    ruling under its ``UNKNOWN-`` case.  The page is fetched once for the
+    whole capture.
+    """
+    h, key, _summaries = presplit
+    h.raw_objects[key.s3_key] = _PAGE.encode()
+
+    first, second = _capture_presplit(h, key, "2025-00912345")
+
+    assert first is not None and second is not None
+    assert first["case_number"].startswith("UNKNOWN-")
+    assert second["case_number"] == _PRINTED_SECOND
+    assert h.worker._s3_client.get_object.call_count == 1
+
+
+def test_presplit_printed_case_number_is_kept(presplit: Any) -> None:
+    """#4976: a number the page prints passes the gate."""
+    h, key, _summaries = presplit
+    h.raw_objects[key.s3_key] = _PAGE.encode()
+
+    first, _second = _capture_presplit(h, key, _PRINTED_FIRST)
+
+    assert first is not None and first["case_number"] == _PRINTED_FIRST
+
+
+def test_presplit_scanned_page_keeps_the_llm_number(presplit: Any) -> None:
+    """#4976 keeps the #4927 rule: a page with too little text (a scanned
+    PDF) cannot refute a number, so the LLM's stays."""
+    h, key, _summaries = presplit
+    h.raw_objects[key.s3_key] = b"Page 1 of 2"
+
+    first, _second = _capture_presplit(h, key, "2025-00912345")
+
+    assert first is not None and first["case_number"] == "2025-00912345"
+
+
+def test_presplit_unreadable_page_keeps_the_llm_number(presplit: Any) -> None:
+    """#4976: when the archived page cannot be read, the capture is still
+    written, with no evidence (the #4927 rule for a page without text)."""
+    h, key, _summaries = presplit
+
+    first, second = _capture_presplit(h, key, "2025-00912345")
+
+    assert first is not None and first["case_number"] == "2025-00912345"
+    assert second is not None and second["case_number"] == _PRINTED_SECOND

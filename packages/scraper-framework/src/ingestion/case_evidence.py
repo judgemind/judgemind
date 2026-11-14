@@ -27,7 +27,9 @@ What counts as evidence:
   returns for ``See below.`` was invented (#4907).  The same holds for a
   number the per-field LLM read from a whole document's text: it saw
   nothing else.  A child a scraper split with an LLM carries the LLM's
-  transcription, so it has no evidence.
+  transcription, so its own text is no evidence: the worker reads the
+  page the scraper archived and gives the child that page's
+  ``document_evidence``, as the worker's own LLM split does (#4976).
 """
 
 from __future__ import annotations
