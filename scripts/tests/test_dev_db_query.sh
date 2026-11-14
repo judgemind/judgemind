@@ -11,6 +11,11 @@
 # Some tests stub `aws` to return a fake task ARN *and* stub out `aws ecs
 # execute-command` as a no-op so we can observe the fully-assembled command.
 #
+# The result-integrity tests (#4781) stub `aws ecs execute-command` with
+# framed captures (complete, cut off, unframed, CRLF) and `aws s3 cp/rm`
+# with the S3-staged body of a >100 KB result, and check that the script
+# prints a complete result or exits non-zero with empty stdout.
+#
 # Exit codes:
 #   0 — All tests passed.
 #   1 — One or more tests failed.
@@ -56,6 +61,23 @@ fail() {
     fi
 }
 
+# Frame a payload the way scripts/dev_db_query_runner.py does (#4781), using
+# the runner's own helpers so the tests can't drift from the real format.
+frame_inline() {
+    printf '%s' "$1" | PYTHONPATH="$SCRIPT_DIR" python3 -c \
+        'import sys, dev_db_query_runner as r; print(r.frame_inline(sys.stdin.read()))'
+}
+
+# frame_s3 <payload-file> <uri>
+frame_s3() {
+    PYTHONPATH="$SCRIPT_DIR" python3 -c \
+        'import sys, dev_db_query_runner as r; print(r.frame_s3(open(sys.argv[1]).read(), sys.argv[2]))' \
+        "$1" "$2"
+}
+
+# What a successful empty-result query prints over ECS Exec.
+FRAMED_EMPTY="$(frame_inline '[]')"
+
 # Mock aws CLI that returns "no tasks". Causes the real script to exit
 # after the query-source step with "no running task found" — lets us assert
 # the script got past flag parsing without actually talking to AWS.
@@ -84,8 +106,13 @@ MOCK_AWS
 # ARN for list-tasks and prints the given SSM-shaped payload for
 # execute-command. Used to test that dev-db-query.sh strips the plugin
 # chatter (#3195 Layer 1).
+#
+# Optional $2: a file served for `aws s3 cp <uri> -` (the S3-staged result
+# of a large query, #4781). Every `aws s3 rm` call is appended to
+# <mock_bin>/../s3_rm_calls so tests can check the staged object is cleaned up.
 setup_mock_aws_with_exec_payload() {
     local payload_file="$1"
+    local s3_body_file="${2:-/nonexistent}"
     local tmpdir
     tmpdir=$(make_temp_dir)
     local mock_bin="$tmpdir/bin"
@@ -98,7 +125,22 @@ if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
     exit 0
 fi
 if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
+    if [[ "\$*" == *"bash -c 'true'"* ]]; then
+        exit 0
+    fi
     cat "$payload_file"
+    exit 0
+fi
+if [[ "\${1:-}" == "s3" && "\${2:-}" == "cp" ]]; then
+    if [[ ! -f "$s3_body_file" ]]; then
+        echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2
+        exit 1
+    fi
+    cat "$s3_body_file"
+    exit 0
+fi
+if [[ "\${1:-}" == "s3" && "\${2:-}" == "rm" ]]; then
+    echo "\$3" >> "$tmpdir/s3_rm_calls"
     exit 0
 fi
 echo "Mock aws: unexpected command: \$*" >&2
@@ -347,24 +389,20 @@ test_strips_ssm_banners_and_trailer() {
     local tmpdir
     tmpdir=$(make_temp_dir)
     local payload="$tmpdir/payload.txt"
-    cat > "$payload" <<'PAYLOAD'
-
-The Session Manager plugin was installed successfully. Use the AWS CLI to start a session.
-
-
-Starting session with SessionId: ecs-execute-command-abc123
-[{"ok":true,"value":42}]
-
-Exiting session with sessionId: ecs-execute-command-abc123
-PAYLOAD
+    {
+        printf '\nThe Session Manager plugin was installed successfully. Use the AWS CLI to start a session.\n\n\n'
+        printf 'Starting session with SessionId: ecs-execute-command-abc123\n'
+        frame_inline '[{"ok":true,"value":42}]'
+        printf '\nExiting session with sessionId: ecs-execute-command-abc123\n'
+    } > "$payload"
 
     local mock_bin
     mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
     local stdout
     stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null || true)
 
-    # Positive: JSON should be present.
-    if [[ "$stdout" != *'{"ok":true,"value":42}'* ]]; then
+    # Positive: exactly the JSON, nothing else.
+    if [[ "$stdout" != '[{"ok":true,"value":42}]' ]]; then
         fail "strips SSM banners: JSON payload survived the filter" \
             "got: $stdout"
         return
@@ -388,46 +426,60 @@ PAYLOAD
     pass "strips SSM banner/trailer lines from stdout"
 }
 
-test_strips_cannot_perform_start_session_trailer() {
-    # #3195 — when SSM terminates mid-stream it emits 'Cannot perform
-    # start session: EOF'. That line must also be stripped so downstream
-    # jq doesn't try to parse it. (The JSON itself may still be truncated
-    # — the retry loop in _query_lib.sh handles that separately.)
+test_truncated_stream_exits_nonzero() {
+    # #4781 / #3195 — SSM cuts the stream off mid-payload and appends
+    # 'Cannot perform start session: EOF' on the same line, while aws still
+    # exits 0. The script must exit non-zero, name the truncation, give a
+    # Fix: block, and print NOTHING to stdout (no partial JSON).
     local tmpdir
     tmpdir=$(make_temp_dir)
+    local framed
+    framed=$(frame_inline '[{"n":1},{"n":2},{"n":3}]')
     local payload="$tmpdir/payload.txt"
-    cat > "$payload" <<'PAYLOAD'
-Starting session with SessionId: ecs-execute-command-xyz
-[{"n":1}]Cannot perform start session: EOF
-PAYLOAD
+    {
+        printf 'Starting session with SessionId: ecs-execute-command-xyz\n'
+        printf '%s' "${framed%%\{\"n\":3\}*}"
+        printf 'Cannot perform start session: EOF\n'
+    } > "$payload"
 
     local mock_bin
     mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
-    local stdout
-    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null || true)
+    local stdout rc=0
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>"$tmpdir/err") || rc=$?
+    local stderr
+    stderr=$(cat "$tmpdir/err")
 
-    if [[ "$stdout" != *'[{"n":1}]Cannot'* ]] \
-        && [[ "$stdout" != *"^Cannot perform start session"* ]]; then
-        # The trailer on the same line as JSON is intentionally NOT
-        # stripped by grep -v (it's a different failure mode that the
-        # retry loop + jq validation catches). What we assert here is
-        # that when the trailer is on its own line (the clean-close
-        # case), it's removed.
-        # For the same-line case, the grep -v pattern only matches at
-        # line-start, so the trailer remains concatenated to the JSON —
-        # that's correct behavior since jq will reject it and the retry
-        # loop will re-fetch.
-        pass "Cannot-perform-start-session: own-line vs. same-line handled"
+    if [[ $rc -eq 0 ]]; then
+        fail "truncated stream: must exit non-zero" "stdout=$stdout stderr=$stderr"
+    elif [[ -n "$stdout" ]]; then
+        fail "truncated stream: stdout must be empty" "stdout=$stdout"
+    elif [[ "$stderr" != *"cut off"* || "$stderr" != *"Fix:"* ]]; then
+        fail "truncated stream: stderr must name the truncation and a Fix:" "stderr=$stderr"
     else
-        # If the "clean" case (own line) — this is the assertion we care
-        # about.
-        local cleaned
-        cleaned=$(printf '%s' "$stdout" | grep -v '^Cannot perform start session' || true)
-        if [[ "$stdout" == "$cleaned" ]]; then
-            pass "Cannot-perform-start-session on own line stripped"
-        else
-            fail "Cannot-perform-start-session on own line leaked" "got: $stdout"
-        fi
+        pass "truncated stream: exits $rc, empty stdout, truncation + Fix: on stderr"
+    fi
+}
+
+test_bare_unframed_prefix_exits_nonzero() {
+    # The #4946 shape: a valid-looking JSON prefix cut at 10272 bytes, with
+    # no frame at all. Before #4781 this printed as-is with exit 0.
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local payload="$tmpdir/payload.txt"
+    PYTHONPATH="$SCRIPT_DIR" python3 -c \
+        'import json; s=json.dumps([{"id":i,"v":"x"*40} for i in range(400)]); print(s[:10272])' \
+        > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
+    local stdout rc=0
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null) || rc=$?
+
+    if [[ $rc -ne 0 && -z "$stdout" ]]; then
+        pass "bare 10272-byte prefix: exits non-zero with empty stdout"
+    else
+        fail "bare 10272-byte prefix: must exit non-zero with empty stdout" \
+            "rc=$rc stdout_bytes=${#stdout}"
     fi
 }
 
@@ -435,37 +487,57 @@ test_strips_own_line_cannot_perform() {
     local tmpdir
     tmpdir=$(make_temp_dir)
     local payload="$tmpdir/payload.txt"
-    cat > "$payload" <<'PAYLOAD'
-Starting session with SessionId: ecs-execute-command-xyz
-[{"n":1}]
-Cannot perform start session: EOF
-PAYLOAD
+    {
+        printf 'Starting session with SessionId: ecs-execute-command-xyz\n'
+        frame_inline '[{"n":1}]'
+        printf 'Cannot perform start session: EOF\n'
+    } > "$payload"
 
     local mock_bin
     mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
-    local stdout
-    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null || true)
+    local stdout rc=0
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null) || rc=$?
 
-    if [[ "$stdout" == *"Cannot perform start session"* ]]; then
-        fail "own-line Cannot-perform-start-session stripped" "got: $stdout"
+    if [[ $rc -eq 0 && "$stdout" == '[{"n":1}]' ]]; then
+        pass "complete frame + own-line EOF trailer: exits 0 with only the JSON"
     else
-        pass "own-line Cannot-perform-start-session stripped"
+        fail "complete frame + own-line EOF trailer: exits 0 with only the JSON" \
+            "rc=$rc stdout=$stdout"
     fi
 }
 
-test_empty_output_after_strip_is_ok() {
-    # Pure banner/trailer payload with no JSON — the grep -v returns exit
-    # 1 (all lines matched filters). The script must not error in that
-    # case, because an aws-exec failure is surfaced via aws's exit code,
-    # not through the content filter. Consumers (jq) will reject the empty
-    # output on their own terms.
+test_crlf_pty_output_accepted() {
+    # The --interactive session runs over a pty, which turns \n into \r\n.
     local tmpdir
     tmpdir=$(make_temp_dir)
     local payload="$tmpdir/payload.txt"
-    cat > "$payload" <<'PAYLOAD'
-Starting session with SessionId: ecs-execute-command-empty
-Exiting session with sessionId: ecs-execute-command-empty
-PAYLOAD
+    {
+        printf 'Starting session with SessionId: ecs-execute-command-xyz\n'
+        frame_inline '[{"n":1}]'
+        printf 'Exiting session with sessionId: ecs-execute-command-xyz\n'
+    } | sed 's/$/\r/' > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
+    local stdout rc=0
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null) || rc=$?
+
+    if [[ $rc -eq 0 && "$stdout" == '[{"n":1}]' ]]; then
+        pass "pty CRLF output: exits 0 with the clean JSON"
+    else
+        fail "pty CRLF output: exits 0 with the clean JSON" "rc=$rc stdout=$stdout"
+    fi
+}
+
+test_banner_only_output_exits_nonzero() {
+    # Banner/trailer with no result frame: the runner never printed a
+    # result (or the stream died before it did). Before #4781 this exited 0
+    # with empty stdout, which reads as "no rows". Now it must fail.
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local payload="$tmpdir/payload.txt"
+    printf 'Starting session with SessionId: ecs-execute-command-empty\nExiting session with sessionId: ecs-execute-command-empty\n' \
+        > "$payload"
 
     local mock_bin
     mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
@@ -473,10 +545,137 @@ PAYLOAD
     local stdout
     stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null) || rc=$?
 
-    if [[ $rc -eq 0 ]]; then
-        pass "empty-after-filter output: script does not propagate grep's exit 1"
+    if [[ $rc -ne 0 && -z "$stdout" ]]; then
+        pass "banner-only output: exits non-zero (no result frame)"
     else
-        fail "empty-after-filter output: exit $rc should have been 0" "got: $stdout"
+        fail "banner-only output: must exit non-zero" "rc=$rc stdout=$stdout"
+    fi
+}
+
+test_runner_error_exits_nonzero_with_message() {
+    # A database error inside the container used to print to the pty and
+    # exit 0. Now the missing frame makes the script fail and the remote
+    # message is shown on stderr.
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local payload="$tmpdir/payload.txt"
+    printf 'Starting session with SessionId: s\nDatabase error: relation "nope" does not exist\nExiting session with sessionId: s\n' \
+        > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
+    local rc=0 stdout
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>"$tmpdir/err") || rc=$?
+
+    if [[ $rc -ne 0 && -z "$stdout" ]] && grep -q 'relation "nope" does not exist' "$tmpdir/err"; then
+        pass "runner error: exits non-zero and shows the remote error"
+    else
+        fail "runner error: exits non-zero and shows the remote error" \
+            "rc=$rc stdout=$stdout stderr=$(cat "$tmpdir/err")"
+    fi
+}
+
+test_invalid_inline_max_env_rejected() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local payload="$tmpdir/payload.txt"
+    frame_inline '[]' > "$payload"
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
+    local rc=0 output
+    output=$(DEV_DB_QUERY_INLINE_MAX_BYTES=lots PATH="$mock_bin:$PATH" \
+        "$DEV_DB_QUERY" "SELECT 1" 2>&1) || rc=$?
+    if [[ $rc -ne 0 && "$output" == *"DEV_DB_QUERY_INLINE_MAX_BYTES must be"* ]]; then
+        pass "invalid DEV_DB_QUERY_INLINE_MAX_BYTES rejected"
+    else
+        fail "invalid DEV_DB_QUERY_INLINE_MAX_BYTES rejected" "rc=$rc output=$output"
+    fi
+}
+
+# ── S3-staged large results (#4781) ───────────────────────────────────────
+
+make_large_payload() {
+    # >100 KB: 5000 rows shaped like `SELECT id, case_number FROM derived.cases`.
+    PYTHONPATH="$SCRIPT_DIR" python3 -c \
+        'import json; print(json.dumps([{"id":"%08d-0000-0000-0000-000000000000"%i,"case_number":"25CV%06d"%i} for i in range(5000)],separators=(",",":")),end="")' \
+        > "$1"
+}
+
+test_large_result_via_s3_comes_back_whole() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local body="$tmpdir/body.json"
+    make_large_payload "$body"
+    local uri="s3://judgemind-document-archive-dev/tmp/dev-db-query/test.json"
+    local payload="$tmpdir/payload.txt"
+    {
+        printf 'Starting session with SessionId: s\n'
+        frame_s3 "$body" "$uri"
+        printf 'Exiting session with sessionId: s\n'
+    } > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload" "$body")
+    local rc=0
+    PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" > "$tmpdir/out" 2>"$tmpdir/err" || rc=$?
+
+    local body_bytes out_rows
+    body_bytes=$(wc -c < "$body" | tr -d ' ')
+    out_rows=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$tmpdir/out" 2>/dev/null || echo "unparseable")
+
+    if [[ $rc -ne 0 ]]; then
+        fail "large result via S3: exit $rc" "stderr=$(cat "$tmpdir/err")"
+    elif [[ $body_bytes -le 100000 ]]; then
+        fail "large result via S3: fixture should exceed 100 KB" "bytes=$body_bytes"
+    elif [[ "$out_rows" != "5000" ]]; then
+        fail "large result via S3: expected 5000 rows" "got: $out_rows"
+    elif ! grep -qx "$uri" "$mock_bin/../s3_rm_calls" 2>/dev/null; then
+        fail "large result via S3: staged object should be deleted after download"
+    else
+        pass "large result via S3: ${body_bytes}-byte, 5000-row result returned whole; object deleted"
+    fi
+}
+
+test_large_result_truncated_download_exits_nonzero() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local body="$tmpdir/body.json"
+    make_large_payload "$body"
+    head -c 50000 "$body" > "$tmpdir/short.json"
+    local uri="s3://judgemind-document-archive-dev/tmp/dev-db-query/test.json"
+    local payload="$tmpdir/payload.txt"
+    frame_s3 "$body" "$uri" > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload" "$tmpdir/short.json")
+    local rc=0 stdout
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>/dev/null) || rc=$?
+
+    if [[ $rc -ne 0 && -z "$stdout" ]]; then
+        pass "large result, short download: exits non-zero with empty stdout"
+    else
+        fail "large result, short download: must exit non-zero" "rc=$rc bytes=${#stdout}"
+    fi
+}
+
+test_large_result_missing_object_exits_nonzero() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local body="$tmpdir/body.json"
+    make_large_payload "$body"
+    local payload="$tmpdir/payload.txt"
+    frame_s3 "$body" "s3://b/tmp/dev-db-query/gone.json" > "$payload"
+
+    local mock_bin
+    mock_bin=$(setup_mock_aws_with_exec_payload "$payload")
+    local rc=0 stdout
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1" 2>"$tmpdir/err") || rc=$?
+
+    if [[ $rc -ne 0 && -z "$stdout" ]] && grep -q "downloading" "$tmpdir/err"; then
+        pass "large result, missing object: exits non-zero naming the download failure"
+    else
+        fail "large result, missing object: must exit non-zero" \
+            "rc=$rc stderr=$(cat "$tmpdir/err")"
     fi
 }
 
@@ -510,7 +709,7 @@ if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
 fi
 if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
     # No-op stub — we only care that the script reached this stage.
-    echo "[]"
+    echo "$FRAMED_EMPTY"
     exit 0
 fi
 echo "Mock aws: unexpected command: \$*" >&2
@@ -598,7 +797,7 @@ if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
         cat "$err_file" >&2
         exit 1
     fi
-    echo "[]"
+    echo "$FRAMED_EMPTY"
     exit 0
 fi
 echo "Mock aws: unexpected command: \$*" >&2
@@ -823,9 +1022,16 @@ test_file_equals_form_accepted
 test_rw_flag_still_works
 test_rw_file_combo
 test_strips_ssm_banners_and_trailer
-test_strips_cannot_perform_start_session_trailer
+test_truncated_stream_exits_nonzero
+test_bare_unframed_prefix_exits_nonzero
 test_strips_own_line_cannot_perform
-test_empty_output_after_strip_is_ok
+test_crlf_pty_output_accepted
+test_banner_only_output_exits_nonzero
+test_runner_error_exits_nonzero_with_message
+test_invalid_inline_max_env_rejected
+test_large_result_via_s3_comes_back_whole
+test_large_result_truncated_download_exits_nonzero
+test_large_result_missing_object_exits_nonzero
 test_polls_until_task_appears
 test_polls_then_gives_up_with_clear_error
 test_exec_agent_probe_success

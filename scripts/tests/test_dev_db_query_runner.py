@@ -22,11 +22,85 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # We need to provide a mock psycopg module before importing the runner,
 # because the runner uses a lazy import.  We import the module-level
 # helpers directly — they don't touch psycopg.
+import dev_db_query_runner  # noqa: E402
+from dev_db_query_result import resolve_payload  # noqa: E402
 from dev_db_query_runner import (  # noqa: E402
+    RESULT_INLINE_MAX_BYTES,
     decode_query,
+    emit_result,
     format_non_select_result,
     format_select_results,
 )
+
+
+def _unframe(out: str) -> str:
+    """Return the payload inside the runner's inline frame (#4781)."""
+    return resolve_payload(out, "us-west-2").decode()
+
+
+class TestEmitResult:
+    """emit_result() frames every payload; large ones go through S3 (#4781)."""
+
+    def test_small_payload_is_framed_inline(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        emit_result('[{"id":1}]')
+        out = capsys.readouterr().out
+        assert out.startswith(dev_db_query_runner.FRAME_BEGIN + " inline ")
+        assert out.rstrip("\n").endswith(dev_db_query_runner.FRAME_END)
+        assert _unframe(out) == '[{"id":1}]'
+
+    def test_large_payload_is_uploaded_and_only_a_pointer_printed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        payload = json.dumps([{"id": i} for i in range(2000)])
+        assert len(payload) > RESULT_INLINE_MAX_BYTES
+        mock_boto3 = MagicMock()
+        with patch.dict(sys.modules, {"boto3": mock_boto3}):
+            with patch.dict("os.environ", {"JUDGEMIND_ARCHIVE_BUCKET": "arch"}):
+                emit_result(payload)
+        put = mock_boto3.client.return_value.put_object
+        put.assert_called_once()
+        kwargs = put.call_args.kwargs
+        assert kwargs["Bucket"] == "arch"
+        assert kwargs["Key"].startswith("tmp/dev-db-query/")
+        assert kwargs["Body"] == payload.encode()
+        out = capsys.readouterr().out
+        assert " s3 " in out
+        assert f"uri=s3://arch/{kwargs['Key']}@@" in out
+        assert payload not in out
+        assert len(out) < 400
+
+    def test_result_bucket_override(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"DEV_DB_QUERY_RESULT_BUCKET": "over", "JUDGEMIND_ARCHIVE_BUCKET": "arch"},
+        ):
+            assert dev_db_query_runner.result_bucket() == "over"
+
+    def test_large_payload_without_bucket_exits(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch.dict(sys.modules, {"boto3": MagicMock()}):
+            with patch.dict("os.environ", {}, clear=True):
+                with pytest.raises(SystemExit) as exc_info:
+                    emit_result("x" * (RESULT_INLINE_MAX_BYTES + 1))
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "JUDGEMIND_ARCHIVE_BUCKET" in captured.err
+
+    def test_upload_failure_exits(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value.put_object.side_effect = RuntimeError("denied")
+        with patch.dict(sys.modules, {"boto3": mock_boto3}):
+            with patch.dict("os.environ", {"JUDGEMIND_ARCHIVE_BUCKET": "arch"}):
+                with pytest.raises(SystemExit) as exc_info:
+                    emit_result("x" * (RESULT_INLINE_MAX_BYTES + 1))
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "denied" in captured.err
 
 
 class TestDecodeQuery:
@@ -181,7 +255,7 @@ class TestRunQuery:
                 run_query(query_b64, "0")
 
         captured = capsys.readouterr()
-        result = json.loads(captured.out)
+        result = json.loads(_unframe(captured.out))
         assert result == [{"id": 1}, {"id": 2}]
 
     def test_non_select_query_prints_rowcount(
@@ -202,7 +276,7 @@ class TestRunQuery:
                 run_query(query_b64, "0")
 
         captured = capsys.readouterr()
-        result = json.loads(captured.out)
+        result = json.loads(_unframe(captured.out))
         assert result == {"rowcount": 5}
 
     def test_comment_only_query_fails_loud(
@@ -252,7 +326,7 @@ class TestRunQuery:
                 run_query(query_b64, "0")
 
         captured = capsys.readouterr()
-        result = json.loads(captured.out)
+        result = json.loads(_unframe(captured.out))
         assert result == {"rowcount": 0}
 
     def test_readonly_flag_sets_transaction_readonly(self) -> None:
@@ -360,3 +434,25 @@ class TestMain:
                         from dev_db_query_runner import main
 
                         main()
+
+    def test_inline_max_arg_is_passed_through(self) -> None:
+        """The fifth arg (inline-max-bytes, #4781) reaches run_query as an int."""
+        query_b64 = base64.b64encode(b"SELECT 1").decode()
+        with patch.object(dev_db_query_runner, "run_query") as mock_run:
+            with patch("sys.argv", ["r.py", query_b64, "1", "1", "999999"]):
+                dev_db_query_runner.main()
+        assert mock_run.call_args.kwargs["inline_max"] == 999999
+
+    def test_invalid_inline_max_arg_exits(self) -> None:
+        query_b64 = base64.b64encode(b"SELECT 1").decode()
+        with patch("sys.argv", ["r.py", query_b64, "1", "1", "-5"]):
+            with pytest.raises(SystemExit) as exc_info:
+                dev_db_query_runner.main()
+        assert exc_info.value.code == 1
+
+    def test_inline_max_forces_large_result_inline(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        payload = "x" * (RESULT_INLINE_MAX_BYTES + 10)
+        emit_result(payload, inline_max=10_000_000)
+        assert _unframe(capsys.readouterr().out) == payload
