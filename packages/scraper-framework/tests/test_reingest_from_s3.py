@@ -583,7 +583,7 @@ class TestReadS3KeyListFile:
         s3.get_object.return_value = {"Body": body_mock}
         with patch.object(reingest.boto3, "client", return_value=s3) as mock_client:
             keys = reingest._read_s3_key_list_file(
-                "s3://judgemind-assets-dev/keylists/orange-78.txt"
+                "s3://judgemind-document-archive-dev/tmp/keys/orange-78.txt"
             )
         assert keys == [
             "ca/orange/superior_court/raw/aaa.pdf",
@@ -591,9 +591,91 @@ class TestReadS3KeyListFile:
         ]
         mock_client.assert_called_once_with("s3")
         s3.get_object.assert_called_once_with(
-            Bucket="judgemind-assets-dev",
-            Key="keylists/orange-78.txt",
+            Bucket="judgemind-document-archive-dev",
+            Key="tmp/keys/orange-78.txt",
         )
+
+    @pytest.mark.parametrize("code", ["AccessDenied", "NoSuchKey", "NoSuchBucket"])
+    def test_s3_uri_unreadable_raises_value_error_with_fix(self, code: str) -> None:
+        """#4803: an unreadable s3:// key list (the old assets-dev location
+        the oneshot role cannot read, a typo'd key, ...) raises ValueError
+        naming the error code and a Fix: block pointing at the canonical
+        location, instead of a raw botocore traceback."""
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": code, "Message": "nope"}}, "GetObject"
+        )
+        uri = "s3://judgemind-assets-dev/keylists/fresno-4796-affected.txt"
+        with patch.object(reingest.boto3, "client", return_value=s3):
+            with pytest.raises(ValueError) as exc:
+                reingest._read_s3_key_list_file(uri)
+        msg = str(exc.value)
+        assert code in msg
+        assert uri in msg
+        assert "Fix:" in msg
+        assert "s3://judgemind-document-archive-dev/tmp/keys/fresno-4796-affected.txt" in msg
+        assert isinstance(exc.value.__cause__, ClientError)
+
+    def test_s3_uri_no_credentials_raises_value_error_with_fix(self) -> None:
+        """#4803: missing AWS credentials also fail fast with the Fix: block."""
+        from botocore.exceptions import NoCredentialsError
+
+        s3 = MagicMock()
+        s3.get_object.side_effect = NoCredentialsError()
+        with patch.object(reingest.boto3, "client", return_value=s3):
+            with pytest.raises(ValueError, match="NoCredentials") as exc:
+                reingest._read_s3_key_list_file("s3://some-bucket/k/")
+        msg = str(exc.value)
+        assert "Fix:" in msg
+        # A trailing-slash URI still yields a usable file name in the Fix.
+        assert f"{reingest.CANONICAL_KEY_LIST_PREFIX}k" in msg
+
+    def test_canonical_prefix_is_archive_tmp_keys(self) -> None:
+        """#4803: the canonical key-list prefix lives under the archive
+        bucket's ``tmp/`` (30-day tmp-ttl lifecycle rule) and the help text
+        names it; the old unreadable assets-dev location is gone."""
+        assert reingest.CANONICAL_KEY_LIST_PREFIX == "s3://judgemind-document-archive-dev/tmp/keys/"
+        help_text = reingest._build_parser().format_help()
+        assert "judgemind-document-archive-dev/tmp/keys/" in help_text.replace("\n", "").replace(
+            " ", ""
+        )
+        assert "judgemind-assets-dev" not in help_text
+        assert "judgemind-assets-dev" not in (reingest.__doc__ or "")
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest_from_prefix")
+    def test_main_unreadable_s3_key_list_exits_before_any_work(
+        self, mock_run_prefix: MagicMock, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#4803: main() turns an unreadable s3:// key list into a usage
+        error (exit 2) with the Fix: block, before any reingest starts."""
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject"
+        )
+        argv = [
+            "reingest_from_s3",
+            "--prefix",
+            "ca/fresno/",
+            "--s3-key-list",
+            "s3://judgemind-assets-dev/keylists/x.txt",
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch.object(reingest.boto3, "client", return_value=s3),
+            pytest.raises(SystemExit) as exc,
+        ):
+            reingest.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "AccessDenied" in err
+        assert "Fix:" in err
+        assert "judgemind-document-archive-dev/tmp/keys/x.txt" in err
+        mock_run_prefix.assert_not_called()
 
     def test_s3_uri_empty_object_raises_value_error(self) -> None:
         """An s3:// object whose body is empty (or all comments/blanks) raises

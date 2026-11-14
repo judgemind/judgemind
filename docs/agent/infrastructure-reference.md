@@ -465,6 +465,24 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --coun
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
 
+### Key lists for ECS scripts (`--s3-key-list`, `--keys`, `--write-failed-manifest`)
+
+**There is one key-list location: `s3://judgemind-document-archive-dev/tmp/keys/<name>.txt`.** Upload a list there and pass the URI to any oneshot that takes one: `reingest_from_s3.py --s3-key-list`, `audit_case_number_support.py --keys`, and `reingest_from_s3.py --write-failed-manifest` (so a failed-key manifest can be fed straight back to `--s3-key-list`).
+
+```
+aws s3 cp tmp/keys.txt s3://judgemind-document-archive-dev/tmp/keys/<name>.txt
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- \
+  --prefix <county-prefix>/ --s3-key-list s3://judgemind-document-archive-dev/tmp/keys/<name>.txt
+```
+
+Why this location (#4803):
+
+- Oneshot tasks run as the scraper task role (`judgemind-scraper-dev`). Its only S3 grant is Get/Put/List on the document-archive bucket, so it can already read and write `tmp/keys/`. No extra IAM grant is needed.
+- The archive bucket's `tmp-ttl` lifecycle rule (`infra/terraform/modules/storage/main.tf`) expires everything under `tmp/` after 30 days, so lists clean themselves up.
+- `rebuild_db.list_s3_keys` filters by `KEY_PATTERN`, so `tmp/` objects are never treated as documents.
+
+Do **not** use `s3://judgemind-assets-dev/keylists/`: the oneshot task role cannot read `judgemind-assets-dev` (scripts reach the task through a presigned URL), so the run fails with `AccessDenied`. Do not invent other prefixes either (`_ops/keylists/`, `keylists/`, `spotcheck/`): they skip the 30-day cleanup or collide with other data. If a list cannot be read, `reingest_from_s3.py` exits 2 before doing any work and prints a `Fix:` block naming this location.
+
 ### Verification audits
 
 Read-only ECS oneshots that check `derived.*` against the raw S3 documents. Run one after a rebuild, reingest or extraction fix in the counties it touched.
@@ -477,7 +495,7 @@ Read-only ECS oneshots that check `derived.*` against the raw S3 documents. Run 
 scripts/ecs-run-task.sh --detach --cpu 4096 --memory 8192 scripts/audit_case_number_support.py -- --county Orange --county Riverside
 scripts/ecs-wait-task.sh
 # Only some keys, or a sample:
-scripts/ecs-run-task.sh scripts/audit_case_number_support.py -- Riverside --keys s3://<bucket>/<key-list> --limit 50
+scripts/ecs-run-task.sh scripts/audit_case_number_support.py -- Riverside --keys s3://judgemind-document-archive-dev/tmp/keys/<name>.txt --limit 50
 ```
 
 Each S3 key is audited in its own forked process with a hard deadline (`--timeout`, default 180s), so one PDF that pdfplumber stalls on is reported as a `TIMEOUT` line instead of hanging the county. A `PROGRESS` line every `--progress-every` keys (default 100) shows the run is moving.
@@ -499,7 +517,7 @@ Why S3 rather than chunked output: the cut happens inside a single SSM session, 
 
 Earlier mitigations from #3195 / PR #3201 remain: compact JSON in the runner, and the 5-attempt `jq -e .` retry loop in `scripts/dispatcher/helpers/_query_lib.sh` (now rarely needed, since a failed call exits non-zero with empty stdout).
 
-**Recipe: a full key list for `reingest_from_s3.py --s3-key-list` in one command.** There is no longer a need to chunk queries under 10 KB:
+**Recipe: a full key list for `reingest_from_s3.py --s3-key-list` in one command.** There is no longer a need to chunk queries under 10 KB. The upload target is the one key-list location (see §Key lists for ECS scripts):
 
 ```
 scripts/dev-db-query.sh "SELECT s3_key FROM derived.documents WHERE <filter>" \
