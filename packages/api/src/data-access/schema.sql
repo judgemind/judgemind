@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 68 migrations.
+-- Generated from 69 migrations.
 
 
 
@@ -274,6 +274,18 @@ CREATE TABLE derived.judge_aliases (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT judge_aliases_confidence_check CHECK (((confidence >= (0)::double precision) AND (confidence <= (1)::double precision)))
 );
+
+
+CREATE TABLE derived.judge_name_evidence (
+    document_id uuid NOT NULL,
+    judge_id uuid NOT NULL,
+    raw_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+COMMENT ON TABLE derived.judge_name_evidence IS 'One row per document: the judge it resolved to and the spelling it printed. resolve_judge arbitration counts distinct active documents per spelling. Issue #4928.';
 
 
 CREATE TABLE derived.judges (
@@ -1150,6 +1162,10 @@ ALTER TABLE ONLY derived.judge_aliases
     ADD CONSTRAINT judge_aliases_pkey PRIMARY KEY (id);
 
 
+ALTER TABLE ONLY derived.judge_name_evidence
+    ADD CONSTRAINT judge_name_evidence_pkey PRIMARY KEY (document_id);
+
+
 ALTER TABLE ONLY derived.judges
     ADD CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id);
 
@@ -1371,6 +1387,9 @@ CREATE UNIQUE INDEX idx_judge_aliases_judge_raw_source_uniq ON derived.judge_ali
 CREATE INDEX idx_judge_aliases_raw_name ON derived.judge_aliases USING btree (lower(raw_name));
 
 
+CREATE INDEX idx_judge_name_evidence_judge_id ON derived.judge_name_evidence USING btree (judge_id);
+
+
 CREATE INDEX idx_parties_canonical_name_lower ON derived.parties USING btree (lower(canonical_name));
 
 
@@ -1589,6 +1608,10 @@ ALTER TABLE ONLY derived.documents
 
 ALTER TABLE ONLY derived.judge_aliases
     ADD CONSTRAINT judge_aliases_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.judge_name_evidence
+    ADD CONSTRAINT judge_name_evidence_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id) ON DELETE CASCADE;
 
 
 ALTER TABLE ONLY derived.judges
