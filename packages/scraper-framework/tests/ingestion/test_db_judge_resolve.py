@@ -27,10 +27,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from ingestion.db import (
+    JudgeVote,
     _choose_canonical_spelling,
     _decisive,
     _spelling_completeness,
     clear_roster_cache,
+    judge_vote_spelling,
+    record_judge_votes,
     resolve_judge,
 )
 
@@ -1395,6 +1398,97 @@ class TestDocumentEvidencePg:
             assert court.canonical() == "Craig L. Griffin"
         finally:
             court.close()
+
+
+class TestJudgeVoteSpelling:
+    """The spelling a document votes for (#4928, #4938)."""
+
+    def test_printed_spelling_wins_when_valid(self) -> None:
+        assert judge_vote_spelling("H. Shaina Colover", "Shaina Clover") == "Shaina Clover"
+
+    def test_unusable_printed_spelling_falls_back(self) -> None:
+        assert judge_vote_spelling("Craig L. Griffin", "Griffin") == "Craig L. Griffin"
+        assert judge_vote_spelling("Craig L. Griffin", None) == "Craig L. Griffin"
+
+
+@_needs_pg
+class TestSettledSplitVotesPg:
+    """A worker split votes once its split set is settled (#4938).
+
+    Each child used to vote while ``write_split_rulings`` had not yet
+    superseded the duplicates, so a ruling the LLM read twice cast two
+    votes, and one document printing a typo renamed the judge.
+    """
+
+    def test_resolve_without_arbitration_never_renames(self) -> None:
+        """Mid-split, the evidence still holds the previous split set: a
+        child resolves without renaming anyone, and casts no vote."""
+        court = _PgCourt("Craig L. Griffin", _GRIFFEN_ALIAS, evidence=[("Craig L. Griffen", 5)])
+        try:
+            renamed: set[str] = set()
+            judge_id = resolve_judge(
+                court.conn,
+                "Craig L. Griffen",
+                court.court_id,
+                source="ca-orange-tentatives",
+                renamed_judge_ids=renamed,
+                arbitrate=False,
+            )
+            court.conn.commit()
+            assert judge_id == court.judge_id
+            assert court.canonical() == "Craig L. Griffin"
+            assert renamed == set()
+            assert len(court.evidence_rows()) == 5
+            # The same call with arbitration applies the evidence.
+            assert court.observe("Craig L. Griffen", "ca-orange-tentatives") is True
+        finally:
+            court.close()
+
+    def test_one_settled_child_does_not_rename(self) -> None:
+        """The issue's repro: the LLM read one ruling twice with a typo.  The
+        duplicate child is superseded, so only the surviving child votes,
+        and one document never renames the judge."""
+        court = _PgCourt("Shaina Colover", [("H. Shaina Colovr", "ca-orange")])
+        try:
+            keeper, duplicate = str(uuid.uuid4()), str(uuid.uuid4())
+            court.add_document(keeper)
+            court.add_document(duplicate, status="superseded")
+            renamed: set[str] = set()
+            record_judge_votes(
+                court.conn,
+                [JudgeVote(keeper, court.judge_id, "H. Shaina Colovr")],
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert court.canonical() == "Shaina Colover"
+            assert renamed == set()
+            assert court.evidence_rows() == [(keeper, "H. Shaina Colovr")]
+        finally:
+            court.close()
+
+    def test_two_settled_children_rename_once_and_report_it(self) -> None:
+        court = _PgCourt("Shaina Colover", [("Shaina Clover", "ca-orange")])
+        try:
+            children = [str(uuid.uuid4()), str(uuid.uuid4())]
+            for document_id in children:
+                court.add_document(document_id)
+            renamed: set[str] = set()
+            record_judge_votes(
+                court.conn,
+                [JudgeVote(d, court.judge_id, "Shaina Clover") for d in children],
+                renamed_judge_ids=renamed,
+            )
+            court.conn.commit()
+            assert court.canonical() == "Shaina Clover"
+            assert renamed == {court.judge_id}
+            assert sorted(court.evidence_rows()) == sorted((d, "Shaina Clover") for d in children)
+        finally:
+            court.close()
+
+    def test_no_votes_is_a_no_op(self) -> None:
+        conn = MagicMock()
+        record_judge_votes(conn, [])
+        conn.cursor.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
