@@ -3277,6 +3277,12 @@ class LlmExtractor:
         else:
             # Default to Anthropic.
             client_kwargs: dict[str, str] = {}
+            resolved_key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
+            if resolved_key is not None and not resolved_key.strip():
+                # The SDK accepts a blank key and fails only on the first
+                # call; a blank secret is a missing one (#4953).
+                msg = "ANTHROPIC_API_KEY is blank"
+                raise ValueError(msg)
             if api_key is not None:
                 client_kwargs["api_key"] = api_key
             self._client = anthropic.Anthropic(**client_kwargs)
@@ -5490,7 +5496,7 @@ def _create_google_client(*, api_key: str | None = None) -> object:
     from google import genai
 
     resolved_key = api_key or os.environ.get("GOOGLE_API_KEY")
-    if not resolved_key:
+    if not resolved_key or not resolved_key.strip():
         msg = (
             "No Google API key provided — pass api_key= or set "
             "the GOOGLE_API_KEY environment variable."

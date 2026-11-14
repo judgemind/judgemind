@@ -59,7 +59,10 @@ properties that must hold for any sequence of re-splits:
   key's split children, no deletions (#4948).  A split-set replacement
   (``reingest`` / ``db``) reports the key as failed
   (``SplitExtractionFailedError``), so the reingest's failed-keys manifest
-  retries it.  Checked by :func:`run_extraction_failure`.
+  retries it.  The same holds when the worker, in ``required`` extraction
+  mode, finds its extractors could not be built (#4953): every step kind,
+  a live capture included, raises ``ExtractorUnavailableError`` and writes
+  nothing.  Checked by :func:`run_extraction_failure`.
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -730,6 +733,9 @@ class FakeExtractor:
     def __init__(self) -> None:
         self.rulings: list[ExtractedRuling] = []
         self.failing = False
+        #: The worker's extractor getters return None, as when the
+        #: extractor cannot be built (#4953).
+        self.unavailable = False
 
     def _result(self) -> list[ExtractedRuling]:
         if self.failing:
@@ -921,6 +927,9 @@ class KeyHarness:
         #: The judge spelling each ruling text printed, as of the last step
         #: that wrote it (ruling texts are unique per key).
         self._spelling: dict[str, str | None] = {}
+        #: A failing step's extractors cannot be built (#4953), rather than
+        #: built and failing every call (#4948).
+        self.fail_unavailable = False
         self.worker = self._make_worker()
 
     def close(self) -> None:
@@ -946,10 +955,18 @@ class KeyHarness:
         worker._get_connection = lambda: self.conn  # type: ignore[method-assign]
         worker._indexer = self.indexer
         worker._fetch_raw_pdf_from_s3 = lambda *_a, **_k: b"%PDF-1.4 harness"  # type: ignore[method-assign]
-        worker._get_multimodal_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
+
+        def extractor(*_a: Any, **_k: Any) -> FakeExtractor | None:
+            return None if self.extractor.unavailable else self.extractor
+
+        worker._get_multimodal_extractor = extractor  # type: ignore[method-assign]
         # The text fallback a failed multimodal extraction tries (#4948).
-        worker._get_framework_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
-        worker._get_county_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
+        worker._get_framework_extractor = extractor  # type: ignore[method-assign]
+        worker._get_county_extractor = extractor  # type: ignore[method-assign]
+        # The deployed configuration (#4953): the suite's conftest opts
+        # into ``optional`` mode, which only the extractor-less unit tests
+        # need.
+        worker._extraction_required = True
         worker._validation_enabled = False
         worker._formatting_enabled = False
         worker._summarization_enabled = False
@@ -1000,10 +1017,16 @@ class KeyHarness:
         self._validation_seen = self._validation_ids(key)
         self._pending = None
         self.extractor.rulings = extracted_rulings(step)
-        self.extractor.failing = step.fail
+        unavailable = step.fail and self.fail_unavailable
+        self.extractor.failing = step.fail and not unavailable
+        self.extractor.unavailable = unavailable
         # A failed extraction on a split-set replacement reports the key as
-        # failed (#4948); a live capture does not raise.
-        expect_failed = step.fail and step.kind != "live"
+        # failed (#4948); a live capture does not raise.  A missing
+        # extractor raises on every step kind (#4953).
+        expect_failed = step.fail and (step.kind != "live" or unavailable)
+        expected_error = (
+            "ExtractorUnavailableError" if unavailable else "SplitExtractionFailedError"
+        )
         reported_failed = False
         logged_before = self.events[_EXTRACTION_FAILED_EVENT]
         try:
@@ -1015,11 +1038,12 @@ class KeyHarness:
         except InvariantError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
-            if not (expect_failed and type(exc).__name__ == "SplitExtractionFailedError"):
+            if not (expect_failed and type(exc).__name__ == expected_error):
                 self._fail("error", f"step raised {type(exc).__name__}: {exc}")
             reported_failed = True
         finally:
             self.extractor.failing = False
+            self.extractor.unavailable = False
             try:
                 self.real.rollback()
             except Exception:  # noqa: BLE001
@@ -1992,17 +2016,22 @@ def run_extraction_failure(
     name: str = "fail",
     steps: list[Step] | None = None,
     kind: str | None = None,
+    unavailable: bool = False,
 ) -> None:
     """Run a history on a key (*steps*, default *seed*'s generated
     sequence), then re-ingest it while every extraction call fails
-    (``ExtractionIncompleteError``).  The failed step must leave the key's
-    rows and search docs exactly as they were (``untouched``) and hold the
-    other invariants; a split-set replacement must report the key as
-    failed.  Raises :class:`InvariantError` on a broken invariant.
+    (``ExtractionIncompleteError``), or, with *unavailable*, while the
+    worker's required extractors cannot be built (#4953).  The failed step
+    must leave the key's rows and search docs exactly as they were
+    (``untouched``) and hold the other invariants; a split-set replacement
+    must report the key as failed, and so must every step kind when the
+    extractors are unavailable.  Raises :class:`InvariantError` on a broken
+    invariant.
 
     The failed step is *kind*, or one the seed picks: a prefix reingest, a
     DB-row reingest or a live capture (the last two only when the key
-    holds rows).
+    holds rows; with *unavailable*, a live capture of a key with no rows
+    too).
     """
     steps = steps if steps is not None else generate(seed)
     rng = random.Random(f"{seed}:fail")
@@ -2013,7 +2042,11 @@ def run_extraction_failure(
             harness.run_step(key, step, f"step {n + 1}/{len(steps)}")
         if kind is None:
             has_rows = bool(read_key(harness.checker, key.s3_key))
-            kind = rng.choice(("reingest", "db", "live") if has_rows else ("reingest",))
+            if has_rows:
+                kind = rng.choice(("reingest", "db", "live"))
+            else:
+                kind = rng.choice(("reingest", "live") if unavailable else ("reingest",))
+        harness.fail_unavailable = unavailable
         failed = replace(steps[-1], kind=kind, fail=True, whole=False)
         harness.run_step(key, failed, "extraction failed")
     finally:

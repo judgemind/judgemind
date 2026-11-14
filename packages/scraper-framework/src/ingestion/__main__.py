@@ -13,6 +13,10 @@ Optional:
     MAX_RETRIES            — Per-message retry limit (default: 3)
     OPENSEARCH_USERNAME    — OpenSearch basic-auth username (local-dev fallback)
     OPENSEARCH_PASSWORD    — OpenSearch basic-auth password (local-dev fallback)
+    JUDGEMIND_EXTRACTION   — ``required`` (default): ANTHROPIC_API_KEY and
+                             GOOGLE_API_KEY must build LLM extractors, or the
+                             worker exits at startup; ``optional``: run
+                             without them, regex-only (#4953)
 
 OpenSearch auth: SigV4-signed requests (from the ambient AWS credential chain)
 are the preferred, deployed path; ``OPENSEARCH_USERNAME``/``OPENSEARCH_PASSWORD``

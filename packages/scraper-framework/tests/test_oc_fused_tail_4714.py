@@ -41,9 +41,12 @@ from framework.models import CapturedDocument, ContentFormat, ScraperConfig
 from ingestion.split_ids import make_split_document_id
 from ingestion.worker import (
     REPLACE_SPLIT_SET_KEY,
+    SPLIT_EXTRACTION_FAILED_EVENT,
     WHOLE_DOCUMENT_KEY,
+    ExtractorUnavailableError,
     IngestionWorker,
     SplitExtractionFailedError,
+    is_infrastructure_error,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -559,10 +562,12 @@ def test_worker_failed_multimodal_with_no_text_extractor_is_a_failure() -> None:
 
 
 def test_worker_with_no_extractor_configured_falls_back_to_the_single_document() -> None:
-    """No extractor configured (a run without LLM keys) is not a failed
-    extraction: the single-document fallback (per-field and regex
-    extraction) is the extraction, as before (#4948)."""
+    """No extractor configured in ``optional`` extraction mode (the explicit
+    opt-in of a run without LLM keys, set by the suite's conftest) is not a
+    failed extraction: the single-document fallback (per-field and regex
+    extraction) is the extraction, as before (#4948, #4953)."""
     worker = _make_worker()
+    assert worker._extraction_required is False
     event = {
         **_event(),
         "county": "Ventura",
@@ -580,6 +585,111 @@ def test_worker_with_no_extractor_configured_falls_back_to_the_single_document()
         )
 
     assert handled is False
+
+
+def _required_worker() -> IngestionWorker:
+    """A worker in ``required`` extraction mode (#4953) whose extractors
+    have gone missing after startup (the runtime half of the check)."""
+    worker = _make_worker()
+    worker._extraction_required = True
+    worker._extractor_init_errors["framework"] = "AuthenticationError: bad key"
+    worker._extractor_init_errors["county"] = "AuthenticationError: bad key"
+    worker._extractor_init_errors["multimodal"] = "ValueError: No Google API key provided"
+    return worker
+
+
+_VENTURA_REINGEST = {
+    "county": "Ventura",
+    "scraper_id": "ca-ventura-tentatives",
+    "content_format": "html",
+    "s3_key": "ca/ventura/superior_court/raw/abc.html",
+    "ruling_text": _DOC_TEXT,
+}
+
+
+@pytest.mark.parametrize("reingest", [True, False])
+def test_worker_extractor_unavailable_writes_nothing(
+    reingest: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """In ``required`` mode a text extractor that cannot be built is a
+    failed extraction, not "no extractor configured": nothing is written
+    (no split-set write, no whole document as a ruling of its own) and
+    ``ExtractorUnavailableError`` names the init error, on a reingest and
+    on a live capture of a new key alike (#4953)."""
+    worker = _required_worker()
+    event = {**_event(), **_VENTURA_REINGEST}
+    if reingest:
+        event[REPLACE_SPLIT_SET_KEY] = True
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=None),
+        patch.object(worker, "_get_county_extractor", return_value=None),
+        patch.object(worker, "_key_has_rows", return_value=False) as has_rows,
+        patch.object(worker, "_write_split_batch") as split_write,
+        patch.object(worker, "_write_one_ruling") as single_write,
+        caplog.at_level(logging.WARNING, logger="ingestion.worker"),
+        pytest.raises(ExtractorUnavailableError, match="extractor unavailable: .*bad key"),
+    ):
+        worker.process_event(event)
+
+    split_write.assert_not_called()
+    single_write.assert_not_called()
+    has_rows.assert_not_called()
+    failed = [
+        r
+        for r in caplog.records
+        if getattr(r, "telemetry_event", None) == SPLIT_EXTRACTION_FAILED_EVENT
+    ]
+    assert [r.action for r in failed] == ["extractor_unavailable"]
+
+
+def test_worker_extractor_unavailable_multimodal_does_not_fall_back_to_text() -> None:
+    """A required multimodal extractor that cannot be built fails the split
+    before any text-extractor call (#4953)."""
+    worker = _required_worker()
+    text = MagicMock()
+    event = {**_event(), "ruling_text": _DOC_TEXT, REPLACE_SPLIT_SET_KEY: True}
+
+    with (
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_dispatch_split_child") as dispatch,
+        pytest.raises(ExtractorUnavailableError, match="multimodal: ValueError"),
+    ):
+        worker._llm_split_document(
+            event, event["document_id"], _DOC_TEXT, "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
+        )
+
+    text.extract.assert_not_called()
+    dispatch.assert_not_called()
+
+
+def test_worker_extractor_unavailable_after_failed_multimodal_names_both() -> None:
+    """Multimodal failed and the required text extractor is missing: the
+    error names both (#4948, #4953)."""
+    worker = _required_worker()
+    _failing_extractors(worker)
+    event = {**_event(), REPLACE_SPLIT_SET_KEY: True}
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=None),
+        patch.object(worker, "_get_county_extractor", return_value=None),
+        pytest.raises(ExtractorUnavailableError, match="PDF pages.*extractor unavailable"),
+    ):
+        worker._llm_split_document(
+            event, event["document_id"], _DOC_TEXT, "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
+        )
+
+
+def test_extractor_unavailable_is_an_infrastructure_error() -> None:
+    """The live worker keeps the message and exits for restart, rather than
+    dead-lettering it after retries (#4953); a reingest still counts it as
+    a failed key."""
+    exc = ExtractorUnavailableError("extractor unavailable: framework: x")
+    assert is_infrastructure_error(exc)
+    assert isinstance(exc, SplitExtractionFailedError)
+    assert not is_infrastructure_error(SplitExtractionFailedError("x"))
 
 
 # ---------------------------------------------------------------------------

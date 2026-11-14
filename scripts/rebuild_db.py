@@ -1907,6 +1907,13 @@ def main() -> None:
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     cache_dir = os.environ.get("S3_CACHE_DIR", "")
 
+    # Fail before any reset when a required LLM extractor cannot be built
+    # (#4953): every document's worker would refuse, leaving the reset
+    # tables empty.
+    from ingestion.worker import check_extraction_ready
+
+    logger.info("Extraction mode", extraction_mode=check_extraction_ready())
+
     s3 = make_s3_client()
     conn = psycopg.connect(database_url, autocommit=False)
 
