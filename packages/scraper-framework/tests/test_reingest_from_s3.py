@@ -4414,3 +4414,74 @@ def _content_parent_4801() -> str:
 
 def _split_child_hash_4801(parent_hash: str, position: int) -> str:
     return hashlib.sha256(f"{parent_hash}:ruling:{position}".encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Judge pre-pass seeds from header fields only (#4934)
+# ---------------------------------------------------------------------------
+
+_KEY_4934 = (
+    "ca/orange/superior_court/raw/"
+    "15acf7b81f4c3fef28afe74f98b15ca195ad50f0d4cf34c84c9a6d52b0141af2.pdf"
+)
+_ORANGE_COURT_IDS_4934 = {"ca-orange": str(uuid.uuid4())}
+
+
+def _run_prepass_4934(conn: MagicMock, text: str) -> dict[str, int]:
+    """Run the real pre-pass on one Orange key whose text is *text*."""
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"%PDF"))}
+    with patch.object(reingest, "_extract_text_from_content", return_value=text):
+        return reingest._seed_judges_from_keys(
+            conn,
+            s3,
+            [_KEY_4934],
+            "bucket",
+            _ORANGE_COURT_IDS_4934,
+            parse_timeout=1.0,
+            concurrency=1,
+        )
+
+
+class TestJudgePrepassHeaderOnly:
+    def test_mediator_in_a_ruling_body_creates_no_judge(self) -> None:
+        """The #4934 Orange calendar: a ruling body names a retired judge who
+        mediated.  The pre-pass must not seed him as a judge of the court."""
+        text = (
+            "TENTATIVE RULINGS\nDEPT C34\nJUDGE H. SHAINA COLOVER\n"
+            "The issue of Ron's nonpayment of Ms. Chen's retainer was mediated\n"
+            "before the Honorable James P. Gray (Ret.) and Ron agreed to pay.\n"
+        )
+        conn, cur = _cursor_conn([])
+        stats = _run_prepass_4934(conn, text)
+
+        executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+        assert not any("INSERT INTO judges" in sql for sql in executed)
+        assert stats["docs_scanned"] == 1
+        assert stats["judges_seeded"] == 0
+        conn.commit.assert_not_called()
+
+    def test_opposing_judge_named_in_a_body_creates_no_judge(self) -> None:
+        text = (
+            "TENTATIVE RULINGS\nDEPT C34\n"
+            "The prior action was assigned to Judge Maria Gonzalez of the\n"
+            "Riverside court, per Hon. Elizabeth L. Bradley's minute order.\n"
+        )
+        conn, _cur = _cursor_conn([])
+        with patch.object(reingest, "resolve_judge") as resolve:
+            stats = _run_prepass_4934(conn, text)
+        resolve.assert_not_called()
+        assert stats["judges_seeded"] == 0
+
+    def test_presiding_judge_header_still_seeds(self) -> None:
+        text = (
+            "DEPARTMENT 56 JUDGE STEVEN A. ELLIS\n"
+            "The parties mediated before the Honorable James P. Gray (Ret.).\n"
+        )
+        conn, _cur = _cursor_conn([])
+        with patch.object(reingest, "resolve_judge", return_value="j1") as resolve:
+            stats = _run_prepass_4934(conn, text)
+        assert resolve.call_args.args[1] == "STEVEN A. ELLIS"
+        assert resolve.call_args.args[2] == _ORANGE_COURT_IDS_4934["ca-orange"]
+        assert stats["judges_seeded"] == 1
+        conn.commit.assert_called_once()

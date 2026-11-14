@@ -1313,9 +1313,10 @@ def _expand_single_word_judge_surname(
     The reingest path at ``scripts/reingest_from_s3.py`` runs a one-shot
     judge pre-pass before its main per-document loop (the two-pass
     resolver).  The pre-pass walks the FETCH cursor once, calls
-    ``extract_judge_name`` against every document's raw text, and
-    upserts any *full* names it finds into ``derived.judges`` via
-    ``resolve_judge``.  After the pre-pass, this Step 4 suffix-LIKE
+    ``extract_header_judge_name`` against every document's raw text (a
+    labelled presiding-judge header field only, never a name in a ruling
+    body, #4934), and upserts any *full* names it finds into
+    ``derived.judges`` via ``resolve_judge``.  After the pre-pass, this Step 4 suffix-LIKE
     match resolves on the first reingest invocation regardless of
     cursor ordering — the chronological-resolver-race class surfaced
     by #4397 is closed.  Two-pass reingests are no longer required to
