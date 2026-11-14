@@ -203,9 +203,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Every aws call below, from the launch through the final log dump, runs
+# under a per-call timeout sized to what is left of the budget, counted from
+# script start (#4850, #4975). Calls slower than 30s are logged as
+# "slow call: ...".
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_wait_budget_lib.sh"
+
 # ─── --logs mode: retrieve logs for a previously launched task ─────────────
 
 if [[ -n "$LOGS_TASK_ARN" ]]; then
+    wait_budget_init "$DEFAULT_TIMEOUT" "$SCRIPT_START_SECS"
     # Extract cluster and task ID from the ARN.
     # ARN format: arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>
     CLUSTER_FROM_ARN=$(echo "$LOGS_TASK_ARN" | cut -d'/' -f2)
@@ -220,7 +228,7 @@ if [[ -n "$LOGS_TASK_ARN" ]]; then
     # Describe the task to get its status
     echo "Task ARN: ${LOGS_TASK_ARN}" >&2
 
-    TASK_DESCRIBE=$(aws ecs describe-tasks \
+    TASK_DESCRIBE=$(wait_budget_call "aws ecs describe-tasks" aws ecs describe-tasks \
         --cluster "$CLUSTER_FROM_ARN" \
         --tasks "$LOGS_TASK_ARN" \
         --region "$REGION" \
@@ -279,11 +287,16 @@ PYEOF
     # Retry log retrieval — CloudWatch may still be ingesting events
     LOGS_OK=false
     for _retry_wait in 0 5 10 15; do
+        if wait_budget_exhausted; then
+            echo "(Stopped retrying: this call's ${DEFAULT_TIMEOUT}s budget is spent.)" >&2
+            break
+        fi
         if [[ "$_retry_wait" -gt 0 ]]; then
             echo "Retrying in ${_retry_wait}s..." >&2
-            sleep "$_retry_wait"
+            wait_budget_sleep "$_retry_wait"
         fi
-        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200; then
+        if wait_budget_call --max 999999 "scripts/ecs-logs.sh" \
+            "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200; then
             LOGS_OK=true
             break
         fi
@@ -376,6 +389,8 @@ if [[ -n "$TIMEOUT" ]]; then
 else
     TIMEOUT="$DEFAULT_TIMEOUT"
 fi
+# The budget covers the launch calls too, not just the wait (#4975).
+wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
 
 # ─── Cleanup trap ────────────────────────────────────────────────────────────
 
@@ -385,7 +400,8 @@ cleanup() {
     if [[ -n "$ONESHOT_TASK_DEF_ARN" ]]; then
         echo "" >&2
         echo "Cleaning up: deregistering oneshot task definition..." >&2
-        aws ecs deregister-task-definition \
+        # Short fixed cap: cleanup runs after the budget may be spent (#4975).
+        wait_budget_call --max 15 "aws ecs deregister-task-definition" aws ecs deregister-task-definition \
             --task-definition "$ONESHOT_TASK_DEF_ARN" \
             --region "$REGION" \
             --output text > /dev/null 2>&1 || true
@@ -393,7 +409,7 @@ cleanup() {
 
     if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" && "$TASK_STILL_RUNNING" == "false" ]]; then
         echo "Cleaning up: removing script from S3..." >&2
-        aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
+        wait_budget_call --max 15 "aws s3 rm" aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null 2>&1 || true
     elif [[ -n "$S3_SCRIPT_KEY" ]]; then
         echo "Task not finished: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download." >&2
@@ -424,7 +440,7 @@ CLUSTER="judgemind-${ENVIRONMENT}"
 
 echo "Reading latest task definition for ${SOURCE_FAMILY}..." >&2
 
-SOURCE_TASK_DEF=$(aws ecs describe-task-definition \
+SOURCE_TASK_DEF=$(wait_budget_call "aws ecs describe-task-definition" aws ecs describe-task-definition \
     --task-definition "$SOURCE_FAMILY" \
     --region "$REGION" \
     --output json 2>/dev/null) || {
@@ -461,7 +477,7 @@ if [[ "$SERVICE_IMAGE_TAG" == "$SERVICE_IMAGE" ]]; then
 fi
 
 # Get the digest of the service's image
-SERVICE_DIGEST=$(aws ecr describe-images \
+SERVICE_DIGEST=$(wait_budget_call "aws ecr describe-images" aws ecr describe-images \
     --repository-name "$ECR_REPO_NAME" \
     --image-ids "imageTag=${SERVICE_IMAGE_TAG}" \
     --region "$REGION" \
@@ -469,7 +485,7 @@ SERVICE_DIGEST=$(aws ecr describe-images \
     --output text 2>/dev/null) || SERVICE_DIGEST=""
 
 # Get the latest image from ECR (most recently pushed)
-LATEST_ECR_INFO=$(aws ecr describe-images \
+LATEST_ECR_INFO=$(wait_budget_call "aws ecr describe-images" aws ecr describe-images \
     --repository-name "$ECR_REPO_NAME" \
     --image-ids imageTag=latest \
     --region "$REGION" \
@@ -526,7 +542,7 @@ OVERRIDE_ROLE_ARN=""
 
 if [[ -n "$ROLE_OVERRIDE" ]]; then
     echo "Resolving IAM role '${ROLE_OVERRIDE}'..." >&2
-    OVERRIDE_ROLE_ARN=$(aws iam get-role \
+    OVERRIDE_ROLE_ARN=$(wait_budget_call "aws iam get-role" aws iam get-role \
         --role-name "$ROLE_OVERRIDE" \
         --region "$REGION" \
         --query 'Role.Arn' \
@@ -597,13 +613,13 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
     echo "Uploading to s3://${S3_BUCKET}/${S3_SCRIPT_KEY}..." >&2
 
     if [[ "$DRY_RUN" == "false" ]]; then
-        aws s3 cp "$SCRIPT_PATH" "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
+        wait_budget_call "aws s3 cp" aws s3 cp "$SCRIPT_PATH" "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null
 
         # Generate a pre-signed URL (15 min TTL) so the container can download
         # the script without needing the AWS CLI installed. 15 minutes allows
         # for Fargate cold starts which can exceed 5 minutes.
-        PRESIGNED_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
+        PRESIGNED_URL=$(wait_budget_call "aws s3 presign" aws s3 presign "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" \
             --expires-in 900)
     else
@@ -733,7 +749,7 @@ fi
 # Write the task def to a temp file for the register command
 echo "$TASK_DEF_JSON" > "${TMP_DIR}/_oneshot_task_def.json"
 
-REGISTER_OUTPUT=$(aws ecs register-task-definition \
+REGISTER_OUTPUT=$(wait_budget_call "aws ecs register-task-definition" aws ecs register-task-definition \
     --cli-input-json "file://${TMP_DIR}/_oneshot_task_def.json" \
     --region "$REGION" \
     --output json)
@@ -748,7 +764,7 @@ SERVICE_NAME="judgemind-ingestion-worker-${ENVIRONMENT}"
 
 echo "Resolving networking from service ${SERVICE_NAME}..." >&2
 
-NETWORK_CONFIG=$(aws ecs describe-services \
+NETWORK_CONFIG=$(wait_budget_call "aws ecs describe-services" aws ecs describe-services \
     --cluster "$CLUSTER" \
     --services "$SERVICE_NAME" \
     --region "$REGION" \
@@ -772,13 +788,28 @@ echo "Security groups: ${SECURITY_GROUPS}" >&2
 echo "" >&2
 echo "Launching oneshot task..." >&2
 
-RUN_OUTPUT=$(aws ecs run-task \
+RUN_TASK_RC=0
+RUN_OUTPUT=$(wait_budget_call "aws ecs run-task" aws ecs run-task \
     --cluster "$CLUSTER" \
     --task-definition "$ONESHOT_TASK_DEF_ARN" \
     --launch-type FARGATE \
     --region "$REGION" \
     --output json \
-    --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}")
+    --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}") \
+    || RUN_TASK_RC=$?
+if [[ "$RUN_TASK_RC" -eq "$WAIT_CALL_TIMEOUT_RC" ]]; then
+    # Killed before it answered (#4975): ECS may or may not have started
+    # the task, and we never saw its ARN. Keep the S3 script in case it did.
+    TASK_STILL_RUNNING=true
+    echo "Error: task status unknown: aws ecs run-task did not answer before its per-call limit." >&2
+    echo "A task MAY have started. Do not blindly re-run this command (that could launch a second task)." >&2
+    echo "Fix: look for it first:" >&2
+    echo "  aws ecs list-tasks --cluster ${CLUSTER} --family ${ONESHOT_FAMILY} --region ${REGION}" >&2
+    exit 125
+elif [[ "$RUN_TASK_RC" -ne 0 ]]; then
+    echo "Error: aws ecs run-task failed (exit ${RUN_TASK_RC})." >&2
+    exit 1
+fi
 
 TASK_ARN=$(echo "$RUN_OUTPUT" | python3 -c "import sys,json; tasks=json.load(sys.stdin)['tasks']; print(tasks[0]['taskArn'] if tasks else '')")
 
@@ -836,12 +867,10 @@ fi
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
 # Every aws call in the wait below runs under a per-call timeout sized to
-# what is left of TIMEOUT (counted from script start), and calls slower than
-# 30s are logged as "slow call: ..." (#4850).  A hung call is killed and
-# counted as a failed poll, so the attached wait still ends on time.
-# shellcheck source=scripts/_wait_budget_lib.sh
-source "${SCRIPT_DIR}/_wait_budget_lib.sh"
-wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
+# what is left of TIMEOUT (counted from script start, budget started after
+# option parsing), and calls slower than 30s are logged as "slow call: ..."
+# (#4850).  A hung call is killed and counted as a failed poll, so the
+# attached wait still ends on time.
 
 ELAPSED=0
 LAST_STATUS=""
@@ -858,6 +887,8 @@ LOG_EVENTS_EMITTED=false
 # handing back fresh tokens can't starve the describe-tasks status check.
 # Anything left over is picked up on the next poll.
 LOG_MAX_PAGES_PER_POLL=50
+# Set once a log fetch was skipped because the budget ran out (#4975).
+LOG_BUDGET_SPENT=false
 
 # describe-tasks error handling (#4791).  Auth / permission / bad-parameter
 # errors can't fix themselves, so they fail fast.  Anything else is retried,
@@ -882,6 +913,9 @@ EXIT_STATUS_UNKNOWN=125
 # ID sorted later was never found (#4723).
 # Returns the stream name, or empty string if not found yet.
 find_log_stream() {
+    if wait_budget_exhausted; then
+        return 0
+    fi
     wait_budget_call "aws logs describe-log-streams" \
         aws logs describe-log-streams \
         --log-group-name "$LOG_GROUP" \
@@ -914,6 +948,12 @@ stream_new_logs() {
     # end of the stream; only a repeated token is.
     local page=0
     while [[ $page -lt $LOG_MAX_PAGES_PER_POLL ]]; do
+        # Each page is one more call: stop paging once the budget is spent
+        # (#4975), or 50 pages could run minutes past it.
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            return 0
+        fi
         page=$((page + 1))
 
         local args=(
@@ -1075,7 +1115,7 @@ else:
                 "# once AWS calls succeed again, re-attach:"
         fi
         echo "WARNING: could not describe task (${DESCRIBE_CONSECUTIVE_ERRORS}/${DESCRIBE_MAX_CONSECUTIVE_ERRORS}): ${DESCRIBE_LAST_ERROR}; retrying in ${POLL_INTERVAL}s..." >&2
-        sleep "$POLL_INTERVAL"
+        wait_budget_sleep "$POLL_INTERVAL"
         ELAPSED=$((ELAPSED + POLL_INTERVAL))
         continue
     fi
@@ -1113,7 +1153,9 @@ else:
         break
     fi
 
-    sleep "$POLL_INTERVAL"
+    # Sliced + wall-clock checked: a laptop sleep cannot hold it past the
+    # budget (#4975).
+    wait_budget_sleep "$POLL_INTERVAL"
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 
@@ -1123,9 +1165,16 @@ done
 # may still be creating the stream.  Only for a STOPPED task: when the wait
 # ran out on a running task, these retries would push the call past its
 # budget (#4850), and ecs-wait-task.sh / --logs pick the logs up later.
+# Every step after STOPPED is budget-bounded too (#4975): once the budget is
+# spent the log dump is cut short (LOG_BUDGET_SPENT) and the exit code is
+# reported anyway, with the --logs command for the rest.
 if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
     for _stream_wait in 3 5 7 10; do
-        sleep "$_stream_wait"
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
+        wait_budget_sleep "$_stream_wait"
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
             echo "Log stream: ${LOG_STREAM_NAME}" >&2
@@ -1137,7 +1186,7 @@ if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
 fi
 
 if [[ "$LOG_STREAMING" == "true" ]]; then
-    sleep 2
+    wait_budget_sleep 2
     stream_new_logs
     echo "─── End of Live Logs ────────────────────────────────────────────" >&2
 fi
@@ -1218,20 +1267,38 @@ if [[ "$LOG_STREAMING" == "false" || "$LOG_EVENTS_EMITTED" == "false" ]]; then
     # Retry log retrieval with increasing waits. CloudWatch can take
     # 10-30 seconds to create the log stream after task completion,
     # especially for short-lived tasks.
+    # The retries, and ecs-logs.sh itself (one external command), run under
+    # what is left of the budget (#4975).
     LOGS_RETRIEVED=false
     for _log_wait in 5 10 30; do
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
         echo "Waiting ${_log_wait}s for CloudWatch log stream..." >&2
-        sleep "$_log_wait"
-        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
+        wait_budget_sleep "$_log_wait"
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
+        if wait_budget_call --max 999999 "scripts/ecs-logs.sh" \
+            "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
             LOGS_RETRIEVED=true
             break
         fi
     done
 
-    if [[ "$LOGS_RETRIEVED" == "false" ]]; then
+    if [[ "$LOGS_RETRIEVED" == "false" && "$LOG_BUDGET_SPENT" == "false" ]]; then
         echo "(Could not retrieve logs after retries. Check manually with:)" >&2
         echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
     fi
+fi
+
+if [[ "$LOG_BUDGET_SPENT" == "true" ]]; then
+    echo "" >&2
+    echo "Log output cut short: this call's ${TIMEOUT}s budget ran out after the task stopped (#4975)." >&2
+    echo "The task is finished; its exit code is below. Fetch the full logs with:" >&2
+    echo "  scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────

@@ -129,6 +129,18 @@ if [[ "$FOLLOW" == true && "$FOLLOW_MAX_SECS" -gt 0 ]]; then
     wait_budget_init "$FOLLOW_MAX_SECS"
 fi
 
+# stop_if_budget_spent — --follow only (no budget otherwise): exit 124 before
+# starting another call once too little budget is left for it. The stream
+# lookup makes up to 5 calls in a row, and each one past the deadline still
+# got the per-call floor, so a hung lookup ran ~25s over (#4975). Inside
+# STREAM=$(find_stream) the exit 124 propagates through `set -e`.
+stop_if_budget_spent() {
+    if wait_budget_exhausted; then
+        echo "--- stopped following after ${FOLLOW_MAX_SECS}s, before the log stream was found (exit 124; nothing is wrong). Re-run the same command to keep following. ---" >&2
+        exit 124
+    fi
+}
+
 # ─── Validate a log stream is accessible ─────────────────────────────────
 
 validate_stream() {
@@ -164,6 +176,7 @@ find_stream() {
         # "oneshot/oneshot/" prefix + --max-items only sees the first N of
         # thousands of streams alphabetically and misses most tasks (#4723).
         for prefix in "oneshot/oneshot/${TASK_FILTER}" "ecs/" "ingestion-worker/" "scraper/"; do
+            stop_if_budget_spent
             local prefix_streams
             prefix_streams=$(wait_budget_call "aws logs describe-log-streams" aws logs describe-log-streams \
                 --log-group-name "$LOG_GROUP" \
@@ -182,6 +195,7 @@ find_stream() {
 
         # Fall back to LastEventTime ordering (catches non-standard prefixes)
         if [[ -z "$match" ]]; then
+            stop_if_budget_spent
             local streams
             streams=$(wait_budget_call "aws logs describe-log-streams" aws logs describe-log-streams \
                 --log-group-name "$LOG_GROUP" \
@@ -238,6 +252,7 @@ find_stream() {
             if [[ -z "$candidate" || "$candidate" == "None" ]]; then
                 continue
             fi
+            stop_if_budget_spent
             if validate_stream "$candidate"; then
                 echo "$candidate"
                 return 0
