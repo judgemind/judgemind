@@ -407,7 +407,7 @@ This closes the race window observed in PR #2907 where a new resolver shipped on
 | Tool | Use for | Reliability | Notes |
 |---|---|---|---|
 | `scripts/ecs-run-task.sh` | All data scripts (backfills, migrations, audits) | Reliable | Standalone Fargate task, CloudWatch logs, no session timeout |
-| `scripts/dev-db-query.sh` | Quick SQL queries | Good for short queries | Uses ECS Exec internally; may drop on long queries |
+| `scripts/dev-db-query.sh` | Quick SQL queries, including large result sets | Complete result or non-zero exit | Uses ECS Exec; results over 512 bytes travel via S3 (#4781). See [Output-size limits](#output-size-limits-via-ssm--ecs-exec) |
 | `scripts/ecs-run.sh` | Interactive debugging only | Unreliable | SSM sessions drop after seconds; never use for scripts |
 | `scripts/ecs-wait-task.sh` | Wait on a `--detach`'d oneshot until STOPPED | Reliable | 60s polling, 480s per call then exit 124 (re-run to keep waiting), propagates container exitCode |
 
@@ -467,17 +467,34 @@ Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 de
 
 ### Output-size limits via SSM / ECS Exec
 
-`scripts/dev-db-query.sh` occasionally truncates large query results mid-field. The root cause is the SSM output budget — the SSM / ECS Exec per-session output byte cap (~1 KB effective, varies with task load), not a timing race or psql buffering issue. See #3195.
+The SSM / ECS Exec transport cuts a session's output off partway: anywhere from ~1 KB to ~10 KB on dev (946 bytes on one run, 8-10 KB on others), with a `Cannot perform start session: EOF` trailer, and `aws ecs execute-command` still exits 0 (#3195, #4781).
 
-Three mitigations were landed in #3195 / PR #3201:
+**`scripts/dev-db-query.sh` returns results of any size complete, or exits non-zero (#4781).** It never prints a partial result as if it were whole:
 
-- **Compact JSON default** in `scripts/dev_db_query_runner.py` (`json.dumps(..., separators=(",", ":"))`) so the payload is as small as possible before it hits the transport layer.
-- **SSM chatter stripping** in `scripts/dev-db-query.sh` (the `grep -Ev` filter against `Starting session…` / `Exiting session…` / `Cannot perform start session: EOF` / `The Session Manager plugin was installed…`) so SSM banner lines do not contaminate JSON consumers.
-- **5-attempt retry loop** in `scripts/dispatcher/helpers/_query_lib.sh` (`_query_lib_run`) that re-executes the query and re-validates with `jq -e .` until the captured output parses as valid JSON.
+- The runner (`scripts/dev_db_query_runner.py`) never prints a bare payload. Results of up to 512 bytes go inline between `@@JM_DEVDB_BEGIN inline bytes=<n> sha256=<hex>@@` and `@@JM_DEVDB_END@@` lines.
+- Larger results are written to `s3://judgemind-document-archive-dev/tmp/dev-db-query/<id>.json` by the ingestion worker's task role. Only a short pointer line (`@@JM_DEVDB_BEGIN s3 bytes=... sha256=... uri=...@@`) crosses SSM.
+- Locally, `scripts/dev_db_query_result.py` finds the frame and downloads the S3 object with `aws s3 cp`. It checks the byte count and sha256 against the BEGIN line, prints the payload to stdout, and deletes the object. The `tmp/` lifecycle rule expires any object left behind after 30 days.
+- A missing frame (a runner or database error, or a stream that died early), a missing END marker (truncation), a size or digest mismatch, or a failed download exits 1. You get a `Fix:` block on stderr and an empty stdout. Re-run, or fall back to `scripts/ecs-run-task.sh`.
 
-**Architectural escape hatch.** When the caller actually needs more than ~1 KB of structured output, run the work as a oneshot ECS task via `scripts/ecs-run-task.sh` and read results from CloudWatch Logs (or write them to S3). That path does not use SSM, so there is no per-session output cap.
+You need local `s3:GetObject` (and ideally `s3:DeleteObject`) on the archive bucket. The operator profile has both. `DEV_DB_QUERY_INLINE_MAX_BYTES` (default 512) moves the inline/S3 cutover. Setting it very high (e.g. `100000000`) forces a large result through SSM, which is how to watch the truncation check fire.
 
-**Rule of thumb:** if you expect more than ~1 KB of JSON from a single helper query, split the query, narrow the `SELECT`, or use `scripts/ecs-run-task.sh` instead of `scripts/dev-db-query.sh`.
+Why S3 rather than chunked output: the cut happens inside a single SSM session, so chunking over SSM would need one session per ~1 KB chunk. A 400 KB result would take hundreds of sessions at ~2-5 s each. One S3 round trip is constant-time for any size, and the inline path stays for small results so counts and lookups don't depend on S3.
+
+Earlier mitigations from #3195 / PR #3201 remain: compact JSON in the runner, and the 5-attempt `jq -e .` retry loop in `scripts/dispatcher/helpers/_query_lib.sh` (now rarely needed, since a failed call exits non-zero with empty stdout).
+
+**Recipe: a full key list for `reingest_from_s3.py --s3-key-list` in one command.** There is no longer a need to chunk queries under 10 KB:
+
+```
+scripts/dev-db-query.sh "SELECT s3_key FROM derived.documents WHERE <filter>" \
+  | jq -r '.[].s3_key' > tmp/keys.txt
+aws s3 cp tmp/keys.txt s3://judgemind-document-archive-dev/tmp/keys/<name>.txt
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- \
+  --s3-key-list s3://judgemind-document-archive-dev/tmp/keys/<name>.txt
+```
+
+If `dev-db-query.sh` exits non-zero, `tmp/keys.txt` is empty (not partial), so don't run the reingest. With `set -o pipefail`, the pipeline itself fails.
+
+**Known limitation (separate bug, #4901):** a `--file` holding several statements returns only one result set. Run one statement per call.
 
 ### Container Insights (per-task CPU/memory/network visibility)
 

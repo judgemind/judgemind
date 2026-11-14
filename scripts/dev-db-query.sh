@@ -28,6 +28,18 @@
 #   EXEC_PROBE_TIMEOUT_SECS       per readiness probe (default 30)
 #   EXEC_AGENT_POLL_TIMEOUT_SECS  overall readiness deadline (default 120)
 #   EXEC_QUERY_TIMEOUT_SECS       the query itself (default 300)
+#
+# Results of any size arrive complete, or the script fails (#4781). The SSM
+# transport cuts output off anywhere from ~1 KB to ~10 KB and still exits 0,
+# so the runner frames every result with a byte count and sha256. Results
+# over 512 bytes are
+# staged in s3://<archive-bucket>/tmp/dev-db-query/ and downloaded here
+# (needs local `aws s3 cp` access to that bucket; the object is deleted
+# after download). A truncated stream, a runner error, or a failed
+# download exits 1 with a Fix: block and prints nothing to stdout.
+#   DEV_DB_QUERY_INLINE_MAX_BYTES  inline/S3 cutover (default 512); set it
+#                                  very high to force a large result inline
+#                                  and see the truncation check fire.
 
 set -euo pipefail
 
@@ -235,22 +247,26 @@ remote_script="/tmp/_dev_db_query_runner.py"
 # bytes-in-flight so the payload is less likely to exceed SSM's per-session
 # output budget in the first place.
 #
-# The output is then piped through grep filters that strip the SSM plugin's
-# own chatter — the `Starting session` / `Exiting session` / `Cannot perform
-# start session: EOF` / `The Session Manager plugin was installed` lines —
-# so downstream consumers (jq, awk) see only the Python runner's JSON
-# output, not the transport's bookkeeping messages (#3195 Layer 1).
+# The capture is then handed to dev_db_query_result.py, which extracts the
+# runner's framed result (see below and #4781).
 #
 # stderr preserves the original log messages so callers can still see
 # `Running query on dev database via ECS Exec...` etc.
-# Capture aws output first so a real aws failure isn't masked by grep's
-# exit-1-when-all-lines-filtered behaviour. `grep -Ev` can legitimately
-# return 1 (every line matched) for e.g. an empty query result wrapped in
-# SSM banner/trailer, which is not an error from our perspective.
 #
 # The call is bounded by EXEC_QUERY_TIMEOUT_SECS (default 300 s) so a stalled
 # SSM session fails loudly instead of hanging forever (#4665).
 EXEC_QUERY_TIMEOUT_SECS="${EXEC_QUERY_TIMEOUT_SECS:-300}"
+
+# Results larger than this many bytes are staged in S3 rather than printed
+# over SSM (#4781). Raising it far past ~10 KB forces a large result through
+# the inline path, which is how to check that a real SSM truncation is
+# caught (the script must exit non-zero).
+inline_max="${DEV_DB_QUERY_INLINE_MAX_BYTES:-512}"
+if [[ ! "$inline_max" =~ ^[0-9]+$ ]]; then
+    echo "Error: DEV_DB_QUERY_INLINE_MAX_BYTES must be a non-negative integer, got '$inline_max'." >&2
+    exit 1
+fi
+
 aws_rc=0
 aws_output=$(ecs_exec_run_with_timeout "$EXEC_QUERY_TIMEOUT_SECS" \
     aws ecs execute-command \
@@ -259,7 +275,7 @@ aws_output=$(ecs_exec_run_with_timeout "$EXEC_QUERY_TIMEOUT_SECS" \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag 1; sync; rm -f $remote_script; sleep 1'") \
+    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag 1 $inline_max; sync; rm -f $remote_script; sleep 1'") \
     || aws_rc=$?
 
 if [[ $aws_rc -eq $ECS_EXEC_TIMEOUT_RC ]]; then
@@ -271,9 +287,12 @@ if [[ $aws_rc -ne 0 ]]; then
     exit "$aws_rc"
 fi
 
-# Strip the SSM plugin's bookkeeping lines, then print the rest. Matches
-# both "SessionId" and "sessionId" casings — the plugin currently emits
-# "SessionId" on session start and "sessionId" on session end.
-printf '%s\n' "$aws_output" \
-    | grep -Ev '^(Starting session with [Ss]essionId|Exiting session with [Ss]essionId|Cannot perform start session|The Session Manager plugin was installed successfully)' \
-    || true
+# Unwrap and check the framed result (#4781). The SSM transport cuts output
+# off at ~1-10 KB and still exits 0, so the capture is never trusted as-is:
+# dev_db_query_result.py finds the runner's BEGIN/END frame, downloads the
+# S3-staged payload for large results, and checks the byte count and
+# sha256. Only a complete, verified payload reaches stdout; anything else
+# (truncated stream, runner error, failed download) exits 1 with a Fix:
+# block, and stdout stays empty. The SSM banner/trailer lines fall outside
+# the frame, so they never reach stdout either.
+printf '%s\n' "$aws_output" | python3 "$SCRIPT_DIR/dev_db_query_result.py" --region "$REGION"
