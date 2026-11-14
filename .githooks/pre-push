@@ -75,9 +75,33 @@
 
 set -uo pipefail
 
+# Run this checkout's own hook (#4950). Linked worktrees share the main
+# repository's hooks directory, and the usual install there is a
+# .git/hooks/pre-push symlink to ../../.githooks/pre-push, which resolves
+# to the MAIN checkout's copy. So a worktree ran whatever hook the main
+# checkout had, not the one on its own branch, and that copy's lib/
+# helpers were looked up under .git/hooks/lib, where they do not exist,
+# so the #4822 venv check never ran. Git runs the hook from the top of
+# the working tree, so $PWD/.githooks/pre-push is this checkout's copy.
+# stdin (the refs being pushed) passes through exec unchanged.
+if [ -z "${PREPUSH_REEXEC:-}" ] && [ -x "$PWD/.githooks/pre-push" ] \
+        && ! [ "$PWD/.githooks/pre-push" -ef "$0" ]; then
+    export PREPUSH_REEXEC=1
+    exec "$PWD/.githooks/pre-push" "$@"
+fi
+
 HOOK_START=$(date +%s)
-# Directory holding this hook and its lib/ helpers.
-PREPUSH_HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
+# Directory holding this hook and its lib/ helpers (symlinks resolved, so
+# a hook run through .git/hooks/pre-push still finds lib/).
+prepush_self="$0"
+while [ -L "$prepush_self" ]; do
+    prepush_link="$(readlink "$prepush_self")"
+    case "$prepush_link" in
+        /*) prepush_self="$prepush_link" ;;
+        *) prepush_self="$(dirname "$prepush_self")/$prepush_link" ;;
+    esac
+done
+PREPUSH_HOOK_DIR=$(cd "$(dirname "$prepush_self")" && pwd)
 PREPUSH_JOB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/prepush-jobs.XXXXXX")
 trap 'rm -rf "$PREPUSH_JOB_DIR"' EXIT
 PREPUSH_TIMINGS="$PREPUSH_JOB_DIR/timings.tsv"

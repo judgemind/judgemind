@@ -61,6 +61,9 @@
 #  44. a test database that cannot be prepared fails the push (#4950)
 #  45. an exported TEST_DATABASE_URL is used as is, helper not run (#4950)
 #  46. a package without Postgres tests does not prepare a database (#4950)
+#  47. a hook run from elsewhere (the main checkout's copy, as linked
+#      worktrees do) re-execs the checkout's own .githooks/pre-push (#4950)
+#  48. a hook run through a symlink still finds its lib/ helpers (#4950)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2033,6 +2036,45 @@ elif [ "$pg_url" != "unset" ]; then
     report_fail "expected no TEST_DATABASE_URL for a package without Postgres tests; saw '$pg_url' (#4950)" "$hook_out"
 else
     report_pass "no Postgres tests, no database (#4950)"
+fi
+
+echo "[scenario 47] a hook run from elsewhere re-execs the checkout's own .githooks/pre-push (#4950)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-own-hook
+mkdir -p "$WORK/.githooks"
+printf '#!/usr/bin/env bash\necho "OWN HOOK RAN reexec=${PREPUSH_REEXEC:-} stdin=$(cat)"\nexit 0\n' > "$WORK/.githooks/pre-push"
+chmod +x "$WORK/.githooks/pre-push"
+git -C "$WORK" add .githooks
+git -C "$WORK" commit --quiet -m "chore: own hook"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+run_hook "refs/heads/feature-own-hook $feat_sha refs/heads/feature-own-hook $ZERO_SHA"
+hook_out_own="$hook_out"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-own-hook $feat_sha refs/heads/feature-own-hook $ZERO_SHA" \
+    | PREPUSH_REEXEC=1 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if ! echo "$hook_out_own" | grep -q "OWN HOOK RAN reexec=1 stdin=refs/heads/feature-own-hook $feat_sha"; then
+    report_fail "expected the checkout's own hook to run, with the pushed refs on stdin (#4950)" "$hook_out_own"
+elif echo "$hook_out" | grep -q "OWN HOOK RAN"; then
+    report_fail "PREPUSH_REEXEC=1 must stop a second re-exec (#4950)" "$hook_out"
+else
+    report_pass "hook re-execs the checkout's own copy once, stdin intact (#4950)"
+fi
+
+echo "[scenario 48] a hook run through a symlink still finds its lib/ helpers (#4950)"
+init_workspace
+commit_testpkg_code feature-symlinked-hook
+declare_testpkg_dev_dep "pytest-timeout>=2.3"
+seed_stub_venv 0 0
+mkdir -p "$WORK/packages/testpkg/.venv/lib/python3.12/site-packages"
+mkdir -p "$TMPDIR/shared-hooks"
+ln -sf "$HOOK" "$TMPDIR/shared-hooks/pre-push"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-symlinked-hook $feat_sha refs/heads/feature-symlinked-hook $ZERO_SHA" \
+    | "$TMPDIR/shared-hooks/pre-push" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected the stale-venv check (lib/missing_venv_deps.py) to run via the symlink (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: testpkg's venv is missing packages"; then
+    report_fail "expected 'FAILED: testpkg's venv is missing packages' via the symlink (#4950)" "$hook_out"
+else
+    report_pass "symlinked hook finds lib/ (#4950)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
