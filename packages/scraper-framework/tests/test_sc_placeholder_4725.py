@@ -19,7 +19,6 @@ shortest real document (a public notice) extracts to 1,150 characters.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -50,12 +49,6 @@ REAL_RULING_PDFS = (
     "sc_table_4696_dept2.pdf",
     "sc_table_4696_dept7.pdf",
 )
-
-
-@pytest.fixture(autouse=True)
-def _no_split_sibling_move() -> Iterator[None]:
-    with patch("ingestion.db._move_split_sibling_ruling", return_value=False):
-        yield
 
 
 # ---------------------------------------------------------------------------

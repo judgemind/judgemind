@@ -1,5 +1,6 @@
-"""Real-Postgres regression tests for split-child relink and stale-child
-cleanup (#4788, regression from #4743 / #4700).
+"""Real-Postgres regression tests for stale-child cleanup (#4788,
+regression from #4743 / #4700).  The split-child case relink rules are
+pinned in ``test_split_write_pg.py`` (``write_split_rulings``).
 
 The mocked tests in ``test_ingestion_db.py`` pin the SQL shape.  These run
 the same functions against a real schema and check the rows that matter:
@@ -56,7 +57,6 @@ def _write(
     case_id: str,
     court_id: str,
     s3_key: str,
-    relink_case: bool = False,
 ) -> None:
     insert_document_and_ruling(
         conn,
@@ -72,7 +72,6 @@ def _write(
         captured_at=datetime(2026, 9, 1),
         hearing_date=date(2026, 9, 5),
         ruling_text=f"Ruling text for {document_id}. The motion is GRANTED.",
-        relink_case=relink_case,
     )
 
 
@@ -104,62 +103,6 @@ def _row(conn: object, sql: str, *params: object) -> tuple | None:
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
-
-
-def test_placeholder_case_never_replaces_real_case(conn: object) -> None:
-    """Re-processing a correctly linked split child whose case number comes
-    back missing (UNKNOWN-) keeps the ruling, its alert, and the document's
-    case link, even when the caller asked for a relink."""
-    court_id = _court(conn)
-    parent = str(uuid.uuid4())
-    child = make_split_document_id(parent, 2)
-    real_case = upsert_case(conn, "24CV004788", court_id)
-    _write(conn, document_id=child, case_id=real_case, court_id=court_id, s3_key="k/4788a.pdf")
-    alert_id, ruling_id = _alert_on(conn, child)
-
-    unknown_case = upsert_case(conn, f"UNKNOWN-{child}", court_id)
-    _write(
-        conn,
-        document_id=child,
-        case_id=unknown_case,
-        court_id=court_id,
-        s3_key="k/4788a.pdf",
-        relink_case=True,
-    )
-
-    assert _row(conn, "SELECT id, case_id FROM rulings WHERE document_id = %s::uuid", child) == (
-        uuid.UUID(ruling_id),
-        uuid.UUID(real_case),
-    )
-    assert _row(conn, "SELECT case_id FROM documents WHERE id = %s::uuid", child) == (
-        uuid.UUID(real_case),
-    )
-    assert _row(conn, "SELECT ruling_id FROM alert_events WHERE id = %s::uuid", alert_id) == (
-        uuid.UUID(ruling_id),
-    )
-
-
-def test_real_case_relink_still_works(conn: object) -> None:
-    """The #4700 relink (real case -> different real case) still applies."""
-    court_id = _court(conn)
-    child = make_split_document_id(str(uuid.uuid4()), 0)
-    old_case = upsert_case(conn, "24CV000001", court_id)
-    new_case = upsert_case(conn, "24CV000002", court_id)
-    _write(conn, document_id=child, case_id=old_case, court_id=court_id, s3_key="k/4788b.pdf")
-    _write(
-        conn,
-        document_id=child,
-        case_id=new_case,
-        court_id=court_id,
-        s3_key="k/4788b.pdf",
-        relink_case=True,
-    )
-    assert _row(conn, "SELECT case_id FROM rulings WHERE document_id = %s::uuid", child) == (
-        uuid.UUID(new_case),
-    )
-    assert _row(conn, "SELECT case_id FROM documents WHERE id = %s::uuid", child) == (
-        uuid.UUID(new_case),
-    )
 
 
 def test_pre_split_sibling_survives_cleanup(conn: object) -> None:

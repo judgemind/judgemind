@@ -14,6 +14,10 @@ every write are the states a reader can see between commits.
 
 Runs only when ``TEST_DATABASE_URL`` points at a migrated database (see
 ``test_split_relink_pg.py``).  Each test runs in one rolled-back transaction.
+
+Since #4967 a scraper's pre-split child is written by ``write_split_rulings``
+as a split set of one (``_write`` with a split set), not by
+``insert_document_and_ruling``.
 """
 
 from __future__ import annotations
@@ -26,11 +30,14 @@ from datetime import date, datetime
 import pytest
 
 from ingestion.db import (
+    SplitChildRuling,
     SplitSet,
     delete_stale_split_children,
+    insert_document,
     insert_document_and_ruling,
     upsert_case,
     upsert_court,
+    write_split_rulings,
 )
 from ingestion.split_ids import split_child_document_id
 
@@ -65,10 +72,29 @@ def _write(
     court_id: str,
     s3_key: str,
     text: str,
-    relink_case: bool = False,
+    relink: bool = False,
     split_set: SplitSet | None = None,
 ) -> None:
-    insert_document_and_ruling(
+    """Write one document.  With *split_set*, as the worker writes a
+    scraper's pre-split child: a split set of one (#4967)."""
+    if split_set is None:
+        insert_document_and_ruling(
+            conn,
+            document_id=document_id,
+            case_id=case_id,
+            court_id=court_id,
+            content_format="pdf",
+            content_hash="a" * 64,
+            s3_key=s3_key,
+            s3_bucket="test-bucket",
+            source_url="",
+            scraper_id="test-4820",
+            captured_at=datetime(2026, 9, 1),
+            hearing_date=date(2026, 9, 5),
+            ruling_text=text,
+        )
+        return
+    insert_document(
         conn,
         document_id=document_id,
         case_id=case_id,
@@ -81,9 +107,25 @@ def _write(
         scraper_id="test-4820",
         captured_at=datetime(2026, 9, 1),
         hearing_date=date(2026, 9, 5),
-        ruling_text=text,
-        relink_case=relink_case,
-        split_set=split_set,
+    )
+    write_split_rulings(
+        conn,
+        s3_key=s3_key,
+        parent_document_id=split_set.parent_document_id,
+        owns_key=True,
+        children=[
+            SplitChildRuling(
+                document_id=document_id,
+                case_id=case_id,
+                court_id=court_id,
+                hearing_date=date(2026, 9, 5),
+                ruling_text=text,
+                hearing_date_source="llm",
+            )
+        ],
+        relink=relink,
+        protected_ids=split_set.written_before(document_id),
+        retire_ids=frozenset({document_id}),
     )
 
 
@@ -168,7 +210,7 @@ def _assert_every_ruling_present(conn: object, s3_key: str) -> None:
         assert len(by_text.get(_text(i), [])) == 1, f"ruling {i} missing: {by_text}"
 
 
-def _resplit(conn: object, *, relink_case: bool, tag: str) -> None:
+def _resplit(conn: object, *, relink: bool, tag: str) -> None:
     court_id, s3_key, parent, cases, alerts = _shifted_key(conn, tag)
     new = [split_child_document_id(parent, i, _N) for i in range(_N)]
     split_set = SplitSet(parent_document_id=parent, child_ids=tuple(new))
@@ -181,7 +223,7 @@ def _resplit(conn: object, *, relink_case: bool, tag: str) -> None:
             court_id=court_id,
             s3_key=s3_key,
             text=_text(i),
-            relink_case=relink_case,
+            relink=relink,
             split_set=split_set,
         )
         _assert_every_ruling_present(conn, s3_key)
@@ -221,12 +263,12 @@ def _resplit(conn: object, *, relink_case: bool, tag: str) -> None:
 
 def test_split_shift_no_ruling_loss_reingest(conn: object) -> None:
     """Prefix reingest / rebuild: children relink to the re-derived case."""
-    _resplit(conn, relink_case=True, tag="R")
+    _resplit(conn, relink=True, tag="R")
 
 
 def test_split_shift_no_ruling_loss_live(conn: object) -> None:
     """Live capture: no relink; the moved ruling keeps its (correct) case."""
-    _resplit(conn, relink_case=False, tag="L")
+    _resplit(conn, relink=False, tag="L")
 
 
 def test_split_shift_second_run_is_a_no_op(conn: object) -> None:
@@ -242,7 +284,7 @@ def test_split_shift_second_run_is_a_no_op(conn: object) -> None:
                 court_id=court_id,
                 s3_key=s3_key,
                 text=_text(i),
-                relink_case=True,
+                relink=True,
                 split_set=split_set,
             )
         delete_stale_split_children(conn, s3_key, new, parent_document_id=parent, owns_key=True)

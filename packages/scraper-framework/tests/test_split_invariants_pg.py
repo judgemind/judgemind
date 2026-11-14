@@ -307,6 +307,40 @@ def test_extractor_unavailable_leaves_the_key_untouched(seed: int) -> None:
 
 
 @_needs_pg
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_new_key_live_fallback_converges(seed: int) -> None:
+    """A live capture of a new key whose extraction fails writes the
+    document on its own (``single_document_fallback``); the generated
+    sequence after it holds every invariant and converges (#4970)."""
+    harness.run_new_key_fallback(_DSN, seed, _RUN)
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", [3, 4, 8, 15, 44])
+def test_presplit_steps_reach_the_split_set_write(seed: int) -> None:
+    """Generated seeds include scraper pre-split captures (#4967, #4970),
+    and each child is written by the split-set write.  Before #4967 these
+    seeds broke ``alert_case``, ``judge_converge`` or ``search`` on the
+    pre-split path."""
+    steps = harness.generate(seed)
+    assert any(s.kind == "presplit" for s in steps), [s.kind for s in steps]
+    from unittest.mock import patch
+
+    from ingestion import worker as worker_mod
+
+    real = worker_mod.IngestionWorker._write_split_batch
+    calls: list[bool] = []
+
+    def spy(self: object, event_data: dict, parent: str, batch: object) -> None:
+        calls.append(batch.pre_split is not None)  # type: ignore[attr-defined]
+        real(self, event_data, parent, batch)  # type: ignore[arg-type]
+
+    with patch.object(worker_mod.IngestionWorker, "_write_split_batch", spy):
+        harness.run_seed(_DSN, seed, _RUN, name="presplit-cover")
+    assert any(calls), "no pre-split child reached _write_split_batch"
+
+
+@_needs_pg
 @pytest.mark.parametrize("kind", ["reingest", "db", "live"])
 def test_known_bug_4953_extractor_unavailable_keeps_the_three_child_split(kind: str) -> None:
     """A key holding a three-child split set, re-ingested while the

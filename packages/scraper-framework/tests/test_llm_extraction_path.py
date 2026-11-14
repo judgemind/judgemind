@@ -25,14 +25,6 @@ from ingestion.worker import IngestionWorker
 
 
 @pytest.fixture(autouse=True)
-def _no_split_sibling_move() -> Iterator[None]:
-    """The mocked cursors here feed fixed ``fetchone`` sequences; the #4820
-    sibling-ruling lookup is covered by ``test_split_shift_move*``."""
-    with patch("ingestion.db._move_split_sibling_ruling", return_value=False):
-        yield
-
-
-@pytest.fixture(autouse=True)
 def split_rulings_write() -> Iterator[MagicMock]:
     """A worker split writes its rulings with one ``write_split_rulings``
     call (#4845).  The mocked cursors here feed fixed ``fetchone``

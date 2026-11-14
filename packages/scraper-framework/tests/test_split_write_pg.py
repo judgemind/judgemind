@@ -28,7 +28,11 @@ from ingestion.db import (
     upsert_court,
     write_split_rulings,
 )
-from ingestion.split_ids import derive_parent_document_id, make_split_document_id
+from ingestion.split_ids import (
+    derive_parent_document_id,
+    make_split_document_id,
+    split_child_document_id,
+)
 from validation.gate import ValidationResult, insert_validation_result
 
 _DSN = os.environ.get("TEST_DATABASE_URL", "")
@@ -564,3 +568,221 @@ def test_move_ruling_case_onto_a_duplicate_dedups(conn: object) -> None:
     assert key.rulings() == {}
     assert _alert_target(conn, alert)[0] is None
     assert len(other.rulings()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scraper pre-split children, written one event at a time (#4967)
+# ---------------------------------------------------------------------------
+
+
+def _presplit_event(
+    h: Any,
+    key: Any,
+    position: int,
+    count: int,
+    *,
+    text: str,
+    case_number: str | None,
+    title: str,
+    judge: str,
+    outcome: str | None,
+) -> dict[str, Any]:
+    """A pre-split child event as the Contra Costa / Los Angeles scrapers
+    emit it: one ruling, its fields filled by the scraper's LLM."""
+    event = h._event(key, "live")
+    event.update(
+        {
+            "document_id": split_child_document_id(key.parent, position, count),
+            "content_format": "html",
+            "ruling_text": text,
+            "case_number": case_number,
+            "case_title": title,
+            "judge_name": judge,
+            "outcome": outcome,
+            "motion_type": "demurrer",
+            "extra": {
+                "_llm_extracted": True,
+                "pre_split": True,
+                "split_position": position,
+                "split_count": count,
+            },
+        }
+    )
+    return event
+
+
+def _slot_ruling(h: Any, document_id: str) -> dict[str, Any] | None:
+    with h.checker.cursor() as cur:
+        cur.execute(
+            "SELECT r.id::text, r.ruling_text, j.canonical_name, r.outcome::text, r.summary, "
+            "c.case_number FROM rulings r JOIN cases c ON c.id = r.case_id "
+            "LEFT JOIN judges j ON j.id = r.judge_id WHERE r.document_id = %s::uuid",
+            (document_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("id", "text", "judge", "outcome", "summary", "case_number")
+    return dict(zip(keys, row, strict=True))
+
+
+def _harness_alert(h: Any, ruling_id: str, document_id: str) -> str:
+    with h.checker.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (email) VALUES (%s) RETURNING id",
+            (f"{uuid.uuid4().hex}@example.test",),
+        )
+        user_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO alert_subscriptions (user_id, alert_type) "
+            "VALUES (%s, (SELECT enum_range(NULL::alert_type))[1]) RETURNING id",
+            (user_id,),
+        )
+        sub_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO alert_events (subscription_id, document_id, ruling_id) "
+            "VALUES (%s, %s::uuid, %s::uuid) RETURNING id",
+            (sub_id, document_id, ruling_id),
+        )
+        return str(cur.fetchone()[0])
+
+
+def _harness_alert_ruling(h: Any, alert_id: str) -> str | None:
+    with h.checker.cursor() as cur:
+        cur.execute("SELECT ruling_id::text FROM alert_events WHERE id = %s::uuid", (alert_id,))
+        return cur.fetchone()[0]
+
+
+@pytest.fixture
+def presplit() -> Iterator[Any]:
+    """A harness worker (real write path, stubbed index) with summarization
+    on, and a fresh key."""
+    from unittest.mock import patch
+
+    import split_harness
+
+    tag = uuid.uuid4().hex
+    h = split_harness.KeyHarness(_DSN, tag, -1)
+    h.worker._summarization_enabled = True
+    summaries: list[str | None] = []
+
+    def summarize(text: str, **_kwargs: Any) -> tuple[str | None, str | None]:
+        summary = summaries.pop(0) if summaries else None
+        return summary, ("stub-model" if summary else None)
+
+    try:
+        with patch("ingestion.worker.summarize_ruling", side_effect=summarize):
+            yield h, split_harness.make_key(f"presplit-{tag}"), summaries
+    finally:
+        h.close()
+
+
+_FIRST = "Ruling P-1. The demurrer is SUSTAINED with leave to amend as to the first count."
+_SECOND = "Ruling P-2. The motion to strike is DENIED; the answer stands as filed."
+
+
+def test_presplit_slot_reused_by_another_numberless_ruling(presplit: Any) -> None:
+    """#4967: a numberless pre-split child whose slot held another ruling.
+
+    The slot's ``UNKNOWN-<slot>`` case is the same whatever ruling lands in
+    it, so the old live write reused the row: the new ruling kept the old
+    one's judge, outcome and summary, and the old ruling's alert followed
+    the slot to it (the #4946 / #4939 bugs on the pre-split path).
+    """
+    h, key, summaries = presplit
+    slot = split_child_document_id(key.parent, 1, 3)
+    summaries.append("The court sustained the demurrer.")
+    h.worker.process_event(
+        _presplit_event(
+            h,
+            key,
+            1,
+            3,
+            text=_FIRST,
+            case_number=None,
+            title="Alder v. Acme Corp",
+            judge="Jane Q. Alpha",
+            outcome="granted",
+        )
+    )
+    first = _slot_ruling(h, slot)
+    assert first is not None
+    assert (first["judge"], first["outcome"]) == ("Jane Q. Alpha", "granted")
+    alert = _harness_alert(h, first["id"], slot)
+
+    h.worker.process_event(
+        _presplit_event(
+            h,
+            key,
+            1,
+            3,
+            text=_SECOND,
+            case_number=None,
+            title="Birch v. Beta LLC",
+            judge="Robert M. Beta",
+            outcome=None,
+        )
+    )
+    second = _slot_ruling(h, slot)
+    assert second is not None
+    assert second["text"] == _SECOND
+    assert second["judge"] == "Robert M. Beta"
+    assert second["outcome"] is None
+    assert second["summary"] is None
+    assert second["id"] != first["id"]
+    assert _harness_alert_ruling(h, alert) is None
+    assert h.indexer.docs[slot] == _SECOND
+
+
+def test_presplit_motions_of_one_case_swap_slots(presplit: Any) -> None:
+    """#4967: two motions of one real case swap slots between captures.
+
+    Each ruling keeps its own judge, outcome and alert: an alert never ends
+    on the other motion's ruling.
+    """
+    h, key, _summaries = presplit
+    number = "30-2026-77777777"
+    title = "Cedar v. Crane Inc"
+    rulings = {
+        _FIRST: ("Jane Q. Alpha", "granted"),
+        _SECOND: ("Robert M. Beta", "denied"),
+    }
+
+    def capture(order: list[str]) -> None:
+        for position, text in enumerate(order):
+            judge, outcome = rulings[text]
+            h.worker.process_event(
+                _presplit_event(
+                    h,
+                    key,
+                    position,
+                    2,
+                    text=text,
+                    case_number=number,
+                    title=title,
+                    judge=judge,
+                    outcome=outcome,
+                )
+            )
+
+    capture([_FIRST, _SECOND])
+    slots = [split_child_document_id(key.parent, i, 2) for i in range(2)]
+    alerts = {}
+    for slot in slots:
+        held = _slot_ruling(h, slot)
+        assert held is not None
+        alerts[held["text"]] = _harness_alert(h, held["id"], slot)
+
+    capture([_SECOND, _FIRST])
+    by_text = {}
+    for slot, text in zip(slots, [_SECOND, _FIRST], strict=True):
+        held = _slot_ruling(h, slot)
+        assert held is not None and held["text"] == text
+        assert (held["judge"], held["outcome"]) == rulings[text]
+        assert held["case_number"] == number
+        by_text[text] = held["id"]
+    for text, alert in alerts.items():
+        # Each alert is on its own ruling, or detached; never on the other.
+        assert _harness_alert_ruling(h, alert) in (by_text[text], None)
+    # The ruling the first write took from its sibling slot keeps its alert.
+    assert _harness_alert_ruling(h, alerts[_SECOND]) == by_text[_SECOND]

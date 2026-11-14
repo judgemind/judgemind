@@ -93,7 +93,17 @@ Step kinds:
   replacement);
 - ``reingest``: a prefix-reingest / rebuild event (``_replace_split_set``);
 - ``db``: ``scripts/reingest_from_s3.py`` in DB-row mode, run through
-  :data:`DB_MODE_DRIVER`.
+  :data:`DB_MODE_DRIVER`;
+- ``presplit``: a scraper that splits the page at capture time (Contra
+  Costa, Los Angeles) emits one event per ruling it extracted, each with
+  ``extra["pre_split"]`` and its fields filled (#4967).  Each event is
+  written on its own, one commit per ruling, as a split set of one.  The
+  events carry no document text, so the step's ``evidence`` check has
+  nothing to read; and a child cannot see its siblings, so a ruling whose
+  slot a sibling takes before its own event arrives is retired and written
+  again (its alert detached, a gap between the two commits): ``gap`` and
+  ``alert`` are not checked on these steps.  ``alert_case`` is: a retired
+  row's alert is detached, never moved to another ruling.
 
 Failures raise :class:`InvariantError` naming the invariant, the seed
 and the step, so a failing seed is its own reproduction:
@@ -213,7 +223,7 @@ class Row:
 
 @dataclass(frozen=True)
 class Step:
-    kind: str  # live | reingest | db
+    kind: str  # live | reingest | db | presplit
     rows: tuple[Row, ...]
     specs: tuple[Spec, ...]
     ops: tuple[str, ...] = ()
@@ -370,7 +380,37 @@ def generate(seed: int, *, whole_documents: bool | None = None) -> list[Step]:
             rows, specs = _apply_op(rng, op, rows, specs, model.shape)
         kind = rng.choices(("live", "reingest", "db"), weights=(3, 4, 2))[0]
         steps.append(model.step(kind, rows, specs, ops, token))
+    if PRESPLIT_STEPS:
+        steps = _with_presplit_steps(seed, steps)
     return steps
+
+
+#: Whether generated seeds include ``presplit`` steps (#4967, #4970): some
+#: live captures become a scraper's pre-split capture of the same rows.
+PRESPLIT_STEPS = True
+
+
+def _with_presplit_steps(seed: int, steps: list[Step]) -> list[Step]:
+    """Turn some of *steps*' live captures into pre-split captures.
+
+    A third random stream, so a seed's rows, ops and model draws are the
+    same with or without pre-split steps.  Only a capture whose extraction
+    returns a ruling: a scraper that gets no rulings from its LLM falls
+    back to emitting the page whole, which is a ``live`` step.
+    """
+    rng = random.Random(f"{seed}:presplit")
+    out = []
+    for step in steps:
+        presplit = rng.random() < 0.5
+        if (
+            presplit
+            and step.kind == "live"
+            and not step.whole
+            and any(r.kind == "ruling" for r in step.rows)
+        ):
+            step = replace(step, kind="presplit")
+        out.append(step)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1056,43 @@ class KeyHarness:
         event.update(self.event_extra)
         return event
 
+    def presplit_events(self, key: Key, step: Step) -> list[dict[str, Any]]:
+        """The events a pre-split scraper capture of *step* emits (#4967).
+
+        One per ruling its LLM returned with text, in page order, each with
+        the fields filled and ``extra["pre_split"]``, as the Contra Costa and
+        Los Angeles scrapers emit them (rows without text are dropped, as
+        Contra Costa's ``kept_rulings``).  The id is the slot
+        ``ScraperBase`` gives a pre-split child: ``split_child_document_id``
+        of the content parent and the ruling's position.
+        """
+        from ingestion.split_ids import split_child_document_id
+
+        rulings = [r for r in extracted_rulings(step) if r.ruling_text]
+        events = []
+        for position, ruling in enumerate(rulings):
+            event = self._event(key, "live")
+            event.update(
+                {
+                    "document_id": split_child_document_id(key.parent, position, len(rulings)),
+                    "content_format": "html",
+                    "ruling_text": ruling.ruling_text,
+                    "case_number": ruling.extracted_case_number,
+                    "case_title": ruling.extracted_case_title,
+                    "judge_name": ruling.extracted_judge_name,
+                    "motion_type": ruling.motion_type,
+                    "parties": [{"name": p.name, "role": p.role} for p in ruling.extracted_parties],
+                    "extra": {
+                        "_llm_extracted": True,
+                        "pre_split": True,
+                        "split_position": position,
+                        "split_count": len(rulings),
+                    },
+                }
+            )
+            events.append(event)
+        return events
+
     # -- running --------------------------------------------------------
 
     def run_step(self, key: Key, step: Step, label: str) -> None:
@@ -1054,6 +1131,9 @@ class KeyHarness:
             with _real_enrichment():
                 if step.kind == "db":
                     DB_MODE_DRIVER(self, key, step)
+                elif step.kind == "presplit":
+                    for event in self.presplit_events(key, step):
+                        self.worker.process_event(event)
                 else:
                     self.worker.process_event(self._event(key, step.kind, step.doc))
         except InvariantError:
@@ -1073,7 +1153,14 @@ class KeyHarness:
             raise self._pending
         after_rows = read_key(self.checker, key.s3_key)
         after = ruling_identities(after_rows)
-        if step.fail:
+        # A live capture of a key with no rows yet writes the document on
+        # its own when its extraction fails (``single_document_fallback``,
+        # #4948): the one failed step that is not ``untouched``.  The
+        # following steps must converge from it (#4970).
+        fallback = step.fail and step.kind == "live" and not unavailable and not before_rows
+        if fallback and self.events[_EXTRACTION_FAILED_EVENT] == logged_before:
+            self._fail("error", "a failed live capture of a new key did not take the fallback")
+        if step.fail and not fallback:
             self._guard(
                 "untouched",
                 self._check_untouched,
@@ -1084,8 +1171,16 @@ class KeyHarness:
                 expect_failed and not reported_failed,
                 self.events[_EXTRACTION_FAILED_EVENT] == logged_before,
             )
-        self._guard("gap", self._check_gap, before, after)
-        self._guard("alert", self._check_alerts, key, after_rows)
+        if step.kind == "presplit":
+            # One event per ruling, each blind to its siblings (see the
+            # module docstring): track the alerts, enforce only alert_case.
+            try:
+                self._check_alerts(key, after_rows)
+            except InvariantError:
+                pass
+        else:
+            self._guard("gap", self._check_gap, before, after)
+            self._guard("alert", self._check_alerts, key, after_rows)
         self._guard("alert_case", self._check_alert_case)
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
@@ -1094,7 +1189,12 @@ class KeyHarness:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
             self._guard("synthetic_title", self._check_rows, key, after_rows, step)
-        doc = self.event_extra.get("ruling_text", step.doc) if step.kind != "db" else step.doc
+        if step.kind == "presplit":
+            doc = ""  # pre-split events carry no document text
+        elif step.kind == "db":
+            doc = step.doc
+        else:
+            doc = self.event_extra.get("ruling_text", step.doc)
         if not step.fail:
             # A failed step writes nothing (``untouched``), so its document
             # text decides nothing.
@@ -1704,7 +1804,7 @@ def run_steps(
 
         final = steps[-1]
         no_rows = not read_key(harness.checker, key.s3_key)
-        if final.kind == "live" or (final.kind == "db" and no_rows):
+        if final.kind in ("live", "presplit") or (final.kind == "db" and no_rows):
             # A live write keeps an established case link (preserve-first,
             # #2475), so its result may depend on history by design, and a
             # DB-row reingest only re-ingests keys that have rows.  A
@@ -2072,3 +2172,18 @@ def run_extraction_failure(
         harness.run_step(key, failed, "extraction failed")
     finally:
         harness.close()
+
+
+def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fallback") -> None:
+    """A live capture of a new key whose extraction fails, then *seed*'s
+    generated sequence (#4970).
+
+    The failed capture writes the document on its own, on the parent row
+    (``single_document_fallback``, ``_write_one_ruling``).  The sequence
+    that follows must hold every invariant and converge: its first split
+    replaces the parent row with the split's children.  Raises
+    :class:`InvariantError` on a broken invariant.
+    """
+    steps = generate(seed)
+    first = replace(steps[0], kind="live", fail=True, whole=False, ops=("fallback",))
+    run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)

@@ -4180,7 +4180,8 @@ def test_reclaim_pending_processes_multiple_messages(mock_psycopg: MagicMock) ->
 # ---------------------------------------------------------------------------
 
 
-@patch("ingestion.db._move_split_sibling_ruling", new=MagicMock(return_value=False))
+@patch("ingestion.worker.record_judge_votes", new=MagicMock())
+@patch("ingestion.worker.write_split_rulings", new=MagicMock(return_value={}))
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 def test_process_event_already_split_no_re_split(
@@ -4207,7 +4208,9 @@ def test_process_event_already_split_no_re_split(
 
 
 @patch("ingestion.worker.batch_upsert_parties")
-@patch("ingestion.worker.insert_document_and_ruling", return_value=True)
+@patch("ingestion.worker.record_judge_votes", new=MagicMock())
+@patch("ingestion.worker.write_split_rulings", return_value={})
+@patch("ingestion.worker.insert_document", return_value=True)
 @patch("ingestion.worker.upsert_case_returning_title", return_value=("case-uuid-1", None))
 @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -4217,14 +4220,13 @@ def test_split_event_insert_document_and_ruling_uses_split_id(
     mock_resolve_judge: MagicMock,
     mock_upsert_court: MagicMock,
     mock_upsert_case: MagicMock,
-    mock_insert_doc_and_ruling: MagicMock,
+    mock_insert_doc: MagicMock,
+    mock_write_split: MagicMock,
     mock_batch_upsert: MagicMock,
 ) -> None:
-    """Split events must pass the split document_id to insert_document_and_ruling.
-
-    Regression test for #1775/#1790: the shared helper guarantees the same
-    document_id is used for both insert_document and insert_ruling internally.
-    """
+    """A split event's document row and ruling both use the split
+    document_id (#1775/#1790).  A split child written on its own goes
+    through the split-set write (#4967)."""
     import hashlib
 
     worker, os_mock = _make_worker()
@@ -4245,10 +4247,13 @@ def test_split_event_insert_document_and_ruling_uses_split_id(
     )
     worker.process_event(event)
 
-    # insert_document_and_ruling must receive the split doc ID
-    mock_insert_doc_and_ruling.assert_called_once()
-    call_kwargs = mock_insert_doc_and_ruling.call_args
+    # The document row and the ruling must use the split doc ID
+    mock_insert_doc.assert_called_once()
+    call_kwargs = mock_insert_doc.call_args
     assert call_kwargs.kwargs["document_id"] == split_doc_id
+    mock_write_split.assert_called_once()
+    (child,) = mock_write_split.call_args.kwargs["children"]
+    assert child.document_id == split_doc_id
 
     # content_hash must be a synthetic per-split hash, not the parent hash
     expected_hash = hashlib.sha256(f"{parent_hash}:ruling:{split_index}".encode()).hexdigest()
