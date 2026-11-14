@@ -622,6 +622,20 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
   # in that string, the secret would not be injected into the
   # container, regardless of what `var.X_secret_arn` says.
   lifecycle {
+    # The worker runs in required extraction mode (#4953): it refuses to
+    # start unless every LLM extractor it uses can be built. The multimodal
+    # and county extractors are always Google; the framework extractor and
+    # the per-field client run on llm_provider (#4957). Tie the secrets to
+    # that, so a provider without its key fails at plan time instead of
+    # crash-looping the worker after a deploy.
+    precondition {
+      condition     = var.google_api_key_secret_arn != ""
+      error_message = "compute/ingestion-worker: google_api_key_secret_arn must be set: the multimodal and county extractors are Google, and required extraction mode refuses to start without them (#4953 / #4957)."
+    }
+    precondition {
+      condition     = var.llm_provider != "anthropic" || var.anthropic_api_key_secret_arn != ""
+      error_message = "compute/ingestion-worker: llm_provider = \"anthropic\" needs anthropic_api_key_secret_arn: the framework extractor runs on llm_provider, and required extraction mode refuses to start without its key (#4957)."
+    }
     postcondition {
       condition     = strcontains(self.container_definitions, "DATABASE_URL")
       error_message = "compute/ingestion-worker: rendered container_definitions is missing DATABASE_URL. See #3764 / parent #2840 for the silent-drop bug class this guards against."

@@ -10,10 +10,14 @@ Environment variables:
     REDIS_URL         — Redis URL, e.g. redis://localhost:6379 (required)
     OPENSEARCH_URL    — OpenSearch endpoint, e.g. https://localhost:9200 (required)
     JUDGEMIND_ARCHIVE_BUCKET — S3 bucket for document content (required for full-text indexing)
-    LLM_PROVIDER      — LLM provider: "google" (default) or "anthropic"
+    LLM_PROVIDER      — LLM provider: "google" (default) or "anthropic".  Also
+                       the framework (text) extractor's provider, the one
+                       counties without a configured provider use (#4957)
     LLM_MODEL         — Model ID (provider-specific; sensible defaults per provider)
-    GOOGLE_API_KEY     — Required when LLM_PROVIDER is "google" (default)
+    GOOGLE_API_KEY     — Always required in required extraction mode (the
+                       multimodal and county extractors are Google)
     ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic"
+    JUDGEMIND_EXTRACTION — "required" (default) or "optional" (#4953)
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
     HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
@@ -285,10 +289,51 @@ def extraction_mode() -> str:
     return raw
 
 
+LLM_PROVIDERS = ("google", "anthropic")
+#: The multimodal (PDF page-image) extractor's provider.  County
+#: extractors name theirs in ``framework.extraction_config``.
+MULTIMODAL_LLM_PROVIDER = "google"
+
+
+def framework_llm_provider(llm_provider: str | None = None) -> str:
+    """The framework extractor's provider (#4957).
+
+    The framework extractor extracts text for counties without a configured
+    provider.  It runs on the worker's LLM provider, as every other LLM
+    client does: *llm_provider*, else ``LLM_PROVIDER``, else google.  Before,
+    it was always Anthropic, which production has no key for.  Any value
+    other than the two providers raises ``ValueError``, so a typo cannot
+    silently pick the Anthropic client.
+    """
+    raw = (
+        (llm_provider or "").strip() or os.environ.get("LLM_PROVIDER", "").strip() or "google"
+    ).lower()
+    if raw not in LLM_PROVIDERS:
+        msg = (
+            f"LLM_PROVIDER={raw!r} is not a known LLM provider; "
+            f"use one of {', '.join(LLM_PROVIDERS)}"
+        )
+        raise ValueError(msg)
+    return raw
+
+
+def _extra_county_providers(framework_provider: str) -> list[str]:
+    """County-config providers the framework and multimodal extractors do
+    not already cover: each needs its own key, so required mode checks it
+    at startup (#4957)."""
+    from framework.extraction_config import configured_providers
+
+    covered = {framework_provider, MULTIMODAL_LLM_PROVIDER}
+    return sorted(configured_providers() - covered)
+
+
 def check_extraction_ready() -> str:
     """Return the extraction mode; in ``required`` mode, first check that
-    the framework (Anthropic) and multimodal (Google) extractors build,
-    raising ``ExtractorUnavailableError`` if one does not (#4953).
+    the extractors this deployment uses build, raising
+    ``ExtractorUnavailableError`` if one does not (#4953): the framework
+    extractor on its configured provider (``framework_llm_provider``,
+    #4957), the multimodal (Google) one, and one per other provider a
+    county config names.
 
     For scripts that change data before their first worker is built:
     ``rebuild_db.py`` resets derived tables first, so it calls this before
@@ -297,10 +342,16 @@ def check_extraction_ready() -> str:
     mode = extraction_mode()
     if mode != EXTRACTION_REQUIRED:
         return mode
+    framework_provider = framework_llm_provider()
+    specs = [
+        ("framework", framework_provider),
+        ("multimodal", MULTIMODAL_LLM_PROVIDER),
+        *((f"county ({p})", p) for p in _extra_county_providers(framework_provider)),
+    ]
     errors = []
-    for label, kwargs in (("framework", {}), ("multimodal", {"provider": "google"})):
+    for label, provider in specs:
         try:
-            LlmExtractor(**kwargs)
+            LlmExtractor(provider=provider)
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}: {exc}")
     if errors:
@@ -1987,8 +2038,10 @@ class IngestionWorker:
         self._github_client: object | None = None
 
         # Framework-level LLM extractor — lazy-initialized on first use.
-        # Uses the Anthropic API (always Haiku) and is separate from the
-        # per-field LLM client above.
+        # Runs on the worker's LLM provider (``framework_llm_provider``,
+        # #4957) with that provider's default model, and is
+        # separate from the per-field LLM client above.
+        self._framework_llm_provider: str = framework_llm_provider(self._llm_provider)
         self._framework_extractor: LlmExtractor | None = None
 
         # County-specific LLM extractors — keyed by (provider, model) tuple.
@@ -2040,12 +2093,15 @@ class IngestionWorker:
             self._require_extractors()
 
     def _require_extractors(self) -> None:
-        """Build the framework (Anthropic) and multimodal (Google) extractors,
-        or raise ``ExtractorUnavailableError`` naming why each that could
-        not be built failed (#4953).
+        """Build the extractors this deployment uses, or raise
+        ``ExtractorUnavailableError`` naming why each that could not be
+        built failed (#4953).
 
-        Google-provider county extractors use the same key as the
-        multimodal one, so building it checks theirs too.  The extractors
+        They are the framework extractor on its configured provider
+        (``framework_llm_provider``, #4957), the multimodal (Google) one,
+        and one per other provider a county config names.  County
+        extractors on a provider already built share its key, so building
+        it checks theirs too.  The framework and multimodal extractors
         built here are the ones the worker caches and uses.
         """
         framework = self._get_framework_extractor()
@@ -2055,6 +2111,13 @@ class IngestionWorker:
             for label, extractor in (("framework", framework), ("multimodal", multimodal))
             if extractor is None
         ]
+        for provider in _extra_county_providers(self._framework_llm_provider):
+            if self._get_county_extractor(provider, None, None) is None:
+                label = f"county ({provider})"
+                self._extractor_init_errors[label] = self._extractor_init_errors.get(
+                    "county", "not built"
+                )
+                missing.append(label)
         if not missing:
             return
         reason = self._extractor_unavailable_reason(*missing)
@@ -2065,8 +2128,10 @@ class IngestionWorker:
                 "extraction_mode": EXTRACTION_REQUIRED,
                 "missing": missing,
                 "reason": reason,
+                "framework_llm_provider": self._framework_llm_provider,
                 "fix": (
-                    f"check the ANTHROPIC_API_KEY / GOOGLE_API_KEY secrets, or set "
+                    f"check the ANTHROPIC_API_KEY / GOOGLE_API_KEY secrets against "
+                    f"LLM_PROVIDER={self._framework_llm_provider}, or set "
                     f"{EXTRACTION_MODE_ENV}={EXTRACTION_OPTIONAL} for a run without LLM keys"
                 ),
             },
@@ -2087,8 +2152,10 @@ class IngestionWorker:
     def _get_framework_extractor(self) -> LlmExtractor | None:
         """Return the framework-level LlmExtractor, creating lazily on first call.
 
-        Returns None if the Anthropic API key is not available (the county
-        will fall back to regex extraction with a warning).
+        Runs on ``self._framework_llm_provider`` (#4957).  Returns None if
+        that provider's API key is not available: in ``required`` mode the
+        worker then refuses to start; in ``optional`` mode the county falls
+        back to regex extraction with a warning.
         """
         if self._framework_extractor is None:
             try:
@@ -2096,11 +2163,15 @@ class IngestionWorker:
                 # cache-bust intent into every extraction call this instance
                 # makes (#4049).
                 self._framework_extractor = LlmExtractor(
+                    provider=self._framework_llm_provider,
                     bust_cache=self._bust_llm_cache,
                 )
                 logger.info(
                     "Initialized framework LlmExtractor for LLM extraction path",
-                    extra={"bust_cache": self._bust_llm_cache},
+                    extra={
+                        "bust_cache": self._bust_llm_cache,
+                        "provider": self._framework_llm_provider,
+                    },
                 )
             except Exception as exc:
                 self._extractor_init_errors["framework"] = f"{type(exc).__name__}: {exc}"
