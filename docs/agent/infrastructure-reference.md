@@ -465,6 +465,23 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --coun
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
 
+### Verification audits
+
+Read-only ECS oneshots that check `derived.*` against the raw S3 documents. Run one after a rebuild, reingest or extraction fix in the counties it touched.
+
+| Script | Checks | Gate |
+|---|---|---|
+| `scripts/audit_case_number_support.py` | Each active ruling's case number against its raw document's extracted text, through the ingest gate's own predicate (`ingestion.case_evidence`). Catches LLM-invented and fuzzy-corrected numbers (#4907, #4915, #4924). | Exit 1 when any ruling is `unsupported`; `SUMMARY <county>: {json}` per county with `supported` / `unsupported` / `no_text` / `timeout` / `error` counts and the unsupported rows. |
+
+```
+scripts/ecs-run-task.sh --detach --cpu 4096 --memory 8192 scripts/audit_case_number_support.py -- --county Orange --county Riverside
+scripts/ecs-wait-task.sh
+# Only some keys, or a sample:
+scripts/ecs-run-task.sh scripts/audit_case_number_support.py -- Riverside --keys s3://<bucket>/<key-list> --limit 50
+```
+
+Each S3 key is audited in its own forked process with a hard deadline (`--timeout`, default 180s), so one PDF that pdfplumber stalls on is reported as a `TIMEOUT` line instead of hanging the county. A `PROGRESS` line every `--progress-every` keys (default 100) shows the run is moving.
+
 ### Output-size limits via SSM / ECS Exec
 
 The SSM / ECS Exec transport cuts a session's output off partway: anywhere from ~1 KB to ~10 KB on dev (946 bytes on one run, 8-10 KB on others), with a `Cannot perform start session: EOF` trailer, and `aws ecs execute-command` still exits 0 (#3195, #4781).
