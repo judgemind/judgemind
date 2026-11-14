@@ -693,6 +693,129 @@ def test_extractor_unavailable_is_an_infrastructure_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #4968: a document no extractor could run on is a failed extraction
+# ---------------------------------------------------------------------------
+
+_VENTURA_PDF = {
+    "county": "Ventura",
+    "scraper_id": "ca-ventura-tentatives",
+    "content_format": "pdf",
+    "s3_key": "ca/ventura/superior_court/raw/abc.pdf",
+}
+
+
+@pytest.mark.parametrize("raw_pdf_bytes", [b"%PDF-1.7 scanned", None])
+def test_text_first_county_pdf_without_text_is_a_failed_extraction(
+    raw_pdf_bytes: bytes | None,
+) -> None:
+    """Ventura extracts from text only.  A PDF with no text layer gives its
+    extractor nothing to read, so no extractor runs: that is a failed
+    extraction, not "nothing to extract" (#4968).  Before, the split left
+    ``extraction_failed`` unset, a reingest treated the key as done, and
+    ``--write-failed-manifest`` never retried it.  With the raw bytes (a
+    PDF read for its text layer) or without them (a multimodal county
+    whose PDF could not be fetched takes the same branch)."""
+    from ingestion.worker import NO_EXTRACTABLE_TEXT, _SplitBatch
+
+    worker = _required_worker()
+    text = MagicMock()
+    event = {**_event(), **_VENTURA_PDF}
+    batch = _SplitBatch(parent_document_id=event["document_id"])
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+    ):
+        split = worker._split_document(
+            event,
+            event["document_id"],
+            "",
+            "CA",
+            "Ventura",
+            raw_pdf_bytes=raw_pdf_bytes,
+            batch=batch,
+        )
+
+    assert split is False
+    assert batch.extraction_failed == NO_EXTRACTABLE_TEXT
+    assert batch.extractor_unavailable is False
+    assert batch.whole_document is False
+    text.extract.assert_not_called()
+
+
+def test_text_first_county_pdf_without_text_is_reported_on_reingest() -> None:
+    """End to end: the reingest raises ``SplitExtractionFailedError`` (its
+    per-key handler counts the key as failed) and writes nothing (#4968)."""
+    worker = _required_worker()
+    event = {**_event(), **_VENTURA_PDF, "ruling_text": "", REPLACE_SPLIT_SET_KEY: True}
+
+    with (
+        patch.object(worker, "_write_split_batch") as split_write,
+        patch.object(worker, "_write_one_ruling") as single_write,
+        pytest.raises(SplitExtractionFailedError, match="no extractable text"),
+    ):
+        worker.process_event(event)
+
+    split_write.assert_not_called()
+    single_write.assert_not_called()
+
+
+def test_text_first_county_pdf_without_text_leaves_a_live_key_alone() -> None:
+    """A live capture of a key that already holds rows writes nothing and
+    does not raise (#4948, #4968)."""
+    worker = _required_worker()
+    event = {**_event(), **_VENTURA_PDF}
+
+    with patch.object(worker, "_key_has_rows", return_value=True):
+        handled = worker._llm_split_document(event, event["document_id"], "", "CA", "Ventura")
+
+    assert handled is True
+
+
+def test_scraper_extracted_county_without_text_is_its_whole_document() -> None:
+    """A county whose scraper extracts every field (``ExtractionMethod.NONE``)
+    runs no extractor, with or without text: the document is the split's
+    one child (#4940), not a failed extraction (#4968)."""
+    from ingestion.worker import _SplitBatch
+
+    worker = _required_worker()
+    event = {**_event(), "state": "FEDERAL", "county": "Federal", "content_format": "html"}
+    batch = _SplitBatch(parent_document_id=event["document_id"])
+
+    split = worker._split_document(
+        event, event["document_id"], "", "FEDERAL", "Federal", batch=batch
+    )
+
+    assert split is False
+    assert batch.whole_document is True
+    assert batch.extraction_failed is None
+
+
+def test_optional_mode_pdf_without_text_is_not_a_failure() -> None:
+    """In ``optional`` mode (no LLM keys) the single-document fallback is the
+    extraction, as before (#4953)."""
+    from ingestion.worker import _SplitBatch
+
+    worker = _make_worker()
+    assert worker._extraction_required is False
+    event = {**_event(), **_VENTURA_PDF}
+    batch = _SplitBatch(parent_document_id=event["document_id"])
+
+    for raw_pdf_bytes in (b"%PDF-1.7 scanned", None):
+        split = worker._split_document(
+            event,
+            event["document_id"],
+            "",
+            "CA",
+            "Ventura",
+            raw_pdf_bytes=raw_pdf_bytes,
+            batch=batch,
+        )
+        assert split is False
+        assert batch.extraction_failed is None
+
+
+# ---------------------------------------------------------------------------
 # Scraper: no capture-time "image-only" warning for deferred transcription
 # ---------------------------------------------------------------------------
 

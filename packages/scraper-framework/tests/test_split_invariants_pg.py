@@ -12,6 +12,9 @@ invariants after every commit (see its docstring for the list).
   as strict xfails; the sweep runs those seeds without that invariant.
 - ``test_invariants_hold_covers_evidence_paths`` checks the generated seeds
   still reach the case-number gate's branches (#4929).
+- ``test_generated_fail_mode_reaches_its_branch`` and
+  ``test_generated_extraction_paths`` check the generated seeds reach every
+  extraction fail mode and county strategy (#4968).
 
 Needs a migrated database in ``TEST_DATABASE_URL`` (``scripts/apply_migrations.sh``).
 Without one every test here skips, unless ``REQUIRE_PG_TESTS=1`` (set in CI),
@@ -117,8 +120,91 @@ def test_invariants_hold_covers_evidence_paths(event: str, seed: int) -> None:
     """The generated seeds drive the case-number gate's branches, not only
     the hand-written point tests (#4929).  Each seed holds every invariant
     while it logs its path's telemetry event."""
-    events = harness.run_seed(_DSN, seed, _RUN, name=f"cover-{event}")
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"cover-{event}", extraction_modes=False)
     assert events[event] > 0, f"seed {seed} no longer reaches {event}: {dict(events)}"
+
+
+#: A default-set seed per generated fail mode (#4968), and the outcome its
+#: failing step must come to: every call failing is a failed extraction;
+#: the multimodal call failing with a working text fallback is complete;
+#: a missing framework or county extractor that the step needs is
+#: unavailable.  Each seed also holds every invariant.
+_FAIL_MODE_SEEDS = {
+    "all": (15, "failed", ("harness.raised.SplitExtractionFailedError",)),
+    "multimodal_only": (15, "ok", ("harness.call.multimodal.fail", "harness.call.framework.ok")),
+    "framework_missing": (
+        6,
+        "unavailable",
+        ("harness.raised.ExtractorUnavailableError", "harness.refused_start.anthropic"),
+    ),
+    "county_missing": (
+        51,
+        "unavailable",
+        ("harness.raised.ExtractorUnavailableError", "harness.refused_start.google"),
+    ),
+}
+
+
+@_needs_pg
+@pytest.mark.parametrize("fail_mode", harness.FAIL_MODES)
+def test_generated_fail_mode_reaches_its_branch(fail_mode: str) -> None:
+    """The generated seeds include every fail mode, and each reaches the
+    worker branch it is for: the text fallback after a failed multimodal
+    call, and the missing-extractor branch after it (#4957's production
+    shape: multimodal built, the framework extractor not)."""
+    seed, outcome, needed = _FAIL_MODE_SEEDS[fail_mode]
+    assert any(s.fail_mode == fail_mode for s in harness.generate(seed))
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"mode-{fail_mode}")
+    reached = [f"harness.fail_mode.{fail_mode}.{outcome}", *needed]
+    assert all(events[e] > 0 for e in reached), (reached, dict(events))
+
+
+#: A default-set seed per extraction path the generated ops reach (#4968),
+#: with the events that show it.
+_EXTRACTION_PATH_SEEDS = {
+    # A multimodal county's whole document with no text and no rulings.
+    "zero_rulings_no_text": (5, ("llm_split.zero_rulings_no_text_skipped",)),
+    # A text-first county on its own provider's extractor (Ventura), and
+    # on a provider only that county names, built at startup (#4957).
+    "county_provider": (1, ("harness.call.county.ok",)),
+    "county_other_provider": (39, ("harness.call.county.ok",)),
+    # A text-first county's PDF with no text: nothing could be read.
+    "no_extractable_text": (1, ("harness.raised.SplitExtractionFailedError",)),
+}
+
+
+@_needs_pg
+@pytest.mark.parametrize(("path", "entry"), sorted(_EXTRACTION_PATH_SEEDS.items()))
+def test_generated_extraction_paths(path: str, entry: tuple[int, tuple[str, ...]]) -> None:
+    seed, needed = entry
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"path-{path}")
+    assert all(events[e] > 0 for e in needed), (needed, dict(events))
+
+
+@_needs_pg
+def test_generated_scraper_extracted_county_runs_no_extractor() -> None:
+    """A seed whose county's scraper extracts every field
+    (``ExtractionMethod.NONE``, Federal's config): every step is the whole
+    document and no extractor is called (#4968)."""
+    seed = 18
+    steps = harness.generate(seed)
+    assert {s.profile for s in steps} == {"none"}
+    events = harness.run_seed(_DSN, seed, _RUN, name="path-none")
+    assert not [e for e in events if e.startswith("harness.call.")], dict(events)
+    assert events["harness.outcome.ok"] > 0
+
+
+def test_extraction_modes_keep_the_seed_s_other_streams() -> None:
+    """The extraction modes come from their own random stream (#4968): a
+    seed's rows, ops, model draws and step kinds are the same with them or
+    without, so the seeds pinned before them keep their sequences."""
+    for seed in range(200):
+        on = harness.generate(seed)
+        off = harness.generate(seed, extraction_modes=False)
+        assert [(s.kind, s.rows, s.specs, s.ops) for s in on] == [
+            (s.kind, s.rows, s.specs, s.ops) for s in off
+        ]
+        assert all(s.profile == "default" and not s.fail_mode for s in off)
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +272,29 @@ _BUG_SEEDS = [
     # 924 fail the same way.)
     pytest.param("4946", 10, "alert_case"),
     pytest.param("4946", 925, "alert_case"),
+    # A PDF with no text layer in a text-first county (Ventura's config):
+    # no extractor ran, the split left ``extraction_failed`` unset, and a
+    # prefix reingest (139) or DB-row reingest (105) of the key raised
+    # nothing, so ``--write-failed-manifest`` missed it.  Found by the
+    # extraction modes' generator; fails on c88b4356, the parent of the
+    # #4968 fix.
+    pytest.param("4968", 139, "failed_manifest"),
+    pytest.param("4968", 105, "failed_manifest"),
 ]
 
 
 @_needs_pg
 @pytest.mark.parametrize(("bug", "seed", "invariant"), _BUG_SEEDS)
 def test_known_bug(bug: str, seed: int, invariant: str) -> None:
-    harness.run_seed(_DSN, seed, _RUN, name=f"bug{bug}", invariants=frozenset({invariant}))
+    # Seeds pinned before the extraction modes (#4968) keep their steps.
+    harness.run_seed(
+        _DSN,
+        seed,
+        _RUN,
+        name=f"bug{bug}",
+        invariants=frozenset({invariant}),
+        extraction_modes=int(bug) >= 4968,
+    )
 
 
 def _single_after_split_setup(h: harness.KeyHarness, key: harness.Key) -> None:
