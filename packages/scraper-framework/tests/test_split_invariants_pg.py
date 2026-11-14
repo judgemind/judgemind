@@ -15,21 +15,26 @@ invariants after every commit (see its docstring for the list).
 - ``test_generated_fail_mode_reaches_its_branch`` and
   ``test_generated_extraction_paths`` check the generated seeds reach every
   extraction fail mode and county strategy (#4968).
+- ``test_shared_court_invariants_hold`` sweeps ``SPLIT_HARNESS_SHARED_SEEDS``
+  (default 100) scenarios where several keys share one court (#4969);
+  ``_OPEN_SHARED_BUGS`` pins their open bugs as strict xfails.
 
 Needs a migrated database in ``TEST_DATABASE_URL`` (``scripts/apply_migrations.sh``).
 Without one every test here skips, unless ``REQUIRE_PG_TESTS=1`` (set in CI),
 which turns the skip into a failure so the harness cannot silently stop
-running.  Each run uses fresh keys and courts, so runs never see each
-other's rows.
+running.  Each run uses fresh keys and courts (tagged with the session's
+token), so runs never see each other's rows.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import uuid
 from pathlib import Path
 
+import psycopg
 import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
@@ -955,3 +960,177 @@ def test_case_retitle_reindexes_rulings_on_other_keys(first_kind: str, second_ki
     key's docs were re-indexed: the Orange rebuild for #4926 left 21 docs
     with a stale case title or type until ``reindex_search_from_db.py --apply``."""
     harness.run_shared_case_retitle(_DSN, _RUN, first_kind, second_kind)
+
+
+# ---------------------------------------------------------------------------
+# #4969: several keys share one court
+# ---------------------------------------------------------------------------
+
+
+def _shared_seeds() -> list[int]:
+    one = os.environ.get("SPLIT_HARNESS_SEED")
+    if one:
+        return [int(one)]
+    return list(range(int(os.environ.get("SPLIT_HARNESS_SHARED_SEEDS", "100"))))
+
+
+#: Open bugs the shared-court scenarios reproduce: ``issue -> (invariant,
+#: seeds)``.  The bug class is broad (about one shared seed in six), so the
+#: sweep runs every shared seed without that invariant, and
+#: ``test_open_shared_bug`` keeps the bug reproduced on *seeds* (a strict
+#: xfail: when the fix lands it fails until the entry is removed, which
+#: turns the invariant back on in the sweep).
+_OPEN_SHARED_BUGS: dict[str, tuple[str, tuple[int, ...]]] = {
+    # A repost loses content-hash dedup to the key holding the ruling; when
+    # that key stops listing it, the reposting key's document stays
+    # superseded and the ruling exists nowhere.
+    "4982": ("printed_somewhere", (7, 8, 9, 17, 23)),
+}
+
+
+def _shared_invariants() -> frozenset[str]:
+    return frozenset(harness.INVARIANTS) - {inv for inv, _ in _OPEN_SHARED_BUGS.values()}
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", _shared_seeds())
+def test_shared_court_invariants_hold(seed: int) -> None:
+    """Two or three keys share one court, its cases and its judge roster
+    (#4969): reposts of one ruling under a second key, court renames, and
+    rulings that lose their judge while sibling keys keep voting.  Every
+    per-step invariant holds, and the court-wide ones (``search_fields``,
+    ``judge_converge``, ``printed_somewhere``, ``held_printed``) hold
+    across all the keys."""
+    harness.run_shared_court(_DSN, seed, _RUN, invariants=_shared_invariants())
+
+
+@_needs_pg
+@pytest.mark.parametrize(
+    ("bug", "invariant", "seed"),
+    [
+        pytest.param(bug, invariant, seed, id=f"{bug}-{seed}")
+        for bug, (invariant, seeds) in _OPEN_SHARED_BUGS.items()
+        for seed in seeds
+    ],
+)
+@pytest.mark.xfail(raises=harness.InvariantError, strict=True, reason="open bug")
+def test_open_shared_bug(bug: str, invariant: str, seed: int) -> None:
+    harness.run_shared_court(_DSN, seed, _RUN, name=f"open{bug}", invariants=frozenset({invariant}))
+
+
+def test_generate_shared_keeps_the_single_key_sequences() -> None:
+    """The shared-court generator draws from its own random stream: adding
+    it left every single-key seed's sequence as it was (#4969)."""
+    before = [harness.generate(seed) for seed in range(20)]
+    for seed in range(20):
+        harness.generate_shared(seed)
+    assert [harness.generate(seed) for seed in range(20)] == before
+    assert harness.generate_shared(5) == harness.generate_shared(5)
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", [0, 5, 10])
+def test_court_rename_reindexes_rulings_on_other_keys(seed: int) -> None:
+    """A step whose events name the court differently renames it
+    (``upsert_court``'s change branch), and the rename re-indexes the
+    court's rulings on the other keys (#4935, #4969).  Before #4969 every
+    generated key had its own court and always sent "Superior Court", so
+    the branch never fired."""
+    from unittest.mock import patch
+
+    from ingestion import worker as worker_mod
+
+    real = worker_mod.reindex_dependent_rulings
+    renamed: list[int] = []
+
+    def spy(conn: object, indexer: object, changes: object, **kwargs: object) -> int:
+        count = real(conn, indexer, changes, **kwargs)  # type: ignore[arg-type]
+        if changes.court_ids:  # type: ignore[attr-defined]
+            renamed.append(count)
+        return count
+
+    _keys, steps = harness.generate_shared(seed)
+    assert any("court_rename" in s.step.ops for s in steps)
+    with patch.object(worker_mod, "reindex_dependent_rulings", spy):
+        harness.run_shared_court(
+            _DSN, seed, _RUN, name="court-rename", invariants=_shared_invariants()
+        )
+    assert any(count > 0 for count in renamed), renamed
+
+
+class _DedupLog(logging.Handler):
+    """Counts ``insert_ruling``'s content-hash dedup supersedes."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "event", None) == "content_hash_dedup_supersede":
+            self.count += 1
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", [0, 1, 24])
+def test_repost_on_another_key_loses_dedup_to_the_holder(seed: int) -> None:
+    """A ruling reposted under a second key of the court (the same case
+    and text) loses content-hash dedup to the key holding it: its document
+    is superseded (#2458).  Generated seeds reach the cross-key supersede
+    and hold every other invariant (#4969)."""
+    log = _DedupLog()
+    logger = logging.getLogger("ingestion")
+    logger.addHandler(log)
+    try:
+        harness.run_shared_court(_DSN, seed, _RUN, name="repost", invariants=_shared_invariants())
+    finally:
+        logger.removeHandler(log)
+    assert log.count > 0
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", [0, 2, 3])
+def test_ruling_that_loses_its_judge_while_other_keys_vote(seed: int) -> None:
+    """A ruling loses its judge on one key while the court's other keys
+    keep voting for that judge (#4966, #4969): every document votes as it
+    stands, and the judge keeps the name its remaining votes give it."""
+    n_keys, steps = harness.generate_shared(seed)
+    assert any("judge_none" in s.step.ops for s in steps)
+    harness.run_shared_court(_DSN, seed, _RUN, name="judge-none", invariants=_shared_invariants())
+    tag = f"{_RUN}-{seed}-judge-none"
+    keys = [harness.make_key(f"{tag}-k{k}", county_tag=tag) for k in range(n_keys)]
+    with psycopg.connect(_DSN) as conn:
+        rows = conn.execute(
+            "SELECT e.judge_id::text, count(DISTINCT d.s3_key) FROM judge_name_evidence e "
+            "JOIN documents d ON d.id = e.document_id WHERE d.s3_key = ANY(%s) "
+            "GROUP BY e.judge_id",
+            ([k.s3_key for k in keys],),
+        ).fetchall()
+    keys_per_judge = dict(rows)
+    assert max(keys_per_judge.values(), default=0) >= 2, keys_per_judge
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "live"])
+@pytest.mark.xfail(raises=harness.InvariantError, strict=True, reason="open bug #4982")
+def test_repost_loser_is_revived_when_the_holder_drops_it(kind: str) -> None:
+    """Key A holds ruling R; key B reposts R (the same case and text) and
+    loses dedup, so B's document is superseded; then A is re-ingested
+    without R.  B still prints R, so R must be held by B (#4969).  Today
+    nothing revives B and R exists nowhere (#4982)."""
+    tag = f"{_RUN}-revive-{kind}"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"printed_somewhere"}))
+    try:
+        a = harness.make_key(f"{tag}-a", county_tag=tag)
+        b = harness.make_key(f"{tag}-b", county_tag=tag)
+        shared = _spec(tag, 1, None)
+        own_a, own_b = _spec(f"{tag}-a", 2, None), _spec(f"{tag}-b", 3, None)
+        h.run_step(a, _rulings_step("reingest", [shared, own_a], [0, 1]), "a holds R")
+        h.run_step(b, _rulings_step("reingest", [shared, own_b], [0, 1]), "b reposts R")
+        on_b = harness.read_key(h.checker, b.s3_key)
+        assert shared.text not in {r.text for r in on_b}
+        assert any(r.status == "superseded" for r in on_b)
+        h.run_step(a, _rulings_step(kind, [own_a], [0]), "a drops R")
+        printed = {a.s3_key: {own_a.text}, b.s3_key: {shared.text, own_b.text}}
+        h._check_printed_somewhere([a, b], printed)
+    finally:
+        h.close()

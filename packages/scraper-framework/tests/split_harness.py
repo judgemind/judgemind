@@ -77,6 +77,21 @@ properties that must hold for any sequence of re-splits:
   refuses to start (``_require_extractors``), and so does the scripts'
   preflight (``check_extraction_ready``), whatever county configs name that
   provider (#4953, #4957).
+- ``printed_somewhere``: in a court several keys share
+  (:func:`run_shared_court`, #4969), every ruling a key's last extraction
+  returned is held, active, by a key that lists it.  A repost on a second
+  key loses content-hash dedup to the holder, so when the holder stops
+  listing the ruling the reposting key must hold it (open: #4982).
+- ``held_printed``: in such a court, no key holds a ruling its last
+  extraction did not return (a pre-split capture keeps its earlier
+  captures' rulings on other slots).
+
+A shared-court scenario also runs ``search_fields`` (a court rename made by
+one key's write re-indexes the other keys' rulings) and ``judge_converge``
+(votes and one judge row per roster judge) across all its keys.  There is
+no orphan-case invariant (every ``UNKNOWN-*`` case and ``case_judges`` row
+backed by a ruling): a reingest leaves orphaned cases by design until the
+opt-in sweep #4744 proposes lands.
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -212,6 +227,8 @@ INVARIANTS = (
     "untouched",
     "failed_manifest",
     "refuse_start",
+    "printed_somewhere",
+    "held_printed",
     "error",
 )
 
@@ -1980,6 +1997,12 @@ class KeyHarness:
 
             printing = {d for d, t, _j, _n in before if key_of(spelling_before.get(t)) == target}
             printing |= {d for d, t, _j, _n in after if key_of(self._spelling.get(t)) == target}
+            # The judge's documents on the court's other keys vote too (#4969).
+            printing |= {
+                d
+                for d, t, j, _n in self._judge_rows_elsewhere()
+                if j == judge_id and key_of(self._spelling.get(t)) == target
+            }
             if len(printing) < 2:
                 self._fail(
                     "judge_converge",
@@ -2229,6 +2252,91 @@ class KeyHarness:
                 f"alert on ruling {(old_text or '')[:24]!r} ({old_case}) now points at "
                 f"a different ruling {(new_text or '')[:24]!r} ({new_case})",
             )
+
+    # -- several keys share one court (#4969) ---------------------------
+
+    def _held_on(self, keys: list[Key]) -> dict[str, set[str]]:
+        """``{ruling text: the S3 keys of the active documents holding it}``."""
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT d.s3_key, r.ruling_text FROM rulings r "
+                "JOIN documents d ON d.id = r.document_id "
+                "WHERE d.status = 'active' AND d.s3_key = ANY(%s)",
+                ([k.s3_key for k in keys],),
+            )
+            held: dict[str, set[str]] = {}
+            for s3_key, text in cur.fetchall():
+                held.setdefault(text or "", set()).add(s3_key)
+        return held
+
+    def _check_printed_somewhere(self, keys: list[Key], printed: dict[str, set[str]]) -> None:
+        """Every ruling a key's last extraction returned (*printed*, by S3
+        key) is held by an active document of a key that lists it (#4969).
+
+        A repost loses content-hash dedup to the key that holds the ruling,
+        so its document is superseded and holds nothing.  When the holder
+        stops listing the ruling, a key that still lists it must hold it.
+        """
+        held = self._held_on(keys)
+        label = {k.s3_key: f"k{n}" for n, k in enumerate(keys)}
+        for text in sorted(set().union(*printed.values())):
+            listing = {s3_key for s3_key, texts in printed.items() if text in texts}
+            if not held.get(text, set()) & listing:
+                self._fail(
+                    "printed_somewhere",
+                    f"ruling {text[:24]!r}, which {sorted(label[k] for k in listing)} list, "
+                    f"is held by no active document of those keys (held on "
+                    f"{sorted(label[k] for k in held.get(text, ()))})",
+                )
+
+    def _check_held_printed(self, keys: list[Key], printed: dict[str, set[str]]) -> None:
+        """No key holds a ruling its last extraction did not return (#4969)."""
+        label = {k.s3_key: f"k{n}" for n, k in enumerate(keys)}
+        for text, where in sorted(self._held_on(keys).items()):
+            for s3_key in sorted(where):
+                if s3_key in printed and text not in printed[s3_key]:
+                    self._fail(
+                        "held_printed",
+                        f"{label[s3_key]} holds ruling {text[:24]!r}, which its last "
+                        "extraction did not return",
+                    )
+
+    def _judge_rows_elsewhere(self) -> list[tuple[str, str, str, str]]:
+        """:meth:`_judge_rows` of every key this harness wrote other than
+        the current step's.  The step leaves those rows as they were."""
+        others = sorted(self._keys - {self._key.s3_key} if self._key else self._keys)
+        if not others:
+            return []
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT d.id::text, r.ruling_text, j.id::text, j.canonical_name "
+                "FROM rulings r JOIN documents d ON d.id = r.document_id "
+                "JOIN judges j ON j.id = r.judge_id WHERE d.s3_key = ANY(%s)",
+                (others,),
+            )
+            return [tuple(row) for row in cur.fetchall()]
+
+    def _check_one_court_judge(self, keys: list[Key]) -> None:
+        """``judge_converge`` across every key of the court: one roster
+        judge's rulings resolve to one judge row, whichever key holds them,
+        and each active document's vote is the spelling it prints now."""
+        self._check_one_judge(keys[0], [row for key in keys for row in self._judge_rows(key)])
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT d.id::text, r.ruling_text, e.raw_name FROM documents d "
+                "JOIN rulings r ON r.document_id = d.id "
+                "JOIN judge_name_evidence e ON e.document_id = d.id AND e.judge_id = r.judge_id "
+                "WHERE d.s3_key = ANY(%s) AND d.status = 'active'",
+                ([k.s3_key for k in keys],),
+            )
+            votes = cur.fetchall()
+        for doc, text, raw in votes:
+            want = self._spelling.get(text)
+            if want and _spelled(raw) != _spelled(want):
+                self._fail(
+                    "judge_converge",
+                    f"document {doc[:8]} votes for spelling {raw!r}, its ruling prints {want!r}",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -2700,3 +2808,233 @@ def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fa
     steps = generate(seed, extraction_modes=False)
     first = replace(steps[0], kind="live", fail=True, whole=False, ops=("fallback",))
     run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
+
+
+# ---------------------------------------------------------------------------
+# Several keys share one court (#4969)
+# ---------------------------------------------------------------------------
+
+#: The court names a shared-court scenario's events send.  The court row's
+#: ``court_name`` is ``"<court>, County of <county>"``, which every search
+#: doc of the court shows: a step that sends another name renames the court
+#: (``upsert_court``'s change branch) and must re-index every ruling in it,
+#: on every key (#4935, ``search_fields``).  A ``db`` step sends the name
+#: ``reingest_from_s3.py`` derives from the S3 key, the first one.
+COURT_NAMES = ("Superior Court", "Superior Court of California", "Superior Court, Civil Division")
+
+_SHARED_OPS = (
+    "add",  # list a ruling no key lists yet
+    "repost",  # list a ruling another key lists (the same text and case)
+    "drop",  # stop listing one of the key's rulings
+    "drop_shared",  # stop listing a ruling another key lists too
+    "judge_none",  # a ruling only this key lists loses its judge
+    "judge_set",  # ... or prints another roster spelling
+    "court_rename",  # the step's events send another court name
+    "case_miss",  # the key's LLM misses one ruling's case number
+    "case_fix",  # ... and reads it again
+    "same",
+)
+
+
+@dataclass(frozen=True)
+class SharedStep:
+    """One step of a shared-court scenario: *step* runs on key number
+    *key*, its events naming the court *court*."""
+
+    key: int
+    step: Step
+    court: str
+
+
+def generate_shared(seed: int) -> tuple[int, list[SharedStep]]:
+    """Return ``(number of keys, steps)`` of shared-court scenario *seed*.
+
+    Two or three keys share one county, so one court, its cases and its
+    judge roster (#4969).  The court posts a pool of rulings and each key's
+    document lists some of them.  A ruling two keys list is a repost: the
+    same text and case, so the later write loses content-hash dedup (#2458)
+    and its document is superseded by the holder's.  Each pool ruling
+    prints one judge spelling (or none) on every key that lists it.
+
+    Every ruling has a caption, so validation rejects none, and a step's
+    document text, when it has one, prints every listed number: each ruling
+    a key's last extraction returned is held, active, by a key that lists
+    it (``printed_somewhere``).
+
+    Its own random stream (``"<seed>:shared"``), so :func:`generate`'s
+    seeds keep their sequences.
+    """
+    rng = random.Random(f"{seed}:shared")
+    token = f"x{seed}"
+    n_keys = rng.randint(2, 3)
+    judges = rng.sample(ROSTER_JUDGES, rng.choice((1, 1, 2)))
+    roster = tuple(j.roster for j in judges)
+
+    def spelling() -> str:
+        judge = rng.choice(judges)
+        return judge.printed if rng.random() < 0.6 else rng.choice(judge.spellings())
+
+    # At most ten rulings: ``_case_number`` repeats one digit per index.
+    pool = [
+        Spec(
+            i,
+            _case_number(i),
+            _title(i),
+            _text(token, i),
+            None if rng.random() < 0.15 else spelling(),
+        )
+        for i in range(rng.randint(5, 10))
+    ]
+    posted: list[list[int]] = [[] for _ in range(n_keys)]
+    #: Per key, the rulings whose case number its LLM misses (the
+    #: document still prints it): the ruling sits on its placeholder case
+    #: until a read finds the number, maybe held by another key by then.
+    missed: list[set[int]] = [set() for _ in range(n_keys)]
+    steps: list[SharedStep] = []
+    court = COURT_NAMES[0]
+
+    def spec(k: int, i: int) -> Spec:
+        if i in missed[k]:
+            return replace(pool[i], case_number=None, printed=pool[i].case_number)
+        return pool[i]
+
+    #: Per ruling, every key that has listed it.  A pre-split capture
+    #: leaves its earlier rulings on other slots, so a key may still hold
+    #: a ruling it no longer lists.
+    listed_by: list[set[int]] = [set() for _ in pool]
+
+    def listers(i: int) -> int:
+        return sum(i in p for p in posted)
+
+    def emit(k: int, ops: list[str], *, first: bool = False) -> None:
+        nonlocal court
+        for i in posted[k]:
+            listed_by[i].add(k)
+        kind = rng.choices(("live", "reingest", "db", "presplit"), weights=(3, 4, 2, 2))[0]
+        if first and kind == "db":
+            kind = "reingest"  # DB-row mode re-ingests only keys it holds
+        if kind == "db":
+            court = COURT_NAMES[0]
+        elif "court_rename" in ops:
+            court = rng.choice([c for c in COURT_NAMES if c != court])
+        specs = tuple(spec(k, i) for i in posted[k])
+        rows = tuple(Row("ruling", n) for n in range(len(specs)))
+        mode = rng.choices(("text", "none"), weights=(4, 1))[0]
+        step = Step(
+            kind,
+            rows,
+            specs,
+            tuple(ops),
+            doc=document_text(rows, specs, mode),
+            roster=roster if not steps else (),
+            party_tag=token,
+        )
+        steps.append(SharedStep(k, step, court))
+
+    for k in range(n_keys):
+        free = [i for i in range(len(pool)) if not listers(i)]
+        rng.shuffle(free)
+        posted[k] = sorted(free[: rng.randint(1, 3)])
+        ops = ["add"]
+        others = [i for p in posted[:k] for i in p]
+        if others and (not posted[k] or rng.random() < 0.4):
+            posted[k].insert(rng.randint(0, len(posted[k])), rng.choice(others))
+            ops.append("repost")
+        emit(k, ops, first=True)
+
+    for _ in range(rng.randint(3, 8)):
+        k = rng.randrange(n_keys)
+        ops = [rng.choice(_SHARED_OPS) for _ in range(rng.randint(1, 2))]
+        mine = posted[k]
+        for op in ops:
+            if op == "add":
+                free = [i for i in range(len(pool)) if not listers(i)]
+                if free:
+                    mine.insert(rng.randint(0, len(mine)), rng.choice(free))
+            elif op == "repost":
+                others = sorted(
+                    {i for j, p in enumerate(posted) if j != k for i in p if i not in mine}
+                )
+                if others:
+                    mine.insert(rng.randint(0, len(mine)), rng.choice(others))
+            elif op == "drop" and len(mine) > 1:
+                mine.pop(rng.randrange(len(mine)))
+            elif op == "drop_shared" and len(mine) > 1:
+                shared = [n for n, i in enumerate(mine) if listers(i) > 1]
+                if shared:
+                    mine.pop(rng.choice(shared))
+            elif op in ("judge_none", "judge_set"):
+                # Only a ruling no other key has listed: the harness keeps
+                # one printed spelling per ruling text (``KeyHarness._spelling``).
+                own = [i for i in mine if listed_by[i] <= {k}]
+                if own:
+                    i = rng.choice(own)
+                    pool[i] = replace(pool[i], judge=None if op == "judge_none" else spelling())
+            elif op == "case_miss":
+                missed[k].add(rng.choice(mine))
+            elif op == "case_fix" and missed[k]:
+                missed[k].discard(rng.choice(sorted(missed[k])))
+        emit(k, ops)
+    return n_keys, steps
+
+
+def run_shared_court(
+    dsn: str,
+    seed: int,
+    run_token: str,
+    *,
+    name: str = "shared",
+    invariants: frozenset[str] | None = None,
+) -> Counter[str]:
+    """Run shared-court scenario *seed* (:func:`generate_shared`); raise
+    :class:`InvariantError` on the first broken invariant.
+
+    Every step holds the per-step invariants, and the court-wide ones run
+    across all the keys: ``search_fields`` (a court rename, a case retitle
+    or a judge rename made by one key's write re-indexes the other keys'
+    rulings), ``judge_converge`` (each document votes as it stands; one
+    roster judge is one judge row in the court) and ``printed_somewhere``.
+    The keys are tagged with *run_token* and *name*, so concurrent runs
+    never share a court.  Returns the ``telemetry_event`` counts the run
+    logged.
+    """
+    n_keys, steps = generate_shared(seed)
+    tag = f"{run_token}-{seed}-{name}"
+    harness = KeyHarness(dsn, run_token, seed, invariants)
+    try:
+        keys = [make_key(f"{tag}-k{k}", county_tag=tag) for k in range(n_keys)]
+        printed: dict[str, set[str]] = {}
+        for n, shared in enumerate(steps):
+            key = keys[shared.key]
+            step = shared.step
+            # DB-row mode selects only keys with an active document.
+            selected = step.kind != "db" or any(
+                r.status == "active" for r in read_key(harness.checker, key.s3_key)
+            )
+            harness.event_extra = {"court": shared.court}
+            try:
+                harness.run_step(
+                    key, step, f"step {n + 1}/{len(steps)} k{shared.key} court={shared.court!r}"
+                )
+            finally:
+                harness.event_extra = {}
+            texts = {step.specs[r.spec].text for r in step.rows}
+            if step.kind == "presplit":
+                # A pre-split capture replaces only its own children's
+                # slots: it runs no stale-child cleanup, so the key may
+                # keep rulings its earlier captures printed on other slots
+                # (``_SplitBatch.pre_split``).
+                kept = {
+                    r.text
+                    for r in read_key(harness.checker, key.s3_key)
+                    if r.ruling_id and r.status == "active"
+                }
+                printed[key.s3_key] = texts | (printed.get(key.s3_key, set()) & kept)
+            elif selected:
+                printed[key.s3_key] = texts
+            harness._guard("printed_somewhere", harness._check_printed_somewhere, keys, printed)
+            harness._guard("held_printed", harness._check_held_printed, keys, printed)
+            harness._guard("judge_converge", harness._check_one_court_judge, keys)
+        return harness.events
+    finally:
+        harness.close()
