@@ -40,6 +40,16 @@ file listing S3 keys to audit, one per line; for ECS runs upload it to
 ``s3://judgemind-document-archive-dev/tmp/keys/<name>.txt``, #4803), ``--limit N`` (at most N keys
 per county), ``--timeout SECS`` (per key, default 180), ``--workers N``
 (default 8), ``--progress-every N`` (default 100).
+
+No-text PDF mode (``--no-text-pdfs``, #4983): instead of judging rulings,
+list every archived PDF under ``ca/<county>/`` in S3 and report the ones
+whose extracted text is too short to be evidence (the same
+``document_evidence`` rule: a scanned PDF with no text layer), with how many
+active rulings each key holds today.  Output: one ``NO_TEXT`` line per such
+key and ``SUMMARY_NO_TEXT <county>: {json}`` per county (``pdf_keys``,
+``no_text``, ``no_text_zero_rulings``, ``timeout``, ``error``).
+``--write-keys s3://bucket/key`` also writes the no-text keys, one per line,
+for a reingest's ``--s3-key-list``.  This mode always exits 0.
 """
 
 from __future__ import annotations
@@ -354,6 +364,182 @@ def audit_county(
 
 
 # ---------------------------------------------------------------------------
+# No-text PDF mode (#4983)
+# ---------------------------------------------------------------------------
+
+NO_TEXT_RULING_COUNTS_SQL = """
+SELECT d.s3_key, count(r.id)
+FROM derived.documents d
+LEFT JOIN derived.rulings r ON r.document_id = d.id
+WHERE d.status = 'active' AND d.s3_key LIKE %s
+GROUP BY d.s3_key
+"""
+
+
+def county_prefix(county: str, state: str = "ca") -> str:
+    """The archive prefix of a county's raw objects: ``ca/santa_clara/``."""
+    return f"{state.lower()}/{county.strip().lower().replace(' ', '_')}/"
+
+
+def is_raw_pdf_key(key: str) -> bool:
+    """A raw PDF capture: content-addressed (``<state>/<county>/<court>/raw/
+    <sha>.pdf``) or dated (``.../raw/YYYY/MM/DD/<uuid>.pdf``)."""
+    parts = key.split("/")
+    return len(parts) >= 5 and parts[3] == "raw" and key.endswith(".pdf")
+
+
+@dataclass(frozen=True)
+class TextProbe:
+    """What one key's text extraction produced."""
+
+    key: str
+    chars: int  # non-blank characters of the extracted text (stripped length)
+    evidence: bool  # True when the gate counts the text as evidence
+
+
+def probe_key_text(key: str, gate: Gate) -> TextProbe:
+    text = text_for(gate.fetch(key), key, gate.extract_pdf, gate.is_pdf)
+    usable = text if text and not gate.is_pdf(text) else ""
+    return TextProbe(key, len(usable.strip()), bool(gate.evidence_for(text)))
+
+
+@dataclass
+class NoTextReport:
+    county: str
+    pdf_keys: int = 0
+    no_text: list[tuple[str, int, int]] = field(
+        default_factory=list
+    )  # key, chars, rulings
+    timeout_keys: list[str] = field(default_factory=list)
+    error_keys: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "pdf_keys": self.pdf_keys,
+            "no_text": len(self.no_text),
+            "no_text_zero_rulings": sum(1 for _, _, n in self.no_text if n == 0),
+            "no_text_rulings": sum(n for _, _, n in self.no_text),
+            "timeout": len(self.timeout_keys),
+            "error": len(self.error_keys),
+            "timeout_keys": self.timeout_keys,
+            "error_keys": self.error_keys,
+        }
+
+
+def audit_no_text_county(
+    county: str,
+    keys: list[str],
+    ruling_counts: dict[str, int],
+    gate: Gate,
+    *,
+    workers: int,
+    timeout: float,
+    progress_every: int,
+    out: Callable[[str], None] = print,
+) -> NoTextReport:
+    report = NoTextReport(county=county, pdf_keys=len(keys))
+    jobs = ((key, (key, gate)) for key in keys)
+    results = run_with_deadline(jobs, probe_key_text, workers=workers, timeout=timeout)
+    for done, (key, status, payload) in enumerate(results, start=1):
+        if status == "timeout":
+            report.timeout_keys.append(key)
+            out(f"TIMEOUT {county} key={key} after={timeout:g}s")
+        elif status == "error":
+            report.error_keys.append(key)
+            out(f"ERROR {county} key={key} error={payload}")
+        elif not payload.evidence:
+            rulings = ruling_counts.get(key, 0)
+            report.no_text.append((key, payload.chars, rulings))
+            out(f"NO_TEXT {county} key={key} chars={payload.chars} rulings={rulings}")
+        if progress_every and done % progress_every == 0 and done < report.pdf_keys:
+            out(
+                f"PROGRESS {county}: {done}/{report.pdf_keys} keys no_text={len(report.no_text)}"
+            )
+    out(f"SUMMARY_NO_TEXT {county}: {json.dumps(report.summary(), sort_keys=True)}")
+    return report
+
+
+def run_no_text(
+    args: argparse.Namespace,
+    keys_by_county: dict[str, list[str]],
+    ruling_counts: dict[str, int],
+    gate: Gate,
+    only: set[str] | None,
+    out: Callable[[str], None] = print,
+) -> list[NoTextReport]:
+    reports = []
+    for county in args.all_counties:
+        keys = sorted(
+            k for k in keys_by_county.get(county, []) if only is None or k in only
+        )
+        if args.limit is not None:
+            keys = keys[: args.limit]
+        out(f"START_NO_TEXT {county}: {len(keys)} pdf keys")
+        reports.append(
+            audit_no_text_county(
+                county,
+                keys,
+                ruling_counts,
+                gate,
+                workers=args.workers,
+                timeout=args.timeout,
+                progress_every=args.progress_every,
+                out=out,
+            )
+        )
+    return reports
+
+
+def no_text_key_list(reports: Iterable[NoTextReport]) -> str:
+    return "".join(f"{key}\n" for r in reports for key, _, _ in r.no_text)
+
+
+def list_county_pdf_keys(
+    s3: Any, bucket: str, counties: list[str]
+) -> dict[str, list[str]]:
+    paginator = s3.get_paginator("list_objects_v2")
+    out: dict[str, list[str]] = {}
+    for county in counties:
+        out[county] = [
+            obj["Key"]
+            for page in paginator.paginate(Bucket=bucket, Prefix=county_prefix(county))
+            for obj in page.get("Contents", [])
+            if is_raw_pdf_key(obj["Key"])
+        ]
+    return out
+
+
+def fetch_ruling_counts(database_url: str, counties: list[str]) -> dict[str, int]:
+    import psycopg
+
+    counts: dict[str, int] = {}
+    with psycopg.connect(database_url) as conn:
+        for county in counties:
+            with conn.cursor() as cur:
+                cur.execute(NO_TEXT_RULING_COUNTS_SQL, (county_prefix(county) + "%",))
+                counts.update({key: int(n) for key, n in cur.fetchall()})
+    return counts
+
+
+def main_no_text(args: argparse.Namespace, only: set[str] | None) -> int:
+    import boto3
+
+    s3 = boto3.client("s3")
+    keys = list_county_pdf_keys(s3, BUCKET, args.all_counties)
+    counts = fetch_ruling_counts(os.environ["DATABASE_URL"], args.all_counties)
+    reports = run_no_text(args, keys, counts, production_gate(), only, out=_print)
+    if args.write_keys:
+        bucket, _, key = args.write_keys.removeprefix("s3://").partition("/")
+        s3.put_object(
+            Bucket=bucket, Key=key, Body=no_text_key_list(reports).encode("utf-8")
+        )
+        _print(
+            f"WROTE {sum(len(r.no_text) for r in reports)} keys to {args.write_keys}"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Inputs and entry point
 # ---------------------------------------------------------------------------
 
@@ -414,7 +600,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--progress-every", type=int, default=100, help="Progress line every N keys."
     )
+    parser.add_argument(
+        "--no-text-pdfs",
+        action="store_true",
+        help="Report archived PDFs with no usable text layer instead (#4983).",
+    )
+    parser.add_argument(
+        "--write-keys",
+        help="With --no-text-pdfs: s3://bucket/key to write the no-text keys to.",
+    )
     args = parser.parse_args(argv)
+    if args.write_keys and (
+        not args.no_text_pdfs or not args.write_keys.startswith("s3://")
+    ):
+        parser.error("--write-keys needs --no-text-pdfs and an s3:// URI")
     args.all_counties = list(dict.fromkeys([*args.counties, *args.county])) or list(
         DEFAULT_COUNTIES
     )
@@ -469,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
         only = load_key_list(
             args.keys, lambda b, k: s3.get_object(Bucket=b, Key=k)["Body"].read()
         )
+    if args.no_text_pdfs:
+        return main_no_text(args, only)
     rows = fetch_county_rows(os.environ["DATABASE_URL"], args.all_counties)
     return run(args, rows, production_gate(), only, out=_print)
 

@@ -95,6 +95,10 @@ Options:
                         object, for a retry with ``--s3-key-list`` (#4619).
                         Use the key-list location,
                         ``s3://judgemind-document-archive-dev/tmp/keys/``.
+                        A key with no extractable text (a PDF with no text
+                        layer in a text-first county) is not listed: a retry
+                        cannot succeed.  It is logged as ``unextractable_keys``
+                        and leaves its rows as they are (#4983).
 
 Removed with the DB-row write path (#4845): ``--full-reparse`` and
 ``--multimodal`` (the worker always re-derives the split, with the county's
@@ -941,6 +945,14 @@ def _emit_partial_failure_warning(
     return error_ratio
 
 
+#: Per-key status of a document no extractor could read (no text layer and
+#: no page images, ``NoExtractableTextError``, #4983).  Not an error: a
+#: retry cannot succeed, so the key is kept out of ``failed_keys`` and the
+#: ``--write-failed-manifest`` retry list, and reported as
+#: ``unextractable_keys``.
+UNEXTRACTABLE = "unextractable"
+
+
 def _process_prefix_document(
     key: str,
     bucket: str,
@@ -962,7 +974,8 @@ def _process_prefix_document(
         cache reads (#4049).
 
     Returns a dict with:
-      - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
+      - ``status``: ``"ok"``, ``"skip"``, ``"error"``, or ``UNEXTRACTABLE``
+        (no text layer and no page images: not retryable, #4983)
       - ``error_class``: ``None`` for ok/skip results; the exception class
         name (e.g. ``"BrokenProcessPool"``, ``"ValueError"``) for the two
         error-return branches (S3 fetch failure and ``worker.process_event``
@@ -1069,6 +1082,18 @@ def _process_prefix_document(
         worker.process_event(event)
         return {"status": "ok", "hash_mismatch": hash_mismatch, "error_class": None}
     except Exception as exc:
+        from ingestion.worker import NoExtractableTextError
+
+        if isinstance(exc, NoExtractableTextError):
+            # No text layer and no page images: a retry reads the same
+            # bytes, so the key is reported apart from the retryable
+            # failures (#4983).
+            logger.warning("Document has no extractable text", s3_key=key)
+            return {
+                "status": UNEXTRACTABLE,
+                "hash_mismatch": hash_mismatch,
+                "error_class": type(exc).__name__,
+            }
         logger.warning("Failed to process document", s3_key=key, exc_info=True)
         return {
             "status": "error",
@@ -1467,6 +1492,8 @@ def _reingest_keys(
     skipped = 0
     hash_mismatch_warnings = 0
     failed_keys: list[str] = []
+    # Keys no extractor could read: reported, never retried (#4983).
+    unextractable_keys: list[str] = []
     error_classes: Counter[str] = Counter()
 
     logger.info(
@@ -1506,6 +1533,8 @@ def _reingest_keys(
                     processed += 1
                 elif status == "skip":
                     skipped += 1
+                elif status == UNEXTRACTABLE:
+                    unextractable_keys.append(key)
                 else:
                     errors += 1
                     failed_keys.append(key)
@@ -1513,7 +1542,7 @@ def _reingest_keys(
                         error_classes[result.get("error_class") or "unknown"] += 1
                     else:
                         error_classes["unknown"] += 1
-                total_done = processed + errors + skipped
+                total_done = processed + errors + skipped + len(unextractable_keys)
                 if processed > 0 and processed % 50 == 0:
                     elapsed = time.monotonic() - t_start
                     elapsed_min = elapsed / 60
@@ -1564,6 +1593,8 @@ def _reingest_keys(
         "error_ratio": error_ratio,
         "top_error_class": top_error_class,
         "failed_keys": failed_keys,
+        "unextractable": len(unextractable_keys),
+        "unextractable_keys": unextractable_keys,
     }
     if prepass_stats is not None:
         stats["judge_prepass_docs_scanned"] = prepass_stats["docs_scanned"]
@@ -1574,13 +1605,24 @@ def _reingest_keys(
 
     # Spread the stats into the completion log but report ``failed_keys`` as a
     # count rather than dumping the full list (which can be hundreds of keys).
-    log_stats = {k: v for k, v in stats.items() if k != "failed_keys"}
+    log_stats = {
+        k: v for k, v in stats.items() if k not in ("failed_keys", "unextractable_keys")
+    }
     logger.info(
         "Key reingest complete",
         mode=mode,
         failed_key_count=len(failed_keys),
         **log_stats,
     )
+
+    if unextractable_keys:
+        # Reported here, apart from the retry manifest: the raw is archived,
+        # but no extractor can read it (no text layer, no page images).
+        logger.warning(
+            "Keys with no extractable text (not retried)",
+            unextractable_count=len(unextractable_keys),
+            unextractable_keys=unextractable_keys,
+        )
 
     if write_failed_manifest and failed_keys:
         manifest_bucket, manifest_key = _parse_s3_uri(write_failed_manifest)

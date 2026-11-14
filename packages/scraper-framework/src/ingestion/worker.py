@@ -241,8 +241,9 @@ SPLIT_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 
 #: The failure reason of a document no extractor could run on (#4968): no
 #: text to read and no page images.  In ``required`` mode that is a failed
-#: extraction, not "nothing to extract", so a reingest reports the key as
-#: failed (``--write-failed-manifest``) and leaves its rows as they are.
+#: extraction, not "nothing to extract", so a reingest leaves the key's rows
+#: as they are and reports it (``NoExtractableTextError``), apart from the
+#: retryable failures in ``--write-failed-manifest`` (#4983).
 NO_EXTRACTABLE_TEXT = "no extractable text: no text layer and no page images to extract from"
 
 
@@ -256,6 +257,17 @@ class SplitExtractionFailedError(RuntimeError):
     as failed, so ``--write-failed-manifest`` retries it.  Before, the
     worker wrote the whole document as one ruling on the parent row, next
     to the key's split children.
+    """
+
+
+class NoExtractableTextError(SplitExtractionFailedError):
+    """A split-set replacement of a document no extractor could run on
+    (``NO_EXTRACTABLE_TEXT``, #4968): no text to read and no page images.
+
+    The key's rows are left as they are, as for any failed extraction, but
+    a retry cannot succeed: the same bytes come back with the same missing
+    text layer.  A reingest reports such keys separately instead of in its
+    ``--write-failed-manifest`` retry list (#4983).
     """
 
 
@@ -5272,9 +5284,11 @@ class IngestionWorker:
         if extractor_unavailable:
             raise ExtractorUnavailableError(f"{s3_key or document_id}: {reason[:500]}")
         if replace_set:
-            raise SplitExtractionFailedError(
-                f"extraction failed for {s3_key or document_id}: {reason[:500]}"
-            )
+            error: type[SplitExtractionFailedError] = SplitExtractionFailedError
+            if reason == NO_EXTRACTABLE_TEXT:
+                # Nothing could be read: a retry cannot succeed (#4983).
+                error = NoExtractableTextError
+            raise error(f"extraction failed for {s3_key or document_id}: {reason[:500]}")
         if key_has_rows:
             # Nothing is written for this event: end the transaction the
             # read opened, keeping the best-effort telemetry rows logged

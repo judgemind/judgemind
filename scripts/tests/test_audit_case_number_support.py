@@ -366,3 +366,155 @@ def test_main_wires_inputs(monkeypatch) -> None:
     )
     monkeypatch.setattr(audit, "production_gate", lambda: _gate({"a.pdf": b"%PDF"}))
     assert audit.main(["Orange"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# No-text PDF mode (#4983)
+# ---------------------------------------------------------------------------
+
+
+def test_county_prefix_and_raw_pdf_keys() -> None:
+    assert audit.county_prefix("Santa Clara") == "ca/santa_clara/"
+    assert audit.is_raw_pdf_key("ca/fresno/superior/raw/abc.pdf")
+    assert audit.is_raw_pdf_key("ca/fresno/superior/raw/2026/03/17/u-u-i-d.pdf")
+    assert not audit.is_raw_pdf_key("ca/fresno/superior/raw/abc.html")
+    assert not audit.is_raw_pdf_key("ca/fresno/superior/meta/abc.pdf")
+
+
+def test_no_text_mode_reports_scanned_pdfs_with_ruling_counts() -> None:
+    gate = _gate(
+        {
+            "ca/x/c/raw/scan.pdf": b"%PDF1",
+            "ca/x/c/raw/short.pdf": b"%PDF2",
+            "ca/x/c/raw/text.pdf": b"%PDF3",
+        },
+        extract_pdf=lambda content: {b"%PDF1": "", b"%PDF2": "  tiny  "}.get(
+            content, LONG
+        ),
+    )
+    lines: list[str] = []
+    reports = audit.run_no_text(
+        _args("--no-text-pdfs", "Riverside", "--workers", "2"),
+        {
+            "Riverside": [
+                "ca/x/c/raw/scan.pdf",
+                "ca/x/c/raw/short.pdf",
+                "ca/x/c/raw/text.pdf",
+                "ca/x/c/raw/missing.pdf",
+            ]
+        },
+        {"ca/x/c/raw/short.pdf": 3},
+        gate,
+        None,
+        out=lines.append,
+    )
+    summary = reports[0].summary()
+    assert summary["pdf_keys"] == 4
+    assert summary["no_text"] == 2
+    assert summary["no_text_zero_rulings"] == 1
+    assert summary["no_text_rulings"] == 3
+    assert summary["error"] == 1
+    assert "NO_TEXT Riverside key=ca/x/c/raw/short.pdf chars=4 rulings=3" in lines
+    assert audit.no_text_key_list(reports) == (
+        "ca/x/c/raw/scan.pdf\nca/x/c/raw/short.pdf\n"
+    )
+
+
+def test_no_text_mode_honours_keys_and_limit() -> None:
+    gate = _gate({"a.pdf": b"%PDF", "b.pdf": b"%PDF"}, extract_pdf=lambda c: "")
+    reports = audit.run_no_text(
+        _args("--no-text-pdfs", "Fresno", "--limit", "1"),
+        {"Fresno": ["b.pdf", "a.pdf", "c.pdf"]},
+        {},
+        gate,
+        {"a.pdf", "b.pdf"},
+        out=lambda line: None,
+    )
+    assert [k for k, _, _ in reports[0].no_text] == ["a.pdf"]
+
+
+def test_write_keys_needs_no_text_mode_and_s3_uri() -> None:
+    with pytest.raises(SystemExit):
+        _args("--write-keys", "s3://b/k")
+    with pytest.raises(SystemExit):
+        _args("--no-text-pdfs", "--write-keys", "local.txt")
+    assert _args("--no-text-pdfs", "--write-keys", "s3://b/k").write_keys == "s3://b/k"
+
+
+def test_list_county_pdf_keys_and_ruling_counts(monkeypatch) -> None:
+    class Paginator:
+        def paginate(self, Bucket, Prefix):
+            assert Bucket == "bkt"
+            yield {
+                "Contents": [
+                    {"Key": f"{Prefix}sup/raw/a.pdf"},
+                    {"Key": f"{Prefix}sup/raw/a.html"},
+                ]
+            }
+
+    class S3:
+        def get_paginator(self, name):
+            return Paginator()
+
+    assert audit.list_county_pdf_keys(S3(), "bkt", ["San Francisco"]) == {
+        "San Francisco": ["ca/san_francisco/sup/raw/a.pdf"]
+    }
+
+    executed: list[tuple] = []
+
+    class Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params):
+            executed.append(params)
+
+        def fetchall(self):
+            return [(executed[-1][0].replace("%", "k.pdf"), 2)]
+
+    class Conn(Cur):
+        def cursor(self):
+            return Cur()
+
+    class FakePsycopg:
+        @staticmethod
+        def connect(url):
+            return Conn()
+
+    monkeypatch.setitem(sys.modules, "psycopg", FakePsycopg)
+    counts = audit.fetch_ruling_counts("postgres://x", ["Fresno"])
+    assert executed == [("ca/fresno/%",)]
+    assert counts == {"ca/fresno/k.pdf": 2}
+
+
+def test_main_no_text_writes_key_list(monkeypatch) -> None:
+    puts: list[dict] = []
+
+    class S3:
+        def put_object(self, **kw):
+            puts.append(kw)
+
+    class FakeBoto3:
+        @staticmethod
+        def client(name):
+            return S3()
+
+    monkeypatch.setitem(sys.modules, "boto3", FakeBoto3)
+    monkeypatch.setenv("DATABASE_URL", "postgres://x")
+    monkeypatch.setattr(
+        audit, "list_county_pdf_keys", lambda s3, b, counties: {"Fresno": ["a.pdf"]}
+    )
+    monkeypatch.setattr(audit, "fetch_ruling_counts", lambda url, counties: {})
+    monkeypatch.setattr(
+        audit,
+        "production_gate",
+        lambda: _gate({"a.pdf": b"%PDF"}, extract_pdf=lambda c: ""),
+    )
+    assert (
+        audit.main(["Fresno", "--no-text-pdfs", "--write-keys", "s3://bkt/tmp/k.txt"])
+        == 0
+    )
+    assert puts == [{"Bucket": "bkt", "Key": "tmp/k.txt", "Body": b"a.pdf\n"}]

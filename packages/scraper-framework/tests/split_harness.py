@@ -70,6 +70,9 @@ properties that must hold for any sequence of re-splits:
   result reports the key as failed.  A split-set replacement (``reingest`` /
   ``db``) raises ``SplitExtractionFailedError``, which the reingest's
   per-key handler counts, so ``--write-failed-manifest`` retries the key;
+  a text-first county's document with no text raises its subclass
+  ``NoExtractableTextError``, which the reingest reports apart from the
+  retry list, since a retry reads the same bytes (#4983);
   a missing extractor raises ``ExtractorUnavailableError`` on every step
   kind, a live capture included, so the live worker keeps the message for
   after its restart (#4948, #4953, #4968).
@@ -1437,9 +1440,13 @@ class KeyHarness:
         # key as failed (#4948, #4968); a live capture does not raise.  A
         # missing extractor raises on every step kind (#4953).
         expect_failed = unavailable or (outcome == "failed" and step.kind != "live")
-        expected_error = (
-            "ExtractorUnavailableError" if unavailable else "SplitExtractionFailedError"
-        )
+        if unavailable:
+            expected_error = "ExtractorUnavailableError"
+        elif self._unextractable(step):
+            # Nothing could be read: reported, never retried (#4983).
+            expected_error = "NoExtractableTextError"
+        else:
+            expected_error = "SplitExtractionFailedError"
         reported_failed = False
         logged_before = self.events[_EXTRACTION_FAILED_EVENT]
         try:
@@ -1689,6 +1696,18 @@ class KeyHarness:
         if all_missing or mode == f"{needed}_missing":
             return "unavailable"
         return "failed" if mode == "all" else "ok"
+
+    def _unextractable(self, step: Step) -> bool:
+        """A text-first county's step with no text: no extractor can run,
+        so the failure is ``NoExtractableTextError`` (#4968, #4983)."""
+        from framework.extraction_config import ExtractionMethod
+
+        config = profile_config(step.profile)
+        return (
+            config is not None
+            and config.method == ExtractionMethod.LLM
+            and not self._step_doc(step)
+        )
 
     def _break_extractors(self, step: Step, mode: str) -> None:
         """Make the extractors the step lacks unbuildable, and drop the
