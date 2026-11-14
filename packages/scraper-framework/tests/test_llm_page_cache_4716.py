@@ -676,3 +676,103 @@ class TestWellFormedShapesStillParse:
             ok, rows = _parse_page_rows_with_status(json.dumps({key: [item]}), 0)
             assert ok is True
             assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# #4940 — ``strict``: an empty result means the document holds no rulings
+# ---------------------------------------------------------------------------
+
+
+class TestStrictEmptyResult:
+    """With ``strict=True`` an empty result is a verdict on the document; a
+    failed call raises ``ExtractionIncompleteError`` instead.  The worker
+    replaces a key's split set with the whole document only on a verdict."""
+
+    def test_failed_page_with_no_rows_raises(self) -> None:
+        from framework.llm_extractor import ExtractionIncompleteError
+
+        ext = _make_extractor(None)
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES[:2]),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=_by_image(
+                    {b"\x89PNG_page1": [EMPTY_PAGE_JSON], b"\x89PNG_page2": [None]}
+                ),
+            ),
+            pytest.raises(ExtractionIncompleteError),
+        ):
+            ext.extract_from_pdf(b"pdf-bytes", strict=True)
+
+    def test_failed_page_without_strict_still_returns_empty(self) -> None:
+        ext = _make_extractor(None)
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES[:1]),
+            patch("ingestion.llm_providers.call_llm_with_images", return_value=None),
+        ):
+            assert ext.extract_from_pdf(b"pdf-bytes") == []
+
+    def test_every_page_answered_with_no_rows_is_empty(self) -> None:
+        ext = _make_extractor(None)
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=PAGES[:2]),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[_resp(EMPTY_PAGE_JSON), _resp(BOILERPLATE_PAGE_JSON)],
+            ),
+        ):
+            assert ext.extract_from_pdf(b"pdf-bytes", strict=True) == []
+
+    def test_no_page_rendered_raises(self) -> None:
+        from framework.llm_extractor import ExtractionIncompleteError
+
+        ext = _make_extractor(None)
+        with (
+            patch("framework.llm_extractor._render_pdf_pages", return_value=[]),
+            pytest.raises(ExtractionIncompleteError),
+        ):
+            ext.extract_from_pdf(b"pdf-bytes", strict=True)
+
+    def test_failed_text_chunk_raises(self) -> None:
+        from framework.llm_extractor import ExtractionIncompleteError
+
+        ext = _make_extractor(None)
+        with (
+            patch.object(ext, "_extract_chunk_with_retry", return_value=[]),
+            pytest.raises(ExtractionIncompleteError),
+        ):
+            ext.extract("Tentative rulings for the civil calendar.", strict=True)
+        with patch.object(ext, "_extract_chunk_with_retry", return_value=[]):
+            assert ext.extract("Tentative rulings for the civil calendar.") == []
+
+    def test_one_failed_chunk_of_several_with_no_rulings_raises(self) -> None:
+        from framework.llm_extractor import ExtractionIncompleteError, ExtractionResult
+
+        ext = _make_extractor(None)
+        answered = [ExtractionResult(rulings=[])]
+        with (
+            patch.object(ext, "_split_into_chunks", return_value=["first", "second"]),
+            patch.object(ext, "_extract_chunk_with_retry", side_effect=[answered, []]),
+            pytest.raises(ExtractionIncompleteError),
+        ):
+            ext.extract("first second", strict=True)
+
+    def test_every_chunk_failed_raises(self) -> None:
+        from framework.llm_extractor import ExtractionIncompleteError
+
+        ext = _make_extractor(None)
+        with (
+            patch.object(ext, "_split_into_chunks", return_value=["first", "second"]),
+            patch.object(ext, "_extract_chunk_with_retry", return_value=[]),
+            pytest.raises(ExtractionIncompleteError),
+        ):
+            ext.extract("first second", strict=True)
+
+    def test_answered_text_with_no_rulings_is_empty(self) -> None:
+        from framework.llm_extractor import ExtractionResult
+
+        ext = _make_extractor(None)
+        with patch.object(
+            ext, "_extract_chunk_with_retry", return_value=[ExtractionResult(rulings=[])]
+        ):
+            assert ext.extract("Tentative rulings for the civil calendar.", strict=True) == []

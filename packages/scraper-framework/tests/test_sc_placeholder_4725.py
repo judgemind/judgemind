@@ -234,9 +234,12 @@ def test_sc_placeholder_gate_is_santa_clara_pdf_only(
             event, event["document_id"], NOTICE, "CA", event["county"], raw_pdf_bytes=None
         )
 
-    assert handled is False
+    # The extraction found no rulings, so the document is the split's one
+    # child (#4940), not a placeholder with none.
+    assert handled is True
     text_extractor.extract.assert_called_once()
     assert "santa_clara_placeholder_skipped" not in [r.getMessage() for r in caplog.records]
+    assert "Orphan document: no rulings extracted" in [r.getMessage() for r in caplog.records]
 
 
 # ---------------------------------------------------------------------------

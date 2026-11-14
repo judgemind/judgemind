@@ -396,13 +396,13 @@ _MODEL_OPS = (
 )
 _JUDGE_OPS = ("judge_typo", "judge_initial", "judge_roster", "judge_printed")
 
-#: Whether generated seeds include ``whole`` steps.  Off until #4940 is
-#: fixed: a whole-document reingest is not a split-set replacement, so it
-#: keeps the key's earlier split children (and their cases), keeps a
-#: ruling on its old placeholder case, and leaves the old ruling in place
-#: when the document is rejected.  ``test_known_bug`` pins seeds that
-#: reproduce it with whole steps on.
-WHOLE_DOCUMENT_STEPS = False
+#: Whether generated seeds include ``whole`` steps.  On since #4940: a
+#: whole document is the one child of a split set, written by the same
+#: split-set write as any re-split, so it replaces the key's earlier
+#: children, leaves a placeholder case for a real number, and a rejected
+#: document leaves the key with no rows.  ``test_known_bug`` pins the seeds
+#: that broke before the fix.
+WHOLE_DOCUMENT_STEPS = True
 
 _DOC_FILLER = (
     "The court has read and considered the moving, opposition and reply papers. "

@@ -39,7 +39,7 @@ from framework.llm_extractor import (
 from framework.llm_schema import ExtractedRuling
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig
 from ingestion.split_ids import make_split_document_id
-from ingestion.worker import IngestionWorker
+from ingestion.worker import WHOLE_DOCUMENT_KEY, IngestionWorker
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PDF_FIXTURE = FIXTURES / "oc_mccartney_c61_fused_tail.pdf"
@@ -364,24 +364,96 @@ def test_worker_skips_zero_ruling_pdf_with_no_text(
     assert "llm_split.zero_rulings_no_text_skipped" in messages
 
 
-def test_worker_zero_ruling_pdf_with_text_still_falls_through() -> None:
-    """When fallback text exists, keep the single-document path unchanged."""
+def test_worker_zero_ruling_pdf_with_text_is_the_split_s_one_child() -> None:
+    """When fallback text exists, the document is written as one ruling: the
+    one child of the key's split set (#4940), so the split-set write replaces
+    the key's earlier children instead of leaving them next to it."""
     worker = _make_worker()
     multimodal = MagicMock()
     multimodal.extract_from_pdf.return_value = []
     worker._multimodal_extractor = multimodal
     event = _event()
 
-    handled = worker._llm_split_document(
-        event,
-        event["document_id"],
-        "Case No. 2024-01234567 The motion is GRANTED.",
-        "CA",
-        "Orange",
-        raw_pdf_bytes=b"%PDF-1.7",
-    )
+    with (
+        patch.object(worker, "_dispatch_split_child") as dispatch,
+        patch.object(worker, "_write_split_batch"),
+    ):
+        handled = worker._llm_split_document(
+            event,
+            event["document_id"],
+            "Case No. 2024-01234567 The motion is GRANTED.",
+            "CA",
+            "Orange",
+            raw_pdf_bytes=b"%PDF-1.7",
+        )
+
+    assert handled is True
+    assert multimodal.extract_from_pdf.call_args.kwargs["strict"] is True
+    batch, child = dispatch.call_args.args
+    assert child[WHOLE_DOCUMENT_KEY] is True
+    assert child["document_id"] == event["document_id"]
+    assert batch.whole_document is True
+
+
+def test_worker_failed_pdf_extraction_leaves_the_split_set_alone() -> None:
+    """A failed extraction (every page's API call failed) is not a verdict on
+    the document: the caller writes it on its own, as before, and the key's
+    split set is not replaced (#4940)."""
+    from framework.llm_extractor import ExtractionIncompleteError
+
+    worker = _make_worker()
+    multimodal = MagicMock()
+    multimodal.extract_from_pdf.side_effect = ExtractionIncompleteError("PDF pages [0] failed")
+    worker._multimodal_extractor = multimodal
+    text = MagicMock()
+    text.extract.side_effect = ExtractionIncompleteError("text extraction failed")
+    event = _event()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_dispatch_split_child") as dispatch,
+        patch.object(worker, "_write_split_batch") as write,
+    ):
+        handled = worker._llm_split_document(
+            event,
+            event["document_id"],
+            "Case No. 2024-01234567 The motion is GRANTED.",
+            "CA",
+            "Orange",
+            raw_pdf_bytes=b"%PDF-1.7",
+        )
 
     assert handled is False
+    assert text.extract.call_args.kwargs["strict"] is True
+    dispatch.assert_not_called()
+    write.assert_not_called()
+
+
+def test_worker_text_with_nothing_to_read_is_not_a_verdict() -> None:
+    """Multimodal failed and the fallback text is blank: the empty result says
+    nothing about the document, so no whole-document split (#4940)."""
+    from framework.llm_extractor import ExtractionIncompleteError
+
+    worker = _make_worker()
+    multimodal = MagicMock()
+    multimodal.extract_from_pdf.side_effect = ExtractionIncompleteError("no PDF page rendered")
+    worker._multimodal_extractor = multimodal
+    text = MagicMock()
+    text.extract.return_value = []
+    event = _event()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=text),
+        patch.object(worker, "_get_county_extractor", return_value=text),
+        patch.object(worker, "_dispatch_split_child") as dispatch,
+    ):
+        handled = worker._llm_split_document(
+            event, event["document_id"], "   ", "CA", "Orange", raw_pdf_bytes=b"%PDF-1.7"
+        )
+
+    assert handled is False
+    dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
