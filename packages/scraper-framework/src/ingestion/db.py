@@ -232,28 +232,53 @@ def _derive_court_code(state: str, county: str) -> str:
     return f"{state.lower()}-{county.lower().replace(' ', '-')}"
 
 
+#: ``RETURNING`` column of the court / case upserts: whether the upsert
+#: changed a field an existing row shows on search docs (#4935).  The
+#: sub-select reads the table with the statement's snapshot, so ``prev`` is
+#: the row as it was before this upsert; an INSERT (``xmax = 0``) changes no
+#: existing doc.  A conflict with no ``prev`` row (another transaction
+#: inserted it meanwhile) counts as a change, so a doc can only be
+#: re-indexed needlessly, never missed.
+_COURT_SHOWN_CHANGED_SQL = (
+    "(NOT (xmax = 0) AND NOT EXISTS (SELECT 1 FROM courts prev WHERE prev.id = courts.id "
+    "AND prev.court_name IS NOT DISTINCT FROM courts.court_name)) AS shown_changed"
+)
+_CASE_SHOWN_CHANGED_SQL = (
+    "(NOT (xmax = 0) AND NOT EXISTS (SELECT 1 FROM cases prev WHERE prev.id = cases.id "
+    "AND prev.case_title IS NOT DISTINCT FROM cases.case_title "
+    "AND prev.case_type IS NOT DISTINCT FROM cases.case_type)) AS shown_changed"
+)
+
+
 def upsert_court(
     conn: psycopg.Connection,
     state: str,
     county: str,
     court_name: str,
     timezone: str = "America/Los_Angeles",
+    *,
+    changed_court_ids: set[str] | None = None,
 ) -> str:
     """Upsert a court row and return its UUID.
 
     Uses court_code (derived from state + county) as the natural key.
     On conflict, updates court_name and timezone to keep the record fresh.
+
+    Every search doc of the court's rulings shows ``court_name``.  When this
+    upsert changes the name of an existing court, the court's id is added to
+    *changed_court_ids* (when given), and the caller re-indexes the court's
+    rulings once it commits (``reindex_dependent_rulings``, #4935).
     """
     court_code = _derive_court_code(state, county)
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO courts (state, county, court_name, court_code, timezone)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (court_code) DO UPDATE
                 SET court_name = EXCLUDED.court_name,
                     timezone   = EXCLUDED.timezone
-            RETURNING id
+            RETURNING id, {_COURT_SHOWN_CHANGED_SQL}
             """,
             (state, county, court_name, court_code, timezone),
         )
@@ -261,8 +286,25 @@ def upsert_court(
     if row is None:
         raise RuntimeError(f"upsert_court returned no row for court_code={court_code!r}")
     court_id: str = str(row[0])
+    if changed_court_ids is not None and len(row) > 1 and row[1] is True:
+        changed_court_ids.add(court_id)
     logger.debug("upsert_court: court_code=%s id=%s", court_code, court_id)
     return court_id
+
+
+def lookup_court_id(conn: psycopg.Connection, state: str, county: str) -> str | None:
+    """Return the id of the court for *state* / *county*, or None.
+
+    For readers that only need the court's id: ``upsert_court`` rewrites the
+    court's name, a change the ruling write records and re-indexes (#4935).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM courts WHERE court_code = %s",
+            (_derive_court_code(state, county),),
+        )
+        row = cur.fetchone()
+    return str(row[0]) if row else None
 
 
 def upsert_case(
@@ -273,6 +315,7 @@ def upsert_case(
     case_type: str | None = None,
     *,
     force_update: bool = False,
+    changed_case_ids: set[str] | None = None,
 ) -> str:
     """Upsert a case row and return its UUID.
 
@@ -305,50 +348,23 @@ def upsert_case(
     ``force_update`` semantic already used by ``insert_document`` /
     ``insert_ruling`` (#2405).
 
+    Every search doc of the case's rulings shows ``case_title`` and
+    ``case_type``.  When the upsert changes either on an existing case, the
+    case's id is added to *changed_case_ids* (when given), and the caller
+    re-indexes the case's rulings once it commits
+    (``reindex_dependent_rulings``, #4935).
+
     Returns the case UUID as a string.  To also retrieve the effective
     case_title (after COALESCE), use ``upsert_case_returning_title()``.
     """
-    normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
-    case_title = normalize_case_title(_strip_nul(case_title))
-    case_type = _strip_nul(case_type)
-    # Build ON CONFLICT set clauses based on force_update mode.  The default
-    # (preserve-existing) mode guards live ingestion against silent identity
-    # rewrites (#2468).  The force_update mode lets reingest correct
-    # previously-stuck values (#2431) while still never erasing a good
-    # existing value with a NULL incoming — EXCLUDED=NULL → COALESCE falls
-    # through to cases.case_title / cases.case_type.
-    if force_update:
-        case_title_clause = "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)"
-        case_type_clause = "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)"
-    else:
-        case_title_clause = "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)"
-        case_type_clause = "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)"
-
-    sql = f"""
-        INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
-        VALUES (%s, %s, %s::uuid, %s, %s)
-        ON CONFLICT (court_id, case_number) DO UPDATE
-            SET {case_title_clause},
-                {case_type_clause}
-        RETURNING id
-        """
-    with conn.cursor() as cur:
-        cur.execute(
-            sql,
-            (case_number, normalized, court_id, case_title, case_type),
-        )
-        row = cur.fetchone()
-    if row is None:
-        raise RuntimeError(
-            f"upsert_case: could not retrieve case id for case_number={case_number!r}"
-        )
-    case_id: str = str(row[0])
-    logger.debug(
-        "upsert_case: case_number=%s case_title=%s case_type=%s id=%s",
+    case_id, _title = upsert_case_returning_title(
+        conn,
         case_number,
-        case_title,
-        case_type,
-        case_id,
+        court_id,
+        case_title=case_title,
+        case_type=case_type,
+        force_update=force_update,
+        changed_case_ids=changed_case_ids,
     )
     return case_id
 
@@ -361,6 +377,7 @@ def upsert_case_returning_title(
     case_type: str | None = None,
     *,
     force_update: bool = False,
+    changed_case_ids: set[str] | None = None,
 ) -> tuple[str, str | None]:
     """Upsert a case row and return ``(case_id, effective_case_title)``.
 
@@ -387,11 +404,18 @@ def upsert_case_returning_title(
     — we never erase a good existing value with an incoming NULL.  Mirrors
     the ``force_update`` semantic already used by ``insert_document`` /
     ``insert_ruling`` (#2405).
+
+    *changed_case_ids*: see ``upsert_case`` (#4935).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = normalize_case_title(_strip_nul(case_title))
     case_type = _strip_nul(case_type)
-    # See ``upsert_case`` for the full force_update rationale (#2431 / #2468).
+    # Build ON CONFLICT set clauses based on force_update mode.  The default
+    # (preserve-existing) mode guards live ingestion against silent identity
+    # rewrites (#2468).  The force_update mode lets reingest correct
+    # previously-stuck values (#2431) while still never erasing a good
+    # existing value with a NULL incoming — EXCLUDED=NULL → COALESCE falls
+    # through to cases.case_title / cases.case_type.
     if force_update:
         case_title_clause = "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)"
         case_type_clause = "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)"
@@ -405,7 +429,7 @@ def upsert_case_returning_title(
         ON CONFLICT (court_id, case_number) DO UPDATE
             SET {case_title_clause},
                 {case_type_clause}
-        RETURNING id, case_title
+        RETURNING id, case_title, {_CASE_SHOWN_CHANGED_SQL}
         """
     with conn.cursor() as cur:
         cur.execute(
@@ -419,6 +443,8 @@ def upsert_case_returning_title(
         )
     case_id: str = str(row[0])
     effective_title: str | None = row[1] if len(row) > 1 else None
+    if changed_case_ids is not None and len(row) > 2 and row[2] is True:
+        changed_case_ids.add(case_id)
     logger.debug(
         "upsert_case_returning_title: case_number=%s case_title=%s effective_title=%s id=%s",
         case_number,
@@ -1809,7 +1835,8 @@ def resolve_judge(
     ruling being written, so the id of each renamed judge is added to
     *renamed_judge_ids* when the caller passes a set.  The caller re-indexes
     those judges' rulings once its transaction commits
-    (``framework.search.ruling_doc.reindex_judge_rulings``, #4920).
+    (``framework.search.ruling_doc.reindex_dependent_rulings``, #4920,
+    #4935).
 
     Lookup strategy:
       1. Normalize the raw name and validate it.

@@ -226,9 +226,17 @@ def discover_courts(keys: list[str]) -> list[dict[str, str]]:
 
 
 def seed_courts(
-    conn: psycopg.Connection, courts: list[dict[str, str]]
+    conn: psycopg.Connection,
+    courts: list[dict[str, str]],
+    *,
+    changed_court_ids: set[str] | None = None,
 ) -> dict[str, str]:
-    """Insert courts and return {court_code: court_id} mapping."""
+    """Insert courts and return {court_code: court_id} mapping.
+
+    Every search doc of a court's rulings shows its name, county and state.
+    The id of an existing court whose shown fields this changes is added to
+    *changed_court_ids*, for the caller to re-index once committed (#4935).
+    """
     court_ids: dict[str, str] = {}
     with conn.cursor() as cur:
         for court in courts:
@@ -240,7 +248,16 @@ def seed_courts(
                     SET state = EXCLUDED.state,
                         county = EXCLUDED.county,
                         court_name = EXCLUDED.court_name
-                RETURNING id
+                RETURNING id,
+                    -- The sub-select sees the row as it was before this
+                    -- statement; an INSERT (xmax = 0) changes no doc.
+                    (NOT (xmax = 0) AND NOT EXISTS (
+                        SELECT 1 FROM courts prev
+                        WHERE prev.id = courts.id
+                          AND prev.state IS NOT DISTINCT FROM courts.state
+                          AND prev.county IS NOT DISTINCT FROM courts.county
+                          AND prev.court_name IS NOT DISTINCT FROM courts.court_name
+                    )) AS shown_changed
                 """,
                 (
                     court["state"],
@@ -252,8 +269,40 @@ def seed_courts(
             )
             row = cur.fetchone()
             court_ids[court["court_code"]] = str(row[0])
+            if changed_court_ids is not None and len(row) > 1 and row[1] is True:
+                changed_court_ids.add(str(row[0]))
     conn.commit()
     return court_ids
+
+
+def reindex_renamed_courts(
+    dsn: str, os_url: str, bucket: str, court_ids: set[str]
+) -> None:
+    """Re-index every ruling of the courts ``seed_courts`` renamed (#4935).
+
+    Best-effort: the index is derivable from ``derived.*``, so a failure is
+    logged with the repair command.
+    """
+    if not court_ids or not os_url:
+        return
+    try:
+        from framework.search.ruling_doc import (
+            ShownRowChanges,
+            reindex_dependent_rulings_at,
+        )
+
+        count = reindex_dependent_rulings_at(
+            dsn, os_url, bucket, ShownRowChanges(court_ids=set(court_ids))
+        )
+    except Exception:
+        logger.warning(
+            "renamed_courts_reindex_failed — run "
+            "scripts/reindex_search_from_db.py --apply to repair",
+            court_ids=sorted(court_ids),
+            exc_info=True,
+        )
+        return
+    logger.info("renamed_courts_reindexed", court_ids=sorted(court_ids), rulings=count)
 
 
 def list_s3_keys(s3_client: Any, bucket: str, prefix: str = "ca/") -> list[str]:
@@ -1981,8 +2030,12 @@ def main() -> None:
             count=len(courts),
             courts=[c["court_code"] for c in courts],
         )
-        court_ids = seed_courts(conn, courts)
+        changed_court_ids: set[str] = set()
+        court_ids = seed_courts(conn, courts, changed_court_ids=changed_court_ids)
         logger.info("Courts seeded", court_ids=court_ids)
+        # A renamed court changes the search docs of its rulings on every
+        # key, including keys this run does not rebuild (#4935).
+        reindex_renamed_courts(database_url, os_url, BUCKET, changed_court_ids)
 
         # Step 3: Process documents using child processes.
         # pdfplumber/pdfminer C extensions are not thread-safe — ProcessPoolExecutor
