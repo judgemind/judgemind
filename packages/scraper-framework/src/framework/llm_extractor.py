@@ -57,6 +57,19 @@ from .title_heuristics import (
 
 logger = structlog.get_logger(__name__)
 
+
+class ExtractionIncompleteError(RuntimeError):
+    """An extraction returned no rulings because part of it failed.
+
+    Raised by ``LlmExtractor.extract`` / ``extract_from_pdf`` only when the
+    caller passes ``strict=True``.  Without it they return ``[]``, which a
+    caller cannot tell apart from a document that holds no rulings.  The
+    ingestion worker replaces a key's split set with the whole document
+    only on a complete empty result (#4940): a failed LLM call is not a
+    verdict on the document.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Token usage tracking
 # ---------------------------------------------------------------------------
@@ -3304,6 +3317,7 @@ class LlmExtractor:
         system_prompt: str | None = None,
         bust_cache: bool = False,
         document_id: str | None = None,
+        strict: bool = False,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from raw calendar page text.
 
@@ -3333,6 +3347,10 @@ class LlmExtractor:
                 source document and group by ``chunk_content_sha256``
                 (#4233 / #4253).  Has no effect on cache key (kept out of
                 metadata).
+            strict: When ``True``, raise :class:`ExtractionIncompleteError`
+                instead of returning an empty list when a chunk's API call
+                failed, so an empty result always means the document holds
+                no rulings (#4940).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -3355,6 +3373,7 @@ class LlmExtractor:
 
         chunks = self._split_into_chunks(text)
         usage = TokenUsage()
+        failed_chunks: list[int] = []
 
         if len(chunks) == 1:
             results = self._extract_chunk_with_retry(
@@ -3366,6 +3385,8 @@ class LlmExtractor:
             )
             self._log_usage(usage)
             if not results:
+                if strict:
+                    raise ExtractionIncompleteError("text extraction failed")
                 return []
             merged = self._merge_results(results)
             rulings = self._propagate_document_fields(merged)
@@ -3386,11 +3407,15 @@ class LlmExtractor:
                     system_prompt=system_prompt,
                     document_id=document_id,
                 )
+                if not results:
+                    failed_chunks.append(i)
                 all_results.extend(results)
 
             self._log_usage(usage)
 
             if not all_results:
+                if strict:
+                    raise ExtractionIncompleteError("text extraction failed on every chunk")
                 return []
 
             merged = self._merge_results(all_results)
@@ -3419,6 +3444,10 @@ class LlmExtractor:
         # No-op on non-SB documents (scoped to CIVSB/CIVRS case numbers).
         rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
 
+        if strict and failed_chunks and not rulings:
+            # The failed chunks may hold the rulings the others did not.
+            raise ExtractionIncompleteError(f"text extraction failed on chunks {failed_chunks}")
+
         # Write to cache
         if self._cache is not None and rulings:
             self._cache.put(
@@ -3437,6 +3466,7 @@ class LlmExtractor:
         max_pages: int = 50,
         bust_cache: bool = False,
         document_id: str | None = None,
+        strict: bool = False,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from PDF page images (multimodal).
 
@@ -3472,6 +3502,10 @@ class LlmExtractor:
                 response, so future log queries can correlate failures
                 back to the source document and group by the page-image
                 ``chunk_content_sha256`` (#4233 / #4253).
+            strict: When ``True``, raise :class:`ExtractionIncompleteError`
+                instead of returning an empty list when rendering failed or
+                a page's API call failed, so an empty result always means
+                every page parsed and none holds a ruling (#4940).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -3510,6 +3544,8 @@ class LlmExtractor:
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
             logger.warning("llm_extractor.no_pages_rendered")
+            if strict:
+                raise ExtractionIncompleteError("no PDF page rendered")
             return []
 
         usage = TokenUsage()
@@ -3572,6 +3608,9 @@ class LlmExtractor:
 
         if not all_rows:
             logger.warning("llm_extractor.no_rows_extracted", page_count=len(page_images))
+            if strict and failed_pages:
+                # The failed pages may hold the rows: not a verdict (#4940).
+                raise ExtractionIncompleteError(f"PDF pages {failed_pages} failed")
             return []
 
         # Join rows into cases and convert to ExtractedRuling objects.  The

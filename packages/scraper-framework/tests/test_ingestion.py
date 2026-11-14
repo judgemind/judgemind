@@ -33,6 +33,7 @@ from ingestion.worker import (
     PENDING_RECLAIM_INTERVAL,
     PENDING_RECLAIM_MIN_IDLE_MS,
     STALE_CONSUMER_IDLE_MS,
+    WHOLE_DOCUMENT_KEY,
     InfrastructureError,
     IngestionWorker,
     _parse_date,
@@ -6699,6 +6700,8 @@ def test_llm_split_logs_orphan_warning_when_no_rulings_extracted(
     with (
         patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
         patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_dispatch_split_child") as dispatch,
+        patch.object(worker, "_write_split_batch"),
         caplog.at_level("WARNING", logger="ingestion.worker"),
     ):
         result = worker._llm_split_document(
@@ -6710,7 +6713,9 @@ def test_llm_split_logs_orphan_warning_when_no_rulings_extracted(
             raw_pdf_bytes=None,
         )
 
-    assert result is False
+    # The document is the split's one child (#4940).
+    assert result is True
+    assert dispatch.call_args.args[1][WHOLE_DOCUMENT_KEY] is True
     orphan_records = [
         r for r in caplog.records if r.message == "Orphan document: no rulings extracted"
     ]
@@ -6761,6 +6766,8 @@ def test_llm_split_writes_zero_ruling_extraction_metric_on_orphan(
         patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
         patch.object(worker, "_get_multimodal_extractor", return_value=None),
         patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch.object(worker, "_dispatch_split_child"),
+        patch.object(worker, "_write_split_batch"),
         caplog.at_level("WARNING", logger="ingestion.worker"),
     ):
         result = worker._llm_split_document(
@@ -6772,7 +6779,7 @@ def test_llm_split_writes_zero_ruling_extraction_metric_on_orphan(
             raw_pdf_bytes=None,
         )
 
-    assert result is False
+    assert result is True  # the whole-document child (#4940)
     # The orphan branch must have attempted a data_quality_metrics
     # INSERT inside a savepoint-protected block.
     executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]

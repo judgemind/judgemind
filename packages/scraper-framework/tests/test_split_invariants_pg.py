@@ -65,10 +65,6 @@ def test_postgres_is_configured_when_required() -> None:
 _OPEN_BUG_SEEDS: dict[int, tuple[str, str, bool]] = {
     # A reused ruling row keeps the previous ruling's judge (#4939).
     925: ("4939", "judge_converge", False),
-    # A whole-document reingest does not replace the key's split set
-    # (#4940); whole-document steps are off in the sweep until it is fixed.
-    21: ("4940", "evidence", True),
-    107: ("4940", "converge", True),
 }
 
 
@@ -105,8 +101,10 @@ def test_open_bug(seed: int, bug: str, invariant: str, whole: bool) -> None:
 #: A default-set seed that reaches each case-number evidence path (#4929):
 #: the gate refusing an extractor's number, a reingest moving a held ruling
 #: off a number its document lacks, and the gate refusing a fuzzy
-#: correction.  The whole-document move (``ruling_left_unsupported_case``)
-#: needs whole-document steps, off until #4940.
+#: correction.  Since #4940 a whole document's reingest moves a held ruling
+#: by the split-set write too (``split_ruling_left_unsupported_case``);
+#: ``ruling_left_unsupported_case`` is left to a document written after a
+#: failed extraction, which the harness does not generate.
 _EVIDENCE_PATH_SEEDS = {
     "case_number_unsupported": 3,
     "split_ruling_left_unsupported_case": 8,
@@ -167,6 +165,16 @@ _BUG_SEEDS = [
     # #4938 fix.  (41, 45, 120, 141, 146 and 196 fail the same way.)
     pytest.param("4938", 702, "judge_converge"),
     pytest.param("4938", 41, "judge_converge"),
+    # A whole-document reingest (the extractor finds no rulings) was written
+    # on its own, not as the key's split set.  Seed 21: an earlier split
+    # child stayed on the key under an invented number its document does
+    # not print.  Seed 107: the ruling stayed on its placeholder case when
+    # the whole document found a real number.  Seed 0: a rejected document
+    # kept the key's earlier ruling, where a fresh ingest stores nothing.
+    # Each fails on 7a82b210, the parent of the #4940 fix.
+    pytest.param("4940", 21, "evidence"),
+    pytest.param("4940", 107, "converge"),
+    pytest.param("4940", 0, "converge"),
 ]
 
 

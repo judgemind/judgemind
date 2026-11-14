@@ -219,6 +219,15 @@ def _markdown_to_html(text: str) -> str:
 #: Live scraper events never carry it (#4788).
 REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 
+#: Event key on the one child of a whole-document split (#4940): the
+#: extractor found no rulings in the document (a complete result, not a
+#: failed call), so the document is written as one ruling, the key's only
+#: split child.  The child keeps the parent's id and is processed as a
+#: whole document (its evidence, its content hash); only its write goes
+#: through the split-set write, so the key's earlier split children are
+#: replaced like any re-split's.
+WHOLE_DOCUMENT_KEY = "_whole_document"
+
 #: Event key set on split children whose ``case_number`` a deterministic
 #: splitter read from the source document (a CASE # cell, a ``Case No.:``
 #: header).  The enrichment step's fuzzy case-number correction is skipped
@@ -319,8 +328,10 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
     """Decide whether a reingest moves this document's ruling to *case_id*
     because its current case number is absent from the document (#4915).
 
-    Only for a whole document (a split child's text is not the whole
-    document; ``write_split_rulings`` handles LLM split children), only on a
+    Only for a whole document written on its own (a split child's text is
+    not the whole document; ``write_split_rulings`` handles LLM split
+    children and, since #4940, a whole document whose extraction found no
+    rulings, so this covers a document whose extraction failed), only on a
     reingest / rebuild (``REPLACE_SPLIT_SET_KEY``), only when the document
     text can settle it, and only off a real case number the evidence
     refutes (``case_number_refuted``).  A number the document prints keeps
@@ -1517,6 +1528,10 @@ class _SplitBatch:
     ``no_rulings_reason`` is set when the document is known to hold no
     rulings (e.g. a Santa Clara placeholder notice, #4725): the split is
     empty by design, not because every child was rejected.
+    ``whole_document`` is set when the split found no rulings and that is
+    a verdict on the document (a complete extraction, or a county whose
+    scraper extracts every field): the document is then the split's one
+    child (``WHOLE_DOCUMENT_KEY``, #4940).
     """
 
     parent_document_id: str
@@ -1524,6 +1539,7 @@ class _SplitBatch:
     keep_ids: set[str] = field(default_factory=set)
     replace: bool = False
     no_rulings_reason: str | None = None
+    whole_document: bool = False
 
 
 class InfrastructureError(Exception):
@@ -2958,7 +2974,14 @@ class IngestionWorker:
                 content_format == "pdf"
                 and (event_data.get("county") or "").upper() == "SANTA CLARA"
             )
-            if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
+            # A whole-document child (#4940) is past the split: the bytes
+            # are only for the splitters.
+            if (
+                raw_pdf_bytes is None
+                and content_format == "pdf"
+                and s3_key
+                and not event_data.get(WHOLE_DOCUMENT_KEY)
+            ):
                 # ``strategy.use_multimodal`` is True for ExtractionMethod.MULTIMODAL
                 # AND for unconfigured counties (the helper preserves the worker's
                 # pre-refactor default-multimodal behavior, #4081).
@@ -2991,8 +3014,11 @@ class IngestionWorker:
 
         # LLM extraction is the sole path for document splitting and
         # structured field extraction.  The legacy regex splitter framework
-        # was removed in #1475.
-        if not event_data.get("_split_processed"):
+        # was removed in #1475.  When the split finds no rulings and that is
+        # a verdict on the document, ``_llm_split_document`` writes the
+        # document as the split's one child (#4940); a failed extraction
+        # returns False and the document is written below as before.
+        if not event_data.get("_split_processed") and not event_data.get(WHOLE_DOCUMENT_KEY):
             llm_split = self._llm_split_document(
                 event_data,
                 document_id,
@@ -4095,12 +4121,12 @@ class IngestionWorker:
         )
 
         # A worker split writes all of its children in one transaction, after
-        # the last one is extracted (``_write_split_batch``, #4845).
+        # the last one is extracted (``_write_split_batch``, #4845).  So does
+        # a whole-document split, whose one child is the document (#4940).
         batch = self._split_batch
-        if (
-            batch is not None
-            and is_split
-            and event_data.get("_original_document_id") == batch.parent_document_id
+        if batch is not None and (
+            (is_split and event_data.get("_original_document_id") == batch.parent_document_id)
+            or (event_data.get(WHOLE_DOCUMENT_KEY) and document_id == batch.parent_document_id)
         ):
             batch.children.append(write)
             return
@@ -4390,8 +4416,11 @@ class IngestionWorker:
         return court_id, case_id, judge_id
 
     def _write_one_ruling(self, w: _RulingWrite) -> None:
-        """Write one ruling document (a non-split document, or a scraper
-        pre-split child that arrives as its own event) and index it."""
+        """Write one ruling document and index it: a scraper pre-split child
+        that arrives as its own event, or a document written whole because
+        its extraction failed or it had nothing to extract.  A document the
+        extractor found no rulings in is a split set of one, written by
+        ``_write_split_batch`` (#4940)."""
         conn = self._get_connection()
         try:
             court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
@@ -4539,13 +4568,15 @@ class IngestionWorker:
                         summary_model=w.summary_model,
                         summary_generated_at=w.summary_generated_at,
                         hearing_date_source=w.hearing_date_source,
-                        # Only an LLM split's children judge the number a
-                        # reused slot holds by the document text: a
-                        # deterministic child's text is its own slice, and
-                        # its slot's number can come from outside it.
+                        # Only an LLM split's children, and a whole
+                        # document (#4940), judge the number a reused slot
+                        # holds by the document text: a deterministic
+                        # child's text is its own slice, and its slot's
+                        # number can come from outside it.
                         case_number_evidence=(
                             w.case_number_evidence
                             if CASE_NUMBER_EVIDENCE_KEY in w.event_data
+                            or w.event_data.get(WHOLE_DOCUMENT_KEY)
                             else ()
                         ),
                     )
@@ -4600,11 +4631,17 @@ class IngestionWorker:
             )
         elif removed and not written and not batch.keep_ids:
             # Every child of this split was rejected (validation, all-NULL
-            # guard): the key now holds no rulings.  Worth a look when it
-            # happens to a key that had some.
+            # guard), the whole document included when the extractor found
+            # no rulings (#4940): the key now holds no rulings.  Worth a
+            # look when it happens to a key that had some.
             logger.warning(
                 "Split set replaced by an empty one: every child was rejected",
-                extra={"document_id": parent_document_id, "s3_key": s3_key, "stale_ids": removed},
+                extra={
+                    "document_id": parent_document_id,
+                    "s3_key": s3_key,
+                    "stale_ids": removed,
+                    "whole_document": batch.whole_document,
+                },
             )
         elif removed:
             logger.info(
@@ -4746,6 +4783,20 @@ class IngestionWorker:
         let readers see a half-replaced split, and a shifted split set
         dedup-superseded and deleted rulings between the child commits
         (#4820, #4836).
+
+        When the split finds no rulings and that is a verdict on the
+        document (``batch.whole_document``), the document itself is the
+        split's one child (#4940): it is processed as a whole document and
+        written by the same split-set write, so the key's earlier children
+        are removed, its case is re-derived (a placeholder left for a real
+        number, a real number its text does not print left for the
+        placeholder), and a document rejected by validation leaves the key
+        with no rows, as a fresh ingest does.  Before, it was written on its
+        own and kept whatever earlier splits had left on the key.
+
+        Returns False only when the caller must write the document itself:
+        the extraction failed (the key's rows are left alone, since a failed
+        LLM call is not a verdict), or there is nothing to extract.
         """
         batch = _SplitBatch(parent_document_id=document_id)
         outer = self._split_batch
@@ -4760,6 +4811,12 @@ class IngestionWorker:
                 raw_pdf_bytes=raw_pdf_bytes,
                 batch=batch,
             )
+            if not split and batch.whole_document:
+                # An exhausted per-field enrichment propagates from here,
+                # before any write: the result is unknown, so the key's rows
+                # stay as they are.
+                self._dispatch_split_child(batch, {**event_data, WHOLE_DOCUMENT_KEY: True})
+                split = True
         finally:
             self._split_batch = outer
         if split and batch.replace:
@@ -5037,6 +5094,9 @@ class IngestionWorker:
                     "scraper_id": event_scraper_id,
                 },
             )
+            # The scraper's fields are the document's: it is one ruling,
+            # the key's only split child (#4940).
+            batch.whole_document = True
             return False
 
         use_multimodal = strategy.use_multimodal
@@ -5056,10 +5116,13 @@ class IngestionWorker:
             )
             if multimodal_extractor is not None:
                 try:
+                    # ``strict``: a failed page raises instead of passing
+                    # for a document with no rulings (#4940).
                     extracted_rulings = multimodal_extractor.extract_from_pdf(
                         raw_pdf_bytes,
                         metadata=metadata or None,
                         document_id=document_id,
+                        strict=True,
                     )
                     extraction_method = "multimodal"
                     if extracted_rulings:
@@ -5128,6 +5191,7 @@ class IngestionWorker:
                     metadata=metadata or None,
                     system_prompt=county_prompt,
                     document_id=document_id,
+                    strict=True,
                 )
             except Exception as exc:
                 llm_latency_ms = round((time.monotonic() - t0) * 1000)
@@ -5229,7 +5293,21 @@ class IngestionWorker:
                         "county": county,
                     },
                 )
+                # The document holds no rulings: the key's split set is
+                # replaced by the empty one, as a fresh ingest leaves it
+                # (#4940).
+                batch.replace = True
+                batch.no_rulings_reason = "zero_rulings_no_text"
                 return True
+            # A complete extraction (every page or chunk answered) that
+            # found no rulings is a verdict: the document is one ruling, the
+            # key's only split child (#4940).  A failed one (``None``, or
+            # text with nothing to read) is not, and the caller writes the
+            # document without touching the key's other rows.
+            if extracted_rulings is not None and (
+                extraction_method == "multimodal" or (ruling_text or "").strip()
+            ):
+                batch.whole_document = True
             return False
 
         logger.info(
