@@ -16,6 +16,7 @@ from ingestion.extract import (
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_case_type_from_title,
+    extract_header_judge_name,
     extract_hearing_date,
     extract_judge_name,
     is_plausible_case_title,
@@ -126,6 +127,61 @@ class TestNormalizeOutcome:
 
 # ---------------------------------------------------------------------------
 # Motion type extraction
+#: The Orange calendar text that seeded the phantom judge of #4934: the
+#: header's presiding judge is printed with a leading initial no pattern
+#: matches, and a ruling body names a retired judge who mediated.
+_OC_MEDIATOR_TEXT = (
+    "TENTATIVE RULINGS\n"
+    "DEPT C34\n"
+    "JUDGE H. SHAINA COLOVER\n"
+    "LAW AND MOTION IS HEARD ON THURSDAY AT 1:30 P.M.\n"
+    "The issue of Ron's nonpayment of Ms. Chen's retainer was mediated\n"
+    "before the Honorable James P. Gray (Ret.) and Ron agreed to pay his 75% share.\n"
+)
+
+
+class TestExtractHeaderJudgeName:
+    """extract_header_judge_name() takes a labelled header field only (#4934)."""
+
+    def test_mediator_in_a_ruling_body_is_not_a_judge(self) -> None:
+        assert (extract_judge_name(_OC_MEDIATOR_TEXT) or "").startswith("James P. Gray")
+        assert extract_header_judge_name(_OC_MEDIATOR_TEXT) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "William A. Crowfoot Judge of the Superior Court",
+            "BEFORE THE HONORABLE BOBBY P. LUNA\nSome ruling text",
+            "as ordered by Hon. Elizabeth L. Bradley in the prior action",
+            "the matter was assigned to Judge Maria Gonzalez for trial",
+        ],
+    )
+    def test_body_text_patterns_are_skipped(self, text: str) -> None:
+        assert extract_judge_name(text) is not None
+        assert extract_header_judge_name(text) is None
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("JUDGE/DEPT: Mkrtchyan/25\nCase Number: 24STCV00001", "Mkrtchyan"),
+            ("DEPARTMENT 56 JUDGE STEVEN A. ELLIS\nHearing Date", "STEVEN A. ELLIS"),
+            ("Department S22 - Judge Bobby P. Luna\nCase 12345", "Bobby P. Luna"),
+            ("Presiding: JOHN A. SMITH\nDepartment 403", "JOHN A. SMITH"),
+            ("Department 2 - Honorable Jane B. Doe\nRuling on motion", "Jane B. Doe"),
+            ("JUDICIAL OFFICER: Maria L. Gonzalez\nDept 5", "Maria L. Gonzalez"),
+        ],
+    )
+    def test_header_fields_are_taken(self, text: str, expected: str) -> None:
+        assert extract_header_judge_name(text) == expected
+
+    def test_header_field_wins_over_a_body_mention(self) -> None:
+        text = (
+            "DEPARTMENT 56 JUDGE STEVEN A. ELLIS\n"
+            "The parties mediated before the Honorable James P. Gray (Ret.).\n"
+        )
+        assert extract_header_judge_name(text) == "STEVEN A. ELLIS"
+
+
 class TestExtractJudgeName:
     """Tests for extract_judge_name()."""
 

@@ -837,6 +837,21 @@ def normalize_motion_type(motion_type: str) -> str | None:
 # Patterns drawn from the California court scrapers.  Each targets a
 # different court's formatting style so the backfill can recover judge
 # names from ruling text that was already stored in the database.
+#
+# Patterns wrapped in ``_body_text(...)`` are not anchored to a labelled
+# presiding-judge field: a signature line, "before the Honorable X", a bare
+# "Hon. X" or "Judge X".  They also match a name a ruling body mentions, such
+# as a mediator ("mediated before the Honorable James P. Gray (Ret.)") or the
+# judge of another court, so ``extract_header_judge_name`` skips them (#4934).
+
+_BODY_TEXT_JUDGE_PATTERNS: list[re.Pattern[str]] = []
+
+
+def _body_text(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """Mark *pattern* as one that can match a name in a ruling body."""
+    _BODY_TEXT_JUDGE_PATTERNS.append(pattern)
+    return pattern
+
 
 _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
     # LA: "JUDGE/DEPT: <Surname>/<dept>" form-layout header (Dept-25
@@ -872,9 +887,11 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
     # see #4104).  Anchoring to the start of a line and capping the capture at
     # 80 characters bounds the work to O(n) and matches all real LA judge
     # signatures, which always start on their own line.
-    re.compile(
-        r"^([^\n]{1,80}?)\s+Judge of the Superior Court",
-        re.IGNORECASE | re.MULTILINE,
+    _body_text(
+        re.compile(
+            r"^([^\n]{1,80}?)\s+Judge of the Superior Court",
+            re.IGNORECASE | re.MULTILINE,
+        )
     ),
     # SB: "Department S22 - Judge Bobby P. Luna"
     re.compile(
@@ -882,7 +899,7 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
         re.IGNORECASE,
     ),
     # SB alternate: "BEFORE THE HONORABLE BOBBY P. LUNA"
-    re.compile(r"BEFORE THE HONORABLE\s+(?P<judge_name>[^\n]+)", re.IGNORECASE),
+    _body_text(re.compile(r"BEFORE THE HONORABLE\s+(?P<judge_name>[^\n]+)", re.IGNORECASE)),
     # SF: "Presiding: BOBBY P. LUNA"
     re.compile(r"Presiding:\s+(?P<judge_name>[A-Z][^\n]+)"),
     # Riverside / OC style: "Department 1 - Honorable John A. Smith"
@@ -899,25 +916,29 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
     # "Hon. John A. Smith" or "Honorable John A. Smith" (standalone, many courts).
     # Requires first+last name minimum.  Uses literal spaces (not \s) so names
     # do not span across newlines.  Supports hyphenated surnames.
-    re.compile(
-        r"\bHon(?:orable)?\.?[ ]+"
-        r"(?P<judge_name>"
-        r"[A-Z][a-z]+"  # first name
-        r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
-        r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
-        r")",
+    _body_text(
+        re.compile(
+            r"\bHon(?:orable)?\.?[ ]+"
+            r"(?P<judge_name>"
+            r"[A-Z][a-z]+"  # first name
+            r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
+            r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
+            r")",
+        )
     ),
     # Standalone "Judge: Name" or "Judge Name" in headers.  Same name-shape
     # constraints as "Hon." pattern.  Uses literal spaces to stay on one line.
-    re.compile(
-        r"(?<![a-zA-Z])"  # not preceded by a letter
-        r"Judge[:  ][ ]*"
-        r"(?P<judge_name>"
-        r"[A-Z][a-z]+"  # first name
-        r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
-        r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
-        r")"
-        r"(?![ ]+of\b)",  # exclude "Judge X of the Superior Court"
+    _body_text(
+        re.compile(
+            r"(?<![a-zA-Z])"  # not preceded by a letter
+            r"Judge[:  ][ ]*"
+            r"(?P<judge_name>"
+            r"[A-Z][a-z]+"  # first name
+            r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
+            r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
+            r")"
+            r"(?![ ]+of\b)",  # exclude "Judge X of the Superior Court"
+        )
     ),
     # LA ALL-CAPS header: "DEPARTMENT 56 JUDGE STEVEN A. ELLIS" (#401)
     # Matches "JUDGE FIRST [M.] LAST" in ALL-CAPS, typically preceded by
@@ -935,6 +956,14 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
         r")"
         r"(?!\s+[Oo][Ff]\b)",  # exclude "JUDGE X OF the Superior Court"
     ),
+]
+
+#: The patterns anchored to a labelled presiding-judge field of a header
+#: (``JUDGE/DEPT:``, ``Department X - Judge``, ``Presiding:``,
+#: ``JUDICIAL OFFICER:``, ``DEPARTMENT 56 JUDGE STEVEN A. ELLIS``), in the
+#: same order as :data:`_JUDGE_NAME_PATTERNS`.
+_HEADER_JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
+    p for p in _JUDGE_NAME_PATTERNS if p not in _BODY_TEXT_JUDGE_PATTERNS
 ]
 
 
@@ -2478,8 +2507,30 @@ def extract_judge_name(ruling_text: str) -> str | None:
 
     The returned name is *raw* — callers should pass it through
     ``normalize_judge_name`` before using it as a canonical name.
+
+    Some patterns also match a name a ruling body mentions (see
+    ``_body_text``).  A caller that scans a whole multi-ruling document
+    rather than one ruling should use :func:`extract_header_judge_name`.
     """
-    for pattern in _JUDGE_NAME_PATTERNS:
+    return _first_judge_name(ruling_text, _JUDGE_NAME_PATTERNS)
+
+
+def extract_header_judge_name(text: str) -> str | None:
+    """Extract the presiding judge from a labelled header field of *text*.
+
+    Like :func:`extract_judge_name`, but only with the patterns anchored to a
+    presiding-judge label (``JUDGE/DEPT:``, ``Department X - Judge``,
+    ``Presiding:``, ``JUDICIAL OFFICER:``, ``DEPARTMENT 56 JUDGE ...``).  A
+    signature line, "before the Honorable X", a bare "Hon. X" or "Judge X"
+    can be a mediator or another court's judge named in a ruling body, and is
+    never taken (#4934).
+    """
+    return _first_judge_name(text, _HEADER_JUDGE_NAME_PATTERNS)
+
+
+def _first_judge_name(ruling_text: str, patterns: list[re.Pattern[str]]) -> str | None:
+    """The first person-like name a pattern of *patterns*, in order, matches."""
+    for pattern in patterns:
         m = pattern.search(ruling_text)
         if m:
             # Use named group 'judge_name' if present, otherwise group 1

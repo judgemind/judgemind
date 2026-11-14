@@ -135,7 +135,7 @@ from framework.storage import (  # noqa: E402
     capture_timestamp_from_s3_object,
 )
 from ingestion.db import _looks_like_valid_judge_name, resolve_judge  # noqa: E402
-from ingestion.extract import extract_judge_name  # noqa: E402
+from ingestion.extract import extract_header_judge_name  # noqa: E402
 from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
 
 # The same logging setup as the ingestion-worker service, so the worker's
@@ -613,10 +613,14 @@ def _seed_judges_from_keys(
 
     The pre-pass walks every key in ``keys`` once before the main
     :class:`ProcessPoolExecutor` runs.  For every key with valid raw S3
-    content, it runs ``extract_judge_name`` against the document text and,
-    when a *full* name (≥2 words, passing ``_looks_like_valid_judge_name``)
-    is found, calls ``resolve_judge`` to upsert the judge into
-    ``derived.judges``.  The per-document write loop's
+    content, it runs ``extract_header_judge_name`` against the document text
+    and, when a *full* name (≥2 words, passing
+    ``_looks_like_valid_judge_name``) is found, calls ``resolve_judge`` to
+    upsert the judge into ``derived.judges``.  Only a labelled presiding-judge
+    header field counts: the text is the whole document, and a ruling body
+    names mediators and other courts' judges ("mediated before the Honorable
+    James P. Gray (Ret.)"), which ``extract_judge_name``'s body-text
+    patterns would seed as judges of this court (#4934).  The per-document write loop's
     ``_expand_single_word_judge_surname`` Step 4 lookup
     (``packages/scraper-framework/src/ingestion/db.py``) finds the seeded
     judge via the suffix-LIKE match regardless of which doc the worker pool
@@ -629,7 +633,7 @@ def _seed_judges_from_keys(
       * Skipped under ``--skip-judge-prepass`` (caller's responsibility).
       * Operates on RAW S3 content + ``_extract_text_from_content`` regex,
         so it works for HTML, PDF, and other formats equally —
-        ``extract_judge_name`` is regex-only and incurs no LLM cost.
+        ``extract_header_judge_name`` is regex-only and incurs no LLM cost.
       * S3 content is re-fetched by :func:`_process_prefix_document`.
       * Keys are fetched and scanned ``_PREPASS_CHUNK`` at a time, with a
         commit after each chunk that seeded a judge.
@@ -772,7 +776,10 @@ def _seed_judges_from_keys(
                 )
                 continue
 
-            judge_name = extract_judge_name(text)
+            # Header fields only: the text is the whole document, every
+            # ruling body included, and a body names mediators and other
+            # courts' judges (#4934).
+            judge_name = extract_header_judge_name(text)
             if not judge_name:
                 continue
 

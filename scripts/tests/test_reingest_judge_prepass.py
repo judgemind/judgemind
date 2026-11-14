@@ -143,7 +143,7 @@ class TestSeedJudgesFromKeys:
     """Tests for ``_seed_judges_from_keys`` — the #4408 / #4419 pre-pass."""
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_chronological_race_closes(
@@ -266,7 +266,7 @@ class TestSeedJudgesFromKeys:
         assert suffix_rows[0][0] == "Karine Mkrtchyan"
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_commits_once_per_chunk_that_seeded(
@@ -329,7 +329,7 @@ class TestSeedJudgesFromKeys:
         assert seeded_at_commit == [2, 3]
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_skips_unparseable_keys(
@@ -363,7 +363,7 @@ class TestSeedJudgesFromKeys:
         assert conn.commit.call_count == 0
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_skips_keys_with_no_court_mapping(
@@ -392,7 +392,7 @@ class TestSeedJudgesFromKeys:
         mock_resolve_judge.assert_not_called()
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_skips_keys_whose_s3_fetch_fails(
@@ -423,7 +423,7 @@ class TestSeedJudgesFromKeys:
         assert conn.commit.call_count == 0
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_only_seeds_full_names(
@@ -462,7 +462,7 @@ class TestSeedJudgesFromKeys:
         assert conn.commit.call_count == 0
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name")
+    @patch("reingest_from_s3.extract_header_judge_name")
     @patch("reingest_from_s3._extract_text_from_content")
     @patch("reingest_from_s3._fetch_s3_content")
     def test_handles_no_judge_match(
@@ -626,7 +626,9 @@ class TestPrePassRenamedJudges:
     """#4920: judges the pre-pass renames have their rulings re-indexed."""
 
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.extract_judge_name", return_value="KARINE A. MKRTCHYAN")
+    @patch(
+        "reingest_from_s3.extract_header_judge_name", return_value="KARINE A. MKRTCHYAN"
+    )
     @patch("reingest_from_s3._extract_text_from_content", return_value="text")
     @patch("reingest_from_s3._fetch_s3_content", return_value=b"raw")
     def test_seed_passes_the_renamed_set_to_resolve_judge(
