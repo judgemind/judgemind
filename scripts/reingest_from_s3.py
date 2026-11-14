@@ -71,7 +71,10 @@ Options:
                         ``#`` comments ignored); a container-local path or an
                         ``s3://bucket/key`` URI (#4606).  DB-row mode: only
                         these keys.  Prefix mode: the listed keys under the
-                        prefix (#3855).
+                        prefix (#3855).  For ECS runs, upload the list to
+                        ``s3://judgemind-document-archive-dev/tmp/keys/<name>.txt``,
+                        the one location the oneshot task role can read
+                        (#4803); ``tmp/`` objects expire after 30 days.
     --limit N           Re-ingest at most N keys.
     --dry-run           Log the keys that would be re-ingested; write nothing.
     --concurrency N     Parallel worker processes (default: 10).
@@ -90,6 +93,8 @@ Options:
     --write-failed-manifest s3://bucket/key
                         When keys fail, write them (one per line) to this S3
                         object, for a retry with ``--s3-key-list`` (#4619).
+                        Use the key-list location,
+                        ``s3://judgemind-document-archive-dev/tmp/keys/``.
 
 Removed with the DB-row write path (#4845): ``--full-reparse`` and
 ``--multimodal`` (the worker always re-derives the split, with the county's
@@ -126,6 +131,7 @@ sys.path.insert(
 )
 
 import boto3  # noqa: E402
+import botocore.exceptions  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
@@ -144,6 +150,14 @@ from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
 # fork; re-run when a spawned child imports this module).
 configure_ingestion_logging(contextvars=True)
 logger = structlog.get_logger()
+
+# The one place to put --s3-key-list files for ECS runs (#4803).  Oneshot
+# tasks run as the scraper task role, whose only S3 grant is Get/Put on the
+# document-archive bucket, so a list anywhere else (e.g. the old
+# ``judgemind-assets-dev/keylists/``) fails with AccessDenied.  The
+# archive's ``tmp-ttl`` lifecycle rule expires ``tmp/`` objects after 30
+# days, and ``rebuild_db.list_s3_keys`` ignores them (KEY_PATTERN).
+CANONICAL_KEY_LIST_PREFIX = "s3://judgemind-document-archive-dev/tmp/keys/"
 
 
 def _build_filters(
@@ -244,13 +258,37 @@ def _parse_s3_key_list_text(raw: str, source: str) -> list[str]:
     return keys
 
 
+def _key_list_read_error_message(path: str, err: Exception) -> str:
+    """Build the fail-fast message for an unreadable ``s3://`` key list (#4803).
+
+    Names the S3 error code and a copy-pasteable ``Fix:`` block that points at
+    :data:`CANONICAL_KEY_LIST_PREFIX`, instead of surfacing a raw boto
+    traceback.
+    """
+    code = "Unknown"
+    if isinstance(err, botocore.exceptions.ClientError):
+        code = str(err.response.get("Error", {}).get("Code", "Unknown"))
+    elif isinstance(err, botocore.exceptions.NoCredentialsError):
+        code = "NoCredentials"
+    name = path.rstrip("/").rsplit("/", 1)[-1] or "keys.txt"
+    return (
+        f"--s3-key-list could not read {path} ({code}: {err}).\n"
+        f"Key lists for ECS runs must live under {CANONICAL_KEY_LIST_PREFIX} "
+        "(the oneshot task role cannot read other locations; #4803).\n"
+        "Fix:\n"
+        f"  aws s3 cp tmp/keys.txt {CANONICAL_KEY_LIST_PREFIX}{name}\n"
+        f"  # then pass --s3-key-list {CANONICAL_KEY_LIST_PREFIX}{name}"
+    )
+
+
 def _read_s3_key_list_file(path: str) -> list[str]:
     """Read a list of S3 keys, one per line, from a local file or S3 object.
 
     *path* may be either a container-local filesystem path or an
     ``s3://bucket/key`` URI. The latter form lets the surgical reingest path
     run from ECS, where companion files cannot be staged into the task
-    (see #4606): upload the keylist with ``aws s3 cp`` and pass the URI.
+    (see #4606): upload the keylist with ``aws s3 cp`` to
+    :data:`CANONICAL_KEY_LIST_PREFIX` and pass the URI (#4803).
 
     Blank lines and lines starting with ``#`` are skipped, leading/trailing
     whitespace on each entry is stripped, and duplicates are de-duplicated
@@ -261,9 +299,12 @@ def _read_s3_key_list_file(path: str) -> list[str]:
     FileNotFoundError
         If *path* is a local path that does not exist.
     ValueError
-        If *path* is a malformed ``s3://`` URI with no key component, or if
-        the source produces an empty key list (every line was blank or a
-        comment) — fail loud rather than silently match every document.
+        If *path* is a malformed ``s3://`` URI with no key component, if the
+        ``s3://`` object cannot be read (AccessDenied, NoSuchKey, ...; the
+        message carries a ``Fix:`` block naming the canonical location,
+        #4803), or if the source produces an empty key list (every line was
+        blank or a comment) — fail loud rather than silently match every
+        document.
     """
     if path.startswith("s3://"):
         without_scheme = path[len("s3://") :]
@@ -275,7 +316,13 @@ def _read_s3_key_list_file(path: str) -> list[str]:
             )
             raise ValueError(msg)
         s3_client = boto3.client("s3")
-        response = s3_client.get_object(Bucket=bucket, Key=key)
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+        except (
+            botocore.exceptions.ClientError,
+            botocore.exceptions.NoCredentialsError,
+        ) as err:
+            raise ValueError(_key_list_read_error_message(path, err)) from err
         raw = response["Body"].read().decode("utf-8")
         return _parse_s3_key_list_text(raw, path)
     raw = Path(path).read_text(encoding="utf-8")
@@ -1729,7 +1776,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "File (local path or s3:// URI, #4606) listing S3 keys, one per "
             "line.  DB-row mode: only these keys.  Prefix mode: the listed "
-            "keys under the prefix (#3855)."
+            "keys under the prefix (#3855).  For ECS runs, upload it to "
+            f"{CANONICAL_KEY_LIST_PREFIX}<name>.txt (#4803)."
         ),
     )
     parser.add_argument(
@@ -1760,7 +1808,8 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="write_failed_manifest",
         help=(
             "An s3://bucket/key destination.  When keys fail, write them "
-            "(one per line) there for a retry with --s3-key-list (#4619)."
+            "(one per line) there for a retry with --s3-key-list (#4619).  "
+            f"Use {CANONICAL_KEY_LIST_PREFIX}<name>.txt."
         ),
     )
     return parser

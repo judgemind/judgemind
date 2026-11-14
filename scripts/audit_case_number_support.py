@@ -36,7 +36,8 @@ Usage (dev DB is private, so run it on ECS)::
 
 Options: positional counties or ``--county NAME`` (repeatable; default
 Orange and Riverside), ``--keys PATH`` (an ``s3://bucket/key`` URI or local
-file listing S3 keys to audit, one per line), ``--limit N`` (at most N keys
+file listing S3 keys to audit, one per line; for ECS runs upload it to
+``s3://judgemind-document-archive-dev/tmp/keys/<name>.txt``, #4803), ``--limit N`` (at most N keys
 per county), ``--timeout SECS`` (per key, default 180), ``--workers N``
 (default 8), ``--progress-every N`` (default 100).
 """
@@ -396,7 +397,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--county", action="append", default=[], help="County to audit (repeatable)."
     )
     parser.add_argument(
-        "--keys", help="s3://bucket/key or local file listing the S3 keys to audit."
+        "--keys",
+        help=(
+            "s3://bucket/key or local file listing the S3 keys to audit.  For "
+            "ECS runs use s3://judgemind-document-archive-dev/tmp/keys/<name>.txt "
+            "(#4803)."
+        ),
     )
     parser.add_argument("--limit", type=int, help="Audit at most N keys per county.")
     parser.add_argument(
