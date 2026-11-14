@@ -3266,7 +3266,9 @@ def write_split_rulings(
     Each existing row matches at most one child, earliest child first, so a
     true duplicate within the document keeps #2458 dedup: the later copy is
     superseded by the earlier one.  A matched row is moved to its child's
-    slot.  Its case is:
+    slot and takes every field of its child's ruling (judge, facts, text),
+    as a new row would; only its id and alerts carry over (#4939).  Its
+    case is:
 
     - the child's case when they agree;
     - the row's real case when the child found no case number
@@ -3477,7 +3479,27 @@ def write_split_rulings(
     # 4. Write every child's fields, in split order.  A claimed row is
     # updated in place; an unclaimed child gets a new row, or loses
     # content-hash dedup to an earlier holder of its case and text.
+    #
+    # A claimed row becomes its child's ruling: it takes every field the
+    # child's write derived, as a new row would, and keeps only its id and
+    # its alerts (#4939).  The row may have held a different ruling (the
+    # third pass matches by slot and case, and two rulings on a slot's
+    # placeholder case always match), so ``insert_ruling``'s live
+    # preserve-first ``judge_id`` would keep that ruling's judge:
+    # ``force_update`` overwrites the judge and the facts, NULL included.
+    # The case is already ``final_case``.  The HTML and summary describe
+    # the row's old text, so they are cleared when the text changes; with
+    # the same text, a child that brings none keeps them.
     result: dict[str, str | None] = {}
+    with conn.cursor() as cur:
+        for i, h in match.items():
+            if h.text_hash != hashes[i]:
+                cur.execute(
+                    "UPDATE rulings SET ruling_text = NULL, ruling_text_hash = NULL, "
+                    "ruling_text_html = NULL, summary = NULL, summary_model = NULL, "
+                    "summary_generated_at = NULL WHERE id = %s::uuid",
+                    (h.ruling_id,),
+                )
     for i, c in enumerate(children):
         insert_ruling(
             conn,
@@ -3495,6 +3517,7 @@ def write_split_rulings(
             summary_model=c.summary_model,
             summary_generated_at=c.summary_generated_at,
             hearing_date_source=c.hearing_date_source,
+            force_update=i in match,
         )
         with conn.cursor() as cur:
             cur.execute(

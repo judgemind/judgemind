@@ -16,6 +16,7 @@ import os
 import uuid
 from collections.abc import Iterator
 from datetime import date, datetime
+from typing import Any
 
 import pytest
 
@@ -63,18 +64,20 @@ class Key:
 
     def write(
         self,
-        rows: list[tuple[str | None, str] | None],
+        rows: list[tuple[str | None, str] | tuple[str | None, str, dict[str, Any]] | None],
         *,
         relink: bool = True,
         protected: frozenset[str] = frozenset(),
     ) -> dict[str, str | None]:
         """Write the split ``[(case number, text), ...]`` like the worker.
-        A ``None`` row is a textless slot the worker skips."""
+        A ``None`` row is a textless slot the worker skips.  A row's optional
+        third element holds more ``SplitChildRuling`` fields."""
         children = []
         for i, row in enumerate(rows):
             if row is None:
                 continue
-            number, text = row
+            number, text = row[0], row[1]
+            fields: dict[str, Any] = row[2] if len(row) > 2 else {}
             doc = self.slot(i) if len(rows) > 1 else self.parent
             case_id = self.case(number, doc)
             insert_document(
@@ -99,6 +102,7 @@ class Key:
                     hearing_date=date(2026, 9, 4),
                     ruling_text=text,
                     hearing_date_source="llm",
+                    **fields,
                 )
             )
         result = write_split_rulings(
@@ -244,6 +248,107 @@ def test_dropped_ruling_is_removed_and_its_alert_detached(conn: object) -> None:
     key.write([("30-F-1", _text(1))])
     assert set(key.rulings()) == {key.parent}
     assert _alert_target(conn, alert_id)[0] is None  # detached, not deleted
+
+
+def _judge(conn: object, court_id: str, name: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO judges (canonical_name, court_id) VALUES (%s, %s::uuid) "
+            "RETURNING id::text",
+            (name, court_id),
+        )
+        return str(cur.fetchone()[0])
+
+
+_ROW_FIELDS = (
+    "judge_id, department, outcome::text, motion_type, ruling_text, ruling_text_html, "
+    "summary, summary_model, hearing_date, hearing_date_source"
+)
+
+
+def _row(conn: object, ruling_id: str) -> tuple[Any, ...]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_ROW_FIELDS} FROM rulings WHERE id = %s::uuid",  # noqa: S608
+            (ruling_id,),
+        )
+        row = cur.fetchone()
+    return tuple(str(v) if v is not None and not isinstance(v, (str, date)) else v for v in row)
+
+
+def test_reused_row_takes_every_field_of_its_new_ruling(conn: object) -> None:
+    """#4939: a slot's row reused for a different ruling (third pass: same
+    slot, same placeholder case, new text) carries the new ruling's judge
+    and every other field, never the previous ruling's.  Only its id and
+    alerts carry over."""
+    key = Key(conn)
+    judge_a = _judge(conn, key.court_id, "Judge A")
+    judge_b = _judge(conn, key.court_id, "Judge B")
+    old = {
+        "judge_id": judge_a,
+        "department": "D1",
+        "outcome": "granted",
+        "motion_type": "Demurrer",
+        "ruling_text_html": "<p>old</p>",
+        "summary": "old summary",
+        "summary_model": "m",
+    }
+    key.write([("30-K-1", _text(1)), (None, _text(2), old)])
+    ruling_id = key.rulings()[key.slot(1)][0]
+    alert_id = _alert(conn, ruling_id, key.slot(1))
+
+    # Slot 1 now holds a different ruling on the same placeholder case.
+    key.write([("30-K-1", _text(1)), (None, _text(3), {"judge_id": judge_b})])
+    after = key.rulings()[key.slot(1)]
+    assert after[0] == ruling_id  # the row is reused
+    assert _row(conn, ruling_id) == (
+        judge_b,
+        None,
+        None,
+        None,
+        _text(3),
+        None,
+        None,
+        None,
+        date(2026, 9, 4),
+        "llm",
+    )
+    assert _alert_target(conn, alert_id) == (ruling_id, key.slot(1))
+
+    # A child with no judge clears the reused row's judge.
+    key.write([("30-K-1", _text(1)), (None, _text(4))])
+    assert _row(conn, ruling_id)[0] is None
+
+
+def test_reused_row_with_the_same_text_keeps_its_text_fields(conn: object) -> None:
+    """A row reused for the same text takes the child's judge and facts, and
+    keeps the HTML and summary of that text when the child brings none."""
+    key = Key(conn)
+    judge_a = _judge(conn, key.court_id, "Judge A")
+    judge_b = _judge(conn, key.court_id, "Judge B")
+    first = {
+        "judge_id": judge_a,
+        "department": "D1",
+        "ruling_text_html": "<p>1</p>",
+        "summary": "summary 1",
+        "summary_model": "m",
+    }
+    key.write([("30-L-1", _text(1), first), ("30-L-2", _text(2))])
+    ruling_id = key.rulings()[key.slot(0)][0]
+    # The same ruling moves to slot 1 (the second pass: a new case number).
+    key.write([("30-L-2", _text(2)), ("30-L-9", _text(1), {"judge_id": judge_b})])
+    moved = key.rulings()[key.slot(1)]
+    assert moved[0] == ruling_id
+    assert _row(conn, ruling_id)[:8] == (
+        judge_b,
+        None,
+        None,
+        None,
+        _text(1),
+        "<p>1</p>",
+        "summary 1",
+        "m",
+    )
 
 
 def test_protected_slot_is_left_alone(conn: object) -> None:

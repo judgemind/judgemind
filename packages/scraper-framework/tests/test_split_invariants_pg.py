@@ -62,10 +62,7 @@ def test_postgres_is_configured_when_required() -> None:
 #: such a seed with every other invariant, and ``test_open_bug`` keeps the
 #: bug reproduced (a strict xfail: when the fix lands it fails until the
 #: entry is removed).
-_OPEN_BUG_SEEDS: dict[int, tuple[str, str, bool]] = {
-    # A reused ruling row keeps the previous ruling's judge (#4939).
-    925: ("4939", "judge_converge", False),
-}
+_OPEN_BUG_SEEDS: dict[int, tuple[str, str, bool]] = {}
 
 
 @_needs_pg
@@ -175,6 +172,11 @@ _BUG_SEEDS = [
     pytest.param("4940", 21, "evidence"),
     pytest.param("4940", 107, "converge"),
     pytest.param("4940", 0, "converge"),
+    # A reingest dropped a ruling with no number and no caption; the
+    # duplicate of another ruling on that slot took the dropped ruling's
+    # row by (slot, placeholder case) and kept its judge.  Fails on
+    # 977bad29, the parent of the #4939 fix.
+    pytest.param("4939", 925, "judge_converge"),
 ]
 
 
