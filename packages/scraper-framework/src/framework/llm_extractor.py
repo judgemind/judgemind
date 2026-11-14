@@ -3278,9 +3278,14 @@ class LlmExtractor:
             # Default to Anthropic.
             client_kwargs: dict[str, str] = {}
             resolved_key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
-            if resolved_key is not None and not resolved_key.strip():
-                # The SDK accepts a blank key and fails only on the first
-                # call; a blank secret is a missing one (#4953).
+            # The SDK accepts a missing or blank key and fails only on the
+            # first call, so a worker would start and then fail every
+            # document; a missing or blank secret fails here instead
+            # (#4953, #4957).
+            if resolved_key is None:
+                msg = "ANTHROPIC_API_KEY is not set"
+                raise ValueError(msg)
+            if not resolved_key.strip():
                 msg = "ANTHROPIC_API_KEY is blank"
                 raise ValueError(msg)
             if api_key is not None:

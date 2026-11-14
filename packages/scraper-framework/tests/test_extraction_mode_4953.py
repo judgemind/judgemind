@@ -66,6 +66,8 @@ def test_required_mode_builds_the_extractors_at_startup(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.delenv(EXTRACTION_MODE_ENV, raising=False)
+    # The framework extractor follows LLM_PROVIDER (#4957).
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     with (
         patch("ingestion.worker.LlmExtractor") as extractor_cls,
         caplog.at_level(logging.INFO, logger="ingestion.worker"),
@@ -73,7 +75,7 @@ def test_required_mode_builds_the_extractors_at_startup(
         worker = _make_worker()
 
     assert worker._extraction_required is True
-    providers = [c.kwargs.get("provider", "anthropic") for c in extractor_cls.call_args_list]
+    providers = [c.kwargs["provider"] for c in extractor_cls.call_args_list]
     assert providers == ["anthropic", "google"]
     # The startup check fills the caches the splits use.
     assert worker._framework_extractor is extractor_cls.return_value
@@ -94,9 +96,10 @@ def test_required_mode_refuses_to_start_without_an_extractor(
     """A secret that is missing (or a client that will not build) fails the
     worker at startup, loudly, naming the extractor and the init error."""
     monkeypatch.setenv(EXTRACTION_MODE_ENV, "required")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
 
     def build(**kwargs: object) -> MagicMock:
-        if kwargs.get("provider", "anthropic") == missing:
+        if kwargs["provider"] == missing:
             raise ValueError(f"no {missing} key")
         return MagicMock()
 
@@ -128,9 +131,10 @@ def test_optional_mode_builds_no_extractor_at_startup(monkeypatch: pytest.Monkey
 def test_check_extraction_ready_in_required_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """The scripts' preflight (``rebuild_db.py`` runs it before its reset)."""
     monkeypatch.setenv(EXTRACTION_MODE_ENV, "required")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     with patch("ingestion.worker.LlmExtractor") as cls:
         assert check_extraction_ready() == "required"
-    assert [c.kwargs.get("provider", "anthropic") for c in cls.call_args_list] == [
+    assert [c.kwargs["provider"] for c in cls.call_args_list] == [
         "anthropic",
         "google",
     ]
@@ -186,6 +190,54 @@ def test_rebuild_refuses_before_its_reset_without_an_extractor(
     connect.assert_not_called()
 
 
+_RULING_JSON = (
+    '{"rulings": [{"extracted_case_number": "24STCV01234", '
+    '"extracted_case_title": "Doe v. Roe", "case_type": "civil", '
+    '"outcome": "denied", "motion_type": "demurrer", '
+    '"ruling_text": "The demurrer is OVERRULED."}]}'
+)
+
+
+@pytest.fixture
+def production_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production's ingestion-worker env shape (#4957): ``LLM_PROVIDER`` is
+    google and only ``GOOGLE_API_KEY`` is wired
+    (``infra/terraform/environments/production/main.tf``)."""
+    monkeypatch.setenv(EXTRACTION_MODE_ENV, "required")
+    monkeypatch.setenv("LLM_PROVIDER", "google")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # No S3 LLM cache: the test must not reach the network.
+    monkeypatch.setenv("JUDGEMIND_ARCHIVE_BUCKET", "")
+
+
+def test_production_env_shape_starts_and_extracts(production_env: None) -> None:
+    """In required mode, a worker with production's env shape starts and its
+    framework extractor extracts, on Google (#4957).  The real extractors are
+    built (no ``LlmExtractor`` stub).  Before, the framework extractor was
+    always Anthropic, so the worker refused to start."""
+    from ingestion.llm_providers import LLMResponse
+
+    worker = _make_worker()
+
+    assert worker._extraction_required is True
+    framework = worker._get_framework_extractor()
+    assert framework is not None
+    assert framework._provider == "google"
+    assert worker._get_multimodal_extractor(max_output_tokens=4096) is not None
+
+    response = LLMResponse(text=_RULING_JSON, input_tokens=10, output_tokens=10)
+    with patch("ingestion.llm_providers.call_llm", return_value=response) as call:
+        rulings = framework.extract("Case No. 24STCV01234 ...", strict=True)
+    assert [r.extracted_case_number for r in rulings] == ["24STCV01234"]
+    assert call.call_args.kwargs["provider"] == "google"
+
+
+def test_production_env_shape_passes_the_scripts_preflight(production_env: None) -> None:
+    """``rebuild_db.py`` runs ``check_extraction_ready`` before its reset (#4957)."""
+    assert check_extraction_ready() == "required"
+
+
 def test_blank_anthropic_key_is_a_missing_one(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Anthropic SDK accepts a blank key and fails only on the first
     call, which the worker would see as a failed extraction per document
@@ -195,6 +247,15 @@ def test_blank_anthropic_key_is_a_missing_one(monkeypatch: pytest.MonkeyPatch) -
         LlmExtractor()
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY is blank"):
         LlmExtractor(api_key="")
+
+
+def test_unset_anthropic_key_is_a_missing_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Anthropic SDK also builds a client with no key at all and fails
+    only on the first call (#4957), so a worker missing the secret started
+    and then failed every framework extraction."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY is not set"):
+        LlmExtractor()
 
 
 def test_blank_google_key_is_a_missing_one(monkeypatch: pytest.MonkeyPatch) -> None:

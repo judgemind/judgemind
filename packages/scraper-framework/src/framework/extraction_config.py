@@ -2,7 +2,8 @@
 
 Maps (state, county) pairs to extraction methods and LLM parameters.
 Counties not in the registry use the default framework-level
-``EXTRACTION_SYSTEM_PROMPT`` with the Anthropic provider.
+``EXTRACTION_SYSTEM_PROMPT`` with the framework provider: the
+worker's ``LLM_PROVIDER`` (#4957).
 
 The ``ExtractionMethod`` enum determines *how* a document is extracted:
 
@@ -61,7 +62,7 @@ class CountyExtractionConfig:
         system_prompt: Custom system prompt for the LLM.  If ``None``,
             the default ``EXTRACTION_SYSTEM_PROMPT`` is used.
         provider: LLM provider (``"anthropic"`` or ``"google"``).
-            If ``None``, uses the framework default (Anthropic).
+            If ``None``, uses the framework provider (#4957).
         model: LLM model ID.  If ``None``, uses the provider default.
         max_output_tokens: Maximum tokens in the model response.
             If ``None``, uses the ``LlmExtractor`` default (4096).
@@ -237,6 +238,17 @@ def get_county_extraction_config(
     return _COUNTY_CONFIGS.get((state.upper(), county.upper()))
 
 
+def configured_providers() -> frozenset[str]:
+    """The LLM providers the county and scraper configs name (#4957).
+
+    The worker's required-mode startup check builds an extractor for each
+    one, so a county configured for a provider whose key the deployment
+    lacks fails the worker at startup rather than once per event.
+    """
+    configs = (*_COUNTY_CONFIGS.values(), *_SCRAPER_CONFIGS.values())
+    return frozenset(c.provider for c in configs if c.provider)
+
+
 # ---------------------------------------------------------------------------
 # Extraction strategy — single source of truth for worker + reingest gates
 # ---------------------------------------------------------------------------
@@ -299,7 +311,7 @@ class ExtractionStrategy:
         system_prompt: County-specific system prompt, or ``None`` to use
             the framework default ``EXTRACTION_SYSTEM_PROMPT``.
         provider: ``"anthropic"`` or ``"google"``, or ``None`` to use
-            the framework default (Anthropic).
+            the framework provider (#4957).
         model: Provider-specific model id, or ``None`` to use the
             provider default.
         max_chars_per_chunk: Per-chunk character cap for chunked

@@ -113,7 +113,7 @@ variable "opensearch_credentials_secret_arn" {
 }
 
 variable "llm_provider" {
-  description = "LLM provider for the ingestion worker: \"anthropic\" or \"google\". Must match the API key secret that is provisioned. Default is \"google\" -- Anthropic API access has been disabled as a cost-control measure (see #4031); flip to \"anthropic\" only after re-enabling that account."
+  description = "LLM provider for the ingestion worker: \"anthropic\" or \"google\". Must match the API key secret that is provisioned: the per-field client and the framework extractor run on it (#4957), so \"anthropic\" requires anthropic_api_key_secret_arn. Default is \"google\" -- Anthropic API access has been disabled as a cost-control measure (see #4031); flip to \"anthropic\" only after re-enabling that account."
   type        = string
   default     = "google"
 
