@@ -22,15 +22,6 @@ from framework.llm_enrichment import LlmEnrichmentExhaustedError
 from framework.llm_schema import ExtractedRuling, ExtractionOutcome
 from ingestion.worker import IngestionWorker
 
-
-@pytest.fixture(autouse=True)
-def _no_split_sibling_move() -> Iterator[None]:
-    """The mocked cursors here feed fixed ``fetchone`` sequences; the #4820
-    sibling-ruling lookup is covered by ``test_split_shift_move*``."""
-    with patch("ingestion.db._move_split_sibling_ruling", return_value=False):
-        yield
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -394,6 +385,18 @@ class TestFirstChildExhaustionDoesNotAbortSiblings:
 
     Parametrized over all 4 splitter paths.
     """
+
+    @pytest.fixture(autouse=True)
+    def _split_set_write(self) -> Iterator[None]:
+        """The splitters are called directly here, outside a split batch,
+        so each child is written on its own as a split set of one (#4967).
+        The mocked cursors feed the court / case / document upserts; the
+        content matching is covered against real Postgres."""
+        with (
+            patch("ingestion.worker.write_split_rulings", return_value={}),
+            patch("ingestion.worker.record_judge_votes"),
+        ):
+            yield
 
     def _make_side_effect(self, worker: IngestionWorker) -> tuple[list, object]:
         """Return (call_log, side_effect_fn) that raises on first split child, succeeds after."""
@@ -2011,6 +2014,13 @@ def _process_with_llm_case_number(event: dict, llm_case_number: str) -> list:
             autospec=True,
             side_effect=lambda _self, write: writes.append(write),
         ),
+        # A split child written on its own is a split set of one (#4967).
+        patch.object(
+            IngestionWorker,
+            "_write_split_batch",
+            autospec=True,
+            side_effect=lambda _self, _event, _parent, batch: writes.extend(batch.children),
+        ),
     ):
         mock_psycopg.connect.return_value = mock_conn
         worker.process_event(event)
@@ -2233,6 +2243,13 @@ def test_regex_only_number_still_counts_as_bad_split_fragment() -> None:
             "_write_one_ruling",
             autospec=True,
             side_effect=lambda _self, write: writes.append(write),
+        ),
+        # A split child written on its own is a split set of one (#4967).
+        patch.object(
+            IngestionWorker,
+            "_write_split_batch",
+            autospec=True,
+            side_effect=lambda _self, _event, _parent, batch: writes.extend(batch.children),
         ),
     ):
         mock_psycopg.connect.return_value = mock_conn

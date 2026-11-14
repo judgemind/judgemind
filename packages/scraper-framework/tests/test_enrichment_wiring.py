@@ -334,6 +334,9 @@ def _fuzzy_case_upserted(event: dict) -> str:
         patch("ingestion.worker.EnrichmentEngine") as mock_engine_cls,
         patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"),
         patch.object(IngestionWorker, "_llm_split_document", return_value=False),
+        # A split child written on its own is a split set of one (#4967).
+        patch("ingestion.worker.write_split_rulings", return_value={}),
+        patch("ingestion.worker.record_judge_votes"),
     ):
         mock_psycopg.connect.return_value = mock_conn
         mock_engine_cls.return_value.enrich.return_value = _fuzzy_result(

@@ -505,25 +505,6 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
     return case_number_refuted(current, w.case_number_evidence)
 
 
-def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
-    """Decide whether a split child's write may move it to a different case.
-
-    Only when all hold (#4700, #4788):
-
-    - the event is a split child (``_split_processed``);
-    - it comes from a split-set replacement (prefix reingest / rebuild), not
-      a live capture or a retry, where the slot's case is already settled;
-    - the new case number is real, never a missing or ``UNKNOWN-``
-      placeholder, so a relink only moves a ruling to a better-supported
-      case.
-    """
-    if not event_data.get("_split_processed"):
-        return False
-    if event_data.get(REPLACE_SPLIT_SET_KEY) is not True:
-        return False
-    return bool(case_number) and not str(case_number).startswith("UNKNOWN-")
-
-
 def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: str) -> list[str]:
     """Return every document id the split that produced *split_event* writes.
 
@@ -541,8 +522,11 @@ def split_child_ids_for_event(split_event: dict[str, Any], parent_document_id: s
 
 
 def split_set_for_event(event_data: dict[str, Any]) -> SplitSet | None:
-    """Return the split a split-child event is written as part of, so the
-    child's write can move a ruling from a sibling slot (#4820).
+    """Return the split a split-child event is written as part of.
+
+    A split child written on its own (a scraper's pre-split child) is
+    written as a split set of one: it may take its ruling from a later
+    sibling slot (#4820) and replaces only its own slot (#4967).
 
     None for an event that is not a split child or does not name its parent.
     """
@@ -1689,6 +1673,12 @@ class _SplitBatch:
     configured in ``optional`` mode (regex-only extraction, e.g. a local
     run without LLM keys), where the single-document fallback is the
     extraction.
+    ``pre_split`` is set for a scraper's pre-split child (#4967), which
+    arrives as its own event: the batch is that one child, its split set
+    of one, written by the same ``_write_split_batch``.  Its siblings are
+    written by their own events, so only the child's own slot is replaced
+    (``write_split_rulings``' *retire_ids*) and no stale-child cleanup runs;
+    ``keep_ids`` holds the siblings this capture already wrote.
     """
 
     parent_document_id: str
@@ -1698,6 +1688,7 @@ class _SplitBatch:
     no_rulings_reason: str | None = None
     whole_document: bool = False
     extraction_failed: str | None = None
+    pre_split: SplitSet | None = None
     extractor_unavailable: bool = False
 
 
@@ -4383,7 +4374,24 @@ class IngestionWorker:
         # the time spent in the failed transaction.
         _db_write_t0 = time.perf_counter()
         try:
-            self._write_one_ruling(write)
+            # A scraper's pre-split child arrives as its own event: it is a
+            # split set of one, written by the same split-set write as a
+            # worker split's children (#4967).
+            pre_split = split_set_for_event(event_data) if is_split else None
+            if pre_split is not None:
+                self._write_split_batch(
+                    event_data,
+                    pre_split.parent_document_id,
+                    _SplitBatch(
+                        parent_document_id=pre_split.parent_document_id,
+                        children=[write],
+                        keep_ids=set(pre_split.written_before(document_id)),
+                        replace=True,
+                        pre_split=pre_split,
+                    ),
+                )
+            else:
+                self._write_one_ruling(write)
         finally:
             timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
 
@@ -4663,14 +4671,14 @@ class IngestionWorker:
         return court_id, case_id, judge_id
 
     def _write_one_ruling(self, w: _RulingWrite) -> None:
-        """Write one ruling document and index it: a scraper pre-split child
-        that arrives as its own event, or a document written whole because
-        no extractor is configured (``optional`` extraction mode, #4953),
-        it had nothing to extract, or (a live
-        capture of a new key only) its extraction failed.  A document the
-        extractor found no rulings in is a split set of one, written by
-        ``_write_split_batch`` (#4940); a reingest whose extraction failed
-        writes nothing (#4948)."""
+        """Write one ruling document and index it: a document written whole
+        because no extractor is configured (``optional`` extraction mode,
+        #4953), it had nothing to extract, or (a live capture of a new key
+        only) its extraction failed.  Every split child goes through
+        ``_write_split_batch``: a worker split's children, a document the
+        extractor found no rulings in (#4940) and a scraper's pre-split
+        child (#4967).  A reingest whose extraction failed writes nothing
+        (#4948)."""
         conn = self._get_connection()
         try:
             court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
@@ -4700,17 +4708,7 @@ class IngestionWorker:
                 summary=w.summary,
                 summary_model=w.summary_model,
                 summary_generated_at=w.summary_generated_at,
-                # A split child's id names a slot in the split, not a case:
-                # when a reingest/rebuild replaces the split set, the
-                # re-derived case wins (#4700).  Live writes and retries,
-                # non-split documents, and placeholder cases stay
-                # preserve-first, so a re-process that misses the case
-                # number cannot delete a correct ruling (#4788).
-                relink_case=_should_relink_split_case(w.event_data, w.effective_case_number),
                 hearing_date_source=w.hearing_date_source,
-                # A pre-split child whose split shifted takes its ruling
-                # from the sibling slot that holds it (#4820).
-                split_set=split_set_for_event(w.event_data),
                 move_ruling_case=_should_move_off_unsupported_case(conn, w, case_id),
             )
             self._link_ruling_rows(conn, w, case_id, judge_id)
@@ -4762,6 +4760,11 @@ class IngestionWorker:
         this pass (``batch.keep_ids``) are left as they were.  Then every
         child is indexed from its committed row and the removed rows are
         dropped from search.
+
+        A scraper's pre-split child (``batch.pre_split``, #4967) is written
+        here too, as a split set of one: it replaces its own slot only and
+        may take its ruling from a later sibling's slot; the siblings' own
+        events write theirs, so no stale-child cleanup runs.
         """
         s3_key = event_data.get("s3_key")
         content_hash = event_data.get("content_hash")
@@ -4773,6 +4776,8 @@ class IngestionWorker:
         )
         written = [w.document_id for w in batch.children]
         removed: list[str] = []
+        # Sibling slots a pre-split child took its ruling from (#4967).
+        vacated: list[str] = []
         split_changes = ShownRowChanges()
         conn = self._get_connection()
         try:
@@ -4837,11 +4842,13 @@ class IngestionWorker:
                 # link (#4700, #4788).
                 relink=event_data.get(REPLACE_SPLIT_SET_KEY) is True,
                 protected_ids=frozenset(batch.keep_ids),
+                retire_ids=frozenset(written) if batch.pre_split is not None else None,
+                vacated_ids=vacated,
             )
             for w, _court_id, case_id, judge_id in prepared:
                 self._link_ruling_rows(conn, w, final_cases.get(w.document_id) or case_id, judge_id)
 
-            if s3_key:
+            if s3_key and batch.pre_split is None:
                 delete_stale_split_children(
                     conn,
                     s3_key,
@@ -4906,8 +4913,8 @@ class IngestionWorker:
             )
         for document_id in written:
             self._index_committed_ruling(conn, document_id)
-        if removed:
-            self._indexer.delete_documents(removed)
+        if removed or vacated:
+            self._indexer.delete_documents(removed + vacated)
         changes = split_changes
         for w in batch.children:
             changes.update(w.shown_changes)

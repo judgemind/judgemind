@@ -3739,61 +3739,6 @@ class TestStaleChildCleanupScopedToParent:
         assert out == [_STALE_PARENT]
 
 
-class TestSplitSetChangeRelinkCase:
-    """#4700: ``relink_case=True`` lets a re-derived case link win for a
-    reused split-child id (the default live path stays preserve-first)."""
-
-    def _call(self, conn: MagicMock, *, relink_case: bool) -> None:
-        insert_document_and_ruling(
-            conn,
-            document_id="eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
-            case_id="case-new",
-            court_id="court-1",
-            content_format="pdf",
-            content_hash="h",
-            s3_key="k",
-            s3_bucket="b",
-            source_url="",
-            scraper_id="reingest-ca-santa_clara",
-            captured_at=datetime(2026, 3, 1),
-            hearing_date=date(2026, 3, 5),
-            ruling_text="The motion is GRANTED.",
-            relink_case=relink_case,
-        )
-
-    def test_split_set_change_relink_overwrites_document_case_id(self) -> None:
-        conn = _mock_conn()
-        self._call(conn, relink_case=True)
-        assert "case_id = EXCLUDED.case_id" in _insert_document_sql(conn)
-
-    def test_split_set_change_relink_replaces_ruling_of_other_case(self) -> None:
-        """The old ruling row (linked to a different case) is removed, its
-        alerts detached (not deleted), before the fresh ruling insert."""
-        conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        self._call(conn, relink_case=True)
-
-        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
-        detach = next(i for i, s in enumerate(sqls) if s.startswith("UPDATE alert_events"))
-        delete = next(i for i, s in enumerate(sqls) if s.startswith("DELETE FROM rulings"))
-        insert = next(i for i, s in enumerate(sqls) if "INSERT INTO rulings" in s)
-        assert detach < delete < insert
-        assert "case_id <> %s::uuid" in sqls[delete]
-        assert cur.execute.call_args_list[delete][0][1] == (
-            "eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
-            "case-new",
-        )
-        assert not any("DELETE FROM alert_events" in s for s in sqls)
-
-    def test_split_set_change_default_keeps_preserve_first(self) -> None:
-        conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        self._call(conn, relink_case=False)
-        assert "COALESCE(documents.case_id, EXCLUDED.case_id)" in _insert_document_sql(conn)
-        sqls = [c[0][0] for c in cur.execute.call_args_list]
-        assert not any("DELETE FROM rulings" in s for s in sqls)
-
-
 # ---------------------------------------------------------------------------
 # insert_ruling / insert_document identity-anchor preservation (#2475)
 # ---------------------------------------------------------------------------
@@ -3810,57 +3755,6 @@ def _insert_ruling_conflict_sql(conn: MagicMock) -> str:
         if args and isinstance(args[0], str) and "INSERT INTO rulings" in args[0]:
             return args[0]
     raise ValueError("No execute() call with INSERT INTO rulings found")
-
-
-class TestRelinkNeverOntoPlaceholderCase:
-    """#4788: a relink may only move a split child to a real case.
-
-    A re-process whose case number comes back missing falls back to a
-    synthetic ``UNKNOWN-<document_id>`` case.  Relinking onto it deleted the
-    correctly linked ruling, detached its ``public.alert_events`` and moved
-    the document to the placeholder case.  With a placeholder target the
-    write keeps the preserve-first semantics instead.
-    """
-
-    def _call(self, conn: MagicMock) -> None:
-        insert_document_and_ruling(
-            conn,
-            document_id="eeeeeeee-5555-5555-5555-eeeeeeeeeeee",
-            case_id="case-placeholder",
-            court_id="court-1",
-            content_format="pdf",
-            content_hash="h",
-            s3_key="k",
-            s3_bucket="b",
-            source_url="",
-            scraper_id="reingest-ca-santa_clara",
-            captured_at=datetime(2026, 3, 1),
-            hearing_date=date(2026, 3, 5),
-            ruling_text="The motion is GRANTED.",
-            relink_case=True,
-        )
-
-    @pytest.mark.parametrize("case_number", ["UNKNOWN-eeeeeeee", None])
-    def test_placeholder_target_keeps_ruling_and_alerts(self, case_number: str | None) -> None:
-        conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.return_value = (case_number,)
-        self._call(conn)
-
-        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
-        assert not any(s.startswith("DELETE FROM rulings") for s in sqls)
-        assert not any(s.startswith("UPDATE alert_events") for s in sqls)
-        assert "COALESCE(documents.case_id, EXCLUDED.case_id)" in _insert_document_sql(conn)
-
-    def test_real_target_still_relinks(self) -> None:
-        conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.return_value = ("24CV000123",)
-        self._call(conn)
-
-        sqls = [" ".join(c[0][0].split()) for c in cur.execute.call_args_list]
-        assert any(s.startswith("DELETE FROM rulings") for s in sqls)
-        assert "case_id = EXCLUDED.case_id" in _insert_document_sql(conn)
 
 
 def _insert_document_sql(conn: MagicMock) -> str:

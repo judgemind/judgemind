@@ -15,11 +15,25 @@ Also covers document-level validation (#2350):
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ingestion.worker import IngestionWorker
+
+
+@pytest.fixture(autouse=True)
+def _split_set_write() -> Iterator[None]:
+    """A split's children are written by one ``write_split_rulings`` call
+    (#4845).  The mocked cursors here feed the court / case / document
+    upserts; the content matching is covered against real Postgres."""
+    with (
+        patch("ingestion.worker.write_split_rulings", return_value={}),
+        patch("ingestion.worker.record_judge_votes"),
+    ):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -607,7 +621,7 @@ def test_det_validation_flag_duplicate_ruling_text_lengths(
     converted = [
         ConvertedRuling(
             document_id=f"split-uuid-{i}",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=i,
             split_count=3,
             is_multi=True,
@@ -685,7 +699,7 @@ def test_det_validation_pass_distinct_ruling_text_lengths(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -700,7 +714,7 @@ def test_det_validation_pass_distinct_ruling_text_lengths(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -774,7 +788,7 @@ def test_det_validation_duplicate_flag_db_error_does_not_crash(
     converted = [
         ConvertedRuling(
             document_id=f"split-uuid-{i}",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=i,
             split_count=3,
             is_multi=True,
@@ -841,7 +855,7 @@ def test_det_validation_flag_cross_case_ruling_text(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -856,7 +870,7 @@ def test_det_validation_flag_cross_case_ruling_text(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -930,7 +944,7 @@ def test_det_validation_pass_no_cross_case_references(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -945,7 +959,7 @@ def test_det_validation_pass_no_cross_case_references(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1015,7 +1029,7 @@ def test_det_validation_cross_case_db_error_does_not_crash(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -1030,7 +1044,7 @@ def test_det_validation_cross_case_db_error_does_not_crash(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1099,7 +1113,7 @@ def test_det_validation_flag_case_number_marker_mismatch(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -1114,7 +1128,7 @@ def test_det_validation_flag_case_number_marker_mismatch(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1203,7 +1217,7 @@ def test_det_validation_pass_case_number_marker_matches(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -1222,7 +1236,7 @@ def test_det_validation_pass_case_number_marker_matches(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1297,7 +1311,7 @@ def test_det_validation_case_number_marker_db_error_does_not_crash(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -1312,7 +1326,7 @@ def test_det_validation_case_number_marker_db_error_does_not_crash(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1397,7 +1411,7 @@ def test_det_validation_multi_case_empty_text_split_rejected(
     converted = [
         ConvertedRuling(
             document_id="split-uuid-0",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=0,
             split_count=2,
             is_multi=True,
@@ -1412,7 +1426,7 @@ def test_det_validation_multi_case_empty_text_split_rejected(
         ),
         ConvertedRuling(
             document_id="split-uuid-1",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=1,
             split_count=2,
             is_multi=True,
@@ -1444,17 +1458,21 @@ def test_det_validation_multi_case_empty_text_split_rejected(
             event = _make_event(
                 ruling_text=_SPLIT_DOC_TEXT,
             )
-            worker.process_event(event)
+            with patch("ingestion.worker.write_split_rulings", return_value={}) as mock_write:
+                worker.process_event(event)
 
-    # Exactly one document+ruling should have been written (the non-empty
-    # split).  The empty-text split is rejected before insert runs.
-    assert mock_insert_doc_ruling.call_count == 1, (
-        f"Expected exactly one DB write, got {mock_insert_doc_ruling.call_count}. "
+    # Exactly one ruling should have been written (the non-empty split), by
+    # the split-set write (#4845).  The empty-text split is rejected before
+    # the write.
+    mock_insert_doc_ruling.assert_not_called()
+    mock_write.assert_called_once()
+    children = mock_write.call_args.kwargs["children"]
+    assert len(children) == 1, (
+        f"Expected exactly one DB write, got {len(children)}. "
         f"The empty-text split should have been rejected by deterministic validation."
     )
-    written_kwargs = mock_insert_doc_ruling.call_args_list[0].kwargs
-    assert written_kwargs["document_id"] == "split-uuid-0"
-    assert written_kwargs["ruling_text"] == "The motion for summary judgment is GRANTED."
+    assert children[0].document_id == "split-uuid-0"
+    assert children[0].ruling_text == "The motion for summary judgment is GRANTED."
 
     # The empty-text split must produce a deterministic-validation fail
     # record citing ruling_text_not_empty and the telemetry marker.
@@ -1831,7 +1849,7 @@ def test_validation_result_county_on_split_document_flags(
     converted = [
         ConvertedRuling(
             document_id=f"split-uuid-{i}",
-            original_document_id="parent-uuid-1",
+            original_document_id="aaaaaaaa-0000-0000-0000-000000000001",
             split_index=i,
             split_count=len(texts),
             is_multi=True,

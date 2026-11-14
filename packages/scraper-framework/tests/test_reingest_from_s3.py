@@ -4004,9 +4004,10 @@ class TestSplitSetChange:
         ]
 
     def test_split_set_change_reused_child_relinks_case(self) -> None:
-        """A split child's DB write lets the re-derived case link win
-        (``relink_case=True``): a reused child id must not keep the old
-        case_id via the preserve-first COALESCE."""
+        """A split child written on its own goes through the split-set
+        write, which lets the re-derived case link win on a replacement
+        (``relink=True``): a reused child id must not keep the old case_id
+        via the preserve-first COALESCE (#4700, #4967)."""
         worker = _split_set_change_worker()
         event = _sc_prefix_event()
         parent_id = event["document_id"]
@@ -4030,17 +4031,18 @@ class TestSplitSetChange:
             patch("ingestion.worker.psycopg") as mock_psycopg,
             patch("ingestion.worker.resolve_judge", return_value=None),
             patch("ingestion.worker.batch_upsert_parties"),
-            patch("ingestion.worker.insert_document_and_ruling", return_value=False) as mock_ins,
+            patch("ingestion.worker.insert_document", return_value=False),
+            patch("ingestion.worker.write_split_rulings", return_value={}) as mock_write,
         ):
             mock_psycopg.connect.return_value = _split_set_change_conn("case-uuid-new")
             worker.process_event(child)
 
-        mock_ins.assert_called_once()
-        assert mock_ins.call_args.kwargs.get("relink_case") is True
+        mock_write.assert_called_once()
+        assert mock_write.call_args.kwargs["relink"] is True
 
     def test_split_set_change_unsplit_document_keeps_preserve_first(self) -> None:
-        """A regular (non-split) document keeps the live preserve-first
-        identity semantics: ``relink_case`` is only for split children."""
+        """A regular (non-split) document is written whole, with the live
+        preserve-first identity semantics of ``insert_document_and_ruling``."""
         worker = _split_set_change_worker()
         event = {
             **_sc_prefix_event(),
@@ -4061,17 +4063,19 @@ class TestSplitSetChange:
             worker.process_event(event)
 
         mock_ins.assert_called_once()
-        assert mock_ins.call_args.kwargs.get("relink_case", False) is False
+        assert "relink_case" not in mock_ins.call_args.kwargs
 
 
 class TestSplitChildRelinkScope:
     """#4788: the split-child case relink from #4700 is scoped.
 
     It applies only to events that replace a split set (prefix reingest and
-    rebuild set ``_replace_split_set``), and never onto an ``UNKNOWN-``
-    placeholder case.  A live write or retry of a split child keeps the
-    preserve-first case link, so a re-process that misses the case number
-    cannot delete a correct ruling or detach its alerts.
+    rebuild set ``_replace_split_set``).  A live write or retry of a split
+    child keeps the preserve-first case link.  Since #4967 a split child
+    written on its own goes through ``write_split_rulings`` like every other
+    split child, so the scope is its ``relink`` flag; that a placeholder
+    case never replaces a real one is pinned against real Postgres in
+    ``test_split_write_pg.py::test_missed_case_number_keeps_the_real_case``.
     """
 
     def _child(self, event: dict[str, Any], **overrides: Any) -> dict[str, Any]:
@@ -4096,16 +4100,18 @@ class TestSplitChildRelinkScope:
 
     def _relink_kwarg(self, child: dict[str, Any]) -> Any:
         worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
         with (
             patch("ingestion.worker.psycopg") as mock_psycopg,
             patch("ingestion.worker.resolve_judge", return_value=None),
             patch("ingestion.worker.batch_upsert_parties"),
-            patch("ingestion.worker.insert_document_and_ruling", return_value=False) as mock_ins,
+            patch("ingestion.worker.insert_document", return_value=False),
+            patch("ingestion.worker.write_split_rulings", return_value={}) as mock_write,
         ):
             mock_psycopg.connect.return_value = _split_set_change_conn("case-uuid-new")
             worker.process_event(child)
-        mock_ins.assert_called_once()
-        return mock_ins.call_args.kwargs.get("relink_case", False)
+        mock_write.assert_called_once()
+        return mock_write.call_args.kwargs["relink"]
 
     def test_prefix_event_marks_split_set_replacement(self) -> None:
         assert _sc_prefix_event()["_replace_split_set"] is True
@@ -4115,12 +4121,6 @@ class TestSplitChildRelinkScope:
         event = {k: v for k, v in _sc_prefix_event().items() if k != "_replace_split_set"}
         event["scraper_id"] = "ca-santa-clara-tentatives"
         assert self._relink_kwarg(self._child(event)) is False
-
-    def test_reingest_child_without_case_number_never_relinks(self) -> None:
-        """A reingest child whose case number comes back missing gets the
-        synthetic ``UNKNOWN-`` case; relinking onto it is never allowed."""
-        child = self._child(_sc_prefix_event(), case_number=None)
-        assert self._relink_kwarg(child) is False
 
     def test_reingest_child_with_real_case_relinks(self) -> None:
         assert self._relink_kwarg(self._child(_sc_prefix_event())) is True

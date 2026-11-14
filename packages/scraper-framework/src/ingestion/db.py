@@ -501,7 +501,6 @@ def insert_document(
     hearing_date: date | None,
     *,
     force_update: bool = False,
-    relink_case: bool = False,
 ) -> bool:
     """Upsert a document row using the scraper-assigned document_id as the PK.
 
@@ -546,11 +545,8 @@ def insert_document(
     document to a corrected case or replace a stuck hearing date after an
     extraction-logic fix.
 
-    **``relink_case=True`` — split children (#4700):** only ``case_id`` is
-    overwritten with ``EXCLUDED.case_id``; ``hearing_date`` keeps the default
-    semantics.  A split child's id is ``make_split_document_id(parent, idx)``,
-    which names a slot in the split, not a case.  When the split set changes,
-    the case at that slot is re-derived and must replace the old link.
+    A split child's case link is decided by ``write_split_rulings``, which
+    re-links its document row to the case its ruling ends on (#4700, #4845).
     """
     # Map ContentFormat string to PostgreSQL document_format enum value
     format_map = {"html": "html", "pdf": "pdf", "docx": "docx", "text": "txt"}
@@ -572,8 +568,6 @@ def insert_document(
             "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)"
         )
         case_id_clause = "case_id = COALESCE(documents.case_id, EXCLUDED.case_id)"
-    if relink_case:
-        case_id_clause = "case_id = EXCLUDED.case_id"
 
     sql = f"""
         INSERT INTO documents (
@@ -2756,19 +2750,37 @@ def insert_ruling(
 
 @dataclass(frozen=True)
 class SplitSet:
-    """The split a child document is written as part of (#4820).
+    """The split a scraper pre-split child is part of (#4820, #4967).
 
     ``child_ids`` is every document id the split writes, in position order
     (the order the children are written in).  ``parent_document_id`` is the
     document that was split.
 
-    Only for scraper pre-split children, which arrive as separate events and
-    are written one at a time.  A split the worker makes itself is written
-    in one transaction by ``write_split_rulings`` (#4845).
+    A scraper that splits a page at capture time (Contra Costa, Los
+    Angeles) emits one event per ruling, so its children are written one
+    at a time, each by ``write_split_rulings`` as a split set of one.  A
+    split the worker makes itself writes all its children in one call.
     """
 
     parent_document_id: str
     child_ids: tuple[str, ...]
+
+    def written_before(self, document_id: str) -> frozenset[str]:
+        """The sibling slots this capture has already written when it
+        writes *document_id*.
+
+        Children are written in position order, so a slot before
+        *document_id* already holds this capture's ruling: a match there is
+        a true duplicate within the page and keeps #2458 dedup.  A slot
+        after it still holds the previous split's ruling, which this child
+        may take (#4820).  Every sibling when *document_id* is not one of
+        the split's slots (an event captured before #4796 carried
+        positions), so it takes a ruling from none of them.
+        """
+        ids = self.child_ids
+        if document_id not in ids:
+            return frozenset(ids)
+        return frozenset(ids[: ids.index(document_id)])
 
 
 def insert_document_and_ruling(
@@ -2795,9 +2807,7 @@ def insert_document_and_ruling(
     summary_model: str | None = None,
     summary_generated_at: datetime | None = None,
     force_update: bool = False,
-    relink_case: bool = False,
     hearing_date_source: str | None = None,
-    split_set: SplitSet | None = None,
     move_ruling_case: bool = False,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
@@ -2806,6 +2816,10 @@ def insert_document_and_ruling(
     same ``document_id`` is guaranteed to be passed to both operations.  This
     prevents the FK divergence fixed in #1775 by construction: callers no
     longer need to remember to thread the same ID through two separate calls.
+
+    For a document written whole.  Split children, a scraper's pre-split
+    children included, are written by ``write_split_rulings``, which matches
+    the key's existing rows to the children by content (#4845, #4967).
 
     Parameters match the union of ``insert_document`` and ``insert_ruling``.
     ``hearing_date`` may be ``None`` — the ruling is still inserted with a
@@ -2831,29 +2845,8 @@ def insert_document_and_ruling(
       of ``force_update`` — we never erase a good ruling text just because a
       re-extraction happened to miss it.
 
-    ``relink_case`` (default False) is for split children, whose id names a
-    slot in the split rather than a case (#4700).  When set, a re-derived
-    case link wins: ``documents.case_id`` is overwritten, and an existing
-    ruling row for this document linked to a *different* case is removed
-    (its alerts detached, never deleted) so the ruling is re-inserted fresh
-    for the new case instead of carrying the old case's fields and text.
-    A ruling already on the same case is updated in place as usual.
-
     ``hearing_date_source`` is written with the ruling's ``hearing_date``
     (see ``insert_ruling``, #4793).
-
-    A relink only ever moves a ruling onto a real case (#4788).  When the
-    target case is a placeholder (``UNKNOWN-*`` / NULL case number, or no
-    such row), ``relink_case`` is ignored and the preserve-first semantics
-    apply: a re-process that missed the case number must not delete a
-    correctly linked ruling or detach its ``public.alert_events``.
-
-    ``split_set`` names the split this document is a child of (#4820).  When
-    given, a ruling with this write's case and text that sits on a sibling
-    slot of the same S3 key which this pass has not written yet (a later
-    slot, or a stale slot the split no longer writes) is **moved** here, not
-    treated as a separate capture that wins content-hash dedup.  See
-    ``_move_split_sibling_ruling``.
 
     ``move_ruling_case`` (default False) moves this document's existing
     ruling to *case_id* in place, placeholder or not, and links the
@@ -2869,30 +2862,6 @@ def insert_document_and_ruling(
     """
     if move_ruling_case:
         _move_document_ruling_to_case(conn, document_id, case_id)
-        relink_case = False
-    if relink_case and _is_placeholder_case(conn, case_id):
-        logger.info(
-            "insert_document_and_ruling: relink skipped, target case is a placeholder",
-            extra={"document_id": document_id, "case_id": case_id},
-        )
-        relink_case = False
-    if relink_case:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
-                "(SELECT id FROM rulings WHERE document_id = %s::uuid AND case_id <> %s::uuid)",
-                (document_id, case_id),
-            )
-            cur.execute(
-                "DELETE FROM rulings WHERE document_id = %s::uuid AND case_id <> %s::uuid",
-                (document_id, case_id),
-            )
-            removed = cur.rowcount
-            if isinstance(removed, int) and removed > 0:
-                logger.info(
-                    "insert_document_and_ruling: split child relinked to a new case",
-                    extra={"document_id": document_id, "case_id": case_id},
-                )
 
     is_new = insert_document(
         conn,
@@ -2908,18 +2877,7 @@ def insert_document_and_ruling(
         captured_at=captured_at,
         hearing_date=hearing_date,
         force_update=force_update,
-        relink_case=relink_case,
     )
-
-    if split_set is not None:
-        _move_split_sibling_ruling(
-            conn,
-            document_id=document_id,
-            case_id=case_id,
-            text_hash=normalize_ruling_text_hash(_strip_nul(ruling_text)),
-            s3_key=s3_key,
-            split_set=split_set,
-        )
 
     insert_ruling(
         conn,
@@ -2956,134 +2914,6 @@ def insert_document_and_ruling(
         )
 
     return is_new
-
-
-def _content_parent_of_key(s3_key: str) -> str | None:
-    """Return ``uuid5(NAMESPACE_URL, <sha256>)`` for a content-addressed key
-    (``.../<sha256>.<ext>``), else None."""
-    stem = s3_key.rsplit("/", 1)[-1].split(".", 1)[0]
-    if len(stem) != 64 or any(ch not in "0123456789abcdef" for ch in stem):
-        return None
-    from .split_ids import derive_parent_document_id
-
-    return derive_parent_document_id(stem)
-
-
-def _is_unwritten_split_slot(
-    holder_id: str, document_id: str, s3_key: str, split: SplitSet
-) -> bool:
-    """Whether *holder_id* is a slot of *split* that this pass has not
-    written yet, as seen from the child *document_id* being written.
-
-    Children are written in position order, so a slot after *document_id*
-    still holds the previous split's content.  A row the split no longer
-    writes is stale, and the post-split cleanup (``delete_stale_split_children``)
-    removes it: a row this parent owns, or any UUIDv5 row on the key when
-    the parent is the key's content parent (#4796).  A slot before
-    *document_id* was already written in this pass, so a match there is a
-    true duplicate within the document and keeps #2458 dedup.
-    """
-    ids = split.child_ids
-    if holder_id in ids:
-        return ids.index(holder_id) > ids.index(document_id)
-    if _own_split_rows(split.parent_document_id, [holder_id]):
-        return True
-    try:
-        is_v5 = uuid.UUID(holder_id).version == 5
-    except ValueError:
-        return False
-    return is_v5 and _content_parent_of_key(s3_key) == split.parent_document_id
-
-
-def _move_split_sibling_ruling(
-    conn: psycopg.Connection,
-    *,
-    document_id: str,
-    case_id: str,
-    text_hash: str | None,
-    s3_key: str | None,
-    split_set: SplitSet,
-) -> bool:
-    """Move the ruling this split child is about to write from the sibling
-    slot that holds it, instead of letting content-hash dedup supersede this
-    child (#4820).
-
-    When a key's split set shifts by one position (a stale 13-way Orange
-    split put ruling k at slot k+1), writing slot k's ruling finds its text
-    on slot k+1, which this pass has not re-written yet.  Superseding slot k
-    there, and then deleting the row slot k+1 held when slot k+1 is written,
-    cascaded down the split and deleted all but the last ruling until the
-    next run.  The holder is a sibling about to be re-written (or removed as
-    stale), not a separate capture, so the ruling row moves:
-
-    - the row this document held (content the new split puts elsewhere or
-      drops) is deleted, its alerts detached, never deleted;
-    - the holder's ruling row is re-keyed to this document, keeping its id,
-      so ``alert_events.ruling_id`` stays attached; alerts on it follow it
-      to this document;
-    - the holder is marked superseded by this document until its own slot
-      is written, when ``insert_document_and_ruling`` revives it (#4809).
-
-    Every step runs in the caller's transaction, so no committed state has
-    the ruling missing.  Returns True when a ruling was moved.
-    """
-    if text_hash is None or not s3_key or document_id not in split_set.child_ids:
-        return False
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT r.id::text, r.document_id::text FROM rulings r "
-            "JOIN documents d ON d.id = r.document_id "
-            "WHERE r.case_id = %s::uuid AND r.ruling_text_hash = %s "
-            "AND r.document_id <> %s::uuid AND d.s3_key = %s",
-            (case_id, text_hash, document_id, s3_key),
-        )
-        row = cur.fetchone()
-    if row is None:
-        return False
-    ruling_id, holder_id = row[0], row[1]
-    if not _is_unwritten_split_slot(holder_id, document_id, s3_key, split_set):
-        return False
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id IN "
-            "(SELECT id FROM rulings WHERE document_id = %s::uuid)",
-            (document_id,),
-        )
-        cur.execute("DELETE FROM rulings WHERE document_id = %s::uuid", (document_id,))
-        displaced = cur.rowcount
-        cur.execute(
-            "UPDATE rulings SET document_id = %s::uuid WHERE id = %s::uuid",
-            (document_id, ruling_id),
-        )
-        cur.execute(
-            "UPDATE alert_events SET document_id = %s::uuid WHERE ruling_id = %s::uuid",
-            (document_id, ruling_id),
-        )
-        # The document holds the ruling, so it is linked to the ruling's case.
-        cur.execute(
-            "UPDATE documents SET case_id = %s::uuid, previous_version_id = CASE "
-            "WHEN previous_version_id = %s::uuid THEN NULL ELSE previous_version_id END "
-            "WHERE id = %s::uuid",
-            (case_id, holder_id, document_id),
-        )
-        cur.execute(
-            "UPDATE documents SET status = 'superseded', previous_version_id = %s::uuid, "
-            "change_type = 'duplicate_content' WHERE id = %s::uuid",
-            (document_id, holder_id),
-        )
-    logger.info(
-        "insert_document_and_ruling: moved a split sibling's ruling to its new slot",
-        extra={
-            "document_id": document_id,
-            "from_document_id": holder_id,
-            "ruling_id": ruling_id,
-            "s3_key": s3_key,
-            "displaced_rulings": displaced,
-            "event": "split_shift_ruling_move",
-        },
-    )
-    return True
 
 
 #: Synthetic case-number prefix the worker uses when no case number could be
@@ -3126,21 +2956,6 @@ def _move_document_ruling_to_case(conn: psycopg.Connection, document_id: str, ca
             "telemetry_event": "ruling_left_unsupported_case",
         },
     )
-
-
-def _is_placeholder_case(conn: psycopg.Connection, case_id: str) -> bool:
-    """Return True unless *case_id* names a case with a real case number.
-
-    A missing row, a NULL/empty case number, or a synthetic ``UNKNOWN-*``
-    case number all count as a placeholder (#4788).
-    """
-    with conn.cursor() as cur:
-        cur.execute("SELECT case_number FROM cases WHERE id = %s::uuid", (case_id,))
-        row = cur.fetchone()
-    case_number = row[0] if row else None
-    if not isinstance(case_number, str) or not case_number.strip():
-        return True
-    return case_number.startswith(_PLACEHOLDER_CASE_PREFIX)
 
 
 #: Upper bound on the split slot index considered when recognising a
@@ -3247,6 +3062,8 @@ def write_split_rulings(
     children: list[SplitChildRuling],
     relink: bool,
     protected_ids: frozenset[str] = frozenset(),
+    retire_ids: frozenset[str] | None = None,
+    vacated_ids: list[str] | None = None,
 ) -> dict[str, str | None]:
     """Write one split set's rulings, reusing the key's existing ruling rows.
 
@@ -3292,7 +3109,20 @@ def write_split_rulings(
 
     Existing rows that match no child are deleted, their alerts detached
     (``ruling_id`` NULL), never deleted.  Rows on *protected_ids* (children
-    whose extraction failed this pass) are left alone.  Every child that
+    whose extraction failed this pass) are left alone.
+
+    *retire_ids*, when given, limits the deletion to unmatched rows on those
+    documents; other unmatched rows are left as they are.  It is for a
+    scraper's pre-split child, which arrives as its own event and is written
+    as a split set of one (#4967): the rows on its siblings' slots are
+    written by their own events, so the child may take one by content (the
+    split shifted, #4820) but removes none.  Its *protected_ids* are the
+    siblings this capture already wrote (``SplitSet.written_before``).  A row
+    taken from a document outside *retire_ids* leaves that document without
+    a ruling: it is marked superseded by the child until its own event
+    writes it, and its id is appended to *vacated_ids*.
+
+    Every child that
     holds a ruling is active and linked to the ruling's case; a child whose
     ruling is a content-hash duplicate of another capture is superseded by
     ``insert_ruling`` (#2458).
@@ -3403,9 +3233,16 @@ def write_split_rulings(
             continue
         claimed.add((final_case[i], hashes[i]))
 
+    # Where each claimed row came from: {document it held: its child}.
+    moved_from = {
+        h.document_id: children[i].document_id
+        for i, h in match.items()
+        if h.document_id != children[i].document_id
+    }
+
     with conn.cursor() as cur:
         # 1. Rows no child claims are removed; their alerts are detached.
-        stale = [h.ruling_id for h in free]
+        stale = [h.ruling_id for h in free if retire_ids is None or h.document_id in retire_ids]
         if stale:
             cur.execute(
                 "UPDATE alert_events SET ruling_id = NULL WHERE ruling_id = ANY(%s::uuid[])",
@@ -3547,6 +3384,22 @@ def write_split_rulings(
                 "previous_version_id = NULL, case_id = %s::uuid WHERE id = %s::uuid",
                 (row[0], c.document_id),
             )
+
+    # 5. A row taken from a slot this write does not own (a pre-split
+    # sibling's, #4967) leaves that slot without a ruling until its own
+    # event writes it.  A document without a ruling is not live (#4809).
+    if retire_ids is not None:
+        vacated = sorted(doc for doc in moved_from if doc not in child_ids)
+        with conn.cursor() as cur:
+            for doc in vacated:
+                cur.execute(
+                    "UPDATE documents SET status = 'superseded', previous_version_id = %s::uuid, "
+                    "change_type = 'duplicate_content' WHERE id = %s::uuid "
+                    "AND NOT EXISTS (SELECT 1 FROM rulings WHERE document_id = %s::uuid)",
+                    (moved_from[doc], doc, doc),
+                )
+        if vacated_ids is not None:
+            vacated_ids.extend(vacated)
     return result
 
 
