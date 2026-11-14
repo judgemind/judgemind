@@ -4126,6 +4126,8 @@ class IngestionWorker:
         parties_data = w.parties_data
         scraper_id = w.scraper_id
         extraction_methods = w.extraction_methods
+        # Set when enrichment swaps the printed judge name for a canonical one.
+        printed_judge_name: str | None = None
 
         # 1. Ensure court exists
         court_id = upsert_court(conn, state, county, court_name)
@@ -4213,6 +4215,9 @@ class IngestionWorker:
             ):
                 judge_name = enrich_result.judge_resolution.canonical_name
                 if _original_judge_name != judge_name:
+                    # Arbitration counts the spelling the document printed,
+                    # not the canonical name it resolved to (#4928).
+                    printed_judge_name = _original_judge_name
                     logger.info(
                         "Enrichment resolved judge via alias",
                         extra={
@@ -4334,6 +4339,10 @@ class IngestionWorker:
                 court_id,
                 source=scraper_id or "scraper",
                 renamed_judge_ids=w.renamed_judge_ids,
+                # Arbitration counts one vote per document, for the
+                # spelling the document printed (#4928).
+                document_id=w.document_id,
+                printed_name=printed_judge_name,
             )
 
         w.case_number = case_number

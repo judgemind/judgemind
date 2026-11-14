@@ -496,6 +496,9 @@ def test_enrichment_alias_match_updates_judge_name(
         "court-uuid-1",
         source="ca-la-tentatives-civil",
         renamed_judge_ids=set(),
+        document_id="aaaaaaaa-0000-0000-0000-000000000001",
+        # The vote is for the spelling the document printed (#4928).
+        printed_name="J. Smith",
     )
 
     # The canonical name reaches OpenSearch through the judge row that
@@ -560,6 +563,8 @@ def test_enrichment_directory_mismatch_logs_warning_no_override(
         "court-uuid-1",
         source="ca-la-tentatives-civil",
         renamed_judge_ids=set(),
+        document_id="aaaaaaaa-0000-0000-0000-000000000001",
+        printed_name=None,
     )
 
     # Verify directory mismatch warning was logged
@@ -820,6 +825,8 @@ def test_enrichment_no_db_api_changes(
         "court-uuid-1",
         source="ca-la-tentatives-civil",
         renamed_judge_ids=set(),
+        document_id="aaaaaaaa-0000-0000-0000-000000000001",
+        printed_name=None,
     )
 
     # Verify commit was called (transaction completed)
@@ -925,6 +932,8 @@ def test_enrichment_invalid_judge_name_handled_gracefully(
         "court-uuid-1",
         source="ca-la-tentatives-civil",
         renamed_judge_ids=set(),
+        document_id="aaaaaaaa-0000-0000-0000-000000000001",
+        printed_name=None,
     )
     mock_conn.commit.assert_called_once()
 
