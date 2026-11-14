@@ -1616,6 +1616,57 @@ def _maybe_arbitrate(
     return True
 
 
+#: SQL predicate: judge ``j`` is the judge a roster name belongs to.  Its
+#: canonical name is the roster spelling (any case), or it holds the roster
+#: spelling as an alias under any source.  Takes the roster name twice.
+#: Shared by ``resolve_judge`` Step 3b and the roster seed
+#: (``ingestion.judge_seed``), so both resolve a roster name to the same
+#: judge (#4926).
+ROSTER_JUDGE_PREDICATE = """(
+    LOWER(j.canonical_name) = LOWER(%s)
+    OR EXISTS (
+        SELECT 1 FROM judge_aliases ja
+        WHERE ja.judge_id = j.id AND LOWER(ja.raw_name) = LOWER(%s)
+    )
+)"""
+
+
+def _find_judge_by_roster_name(
+    cur: psycopg.Cursor, court_id: str, roster_name: str
+) -> tuple[str, str] | None:
+    """Return ``(judge_id, canonical_name)`` of the judge *roster_name* belongs to.
+
+    Arbitration can rename a judge away from the roster spelling and keep
+    that spelling only as an alias, and a judge created under a non-roster
+    spelling holds the roster name as a ``roster_match`` alias (#3858).  A
+    lookup by ``canonical_name`` alone misses both, so a new spelling of
+    the same judge created a second judge row (#4926).  The lookup matches
+    the canonical name or any alias (see :data:`ROSTER_JUDGE_PREDICATE`).
+
+    When several judges match, an exact canonical match wins, then a
+    case-insensitive one, then the oldest judge, so the choice is
+    deterministic.
+    """
+    cur.execute(
+        f"""
+        SELECT j.id, j.canonical_name
+        FROM judges j
+        WHERE j.court_id = %s::uuid
+          AND {ROSTER_JUDGE_PREDICATE}
+        ORDER BY (j.canonical_name = %s) DESC,
+                 (LOWER(j.canonical_name) = LOWER(%s)) DESC,
+                 j.created_at ASC,
+                 j.id ASC
+        LIMIT 1
+        """,
+        (court_id, roster_name, roster_name, roster_name, roster_name),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
 def resolve_judge(
     conn: psycopg.Connection,
     raw_name: str,
@@ -1648,9 +1699,10 @@ def resolve_judge(
       6. Check for near-duplicates (missing middle initial) at the same court.
       7. If near-match found, link to existing judge (prefer more complete name).
       8. Fuzzy-match against court directory roster names (#2140).
-         If a roster match is found AND a judge with that canonical name exists,
-         link via alias. If no existing judge, use the roster canonical name
-         for the new record.
+         If a roster match is found AND a judge holds the roster name, as its
+         canonical name or as an alias (#4926), link via alias. If no
+         existing judge, keep the incoming spelling for the new record and
+         store the roster name as a roster_match alias (#3858).
       9. If no match at all, create a new judge with ON CONFLICT handling.
     """
     raw_name = _strip_nul(raw_name) or raw_name
@@ -1827,34 +1879,27 @@ def resolve_judge(
                 # Normalize the roster name through the same pipeline
                 roster_normalized = normalize_judge_name(roster_canonical)
                 if roster_normalized is not None:
-                    # Check if a judge with the roster's canonical name exists
-                    cur.execute(
-                        """
-                        SELECT id FROM judges
-                        WHERE canonical_name = %s AND court_id = %s::uuid
-                        LIMIT 1
-                        """,
-                        (roster_normalized, court_id),
-                    )
-                    row = cur.fetchone()
+                    row = _find_judge_by_roster_name(cur, court_id, roster_normalized)
                     if row is not None:
                         judge_id = str(row[0])
+                        # The judge's name today, which is the roster spelling
+                        # only when the canonical matched.
+                        current_canonical = str(row[1])
                         # Step 3b arbitration (#3484/#3503): when the incoming
-                        # canonical differs from the roster canonical, check
-                        # whether the incoming spelling has independent source
-                        # corroboration.  Delegate to _maybe_arbitrate which
-                        # promotes if >=1 distinct non-roster source already
-                        # supports the incoming spelling.
+                        # canonical differs from the judge's current canonical,
+                        # record the incoming spelling as evidence and let
+                        # _maybe_arbitrate rename the judge if the evidence
+                        # favours another spelling (#4922).
                         incoming_canonical = canonical  # the normalized incoming name
                         if (
-                            incoming_canonical.lower() != roster_normalized.lower()
+                            incoming_canonical.lower() != current_canonical.lower()
                             and source
                             and _maybe_arbitrate(
                                 cur,
                                 judge_id,
                                 raw_name,
                                 incoming_canonical=incoming_canonical,
-                                roster_normalized=roster_normalized,
+                                roster_normalized=current_canonical,
                                 source=source,
                                 confidence=confidence,
                                 renamed_judge_ids=renamed_judge_ids,
@@ -1869,7 +1914,7 @@ def resolve_judge(
                         # 'roster_match' as before.
                         fall_through_source = (
                             source
-                            if (source and incoming_canonical.lower() != roster_normalized.lower())
+                            if (source and incoming_canonical.lower() != current_canonical.lower())
                             else "roster_match"
                         )
                         cur.execute(

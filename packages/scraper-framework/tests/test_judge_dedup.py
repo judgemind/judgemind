@@ -481,7 +481,7 @@ class TestResolveJudgeRosterIntegration:
             ("ca-orange",),  # court_code
             ({"D1": "Jennifer Mccartney"},),  # snapshot
             # Step 3b: check if roster-matched judge exists
-            ("existing-judge-uuid",),  # YES - judge with roster name exists
+            ("existing-judge-uuid", "Jennifer Mccartney"),  # YES - judge with roster name exists
         ]
         mock_cur.fetchall.return_value = []  # Step 3: no near-duplicates
 

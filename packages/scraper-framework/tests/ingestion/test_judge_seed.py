@@ -29,14 +29,22 @@ Coverage matrix:
   - Deduplication: when multiple departments map to the same canonical
     name, only one INSERT is attempted (one candidate counted).
   - Mapping JSON parse failure: skipped without raising.
+  - Real Postgres: a roster name a judge already holds (as an alias, or
+    as its canonical name in another case) is not seeded again (#4926).
 """
 
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from unittest.mock import MagicMock
 
+import pytest
+
 from ingestion.judge_seed import seed_judges_from_directory_snapshots
+
+_DSN = os.environ.get("TEST_DATABASE_URL", "")
 
 
 def _make_mock_conn() -> tuple[MagicMock, MagicMock]:
@@ -113,7 +121,7 @@ class TestHappyPath:
         insert_calls = [
             c for c in mock_cur.execute.call_args_list if "INSERT INTO judges" in c.args[0]
         ]
-        assert insert_calls[0].args[1] == ("Karine Mkrtchyan", "la-uuid")
+        assert insert_calls[0].args[1][:2] == ("Karine Mkrtchyan", "la-uuid")
 
 
 class TestIdempotency:
@@ -415,3 +423,86 @@ class TestEmptySnapshots:
             "skipped_invalid": 0,
             "skipped_no_court": 0,
         }
+
+
+@pytest.mark.skipif(not _DSN, reason="TEST_DATABASE_URL not set")
+class TestSeedSkipsRosterNameHeldByAJudgePg:
+    """Real Postgres: the seed does not duplicate a judge that holds the
+    roster name as an alias or under another case (#4926).
+
+    On dev, Orange judge fb070234 was renamed to 'H. Shaina Clover' and
+    kept the roster spelling 'H. Shaina Colover' as an alias.  The seed
+    matched only ``canonical_name``, so it inserted an empty 'H. Shaina
+    Colover' judge, which then took every document printing the roster
+    spelling.
+    """
+
+    def test_roster_names_held_by_existing_judges_are_not_seeded(self) -> None:
+        import psycopg
+
+        code = f"ca-seed4926-{uuid.uuid4().hex[:12]}"
+        snapshot_court = code.replace("-", "_")
+        roster = {"C23": "H. Shaina Colover", "C24": "Craig Griffin", "C25": "Pat Q. Newjudge"}
+        conn = psycopg.connect(_DSN, autocommit=False)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO courts (state, county, court_name, court_code) "
+                    "VALUES ('CA', 'Seed4926', 'Superior Court', %s) RETURNING id",
+                    (code,),
+                )
+                court_id = str(cur.fetchone()[0])
+                cur.execute(
+                    "INSERT INTO court_directory_snapshots "
+                    "(court_id, captured_at, s3_key, mapping, content_hash) "
+                    "VALUES (%s, NOW(), %s, %s::jsonb, %s)",
+                    (snapshot_court, f"test/{code}.json", json.dumps(roster), code),
+                )
+                cur.execute(
+                    "INSERT INTO judges (canonical_name, court_id) "
+                    "VALUES ('H. Shaina Clover', %s::uuid) RETURNING id",
+                    (court_id,),
+                )
+                clover = str(cur.fetchone()[0])
+                cur.execute(
+                    "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence) "
+                    "VALUES (%s::uuid, 'H. Shaina Colover', 'roster_match', 1.0)",
+                    (clover,),
+                )
+                cur.execute(
+                    "INSERT INTO judges (canonical_name, court_id) "
+                    "VALUES ('CRAIG GRIFFIN', %s::uuid)",
+                    (court_id,),
+                )
+            conn.commit()
+
+            stats = seed_judges_from_directory_snapshots(conn, only_court_id=snapshot_court)
+            conn.commit()
+            # Running again inserts nothing.
+            again = seed_judges_from_directory_snapshots(conn, only_court_id=snapshot_court)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT canonical_name FROM judges WHERE court_id = %s::uuid "
+                    "ORDER BY canonical_name",
+                    (court_id,),
+                )
+                names = [r[0] for r in cur.fetchall()]
+            assert names == ["CRAIG GRIFFIN", "H. Shaina Clover", "Pat Q. Newjudge"]
+            assert stats["inserted"] == 1
+            assert stats["skipped_existing"] == 2
+            assert again["inserted"] == 0
+        finally:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM courts WHERE court_code = %s", (code,))
+                for (cleanup_court,) in cur.fetchall():
+                    cur.execute("DELETE FROM judges WHERE court_id = %s", (cleanup_court,))
+                    cur.execute("DELETE FROM courts WHERE id = %s", (cleanup_court,))
+                cur.execute(
+                    "DELETE FROM court_directory_snapshots WHERE court_id = %s",
+                    (snapshot_court,),
+                )
+            conn.commit()
+            conn.close()

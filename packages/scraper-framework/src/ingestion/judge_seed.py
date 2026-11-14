@@ -32,6 +32,10 @@ Behaviour
 - INSERT-only (idempotent).  Never UPDATEs an existing row, never
   removes rows.  Uses ``ON CONFLICT (canonical_name, court_id) DO
   NOTHING`` against the constraint defined in migration #10.
+- Skips a roster name that a judge in the court already holds, as its
+  canonical name (any case) or as an alias (#4926).  A judge renamed
+  away from the roster spelling keeps that spelling as an alias; seeding
+  it again would create an empty duplicate judge.
 - Skips entries that fail :func:`_looks_like_valid_judge_name` (e.g.
   empty strings, single-word values, garbage).  These should never
   appear in a directory mapping but we defend in depth.
@@ -183,7 +187,11 @@ def seed_judges_from_directory_snapshots(
           resolve to a row in ``derived.courts``.
     """
     # Lazy import to avoid circular dependency with ingestion.db.
-    from ingestion.db import _looks_like_valid_judge_name
+    from ingestion.db import (
+        ROSTER_JUDGE_PREDICATE,
+        _looks_like_valid_judge_name,
+        normalize_judge_name,
+    )
 
     stats = {
         "courts": 0,
@@ -224,19 +232,35 @@ def seed_judges_from_directory_snapshots(
                 )
                 continue
 
+            # The roster name as resolve_judge's Step 3b normalizes it.
+            normalized = normalize_judge_name(name) or name
             with conn.cursor() as cur:
+                # Skip the name when a judge in this court already holds
+                # it, as its canonical name (any case) or as an alias.
+                # Arbitration can rename a judge away from the roster
+                # spelling and keep that spelling as an alias; seeding the
+                # roster spelling again created an empty duplicate judge
+                # that then took every document printing the roster
+                # spelling (#4926, Orange 'H. Shaina Colover').  Same
+                # predicate as resolve_judge Step 3b.
+                #
                 # ON CONFLICT DO NOTHING relies on migration #10's
                 # UNIQUE (canonical_name, court_id) constraint.  We
                 # check rowcount instead of using RETURNING because
                 # ON CONFLICT DO NOTHING with RETURNING returns no row
                 # on conflict — rowcount is the simpler path.
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO judges (canonical_name, court_id)
-                    VALUES (%s, %s::uuid)
+                    SELECT %s, %s::uuid
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM judges j
+                        WHERE j.court_id = %s::uuid
+                          AND ({ROSTER_JUDGE_PREDICATE} OR {ROSTER_JUDGE_PREDICATE})
+                    )
                     ON CONFLICT (canonical_name, court_id) DO NOTHING
                     """,
-                    (name, court_uuid),
+                    (name, court_uuid, court_uuid, name, name, normalized, normalized),
                 )
                 if cur.rowcount > 0:
                     stats["inserted"] += 1
