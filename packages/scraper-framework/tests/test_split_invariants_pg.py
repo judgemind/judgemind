@@ -300,6 +300,51 @@ def test_misread_repeated_in_llm_transcription_still_relinks() -> None:
     assert new_id == old_id and new_alert == old_id
 
 
+#: The number a Riverside PDF prints, and the LLM's misread of it (#4911).
+_RIV_PRINTED = "CVRI2501831"
+_RIV_MISREAD = "CVRI2501911"
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["live", "reingest"])
+def test_regex_fallback_transcription_cannot_restore_misread(kind: str) -> None:
+    """#4927: the LLM split reads ``CVRI2501911`` for a row the document
+    prints as ``CVRI2501831``, and its transcription of the ruling repeats
+    the misread.  The gate refutes the LLM's number; before the fix the
+    regex fallback then read ``CVRI2501911`` back out of the transcription
+    (the LLM's own output) and the ruling was filed under it.  Every
+    candidate is now checked against the document's text, so the ruling
+    lands on its ``UNKNOWN-`` case and its sibling keeps its printed one."""
+    h = harness.KeyHarness(_DSN, _RUN, -1)
+    try:
+        key = harness.make_key(f"{_RUN}-b4927-{kind}")
+        sibling = harness._case_number(1)
+        h.event_extra = {
+            "ruling_text": (
+                "SUPERIOR COURT OF CALIFORNIA, COUNTY OF RIVERSIDE. Tentative rulings. "
+                f"1. {_RIV_PRINTED} {harness._title(0)}. 2. {sibling} {harness._title(1)}. "
+                + "The court has read and considered the papers filed. "
+                * 4
+            )
+        }
+        transcription = (
+            f"Plaintiff's motion in {_RIV_MISREAD} is GRANTED. Defendant shall serve "
+            "further responses within 20 days."
+        )
+        specs = (
+            harness.Spec(0, _RIV_MISREAD, harness._title(0), transcription),
+            harness.Spec(1, sibling, harness._title(1), harness._text("b4927", 1)),
+        )
+        rows = (harness.Row("ruling", 0), harness.Row("ruling", 1))
+        h.run_step(key, harness.Step(kind, rows, specs), "misread")
+        cases = sorted(case for _rid, case, _alert in _rulings_with_alerts(h, key))
+    finally:
+        h.close()
+    assert _RIV_MISREAD not in cases
+    assert cases[0] == sibling
+    assert cases[1].startswith("UNKNOWN-")
+
+
 # ---------------------------------------------------------------------------
 # #4920: a judge rename re-indexes the judge's rulings on other keys
 # ---------------------------------------------------------------------------

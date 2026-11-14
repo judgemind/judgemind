@@ -2043,17 +2043,27 @@ def test_llm_case_number_in_child_text_is_kept() -> None:
     assert writes[0].extraction_methods["case_number"] == "llm"
 
 
-def _llm_split_children(document_text: str, case_numbers: list[str | None]) -> list[dict]:
+_SPLIT_CHILD_TEXTS = [
+    "Motion GRANTED for the moving party in full.",
+    "Motion DENIED; the opposition is well taken and persuasive.",
+    "Motion CONTINUED to allow supplemental briefing on the merits by both sides.",
+]
+
+
+def _llm_split_writes(
+    document_text: str,
+    case_numbers: list[str | None],
+    texts: list[str] | None = None,
+    **event_overrides: object,
+) -> list:
     """Run the LLM split path on *document_text* with the extractor
-    returning one ruling per entry of *case_numbers*; return the dispatched
-    child events."""
+    returning one ruling per entry of *case_numbers* (child text *texts*,
+    the LLM's transcription); return the ``_RulingWrite`` objects of the
+    split batch, after each child went through ``process_event`` and its
+    case-number gate."""
     worker, _ = _make_worker()
     mock_conn, _cur = _make_mock_conn()
-    texts = [
-        "Motion GRANTED for the moving party in full.",
-        "Motion DENIED; the opposition is well taken and persuasive.",
-        "Motion CONTINUED to allow supplemental briefing on the merits by both sides.",
-    ]
+    texts = texts or _SPLIT_CHILD_TEXTS
     rulings = [
         ExtractedRuling(
             extracted_case_number=cn,
@@ -2066,23 +2076,20 @@ def _llm_split_children(document_text: str, case_numbers: list[str | None]) -> l
     mock_extractor = MagicMock()
     mock_extractor.extract.return_value = rulings
     worker._get_framework_extractor = lambda: mock_extractor  # type: ignore[method-assign]
-    captured: list[dict] = []
-    original = worker.process_event
-
-    def capture(event_data: dict) -> None:
-        if event_data.get("_split_processed"):
-            captured.append(event_data)
-            return
-        original(event_data)
-
-    worker.process_event = capture  # type: ignore[method-assign]
+    batches: list = []
     with (
         patch("ingestion.worker.psycopg") as mock_psycopg,
-        patch.object(IngestionWorker, "_write_split_batch", autospec=True),
+        patch.object(
+            IngestionWorker,
+            "_write_split_batch",
+            autospec=True,
+            side_effect=lambda _self, _event, _parent, batch: batches.append(batch),
+        ),
     ):
         mock_psycopg.connect.return_value = mock_conn
-        worker.process_event(_make_llm_event(ruling_text=document_text))
-    return captured
+        worker.process_event(_make_llm_event(ruling_text=document_text, **event_overrides))
+    assert len(batches) == 1
+    return sorted(batches[0].children, key=lambda w: w.event_data["_split_index"])
 
 
 _OC_DOCUMENT_TEXT = (
@@ -2098,14 +2105,149 @@ def test_llm_split_drops_case_number_absent_from_document_text() -> None:
     came back for an Orange row that prints no case number.  A number the
     document's extracted text does not carry is dropped; numbers it does
     carry (even wrapped across a line) are kept."""
-    children = _llm_split_children(
+    writes = _llm_split_writes(
         _OC_DOCUMENT_TEXT, ["2024-01393434", "2023-01329371", "2025-00912345"]
     )
-    assert [c["case_number"] for c in children] == ["2024-01393434", "2023-01329371", None]
+    assert [w.case_number for w in writes] == ["2024-01393434", "2023-01329371", None]
+    assert all(w.case_number_evidence == (_OC_DOCUMENT_TEXT,) for w in writes)
 
 
 def test_llm_split_keeps_case_number_when_document_has_no_text_layer() -> None:
     """A scanned PDF has no extracted text to check against, so the LLM's
     number stands."""
-    children = _llm_split_children("Page 1", ["2024-01393434", "2025-00912345", None])
-    assert [c["case_number"] for c in children] == ["2024-01393434", "2025-00912345", None]
+    writes = _llm_split_writes("Page 1", ["2024-01393434", "2025-00912345", None])
+    assert [w.case_number for w in writes] == ["2024-01393434", "2025-00912345", None]
+    assert all(w.case_number_evidence == () for w in writes)
+
+
+_RIVERSIDE_DOCUMENT_TEXT = (
+    "SUPERIOR COURT OF CALIFORNIA, COUNTY OF RIVERSIDE — TENTATIVE RULINGS, DEPT. 6\n"
+    "1  CVRI2501831  Smith v. Jones   Motion to compel further responses.\n"
+    "2  CVRI2500044  Doe v. Roe       Demurrer to the first amended complaint.\n"
+    "The court has read and considered the moving, opposition and reply papers.\n"
+)
+
+
+def test_llm_split_regex_fallback_cannot_restore_refuted_number() -> None:
+    """#4927: the LLM misread ``CVRI2501831`` as ``CVRI2501911`` and its
+    transcription of the ruling repeats the misread.  The gate refuted the
+    LLM's number, then the regex fallback read ``CVRI2501911`` straight
+    back out of the transcription and nothing checked it.  Every candidate
+    is now checked against the document's text, so the child is stored
+    case-less (``UNKNOWN-``)."""
+    transcription = (
+        "Plaintiff's motion in CVRI2501911 is GRANTED. Defendant shall serve further "
+        "responses within 20 days."
+    )
+    writes = _llm_split_writes(
+        _RIVERSIDE_DOCUMENT_TEXT,
+        ["CVRI2501911", "CVRI2500044"],
+        [transcription, _SPLIT_CHILD_TEXTS[1]],
+    )
+    assert [w.case_number for w in writes] == [None, "CVRI2500044"]
+    assert "case_number" not in writes[0].extraction_methods
+
+
+def test_llm_split_regex_fallback_keeps_number_the_document_prints() -> None:
+    """Control for #4927: a child the LLM gave no number keeps the regex
+    fallback's number when the document prints it."""
+    transcription = "Motion in CVRI2501831 is GRANTED; the responses are evasive."
+    writes = _llm_split_writes(
+        _RIVERSIDE_DOCUMENT_TEXT,
+        [None, "CVRI2500044"],
+        [transcription, _SPLIT_CHILD_TEXTS[1]],
+    )
+    assert [w.case_number for w in writes] == ["CVRI2501831", "CVRI2500044"]
+    assert writes[0].extraction_methods["case_number"] == "regex_post_llm"
+
+
+def test_single_ruling_llm_split_falls_back_to_parent_number() -> None:
+    """A split into one ruling is the document: when the gate refutes the
+    LLM's number, the parent event's number (which the link text carries)
+    is next, as it was before the gate moved out of the split."""
+    writes = _llm_split_writes(
+        _RIVERSIDE_DOCUMENT_TEXT,
+        ["CVRI2501911"],
+        ["Plaintiff's motion in CVRI2501911 is GRANTED."],
+        case_number="CVRI2509999",
+        extra={"link_text": "CVRI2509999 Tentative Ruling"},
+    )
+    assert [w.case_number for w in writes] == ["CVRI2509999"]
+    assert writes[0].extraction_methods["case_number"] == "split_parent"
+
+
+@pytest.mark.parametrize("llm_number", [None, "CVRI2501911"])
+def test_single_ruling_llm_split_trusts_parent_number(llm_number: str | None) -> None:
+    """The parent event's number is the scraper's (a listing row, say), and
+    a whole document keeps it unchecked when the split does not run.  A
+    split into one ruling is the same document, so it keeps it too, even
+    when neither the text nor the link text prints it."""
+    writes = _llm_split_writes(
+        _RIVERSIDE_DOCUMENT_TEXT,
+        [llm_number],
+        ["Plaintiff's motion is GRANTED."],
+        case_number="CVRI2509999",
+    )
+    assert [w.case_number for w in writes] == ["CVRI2509999"]
+
+
+def _whole_document_with_llm_number(text: str, llm_number: str) -> list:
+    """A whole document (no split) whose per-field LLM returns *llm_number*."""
+    event = _make_llm_event(
+        document_id="aaaaaaaa-0000-0000-0000-000000004928", ruling_text=text, case_number=None
+    )
+    with patch.object(IngestionWorker, "_llm_split_document", return_value=False):
+        return _process_with_llm_case_number(event, llm_number)
+
+
+def test_short_whole_document_refutes_invented_llm_number() -> None:
+    """#4907 on a whole document: the per-field LLM read only "Page 1", so
+    a number it returns was invented.  The 200-character floor is for text
+    judging numbers read elsewhere (page images, older runs), not for a
+    number read from that same text."""
+    writes = _whole_document_with_llm_number("Page 1 Smith v. Jones", "2025-00912345")
+    assert len(writes) == 1
+    assert writes[0].case_number is None
+    assert writes[0].case_number_evidence == ()
+
+
+def test_short_whole_document_keeps_llm_number_it_prints() -> None:
+    writes = _whole_document_with_llm_number("Page 1 Case 2025-00912345", "2025-00912345")
+    assert [w.case_number for w in writes] == ["2025-00912345"]
+    assert writes[0].extraction_methods["case_number"] == "llm"
+
+
+def test_regex_only_number_still_counts_as_bad_split_fragment() -> None:
+    """#2571 is unchanged by the gate running the regex fallback earlier: a
+    split child with no number and no caption of its own is a fragment and
+    skips LLM enrichment, even when its text quotes a case number."""
+    event = _sc_case_less_child("Consolidated with 24CV412345; the motion is DENIED.")
+    event["case_title"] = None
+    worker, _ = _make_worker()
+    mock_conn, _cur = _make_mock_conn()
+    writes: list = []
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch.object(
+            IngestionWorker,
+            "_write_one_ruling",
+            autospec=True,
+            side_effect=lambda _self, write: writes.append(write),
+        ),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        worker.process_event(event)
+    assert len(writes) == 1
+    assert writes[0].case_number == "24CV412345"
+    assert writes[0].extraction_methods["motion_type"] == "skipped_bad_split_fragment"
+
+
+def test_pre_split_llm_child_transcription_is_not_evidence() -> None:
+    """A scraper that split the page with an LLM (CC / LA) emits children
+    whose text is that LLM's transcription: no case-number evidence."""
+    from ingestion.worker import _case_number_evidence
+
+    llm_child = {"_split_processed": True, "extra": {"pre_split": True, "_llm_extracted": True}}
+    deterministic_child = {"_split_processed": True, "_llm_extracted": True}
+    assert _case_number_evidence(llm_child, "Motion in 23STCV00001 GRANTED.") == ()
+    assert _case_number_evidence(deterministic_child, "See below.") == ("See below.",)

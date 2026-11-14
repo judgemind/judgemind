@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
@@ -68,6 +69,15 @@ from validation.hearing_date_source import (
 )
 from validation.issue_filer import file_validation_issue
 
+from .case_evidence import (
+    CASE_NUMBER_EVIDENCE_KEY,
+    INHERITED_CASE_NUMBER_KEY,
+    CaseNumberCandidate,
+    case_number_refuted,
+    document_evidence,
+    own_text_evidence,
+    settle_case_number,
+)
 from .case_type_resolver import resolve_case_type
 from .db import (
     SplitChildRuling,
@@ -88,7 +98,6 @@ from .db import (
 from .department_normalize import normalize_department
 from .doc_timing import DocTiming, emit_via_stdlib_logger
 from .extract import (
-    case_number_supported_by_text,
     clean_case_title,
     dedupe_repeated_title,
     extract_case_number,
@@ -223,8 +232,9 @@ def _split_child_case_fields(
     case (``PdfLinkScraper.parse_document`` takes the first match, the LA
     scraper the first ``Case Number:``), so a child without its own number
     that took them was filed under another case.  It stays case-less
-    instead: the worker's regex fallback reads its own text, else it gets
-    an ``UNKNOWN-`` placeholder that validation drops.
+    instead: the worker's regex fallback reads its own text (and the
+    case-number gate checks what it finds, ``settle_case_number``), else it
+    gets an ``UNKNOWN-`` placeholder that validation drops.
 
     A split into a single ruling is the document itself, so it may still
     fall back to the event's values.
@@ -242,73 +252,59 @@ def _split_child_case_fields(
     return child_case_number, child_case_title
 
 
-#: Below this many non-blank characters a document's extracted text cannot
-#: confirm or refute an LLM-read case number (a scanned PDF with no text
-#: layer, read by the multimodal LLM from page images).
-_MIN_TEXT_TO_CHECK_CASE_NUMBER = 200
+def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -> tuple[str, ...]:
+    """Return the source evidence the event's case number is checked
+    against (``case_evidence``, #4927).
 
-
-def _llm_case_number_unsupported(
-    case_number: str | None,
-    texts: tuple[str | None, ...],
-    *,
-    min_text_len: int = 0,
-) -> bool:
-    """Return True when an LLM-read *case_number* appears in none of *texts*.
-
-    An LLM can return a case number the document does not carry: a prompt
-    example (``2025-00912345`` on an Orange row with no number), a misread
-    (``CVRI2501911`` for a printed ``CVRI2501831``) or an invented
-    placeholder (``23STCV01234`` for a Santa Clara split child whose whole
-    text was ``See below.``, #4907).  Such a number must not be stored: the
-    ruling would be filed under, and dedup-merged into, a case it does not
-    belong to.
-
-    ``texts[0]`` is the text the LLM read; the rest only add support.  The
-    check is skipped (False) when ``texts[0]`` cannot settle it: no number,
-    a synthetic ``UNKNOWN-`` one, raw PDF bytes instead of text, or fewer
-    than *min_text_len* non-blank characters.
+    - An LLM split child carries its evidence on the event
+      (``CASE_NUMBER_EVIDENCE_KEY``): the parent document's text.  Its own
+      ``ruling_text`` is the LLM's transcription and never counts.
+    - A scraper's pre-split child whose fields the scraper filled with an
+      LLM (``extra["_llm_extracted"]``) has none: its text is that LLM's
+      transcription.
+    - Any other split child (a deterministic splitter's, a scraper's
+      pre-split child) is checked against its own text, at any length.
+    - A whole document is checked against its extracted text and link text,
+      when the text is long enough to settle it.
     """
-    if not case_number or case_number.startswith("UNKNOWN-") or not texts:
-        return False
-    primary = texts[0]
-    if not primary or is_pdf_binary(primary) or len(primary.strip()) < max(min_text_len, 1):
-        return False
-    return not case_number_supported_by_text(case_number, *texts)
+    if CASE_NUMBER_EVIDENCE_KEY in event_data:
+        return tuple(t for t in event_data[CASE_NUMBER_EVIDENCE_KEY] or () if t)
+    extra = event_data.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    if event_data.get("_split_processed"):
+        if extra.get("_llm_extracted"):
+            return ()
+        return own_text_evidence(ruling_text)
+    return document_evidence(ruling_text, extra.get("link_text"))
 
 
-def _case_number_check_texts(document_text: str | None) -> tuple[str, ...]:
-    """Return ``(document_text,)`` when the text can confirm or refute a
-    case number, else ``()``: no text, raw PDF bytes, or fewer than
-    ``_MIN_TEXT_TO_CHECK_CASE_NUMBER`` non-blank characters (a scanned
-    PDF with no text layer, #4915)."""
-    if (
-        not document_text
-        or len(document_text.strip()) < _MIN_TEXT_TO_CHECK_CASE_NUMBER
-        or is_pdf_binary(document_text)
-    ):
+def _read_text_evidence(event_data: dict[str, Any], ruling_text: str | None) -> tuple[str, ...]:
+    """Evidence for a number an extractor read from a whole document's own
+    text (the per-field LLM, the regex fallback): that text and the link
+    text, at any length, since the extractor saw nothing else (#4907).
+    ``()`` for a split child, whose write evidence already covers it."""
+    if event_data.get("_split_processed") or not own_text_evidence(ruling_text):
         return ()
-    return (document_text,)
+    extra = event_data.get("extra")
+    link_text = extra.get("link_text") if isinstance(extra, dict) else None
+    return (*own_text_evidence(ruling_text), *((link_text,) if link_text else ()))
 
 
-def _fuzzy_correction_contradicts_text(
-    case_number: str | None,
-    corrected: str | None,
-    texts: tuple[str | None, ...],
-    link_text: str | None = None,
-) -> bool:
-    """Return True when *texts* carry *case_number* but not the fuzzy
-    match *corrected* the enrichment engine would replace it with (#4915).
-
-    The document printing a number is the strongest evidence of its case;
-    a near-miss it does not print is a different case.  False when there
-    are no texts to check.  *link_text* only adds support.
-    """
-    if not texts or not any(texts) or not case_number or not corrected:
-        return False
-    return case_number_supported_by_text(
-        case_number, *texts, link_text
-    ) and not case_number_supported_by_text(corrected, *texts, link_text)
+def _log_refuted_case_numbers(
+    refuted: list[CaseNumberCandidate], event_data: dict[str, Any], county: str
+) -> None:
+    for candidate in refuted:
+        logger.warning(
+            "Discarded case_number absent from the document's source text",
+            extra={
+                "document_id": event_data.get("document_id"),
+                "county": county,
+                "rejected_case_number": (candidate.case_number or "")[:80],
+                "method": candidate.method,
+                "split_child": bool(event_data.get("_split_processed")),
+                "telemetry_event": "case_number_unsupported",
+            },
+        )
 
 
 def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) -> bool:
@@ -318,17 +314,16 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
     Only for a whole document (a split child's text is not the whole
     document; ``write_split_rulings`` handles LLM split children), only on a
     reingest / rebuild (``REPLACE_SPLIT_SET_KEY``), only when the document
-    text can settle it, and only off a real case number neither the text
-    nor the link text carries.  A number the document prints keeps
+    text can settle it, and only off a real case number the evidence
+    refutes (``case_number_refuted``).  A number the document prints keeps
     preserve-first semantics (#2475, #4788).
     """
     if (
         w.event_data.get("_split_processed")
         or w.event_data.get(REPLACE_SPLIT_SET_KEY) is not True
-        or not w.case_number_texts
+        or not w.case_number_evidence
     ):
         return False
-    link_text = (w.event_data.get("extra") or {}).get("link_text")
     with conn.cursor() as cur:
         cur.execute(
             "SELECT c.case_number FROM rulings r JOIN cases c ON c.id = r.case_id "
@@ -337,9 +332,9 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
         )
         row = cur.fetchone()
     current = row[0] if row else None
-    if not isinstance(current, str) or not current or current.startswith("UNKNOWN-"):
+    if not isinstance(current, str):
         return False
-    return not case_number_supported_by_text(current, *w.case_number_texts, link_text)
+    return case_number_refuted(current, w.case_number_evidence)
 
 
 def _should_relink_split_case(event_data: dict[str, Any], case_number: str | None) -> bool:
@@ -1486,10 +1481,10 @@ class _RulingWrite:
     validation_result: ValidationResult | None
     extraction_methods: dict[str, str]
     effective_case_number: str = ""
-    #: The text the ruling's case number must appear in: the document's
-    #: extracted text (and the child's own) when it can settle that, else
-    #: empty (``_case_number_check_texts``, #4915).
-    case_number_texts: tuple[str | None, ...] = ()
+    #: The source text the ruling's case number must appear in, empty when
+    #: there is none that can settle it (``_case_number_evidence``, #4927).
+    #: Never LLM output.
+    case_number_evidence: tuple[str, ...] = ()
     #: Judges ``resolve_judge`` renamed while preparing this write; their
     #: rulings are re-indexed once it commits (#4920).
     renamed_judge_ids: set[str] = field(default_factory=set)
@@ -1516,11 +1511,6 @@ class _SplitBatch:
     keep_ids: set[str] = field(default_factory=set)
     replace: bool = False
     no_rulings_reason: str | None = None
-    #: Set by the LLM split: the document text every child's case number
-    #: must appear in (``db.SplitChildRuling.case_number_texts``, #4915).
-    #: Empty for deterministic splits and for documents whose text cannot
-    #: settle it.
-    case_number_texts: tuple[str, ...] = ()
 
 
 class InfrastructureError(Exception):
@@ -3079,6 +3069,7 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         llm_result: LLMExtractionResult | None = None
         case_number_prefix: str | None = None
+        llm_case_number: str | None = None
         skip_llm = is_llm_extracted or is_extraction_none
         if not skip_llm and missing_fields and ruling_text and self._llm_client is not None:
             metadata = {
@@ -3160,13 +3151,8 @@ class IngestionWorker:
                 if ruling is not None:
                     if ruling.case_number_prefix:
                         case_number_prefix = ruling.case_number_prefix
-                    # The LLM saw only ``ruling_text`` (and, for a whole
-                    # document, its link text), so a number it returns that
-                    # is in neither was invented (#4907).  A split child's
-                    # link text belongs to the parent document.
-                    supporting_texts: tuple[str | None, ...] = (ruling_text,)
-                    if not event_data.get("_split_processed"):
-                        supporting_texts += (metadata.get("link_text"),)
+                    # The case-number gate below checks the LLM's number
+                    # against the source text (#4907, #4927).
                     if not case_number and ruling.case_number:
                         if not is_valid_case_number(ruling.case_number):
                             # LLM returned a case title as case_number —
@@ -3182,20 +3168,8 @@ class IngestionWorker:
                             if not case_title:
                                 case_title = ruling.case_number
                                 extraction_methods["case_title"] = "llm_redirect"
-                        elif _llm_case_number_unsupported(ruling.case_number, supporting_texts):
-                            logger.warning(
-                                "Discarded LLM case_number absent from the document text",
-                                extra={
-                                    "document_id": document_id,
-                                    "county": county,
-                                    "rejected_case_number": ruling.case_number[:80],
-                                    "split_child": bool(event_data.get("_split_processed")),
-                                    "telemetry_event": "llm_case_number_unsupported",
-                                },
-                            )
                         else:
-                            case_number = ruling.case_number
-                            extraction_methods["case_number"] = "llm"
+                            llm_case_number = ruling.case_number
                     if not case_title and ruling.case_title:
                         case_title = ruling.case_title
                         extraction_methods["case_title"] = "llm"
@@ -3231,6 +3205,58 @@ class IngestionWorker:
                 )
 
         # ------------------------------------------------------------------
+        # Case-number gate (#4927).  Every extractor's number is a
+        # candidate, in priority order: the event's own (a scraper's, a
+        # deterministic splitter's, or the LLM split's), the per-field
+        # LLM's, then the regex fallback over this event's text.  The first
+        # one the source evidence does not refute wins.  The LLM split's
+        # numbers, the per-field LLM's and the regex fallback's are all
+        # checked, whatever text they were read from: for an LLM split
+        # child the regex reads the LLM's transcription, so it can repeat
+        # the LLM's misread (``CVRI2501911`` for a printed ``CVRI2501831``).
+        # Settled before anything reads ``case_number`` (case type,
+        # department, validation).
+        # ------------------------------------------------------------------
+        case_number_evidence = _case_number_evidence(event_data, ruling_text)
+        read_evidence = _read_text_evidence(event_data, ruling_text) or None
+        event_case_number_method = extraction_methods.get("case_number")
+        # A split into one ruling is the document: the parent event's number
+        # is the scraper's, trusted as it is when the split does not run.
+        inherited = event_data.get(INHERITED_CASE_NUMBER_KEY)
+
+        def _case_number_candidates() -> Iterator[CaseNumberCandidate]:
+            yield CaseNumberCandidate(
+                case_number,
+                event_case_number_method,
+                trusted=CASE_NUMBER_EVIDENCE_KEY not in event_data
+                or (bool(inherited) and case_number == inherited),
+            )
+            yield CaseNumberCandidate(inherited, "split_parent", trusted=True)
+            yield CaseNumberCandidate(llm_case_number, "llm", evidence=read_evidence)
+            if ruling_text:
+                yield CaseNumberCandidate(
+                    extract_case_number(ruling_text),
+                    "regex_post_llm" if is_llm_extracted else "regex",
+                    evidence=read_evidence,
+                )
+
+        settled, refuted_candidates = settle_case_number(
+            _case_number_candidates(), case_number_evidence
+        )
+        _log_refuted_case_numbers(refuted_candidates, event_data, county)
+        if settled is None:
+            case_number = None
+            extraction_methods.pop("case_number", None)
+        elif settled.case_number != case_number:
+            case_number = settled.case_number
+            extraction_methods["case_number"] = settled.method or "unknown"
+            if extraction_methods["case_number"].startswith("regex"):
+                logger.info(
+                    "Extracted case_number from ruling text (regex fallback)",
+                    extra={"document_id": document_id, "case_number": case_number},
+                )
+
+        # ------------------------------------------------------------------
         # LLM enrichment — dedicated enrichment call for motion_type,
         # outcome, case_title, and parties (#2176).  Runs after per-field
         # LLM extraction.  Regex fallback removed in #2178 — LLM is now
@@ -3250,7 +3276,13 @@ class IngestionWorker:
         # letting the Layer 3 deterministic rule reject the row) is the
         # correct behaviour.
         # ------------------------------------------------------------------
-        is_bad_split_fragment = not case_number and not case_title
+        # A number only the regex fallback found does not count here: the
+        # fallback ran after this check until the case-number gate moved it
+        # ahead (#4927), and a fragment's text can quote another case.
+        number_before_regex = case_number and not extraction_methods.get(
+            "case_number", ""
+        ).startswith("regex")
+        is_bad_split_fragment = not number_before_regex and not case_title
         enrichment_fields_missing = (
             ruling_text
             and not is_extraction_none
@@ -3301,8 +3333,9 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         # PHASE: regex_fallback_ms (#4116)
         # ------------------------------------------------------------------
-        # Remaining regex fallbacks — hearing_date, judge_name, case_number,
-        # and case_type are still extracted via regex when missing.  The
+        # Remaining regex fallbacks — hearing_date, judge_name and case_type
+        # are still extracted via regex when missing (case_number's runs in
+        # the case-number gate, #4927).  The
         # enrichment fields (outcome, motion_type, case_title, parties)
         # are handled exclusively by LLM enrichment above (#2178).
         #
@@ -3351,18 +3384,8 @@ class IngestionWorker:
             cleaned_ruling_text = clean_ruling_text(ruling_text)
 
             court_name = f"{court}, County of {county}"
-
-            # Fallback case number extraction (regex)
-            if not case_number and ruling_text:
-                extracted = extract_case_number(ruling_text)
-                if extracted:
-                    method = "regex_post_llm" if is_llm_extracted else "regex"
-                    extraction_methods.setdefault("case_number", method)
-                    logger.info(
-                        "Extracted case_number from ruling text (regex fallback)",
-                        extra={"document_id": document_id, "case_number": extracted},
-                    )
-                    case_number = extracted
+            # The case-number regex fallback runs in the case-number gate
+            # above (#4927).
 
         # ------------------------------------------------------------------
         # Deterministic case_title cleanup (#2212, #2370)
@@ -4051,7 +4074,7 @@ class IngestionWorker:
             summary_generated_at=summary_generated_at,
             validation_result=validation_result,
             extraction_methods=extraction_methods,
-            case_number_texts=_case_number_check_texts(cleaned_ruling_text),
+            case_number_evidence=case_number_evidence,
         )
 
         # A worker split writes all of its children in one transaction, after
@@ -4130,36 +4153,41 @@ class IngestionWorker:
             # the near-miss it would move to is typically an older case an
             # LLM created from a court typo, or another case entirely.
             #
-            # Nor when the document text carries the number but not the
-            # correction (#4915): the near-miss is another, existing case,
-            # e.g. ``CVRI2401570`` printed, ``CVRI2401073`` matched.
+            # The correction is a candidate like any other extractor's: the
+            # case-number gate refuses it when the source evidence does not
+            # carry it (#4915, #4927), e.g. ``CVRI2401570`` printed,
+            # ``CVRI2401073`` matched.  The already-settled number stays.
             case_match = enrich_result.case_match
+            correction: CaseNumberCandidate | None = None
             if (
                 case_match is not None
                 and case_match.match_type == "fuzzy"
-                and _fuzzy_correction_contradicts_text(
-                    case_number,
-                    case_match.case_number,
-                    w.case_number_texts,
-                    (w.event_data.get("extra") or {}).get("link_text"),
-                )
-            ):
-                logger.info(
-                    "Kept case_number the document prints over a fuzzy match it does not",
-                    extra={
-                        "document_id": document_id,
-                        "case_number": case_number,
-                        "rejected_case_number": case_match.case_number,
-                        "telemetry_event": "fuzzy_case_correction_unsupported",
-                    },
-                )
-            elif (
-                enrich_result.case_match is not None
-                and enrich_result.case_match.match_type == "fuzzy"
                 and w.event_data.get(CASE_NUMBER_FROM_SOURCE_KEY) is not True
             ):
+                correction, _refuted = settle_case_number(
+                    [
+                        CaseNumberCandidate(case_match.case_number, "fuzzy_match"),
+                        CaseNumberCandidate(case_number, None, trusted=True),
+                    ],
+                    w.case_number_evidence,
+                )
+                if _refuted:
+                    logger.info(
+                        "Kept case_number over a fuzzy match the document does not print",
+                        extra={
+                            "document_id": document_id,
+                            "case_number": case_number,
+                            "rejected_case_number": case_match.case_number,
+                            "telemetry_event": "fuzzy_case_correction_unsupported",
+                        },
+                    )
+            if (
+                case_match is not None
+                and correction is not None
+                and correction.method == "fuzzy_match"
+            ):
                 original_case_number = case_number
-                case_number = enrich_result.case_match.case_number
+                case_number = correction.case_number
                 logger.info(
                     "Enrichment corrected case_number via fuzzy match",
                     extra={
@@ -4423,11 +4451,6 @@ class IngestionWorker:
         try:
             prepared: list[tuple[_RulingWrite, str, str, str | None]] = []
             for w in batch.children:
-                if batch.case_number_texts:
-                    # The LLM split read the child's number from the whole
-                    # document; the child's text is the LLM's own
-                    # transcription, so it is no evidence (#4915).
-                    w.case_number_texts = batch.case_number_texts
                 court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
                 insert_document(
                     conn,
@@ -4466,7 +4489,15 @@ class IngestionWorker:
                         summary_model=w.summary_model,
                         summary_generated_at=w.summary_generated_at,
                         hearing_date_source=w.hearing_date_source,
-                        case_number_texts=w.case_number_texts if batch.case_number_texts else (),
+                        # Only an LLM split's children judge the number a
+                        # reused slot holds by the document text: a
+                        # deterministic child's text is its own slice, and
+                        # its slot's number can come from outside it.
+                        case_number_evidence=(
+                            w.case_number_evidence
+                            if CASE_NUMBER_EVIDENCE_KEY in w.event_data
+                            else ()
+                        ),
                     )
                     for w, court_id, case_id, judge_id in prepared
                 ],
@@ -5392,11 +5423,19 @@ class IngestionWorker:
         # it in the aggregated per-ruling path avoids double-flagging the
         # same ruling (once here and once in the split recursion).
 
-        # The LLM read every child's case number from this document, so a
-        # number its text does not carry was invented or misread (#4907).
-        # A reingest moves a ruling off such a number even when the child
-        # found none this time (#4915).
-        batch.case_number_texts = _case_number_check_texts(ruling_text)
+        # The LLM read every child's case number from this document, so the
+        # document's extracted text is each child's case-number evidence
+        # (#4907, #4927); the child's own text is the LLM's transcription and
+        # can repeat its misread (#4915, ``2024-0139388`` for a printed
+        # ``30-2024-01399388``).  The case-number gate in ``process_event``
+        # checks the child's number, from the LLM, the regex fallback or the
+        # parent, against it.  A reingest also moves a ruling off a number
+        # it does not carry when the child found none (#4915).  A scanned
+        # PDF gives no evidence (``document_evidence``).
+        extra = event_data.get("extra")
+        link_text = extra.get("link_text") if isinstance(extra, dict) else None
+        split_evidence = document_evidence(ruling_text)
+        whole_document_evidence = document_evidence(ruling_text, link_text)
 
         for cr in converted:
             # Multimodal rows with no ruling body are not rulings (#4714).
@@ -5435,32 +5474,16 @@ class IngestionWorker:
             child_hearing_date, child_hearing_date_source = _llm_child_hearing_date(
                 cr.hearing_date, event_data
             )
-            # The LLM read the number from the whole document, so the
-            # document's extracted text must carry it (#4907).  The child's
-            # own text is the LLM's transcription, not evidence: it can
-            # repeat the misread (#4915, ``2024-0139388`` for a printed
-            # ``30-2024-01399388``).
-            llm_case_number = cr.case_number
-            if _llm_case_number_unsupported(
-                llm_case_number,
-                (ruling_text,),
-                min_text_len=_MIN_TEXT_TO_CHECK_CASE_NUMBER,
-            ):
-                logger.warning(
-                    "Discarded LLM case_number absent from the document text",
-                    extra={
-                        "document_id": document_id,
-                        "split_document_id": cr.document_id,
-                        "county": county,
-                        "rejected_case_number": (llm_case_number or "")[:80],
-                        "split_child": True,
-                        "telemetry_event": "llm_case_number_unsupported",
-                    },
-                )
-                llm_case_number = None
             case_number, case_title = _split_child_case_fields(
-                llm_case_number, cr.case_title, event_data, cr.split_count
+                cr.case_number, cr.case_title, event_data, cr.split_count
             )
+            # A split into one ruling is the document itself: its link text
+            # is evidence too, and the parent's number is the next candidate
+            # when the gate refutes the LLM's.
+            single = cr.split_count == 1
+            inherited = event_data.get("case_number") if single else None
+            # The parent's number rides along for a single split, whether or
+            # not the child took it, so the gate can trust it (#4927).
             split_event: dict[str, Any] = {
                 **event_data,
                 "document_id": cr.document_id,
@@ -5477,6 +5500,8 @@ class IngestionWorker:
                 "case_number": case_number,
                 "case_title": case_title,
                 CASE_NUMBER_FROM_SOURCE_KEY: False,
+                CASE_NUMBER_EVIDENCE_KEY: whole_document_evidence if single else split_evidence,
+                INHERITED_CASE_NUMBER_KEY: inherited,
                 "judge_name": cr.judge_name or event_data.get("judge_name"),
                 "department": cr.department or event_data.get("department"),
                 "motion_type": cr.motion_type or event_data.get("motion_type"),

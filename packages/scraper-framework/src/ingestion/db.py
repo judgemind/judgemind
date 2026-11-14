@@ -2901,11 +2901,12 @@ class SplitChildRuling:
     summary_model: str | None = None
     summary_generated_at: datetime | None = None
     hearing_date_source: str | None = None
-    #: The document text a case number on this child's slot must appear in
-    #: to be kept when this child found none (#4915).  Empty when the
+    #: The source evidence a case number on this child's slot must appear
+    #: in to be kept when this child found none (#4915, #4927): the
+    #: document's extracted text, never LLM output.  Empty when the
     #: document's text cannot settle it (no text layer, or a split path
     #: whose case numbers can come from outside the text).
-    case_number_texts: tuple[str | None, ...] = ()
+    case_number_evidence: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2925,13 +2926,12 @@ def _is_placeholder_case_number(case_number: str | None) -> bool:
 
 
 def _held_case_number_unsupported(held: _HeldRuling, child: SplitChildRuling) -> bool:
-    """Return True when *held*'s case number is in none of *child*'s
-    ``case_number_texts`` (#4915).  False when the child gives no texts."""
-    if not child.case_number_texts or not any(child.case_number_texts):
-        return False
-    from .extract import case_number_supported_by_text
+    """Return True when the case-number gate refutes *held*'s case number
+    with *child*'s ``case_number_evidence`` (#4915, #4927).  False when the
+    child gives no evidence."""
+    from .case_evidence import case_number_refuted
 
-    return not case_number_supported_by_text(held.case_number, *child.case_number_texts)
+    return case_number_refuted(held.case_number, child.case_number_evidence)
 
 
 def _owned_rows_on_key(
@@ -2985,7 +2985,7 @@ def write_split_rulings(
     - the row's real case when the child found no case number
       (``UNKNOWN-*``): a re-extraction that misses the case number must not
       drop the one found before (#4788).  The exception is a *relink* whose
-      child gives ``case_number_texts`` that do not carry the row's number:
+      child gives ``case_number_evidence`` that does not carry the row's number:
       the number is not in the document, so an LLM invented or misread it,
       and the row moves to the child's placeholder case (#4915);
     - the child's case when the row's case is a placeholder;
