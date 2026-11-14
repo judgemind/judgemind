@@ -179,6 +179,13 @@ _BUG_SEEDS = [
     # row by (slot, placeholder case) and kept its judge.  Fails on
     # 977bad29, the parent of the #4939 fix.
     pytest.param("4939", 925, "judge_converge"),
+    # The same match moved the dropped ruling's alert to the other ruling
+    # on that slot's placeholder case: the third pass matched by (slot,
+    # UNKNOWN case), which is evidence of the slot, not of the ruling.
+    # Fails on 24d00bd6, the parent of the #4946 fix.  (232, 379, 629 and
+    # 924 fail the same way.)
+    pytest.param("4946", 10, "alert_case"),
+    pytest.param("4946", 925, "alert_case"),
 ]
 
 

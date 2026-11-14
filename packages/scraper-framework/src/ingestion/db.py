@@ -3261,7 +3261,14 @@ def write_split_rulings(
 
     1. the same text and case;
     2. the same text on a different case (the case number was re-extracted);
-    3. the same slot and case (the text was re-extracted).
+    3. the same slot and real case (the text was re-extracted).  A
+       placeholder (``UNKNOWN-*``) case does not count: it is evidence of
+       the slot, not of the ruling, so a numberless ruling whose text
+       changed is a different ruling.  Its old row is retired with its
+       alerts detached, and the new ruling gets a fresh row: an alert never
+       follows a slot to another ruling (#4946).  The cost is that an LLM
+       re-transcription that rewords a numberless ruling detaches its
+       alerts too; detached alerts are kept and still render.
 
     Each existing row matches at most one child, earliest child first, so a
     true duplicate within the document keeps #2458 dedup: the later copy is
@@ -3343,8 +3350,12 @@ def write_split_rulings(
     for i, c in enumerate(children):
         if i not in match and hashes[i] is not None:
             take(i, lambda h, i=i: h.text_hash == hashes[i])
+    # The third pass needs a real case: a slot's ``UNKNOWN-<slot>`` case is
+    # evidence of the slot, not of the ruling, so any two numberless
+    # rulings on one slot would "match" and the dropped one's alerts would
+    # follow the slot to the other (#4946).
     for i, c in enumerate(children):
-        if i not in match:
+        if i not in match and not _is_placeholder_case_number(child_case_numbers.get(c.case_id)):
             take(i, lambda h, c=c: h.document_id == c.document_id and h.case_id == c.case_id)
 
     final_case: dict[int, str] = {}
@@ -3482,10 +3493,9 @@ def write_split_rulings(
     #
     # A claimed row becomes its child's ruling: it takes every field the
     # child's write derived, as a new row would, and keeps only its id and
-    # its alerts (#4939).  The row may have held a different ruling (the
-    # third pass matches by slot and case, and two rulings on a slot's
-    # placeholder case always match), so ``insert_ruling``'s live
-    # preserve-first ``judge_id`` would keep that ruling's judge:
+    # its alerts (#4939).  The row may have held other text (the third pass
+    # matches by slot and real case, #4946), so ``insert_ruling``'s live
+    # preserve-first ``judge_id`` would keep the old text's judge:
     # ``force_update`` overwrites the judge and the facts, NULL included.
     # The case is already ``final_case``.  The HTML and summary describe
     # the row's old text, so they are cleared when the text changes; with
