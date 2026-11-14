@@ -293,23 +293,155 @@ def test_enrichment_fuzzy_skipped_when_text_prints_number_but_not_match(
     assert "CVRI2401073" not in case_calls[0][0][1]
 
 
-@pytest.mark.parametrize(
-    ("printed", "near_miss", "text", "contradicts"),
-    [
-        ("CVRI2401570", "CVRI2401073", "x CVRI2401570 y", True),
-        # The text prints the match too: the correction may stand.
-        ("CVRI2401570", "CVRI2401073", "CVRI2401570 and CVRI2401073", False),
-        # The text prints neither: nothing to go on, the correction stands.
-        ("CVRI2401570", "CVRI2401073", "no number here", False),
-    ],
-)
-def test_fuzzy_correction_contradicts_text(
-    printed: str, near_miss: str, text: str, contradicts: bool
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.EnrichmentEngine")
+@patch("ingestion.worker.psycopg")
+def test_enrichment_fuzzy_applied_when_text_prints_the_match(
+    mock_psycopg: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
-    from ingestion.worker import _fuzzy_correction_contradicts_text
+    """Control for #4915: the document prints both numbers, so the gate
+    does not refute the fuzzy match and the correction stands."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+    mock_engine_cls.return_value.enrich.return_value = _fuzzy_result("CVRI2401570", "CVRI2401073")
+    text = "CVRI2401570 (see CVRI2401073). " + "The motion is granted in part and denied. " * 6
 
-    assert _fuzzy_correction_contradicts_text(printed, near_miss, (text,)) is contradicts
-    assert _fuzzy_correction_contradicts_text(printed, near_miss, ()) is False
+    worker.process_event(_make_event(case_number="CVRI2401570", ruling_text=text))
+
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INTO cases" in str(c)]
+    assert case_calls
+    assert "CVRI2401073" in case_calls[0][0][1]
+
+
+def _fuzzy_case_upserted(event: dict) -> str:
+    """Run *event* with the fuzzy matcher proposing ``CVRI2401073`` for
+    ``CVRI2401570``; return the case number the case upsert received."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",), (True,)]
+    mock_cur.rowcount = 1
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.EnrichmentEngine") as mock_engine_cls,
+        patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"),
+        patch.object(IngestionWorker, "_llm_split_document", return_value=False),
+    ):
+        mock_psycopg.connect.return_value = mock_conn
+        mock_engine_cls.return_value.enrich.return_value = _fuzzy_result(
+            "CVRI2401570", "CVRI2401073"
+        )
+        worker.process_event(event)
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INTO cases" in str(c)]
+    assert case_calls
+    params = case_calls[0][0][1]
+    return "CVRI2401073" if "CVRI2401073" in params else "CVRI2401570"
+
+
+def test_fuzzy_refused_when_usable_text_prints_neither() -> None:
+    """#4927: the gate refuses a correction the usable source text does not
+    print, even when it does not print the (scraper's, trusted) original
+    either.  Before, the correction stood unless the text printed the
+    original."""
+    text = "Tentative ruling. " + "The motion is granted in part and denied in part. " * 6
+    event = _make_event(case_number="CVRI2401570", ruling_text=text)
+    assert _fuzzy_case_upserted(event) == "CVRI2401570"
+
+
+def test_fuzzy_applied_when_text_too_short_to_settle() -> None:
+    """A whole document under 200 characters (a scanned PDF) is not
+    evidence: the fuzzy correction goes ahead."""
+    event = _make_event(case_number="CVRI2401570", ruling_text="Page 1")
+    assert _fuzzy_case_upserted(event) == "CVRI2401073"
+
+
+def test_fuzzy_refused_by_short_deterministic_child_text() -> None:
+    """A deterministic split child's own text counts at any length: it
+    prints ``CVRI2401570``, not the match, so the correction is refused.
+    Before, child text under 200 characters allowed every correction."""
+    event = _make_event(
+        case_number="CVRI2401570",
+        ruling_text="CVRI2401570: demurrer OVERRULED.",
+        _split_processed=True,
+        _original_document_id="aaaaaaaa-0000-0000-0000-00000000aaaa",
+        _split_index=0,
+        _split_count=2,
+    )
+    assert _fuzzy_case_upserted(event) == "CVRI2401570"
+
+
+@patch("ingestion.worker.EnrichmentEngine")
+@patch("ingestion.worker.psycopg")
+def test_fuzzy_guard_ignores_transcription(
+    mock_psycopg: MagicMock, mock_engine_cls: MagicMock
+) -> None:
+    """#4927: an LLM split of a scanned PDF (no usable text layer).  The
+    LLM misread ``CVRI2401073`` as ``CVRI2401570`` and its transcription of
+    the ruling repeats the misread.  The transcription is LLM output, not
+    evidence: the fuzzy correction to the real, existing ``CVRI2401073``
+    goes ahead.  Before the fix ``_write_split_batch`` kept the
+    transcription as the fuzzy guard's evidence whenever the document text
+    was unusable, so the guard kept the misread."""
+    from framework.llm_schema import ExtractedRuling, ExtractionOutcome
+
+    worker, _ = _make_worker()
+    mock_conn, _cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_engine_cls.return_value.enrich.return_value = _fuzzy_result("CVRI2401570", "CVRI2401073")
+    transcription = (
+        "Plaintiff's motion to compel in CVRI2401570 is GRANTED. Defendant shall serve "
+        "verified further responses within 20 days. " * 3
+    )
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = [
+        ExtractedRuling(
+            extracted_case_number="CVRI2401570",
+            extracted_case_title="Smith v. Jones",
+            ruling_text=transcription,
+            outcome=ExtractionOutcome.GRANTED,
+        ),
+        ExtractedRuling(
+            extracted_case_number="CVRI2400044",
+            extracted_case_title="Doe v. Roe",
+            ruling_text="The demurrer is OVERRULED. Defendant to answer in 10 days.",
+            outcome=ExtractionOutcome.DENIED,
+        ),
+    ]
+    worker._get_framework_extractor = lambda: mock_extractor  # type: ignore[method-assign]
+    batches: list = []
+    scanned = _make_event(
+        document_id="aaaaaaaa-0000-0000-0000-000000004927",
+        county="Orange",
+        scraper_id="ca-oc-tentatives",
+        content_format="pdf",
+        case_number=None,
+        judge_name=None,
+        ruling_text="Page 1",
+    )
+    with patch.object(
+        IngestionWorker,
+        "_write_split_batch",
+        autospec=True,
+        side_effect=lambda _self, _event, _parent, batch: batches.append(batch),
+    ):
+        worker.process_event(scanned)
+    child = next(w for w in batches[0].children if w.case_number == "CVRI2401570")
+
+    with (
+        patch("ingestion.worker.upsert_court", return_value="court-uuid-1"),
+        patch(
+            "ingestion.worker.upsert_case_returning_title", return_value=("case-uuid-1", None)
+        ) as upsert_case,
+    ):
+        worker._prepare_ruling_write(mock_conn, child)
+
+    assert child.case_number == "CVRI2401073"
+    assert upsert_case.call_args[0][1] == "CVRI2401073"
+    assert child.case_number_evidence == ()
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")

@@ -22,7 +22,7 @@ def _conn(current: str | None) -> MagicMock:
 
 
 def _write(event: dict[str, Any], texts: tuple[str, ...] = (_TEXT,)) -> Any:
-    return SimpleNamespace(event_data=event, document_id="doc-1", case_number_texts=texts)
+    return SimpleNamespace(event_data=event, document_id="doc-1", case_number_evidence=texts)
 
 
 _REINGEST = {REPLACE_SPLIT_SET_KEY: True}
@@ -35,13 +35,8 @@ _REINGEST = {REPLACE_SPLIT_SET_KEY: True}
         (_REINGEST, (_TEXT,), "CVRI2401073", True),
         # The held number is printed: keep (#4788).
         (_REINGEST, (_TEXT,), "CVRI2401570", False),
-        # The link text carries it: keep.
-        (
-            {**_REINGEST, "extra": {"link_text": "CVRI2401073 ruling"}},
-            (_TEXT,),
-            "CVRI2401073",
-            False,
-        ),
+        # The link text (part of a whole document's evidence) carries it: keep.
+        (_REINGEST, (_TEXT, "CVRI2401073 ruling"), "CVRI2401073", False),
         # No ruling on another case, or a placeholder one: nothing to move.
         (_REINGEST, (_TEXT,), None, False),
         (_REINGEST, (_TEXT,), "UNKNOWN-doc-1", False),
