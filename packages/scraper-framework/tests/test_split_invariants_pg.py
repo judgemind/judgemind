@@ -8,6 +8,10 @@ invariants after every commit (see its docstring for the list).
   200).  ``SPLIT_HARNESS_SEED=<n>`` runs one seed.
 - ``test_known_bug`` pins the seeds (and hand-built scenarios) that
   reproduce the bugs filed against this area, so each stays reproduced.
+- ``test_open_bug`` pins the seeds of bugs still open (``_OPEN_BUG_SEEDS``)
+  as strict xfails; the sweep runs those seeds without that invariant.
+- ``test_invariants_hold_covers_evidence_paths`` checks the generated seeds
+  still reach the case-number gate's branches (#4929).
 
 Needs a migrated database in ``TEST_DATABASE_URL`` (``scripts/apply_migrations.sh``).
 Without one every test here skips, unless ``REQUIRE_PG_TESTS=1`` (set in CI),
@@ -53,10 +57,79 @@ def test_postgres_is_configured_when_required() -> None:
         pytest.fail("REQUIRE_PG_TESTS=1 but TEST_DATABASE_URL is not set")
 
 
+#: Seeds that break an invariant on main because of an open bug:
+#: ``seed -> (issue, invariant, whole-document steps on)``.  The sweep runs
+#: such a seed with every other invariant, and ``test_open_bug`` keeps the
+#: bug reproduced (a strict xfail: when the fix lands it fails until the
+#: entry is removed).
+_OPEN_BUG_SEEDS: dict[int, tuple[str, str, bool]] = {
+    # A ruling the LLM repeats in one split votes once per copy in judge
+    # arbitration, so one document renames the judge (#4938).
+    41: ("4938", "judge_converge", False),
+    45: ("4938", "judge_converge", False),
+    120: ("4938", "judge_converge", False),
+    141: ("4938", "judge_converge", False),
+    146: ("4938", "judge_converge", False),
+    196: ("4938", "judge_converge", False),
+    # A reused ruling row keeps the previous ruling's judge (#4939).
+    925: ("4939", "judge_converge", False),
+    # A whole-document reingest does not replace the key's split set
+    # (#4940); whole-document steps are off in the sweep until it is fixed.
+    21: ("4940", "evidence", True),
+    107: ("4940", "converge", True),
+}
+
+
 @_needs_pg
 @pytest.mark.parametrize("seed", _seeds())
 def test_invariants_hold(seed: int) -> None:
-    harness.run_seed(_DSN, seed, _RUN)
+    invariants = None
+    open_bug = _OPEN_BUG_SEEDS.get(seed)
+    if open_bug is not None and not open_bug[2]:
+        invariants = frozenset(harness.INVARIANTS) - {open_bug[1]}
+    harness.run_seed(_DSN, seed, _RUN, invariants=invariants)
+
+
+@_needs_pg
+@pytest.mark.parametrize(
+    ("seed", "bug", "invariant", "whole"),
+    [
+        pytest.param(seed, *entry, id=f"{entry[0]}-{seed}")
+        for seed, entry in _OPEN_BUG_SEEDS.items()
+    ],
+)
+@pytest.mark.xfail(raises=harness.InvariantError, strict=True, reason="open bug")
+def test_open_bug(seed: int, bug: str, invariant: str, whole: bool) -> None:
+    harness.run_seed(
+        _DSN,
+        seed,
+        _RUN,
+        name=f"open{bug}",
+        invariants=frozenset({invariant}),
+        whole_documents=whole,
+    )
+
+
+#: A default-set seed that reaches each case-number evidence path (#4929):
+#: the gate refusing an extractor's number, a reingest moving a held ruling
+#: off a number its document lacks, and the gate refusing a fuzzy
+#: correction.  The whole-document move (``ruling_left_unsupported_case``)
+#: needs whole-document steps, off until #4940.
+_EVIDENCE_PATH_SEEDS = {
+    "case_number_unsupported": 3,
+    "split_ruling_left_unsupported_case": 8,
+    "fuzzy_case_correction_unsupported": 80,
+}
+
+
+@_needs_pg
+@pytest.mark.parametrize(("event", "seed"), sorted(_EVIDENCE_PATH_SEEDS.items()))
+def test_invariants_hold_covers_evidence_paths(event: str, seed: int) -> None:
+    """The generated seeds drive the case-number gate's branches, not only
+    the hand-written point tests (#4929).  Each seed holds every invariant
+    while it logs its path's telemetry event."""
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"cover-{event}")
+    assert events[event] > 0, f"seed {seed} no longer reaches {event}: {dict(events)}"
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +155,20 @@ _BUG_SEEDS = [
     # DB-row reingest wrote hearing_date with no hearing_date_source.  Fixed
     # by the one write path: DB-row mode now runs through the worker.
     pytest.param("4839", 13, "date_source"),
+    # The seeds below come from the #4929 generator (document text, LLM
+    # case numbers, judge spellings); each fails on its fix's parent commit.
+    #
+    # The LLM split misreads CVRI2511111 as CVRI2591111 and its
+    # transcription repeats the misread; the gate refutes the LLM's number
+    # and the regex fallback read it back out of the transcription.  Fails
+    # on c6c511d2, the parent of the #4927 fix (4a905e0).
+    pytest.param("4927", 31, "evidence"),
+    # The same with the prompt's example number, 2025-00912345.
+    pytest.param("4927", 189, "evidence"),
+    # One document printing a one-letter typo of the judge's name
+    # ("H. Shaina Colovr") renamed the judge.  Fails on c1542b19, the parent
+    # of the #4928 fix (5b7d6a5b).
+    pytest.param("4928", 64, "judge_converge"),
 ]
 
 

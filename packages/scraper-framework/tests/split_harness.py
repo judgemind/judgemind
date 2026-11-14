@@ -31,6 +31,21 @@ properties that must hold for any sequence of re-splits:
   committed, is never deleted, including a fail row the same step logged
   for a child it then dropped as stale (#4879).  ``telemetry.*`` is not
   rebuildable from S3.
+- ``evidence``: after a step whose document text can settle a case number
+  (``MIN_DOCUMENT_TEXT_CHARS`` or more), every ruling on the key is filed
+  under a number that text prints, or under its ``UNKNOWN-`` case (#4907,
+  #4915, #4927).  A live step keeps an established case link
+  (preserve-first, #2475), so on a live step a ruling that kept its row and
+  its case is exempt.  An LLM's misread or invented number, whichever
+  extractor (the LLM split, the regex fallback over the LLM's
+  transcription, the fuzzy correction) produced it, breaks it.
+- ``judge_converge``: a court's rulings of one roster judge, whatever
+  spelling their documents print, resolve to one judge row; a judge is
+  renamed only to a spelling at least two documents print, so one typo
+  document never renames (#4928); and when the documents decide a judge's
+  name (``_choose_canonical_spelling`` returns it whatever the current
+  name), ingesting the same document in the opposite row order ends on
+  the same name (#4922).
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -38,9 +53,22 @@ moves between split slots, or is relinked to a better case, is still tracked.
 
 The extractor is stubbed: each step decides the rows the multimodal
 extractor returns for the key's PDF.  Everything downstream of it (the
-worker's split dispatch, validation, the case/document/ruling writes, the
-split-set write, content-hash dedup, stale-child cleanup, search indexing) is
-the production code.
+worker's split dispatch, validation, the case-number gate, the
+case/document/ruling writes, judge resolution and arbitration, the split-set
+write, content-hash dedup, stale-child cleanup, search indexing) is the
+production code.
+
+The generator models what the gate and judge resolution read (#4929): the
+document's extracted text (the parent event's ``ruling_text``: a text layer
+printing each row's real case number, a scanned PDF's few characters, or
+nothing), the LLM's transcription of each ruling (which can repeat a
+misread), the case number the LLM reads (the printed one, a one- or
+two-character misread, or an invented one such as the prompt example
+``2025-00912345``), the judge name each ruling prints (a roster judge's
+usual spelling, the roster spelling, an extra initial, or a one-letter
+typo) and the court's roster.  Some steps are whole-document steps: the
+extractor finds no rulings and the worker writes the document as one ruling
+(the #4915 whole-document move).
 
 Step kinds:
 
@@ -58,7 +86,10 @@ and the step, so a failing seed is its own reproduction:
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import random
+import re
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -70,10 +101,21 @@ from unittest.mock import MagicMock, patch
 
 import psycopg
 
-from framework.llm_schema import ExtractedRuling
+from framework.llm_schema import ExtractedParty, ExtractedRuling
 from framework.search.indexer import search_doc_metadata
 from framework.search.ruling_doc import load_search_events
+from ingestion.db import (
+    _choose_canonical_spelling,
+    _normalize_for_comparison,
+    normalize_judge_name,
+)
+from ingestion.extract import case_number_supported_by_text
 from ingestion.split_ids import derive_parent_document_id, make_split_document_id
+
+try:
+    from ingestion.case_evidence import MIN_DOCUMENT_TEXT_CHARS
+except ImportError:  # trees before #4927, so a recorded seed can be bisected
+    MIN_DOCUMENT_TEXT_CHARS = 200
 
 CAPTURED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 HEARING = date(2026, 9, 4)
@@ -93,6 +135,8 @@ INVARIANTS = (
     "converge",
     "kept",
     "telemetry",
+    "evidence",
+    "judge_converge",
     "error",
 )
 
@@ -120,6 +164,15 @@ class Spec:
     text: str
     #: The judge name the extraction reads for the ruling (#4920).
     judge: str | None = None
+    #: The case number the document's text prints for the ruling (#4929),
+    #: when it differs from ``case_number`` (what the LLM reads: a misread,
+    #: an invented number, or none).  ``None``: the text prints
+    #: ``case_number``.
+    printed: str | None = None
+
+    @property
+    def printed_number(self) -> str | None:
+        return self.printed or self.case_number
 
 
 @dataclass(frozen=True)
@@ -141,6 +194,18 @@ class Step:
     rows: tuple[Row, ...]
     specs: tuple[Spec, ...]
     ops: tuple[str, ...] = ()
+    #: The document's extracted text: the parent event's ``ruling_text``
+    #: (#4929).  ``""`` is no text at all; a scanned PDF has a few
+    #: characters, below ``MIN_DOCUMENT_TEXT_CHARS``.
+    doc: str = ""
+    #: The extractor finds no rulings, so the worker writes the whole
+    #: document as one ruling (``doc`` is its text).
+    whole: bool = False
+    #: The court's roster (``court_directory_snapshots``) spellings.
+    roster: tuple[str, ...] = ()
+    #: Tag on the extracted parties' names (none when empty), unique per
+    #: seed: see :func:`_parties`.
+    party_tag: str = ""
 
     def describe(self) -> str:
         parts = []
@@ -152,10 +217,21 @@ class Step:
                 tag = f"R{spec.idx}" if row.kind == "ruling" else f"t{spec.idx}"
                 if spec.case_number is None:
                     tag += "?"
+                elif spec.case_number != spec.printed_number:
+                    tag += "!"  # the LLM's number is not the printed one
                 if spec.title is None:
                     tag += "~"
+                if row.kind == "ruling" and spec.judge:
+                    tag += f"@{spec.judge}"
                 parts.append(tag)
-        return f"{self.kind}[{' '.join(parts)}] ops={list(self.ops)}"
+        doc = "none" if not self.doc else "scan" if not doc_is_evidence(self.doc) else "text"
+        whole = " whole" if self.whole else ""
+        return f"{self.kind}[{' '.join(parts)}] doc={doc}{whole} ops={list(self.ops)}"
+
+
+def doc_is_evidence(doc: str | None) -> bool:
+    """Whether a document's text is long enough to settle a case number."""
+    return len((doc or "").strip()) >= MIN_DOCUMENT_TEXT_CHARS
 
 
 def _case_number(idx: int) -> str:
@@ -207,37 +283,270 @@ _OPS = (
 )
 
 
-def generate(seed: int) -> list[Step]:
-    """Return the step sequence for *seed* (deterministic)."""
+def generate(seed: int, *, whole_documents: bool | None = None) -> list[Step]:
+    """Return the step sequence for *seed* (deterministic).
+
+    The rows, ops and step kinds come from one random stream, as they did
+    before #4929, so a seed's split sequence is unchanged.  The document
+    text, the case number the LLM reads, the judge names and the roster
+    come from a second stream (:class:`_Model`).  *whole_documents*
+    (default :data:`WHOLE_DOCUMENT_STEPS`) turns the ``whole`` op on; the
+    random streams are the same either way.
+    """
     rng = random.Random(seed)
+    model = _Model(seed, WHOLE_DOCUMENT_STEPS if whole_documents is None else whole_documents)
     token = f"s{seed}"
     n_specs = rng.randint(3, 7)
-    specs = [
-        Spec(
-            idx=i,
-            case_number=None if rng.random() < 0.2 else _case_number(i),
-            title=None if rng.random() < 0.3 else _title(i),
-            text=_text(token, i),
+    specs = []
+    for i in range(n_specs):
+        case_number = None if rng.random() < 0.2 else model.shape(i)
+        title = None if rng.random() < 0.3 else _title(i)
+        specs.append(
+            Spec(
+                idx=i,
+                case_number=case_number,
+                title=title,
+                text=_text(token, i),
+                judge=model.first_judge(),
+                printed=model.shape(i),
+            )
         )
-        for i in range(n_specs)
-    ]
     order = list(range(n_specs))
     rng.shuffle(order)
     first = sorted(order[: rng.randint(1, n_specs)])
     rows = [Row("ruling", i) for i in first]
-    steps = [Step(rng.choice(("live", "reingest", "db")), tuple(rows), tuple(specs))]
+    steps = [model.step(rng.choice(("live", "reingest", "db")), rows, specs, [], token)]
 
     for _ in range(rng.randint(2, 6)):
         ops = [rng.choice(_OPS) for _ in range(rng.randint(1, 2))]
         for op in ops:
-            rows, specs = _apply_op(rng, op, rows, specs)
+            rows, specs = _apply_op(rng, op, rows, specs, model.shape)
         kind = rng.choices(("live", "reingest", "db"), weights=(3, 4, 2))[0]
-        steps.append(Step(kind, tuple(rows), tuple(specs), tuple(ops)))
+        steps.append(model.step(kind, rows, specs, ops, token))
     return steps
 
 
+# ---------------------------------------------------------------------------
+# What the case-number gate and judge resolution read (#4929)
+# ---------------------------------------------------------------------------
+
+#: Case-number shapes a seed's court prints.  Each repeats one digit, so
+#: every pair is beyond the fuzzy matcher's reach (distance 2).  The
+#: regex fallback (``extract_case_number``) reads the Riverside and Orange
+#: shapes from a ruling's text (Orange as ``2026-NNNNNNNN``, the way it
+#: reads real Orange numbers); it does not read the harness shape.
+_SHAPES: dict[str, Callable[[int], str]] = {
+    "harness": _case_number,
+    "riverside": lambda idx: f"CVRI25{str(idx % 10) * 5}",
+    "orange": lambda idx: f"30-2026-{str(idx % 10) * 8}",
+}
+
+#: Numbers an LLM invents: the extraction prompt's own example (#4907) and
+#: other counties' shapes.  None is printed by any generated document.
+INVENTED_CASE_NUMBERS = ("2025-00912345", "23STCV01234", "CGC-25-612345", "24CV998877")
+
+
+@dataclass(frozen=True)
+class RosterJudge:
+    """One judge on the court's roster and the spellings documents print."""
+
+    roster: str  # the court directory's spelling
+    printed: str  # how most calendars print it
+    initial: str  # with an extra middle initial
+    typo: str  # a one-letter typo of the surname
+
+    def spellings(self) -> tuple[str, ...]:
+        return (self.roster, self.printed, self.initial, self.typo)
+
+
+#: Every typo is one letter from the roster spelling (``fuzzy_match_roster_name``
+#: confidence 0.85, the threshold), and every spelling of one judge is
+#: beyond the roster match of the others.
+ROSTER_JUDGES = (
+    RosterJudge("Craig L. Griffin", "Craig Griffin", "Craig L. M. Griffin", "Craig L. Grifin"),
+    RosterJudge(
+        "Rafael A. Sivilla-Jones",
+        "Rafael Sivilla-Jones",
+        "Rafael A. B. Sivilla-Jones",
+        "Rafael A. Sivila-Jones",
+    ),
+    RosterJudge("H. Shaina Colover", "Shaina Colover", "Shaina H. Colover", "H. Shaina Colovr"),
+)
+
+_JUDGE_OF_SPELLING: dict[str, RosterJudge] = {
+    s.lower(): j for j in ROSTER_JUDGES for s in j.spellings()
+}
+
+
+def roster_judge(spelling: str | None) -> RosterJudge | None:
+    """The roster judge a generated spelling belongs to."""
+    return _JUDGE_OF_SPELLING.get((spelling or "").lower())
+
+
+#: Ops on what the LLM reads and what the document prints.
+_MODEL_OPS = (
+    "case_misread",  # the LLM reads one or two characters off the printed number
+    "case_misread_text",  # ... and its transcription of the ruling repeats the misread
+    "case_invented",  # the LLM invents a number no document prints
+    "case_invented_text",  # ... and its transcription repeats it
+    "case_cited",  # the transcription cites the printed number
+    "case_fix",  # the LLM reads the printed number again
+    "whole",  # the extractor finds no rulings: the document is one ruling
+)
+_JUDGE_OPS = ("judge_typo", "judge_initial", "judge_roster", "judge_printed")
+
+#: Whether generated seeds include ``whole`` steps.  Off until #4940 is
+#: fixed: a whole-document reingest is not a split-set replacement, so it
+#: keeps the key's earlier split children (and their cases), keeps a
+#: ruling on its old placeholder case, and leaves the old ruling in place
+#: when the document is rejected.  ``test_known_bug`` pins seeds that
+#: reproduce it with whole steps on.
+WHOLE_DOCUMENT_STEPS = False
+
+_DOC_FILLER = (
+    "The court has read and considered the moving, opposition and reply papers. "
+    "Any party who wishes to be heard must give notice by telephone. "
+)
+
+
+class _Model:
+    """The second random stream of a seed: document text, the numbers the
+    LLM reads, judge names and the roster."""
+
+    def __init__(self, seed: int, whole_documents: bool) -> None:
+        self.rng = random.Random(f"{seed}:model")
+        self.whole_documents = whole_documents
+        self.shape = _SHAPES[self.rng.choice(sorted(_SHAPES))]
+        n_judges = self.rng.choices((0, 1, 2), weights=(4, 5, 1))[0]
+        self.judges = tuple(self.rng.sample(ROSTER_JUDGES, n_judges))
+
+    def first_judge(self) -> str | None:
+        if not self.judges:
+            return None
+        judge = self.rng.choice(self.judges)
+        return judge.printed if self.rng.random() < 0.75 else self.rng.choice(judge.spellings())
+
+    def step(
+        self, kind: str, rows: list[Row], specs: list[Spec], ops: list[str], token: str
+    ) -> Step:
+        """Build a step from the split stream's rows and specs, applying
+        this stream's ops to *specs* in place (a misread persists)."""
+        ops = list(ops)
+        whole = False
+        pool = _MODEL_OPS + (_JUDGE_OPS if self.judges else ())
+        for _ in range(self.rng.choice((0, 1, 1, 2))):
+            op = self.rng.choice(pool)
+            if op == "whole":
+                if not self.whole_documents:
+                    continue
+                whole = True
+            else:
+                self._apply(op, specs, rows, token)
+            ops.append(op)
+        mode = self.rng.choices(("text", "scan", "none"), weights=(6, 2, 2))[0]
+        if whole and mode == "none":
+            mode = "text"
+        doc = document_text(rows, specs, mode)
+        return Step(
+            kind,
+            tuple(rows),
+            tuple(specs),
+            tuple(ops),
+            doc=doc,
+            whole=whole,
+            roster=tuple(j.roster for j in self.judges),
+            party_tag=token,
+        )
+
+    def _apply(self, op: str, specs: list[Spec], rows: list[Row], token: str) -> None:
+        on_rows = sorted({r.spec for r in rows if r.kind == "ruling"})
+        i = self.rng.choice(on_rows) if on_rows else self.rng.randrange(len(specs))
+        spec = specs[i]
+        printed = spec.printed_number or self.shape(spec.idx)
+        base = _text(token, spec.idx)
+        if op.startswith("case_misread"):
+            number = misread(printed, self.rng)
+        elif op.startswith("case_invented"):
+            number = self.rng.choice(INVENTED_CASE_NUMBERS)
+        if op in ("case_misread", "case_invented"):
+            spec = replace(spec, case_number=number, printed=printed)
+        elif op in ("case_misread_text", "case_invented_text"):
+            spec = replace(spec, case_number=number, printed=printed, text=_cites(base, number))
+        elif op == "case_cited":
+            spec = replace(spec, printed=printed, text=_cites(base, printed))
+        elif op == "case_fix":
+            spec = replace(spec, case_number=printed, printed=printed, text=base)
+        elif op.startswith("judge_"):
+            judge = roster_judge(spec.judge) or self.rng.choice(self.judges)
+            spelling = getattr(judge, op.removeprefix("judge_"))
+            spec = replace(spec, judge=spelling)
+        specs[i] = spec
+
+
+def _cites(text: str, number: str) -> str:
+    """A transcription that names *number* (the LLM's or the printed one)."""
+    return f"{text} The motion in case {number} is decided as stated."
+
+
+def misread(printed: str, rng: random.Random) -> str:
+    """*printed* with one or two of its digits misread (within the fuzzy
+    matcher's distance-2 reach of the printed number)."""
+    digits = [m.start() for m in re.finditer(r"\d", printed)]
+    tail = digits[-5:]  # the serial, not the year or the court prefix
+    chars = list(printed)
+    for pos in rng.sample(tail, rng.choice((1, 1, 2))):
+        chars[pos] = rng.choice([d for d in "0123456789" if d != chars[pos]])
+    return "".join(chars)
+
+
+def document_text(
+    rows: list[Row] | tuple[Row, ...], specs: list[Spec] | tuple[Spec, ...], mode: str
+) -> str:
+    """The extracted text of a calendar PDF listing *rows*.
+
+    ``text``: a text layer printing each listed ruling's real case number
+    and caption (at least ``MIN_DOCUMENT_TEXT_CHARS``); ``scan``: a scanned
+    PDF whose text layer is a few characters; ``none``: no text.
+    """
+    if mode == "none":
+        return ""
+    if mode == "scan":
+        return "Tentative rulings (scanned image)"
+    lines = ["SUPERIOR COURT OF CALIFORNIA. Tentative rulings for the civil calendar."]
+    listed: list[int] = []
+    for row in rows:
+        if row.kind == "preamble" or row.spec in listed:
+            continue
+        listed.append(row.spec)
+        spec = specs[row.spec]
+        number = spec.printed_number or "pending assignment"
+        lines.append(f"Item. Case No. {number} {spec.title or 'Untitled matter'}.")
+    lines.append(_DOC_FILLER * 2)
+    return " ".join(lines)
+
+
+def _parties(title: str | None, tag: str) -> list[ExtractedParty]:
+    """The parties of a generated caption (``Plaintiff v. Defendant``).
+
+    Party rows are global (not per court), so each seed's parties carry
+    the seed's *tag*: concurrent seeds then never wait on each other's
+    party rows, and a seed's party history is its own.
+    """
+    if not tag or not title or " v. " not in title:
+        return []
+    plaintiff, defendant = title.split(" v. ", 1)
+    return [
+        ExtractedParty(name=f"{plaintiff} {tag}", role="plaintiff"),
+        ExtractedParty(name=f"{defendant} {tag}", role="defendant"),
+    ]
+
+
 def _apply_op(
-    rng: random.Random, op: str, rows: list[Row], specs: list[Spec]
+    rng: random.Random,
+    op: str,
+    rows: list[Row],
+    specs: list[Spec],
+    shape: Callable[[int], str] = _case_number,
 ) -> tuple[list[Row], list[Spec]]:
     rows = list(rows)
     specs = list(specs)
@@ -276,7 +585,7 @@ def _apply_op(
         elif op == "case_none":
             spec = replace(spec, case_number=None)
         else:
-            spec = replace(spec, case_number=_case_number(spec.idx))
+            spec = replace(spec, case_number=spec.printed or shape(spec.idx))
         specs[i] = spec
     return rows, specs
 
@@ -284,6 +593,8 @@ def _apply_op(
 def extracted_rulings(step: Step) -> list[ExtractedRuling]:
     """The multimodal extractor's output for *step*."""
     out: list[ExtractedRuling] = []
+    if step.whole:
+        return out
     for n, row in enumerate(step.rows):
         if row.kind == "preamble":
             out.append(ExtractedRuling(ruling_text="", entry_number=None))
@@ -294,6 +605,7 @@ def extracted_rulings(step: Step) -> list[ExtractedRuling]:
             ExtractedRuling(
                 extracted_case_number=spec.case_number,
                 extracted_case_title=spec.title,
+                extracted_parties=_parties(spec.title, step.party_tag) if is_ruling else [],
                 extracted_judge_name=spec.judge if is_ruling else None,
                 ruling_text=spec.text if is_ruling else "",
                 hearing_date=HEARING.isoformat(),
@@ -386,6 +698,47 @@ class FakeExtractor:
         return [r.model_copy() for r in self.rulings]
 
 
+@contextmanager
+def _real_enrichment() -> Iterator[None]:
+    """Run the worker with the real ``EnrichmentEngine``.
+
+    The suite's ``conftest`` replaces it with a no-op for the unit tests,
+    which hid the enrichment step from the harness: its fuzzy case-number
+    correction (and the gate's check of it, #4927) and its judge alias
+    resolution never ran (#4929).
+    """
+    from framework.enrichment import EnrichmentEngine
+    from ingestion import worker as worker_mod
+
+    with patch.object(worker_mod, "EnrichmentEngine", EnrichmentEngine):
+        yield
+
+
+class _TelemetryHandler(logging.Handler):
+    """Counts the ``telemetry_event`` of every log record (#4929), so a
+    test can tell which code paths a seed reached."""
+
+    def __init__(self, counter: Counter[str]) -> None:
+        super().__init__(level=logging.INFO)
+        self.counter = counter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        event = getattr(record, "telemetry_event", None)
+        if isinstance(event, str):
+            self.counter[event] += 1
+
+
+def _spelled(spelling: str | None) -> str:
+    """The lowercased spelling ``resolve_judge`` stores for *spelling*."""
+    return (normalize_judge_name(spelling) or "").lower() if spelling else ""
+
+
+def _family(spelling: str) -> str:
+    """The family of spellings *spelling* belongs to (initials, case and
+    word order aside), as arbitration groups them."""
+    return _normalize_for_comparison(spelling) if spelling else ""
+
+
 class _CheckedConn:
     """A connection proxy that runs *on_commit* after every commit."""
 
@@ -430,6 +783,9 @@ def default_db_mode_driver(harness: KeyHarness, key: Key, step: Step) -> None:
             "harness-bucket",
             capture_timestamp=CAPTURED_AT,
         )
+        if step.doc:
+            # The text layer the worker would extract from the PDF bytes.
+            event["ruling_text"] = step.doc
         harness.worker.process_event(event)
 
 
@@ -502,9 +858,24 @@ class KeyHarness:
         #: Fields merged into every step's event (a deterministic splitter's
         #: county, format and text).
         self.event_extra: dict[str, Any] = {}
+        #: ``telemetry_event`` values the code under test logged (#4929).
+        self.events: Counter[str] = Counter()
+        self._log_handler = _TelemetryHandler(self.events)
+        self._ingestion_logger = logging.getLogger("ingestion")
+        self._saved_log_level = self._ingestion_logger.level
+        self._ingestion_logger.addHandler(self._log_handler)
+        if self._ingestion_logger.getEffectiveLevel() > logging.INFO:
+            self._ingestion_logger.setLevel(logging.INFO)
+        #: Keys whose court has its roster snapshot.
+        self._rostered: set[str] = set()
+        #: The judge spelling each ruling text printed, as of the last step
+        #: that wrote it (ruling texts are unique per key).
+        self._spelling: dict[str, str | None] = {}
         self.worker = self._make_worker()
 
     def close(self) -> None:
+        self._ingestion_logger.removeHandler(self._log_handler)
+        self._ingestion_logger.setLevel(self._saved_log_level)
         self.real.close()
         self.checker.close()
 
@@ -531,7 +902,7 @@ class KeyHarness:
         worker._summarization_enabled = False
         return worker
 
-    def _event(self, key: Key, kind: str) -> dict[str, Any]:
+    def _event(self, key: Key, kind: str, doc: str = "") -> dict[str, Any]:
         event: dict[str, Any] = {
             "document_id": key.parent,
             "state": "CA",
@@ -543,7 +914,7 @@ class KeyHarness:
             "s3_bucket": "harness-bucket",
             "source_url": "",
             "capture_timestamp": CAPTURED_AT.isoformat(),
-            "ruling_text": "",
+            "ruling_text": doc,
         }
         if kind == "live":
             event["scraper_id"] = "ca-harness-tentatives"
@@ -562,16 +933,25 @@ class KeyHarness:
         self._key = key
         self._step_label = f"seed={self.seed} {label} {step.describe()}"
         self._attach_alerts(key)
-        before = ruling_identities(read_key(self.checker, key.s3_key))
+        self._ensure_roster(key, step.roster)
+        before_rows = read_key(self.checker, key.s3_key)
+        before = ruling_identities(before_rows)
+        judges_before = self._judge_rows(key)
+        spelling_before = dict(self._spelling)
+        for row in step.rows:
+            if row.kind == "ruling" and not step.whole:
+                spec = step.specs[row.spec]
+                self._spelling[spec.text] = spec.judge
         self._snapshots = []
         self._validation_seen = self._validation_ids(key)
         self._pending = None
         self.extractor.rulings = extracted_rulings(step)
         try:
-            if step.kind == "db":
-                DB_MODE_DRIVER(self, key, step)
-            else:
-                self.worker.process_event(self._event(key, step.kind))
+            with _real_enrichment():
+                if step.kind == "db":
+                    DB_MODE_DRIVER(self, key, step)
+                else:
+                    self.worker.process_event(self._event(key, step.kind, step.doc))
         except InvariantError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
@@ -590,10 +970,21 @@ class KeyHarness:
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
-        if step.kind != "db":
+        if step.kind != "db" and not step.whole:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
             self._guard("synthetic_title", self._check_rows, key, after_rows, step)
+        doc = self.event_extra.get("ruling_text", step.doc) if step.kind != "db" else step.doc
+        self._guard("evidence", self._check_evidence, key, step, doc, before_rows, after_rows)
+        judges_after = self._judge_rows(key)
+        self._guard("judge_converge", self._check_one_judge, key, judges_after)
+        self._guard(
+            "judge_converge",
+            self._check_renames,
+            judges_before,
+            judges_after,
+            spelling_before,
+        )
 
     def write_legacy_row(self, key: Key, document_id: str, spec: Spec) -> None:
         """Write one document + ruling on *key* directly, the way an older
@@ -788,6 +1179,185 @@ class KeyHarness:
                     f"synthetic case carries {r.case_title!r}",
                 )
 
+    def _check_evidence(
+        self,
+        key: Key,
+        step: Step,
+        doc: str,
+        before_rows: list[DocRow],
+        after_rows: list[DocRow],
+    ) -> None:
+        """Every ruling is filed under a number the document prints, or under
+        its ``UNKNOWN-`` case, once the document's text can settle it.
+
+        A live step keeps an established case link (preserve-first, #2475,
+        #4788): a ruling that kept its row and its case on a live step is
+        exempt.  A reingest moves it off a number its document lacks (#4915).
+        """
+        if not doc_is_evidence(doc):
+            return
+        held = {(r.ruling_id, r.case_number) for r in before_rows if r.ruling_id}
+        for r in after_rows:
+            number = r.case_number
+            if not r.ruling_id or not number or number.startswith("UNKNOWN-"):
+                continue
+            if step.kind == "live" and (r.ruling_id, number) in held:
+                continue
+            if not case_number_supported_by_text(number, doc):
+                self._fail(
+                    "evidence",
+                    f"ruling {(r.text or '')[:24]!r} on {key.label(r.id)} is filed under "
+                    f"{number!r}, which its document's text does not print",
+                )
+
+    # -- judges ---------------------------------------------------------
+
+    def _ensure_roster(self, key: Key, roster: tuple[str, ...]) -> None:
+        """Give the key's court a roster snapshot of *roster* before its
+        first step (``_get_roster_names`` reads the latest one)."""
+        if not roster or key.s3_key in self._rostered:
+            return
+        from ingestion.db import _derive_court_code, clear_roster_cache
+
+        snapshot_court = _derive_court_code("CA", key.county).replace("-", "_")
+        mapping = {f"harness-{n}": name for n, name in enumerate(roster)}
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "INSERT INTO court_directory_snapshots "
+                "(court_id, captured_at, s3_key, mapping, content_hash) "
+                "VALUES (%s, %s, %s, %s::jsonb, %s)",
+                (
+                    snapshot_court,
+                    CAPTURED_AT,
+                    f"harness/roster/{snapshot_court}.json",
+                    json.dumps(mapping),
+                    hashlib.sha256(json.dumps(mapping).encode()).hexdigest(),
+                ),
+            )
+        clear_roster_cache()
+        self._rostered.add(key.s3_key)
+
+    def _judge_rows(self, key: Key) -> list[tuple[str, str, str, str]]:
+        """``(document id, ruling text, judge id, canonical name)`` of every
+        ruling on *key* that has a judge."""
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT d.id::text, r.ruling_text, j.id::text, j.canonical_name "
+                "FROM rulings r JOIN documents d ON d.id = r.document_id "
+                "JOIN judges j ON j.id = r.judge_id WHERE d.s3_key = %s",
+                (key.s3_key,),
+            )
+            return [tuple(row) for row in cur.fetchall()]
+
+    def _check_one_judge(self, key: Key, rows: list[tuple[str, str, str, str]]) -> None:
+        """A court's rulings of one roster judge share one judge row,
+        whatever spelling their documents print (#2140, #4926)."""
+        by_judge: dict[str, dict[str, str]] = {}
+        for _doc, text, judge_id, canonical in rows:
+            judge = roster_judge(self._spelling.get(text))
+            if judge is not None:
+                by_judge.setdefault(judge.roster, {})[judge_id] = canonical
+        for roster, judges in sorted(by_judge.items()):
+            if len(judges) > 1:
+                self._fail(
+                    "judge_converge",
+                    f"rulings of roster judge {roster!r} resolve to {len(judges)} judges: "
+                    f"{sorted(judges.values())}",
+                )
+
+    def _check_renames(
+        self,
+        before: list[tuple[str, str, str, str]],
+        after: list[tuple[str, str, str, str]],
+        spelling_before: dict[str, str | None],
+    ) -> None:
+        """A judge takes a new name only when two documents support it (#4928).
+
+        Within a family of spellings (``_normalize_for_comparison``: the
+        same words, initials aside) the new spelling itself needs two
+        documents; a move to another family (a typo's, or away from one)
+        needs two documents printing that family.  So one typo document
+        never renames a judge, and neither does one extra initial.
+
+        A document counts for the spelling it printed before the step or
+        the one it prints now: arbitration runs while the step's own rows
+        and the key's earlier rows are both in place.
+        """
+        names_before = {judge_id: name for _d, _t, judge_id, name in before}
+        if not names_before:
+            return
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, canonical_name FROM judges WHERE id = ANY(%s::uuid[])",
+                (sorted(names_before),),
+            )
+            names_now = dict(cur.fetchall())
+        for judge_id, old in sorted(names_before.items()):
+            new = names_now.get(judge_id)
+            if new is None or new.lower() == old.lower():
+                continue
+            if _family(new) == _family(old):
+                target, what = new.lower(), "spelling"
+
+                def key_of(s: str | None) -> str:
+                    return _spelled(s)
+            else:
+                target, what = _family(new), "family of spellings"
+
+                def key_of(s: str | None) -> str:
+                    return _family(_spelled(s))
+
+            printing = {d for d, t, _j, _n in before if key_of(spelling_before.get(t)) == target}
+            printing |= {d for d, t, _j, _n in after if key_of(self._spelling.get(t)) == target}
+            if len(printing) < 2:
+                self._fail(
+                    "judge_converge",
+                    f"judge {old!r} was renamed {new!r}, a {what} "
+                    f"{len(printing)} document(s) print",
+                )
+
+    def _roster_votes(self, key: Key) -> dict[str, tuple[set[str], Counter[str]]]:
+        """Per roster judge: the canonical names its rulings on *key* carry,
+        and how many documents print each spelling."""
+        out: dict[str, tuple[set[str], Counter[str]]] = {}
+        for _doc, text, _judge_id, canonical in self._judge_rows(key):
+            spelling = self._spelling.get(text)
+            judge = roster_judge(spelling)
+            if judge is None or spelling is None:
+                continue
+            names, votes = out.setdefault(judge.roster, (set(), Counter()))
+            names.add(canonical)
+            votes[spelling] += 1
+        return out
+
+    def _check_order(self, forward: Key, flipped: Key) -> None:
+        """When a judge's documents decide its name, the order they arrive
+        in does not change it (#4922, #4928).
+
+        The documents decide the name when ``_choose_canonical_spelling``
+        picks the same spelling whatever the current name; close counts keep
+        whichever name came first, by design.
+        """
+        ahead = self._roster_votes(forward)
+        behind = self._roster_votes(flipped)
+        for roster in sorted(set(ahead) | set(behind)):
+            names_a, votes = ahead.get(roster, (set(), Counter()))
+            names_b, _ = behind.get(roster, (set(), Counter()))
+            if {n.lower() for n in names_a} == {n.lower() for n in names_b}:
+                continue
+            evidence = sorted(votes.items())
+            winners = {
+                _choose_canonical_spelling(normalize_judge_name(s) or s, evidence)[0].lower()
+                for s in votes
+            }
+            if len(winners) == 1:
+                self._fail(
+                    "judge_converge",
+                    f"documents printing {dict(evidence)} decide roster judge {roster!r} is "
+                    f"{winners.pop()!r}, but one row order leaves {sorted(names_a)} and the "
+                    f"other {sorted(names_b)}",
+                )
+
     # -- alerts ---------------------------------------------------------
 
     def _attach_alerts(self, key: Key) -> None:
@@ -832,33 +1402,39 @@ class KeyHarness:
         ``min(k, alerts)`` of that identity's alerts must still point at one.
         An alert whose ruling is gone was rightly detached and is retired; a
         later step that brings the text back makes a new ruling, not that one.
+        An alert whose ruling now has another identity (its text or case
+        changed) counts for that identity from now on: when a step folds two
+        rulings of one identity into one, the survivor may be the one whose
+        alert was filed under its earlier text (#4929, seed 15).
         """
         present = ruling_identities(rows)
-        by_identity: dict[tuple[str, str], list[str]] = {}
-        for alert_id, (s3_key, identity) in self._alerts.items():
-            if s3_key == key.s3_key:
-                by_identity.setdefault(identity, []).append(alert_id)
+        recorded: Counter[tuple[str, str]] = Counter()
+        attached: Counter[tuple[str, str]] = Counter()
         with self.checker.cursor() as cur:
-            for identity, alert_ids in by_identity.items():
-                attached = []
-                for alert_id in alert_ids:
-                    cur.execute(
-                        "SELECT r.ruling_text, c.case_number FROM alert_events a "
-                        "LEFT JOIN rulings r ON r.id = a.ruling_id "
-                        "LEFT JOIN cases c ON c.id = r.case_id WHERE a.id = %s::uuid",
-                        (alert_id,),
-                    )
-                    text, case_number = cur.fetchone()
-                    if (text, _norm_case(case_number)) == identity:
-                        attached.append(alert_id)
-                    else:
-                        del self._alerts[alert_id]
-                if len(attached) < min(present[identity], len(alert_ids)):
-                    self._fail(
-                        "alert",
-                        f"alert on ruling {(identity[0] or '')[:24]!r} ({identity[1]}) lost "
-                        "its ruling_id while the ruling still exists",
-                    )
+            for alert_id, (s3_key, identity) in list(self._alerts.items()):
+                if s3_key != key.s3_key:
+                    continue
+                recorded[identity] += 1
+                cur.execute(
+                    "SELECT r.ruling_text, c.case_number FROM alert_events a "
+                    "LEFT JOIN rulings r ON r.id = a.ruling_id "
+                    "LEFT JOIN cases c ON c.id = r.case_id WHERE a.id = %s::uuid",
+                    (alert_id,),
+                )
+                text, case_number = cur.fetchone()
+                if text is None:
+                    del self._alerts[alert_id]
+                    continue
+                now = (text, _norm_case(case_number))
+                attached[now] += 1
+                self._alerts[alert_id] = (s3_key, now)
+        for identity, count in sorted(recorded.items()):
+            if attached[identity] < min(present[identity], count):
+                self._fail(
+                    "alert",
+                    f"alert on ruling {(identity[0] or '')[:24]!r} ({identity[1]}) lost "
+                    "its ruling_id while the ruling still exists",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -896,12 +1472,16 @@ def run_seed(
     *,
     name: str = "seq",
     invariants: frozenset[str] | None = None,
-) -> None:
+    whole_documents: bool | None = None,
+) -> Counter[str]:
     """Run *seed*'s sequence and the convergence checks; raise
     :class:`InvariantError` on the first broken invariant.  Two runs of one
     seed in one session need distinct *name*s (their keys derive from it).
-    *invariants* limits the check to those invariants (default: all)."""
-    run_steps(dsn, generate(seed), run_token, seed=seed, name=name, invariants=invariants)
+    *invariants* limits the check to those invariants (default: all);
+    *whole_documents* is :func:`generate`'s.  Returns the
+    ``telemetry_event`` counts the run logged."""
+    steps = generate(seed, whole_documents=whole_documents)
+    return run_steps(dsn, steps, run_token, seed=seed, name=name, invariants=invariants)
 
 
 def run_steps(
@@ -913,10 +1493,11 @@ def run_steps(
     name: str = "seq",
     setup: Callable[[KeyHarness, Key], None] | None = None,
     invariants: frozenset[str] | None = None,
-) -> None:
+) -> Counter[str]:
     """Run *steps* on one key, then the convergence checks.  *setup*, when
     given, prepares the key's starting state; *invariants* limits the check
-    to those invariants (default: all)."""
+    to those invariants (default: all).  Returns the ``telemetry_event``
+    counts the run logged."""
     harness = KeyHarness(dsn, run_token, seed, invariants)
     try:
         key = make_key(f"{run_token}-{seed}-{name}-main")
@@ -933,19 +1514,38 @@ def run_steps(
             # DB-row reingest only re-ingests keys that have rows.  A
             # split-set replacement must not depend on history: re-ingest
             # the same bytes.
-            settle = Step("reingest", final.rows, final.specs, ("settle",))
+            settle = replace(final, kind="reingest", ops=("settle",))
             harness.run_step(key, settle, "settle")
         history = normalized(key, read_key(harness.checker, key.s3_key))
 
         fresh = {}
+        fresh_keys = {}
         for kind in ("reingest", "live"):
             fresh_key = make_key(f"{run_token}-{seed}-{name}-fresh-{kind}")
             harness.run_step(fresh_key, replace(final, kind=kind), f"fresh {kind}")
             fresh[kind] = normalized(fresh_key, read_key(harness.checker, fresh_key.s3_key))
+            fresh_keys[kind] = fresh_key
+
+        if final.roster and any(r.kind == "ruling" for r in final.rows) and not final.whole:
+            # The same document with its rows in the opposite order: the
+            # judge's documents vote in the opposite order (#4922).
+            reversed_key = make_key(f"{run_token}-{seed}-{name}-fresh-reversed")
+            flipped = replace(final, kind="reingest", rows=tuple(reversed(final.rows)))
+            harness.run_step(reversed_key, flipped, "fresh reversed")
+            harness._guard(
+                "judge_converge",
+                harness._check_order,
+                fresh_keys["reingest"],
+                reversed_key,
+            )
 
         if "converge" not in harness.invariants:
-            return
-        if not _converged(history, fresh["reingest"]):
+            return harness.events
+        # Without document text to settle a number, the enrichment step's
+        # fuzzy correction moves a number onto a near-miss case the court
+        # already holds (#1576), which depends on the court's history.
+        near_miss_ok = not doc_is_evidence(final.doc)
+        if not _converged(history, fresh["reingest"], near_miss_ok=near_miss_ok):
             raise InvariantError(
                 "converge",
                 f"seed={seed}: reingest after the history leaves {_fmt(history)}, "
@@ -957,6 +1557,7 @@ def run_steps(
                 f"seed={seed}: a fresh live capture leaves {_fmt(fresh['live'])}, a "
                 f"fresh reingest of the same bytes leaves {_fmt(fresh['reingest'])}",
             )
+        return harness.events
     finally:
         harness.close()
 
@@ -964,6 +1565,8 @@ def run_steps(
 def _converged(
     history: tuple[frozenset[tuple], frozenset[str]],
     fresh: tuple[frozenset[tuple], frozenset[str]],
+    *,
+    near_miss_ok: bool = False,
 ) -> bool:
     """Whether a key re-ingested after a history holds the rows a fresh
     ingest of the same bytes holds.
@@ -971,7 +1574,10 @@ def _converged(
     One difference is allowed: where the fresh ingest found no case number
     (``UNKNOWN``), the key may keep the real case its ruling had before.  A
     re-extraction that misses a case number must not throw away the one an
-    earlier extraction of the same bytes found (#4788).
+    earlier extraction of the same bytes found (#4788).  With
+    *near_miss_ok*, the two may also hold case numbers within the fuzzy
+    matcher's reach of each other (the enrichment correction, which reads
+    the court's existing cases).
     """
     if history[1] != fresh[1]:
         return False
@@ -985,9 +1591,22 @@ def _converged(
             return False
         if h_case == case and h_title == title:
             continue
-        if not (case == "UNKNOWN" and h_case != "UNKNOWN"):
-            return False
+        if case == "UNKNOWN" and h_case != "UNKNOWN":
+            continue
+        if near_miss_ok and _near_miss(case, h_case):
+            continue
+        return False
     return True
+
+
+def _near_miss(a: str, b: str) -> bool:
+    """Whether two real case numbers are within the enrichment fuzzy
+    matcher's distance (2) of each other."""
+    from framework.enrichment import levenshtein_distance, normalize_case_number
+
+    if "UNKNOWN" in (a, b):
+        return False
+    return levenshtein_distance(normalize_case_number(a), normalize_case_number(b)) <= 2
 
 
 def _fmt(state: tuple[frozenset[tuple], frozenset[str]]) -> str:
