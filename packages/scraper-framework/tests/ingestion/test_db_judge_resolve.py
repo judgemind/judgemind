@@ -1485,10 +1485,71 @@ class TestSettledSplitVotesPg:
         finally:
             court.close()
 
+
+class TestSettledSplitVotesMocked:
+    """``record_judge_votes`` and ``arbitrate=False`` without Postgres (#4938)."""
+
     def test_no_votes_is_a_no_op(self) -> None:
         conn = MagicMock()
         record_judge_votes(conn, [])
         conn.cursor.assert_not_called()
+
+    def test_resolve_without_arbitration_reads_no_evidence(self) -> None:
+        """Step 1 alias hit with a better-supported spelling on file: with
+        ``arbitrate=False`` the evidence is not even read, nothing renamed."""
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("existing-judge-uuid", "Mattew C. Braner")]
+        mock_cur.fetchall.side_effect = [[("matthew c. braner", 2)]]
+
+        result = resolve_judge(
+            mock_conn, "MATTHEW C. BRANER", "court-uuid-2", source="sd_roa", arbitrate=False
+        )
+
+        assert result == "existing-judge-uuid"
+        mock_cur.fetchall.assert_not_called()
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert not [c for c in sql if "UPDATE judges" in c]
+        assert not [c for c in sql if "INSERT INTO judge_name_evidence" in c]
+
+    def test_one_settled_vote_does_not_rename(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("Shaina Colover",)]
+        mock_cur.fetchall.side_effect = [[("H. Shaina Colovr", 1)]]
+        renamed: set[str] = set()
+
+        record_judge_votes(
+            mock_conn,
+            [JudgeVote("doc-1", "judge-1", "H. Shaina Colovr")],
+            renamed_judge_ids=renamed,
+        )
+
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert len([c for c in sql if "INSERT INTO judge_name_evidence" in c]) == 1
+        assert not [c for c in sql if "UPDATE judges" in c]
+        assert renamed == set()
+
+    def test_settled_votes_arbitrate_once_per_judge(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchone.side_effect = [("Shaina Colover",)]
+        mock_cur.fetchall.side_effect = [[("Shaina Clover", 2)]]
+        mock_cur.rowcount = 1
+        renamed: set[str] = set()
+
+        record_judge_votes(
+            mock_conn,
+            [
+                JudgeVote("doc-1", "judge-1", "Shaina Clover"),
+                JudgeVote("doc-2", "judge-1", "Shaina Clover"),
+            ],
+            renamed_judge_ids=renamed,
+        )
+
+        sql = [str(c) for c in mock_cur.execute.call_args_list]
+        assert len([c for c in sql if "INSERT INTO judge_name_evidence" in c]) == 2
+        # One arbitration for the judge: one evidence read, one rename.
+        assert mock_cur.fetchall.call_count == 1
+        assert len([c for c in sql if "UPDATE judges" in c]) == 1
+        assert renamed == {"judge-1"}
 
 
 # ---------------------------------------------------------------------------
