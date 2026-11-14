@@ -98,6 +98,7 @@ from .db import (
     insert_document,
     insert_document_and_ruling,
     judge_vote_spelling,
+    judge_votes_held,
     lookup_court_id,
     record_judge_votes,
     resolve_judge,
@@ -4411,10 +4412,10 @@ class IngestionWorker:
         ``(court_id, case_id, judge_id)``.  Runs in the caller's
         transaction and commits nothing.
 
-        With *defer_vote* (a worker split's child) the judge is resolved
+        With *defer_vote* (every worker write) the judge is resolved
         without arbitration and without the document's vote, which is left
-        on ``w.judge_vote`` for the caller to record once the split set is
-        settled (``db.record_judge_votes``, #4938).
+        on ``w.judge_vote`` for the caller to record once its rulings are
+        written (``db.record_judge_votes``, #4938, #4966).
         """
         document_id = w.document_id
         state = w.state
@@ -4681,7 +4682,9 @@ class IngestionWorker:
         (#4948)."""
         conn = self._get_connection()
         try:
-            court_id, case_id, judge_id = self._prepare_ruling_write(conn, w)
+            # The document votes once its ruling is written: dedup can
+            # supersede it, and an established judge can stay (#4966).
+            court_id, case_id, judge_id = self._prepare_ruling_write(conn, w, defer_vote=True)
 
             # 4. Insert document + ruling via shared helper (#1790).
             # The helper guarantees the same document_id is passed to both
@@ -4712,6 +4715,12 @@ class IngestionWorker:
                 move_ruling_case=_should_move_off_unsupported_case(conn, w, case_id),
             )
             self._link_ruling_rows(conn, w, case_id, judge_id)
+            record_judge_votes(
+                conn,
+                [w.judge_vote] if w.judge_vote is not None else [],
+                document_ids=[w.document_id],
+                renamed_judge_ids=w.shown_changes.judge_ids,
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -4781,6 +4790,10 @@ class IngestionWorker:
         split_changes = ShownRowChanges()
         conn = self._get_connection()
         try:
+            # The votes the key's documents cast before this write, read
+            # before anything changes: a removed child's row goes with its
+            # document, and its judge must still be re-arbitrated (#4966).
+            held_votes = judge_votes_held(conn, s3_key=s3_key, document_ids=written)
             prepared: list[tuple[_RulingWrite, str, str, str | None]] = []
             for w in batch.children:
                 # The judge vote waits until the split set is settled: a
@@ -4858,7 +4871,9 @@ class IngestionWorker:
                     owns_key=owns_key,
                 )
             # The split set is settled: only the children that keep a ruling
-            # vote, and each judge is arbitrated once for the split (#4938).
+            # vote, every document the write touched loses a vote that no
+            # longer holds, and each judge that gained or lost one is
+            # arbitrated once for the split (#4938, #4966).
             record_judge_votes(
                 conn,
                 [
@@ -4866,6 +4881,8 @@ class IngestionWorker:
                     for w in batch.children
                     if w.judge_vote is not None and final_cases.get(w.document_id) is not None
                 ],
+                document_ids=[*written, *removed, *vacated, *batch.keep_ids],
+                held=held_votes,
                 renamed_judge_ids=split_changes.judge_ids,
             )
             conn.commit()

@@ -609,6 +609,8 @@ def _add_name_evidence(h: harness.KeyHarness, key: harness.Key, spelling: str, c
 
     Arbitration counts documents (#4928): a rename needs a spelling printed
     on more documents than the stored one, so the tests seed earlier ones.
+    Each is an active document with a ruling on the judge: a vote counts
+    only while it describes its document (#4966).
     """
     with h.checker.cursor() as cur:
         cur.execute(
@@ -622,13 +624,18 @@ def _add_name_evidence(h: harness.KeyHarness, key: harness.Key, spelling: str, c
                 FROM documents d, generate_series(1, %s)
                 WHERE d.id = %s::uuid
                 RETURNING id
+            ), held AS (
+                INSERT INTO rulings (document_id, case_id, court_id, judge_id, is_tentative)
+                SELECT docs.id, r.case_id, r.court_id, r.judge_id, TRUE
+                FROM docs, rulings r
+                WHERE r.document_id = %s::uuid
+                RETURNING document_id, judge_id
             )
             INSERT INTO judge_name_evidence (document_id, judge_id, raw_name)
-            SELECT docs.id, r.judge_id, %s
-            FROM docs, rulings r
-            WHERE r.document_id = %s::uuid
+            SELECT held.document_id, held.judge_id, %s
+            FROM held
             """,
-            (count, key.parent, spelling, key.parent),
+            (count, key.parent, key.parent, spelling),
         )
 
 
@@ -713,6 +720,121 @@ def test_judge_arbitration_reindexes_rulings_on_other_keys() -> None:
 
         assert _judge_canonical(h, first) == ["Craig L. Griffin"]
         assert {m["judge_name"] for m in h.indexer.meta.values()} == {"Craig L. Griffin"}
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------------------
+# #4966: a document's judge vote follows the document
+# ---------------------------------------------------------------------------
+
+
+def _votes(h: harness.KeyHarness, key: harness.Key) -> dict[str, tuple[str, str]]:
+    """``{slot label: (judge's canonical name, voted spelling)}`` of the
+    evidence rows of every document id on *key*, deleted ones included."""
+    ids = [key.parent, *key.slots]
+    with h.checker.cursor() as cur:
+        cur.execute(
+            "SELECT e.document_id::text, j.canonical_name, e.raw_name "
+            "FROM judge_name_evidence e JOIN judges j ON j.id = e.judge_id "
+            "WHERE e.document_id = ANY(%s::uuid[])",
+            (ids,),
+        )
+        return {key.label(doc): (name, raw) for doc, name, raw in cur.fetchall()}
+
+
+def _rulings_step(kind: str, specs: list[harness.Spec], rows: list[int]) -> harness.Step:
+    return harness.Step(kind, tuple(harness.Row("ruling", i) for i in rows), tuple(specs))
+
+
+def _spec(tag: str, idx: int, judge: str | None) -> harness.Spec:
+    return harness.Spec(
+        idx, harness._case_number(idx), harness._title(idx), harness._text(tag, idx), judge
+    )
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["live", "reingest"])
+def test_ruling_that_loses_its_judge_stops_voting(kind: str) -> None:
+    """#4966: the same ruling re-extracted without a judge keeps its row
+    (content match) and ``force_update`` clears its ``judge_id``, but its
+    document kept voting for the old judge.  Its vote is removed in the
+    same transaction."""
+    tag = f"{_RUN}-b4966-lose-{kind}"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"judge_converge"}))
+    try:
+        key = harness.make_key(tag)
+        h.run_step(key, _rulings_step(kind, [_spec(tag, 1, "Craig L. Griffin")], [0]), "judge")
+        assert list(_votes(h, key).values()) == [("Craig L. Griffin", "Craig L. Griffin")]
+
+        h.run_step(key, _rulings_step("reingest", [_spec(tag, 1, None)], [0]), "no judge")
+
+        assert _judge_canonical(h, key) == []
+        assert _votes(h, key) == {}
+    finally:
+        h.close()
+
+
+@_needs_pg
+def test_removed_and_superseded_documents_stop_voting() -> None:
+    """#4966: a split slot the new split set no longer writes is deleted
+    (``delete_stale_split_children``), and a slot whose ruling becomes a
+    duplicate of an earlier one is superseded; neither keeps voting."""
+    tag = f"{_RUN}-b4966-retire"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"judge_converge"}))
+    try:
+        key = harness.make_key(tag)
+        specs = [
+            _spec(tag, 1, "Craig L. Griffin"),
+            _spec(tag, 2, "Shaina H. Colover"),
+            _spec(tag, 3, "Rafael Sivilla-Jones"),
+        ]
+        h.run_step(key, _rulings_step("reingest", specs, [0, 1, 2]), "three")
+        assert set(_votes(h, key)) == {"S0", "S1", "S2"}
+
+        # Slot 1 repeats slot 0's ruling (superseded as a duplicate); slot 2
+        # is gone (deleted).
+        h.run_step(key, _rulings_step("reingest", specs, [0, 0]), "duplicate")
+
+        with h.checker.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, status::text FROM documents WHERE id = ANY(%s::uuid[])",
+                ([key.parent, *key.slots],),
+            )
+            status = {key.label(doc): s for doc, s in cur.fetchall()}
+        assert status.get("S1") == "superseded"
+        assert "S2" not in status
+        assert _votes(h, key) == {"S0": ("Craig L. Griffin", "Craig L. Griffin")}
+    finally:
+        h.close()
+
+
+@_needs_pg
+def test_judge_that_loses_votes_is_rearbitrated() -> None:
+    """#4966: a judge whose votes move away is arbitrated again in the same
+    transaction.  "Craig L. Grifin" (two documents) holds against "Craig L.
+    Griffin" (three documents, not decisive); once one Grifin document's
+    ruling loses its judge, Griffin leads decisively and the judge is
+    renamed, its rulings on other keys re-indexed.  Before the fix only the
+    judges a write voted for were arbitrated, so the judge kept the name."""
+    tag = f"{_RUN}-b4966-rearb"
+    h = harness.KeyHarness(_DSN, _RUN, -1, frozenset({"search", "search_fields"}))
+    try:
+        first = harness.make_key(f"{tag}-a", county_tag=tag)
+        second = harness.make_key(f"{tag}-b", county_tag=tag)
+        h.run_step(first, _judge_ruling_step("reingest", tag, 1, "Craig L. Grifin"), "a")
+        h.run_step(second, _judge_ruling_step("reingest", tag, 2, "Craig L. Grifin"), "b")
+        _add_name_evidence(h, first, "Craig L. Griffin", 3)
+        assert _judge_canonical(h, first) == ["Craig L. Grifin"]
+
+        h.run_step(second, _judge_ruling_step("reingest", tag, 2, None), "b loses judge")
+
+        assert _judge_canonical(h, second) == []
+        assert _judge_canonical(h, first) == ["Craig L. Griffin"]
+        on_first = {first.parent, *first.slots}
+        assert {m["judge_name"] for d, m in h.indexer.meta.items() if d in on_first} == {
+            "Craig L. Griffin"
+        }
     finally:
         h.close()
 
