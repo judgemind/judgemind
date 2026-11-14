@@ -85,9 +85,11 @@ fi
 #   6. ``gh api -X PUT /repos/<owner>/<repo>/pulls/<N>/merge -f merge_method=squash --jq ...``
 #      REST fallback for `pr merge`. Behavior: ``MOCK_REST_MERGE_MODE``.
 #
-#   7. ``gh api /repos/<owner>/<repo>/pulls/<N> --jq .head.ref``
-#      Resolves the head ref for --delete-branch in the REST path.
-#      Returns ``MOCK_HEAD_REF`` (default: "feature-branch").
+#   7. ``gh api /repos/<owner>/<repo>/pulls/<N> --jq <expr>``
+#      Pre-merge protection gate read in the REST path (#4965). Runs the
+#      wrapper's jq over a PR object built from ``MOCK_MERGEABLE_STATE``
+#      (default "clean"), ``MOCK_HEAD_SHA`` and ``MOCK_HEAD_REF``
+#      (default "feature-branch").
 #
 #   8. ``gh api -X DELETE /repos/<owner>/<repo>/git/refs/heads/<ref>``
 #      Branch-delete in the REST path. Behavior:
@@ -292,9 +294,28 @@ GONE_EOF
     esac
 fi
 
-# ── gh api /repos/.../pulls/<N> --jq .head.ref (head-ref resolution) ──────
+# ── gh api /repos/.../pulls/<N> --jq <expr> (pre-merge gate read) ─────────
+# Builds a minimal PR object from MOCK_MERGEABLE_STATE / MOCK_HEAD_SHA /
+# MOCK_HEAD_REF and runs the wrapper's own --jq expression over it.
 if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/pulls/[0-9]+$ ]]; then
-    echo "${MOCK_HEAD_REF:-feature-branch}"
+    pr_json=$(jq -cn \
+        --arg st "${MOCK_MERGEABLE_STATE:-clean}" \
+        --arg sha "${MOCK_HEAD_SHA:-0123456789abcdef0123456789abcdef01234567}" \
+        --arg ref "${MOCK_HEAD_REF:-feature-branch}" \
+        '{mergeable_state: $st, head: {sha: $sha, ref: $ref}}')
+    jq_expr=""
+    for ((i=1; i<=$#; i++)); do
+        if [[ "${!i}" == "--jq" ]]; then
+            next=$((i+1))
+            jq_expr="${!next}"
+            break
+        fi
+    done
+    if [[ -n "$jq_expr" ]]; then
+        printf '%s' "$pr_json" | jq -r "$jq_expr"
+    else
+        printf '%s\n' "$pr_json"
+    fi
     exit 0
 fi
 
@@ -961,6 +982,52 @@ else
     fail "M.6: merge without --delete-branch makes no DELETE call" \
         "found $delete_calls DELETE calls"
 fi
+
+# M.7 (#4965) — the REST merge pins the head SHA it checked.
+INVOCATIONS_M7="$MOCK_BIN_DIR/invocations_m7.txt"
+: > "$INVOCATIONS_M7"
+
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_M7" \
+MOCK_PR_MERGE_MODE=graphql_rate_limit \
+MOCK_REST_MERGE_MODE=success \
+MOCK_MERGEABLE_STATE=unstable \
+MOCK_HEAD_SHA=feedfacefeedfacefeedfacefeedfacefeedface \
+    "$WRAPPER" merge 355 --squash > /dev/null 2>&1 || exit_code=$?
+
+if [[ "$exit_code" -eq 0 ]] \
+        && grep -qE "^api -X PUT /repos/.*/pulls/355/merge .*-f sha=feedfacefeedfacefeedfacefeedfacefeedface( |$)" "$INVOCATIONS_M7"; then
+    pass "M.7: REST merge pins -f sha=<head.sha>"
+else
+    fail "M.7: REST merge pins -f sha=<head.sha>" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_M7")"
+fi
+
+# M.8 (#4965) — the REST merge refuses when branch protection is not
+# satisfied. It is an admin bypass, so mergeable_state=blocked (a required
+# check still running) must never reach the PUT.
+for blocked_state in blocked behind dirty unknown draft; do
+    INVOCATIONS_M8="$MOCK_BIN_DIR/invocations_m8_${blocked_state}.txt"
+    : > "$INVOCATIONS_M8"
+
+    exit_code=0
+    err_output=$(
+        MOCK_INVOCATIONS="$INVOCATIONS_M8" \
+        MOCK_PR_MERGE_MODE=graphql_rate_limit \
+        MOCK_REST_MERGE_MODE=success \
+        MOCK_MERGEABLE_STATE="$blocked_state" \
+        "$WRAPPER" merge 356 --squash --delete-branch 2>&1 >/dev/null
+    ) || exit_code=$?
+
+    put_calls=$(awk '/^api -X PUT / {n++} END {print n+0}' "$INVOCATIONS_M8")
+    if [[ "$exit_code" -eq 1 ]] && [[ "$put_calls" == "0" ]] \
+            && [[ "$err_output" == *"mergeable_state='$blocked_state'"* ]]; then
+        pass "M.8: REST merge refuses on mergeable_state=$blocked_state (exit 1, no PUT)"
+    else
+        fail "M.8: REST merge refuses on mergeable_state=$blocked_state (exit 1, no PUT)" \
+            "exit=$exit_code put_calls=$put_calls err: $err_output"
+    fi
+done
 
 # ── Summary ────────────────────────────────────────────────────────────────
 

@@ -19,10 +19,18 @@
 #
 #   create  → POST   /repos/<owner>/<repo>/pulls
 #   edit    → PATCH  /repos/<owner>/<repo>/pulls/<N>
-#   merge   → PUT    /repos/<owner>/<repo>/pulls/<N>/merge
+#   merge   → GET    /repos/<owner>/<repo>/pulls/<N>   (protection gate)
+#             PUT    /repos/<owner>/<repo>/pulls/<N>/merge  (sha= pinned)
 #             (+ DELETE /repos/<owner>/<repo>/git/refs/heads/<branch>
 #              when --delete-branch is set, to match `gh pr merge`'s
 #              one-shot semantic)
+#
+#   The merge fallback is guarded (#4965): for a repo-admin token with
+#   enforce_admins=false, `PUT /pulls/N/merge` skips required status
+#   checks, so it is an admin bypass, not a re-evaluation of branch
+#   protection. The wrapper therefore reads the PR first and refuses
+#   (exit 1) unless `mergeable_state` is clean, unstable or has_hooks, and
+#   it pins the PUT to the head SHA it checked (`-f sha=<head.sha>`).
 #
 # The shape mirrors `scripts/gh-comment-with-retry.sh` (#4478, #4503,
 # #4484): try the gh subcommand first, on the explicit GraphQL-quota
@@ -32,7 +40,10 @@
 # comment endpoint, and the only failure mode #4527 calls out is
 # GraphQL-quota exhaustion. The 504-on-merge recovery is documented in
 # `.claude/skills/task/SKILL.md` §A.7 ("Fallback — `gh pr merge` returns
-# 5xx / 504 Gateway Timeout (#4231)") and stays operator-driven.
+# 5xx / 504 Gateway Timeout (#4231)") and stays operator-driven. A
+# `base branch policy prohibits the merge` refusal is passed through
+# untouched: it means branch protection is not satisfied, so the caller
+# waits (scripts/wait-for-ci.sh) instead of bypassing it (#4965).
 #
 # Tracking: issue #4527.
 #
@@ -502,9 +513,40 @@ run_merge() {
 
     echo "gh-pr-with-retry: GraphQL rate-limit exhausted on 'pr merge', falling back to REST API..." >&2
 
+    # Branch-protection gate (#4965). With a repo-admin token and
+    # enforce_admins=false, `PUT /pulls/N/merge` does NOT enforce required
+    # checks — it is an admin bypass. So before calling it, re-read the PR
+    # over REST and refuse unless GitHub reports the PR mergeable through the
+    # protected path (mergeable_state clean / unstable / has_hooks; never
+    # blocked, behind, dirty, draft or unknown). Then pin the merge to the
+    # head SHA we just checked, so a commit pushed in between cannot merge
+    # untested.
+    local pr_state_line pr_mergeable_state pr_head_sha head_ref
+    pr_state_line=$(gh api "/repos/$REPO/pulls/$PR_NUMBER" \
+        --jq '[(.mergeable_state // "unknown"), (.head.sha // ""), (.head.ref // "")] | join("\u001f")' \
+        2>/dev/null) || pr_state_line=""
+    # Unit-separator (non-whitespace) IFS so an empty field is not collapsed.
+    IFS=$'\x1f' read -r pr_mergeable_state pr_head_sha head_ref <<< "$pr_state_line" || true
+    case "${pr_mergeable_state:-unknown}" in
+        clean|unstable|has_hooks)
+            ;;
+        *)
+            echo "ERROR: refusing the REST merge fallback for PR #$PR_NUMBER: mergeable_state='${pr_mergeable_state:-unknown}'." >&2
+            echo "  The REST merge endpoint bypasses required checks for an admin token, so it only runs" >&2
+            echo "  when GitHub reports the PR mergeable (clean/unstable/has_hooks). Wait for CI with" >&2
+            echo "  scripts/wait-for-ci.sh $PR_NUMBER, then retry once the GraphQL quota resets." >&2
+            exit 1
+            ;;
+    esac
+    if [[ -z "${pr_head_sha:-}" ]]; then
+        echo "ERROR: refusing the REST merge fallback for PR #$PR_NUMBER: could not read the head SHA to pin." >&2
+        exit 1
+    fi
+
     set +e
     gh api -X PUT "/repos/$REPO/pulls/$PR_NUMBER/merge" \
         -f "merge_method=squash" \
+        -f "sha=$pr_head_sha" \
         --jq '{merged: .merged, sha: .sha, message: .message}' \
         > "$REST_STDOUT_FILE" 2> "$REST_STDERR_FILE"
     local rest_exit=$?
@@ -532,13 +574,9 @@ run_merge() {
         exit 0
     fi
 
-    # Resolve the head ref via REST (one extra core-quota call). We
-    # cannot rely on `gh pr view --jq .headRefName` here because that
-    # path also goes through GraphQL — which is exactly why we're in
-    # the fallback. Use the REST GET on the PR.
-    local head_ref
-    head_ref=$(gh api "/repos/$REPO/pulls/$PR_NUMBER" --jq '.head.ref' 2>/dev/null) || head_ref=""
-    if [[ -z "$head_ref" ]]; then
+    # The head ref came from the pre-merge REST read above (GraphQL
+    # `gh pr view` is unavailable — that is why we're in the fallback).
+    if [[ -z "${head_ref:-}" ]]; then
         echo "WARNING: merge succeeded but could not resolve head ref to delete (--delete-branch)." >&2
         echo "merge succeeded (REST fallback): $rest_summary" >&2
         echo "  manual cleanup: gh api /repos/$REPO/git/refs/heads/<branch> -X DELETE" >&2
