@@ -8,6 +8,12 @@ properties that must hold for any sequence of re-splits:
   a commit in between (no ruling-less interval);
 - ``alert``: a ``public.alert_events`` row keeps its ``ruling_id`` while its
   ruling still exists;
+- ``alert_case``: an alert follows only its own ruling: a row whose alert
+  carried over holds the same generated ruling (a re-extracted or relinked
+  case number) or the same real case (re-extracted text).  Another ruling
+  on a synthetic ``UNKNOWN`` case, or on a different case, is a different
+  ruling, so the old row is retired and its alert detached, never moved to
+  it (#4946);
 - ``superseded``: no superseded document holds a ruling, and there is no
   ``previous_version_id`` cycle (``scripts/audit_supersede_integrity.py``);
 - ``search``: every document with a ruling has exactly one search doc, with
@@ -135,6 +141,7 @@ _DEFENDANTS = ["Acme Corp", "Beta LLC", "Crane Inc", "Delta Co", "Echo Ltd", "Fo
 INVARIANTS = (
     "gap",
     "alert",
+    "alert_case",
     "superseded",
     "search",
     "search_fields",
@@ -669,6 +676,17 @@ def read_key(conn: psycopg.Connection, s3_key: str) -> list[DocRow]:
         return [DocRow(*row) for row in cur.fetchall()]
 
 
+_GENERATED_RULING = re.compile(r"^Ruling (\S+-\d+)\. ")
+
+
+def _generated_ruling(text: str | None) -> str | None:
+    """The generated ruling a ruling text was made from (``<token>-<idx>``,
+    see :func:`_text`), whatever the transcription appended (:func:`_cites`);
+    the text itself when it is not a generated ruling's (a whole document)."""
+    m = _GENERATED_RULING.match(text or "")
+    return m.group(1) if m else text
+
+
 def ruling_identities(rows: list[DocRow]) -> Counter[tuple[str, str]]:
     return Counter((r.text, _norm_case(r.case_number)) for r in rows if r.ruling_id)
 
@@ -883,6 +901,9 @@ class KeyHarness:
         self.conn = _CheckedConn(self.real, self._after_commit)
         #: alert id -> (s3_key, ruling identity)
         self._alerts: dict[str, tuple[str, tuple[str, str]]] = {}
+        #: (identity before, identity now) of each alert whose ruling row
+        #: changed identity in the last step (``alert_case``, #4946).
+        self._alert_moves: list[tuple[tuple[str, str], tuple[str, str]]] = []
         self._user_sub: str | None = None
         #: Fields merged into every step's event (a deterministic splitter's
         #: county, format and text).
@@ -1020,6 +1041,7 @@ class KeyHarness:
             )
         self._guard("gap", self._check_gap, before, after)
         self._guard("alert", self._check_alerts, key, after_rows)
+        self._guard("alert_case", self._check_alert_case)
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
@@ -1510,6 +1532,7 @@ class KeyHarness:
         rulings of one identity into one, the survivor may be the one whose
         alert was filed under its earlier text (#4929, seed 15).
         """
+        self._alert_moves = []
         present = ruling_identities(rows)
         recorded: Counter[tuple[str, str]] = Counter()
         attached: Counter[tuple[str, str]] = Counter()
@@ -1530,6 +1553,8 @@ class KeyHarness:
                     continue
                 now = (text, _norm_case(case_number))
                 attached[now] += 1
+                if now != identity:
+                    self._alert_moves.append((identity, now))
                 self._alerts[alert_id] = (s3_key, now)
         for identity, count in sorted(recorded.items()):
             if attached[identity] < min(present[identity], count):
@@ -1538,6 +1563,29 @@ class KeyHarness:
                     f"alert on ruling {(identity[0] or '')[:24]!r} ({identity[1]}) lost "
                     "its ruling_id while the ruling still exists",
                 )
+
+    def _check_alert_case(self) -> None:
+        """An alert follows only its own ruling (#4946).
+
+        A ruling row whose alert carried over from the last step must hold
+        the same ruling: the same generated ruling (its case number was
+        re-extracted or relinked, or its transcription now cites a
+        different number), or the same real case (its text was
+        re-extracted).  A synthetic ``UNKNOWN`` case is evidence of a slot,
+        not of a ruling, so another ruling there is a different ruling: the
+        old row is retired and its alert detached.  Another ruling on
+        another case is a different ruling about a different case.
+        """
+        for (old_text, old_case), (new_text, new_case) in self._alert_moves:
+            if _generated_ruling(old_text) == _generated_ruling(new_text):
+                continue
+            if old_case == new_case and old_case != "UNKNOWN":
+                continue
+            self._fail(
+                "alert_case",
+                f"alert on ruling {(old_text or '')[:24]!r} ({old_case}) now points at "
+                f"a different ruling {(new_text or '')[:24]!r} ({new_case})",
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -277,9 +277,9 @@ def _row(conn: object, ruling_id: str) -> tuple[Any, ...]:
 
 
 def test_reused_row_takes_every_field_of_its_new_ruling(conn: object) -> None:
-    """#4939: a slot's row reused for a different ruling (third pass: same
-    slot, same placeholder case, new text) carries the new ruling's judge
-    and every other field, never the previous ruling's.  Only its id and
+    """#4939: a slot's row reused for a re-extracted ruling (third pass:
+    same slot, same real case, new text) carries the new ruling's judge
+    and every other field, never the previous text's.  Only its id and
     alerts carry over."""
     key = Key(conn)
     judge_a = _judge(conn, key.court_id, "Judge A")
@@ -293,12 +293,12 @@ def test_reused_row_takes_every_field_of_its_new_ruling(conn: object) -> None:
         "summary": "old summary",
         "summary_model": "m",
     }
-    key.write([("30-K-1", _text(1)), (None, _text(2), old)])
+    key.write([("30-K-1", _text(1)), ("30-K-2", _text(2), old)])
     ruling_id = key.rulings()[key.slot(1)][0]
     alert_id = _alert(conn, ruling_id, key.slot(1))
 
-    # Slot 1 now holds a different ruling on the same placeholder case.
-    key.write([("30-K-1", _text(1)), (None, _text(3), {"judge_id": judge_b})])
+    # Slot 1's ruling is re-extracted with new text on the same case.
+    key.write([("30-K-1", _text(1)), ("30-K-2", _text(3), {"judge_id": judge_b})])
     after = key.rulings()[key.slot(1)]
     assert after[0] == ruling_id  # the row is reused
     assert _row(conn, ruling_id) == (
@@ -316,8 +316,42 @@ def test_reused_row_takes_every_field_of_its_new_ruling(conn: object) -> None:
     assert _alert_target(conn, alert_id) == (ruling_id, key.slot(1))
 
     # A child with no judge clears the reused row's judge.
-    key.write([("30-K-1", _text(1)), (None, _text(4))])
+    key.write([("30-K-1", _text(1)), ("30-K-2", _text(4))])
     assert _row(conn, ruling_id)[0] is None
+
+
+def test_placeholder_alert_stays_with_a_dropped_ruling(conn: object) -> None:
+    """#4946: a slot's ``UNKNOWN-<slot>`` case is evidence of the slot, not of
+    the ruling.  When the split drops the ruling a slot held on its
+    placeholder case and puts a different numberless ruling there, the old
+    row is retired (its alert detached, kept) and the new ruling gets a
+    fresh row: the alert never follows the slot to a different ruling."""
+    key = Key(conn)
+    key.write([("30-M-1", _text(1)), (None, _text(2))])
+    old_id = key.rulings()[key.slot(1)][0]
+    alert_id = _alert(conn, old_id, key.slot(1))
+
+    key.write([("30-M-1", _text(1)), (None, _text(3))])
+    new_id, text, number, _status = key.rulings()[key.slot(1)]
+    assert (text, number) == (_text(3), f"UNKNOWN-{key.slot(1)}")
+    assert new_id != old_id
+    ruling_id, document_id = _alert_target(conn, alert_id)
+    assert ruling_id is None  # detached, not deleted, and not on the new ruling
+    assert document_id == key.slot(1)
+
+
+def test_placeholder_alert_follows_its_own_ruling_across_slots(conn: object) -> None:
+    """#4946: the same numberless ruling (same text) keeps its row and alert
+    when it moves to another slot's placeholder case."""
+    key = Key(conn)
+    key.write([("30-N-1", _text(1)), (None, _text(2))])
+    old_id = key.rulings()[key.slot(1)][0]
+    alert_id = _alert(conn, old_id, key.slot(1))
+
+    key.write([(None, _text(2)), ("30-N-1", _text(1))])
+    moved_id, text, _number, _status = key.rulings()[key.slot(0)]
+    assert (moved_id, text) == (old_id, _text(2))
+    assert _alert_target(conn, alert_id) == (old_id, key.slot(0))
 
 
 def test_reused_row_with_the_same_text_keeps_its_text_fields(conn: object) -> None:
