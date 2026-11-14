@@ -196,6 +196,20 @@ def _disable_llm_s3_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _optional_llm_extraction() -> Generator[None, None, None]:
+    """Run the suite's ingestion workers in ``optional`` extraction mode.
+
+    A deployed worker defaults to ``required`` mode: it builds the LLM
+    extractors at startup and refuses to start without them (#4953).  The
+    unit tests have no LLM keys and stub the extractors they need, so they
+    use the explicit opt-in that local regex-only runs use.  Tests of the
+    required mode set ``JUDGEMIND_EXTRACTION`` themselves.
+    """
+    with patch.dict(os.environ, {"JUDGEMIND_EXTRACTION": "optional"}):
+        yield
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _block_telemetry_db_writes() -> Generator[None, None, None]:
     """Prevent any test from accidentally writing to ``telemetry.scraper_runs``.
 

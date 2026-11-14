@@ -247,6 +247,85 @@ class SplitExtractionFailedError(RuntimeError):
     """
 
 
+#: Environment variable naming the worker's extraction mode (#4953).
+EXTRACTION_MODE_ENV = "JUDGEMIND_EXTRACTION"
+#: The default mode, and the one every deployed process (the ECS worker, the
+#: reingest and rebuild oneshots) runs in: the LLM extractors must build.
+#: A worker that cannot build one fails at startup, and a split that finds
+#: one missing writes nothing.
+EXTRACTION_REQUIRED = "required"
+#: The explicit opt-in for runs without LLM keys (local regex-only runs,
+#: unit tests): an extractor that cannot be built is skipped, and the
+#: single-document fallback (per-field and regex extraction) is the
+#: extraction.
+EXTRACTION_OPTIONAL = "optional"
+EXTRACTION_MODES = (EXTRACTION_REQUIRED, EXTRACTION_OPTIONAL)
+
+#: The multimodal response-token cap a county without an override gets
+#: (``decide_extraction_strategy``), so the startup check builds the same
+#: cached extractor those counties use.
+_DEFAULT_MM_OUTPUT_TOKENS = 4096
+
+
+def extraction_mode() -> str:
+    """The extraction mode named by ``JUDGEMIND_EXTRACTION`` (#4953).
+
+    Unset or blank means ``required``.  Any other value than the two modes
+    raises ``ValueError``, so a typo cannot silently pick a mode.
+    """
+    raw = os.environ.get(EXTRACTION_MODE_ENV, "").strip().lower()
+    if not raw:
+        return EXTRACTION_REQUIRED
+    if raw not in EXTRACTION_MODES:
+        msg = (
+            f"{EXTRACTION_MODE_ENV}={raw!r} is not a known extraction mode; "
+            f"use one of {', '.join(EXTRACTION_MODES)}"
+        )
+        raise ValueError(msg)
+    return raw
+
+
+def check_extraction_ready() -> str:
+    """Return the extraction mode; in ``required`` mode, first check that
+    the framework (Anthropic) and multimodal (Google) extractors build,
+    raising ``ExtractorUnavailableError`` if one does not (#4953).
+
+    For scripts that change data before their first worker is built:
+    ``rebuild_db.py`` resets derived tables first, so it calls this before
+    the reset rather than finding the missing key once per document.
+    """
+    mode = extraction_mode()
+    if mode != EXTRACTION_REQUIRED:
+        return mode
+    errors = []
+    for label, kwargs in (("framework", {}), ("multimodal", {"provider": "google"})):
+        try:
+            LlmExtractor(**kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise ExtractorUnavailableError(
+            "extractor unavailable: "
+            + "; ".join(errors)
+            + f" (set {EXTRACTION_MODE_ENV}={EXTRACTION_OPTIONAL} for a run without LLM keys)"
+        )
+    return mode
+
+
+class ExtractorUnavailableError(SplitExtractionFailedError):
+    """An LLM extractor the worker requires could not be built (#4953): a
+    missing or blank API key secret, or a client init error.
+
+    Raised at worker startup in ``required`` mode, and by a split that finds
+    its extractor missing.  The split writes nothing: the key's rows are
+    left as they are, never replaced by the whole document written as one
+    ruling.  It is an infrastructure error (``is_infrastructure_error``):
+    the live worker leaves the message unacknowledged and exits for
+    restart.  A reingest or rebuild counts the key as failed, as for any
+    ``SplitExtractionFailedError``.
+    """
+
+
 #: Event key set on split children whose ``case_number`` a deterministic
 #: splitter read from the source document (a CASE # cell, a ``Case No.:``
 #: header).  The enrichment step's fuzzy case-number correction is skipped
@@ -1553,9 +1632,11 @@ class _SplitBatch:
     child (``WHOLE_DOCUMENT_KEY``, #4940).
     ``extraction_failed`` names the extraction call that failed (an
     ``ExtractionIncompleteError`` or any other error from the extractor):
-    not a verdict, so the key's rows are left alone (#4948).  It stays
-    unset when no extractor is configured (regex-only extraction, e.g. a
-    local run without LLM keys), where the single-document fallback is the
+    not a verdict, so the key's rows are left alone (#4948).  In
+    ``required`` extraction mode a missing extractor sets it too, with
+    ``extractor_unavailable`` (#4953).  It stays unset when no extractor is
+    configured in ``optional`` mode (regex-only extraction, e.g. a local
+    run without LLM keys), where the single-document fallback is the
     extraction.
     """
 
@@ -1566,6 +1647,7 @@ class _SplitBatch:
     no_rulings_reason: str | None = None
     whole_document: bool = False
     extraction_failed: str | None = None
+    extractor_unavailable: bool = False
 
 
 class InfrastructureError(Exception):
@@ -1589,7 +1671,7 @@ def is_infrastructure_error(exc: Exception) -> bool:
     cannot process it right now (DB down, schema missing, etc.). These
     should NOT cause dead-lettering.
     """
-    return isinstance(exc, (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS))
+    return isinstance(exc, (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS, ExtractorUnavailableError))
 
 
 def is_schema_constraint_error(exc: Exception) -> bool:
@@ -1939,6 +2021,65 @@ class IngestionWorker:
         # collected here and written together (#4845).
         self._split_batch: _SplitBatch | None = None
 
+        # Why each LLM extractor failed to build, by extractor label
+        # (#4953).  Named in the error a split raises when one is missing.
+        self._extractor_init_errors: dict[str, str] = {}
+
+        # Extraction mode (#4953): ``required`` (the default, every deployed
+        # process) builds the LLM extractors now and fails loudly when one
+        # cannot be built; ``optional`` is the explicit opt-in for runs
+        # without LLM keys.
+        mode = extraction_mode()
+        self._extraction_required: bool = mode == EXTRACTION_REQUIRED
+        logger.info(
+            "Extraction mode: %s",
+            mode,
+            extra={"telemetry_event": "ingestion.extraction_mode", "extraction_mode": mode},
+        )
+        if self._extraction_required:
+            self._require_extractors()
+
+    def _require_extractors(self) -> None:
+        """Build the framework (Anthropic) and multimodal (Google) extractors,
+        or raise ``ExtractorUnavailableError`` naming why each that could
+        not be built failed (#4953).
+
+        Google-provider county extractors use the same key as the
+        multimodal one, so building it checks theirs too.  The extractors
+        built here are the ones the worker caches and uses.
+        """
+        framework = self._get_framework_extractor()
+        multimodal = self._get_multimodal_extractor(max_output_tokens=_DEFAULT_MM_OUTPUT_TOKENS)
+        missing = [
+            label
+            for label, extractor in (("framework", framework), ("multimodal", multimodal))
+            if extractor is None
+        ]
+        if not missing:
+            return
+        reason = self._extractor_unavailable_reason(*missing)
+        logger.critical(
+            "LLM extractor unavailable in required extraction mode — refusing to start",
+            extra={
+                "telemetry_event": "ingestion.extractor_unavailable",
+                "extraction_mode": EXTRACTION_REQUIRED,
+                "missing": missing,
+                "reason": reason,
+                "fix": (
+                    f"check the ANTHROPIC_API_KEY / GOOGLE_API_KEY secrets, or set "
+                    f"{EXTRACTION_MODE_ENV}={EXTRACTION_OPTIONAL} for a run without LLM keys"
+                ),
+            },
+        )
+        raise ExtractorUnavailableError(reason)
+
+    def _extractor_unavailable_reason(self, *labels: str) -> str:
+        """``extractor unavailable: <label>: <init error>; ...`` (#4953)."""
+        parts = [
+            f"{label}: {self._extractor_init_errors.get(label, 'not built')}" for label in labels
+        ]
+        return "extractor unavailable: " + "; ".join(parts)
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -1962,6 +2103,7 @@ class IngestionWorker:
                     extra={"bust_cache": self._bust_llm_cache},
                 )
             except Exception as exc:
+                self._extractor_init_errors["framework"] = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Failed to initialize LlmExtractor — LLM extraction path unavailable: %s",
                     exc,
@@ -2019,6 +2161,7 @@ class IngestionWorker:
                     extra={"bust_cache": self._bust_llm_cache},
                 )
             except Exception as exc:
+                self._extractor_init_errors["multimodal"] = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
                     exc,
@@ -2047,6 +2190,7 @@ class IngestionWorker:
                     },
                 )
             except Exception as exc:
+                self._extractor_init_errors["multimodal"] = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
                     exc,
@@ -2278,6 +2422,7 @@ class IngestionWorker:
                     extra={"provider": provider, "model": model},
                 )
             except Exception as exc:
+                self._extractor_init_errors["county"] = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Failed to initialize county LlmExtractor: %s",
                     exc,
@@ -3046,7 +3191,8 @@ class IngestionWorker:
         # leaves the key's rows alone (#4948): a reingest / rebuild raises
         # ``SplitExtractionFailedError``, a live capture of a key that holds
         # rows writes nothing, and a live capture of a new key returns False
-        # and is written below.
+        # and is written below.  A required extractor that cannot be built
+        # raises ``ExtractorUnavailableError`` on every event (#4953).
         if not event_data.get("_split_processed") and not event_data.get(WHOLE_DOCUMENT_KEY):
             llm_split = self._llm_split_document(
                 event_data,
@@ -4448,7 +4594,8 @@ class IngestionWorker:
     def _write_one_ruling(self, w: _RulingWrite) -> None:
         """Write one ruling document and index it: a scraper pre-split child
         that arrives as its own event, or a document written whole because
-        no extractor is configured, it had nothing to extract, or (a live
+        no extractor is configured (``optional`` extraction mode, #4953),
+        it had nothing to extract, or (a live
         capture of a new key only) its extraction failed.  A document the
         extractor found no rulings in is a split set of one, written by
         ``_write_split_batch`` (#4940); a reingest whose extraction failed
@@ -4837,9 +4984,13 @@ class IngestionWorker:
         on its own (the per-field extraction fallback); a live capture of a
         key that already holds rows writes nothing.
 
+        In ``required`` extraction mode (the default, #4953) a missing
+        extractor is not "no extractor configured": the split raises
+        ``ExtractorUnavailableError`` and writes nothing, on every event.
+
         Returns False only when the caller must write the document itself:
-        no extractor is configured, there is nothing to extract, or a live
-        capture of a new key failed extraction.
+        no extractor is configured (``optional`` mode), there is nothing to
+        extract, or a live capture of a new key failed extraction.
         """
         batch = _SplitBatch(parent_document_id=document_id)
         outer = self._split_batch
@@ -4869,12 +5020,22 @@ class IngestionWorker:
             return True
         if batch.extraction_failed is not None:
             return self._leave_key_after_failed_extraction(
-                event_data, document_id, county, batch.extraction_failed
+                event_data,
+                document_id,
+                county,
+                batch.extraction_failed,
+                extractor_unavailable=batch.extractor_unavailable,
             )
         return False
 
     def _leave_key_after_failed_extraction(
-        self, event_data: dict[str, Any], document_id: str, county: str, reason: str
+        self,
+        event_data: dict[str, Any],
+        document_id: str,
+        county: str,
+        reason: str,
+        *,
+        extractor_unavailable: bool = False,
     ) -> bool:
         """Leave the key's rows alone after a failed extraction (#4948).
 
@@ -4883,11 +5044,23 @@ class IngestionWorker:
         as failed (``--write-failed-manifest``).  On a live capture, returns
         True (write nothing) when the key already holds rows, and False
         (the caller writes the document on its own) when it holds none.
+
+        A required extractor that could not be built (*extractor_unavailable*,
+        #4953) raises ``ExtractorUnavailableError`` on every event, a live
+        capture of a new key included: the document is never written on its
+        own, and the live worker keeps the message for after the restart.
         """
         s3_key = event_data.get("s3_key")
         replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
-        key_has_rows = not replace_set and bool(s3_key) and self._key_has_rows(str(s3_key))
-        if replace_set:
+        key_has_rows = (
+            not replace_set
+            and not extractor_unavailable
+            and bool(s3_key)
+            and self._key_has_rows(str(s3_key))
+        )
+        if extractor_unavailable:
+            action = "extractor_unavailable"
+        elif replace_set:
             action = "reported_failed"
         elif key_has_rows:
             action = "left_key_alone"
@@ -4905,6 +5078,8 @@ class IngestionWorker:
                 "action": action,
             },
         )
+        if extractor_unavailable:
+            raise ExtractorUnavailableError(f"{s3_key or document_id}: {reason[:500]}")
         if replace_set:
             raise SplitExtractionFailedError(
                 f"extraction failed for {s3_key or document_id}: {reason[:500]}"
@@ -5217,6 +5392,11 @@ class IngestionWorker:
             multimodal_extractor = self._get_multimodal_extractor(
                 max_output_tokens=mm_max_output_tokens,
             )
+            if multimodal_extractor is None and self._extraction_required:
+                # A required extractor is missing (#4953): not a verdict.
+                batch.extraction_failed = self._extractor_unavailable_reason("multimodal")
+                batch.extractor_unavailable = True
+                return False
             if multimodal_extractor is not None:
                 try:
                     # ``strict``: a failed page raises instead of passing
@@ -5287,9 +5467,19 @@ class IngestionWorker:
                 if county_prompt:
                     extraction_method = "llm_county"
 
+            if extractor is None and self._extraction_required:
+                # A required extractor is missing (#4953): not a verdict,
+                # never the single-document fallback.
+                label = "county" if strategy.provider else "framework"
+                batch.extraction_failed = "; ".join(
+                    e for e in (multimodal_error, self._extractor_unavailable_reason(label)) if e
+                )
+                batch.extractor_unavailable = True
+                return False
             if extractor is None:
-                # No text extractor to fall back on: a failed multimodal
-                # call is still a failed extraction (#4948).
+                # ``optional`` mode, no text extractor to fall back on: a
+                # failed multimodal call is still a failed extraction
+                # (#4948); with none, regex-only extraction is the run's.
                 batch.extraction_failed = multimodal_error
                 return False
             try:

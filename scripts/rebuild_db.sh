@@ -97,10 +97,15 @@ ENV_VARS=(
 )
 
 if [ "$USE_LLM" = true ]; then
-    echo "  LLM extraction: enabled (fetching API key from Secrets Manager)"
-    exec scripts/with-secret.sh -e GOOGLE_API_KEY=judgemind/google/api-key -- \
-        env "${ENV_VARS[@]}" scripts/run-py.sh scripts/rebuild_db.py
+    # The worker's default ``required`` extraction mode builds both LLM
+    # extractors at startup and refuses to start without them (#4953).
+    echo "  LLM extraction: enabled (fetching API keys from Secrets Manager)"
+    exec scripts/with-secret.sh \
+        -e GOOGLE_API_KEY=judgemind/google/api-key \
+        -e ANTHROPIC_API_KEY=judgemind/anthropic/api-key -- \
+        env "${ENV_VARS[@]}" JUDGEMIND_EXTRACTION=required scripts/run-py.sh scripts/rebuild_db.py
 else
-    echo "  LLM extraction: disabled (regex only)"
-    exec env "${ENV_VARS[@]}" scripts/run-py.sh scripts/rebuild_db.py
+    # The explicit opt-in for a run without LLM keys (#4953).
+    echo "  LLM extraction: disabled (regex only, JUDGEMIND_EXTRACTION=optional)"
+    exec env "${ENV_VARS[@]}" JUDGEMIND_EXTRACTION=optional scripts/run-py.sh scripts/rebuild_db.py
 fi

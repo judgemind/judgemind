@@ -263,6 +263,34 @@ def test_failed_extraction_leaves_the_key_untouched(seed: int) -> None:
     harness.run_extraction_failure(_DSN, seed, _RUN)
 
 
+@_needs_pg
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_extractor_unavailable_leaves_the_key_untouched(seed: int) -> None:
+    """A step whose required extractors cannot be built (a missing LLM
+    secret), after a generated history, leaves the key's rows and search
+    docs exactly as they were and raises on every step kind, a live capture
+    included (#4953).  Before the fix the worker treated it as "no
+    extractor configured" and wrote the whole document as a ruling."""
+    harness.run_extraction_failure(_DSN, seed, _RUN, name="unavail", unavailable=True)
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "db", "live"])
+def test_known_bug_4953_extractor_unavailable_keeps_the_three_child_split(kind: str) -> None:
+    """A key holding a three-child split set, re-ingested while the
+    worker's extractors cannot be built, keeps exactly its three rulings and
+    gains no whole-document ruling on the parent row (#4953)."""
+    harness.run_extraction_failure(
+        _DSN,
+        -1,
+        _RUN,
+        name=f"bug4953-{kind}",
+        steps=_three_child_split(),
+        kind=kind,
+        unavailable=True,
+    )
+
+
 def _three_child_split() -> list[harness.Step]:
     specs = tuple(
         harness.Spec(i, harness._case_number(i), harness._title(i), harness._text("b4948", i))
