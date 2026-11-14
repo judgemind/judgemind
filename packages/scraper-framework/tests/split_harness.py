@@ -61,13 +61,22 @@ properties that must hold for any sequence of re-splits:
 - ``untouched``: a step whose extraction fails (every page's and chunk's
   API call failed, ``ExtractionIncompleteError``) leaves the key's rows and
   search docs exactly as they were: no whole-document ruling next to the
-  key's split children, no deletions (#4948).  A split-set replacement
-  (``reingest`` / ``db``) reports the key as failed
-  (``SplitExtractionFailedError``), so the reingest's failed-keys manifest
-  retries it.  The same holds when the worker, in ``required`` extraction
-  mode, finds its extractors could not be built (#4953): every step kind,
-  a live capture included, raises ``ExtractorUnavailableError`` and writes
-  nothing.  Checked by :func:`run_extraction_failure`.
+  key's split children, no deletions (#4948).  The same holds when the
+  worker, in ``required`` extraction mode, finds an extractor it needs
+  could not be built (#4953), and when no extractor could run at all (no
+  text to read and no page images, #4968).  Checked on every generated
+  step whose extraction is incomplete, and by :func:`run_extraction_failure`.
+- ``failed_manifest``: a step whose extraction did not produce a complete
+  result reports the key as failed.  A split-set replacement (``reingest`` /
+  ``db``) raises ``SplitExtractionFailedError``, which the reingest's
+  per-key handler counts, so ``--write-failed-manifest`` retries the key;
+  a missing extractor raises ``ExtractorUnavailableError`` on every step
+  kind, a live capture included, so the live worker keeps the message for
+  after its restart (#4948, #4953, #4968).
+- ``refuse_start``: a worker whose required extractor's secret is missing
+  refuses to start (``_require_extractors``), and so does the scripts'
+  preflight (``check_extraction_ready``), whatever county configs name that
+  provider (#4953, #4957).
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -113,6 +122,30 @@ Step kinds:
   ``alert`` are not checked on these steps.  ``alert_case`` is: a retired
   row's alert is detached, never moved to another ruling.
 
+Extraction modes (#4968), from a fourth random stream (:func:`_with_extraction_modes`):
+
+- the worker is built by the production path in ``required`` mode
+  (``_require_extractors``, after the ``check_extraction_ready`` preflight)
+  in one of three env shapes: production's (``LLM_PROVIDER=google``, no
+  Anthropic key), Google with an Anthropic key too, or
+  ``LLM_PROVIDER=anthropic``.  ``LlmExtractor`` is built for real (a missing
+  key fails as in production), only its calls are routed to the step's rows;
+- a seed's keys get one county extraction config (:data:`PROFILES`), copied
+  from a real county so ``decide_extraction_strategy`` takes each branch:
+  multimodal (Orange), text-first on the county's own provider (Ventura),
+  text-first on the framework extractor, text-first on a provider the
+  deployment covers only through that county (the #4957 startup check), or
+  ``ExtractionMethod.NONE`` (Federal: every step is a whole document);
+- a step has a ``fail_mode`` (:data:`FAIL_MODES`): every call fails, the
+  multimodal call fails and the text fallback succeeds, or the multimodal
+  call fails and the framework or county extractor cannot be built;
+- a whole-document step can have no text at all, so a multimodal county
+  reaches ``zero_rulings_no_text`` and a text-first one has nothing to read.
+
+:meth:`KeyHarness.expected_outcome` says what each step's extraction must
+come to (complete, failed, or an extractor unavailable), independently of
+the worker.
+
 Failures raise :class:`InvariantError` naming the invariant, the seed
 and the step, so a failing seed is its own reproduction:
 ``SPLIT_HARNESS_SEED=<n> pytest tests/test_split_invariants_pg.py``.
@@ -124,8 +157,10 @@ import hashlib
 import io
 import json
 import logging
+import os
 import random
 import re
+import sys
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -175,6 +210,8 @@ INVARIANTS = (
     "evidence",
     "judge_converge",
     "untouched",
+    "failed_manifest",
+    "refuse_start",
     "error",
 )
 
@@ -250,6 +287,14 @@ class Step:
     party_tag: str = ""
     #: Every extraction call fails (``ExtractionIncompleteError``, #4948).
     fail: bool = False
+    #: The key's county extraction config (:data:`PROFILES`, #4968).  One
+    #: per seed: every key of a run, the fresh ones included, has it.
+    profile: str = "default"
+    #: The worker's env shape (:data:`ENVS`).  One per seed.
+    env: str = "google"
+    #: Which extractor fails or cannot be built (:data:`FAIL_MODES`), or
+    #: ``""`` for none.
+    fail_mode: str = ""
 
     def describe(self) -> str:
         parts = []
@@ -271,6 +316,10 @@ class Step:
         doc = "none" if not self.doc else "scan" if not doc_is_evidence(self.doc) else "text"
         whole = " whole" if self.whole else ""
         fail = " FAIL" if self.fail else ""
+        if self.fail_mode:
+            fail += f" fail_mode={self.fail_mode}"
+        if (self.profile, self.env) != ("default", "google"):
+            fail += f" profile={self.profile} env={self.env}"
         return f"{self.kind}[{' '.join(parts)}] doc={doc}{whole}{fail} ops={list(self.ops)}"
 
 
@@ -349,7 +398,12 @@ _OPS = (
 )
 
 
-def generate(seed: int, *, whole_documents: bool | None = None) -> list[Step]:
+def generate(
+    seed: int,
+    *,
+    whole_documents: bool | None = None,
+    extraction_modes: bool | None = None,
+) -> list[Step]:
     """Return the step sequence for *seed* (deterministic).
 
     The rows, ops and step kinds come from one random stream, as they did
@@ -357,7 +411,10 @@ def generate(seed: int, *, whole_documents: bool | None = None) -> list[Step]:
     text, the case number the LLM reads, the judge names and the roster
     come from a second stream (:class:`_Model`).  *whole_documents*
     (default :data:`WHOLE_DOCUMENT_STEPS`) turns the ``whole`` op on; the
-    random streams are the same either way.
+    random streams are the same either way.  *extraction_modes* (default
+    :data:`EXTRACTION_MODE_STEPS`) turns the extraction modes on
+    (:func:`_with_extraction_modes`); off, a seed's steps are exactly the
+    ones they were before #4968.
     """
     rng = random.Random(seed)
     model = _Model(seed, WHOLE_DOCUMENT_STEPS if whole_documents is None else whole_documents)
@@ -391,7 +448,96 @@ def generate(seed: int, *, whole_documents: bool | None = None) -> list[Step]:
         steps.append(model.step(kind, rows, specs, ops, token))
     if PRESPLIT_STEPS:
         steps = _with_presplit_steps(seed, steps)
+    if EXTRACTION_MODE_STEPS if extraction_modes is None else extraction_modes:
+        steps = _with_extraction_modes(seed, steps)
     return steps
+
+
+#: Whether generated seeds include the extraction modes (#4968).
+EXTRACTION_MODE_STEPS = True
+
+#: A seed's county extraction config (:func:`profile_config`), and how often
+#: each is drawn.
+PROFILES = ("default", "multimodal", "llm_county", "llm_framework", "llm_other", "none")
+_PROFILE_WEIGHTS = (8, 3, 3, 2, 2, 2)
+
+#: The worker's env shapes: production's (``LLM_PROVIDER=google``, only the
+#: Google key wired), Google with an Anthropic key too, and Anthropic.
+ENVS = ("google", "google+anthropic", "anthropic")
+_ENV_VARS: dict[str, dict[str, str]] = {
+    "google": {"LLM_PROVIDER": "google", "GOOGLE_API_KEY": "harness-google-key"},
+    "google+anthropic": {
+        "LLM_PROVIDER": "google",
+        "GOOGLE_API_KEY": "harness-google-key",
+        "ANTHROPIC_API_KEY": "harness-anthropic-key",
+    },
+    "anthropic": {
+        "LLM_PROVIDER": "anthropic",
+        "GOOGLE_API_KEY": "harness-google-key",
+        "ANTHROPIC_API_KEY": "harness-anthropic-key",
+    },
+}
+
+#: How a step's extraction fails.  ``all``: every call fails.
+#: ``multimodal_only``: the multimodal call fails, the text fallback
+#: succeeds.  ``framework_missing`` / ``county_missing``: the multimodal
+#: call fails and that text extractor cannot be built (a lazily built
+#: extractor's init error), so a county that needs it has none (#4957).
+FAIL_MODES = ("all", "multimodal_only", "framework_missing", "county_missing")
+
+
+def profile_config(profile: str) -> Any:
+    """The ``CountyExtractionConfig`` a key of *profile* has, or None
+    (an unconfigured county: the multimodal default).
+
+    Each is a real county's config, so production's configs are what the
+    harness runs: Orange (multimodal), Ventura (text first, on the county's
+    own Google extractor), Ventura on the framework extractor (no provider),
+    Ventura on Anthropic (a provider only that county names, so the worker
+    builds it at startup, #4957) and Federal (``ExtractionMethod.NONE``).
+    The keys keep their own county names, so their courts and cases are
+    their own (#4956).
+    """
+    from framework.extraction_config import _COUNTY_CONFIGS
+
+    ventura = _COUNTY_CONFIGS[("CA", "VENTURA")]
+    configs = {
+        "default": None,
+        "multimodal": _COUNTY_CONFIGS[("CA", "ORANGE")],
+        "llm_county": ventura,
+        "llm_framework": replace(ventura, provider=None, model=None),
+        "llm_other": replace(ventura, provider="anthropic", model=None),
+        "none": _COUNTY_CONFIGS[("FEDERAL", "FEDERAL")],
+    }
+    return configs[profile]
+
+
+def _with_extraction_modes(seed: int, steps: list[Step]) -> list[Step]:
+    """Give *steps* a county extraction config, an env shape and fail modes.
+
+    A fourth random stream, so a seed's rows, ops, model draws and pre-split
+    steps are the same with or without extraction modes.  A pre-split step
+    runs no extraction (its scraper filled the fields), so it gets no fail
+    mode; under ``none`` every other step is a whole document.
+    """
+    rng = random.Random(f"{seed}:extraction")
+    profile = rng.choices(PROFILES, weights=_PROFILE_WEIGHTS)[0]
+    # The Anthropic county config needs the Anthropic key, on a Google
+    # framework (on an Anthropic one it is covered).
+    env = "google+anthropic" if profile == "llm_other" else rng.choice(ENVS)
+    out = []
+    for step in steps:
+        fail_draw, mode_draw, blank_draw = rng.random(), rng.choice(FAIL_MODES), rng.random()
+        if step.kind == "presplit":
+            out.append(replace(step, profile=profile, env=env))
+            continue
+        whole = step.whole or profile == "none"
+        fail_mode = mode_draw if fail_draw < 0.2 and profile != "none" else ""
+        doc = "" if whole and blank_draw < 0.3 else step.doc
+        out.append(
+            replace(step, profile=profile, env=env, whole=whole, fail_mode=fail_mode, doc=doc)
+        )
+    return out
 
 
 #: Whether generated seeds include ``presplit`` steps (#4967, #4970): some
@@ -796,29 +942,80 @@ class StubIndexer:
 
 
 class FakeExtractor:
-    """Extractor double (multimodal and text): returns the current step's
-    rows, or raises ``ExtractionIncompleteError`` when ``failing``, as a
-    strict extraction whose API calls all failed does (#4940, #4948)."""
+    """What the worker's LLM extractors return (multimodal and text): the
+    current step's rows, or ``ExtractionIncompleteError``, as a strict
+    extraction whose API calls all failed raises (#4940, #4948).
 
-    def __init__(self) -> None:
+    The worker builds its extractors itself (``LlmExtractor`` for real, see
+    :class:`_RoutedExtractor`); their calls come here.  ``broken`` names
+    the extractors (``framework`` / ``multimodal`` / ``county``) whose
+    build fails, as a missing secret or a client init error makes it
+    (#4953).
+    """
+
+    def __init__(self, events: Counter[str] | None = None) -> None:
         self.rulings: list[ExtractedRuling] = []
+        #: Every call fails (``fail_mode == "all"``).
         self.failing = False
-        #: The worker's extractor getters return None, as when the
-        #: extractor cannot be built (#4953).
-        self.unavailable = False
+        #: The step's :data:`FAIL_MODES` entry, or ``""``.
+        self.fail_mode = ""
+        self.broken: set[str] = set()
+        #: ``harness.call.<extractor>.<ok|fail>`` counts (#4968).
+        self.events: Counter[str] = events if events is not None else Counter()
 
-    def _result(self) -> list[ExtractedRuling]:
-        if self.failing:
+    def result(self, role: str) -> list[ExtractedRuling]:
+        fails = self.failing or self.fail_mode == "all"
+        if role == "multimodal" and self.fail_mode in FAIL_MODES:
+            fails = True
+        self.events[f"harness.call.{role}.{'fail' if fails else 'ok'}"] += 1
+        if fails:
             from framework.llm_extractor import ExtractionIncompleteError
 
-            raise ExtractionIncompleteError("harness: every API call failed")
+            raise ExtractionIncompleteError(f"harness: every {role} API call failed")
         return [r.model_copy() for r in self.rulings]
 
+
+class _RoutedExtractor:
+    """An extractor the worker built: its calls go to the harness's
+    :class:`FakeExtractor` under *role*."""
+
+    def __init__(self, fake: FakeExtractor, role: str) -> None:
+        self._fake = fake
+        self.role = role
+
     def extract_from_pdf(self, _pdf: bytes, **_kwargs: Any) -> list[ExtractedRuling]:
-        return self._result()
+        return self._fake.result("multimodal")
 
     def extract(self, _text: str, **_kwargs: Any) -> list[ExtractedRuling]:
-        return self._result()
+        return self._fake.result(self.role)
+
+
+#: The worker method building an extractor, and the extractor it builds.
+_BUILDERS = {
+    "_get_framework_extractor": "framework",
+    "_get_multimodal_extractor": "multimodal",
+    "_get_county_extractor": "county",
+}
+
+
+def _extractor_factory(fake: FakeExtractor) -> Callable[..., _RoutedExtractor]:
+    """Stands in for ``ingestion.worker.LlmExtractor``.
+
+    Builds the real ``LlmExtractor`` first, so a missing or blank key fails
+    exactly as in production (no LLM cache: ``JUDGEMIND_ARCHIVE_BUCKET`` is
+    blank), then fails the build of an extractor in ``fake.broken``.  The
+    worker method calling it says which extractor it is.
+    """
+    from framework.llm_extractor import LlmExtractor
+
+    def build(**kwargs: Any) -> _RoutedExtractor:
+        role = _BUILDERS.get(sys._getframe(1).f_code.co_name, "preflight")
+        LlmExtractor(**kwargs)
+        if role in fake.broken:
+            raise ValueError(f"harness: the {role} extractor cannot be built")
+        return _RoutedExtractor(fake, role)
+
+    return build
 
 
 @contextmanager
@@ -956,7 +1153,14 @@ class KeyHarness:
     """Runs steps for keys against *dsn* and checks the invariants."""
 
     def __init__(
-        self, dsn: str, run_token: str, seed: int, invariants: frozenset[str] | None = None
+        self,
+        dsn: str,
+        run_token: str,
+        seed: int,
+        invariants: frozenset[str] | None = None,
+        *,
+        profile: str = "default",
+        env: str = "google",
     ) -> None:
         self.dsn = dsn
         #: The invariants this run enforces (all by default); ``error`` is
@@ -967,7 +1171,10 @@ class KeyHarness:
         self.checker = psycopg.connect(dsn, autocommit=True)
         self.real = psycopg.connect(dsn, autocommit=False)
         self.indexer = StubIndexer()
-        self.extractor = FakeExtractor()
+        #: ``telemetry_event`` values the code under test logged (#4929),
+        #: and the harness's own ``harness.*`` counts (#4968).
+        self.events: Counter[str] = Counter()
+        self.extractor = FakeExtractor(self.events)
         self._key: Key | None = None
         self._step_label = ""
         self._snapshots: list[Counter[tuple[str, str]]] = []
@@ -984,8 +1191,6 @@ class KeyHarness:
         #: Fields merged into every step's event (a deterministic splitter's
         #: county, format and text).
         self.event_extra: dict[str, Any] = {}
-        #: ``telemetry_event`` values the code under test logged (#4929).
-        self.events: Counter[str] = Counter()
         self._log_handler = _TelemetryHandler(self.events)
         self._ingestion_logger = logging.getLogger("ingestion")
         self._saved_log_level = self._ingestion_logger.level
@@ -1007,27 +1212,95 @@ class KeyHarness:
         #: The archived raw object of each S3 key, which the worker's S3
         #: client returns (a pre-split child's page, #4976).
         self.raw_objects: dict[str, bytes] = {}
-        self.worker = self._make_worker()
+        #: The run's county extraction config and env shape (#4968).
+        self.profile = profile
+        self.env = env
+        #: Providers whose missing key :meth:`_check_refuses_start` checked.
+        self._refusal_checked: set[str] = set()
+        self._patches: list[Any] = []
+        try:
+            self._start_extraction_env()
+            self.worker = self._make_worker()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
+        for p in reversed(self._patches):
+            p.stop()
+        self._patches = []
         self._ingestion_logger.removeHandler(self._log_handler)
         self._ingestion_logger.setLevel(self._saved_log_level)
         self.real.close()
         self.checker.close()
 
+    # -- extraction env (#4968) -----------------------------------------
+
+    def _start_extraction_env(self) -> None:
+        """Set the run's env shape and county configs, and route the
+        worker's ``LlmExtractor`` to :class:`FakeExtractor`.  All undone by
+        :meth:`close`."""
+        from framework import extraction_config
+        from ingestion import worker as worker_mod
+
+        env = {
+            # The deployed configuration (#4953): the suite's conftest opts
+            # into ``optional`` mode, which only the extractor-less unit
+            # tests need.
+            "JUDGEMIND_EXTRACTION": "required",
+            # No S3 LLM cache: building an extractor stays offline.
+            "JUDGEMIND_ARCHIVE_BUCKET": "",
+            **_ENV_VARS[self.env],
+        }
+        env_patch = patch.dict(os.environ, env)
+        env_patch.start()
+        self._patches.append(env_patch)
+        if "ANTHROPIC_API_KEY" not in _ENV_VARS[self.env]:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        configs = patch.dict(extraction_config._COUNTY_CONFIGS)
+        configs.start()
+        self._patches.append(configs)
+        config = profile_config(self.profile)
+        if config is not None:
+            # Named at startup, as a deployed county config is: the worker
+            # builds an extractor for every provider the configs name.
+            extraction_config._COUNTY_CONFIGS[("CA", "HARNESS PROFILE")] = config
+        factory = patch.object(worker_mod, "LlmExtractor", _extractor_factory(self.extractor))
+        factory.start()
+        self._patches.append(factory)
+        # The scripts' preflight (``rebuild_db.py``), then the worker.
+        if worker_mod.check_extraction_ready() != worker_mod.EXTRACTION_REQUIRED:
+            raise InvariantError("error", "check_extraction_ready did not run in required mode")
+
+    def _configure_county(self, key: Key, profile: str) -> None:
+        """Give *key*'s county the extraction config of *profile*."""
+        from framework import extraction_config
+
+        config = profile_config(profile)
+        if config is not None:
+            extraction_config._COUNTY_CONFIGS[("CA", key.county.upper())] = config
+
     # -- worker ---------------------------------------------------------
 
-    def _make_worker(self) -> Any:
+    def _new_worker(self) -> Any:
+        """An ``IngestionWorker`` built by the production path: in
+        ``required`` mode its constructor builds the extractors
+        (``_require_extractors``) and raises when one cannot be built."""
         from ingestion import worker as worker_mod
 
         with patch.object(worker_mod, "create_llm_client", return_value=None):
-            worker = worker_mod.IngestionWorker(
+            return worker_mod.IngestionWorker(
                 redis_client=MagicMock(),
                 pg_dsn=self.dsn,
                 opensearch_client=MagicMock(),
                 s3_client=MagicMock(),
                 archive_bucket="harness-bucket",
             )
+
+    def _make_worker(self) -> Any:
+        worker = self._new_worker()
+        if not worker._extraction_required:
+            raise InvariantError("error", "the harness worker is not in required mode")
         worker._conn = self.real
         worker._get_connection = lambda: self.conn  # type: ignore[method-assign]
         worker._indexer = self.indexer
@@ -1037,18 +1310,6 @@ class KeyHarness:
             return {"Body": io.BytesIO(self.raw_objects[Key])}
 
         worker._s3_client.get_object.side_effect = get_object
-
-        def extractor(*_a: Any, **_k: Any) -> FakeExtractor | None:
-            return None if self.extractor.unavailable else self.extractor
-
-        worker._get_multimodal_extractor = extractor  # type: ignore[method-assign]
-        # The text fallback a failed multimodal extraction tries (#4948).
-        worker._get_framework_extractor = extractor  # type: ignore[method-assign]
-        worker._get_county_extractor = extractor  # type: ignore[method-assign]
-        # The deployed configuration (#4953): the suite's conftest opts
-        # into ``optional`` mode, which only the extractor-less unit tests
-        # need.
-        worker._extraction_required = True
         worker._validation_enabled = False
         worker._formatting_enabled = False
         worker._summarization_enabled = False
@@ -1134,21 +1395,31 @@ class KeyHarness:
         judges_before = self._judge_rows(key)
         spelling_before = dict(self._spelling)
         search_before = self._search_docs(key)
+        doc = self._step_doc(step)
+        outcome = self.expected_outcome(step, has_rows=bool(before_rows))
+        self.events[f"harness.outcome.{outcome}"] += 1
+        complete = outcome in ("ok", "skipped")
+        unavailable = outcome == "unavailable"
         for row in step.rows:
-            if row.kind == "ruling" and not step.whole and not step.fail:
+            if row.kind == "ruling" and not step.whole and complete:
                 spec = step.specs[row.spec]
                 self._spelling[spec.text] = spec.judge
         self._snapshots = []
         self._validation_seen = self._validation_ids(key)
         self._pending = None
+        self._configure_county(key, step.profile)
+        fail_mode = self._fail_mode(step)
+        if fail_mode:
+            self.events[f"harness.fail_mode.{fail_mode}.{outcome}"] += 1
+        if fail_mode in ("framework_missing", "county_missing"):
+            self._check_refuses_start(step, fail_mode)
         self.extractor.rulings = extracted_rulings(step)
-        unavailable = step.fail and self.fail_unavailable
-        self.extractor.failing = step.fail and not unavailable
-        self.extractor.unavailable = unavailable
-        # A failed extraction on a split-set replacement reports the key as
-        # failed (#4948); a live capture does not raise.  A missing
-        # extractor raises on every step kind (#4953).
-        expect_failed = step.fail and (step.kind != "live" or unavailable)
+        self.extractor.fail_mode = fail_mode
+        self._break_extractors(step, fail_mode)
+        # An incomplete extraction on a split-set replacement reports the
+        # key as failed (#4948, #4968); a live capture does not raise.  A
+        # missing extractor raises on every step kind (#4953).
+        expect_failed = unavailable or (outcome == "failed" and step.kind != "live")
         expected_error = (
             "ExtractorUnavailableError" if unavailable else "SplitExtractionFailedError"
         )
@@ -1166,12 +1437,13 @@ class KeyHarness:
         except InvariantError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
+            self.events[f"harness.raised.{type(exc).__name__}"] += 1
             if not (expect_failed and type(exc).__name__ == expected_error):
                 self._fail("error", f"step raised {type(exc).__name__}: {exc}")
             reported_failed = True
         finally:
-            self.extractor.failing = False
-            self.extractor.unavailable = False
+            self.extractor.fail_mode = ""
+            self.extractor.broken = set()
             try:
                 self.real.rollback()
             except Exception:  # noqa: BLE001
@@ -1184,10 +1456,13 @@ class KeyHarness:
         # its own when its extraction fails (``single_document_fallback``,
         # #4948): the one failed step that is not ``untouched``.  The
         # following steps must converge from it (#4970).
-        fallback = step.fail and step.kind == "live" and not unavailable and not before_rows
-        if fallback and self.events[_EXTRACTION_FAILED_EVENT] == logged_before:
+        fallback = outcome == "failed" and step.kind == "live" and not before_rows
+        not_logged = self.events[_EXTRACTION_FAILED_EVENT] == logged_before
+        if fallback and not_logged:
             self._fail("error", "a failed live capture of a new key did not take the fallback")
-        if step.fail and not fallback:
+        if expect_failed and not reported_failed:
+            self._guard("failed_manifest", self._check_reported, step, outcome)
+        if not complete and not fallback:
             self._guard(
                 "untouched",
                 self._check_untouched,
@@ -1195,8 +1470,7 @@ class KeyHarness:
                 before_rows,
                 after_rows,
                 search_before,
-                expect_failed and not reported_failed,
-                self.events[_EXTRACTION_FAILED_EVENT] == logged_before,
+                not_logged,
             )
         if step.kind == "presplit":
             # One event per ruling, each blind to its siblings (see the
@@ -1212,15 +1486,11 @@ class KeyHarness:
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
-        if step.kind != "db" and not step.whole and not step.fail:
+        if step.kind != "db" and not step.whole and complete:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
             self._guard("synthetic_title", self._check_rows, key, after_rows, step)
-        if step.kind in ("presplit", "db"):
-            doc = step.doc
-        else:
-            doc = self.event_extra.get("ruling_text", step.doc)
-        if not step.fail:
+        if complete:
             # A failed step writes nothing (``untouched``), so its document
             # text decides nothing.
             self._guard("evidence", self._check_evidence, key, step, doc, before_rows, after_rows)
@@ -1313,7 +1583,6 @@ class KeyHarness:
         before: list[DocRow],
         after: list[DocRow],
         search_before: dict[str, str | None],
-        not_reported: bool,
         not_logged: bool,
     ) -> None:
         def show(rows: list[DocRow]) -> list[tuple[str, str, str | None, str | None]]:
@@ -1341,13 +1610,118 @@ class KeyHarness:
                 f"the step did not take the failed-extraction branch (no "
                 f"{_EXTRACTION_FAILED_EVENT} event logged)",
             )
-        if not_reported:
+
+    def _check_reported(self, step: Step, outcome: str) -> None:
+        """Called when an incomplete extraction raised nothing."""
+        if outcome == "unavailable":
             self._fail(
-                "untouched",
-                "a failed extraction on a split-set replacement did not report the "
-                "key as failed (no SplitExtractionFailedError), so the reingest's "
-                "failed-keys manifest would not retry it",
+                "failed_manifest",
+                "a step whose extractor is unavailable raised no ExtractorUnavailableError, "
+                "so the key is not reported as failed (a live worker would acknowledge "
+                "the message instead of restarting)",
             )
+        self._fail(
+            "failed_manifest",
+            f"an incomplete extraction on a {step.kind} step did not report the key as "
+            "failed (no SplitExtractionFailedError), so the reingest's failed-keys "
+            "manifest would not retry it",
+        )
+
+    # -- extraction outcome (#4968) -------------------------------------
+
+    def _step_doc(self, step: Step) -> str:
+        """The document text the step's event carries."""
+        if step.kind in ("presplit", "db"):
+            return step.doc
+        return self.event_extra.get("ruling_text", step.doc)
+
+    def _fail_mode(self, step: Step) -> str:
+        if step.fail_mode:
+            return step.fail_mode
+        return "all" if step.fail and not self.fail_unavailable else ""
+
+    def expected_outcome(self, step: Step, *, has_rows: bool) -> str:
+        """What the step's extraction comes to, from the step alone.
+
+        ``ok``: a complete extraction (rows, a whole document, or a verdict
+        of no rulings).  ``failed``: no complete result (a call failed with
+        nothing to fall back on, or nothing could be read at all).
+        ``unavailable``: an extractor the step needs cannot be built.
+        ``skipped``: a DB-row reingest of a key with no rows selects nothing.
+        """
+        from framework.extraction_config import ExtractionMethod
+
+        if step.kind == "db" and not has_rows:
+            return "skipped"
+        if step.kind == "presplit":
+            return "ok"  # the scraper extracted the fields
+        config = profile_config(step.profile)
+        if config is not None and config.method == ExtractionMethod.NONE:
+            return "ok"  # the scraper's fields are the document's
+        mode = self._fail_mode(step)
+        all_missing = step.fail and self.fail_unavailable
+        if config is None or config.method == ExtractionMethod.MULTIMODAL:
+            # The worker reads the page images (the harness's PDF bytes).
+            if all_missing:
+                return "unavailable"
+            if mode not in FAIL_MODES:
+                return "ok"
+        if not self._step_doc(step):
+            return "failed"  # no text to fall back on, or to read at all
+        needed = "county" if config is not None and config.provider else "framework"
+        if all_missing or mode == f"{needed}_missing":
+            return "unavailable"
+        return "failed" if mode == "all" else "ok"
+
+    def _break_extractors(self, step: Step, mode: str) -> None:
+        """Make the extractors the step lacks unbuildable, and drop the
+        worker's cached ones, so the worker's getters build them again and
+        fail as an init error makes them."""
+        broken: set[str] = set()
+        if step.fail and self.fail_unavailable:
+            broken = {"framework", "multimodal", "county"}
+        elif mode in ("framework_missing", "county_missing"):
+            broken = {mode.removesuffix("_missing")}
+        self.extractor.broken = broken
+        if "framework" in broken:
+            self.worker._framework_extractor = None
+        if "multimodal" in broken:
+            self.worker._multimodal_extractor = None
+            self.worker._multimodal_extractors.clear()
+        if "county" in broken:
+            self.worker._county_extractors.clear()
+
+    def _check_refuses_start(self, step: Step, mode: str) -> None:
+        """A worker missing the secret of the extractor *mode* lacks
+        refuses to start, and the scripts' preflight refuses too (#4953,
+        #4957)."""
+        from ingestion import worker as worker_mod
+
+        config = profile_config(step.profile)
+        provider = worker_mod.framework_llm_provider()
+        if mode == "county_missing" and config is not None and config.provider:
+            provider = config.provider
+        if provider in self._refusal_checked:
+            return
+        self._refusal_checked.add(provider)
+        secret = "ANTHROPIC_API_KEY" if provider == "anthropic" else "GOOGLE_API_KEY"
+        with patch.dict(os.environ):
+            os.environ.pop(secret, None)
+            for what, start in (
+                ("check_extraction_ready", worker_mod.check_extraction_ready),
+                ("the worker", self._new_worker),
+            ):
+                try:
+                    start()
+                except worker_mod.ExtractorUnavailableError:
+                    self.events[f"harness.refused_start.{provider}"] += 1
+                    continue
+                self._guard(
+                    "refuse_start",
+                    self._fail,
+                    "refuse_start",
+                    f"{what} started without {secret} ({provider} extractors required)",
+                )
 
     def _check_date_source(self, key: Key, rows: list[DocRow]) -> None:
         for r in rows:
@@ -1893,14 +2267,15 @@ def run_seed(
     name: str = "seq",
     invariants: frozenset[str] | None = None,
     whole_documents: bool | None = None,
+    extraction_modes: bool | None = None,
 ) -> Counter[str]:
     """Run *seed*'s sequence and the convergence checks; raise
     :class:`InvariantError` on the first broken invariant.  Two runs of one
     seed in one session need distinct *name*s (their keys derive from it).
     *invariants* limits the check to those invariants (default: all);
-    *whole_documents* is :func:`generate`'s.  Returns the
-    ``telemetry_event`` counts the run logged."""
-    steps = generate(seed, whole_documents=whole_documents)
+    *whole_documents* and *extraction_modes* are :func:`generate`'s.
+    Returns the ``telemetry_event`` counts the run logged."""
+    steps = generate(seed, whole_documents=whole_documents, extraction_modes=extraction_modes)
     return run_steps(dsn, steps, run_token, seed=seed, name=name, invariants=invariants)
 
 
@@ -1918,7 +2293,9 @@ def run_steps(
     given, prepares the key's starting state; *invariants* limits the check
     to those invariants (default: all).  Returns the ``telemetry_event``
     counts the run logged."""
-    harness = KeyHarness(dsn, run_token, seed, invariants)
+    harness = KeyHarness(
+        dsn, run_token, seed, invariants, profile=steps[0].profile, env=steps[0].env
+    )
     try:
         key = make_key(f"{run_token}-{seed}-{name}-main")
         if setup is not None:
@@ -1926,17 +2303,25 @@ def run_steps(
         for n, step in enumerate(steps):
             harness.run_step(key, step, f"step {n + 1}/{len(steps)}")
 
-        final = steps[-1]
+        # The convergence checks extract the final bytes healthily: a failed
+        # extraction's result is no result (#4968).
+        last = steps[-1]
+        final = replace(last, fail_mode="", fail=False)
         no_rows = not read_key(harness.checker, key.s3_key)
-        if final.kind in ("live", "presplit") or (final.kind == "db" and no_rows):
+        if final.kind in ("live", "presplit") or (final.kind == "db" and no_rows) or final != last:
             # A live write keeps an established case link (preserve-first,
             # #2475), so its result may depend on history by design, and a
             # DB-row reingest only re-ingests keys that have rows.  A
             # split-set replacement must not depend on history: re-ingest
-            # the same bytes.
+            # the same bytes.  A failed step left the key as it was.
             settle = replace(final, kind="reingest", ops=("settle",))
             harness.run_step(key, settle, "settle")
         history = normalized(key, read_key(harness.checker, key.s3_key))
+        # Bytes nothing can be extracted from (no text in a text-first
+        # county) leave a key as its history left it, in the failed-keys
+        # manifest; only a fresh live capture and a fresh reingest of them
+        # must agree.
+        extractable = harness.expected_outcome(replace(final, kind="reingest"), has_rows=True)
 
         fresh = {}
         fresh_keys = {}
@@ -1965,7 +2350,9 @@ def run_steps(
         # fuzzy correction moves a number onto a near-miss case the court
         # already holds (#1576), which depends on the court's history.
         near_miss_ok = not doc_is_evidence(final.doc)
-        if not _converged(history, fresh["reingest"], near_miss_ok=near_miss_ok):
+        if extractable == "ok" and not _converged(
+            history, fresh["reingest"], near_miss_ok=near_miss_ok
+        ):
             raise InvariantError(
                 "converge",
                 f"seed={seed}: reingest after the history leaves {_fmt(history)}, "
@@ -2278,7 +2665,9 @@ def run_extraction_failure(
     holds rows; with *unavailable*, a live capture of a key with no rows
     too).
     """
-    steps = steps if steps is not None else generate(seed)
+    # The extraction modes have their own failed steps; this history is
+    # the one these tests were written against.
+    steps = steps if steps is not None else generate(seed, extraction_modes=False)
     rng = random.Random(f"{seed}:fail")
     harness = KeyHarness(dsn, run_token, seed)
     try:
@@ -2308,6 +2697,6 @@ def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fa
     replaces the parent row with the split's children.  Raises
     :class:`InvariantError` on a broken invariant.
     """
-    steps = generate(seed)
+    steps = generate(seed, extraction_modes=False)
     first = replace(steps[0], kind="live", fail=True, whole=False, ops=("fallback",))
     run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)

@@ -239,6 +239,13 @@ WHOLE_DOCUMENT_KEY = "_whole_document"
 SPLIT_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 
 
+#: The failure reason of a document no extractor could run on (#4968): no
+#: text to read and no page images.  In ``required`` mode that is a failed
+#: extraction, not "nothing to extract", so a reingest reports the key as
+#: failed (``--write-failed-manifest``) and leaves its rows as they are.
+NO_EXTRACTABLE_TEXT = "no extractable text: no text layer and no page images to extract from"
+
+
 class SplitExtractionFailedError(RuntimeError):
     """A split-set replacement event (``REPLACE_SPLIT_SET_KEY``: a prefix
     reingest or a rebuild) whose extraction failed (#4948).
@@ -483,7 +490,10 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
     Only for a whole document written on its own (a split child's text is
     not the whole document; ``write_split_rulings`` handles LLM split
     children and, since #4940, a whole document whose extraction found no
-    rulings, so this covers a document whose extraction failed), only on a
+    rulings).  A failed extraction writes nothing on a reingest (#4948), and
+    in ``required`` mode neither does a document no extractor could run on
+    (#4968), so this covers a document written on its own in ``optional``
+    mode (no extractor configured: regex-only extraction).  Only on a
     reingest / rebuild (``REPLACE_SPLIT_SET_KEY``), only when the document
     text can settle it, and only off a real case number the evidence
     refutes (``case_number_refuted``).  A number the document prints keeps
@@ -1672,10 +1682,11 @@ class _SplitBatch:
     ``ExtractionIncompleteError`` or any other error from the extractor):
     not a verdict, so the key's rows are left alone (#4948).  In
     ``required`` extraction mode a missing extractor sets it too, with
-    ``extractor_unavailable`` (#4953).  It stays unset when no extractor is
-    configured in ``optional`` mode (regex-only extraction, e.g. a local
-    run without LLM keys), where the single-document fallback is the
-    extraction.
+    ``extractor_unavailable`` (#4953), and so does a document no extractor
+    could run on, with ``NO_EXTRACTABLE_TEXT`` (#4968).  It stays unset
+    when no extractor is configured in ``optional`` mode (regex-only
+    extraction, e.g. a local run without LLM keys), where the
+    single-document fallback is the extraction.
     ``pre_split`` is set for a scraper's pre-split child (#4967), which
     arrives as its own event: the batch is that one child, its split set
     of one, written by the same ``_write_split_batch``.  Its siblings are
@@ -3349,9 +3360,10 @@ class IngestionWorker:
             if llm_split:
                 # Handled: the split was written, or the key was left alone.
                 return
-            # No extractor configured, nothing to extract, or a live
-            # capture of a new key whose extraction failed — continue with
-            # single-document processing and per-field extraction below.
+            # No extractor configured or nothing to extract (``optional``
+            # mode), or a live capture of a new key whose extraction failed
+            # — continue with single-document processing and per-field
+            # extraction below.
 
         # Parse timestamps
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
@@ -5163,10 +5175,13 @@ class IngestionWorker:
         In ``required`` extraction mode (the default, #4953) a missing
         extractor is not "no extractor configured": the split raises
         ``ExtractorUnavailableError`` and writes nothing, on every event.
+        Nor is a document no extractor could run on (no text and no page
+        images) "nothing to extract": it is a failed extraction (#4968).
 
         Returns False only when the caller must write the document itself:
-        no extractor is configured (``optional`` mode), there is nothing to
-        extract, or a live capture of a new key failed extraction.
+        no extractor is configured or there is nothing to extract
+        (``optional`` mode), or a live capture of a new key failed
+        extraction.
         """
         batch = _SplitBatch(parent_document_id=document_id)
         outer = self._split_batch
@@ -5349,6 +5364,19 @@ class IngestionWorker:
             continue with single-document processing.
         """
         if not ruling_text and not raw_pdf_bytes:
+            # Nothing any extractor could read: no text, and no page images
+            # (a text-first county's PDF with no text layer, or a multimodal
+            # county whose raw PDF could not be fetched).
+            from framework.extraction_config import decide_extraction_strategy
+
+            strategy = decide_extraction_strategy(
+                state, county, scraper_id=event_data.get("scraper_id", "")
+            )
+            if strategy.skip_llm:
+                # The scraper's fields are the document's, as below.
+                batch.whole_document = True
+            elif self._extraction_required:
+                batch.extraction_failed = NO_EXTRACTABLE_TEXT
             return False
 
         # ------------------------------------------------------------------
@@ -5763,6 +5791,7 @@ class IngestionWorker:
                 logger.info(
                     "llm_split.zero_rulings_no_text_skipped",
                     extra={
+                        "telemetry_event": "llm_split.zero_rulings_no_text_skipped",
                         "document_id": document_id,
                         "s3_key": event_data.get("s3_key"),
                         "county": county,
@@ -5778,13 +5807,18 @@ class IngestionWorker:
             # found no rulings is a verdict: the document is one ruling, the
             # key's only split child (#4940).  A failed one (``None``, or
             # text with nothing to read after a failed multimodal call) is
-            # not: the key's rows are left alone (#4948).
+            # not: the key's rows are left alone (#4948).  Neither is one no
+            # extractor ran on (a text-first county's PDF with no text
+            # layer, #4968): in ``required`` mode it is a failed extraction,
+            # so a reingest reports the key as failed.
             if extracted_rulings is not None and (
                 extraction_method == "multimodal" or (ruling_text or "").strip()
             ):
                 batch.whole_document = True
-            else:
+            elif multimodal_error is not None or not self._extraction_required:
                 batch.extraction_failed = multimodal_error
+            else:
+                batch.extraction_failed = NO_EXTRACTABLE_TEXT
             return False
 
         logger.info(
