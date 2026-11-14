@@ -156,11 +156,13 @@ while true; do
         exit 124
     fi
 
-    # Never sleep past the deadline, so the call ends on time.
+    # Never sleep past the deadline, so the call ends on time. Sliced and
+    # wall-clock checked, so a laptop sleep cannot hold it past the budget
+    # (#4975).
     _sleep_for=$POLL_INTERVAL
     _remaining=$(( TIMEOUT_SECS - ELAPSED ))
     if [[ $_remaining -lt $_sleep_for ]]; then
         _sleep_for=$_remaining
     fi
-    sleep "$_sleep_for"
+    wait_budget_sleep "$_sleep_for"
 done

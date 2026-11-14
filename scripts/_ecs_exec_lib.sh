@@ -37,13 +37,22 @@ if [[ -z "${ECS_EXEC_SLEEP_BIN:-}" ]]; then
     fi
 fi
 
-# ecs_exec_run_with_timeout <secs> <cmd> [args...]
+# ecs_exec_run_with_timeout [--wall-stop <SECONDS-value>] <secs> <cmd> [args...]
 #
-# Runs <cmd> with a hard wall-clock deadline of <secs> seconds (#4665). If the
+# Runs <cmd> with a hard deadline of <secs> seconds (#4665). If the
 # command has not exited by then, it and its direct children (e.g. the
 # session-manager-plugin process that `aws ecs execute-command` spawns) are
 # sent SIGTERM, then SIGKILL two seconds later, and the function returns 124.
 # Otherwise it returns the command's own exit status.
+#
+# <secs> is counted in watchdog ticks, i.e. seconds the host was awake. The
+# optional --wall-stop is a $SECONDS value (wall clock, so it includes time
+# the host spent asleep): once $SECONDS reaches it, the command is killed
+# the same way even if fewer than <secs> ticks have run. The long-wait
+# helpers pass their budget deadline here so a call in flight when a laptop
+# sleeps is killed right after wake, not up to <secs> awake seconds later
+# (#4975). If the watchdog kills the command, the marker file records why
+# ("ticks" or "wall"); ECS_EXEC_LAST_KILL holds that reason after a 124.
 #
 # Why not timeout(1)/gtimeout(1): macOS has no GNU timeout by default, and
 # GNU timeout moves the child into a background process group, which makes an
@@ -53,9 +62,18 @@ fi
 # The command's stdin/stdout/stderr are the caller's. The watchdog's own fds
 # go to /dev/null, so a caller that captures stdout with $(...) doesn't
 # block on the watchdog's leftover `sleep` holding the pipe open.
+# shellcheck disable=SC2034  # read by callers (wait_budget_call)
+ECS_EXEC_LAST_KILL=""
+
 ecs_exec_run_with_timeout() {
+    local wall_stop=""
+    if [ "${1:-}" = "--wall-stop" ]; then
+        wall_stop="$2"
+        shift 2
+    fi
     local secs="$1"
     shift
+    ECS_EXEC_LAST_KILL=""
 
     local marker_dir
     marker_dir=$(mktemp -d)
@@ -70,8 +88,17 @@ ecs_exec_run_with_timeout() {
     (
         waited=0
         while kill -0 "$cmd_pid" 2>/dev/null; do
+            why=""
             if [ "$waited" -ge "$secs" ]; then
-                : > "$marker"
+                why=ticks
+            elif [ -n "$wall_stop" ] && [ "$SECONDS" -ge "$wall_stop" ]; then
+                # $SECONDS follows the wall clock (a subshell keeps the
+                # parent's start time), so this fires right after a laptop
+                # wakes past the caller's deadline (#4975).
+                why=wall
+            fi
+            if [ -n "$why" ]; then
+                printf '%s\n' "$why" > "$marker"
                 pkill -TERM -P "$cmd_pid" 2>/dev/null
                 kill -TERM "$cmd_pid" 2>/dev/null
                 "$ECS_EXEC_SLEEP_BIN" 2
@@ -103,6 +130,8 @@ ecs_exec_run_with_timeout() {
     wait "$watchdog_pid" 2>/dev/null || true
 
     if [[ -e "$marker" ]]; then
+        # shellcheck disable=SC2034  # read by callers (wait_budget_call)
+        ECS_EXEC_LAST_KILL=$(cat "$marker" 2>/dev/null || true)
         rm -rf "$marker_dir"
         return "$ECS_EXEC_TIMEOUT_RC"
     fi

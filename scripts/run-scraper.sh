@@ -114,6 +114,13 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Every aws call below, launch included, runs under a per-call timeout sized
+# to what is left of TIMEOUT (counted from script start), and calls slower
+# than 30s are logged as "slow call: ..." (#4850, #4975).
+# shellcheck source=scripts/_wait_budget_lib.sh
+source "${SCRIPT_DIR}/_wait_budget_lib.sh"
+wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
+
 # ─── Validate arguments ─────────────────────────────────────────────────────
 
 if [[ ${#SCRAPER_IDS[@]} -eq 0 ]]; then
@@ -135,7 +142,7 @@ SCHEDULER_NAME="judgemind-scraper-${ENVIRONMENT}"
 
 echo "Reading latest task definition for ${TASK_FAMILY}..." >&2
 
-TASK_DEF_JSON=$(aws ecs describe-task-definition \
+TASK_DEF_JSON=$(wait_budget_call "aws ecs describe-task-definition" aws ecs describe-task-definition \
     --task-definition "$TASK_FAMILY" \
     --region "$REGION" \
     --output json 2>/dev/null) || {
@@ -152,7 +159,7 @@ echo "Task definition: ${TASK_DEF_ARN}" >&2
 
 echo "Reading network config from scheduler '${SCHEDULER_NAME}'..." >&2
 
-SCHEDULER_JSON=$(aws scheduler get-schedule \
+SCHEDULER_JSON=$(wait_budget_call "aws scheduler get-schedule" aws scheduler get-schedule \
     --name "$SCHEDULER_NAME" \
     --region "$REGION" \
     --output json 2>/dev/null) || {
@@ -219,14 +226,28 @@ fi
 
 echo "Launching scraper task..." >&2
 
-RUN_OUTPUT=$(aws ecs run-task \
+RUN_TASK_RC=0
+RUN_OUTPUT=$(wait_budget_call "aws ecs run-task" aws ecs run-task \
     --cluster "$CLUSTER" \
     --task-definition "$TASK_DEF_ARN" \
     --launch-type FARGATE \
     --region "$REGION" \
     --output json \
     --overrides "$OVERRIDE_JSON" \
-    --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}")
+    --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}") \
+    || RUN_TASK_RC=$?
+if [[ "$RUN_TASK_RC" -eq "$WAIT_CALL_TIMEOUT_RC" ]]; then
+    # Killed before it answered (#4975): ECS may or may not have started
+    # the scraper, and we never saw its ARN.
+    echo "Error: task status unknown: aws ecs run-task did not answer before its per-call limit." >&2
+    echo "A scraper task MAY have started. Do not blindly re-run this command (that could launch a second one)." >&2
+    echo "Fix: look for it first:" >&2
+    echo "  aws ecs list-tasks --cluster ${CLUSTER} --family ${TASK_FAMILY} --region ${REGION}" >&2
+    exit 125
+elif [[ "$RUN_TASK_RC" -ne 0 ]]; then
+    echo "Error: aws ecs run-task failed (exit ${RUN_TASK_RC})." >&2
+    exit 1
+fi
 
 TASK_ARN=$(echo "$RUN_OUTPUT" | python3 -c "import sys,json; tasks=json.load(sys.stdin)['tasks']; print(tasks[0]['taskArn'] if tasks else '')")
 
@@ -275,12 +296,10 @@ fi
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
 # Every aws call in the wait below runs under a per-call timeout sized to
-# what is left of TIMEOUT (counted from script start), and calls slower than
-# 30s are logged as "slow call: ..." (#4850).  A hung call is killed and
-# counted as a failed poll, so the attached wait still ends on time.
-# shellcheck source=scripts/_wait_budget_lib.sh
-source "${SCRIPT_DIR}/_wait_budget_lib.sh"
-wait_budget_init "$TIMEOUT" "$SCRIPT_START_SECS"
+# what is left of TIMEOUT (budget started at script start, above), and calls
+# slower than 30s are logged as "slow call: ..." (#4850).  A hung call is
+# killed and counted as a failed poll, so the attached wait still ends on
+# time.
 
 ELAPSED=0
 LAST_STATUS=""
@@ -294,6 +313,9 @@ LOG_NEXT_TOKEN=""
 LOG_STREAMING=false
 
 find_log_stream() {
+    if wait_budget_exhausted; then
+        return 0
+    fi
     wait_budget_call "aws logs describe-log-streams" \
         aws logs describe-log-streams \
         --log-group-name "$LOG_GROUP" \
@@ -391,7 +413,7 @@ while wait_budget_left; do
             exit 125
         fi
         echo "WARNING: could not describe task (${DESCRIBE_CONSECUTIVE_ERRORS}/${DESCRIBE_MAX_CONSECUTIVE_ERRORS}); retrying in ${POLL_INTERVAL}s..." >&2
-        sleep "$POLL_INTERVAL"
+        wait_budget_sleep "$POLL_INTERVAL"
         ELAPSED=$((ELAPSED + POLL_INTERVAL))
         continue
     fi
@@ -423,16 +445,25 @@ while wait_budget_left; do
         break
     fi
 
-    sleep "$POLL_INTERVAL"
+    # Sliced + wall-clock checked: a laptop sleep cannot hold it past the
+    # budget (#4975).
+    wait_budget_sleep "$POLL_INTERVAL"
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 
 # Final log flush.  The stream-discovery retries only run for a STOPPED
 # task: after the wait ran out they would push the call past its budget
-# (#4850), and the re-attach path picks the logs up later.
+# (#4850), and the re-attach path picks the logs up later.  Every step
+# after STOPPED is budget-bounded too (#4975): once the budget is spent the
+# log dump is cut short (LOG_BUDGET_SPENT) and the exit code is reported.
+LOG_BUDGET_SPENT=false
 if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
     for _retry in 1 2 3; do
-        sleep 3
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
+        wait_budget_sleep 3
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
             echo "Log stream: ${LOG_STREAM_NAME}" >&2
@@ -444,8 +475,12 @@ if [[ "$LOG_STREAMING" == "false" && "$CURRENT_STATUS" == "STOPPED" ]]; then
 fi
 
 if [[ "$LOG_STREAMING" == "true" ]]; then
-    sleep 2
-    stream_new_logs
+    wait_budget_sleep 2
+    if wait_budget_exhausted; then
+        LOG_BUDGET_SPENT=true
+    else
+        stream_new_logs
+    fi
     echo "─── End of Live Logs ────────────────────────────────────────────" >&2
 fi
 
@@ -500,20 +535,38 @@ if [[ "$LOG_STREAMING" == "false" ]]; then
     echo "" >&2
     echo "─── Task Logs ───────────────────────────────────────────────────" >&2
 
+    # The retries, and ecs-logs.sh itself (one external command), run under
+    # what is left of the budget (#4975).
     LOGS_RETRIEVED=false
     for _log_wait in 5 10 15; do
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
         echo "Waiting ${_log_wait}s for CloudWatch log stream..." >&2
-        sleep "$_log_wait"
-        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
+        wait_budget_sleep "$_log_wait"
+        if wait_budget_exhausted; then
+            LOG_BUDGET_SPENT=true
+            break
+        fi
+        if wait_budget_call --max 999999 "scripts/ecs-logs.sh" \
+            "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
             LOGS_RETRIEVED=true
             break
         fi
     done
 
-    if [[ "$LOGS_RETRIEVED" == "false" ]]; then
+    if [[ "$LOGS_RETRIEVED" == "false" && "$LOG_BUDGET_SPENT" == "false" ]]; then
         echo "(Could not retrieve logs after retries. Check manually with:)" >&2
         echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
     fi
+fi
+
+if [[ "$LOG_BUDGET_SPENT" == "true" ]]; then
+    echo "" >&2
+    echo "Log output cut short: this call's ${TIMEOUT}s budget ran out after the task stopped (#4975)." >&2
+    echo "The scraper is finished; its exit code is below. Fetch the full logs with:" >&2
+    echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
 fi
 
 echo "" >&2

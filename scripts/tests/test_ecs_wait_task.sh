@@ -20,6 +20,8 @@
 #   - describe-tasks failing exits 125 (status unknown)
 #   - --quiet suppresses the per-poll status lines but keeps the final
 #     summary line on stdout
+#   - No aws call after STOPPED can hold the helper (#4975); host-sleep
+#     behaviour is covered by test_wait_budget_host_sleep.sh
 #
 # Usage:
 #   scripts/tests/test_ecs_wait_task.sh
@@ -537,6 +539,44 @@ test_quiet_suppresses_progress() {
     fi
 }
 
+# Test 12 (#4975): nothing after STOPPED can hold the helper. The issue
+# suspected a post-STOPPED log fetch; the helper makes no such call, and
+# this pins that down: every aws call other than describe-tasks (logs
+# included) sleeps 900s, and the helper must still return the exit code at
+# once, well inside 500s.
+test_no_unbounded_call_after_stopped() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    cat > "$tmpdir/aws" << MOCK_AWS
+#!/usr/bin/env bash
+echo "\$*" >> "$tmpdir/calls.log"
+case "\$*" in
+    *"ecs describe-tasks"*)
+        cat "$tmpdir/responses/01.json"
+        exit 0
+        ;;
+esac
+exec /bin/sleep 900
+MOCK_AWS
+    chmod +x "$tmpdir/aws"
+    write_stopped_response_with_exit_code "$tmpdir/responses/01.json" 0
+
+    local output exit_code=0 start=$SECONDS took
+    output=$(PATH="$tmpdir:$PATH" "$SCRIPT_UNDER_TEST" --poll-interval 1 "$ARN" 2>&1) || exit_code=$?
+    took=$((SECONDS - start))
+    if [ "$exit_code" -eq 0 ] && [ "$took" -lt 500 ] && [ "$took" -le 20 ]; then
+        pass "post-STOPPED: exits 0 in ${took}s even with aws logs sleeping 900s"
+    else
+        fail "post-STOPPED: exits 0 in well under 500s with aws logs sleeping 900s" \
+            "exit=$exit_code took=${took}s output=$output"
+    fi
+    if ! grep -qv "ecs describe-tasks" "$tmpdir/calls.log"; then
+        pass "post-STOPPED: the only aws call is describe-tasks"
+    else
+        fail "post-STOPPED: the only aws call is describe-tasks" "calls=$(cat "$tmpdir/calls.log")"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_help_documents_usage
@@ -553,6 +593,7 @@ test_default_timeout_under_tool_cap
 test_reinvoke_after_still_waiting_resumes
 test_describe_failure_exits_125
 test_quiet_suppresses_progress
+test_no_unbounded_call_after_stopped
 
 echo ""
 echo "────────────────────────────────────────────"

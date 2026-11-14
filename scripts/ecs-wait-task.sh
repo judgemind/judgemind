@@ -416,8 +416,16 @@ while true; do
             _sleep_for="$_remaining"
         fi
     fi
-    sleep "$_sleep_for"
+    # wait_budget_sleep, not a raw `sleep`: it re-reads the wall clock every
+    # couple of seconds, so after a laptop sleep past the deadline the loop
+    # exits 124 at once instead of finishing a `sleep 60` that counts only
+    # awake time (#4975).
+    wait_budget_sleep "$_sleep_for"
     ELAPSED_SECS=$(( ELAPSED_SECS + _sleep_for ))
+    _wall_elapsed=$(( SECONDS - WAIT_START_SECS ))
+    if [[ "$_wall_elapsed" -gt "$ELAPSED_SECS" ]]; then
+        ELAPSED_SECS="$_wall_elapsed"
+    fi
 done
 
 # ─── Extract exit code + stop reason ───────────────────────────────────────

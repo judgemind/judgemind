@@ -40,6 +40,33 @@
 # took longer on the wall clock than its per-call cap but the watchdog never
 # fired, the host was asleep during the call, and the slow-call log says so.
 #
+# ── The Bash tool's 600s cap is wall-clock time (#4975) ──────────────────────
+#
+# The harness counts time the laptop spends asleep against its 600s cap. A
+# process does not run while the host sleeps, and `sleep N` on macOS counts
+# only awake time, so a helper parked in `sleep 60` when the lid closed
+# stayed parked for up to 60 more seconds after wake. On 2026-11-14
+# ecs-wait-task.sh was moved to the background twice this way (pmset showed
+# host sleeps of 932s and 558s inside the calls). So after a wake the helper
+# must notice at once that its wall-clock budget is gone:
+#   - wait_budget_sleep sleeps in slices of WAIT_SLEEP_SLICE_SECS and
+#     re-reads $SECONDS (wall clock) between slices;
+#   - wait_budget_call also passes the budget deadline to the watchdog as a
+#     wall-clock stop, so a call in flight across the sleep is killed right
+#     after wake once the deadline has passed. A sleep with budget left
+#     still does not count as a hung call.
+# Raw `sleep` in a helper's wait path is a bug; scripts/tests/
+# test_wait_budget_host_sleep.sh fails on it.
+#
+# That only shortens the overrun. When the host wakes after the tool's 600s
+# mark has already passed, the tool backgrounds the call the moment it wakes
+# and no helper can beat it. So on macOS, wait_budget_init also holds a
+# "prevent system sleep" assertion for the life of the helper:
+# `caffeinate -s -w <helper pid> -t <budget + 60>`. -s only applies on AC
+# power (both incidents were idle "Maintenance Sleep" on AC), so battery
+# behaviour and lid-close sleep are unchanged, and the assertion ends when
+# the helper exits. Set WAIT_BUDGET_NO_CAFFEINATE=1 to turn it off.
+#
 # ── Usage ────────────────────────────────────────────────────────────────────
 #
 #   source "$(dirname "${BASH_SOURCE[0]}")/_wait_budget_lib.sh"
@@ -55,6 +82,8 @@
 #                         below which wait_budget_exhausted is true (default
 #                         5; capped at a quarter of the budget)
 #   WAIT_SLOW_CALL_SECS   log calls at least this slow (default 30)
+#   WAIT_SLEEP_SLICE_SECS longest single sleep inside wait_budget_sleep
+#                         (default 2)
 
 _WAIT_BUDGET_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_ecs_exec_lib.sh
@@ -63,6 +92,7 @@ source "${_WAIT_BUDGET_LIB_DIR}/_ecs_exec_lib.sh"
 WAIT_CALL_MAX_SECS="${WAIT_CALL_MAX_SECS:-60}"
 WAIT_CALL_MIN_SECS="${WAIT_CALL_MIN_SECS:-5}"
 WAIT_SLOW_CALL_SECS="${WAIT_SLOW_CALL_SECS:-30}"
+WAIT_SLEEP_SLICE_SECS="${WAIT_SLEEP_SLICE_SECS:-2}"
 # Exit code a wait_budget_call returns when its call was killed.
 WAIT_CALL_TIMEOUT_RC="$ECS_EXEC_TIMEOUT_RC"
 
@@ -92,6 +122,30 @@ wait_budget_init() {
         exec 9>&2
         _WAIT_BUDGET_LOG_FD_OPEN=true
     fi
+    if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
+        _wait_budget_hold_awake $((WAIT_BUDGET_DEADLINE - WAIT_BUDGET_START + 60))
+    fi
+}
+
+# _wait_budget_hold_awake <secs> — macOS only: keep the host from idle
+# sleeping (on AC power) while this helper runs, for at most <secs>. See
+# "The Bash tool's 600s cap is wall-clock time" above (#4975). No-op where
+# caffeinate is missing (Linux CI, Fargate) or WAIT_BUDGET_NO_CAFFEINATE=1.
+_WAIT_BUDGET_CAFFEINATED=false
+_wait_budget_hold_awake() {
+    local secs="$1"
+    if [ "$_WAIT_BUDGET_CAFFEINATED" = "true" ] \
+        || [ "${WAIT_BUDGET_NO_CAFFEINATE:-0}" = "1" ] \
+        || [ "$secs" -le 0 ] \
+        || ! command -v caffeinate >/dev/null 2>&1; then
+        return 0
+    fi
+    # All fds pointed away from the caller's pipes (fd 9 is a copy of
+    # stderr), so the assertion process can never hold a capture open.
+    # -w ends it as soon as the helper exits; -t caps it regardless.
+    caffeinate -s -w "$$" -t "$secs" </dev/null >/dev/null 2>&1 9>&- &
+    _WAIT_BUDGET_CAFFEINATED=true
+    return 0
 }
 
 # wait_budget_remaining — prints the seconds left in the budget (may be
@@ -120,17 +174,38 @@ wait_budget_exhausted() {
 }
 
 # wait_budget_sleep <secs> — sleep <secs>, but never past the budget.
+#
+# Sleeps in slices of at most WAIT_SLEEP_SLICE_SECS and re-reads the wall
+# clock between slices, so it returns within one slice of a laptop waking
+# up past the deadline (#4975). A single `sleep 60` counts only awake time
+# on macOS and would hold the helper for up to a minute after wake, while
+# the Bash tool's wall-clock cap has already run out. Always returns 0.
 wait_budget_sleep() {
     local secs="$1"
-    if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
-        local left=$((WAIT_BUDGET_DEADLINE - SECONDS))
-        if [ "$left" -lt "$secs" ]; then
-            secs="$left"
+    local slice left t0 took
+    while [ "$secs" -gt 0 ]; do
+        if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
+            left=$((WAIT_BUDGET_DEADLINE - SECONDS))
+            if [ "$left" -le 0 ]; then
+                return 0
+            fi
+            if [ "$left" -lt "$secs" ]; then
+                secs="$left"
+            fi
         fi
-    fi
-    if [ "$secs" -gt 0 ]; then
-        sleep "$secs"
-    fi
+        slice="$WAIT_SLEEP_SLICE_SECS"
+        if [ "$secs" -lt "$slice" ]; then
+            slice="$secs"
+        fi
+        t0=$SECONDS
+        sleep "$slice"
+        took=$((SECONDS - t0))
+        if [ "$took" -gt $((slice + 10)) ]; then
+            _wait_budget_note "host asleep: a ${slice}s sleep took ${took}s on the wall clock; that time counts against this call's budget (#4975)."
+        fi
+        secs=$((secs - slice))
+    done
+    return 0
 }
 
 _wait_budget_note() {
@@ -177,7 +252,18 @@ wait_budget_call() {
     err_file=$(mktemp)
     local rc=0
     local t0=$SECONDS
-    ecs_exec_run_with_timeout "$cap" "$@" \
+    # Wall-clock stop (#4975): the budget deadline, or t0 + cap when the call
+    # got the WAIT_CALL_MIN_SECS floor past the deadline. Awake, the tick cap
+    # always fires first; it only matters after the host slept mid-call.
+    local wall_args=()
+    if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
+        local wall_stop="$WAIT_BUDGET_DEADLINE"
+        if [ $((t0 + cap)) -gt "$wall_stop" ]; then
+            wall_stop=$((t0 + cap))
+        fi
+        wall_args=(--wall-stop "$wall_stop")
+    fi
+    ecs_exec_run_with_timeout ${wall_args[@]+"${wall_args[@]}"} "$cap" "$@" \
         </dev/null >"$out_file" 2>"$err_file" 9>&- || rc=$?
     local took=$((SECONDS - t0))
 
@@ -185,7 +271,9 @@ wait_budget_call() {
     cat "$err_file" >&2
     rm -f "$out_file" "$err_file"
 
-    if [ "$rc" -eq "$WAIT_CALL_TIMEOUT_RC" ]; then
+    if [ "$rc" -eq "$WAIT_CALL_TIMEOUT_RC" ] && [ "$ECS_EXEC_LAST_KILL" = "wall" ]; then
+        _wait_budget_note "timed out: ${label} was killed at the budget deadline after ${took}s wall, before its ${cap}s per-call limit ran out on the awake clock, so the host was probably asleep; treating it as a failed poll (#4975)."
+    elif [ "$rc" -eq "$WAIT_CALL_TIMEOUT_RC" ]; then
         _wait_budget_note "timed out: ${label} was killed after its ${cap}s per-call limit (${took}s wall); treating it as a failed poll (#4850)."
     elif [ "$took" -ge "$WAIT_SLOW_CALL_SECS" ]; then
         if [ "$took" -gt $((cap + 5)) ]; then
