@@ -372,8 +372,11 @@ class TestLlmExtractionPath:
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
     ) -> None:
-        """When LLM extraction fails, single-document processing continues."""
+        """When LLM extraction fails on a live capture of a new key,
+        single-document processing continues (#4948: a key that already
+        holds rows, or a reingest, writes nothing)."""
         worker, _ = _make_worker()
+        worker._key_has_rows = lambda _s3_key: False  # type: ignore[method-assign]
 
         mock_conn, mock_cur = _make_mock_conn()
         mock_psycopg.connect.return_value = mock_conn

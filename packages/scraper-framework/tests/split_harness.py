@@ -47,6 +47,13 @@ properties that must hold for any sequence of re-splits:
   name (``_choose_canonical_spelling`` returns it whatever the current
   name), ingesting the same document in the opposite row order ends on
   the same name (#4922).
+- ``untouched``: a step whose extraction fails (every page's and chunk's
+  API call failed, ``ExtractionIncompleteError``) leaves the key's rows and
+  search docs exactly as they were: no whole-document ruling next to the
+  key's split children, no deletions (#4948).  A split-set replacement
+  (``reingest`` / ``db``) reports the key as failed
+  (``SplitExtractionFailedError``), so the reingest's failed-keys manifest
+  retries it.  Checked by :func:`run_extraction_failure`.
 
 A *ruling* is identified by its text and case number (a synthetic
 ``UNKNOWN-*`` case counts as one case number, ``UNKNOWN``), so a ruling that
@@ -138,8 +145,13 @@ INVARIANTS = (
     "telemetry",
     "evidence",
     "judge_converge",
+    "untouched",
     "error",
 )
+
+
+#: ``ingestion.worker.SPLIT_EXTRACTION_FAILED_EVENT`` (#4948).
+_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 
 
 class InvariantError(AssertionError):
@@ -207,6 +219,8 @@ class Step:
     #: Tag on the extracted parties' names (none when empty), unique per
     #: seed: see :func:`_parties`.
     party_tag: str = ""
+    #: Every extraction call fails (``ExtractionIncompleteError``, #4948).
+    fail: bool = False
 
     def describe(self) -> str:
         parts = []
@@ -227,7 +241,8 @@ class Step:
                 parts.append(tag)
         doc = "none" if not self.doc else "scan" if not doc_is_evidence(self.doc) else "text"
         whole = " whole" if self.whole else ""
-        return f"{self.kind}[{' '.join(parts)}] doc={doc}{whole} ops={list(self.ops)}"
+        fail = " FAIL" if self.fail else ""
+        return f"{self.kind}[{' '.join(parts)}] doc={doc}{whole}{fail} ops={list(self.ops)}"
 
 
 def doc_is_evidence(doc: str | None) -> bool:
@@ -690,13 +705,26 @@ class StubIndexer:
 
 
 class FakeExtractor:
-    """Multimodal extractor double: returns the current step's rows."""
+    """Extractor double (multimodal and text): returns the current step's
+    rows, or raises ``ExtractionIncompleteError`` when ``failing``, as a
+    strict extraction whose API calls all failed does (#4940, #4948)."""
 
     def __init__(self) -> None:
         self.rulings: list[ExtractedRuling] = []
+        self.failing = False
+
+    def _result(self) -> list[ExtractedRuling]:
+        if self.failing:
+            from framework.llm_extractor import ExtractionIncompleteError
+
+            raise ExtractionIncompleteError("harness: every API call failed")
+        return [r.model_copy() for r in self.rulings]
 
     def extract_from_pdf(self, _pdf: bytes, **_kwargs: Any) -> list[ExtractedRuling]:
-        return [r.model_copy() for r in self.rulings]
+        return self._result()
+
+    def extract(self, _text: str, **_kwargs: Any) -> list[ExtractedRuling]:
+        return self._result()
 
 
 @contextmanager
@@ -898,6 +926,9 @@ class KeyHarness:
         worker._indexer = self.indexer
         worker._fetch_raw_pdf_from_s3 = lambda *_a, **_k: b"%PDF-1.4 harness"  # type: ignore[method-assign]
         worker._get_multimodal_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
+        # The text fallback a failed multimodal extraction tries (#4948).
+        worker._get_framework_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
+        worker._get_county_extractor = lambda *_a, **_k: self.extractor  # type: ignore[method-assign]
         worker._validation_enabled = False
         worker._formatting_enabled = False
         worker._summarization_enabled = False
@@ -939,14 +970,21 @@ class KeyHarness:
         before = ruling_identities(before_rows)
         judges_before = self._judge_rows(key)
         spelling_before = dict(self._spelling)
+        search_before = self._search_docs(key)
         for row in step.rows:
-            if row.kind == "ruling" and not step.whole:
+            if row.kind == "ruling" and not step.whole and not step.fail:
                 spec = step.specs[row.spec]
                 self._spelling[spec.text] = spec.judge
         self._snapshots = []
         self._validation_seen = self._validation_ids(key)
         self._pending = None
         self.extractor.rulings = extracted_rulings(step)
+        self.extractor.failing = step.fail
+        # A failed extraction on a split-set replacement reports the key as
+        # failed (#4948); a live capture does not raise.
+        expect_failed = step.fail and step.kind != "live"
+        reported_failed = False
+        logged_before = self.events[_EXTRACTION_FAILED_EVENT]
         try:
             with _real_enrichment():
                 if step.kind == "db":
@@ -956,8 +994,11 @@ class KeyHarness:
         except InvariantError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
-            self._fail("error", f"step raised {type(exc).__name__}: {exc}")
+            if not (expect_failed and type(exc).__name__ == "SplitExtractionFailedError"):
+                self._fail("error", f"step raised {type(exc).__name__}: {exc}")
+            reported_failed = True
         finally:
+            self.extractor.failing = False
             try:
                 self.real.rollback()
             except Exception:  # noqa: BLE001
@@ -966,17 +1007,31 @@ class KeyHarness:
             raise self._pending
         after_rows = read_key(self.checker, key.s3_key)
         after = ruling_identities(after_rows)
+        if step.fail:
+            self._guard(
+                "untouched",
+                self._check_untouched,
+                key,
+                before_rows,
+                after_rows,
+                search_before,
+                expect_failed and not reported_failed,
+                self.events[_EXTRACTION_FAILED_EVENT] == logged_before,
+            )
         self._guard("gap", self._check_gap, before, after)
         self._guard("alert", self._check_alerts, key, after_rows)
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
-        if step.kind != "db" and not step.whole:
+        if step.kind != "db" and not step.whole and not step.fail:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
             self._guard("synthetic_title", self._check_rows, key, after_rows, step)
         doc = self.event_extra.get("ruling_text", step.doc) if step.kind != "db" else step.doc
-        self._guard("evidence", self._check_evidence, key, step, doc, before_rows, after_rows)
+        if not step.fail:
+            # A failed step writes nothing (``untouched``), so its document
+            # text decides nothing.
+            self._guard("evidence", self._check_evidence, key, step, doc, before_rows, after_rows)
         judges_after = self._judge_rows(key)
         self._guard("judge_converge", self._check_one_judge, key, judges_after)
         self._guard(
@@ -1052,6 +1107,53 @@ class KeyHarness:
             self._guard("date_source", self._check_date_source, key, rows)
         except InvariantError as exc:
             self._pending = exc
+
+    def _search_docs(self, key: Key) -> dict[str, str | None]:
+        """The key's search docs: ``{document id: indexed ruling text}``."""
+        ids = {key.parent, *key.slots}
+        return {d: t for d, t in self.indexer.docs.items() if d in ids}
+
+    def _check_untouched(
+        self,
+        key: Key,
+        before: list[DocRow],
+        after: list[DocRow],
+        search_before: dict[str, str | None],
+        not_reported: bool,
+        not_logged: bool,
+    ) -> None:
+        def show(rows: list[DocRow]) -> list[tuple[str, str, str | None, str | None]]:
+            return [(key.label(r.id), r.status, r.ruling_id, r.case_number) for r in rows]
+
+        if after != before:
+            self._fail(
+                "untouched",
+                f"a failed extraction changed the key's rows: before {show(before)}, "
+                f"after {show(after)}",
+            )
+        search_after = self._search_docs(key)
+        if search_after != search_before:
+            self._fail(
+                "untouched",
+                f"a failed extraction changed the key's search docs: before "
+                f"{sorted(key.label(d) for d in search_before)}, after "
+                f"{sorted(key.label(d) for d in search_after)}",
+            )
+        if not_logged:
+            # Without the failure branch's log, a step that skipped the
+            # extraction for another reason would pass vacuously.
+            self._fail(
+                "untouched",
+                f"the step did not take the failed-extraction branch (no "
+                f"{_EXTRACTION_FAILED_EVENT} event logged)",
+            )
+        if not_reported:
+            self._fail(
+                "untouched",
+                "a failed extraction on a split-set replacement did not report the "
+                "key as failed (no SplitExtractionFailedError), so the reingest's "
+                "failed-keys manifest would not retry it",
+            )
 
     def _check_date_source(self, key: Key, rows: list[DocRow]) -> None:
         for r in rows:
@@ -1825,5 +1927,46 @@ def run_enrichment_failure(
                         f"(had {held.ruling_id}, now "
                         f"{None if now is None else now.ruling_id})",
                     )
+    finally:
+        harness.close()
+
+
+# ---------------------------------------------------------------------------
+# A failed extraction leaves the key alone (#4948)
+# ---------------------------------------------------------------------------
+
+
+def run_extraction_failure(
+    dsn: str,
+    seed: int,
+    run_token: str,
+    *,
+    name: str = "fail",
+    steps: list[Step] | None = None,
+    kind: str | None = None,
+) -> None:
+    """Run a history on a key (*steps*, default *seed*'s generated
+    sequence), then re-ingest it while every extraction call fails
+    (``ExtractionIncompleteError``).  The failed step must leave the key's
+    rows and search docs exactly as they were (``untouched``) and hold the
+    other invariants; a split-set replacement must report the key as
+    failed.  Raises :class:`InvariantError` on a broken invariant.
+
+    The failed step is *kind*, or one the seed picks: a prefix reingest, a
+    DB-row reingest or a live capture (the last two only when the key
+    holds rows).
+    """
+    steps = steps if steps is not None else generate(seed)
+    rng = random.Random(f"{seed}:fail")
+    harness = KeyHarness(dsn, run_token, seed)
+    try:
+        key = make_key(f"{run_token}-{seed}-{name}")
+        for n, step in enumerate(steps):
+            harness.run_step(key, step, f"step {n + 1}/{len(steps)}")
+        if kind is None:
+            has_rows = bool(read_key(harness.checker, key.s3_key))
+            kind = rng.choice(("reingest", "db", "live") if has_rows else ("reingest",))
+        failed = replace(steps[-1], kind=kind, fail=True, whole=False)
+        harness.run_step(key, failed, "extraction failed")
     finally:
         harness.close()
