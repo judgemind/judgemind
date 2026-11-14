@@ -115,6 +115,17 @@ if [[ "$PKG_TYPE" == "python" ]]; then
 
     # Run tests to generate coverage (unless --skip-tests)
     if [[ "$SKIP_TESTS" == "false" ]]; then
+        # Real-Postgres tests need TEST_DATABASE_URL; without it they skip
+        # and the lines only they reach look uncovered. Use this checkout's
+        # migrated test database, as the pre-push hook does (#4950).
+        if [[ -z "${TEST_DATABASE_URL:-}" ]] \
+                && grep -rqs --include='*.py' TEST_DATABASE_URL "$PKG_DIR/tests"; then
+            if pg_url="$("$REPO_ROOT/scripts/ensure-test-db.sh")"; then
+                export TEST_DATABASE_URL="$pg_url"
+            else
+                echo "WARNING: real-Postgres tests will skip (see above)." >&2
+            fi
+        fi
         echo "Running pytest with coverage for $PACKAGE..." >&2
         if ! (cd "$PKG_DIR" && "$PYTEST" tests/ -x -q --tb=line) 2>&1; then
             echo "" >&2

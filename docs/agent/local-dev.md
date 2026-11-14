@@ -46,9 +46,41 @@ TEST_DATABASE_URL=postgresql://judgemind:localdev@localhost:5432/judgemind_test 
 TEST_OPENSEARCH_URL=http://localhost:9200 npm --prefix packages/api test
 ```
 
+**Real-Postgres Python tests (scraper-framework `tests/*_pg.py`, the split
+harness, `test_db_judge_resolve.py`).** These read `TEST_DATABASE_URL` and
+skip without it. You do not need to set it for a push: the pre-push hook
+runs `scripts/ensure-test-db.sh`, which keeps one migrated database per
+checkout in the docker-compose Postgres and passes its URL to that
+package's pytest, so these tests count toward diff coverage as they do in
+CI (#4950).
+
+- **Name:** `jm_prepush_<checkout dir name>_<hash of its path>`, e.g.
+  `jm_prepush_agent_a2c2bba231d1f806d_b120416b`.
+- **Reuse:** the database comment records a hash of every file in
+  `packages/api/migrations/`. While it matches, the database is reused
+  (about 1 s). When a migration is added or edited, it is dropped and
+  rebuilt from scratch (about 10 s). Tests roll back their transactions,
+  so reuse does not carry rows between runs.
+- **Cleanup:** every run drops `jm_prepush_*` databases whose checkout
+  directory no longer exists, so removed worktrees leave nothing behind.
+  `scripts/ensure-test-db.sh --drop` drops the current checkout's
+  database; `--prune` only runs the cleanup.
+- **Running the tests by hand:** `scripts/ensure-test-db.sh` prints the
+  URL on stdout; export it as `TEST_DATABASE_URL`.
+  `scripts/check-diff-coverage.sh <pkg>` does this itself.
+- **An exported `TEST_DATABASE_URL` wins:** the hook uses it as is.
+- **No Postgres running** (or `PREPUSH_PG=0 git push`): the hook prints a
+  WARNING with a `Fix:` block (`docker compose up -d postgres`), the
+  Postgres tests skip, and diff coverage leaves out the source files those
+  tests import (listed in the WARNING) instead of failing on lines it
+  cannot measure. CI still runs the Postgres tests and checks diff
+  coverage on every file.
+- **A migration that does not apply** fails the push, as it would fail
+  CI's `Apply migrations to the test database` step.
+
 ## Schema management
 
-- `scripts/apply_migrations.sh` — applies all migrations (up sections only) to local DB.
+- `scripts/apply_migrations.sh [URL]` — applies migrations (up sections only); default URL is the local `judgemind` DB. Re-runnable (#4950): each applied migration is recorded in `public.pgmigrations` (the table and names node-pg-migrate uses), and a re-run applies only new ones. A database migrated by the pre-#4950 script has tables but no `pgmigrations`; the script refuses it with a `Fix:` block. `scripts/apply_migrations.sh --recreate [URL]` drops and recreates such a database (local hosts only) and applies everything.
 - `scripts/regenerate_schema.sh` — regenerates `schema.sql` from migrations (run after adding a migration).
 - `scripts/check_schema_drift.sh` — verifies `schema.sql` matches applied migrations.
 - `schema.sql` is auto-generated — **do not edit directly**. Add a migration, then run `regenerate_schema.sh`.
