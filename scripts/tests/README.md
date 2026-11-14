@@ -31,6 +31,8 @@ The skip list is maintained via the `SKIP_TESTS` env var on the
 | Test | Dedicated job | Trigger | Rationale |
 |---|---|---|---|
 | `test_pre_push.sh` | `githooks-pre-push-test` | `.githooks/**`, `scripts/tests/test_pre_push.sh`, `.github/workflows/ci.yml` | ~32s. Originally added to scripts-tests via #2505 auto-discovery; caused a +112% duration regression (#2536). |
+| `test_ensure_test_db.sh` | `githooks-pre-push-test` | `scripts/ensure-test-db.sh`, `scripts/apply_migrations.sh`, the test itself, `.github/workflows/ci.yml` | Needs a real Postgres; that job has the service and sets `REQUIRE_PG_TESTS=1` so the database scenarios cannot skip (#4950). |
+| `test_apply_migrations.sh` | `githooks-pre-push-test` | same as above | Same reason (#4950). |
 
 When adding a new "deferred" entry, make sure the dedicated job's path
 filter covers every file that the test exercises — otherwise relevant

@@ -51,6 +51,27 @@
 #   PREPUSH_SERIAL=1      run every stage in the foreground, in order
 #                         (debugging aid; same gates, slower).
 #   CI_GUARDS_JOBS        guard concurrency for scripts/run-ci-guards.sh.
+#   PREPUSH_PG=0          do not provision a Postgres test database; the
+#                         real-Postgres tests skip and diff coverage leaves
+#                         out the files they import, with a WARNING (#4950).
+#   TEST_DATABASE_URL     when exported, used as is for the real-Postgres
+#                         tests instead of the per-checkout database.
+#
+# Real-Postgres tests (#4950)
+# ───────────────────────────
+# A Python package whose tests read TEST_DATABASE_URL (scraper-framework:
+# tests/*_pg.py, the split harness, test_db_judge_resolve.py) gets a
+# migrated database from scripts/ensure-test-db.sh: one per checkout in
+# the local docker-compose Postgres, reused while packages/api/migrations
+# is unchanged and rebuilt when it changes. The hook passes it to that
+# package's pytest only, so those tests count toward diff coverage like
+# they do in CI. Before #4950 they skipped unless the operator exported
+# TEST_DATABASE_URL, and Postgres-only lines failed diff coverage.
+#
+# Without a reachable Postgres the tests skip, the hook prints a WARNING
+# with a Fix: block, and diff coverage leaves out the source files those
+# tests import (.githooks/lib/pg_only_sources.py) instead of failing on
+# lines it cannot measure. CI runs the Postgres tests and gates every file.
 
 set -uo pipefail
 
@@ -365,6 +386,70 @@ venv_has_declared_deps() {
 }
 
 # -------------------------------------------------------------------
+# Real-Postgres test database (#4950; see the header comment).
+#
+# pkg_has_pg_tests <pkg_dir>
+#   True when a .py file under <pkg_dir>/tests reads TEST_DATABASE_URL.
+#
+# ensure_prepush_pg
+#   Runs once per push, in the foreground, before the package jobs start
+#   (they inherit the result). Sets PREPUSH_PG_STATE to ready (and
+#   PREPUSH_PG_URL), unavailable (degrade with a WARNING), or failed (a
+#   migration did not apply: counted as a failure, CI would fail too).
+# -------------------------------------------------------------------
+PREPUSH_PG_STATE=""
+PREPUSH_PG_URL=""
+
+pkg_has_pg_tests() {
+    [ -d "$1/tests" ] && grep -rqs --include='*.py' TEST_DATABASE_URL "$1/tests"
+}
+
+ensure_prepush_pg() {
+    [ -z "$PREPUSH_PG_STATE" ] || return 0
+    if [ -n "${TEST_DATABASE_URL:-}" ]; then
+        PREPUSH_PG_STATE=ready
+        PREPUSH_PG_URL="$TEST_DATABASE_URL"
+        echo "pre-push: Postgres tests use TEST_DATABASE_URL from the environment" >&2
+        return 0
+    fi
+    if [ "${PREPUSH_PG:-1}" = "0" ]; then
+        PREPUSH_PG_STATE=unavailable
+        echo "pre-push: WARNING: PREPUSH_PG=0, so no Postgres test database (#4950)" >&2
+        return 0
+    fi
+    local helper="scripts/ensure-test-db.sh"
+    if [ ! -x "$helper" ]; then
+        PREPUSH_PG_STATE=unavailable
+        echo "pre-push: WARNING: $helper not found; no Postgres test database (#4950)" >&2
+        return 0
+    fi
+    echo "pre-push: preparing the Postgres test database (scripts/ensure-test-db.sh)..." >&2
+    local log="$PREPUSH_LOG_DIR/prepush-_-ensure-test-db.log" out rc=0 start end
+    start=$(date +%s)
+    out="$("$helper" 2>"$log")" || rc=$?
+    end=$(date +%s)
+    printf '%s\t%s\t%s\t%s\n' "$((end - start))" "_" "ensure-test-db" "$rc" >> "$PREPUSH_TIMINGS"
+    case "$rc" in
+        0)
+            PREPUSH_PG_STATE=ready
+            PREPUSH_PG_URL="$(printf '%s\n' "$out" | tail -n 1)"
+            sed 's/^/  /' "$log" >&2
+            ;;
+        3)
+            PREPUSH_PG_STATE=unavailable
+            sed 's/^/  /' "$log" >&2
+            ;;
+        *)
+            PREPUSH_PG_STATE=failed
+            echo "" >&2
+            echo "  FAILED: could not prepare the Postgres test database" >&2
+            sed 's/^/  /' "$log" >&2
+            failures=$((failures + 1))
+            ;;
+    esac
+}
+
+# -------------------------------------------------------------------
 # python_pkg_checks <pkg> <has_code: true|false>
 #
 # ruff check + ruff format for one Python package, then (code changes
@@ -430,6 +515,36 @@ python_pkg_checks() {
         return 0
     fi
 
+    # Real-Postgres tests (#4950). pg_assign hands this package's pytest
+    # the database ensure_prepush_pg prepared. Without one, the tests
+    # skip and diff coverage leaves out the files they import
+    # (pg_excludes), loudly.
+    local pg_assign="" pg_degraded=false pg_excludes="" f
+    if pkg_has_pg_tests "$pkg_dir"; then
+        if [ "$PREPUSH_PG_STATE" = "ready" ]; then
+            pg_assign="TEST_DATABASE_URL=$PREPUSH_PG_URL"
+        else
+            pg_degraded=true
+            pg_excludes="$(python3 "$PREPUSH_HOOK_DIR/lib/pg_only_sources.py" "$pkg_dir" 2>/dev/null || true)"
+            echo "" >&2
+            echo "  WARNING: no Postgres test database, so $pkg's real-Postgres tests" >&2
+            echo "  (tests that read TEST_DATABASE_URL) are SKIPPED and lines only they" >&2
+            echo "  reach cannot be measured (#4950)." >&2
+            if [ -n "$pg_excludes" ]; then
+                echo "  Diff coverage here leaves out the source files those tests import;" >&2
+                echo "  CI runs the Postgres tests and checks diff coverage on every file:" >&2
+                local here
+                here="$(pwd -P)"
+                for f in $pg_excludes; do
+                    echo "    ${f#"$here"/}" >&2
+                done
+            fi
+            echo "  Fix: start the local Postgres and push again; the hook then creates" >&2
+            echo "  and migrates a test database for this checkout by itself:" >&2
+            echo "    docker compose up -d postgres" >&2
+        fi
+    fi
+
     if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
         echo "pre-push: running tests for Python package '$pkg'..." >&2
         # pytest-testmon must not run alongside pytest-cov: both drive
@@ -481,7 +596,8 @@ python_pkg_checks() {
         # limit, and a stall should end with stacks, not a killed push.
         local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
         local pytest_log="$PREPUSH_LOG_DIR/prepush-${pkg//\//_}-pytest.log"
-        run_check "$pkg" "pytest" run_capped "$max_secs" \
+        # $pg_assign is unquoted on purpose: empty, it expands to nothing.
+        run_check "$pkg" "pytest" run_capped "$max_secs" env $pg_assign \
             bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line" \
             || pytest_rc=$?
         if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
@@ -546,14 +662,27 @@ python_pkg_checks() {
         failures=$((failures + 1))
     elif [ -f "$cov_file" ]; then
         echo "pre-push: checking diff coverage for '$pkg'..." >&2
+        # Without a Postgres test database, leave out the files the
+        # skipped Postgres tests import (#4950; WARNING printed above).
+        local exclude_args=()
+        if [ "$pg_degraded" = true ] && [ -n "$pg_excludes" ]; then
+            exclude_args=(--exclude)
+            for f in $pg_excludes; do
+                exclude_args+=("$f")
+            done
+        fi
         if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                 --compare-branch=origin/main \
                 --fail-under=90 \
-                --diff-range-notation='...'; then
+                --diff-range-notation='...' \
+                ${exclude_args[@]+"${exclude_args[@]}"}; then
             echo "  New/changed lines have < 90% test coverage." >&2
             echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
             echo "  to see exactly which lines need tests." >&2
             failures=$((failures + 1))
+        fi
+        if [ "$pg_degraded" = true ]; then
+            echo "  NOTE: $pkg diff coverage ran without the Postgres tests (see WARNING above)." >&2
         fi
     fi
 }
@@ -840,6 +969,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # alongside the CI guard umbrella, they run concurrently. See
     # python_pkg_checks / ts_pkg_checks above.
     # ---------------------------------------------------------------
+    # Prepare the Postgres test database first, in the foreground, so
+    # the package jobs started below inherit it (#4950).
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pg_pkg_dir="$pkg"
+        else
+            pg_pkg_dir="packages/$pkg"
+        fi
+        if pkg_has_pg_tests "$pg_pkg_dir"; then
+            ensure_prepush_pg
+        fi
+    done
+
     for pkg in $changed_python_pkgs; do
         has_code=false
         if in_list "$pkg" "$python_pkgs_with_code"; then

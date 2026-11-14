@@ -82,6 +82,8 @@ jobs:
               - 'scripts/dq_trend_storage.py'
               - 'scripts/rebuild_db.py'
               - 'scripts/reingest_from_s3.py'
+              # The job migrates its test database with this script.
+              - 'scripts/apply_migrations.sh'
             scraper-courts:
               - 'packages/scraper-framework/src/courts/**'
               - 'packages/scraper-framework/tests/courts/**'
@@ -186,6 +188,11 @@ jobs:
               - 'scripts/tests/test_pre_push.sh'
               - 'scripts/tests/test_run_ci_guards.sh'
               - 'scripts/run-ci-guards.sh'
+              # The hook's Postgres test database (#4950).
+              - 'scripts/ensure-test-db.sh'
+              - 'scripts/apply_migrations.sh'
+              - 'scripts/tests/test_ensure_test_db.sh'
+              - 'scripts/tests/test_apply_migrations.sh'
               - '.github/workflows/ci.yml'
             dispatcher-terminals:
               - 'scripts/dispatcher/daemon.py'
@@ -1015,7 +1022,7 @@ jobs:
         env:
           # Whitespace-separated list of test paths to defer to their own
           # dedicated CI jobs. See the comment above this step for why.
-          SKIP_TESTS: "scripts/tests/test_pre_push.sh"
+          SKIP_TESTS: "scripts/tests/test_pre_push.sh scripts/tests/test_ensure_test_db.sh scripts/tests/test_apply_migrations.sh"
           SHARD_FILTER: ${{ matrix.shard-filter }}
         run: scripts/run-scripts-tests.sh
       # The dispatcher tests directory has only fast tests today, so it
@@ -2141,10 +2148,34 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.githooks == 'true'
     runs-on: ubuntu-latest
+    # The hook's Postgres test database helpers (#4950) are tested against
+    # a real server here. REQUIRE_PG_TESTS=1 makes a missing server a
+    # failure rather than a skip.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: judgemind
+          POSTGRES_PASSWORD: localdev
+          POSTGRES_DB: judgemind
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ENSURE_TEST_DB_ADMIN_URL: postgresql://judgemind:localdev@localhost:5432/postgres
+      REQUIRE_PG_TESTS: "1"
     steps:
       - uses: actions/checkout@v6
       - name: Run pre-push hook integration tests
         run: scripts/tests/test_pre_push.sh
+      - name: Run Postgres test-database helper tests
+        run: |
+          scripts/tests/test_ensure_test_db.sh
+          scripts/tests/test_apply_migrations.sh
 
   # ---------------------------------------------------------------
   # Dispatcher terminal-status consistency guard: verifies the five

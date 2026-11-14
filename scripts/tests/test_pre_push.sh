@@ -54,6 +54,13 @@
 #  40b. same venv with the dep installed runs pytest with --timeout (#4822)
 #  41. a pytest run past PREPUSH_PYTEST_MAX_SECS is killed, whole process
 #      tree included, with each process's stack in the log (#4822)
+#  42. a package with real-Postgres tests gets scripts/ensure-test-db.sh's
+#      URL as TEST_DATABASE_URL for its pytest; no diff-cover --exclude (#4950)
+#  43. no Postgres: loud WARNING + Fix: block, and diff coverage leaves out
+#      the sources the Postgres tests import (#4950)
+#  44. a test database that cannot be prepared fails the push (#4950)
+#  45. an exported TEST_DATABASE_URL is used as is, helper not run (#4950)
+#  46. a package without Postgres tests does not prepare a database (#4950)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -1870,6 +1877,162 @@ elif echo "$hook_out" | grep -q "integration tests were SKIPPED"; then
     report_fail "no skip NOTE expected when integration tests ran (#4711)" "$hook_out"
 else
     report_pass "no skip NOTE when integration tests ran (#4711)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 42-46 (#4950): real-Postgres tests get a test database.
+# testpkg gains a test that reads TEST_DATABASE_URL and imports
+# src/good.py; scripts/ensure-test-db.sh is a stub whose exit code picks
+# the path (0 ready, 3 Postgres unavailable, 1 failed). The pytest stub
+# records the TEST_DATABASE_URL it saw; the diff-cover stub its argv.
+# ───────────────────────────────────────────────────────────────────────
+
+# commit_pg_testpkg <branch>: testpkg plus a Postgres test, committed.
+commit_pg_testpkg() {
+    git -C "$WORK" checkout --quiet -b "$1"
+    seed_testpkg
+    cat > "$WORK/packages/testpkg/tests/test_thing_pg.py" <<'PY'
+"""A real-Postgres test (reads TEST_DATABASE_URL)."""
+
+import os
+
+from good import greet
+
+_DSN = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def test_greet() -> None:
+    assert greet() == "hello"
+PY
+    printf '.venv/\npytest-args.txt\ncoverage.xml\npg-url.txt\n' > "$WORK/packages/testpkg/.gitignore"
+    git -C "$WORK" add packages/testpkg
+    git -C "$WORK" commit --quiet -m "feat: testpkg with a postgres test"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+# seed_pg_stubs <ensure_rc>: stub venv + stub scripts/ensure-test-db.sh.
+# The ensure stub counts its calls in ensure-calls.txt (outside the repo).
+seed_pg_stubs() {
+    local ensure_rc="$1" bin="$WORK/packages/testpkg/.venv/bin"
+    seed_stub_venv 0 0
+    printf '#!/usr/bin/env bash\necho "${TEST_DATABASE_URL:-unset}" > pg-url.txt\necho "<coverage/>" > coverage.xml\nexit 0\n' > "$bin/pytest"
+    printf '#!/usr/bin/env bash\necho "$*" > %q\nexit 0\n' "$TMPDIR/diff-cover-args.txt" > "$bin/diff-cover"
+    chmod +x "$bin/pytest" "$bin/diff-cover"
+    mkdir -p "$WORK/scripts"
+    cat > "$WORK/scripts/ensure-test-db.sh" <<SH
+#!/usr/bin/env bash
+echo call >> "$TMPDIR/ensure-calls.txt"
+case $ensure_rc in
+    0) echo "ensure-test-db: reusing jm_prepush_stub" >&2
+       echo "postgresql://u:p@localhost:5432/jm_prepush_stub" ;;
+    3) echo "WARNING: no local Postgres for the real-Postgres tests: stub" >&2
+       echo "Fix:" >&2
+       echo "  docker compose up -d postgres" >&2 ;;
+    *) echo "FAILED: migrations did not apply to jm_prepush_stub" >&2 ;;
+esac
+exit $ensure_rc
+SH
+    chmod +x "$WORK/scripts/ensure-test-db.sh"
+    rm -f "$TMPDIR/ensure-calls.txt" "$TMPDIR/diff-cover-args.txt" "$WORK/packages/testpkg/pg-url.txt"
+}
+
+echo "[scenario 42] Postgres tests get the per-checkout test database (#4950)"
+init_workspace
+commit_pg_testpkg feature-pg-ready
+seed_pg_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-pg-ready $feat_sha refs/heads/feature-pg-ready $ZERO_SHA" \
+    | env -u TEST_DATABASE_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+pg_url="$(cat "$WORK/packages/testpkg/pg-url.txt" 2>/dev/null || true)"
+dc_args="$(cat "$TMPDIR/diff-cover-args.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass with a ready test database (#4950)" "$hook_out"
+elif [ "$pg_url" != "postgresql://u:p@localhost:5432/jm_prepush_stub" ]; then
+    report_fail "expected pytest to see the ensure-test-db URL; saw '$pg_url' (#4950)" "$hook_out"
+elif echo "$dc_args" | grep -q -- "--exclude"; then
+    report_fail "expected no diff-cover --exclude with a database (#4950); got: $dc_args" "$hook_out"
+elif echo "$hook_out" | grep -q "SKIPPED"; then
+    report_fail "expected no skip WARNING with a database (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "reusing jm_prepush_stub"; then
+    report_fail "expected the ensure-test-db message in the output (#4950)" "$hook_out"
+else
+    report_pass "Postgres tests run against the per-checkout database (#4950)"
+fi
+
+echo "[scenario 43] no Postgres: WARNING + Fix:, PG-test sources left out of diff coverage (#4950)"
+init_workspace
+commit_pg_testpkg feature-pg-unavailable
+seed_pg_stubs 3
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-pg-unavailable $feat_sha refs/heads/feature-pg-unavailable $ZERO_SHA" \
+    | env -u TEST_DATABASE_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+pg_url="$(cat "$WORK/packages/testpkg/pg-url.txt" 2>/dev/null || true)"
+dc_args="$(cat "$TMPDIR/diff-cover-args.txt" 2>/dev/null || true)"
+good_abs="$(cd "$WORK/packages/testpkg/src" && pwd -P)/good.py"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a degraded push to pass when the rest is green (#4950)" "$hook_out"
+elif [ "$pg_url" != "unset" ]; then
+    report_fail "expected pytest to run without TEST_DATABASE_URL; saw '$pg_url' (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "WARNING: no Postgres test database, so testpkg's real-Postgres tests"; then
+    report_fail "expected the loud skip WARNING (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "packages/testpkg/src/good.py"; then
+    report_fail "expected the left-out file to be named (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a Fix: block (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "docker compose up -d postgres"; then
+    report_fail "expected 'docker compose up -d postgres' in the Fix block (#4950)" "$hook_out"
+elif ! echo "$dc_args" | grep -q -- "--exclude $good_abs"; then
+    report_fail "expected diff-cover --exclude $good_abs (#4950); got: $dc_args" "$hook_out"
+else
+    report_pass "no Postgres: loud WARNING, Fix: block, PG-test sources excluded (#4950)"
+fi
+
+echo "[scenario 44] a test database that cannot be prepared fails the push (#4950)"
+init_workspace
+commit_pg_testpkg feature-pg-failed
+seed_pg_stubs 1
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-pg-failed $feat_sha refs/heads/feature-pg-failed $ZERO_SHA" \
+    | env -u TEST_DATABASE_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a failed migration to fail the push (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: could not prepare the Postgres test database"; then
+    report_fail "expected 'FAILED: could not prepare the Postgres test database' (#4950)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "migrations did not apply to jm_prepush_stub"; then
+    report_fail "expected the helper's own message in the output (#4950)" "$hook_out"
+else
+    report_pass "an unpreparable test database fails the push (#4950)"
+fi
+
+echo "[scenario 45] an exported TEST_DATABASE_URL is used as is (#4950)"
+init_workspace
+commit_pg_testpkg feature-pg-env
+seed_pg_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-pg-env $feat_sha refs/heads/feature-pg-env $ZERO_SHA" \
+    | TEST_DATABASE_URL=postgresql://op@localhost/mine "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+pg_url="$(cat "$WORK/packages/testpkg/pg-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#4950)" "$hook_out"
+elif [ "$pg_url" != "postgresql://op@localhost/mine" ]; then
+    report_fail "expected pytest to see the exported URL; saw '$pg_url' (#4950)" "$hook_out"
+elif [ -f "$TMPDIR/ensure-calls.txt" ]; then
+    report_fail "ensure-test-db.sh must not run when TEST_DATABASE_URL is exported (#4950)" "$hook_out"
+else
+    report_pass "an exported TEST_DATABASE_URL is used as is (#4950)"
+fi
+
+echo "[scenario 46] a package without Postgres tests does not prepare a database (#4950)"
+init_workspace
+commit_testpkg_code feature-pg-none
+seed_pg_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-pg-none $feat_sha refs/heads/feature-pg-none $ZERO_SHA" \
+    | env -u TEST_DATABASE_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+pg_url="$(cat "$WORK/packages/testpkg/pg-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#4950)" "$hook_out"
+elif [ -f "$TMPDIR/ensure-calls.txt" ]; then
+    report_fail "ensure-test-db.sh must not run for a package without Postgres tests (#4950)" "$hook_out"
+elif [ "$pg_url" != "unset" ]; then
+    report_fail "expected no TEST_DATABASE_URL for a package without Postgres tests; saw '$pg_url' (#4950)" "$hook_out"
+else
+    report_pass "no Postgres tests, no database (#4950)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
