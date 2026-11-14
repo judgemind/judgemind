@@ -267,16 +267,37 @@ def _case_number(idx: int) -> str:
 
 
 #: Case-number shapes for counties whose format validation checks
-#: (``case_number_matches_county_format``, #4907); repeated digits keep every
-#: pair beyond the fuzzy matcher's reach.
-_COUNTY_CASE_NUMBERS: dict[str, Callable[[int], str]] = {
-    "Santa Clara": lambda idx: f"26CV{str(idx % 10) * 6}",
-    "San Francisco": lambda idx: f"CGC-26-{str(idx % 10) * 6}",
+#: (``case_number_matches_county_format``, #4907).  Each takes the index's
+#: repeated digit and a per-tag ``(letters, digits)`` block: three repeated
+#: digits keep every pair of one tag's numbers beyond the fuzzy matcher's
+#: reach (distance 2).
+_COUNTY_CASE_NUMBERS: dict[str, Callable[[str, str, str], str]] = {
+    "Santa Clara": lambda d, letters, digits: f"{digits[:2]}{letters[:2]}{digits[2:5]}{d * 3}",
+    "San Francisco": lambda d, letters, digits: f"{letters}-{digits[:2]}-{digits[2:5]}{d * 3}",
 }
 
 
-def _county_case_number(county: str, idx: int) -> str:
-    return _COUNTY_CASE_NUMBERS.get(county, _case_number)(idx)
+def _county_case_number(county: str, idx: int, tag: str) -> str:
+    """Ruling *idx*'s case number in the real *county* for the key tagged *tag*.
+
+    A deterministic splitter's county gate is real, so its keys share the
+    county's real court with every other test of that splitter, on other
+    xdist workers too.  A case number shared across tags would share the
+    case row: one test's write retitling the case re-indexes the other
+    test's rulings into the writer's stub indexer, and the other test sees
+    its own search doc drift (``search_fields``, #4956).  So each tag gets
+    its own numbers.  A splitter reads the number from the source
+    (``CASE_NUMBER_FROM_SOURCE_KEY``), so no fuzzy correction can move a
+    ruling onto another tag's near-miss number.
+    """
+    digest = hashlib.sha256(tag.encode()).digest()
+    letters = "".join(chr(ord("A") + b % 26) for b in digest[:3])
+    digits = "".join(str(b % 10) for b in digest[3:13])
+    d = str(idx % 10)
+    shape = _COUNTY_CASE_NUMBERS.get(county)
+    if shape is not None:
+        return shape(d, letters, digits)
+    return f"{digits}-{d * 5}"
 
 
 def _title(idx: int, variant: int = 0) -> str:
@@ -1957,7 +1978,7 @@ def run_enrichment_failure(
     specs = [
         Spec(
             idx=i,
-            case_number=_county_case_number(splitter.county, i),
+            case_number=_county_case_number(splitter.county, i, token),
             title=None if rng.random() < 0.3 else _title(i),
             text=_text(token, i),
         )

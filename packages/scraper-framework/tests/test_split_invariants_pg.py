@@ -229,6 +229,38 @@ def _enrichment_seeds() -> list[int]:
     return list(range(int(os.environ.get("SPLIT_HARNESS_ENRICHMENT_SEEDS", "8"))))
 
 
+def _distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+@pytest.mark.parametrize("splitter", harness.DETERMINISTIC_SPLITTERS, ids=lambda s: s.name)
+def test_enrichment_case_numbers_are_per_key(splitter: harness.DeterministicSplitter) -> None:
+    """The enrichment-failure keys share their splitter's real court, so each
+    key gets its own case numbers (#4956): with shared numbers, parallel
+    workers shared case rows and one test's retitle drifted another's search
+    doc.  One key's numbers stay beyond the fuzzy matcher's reach of each
+    other and fit the county's validated format."""
+    from validation.deterministic import check_case_number_matches_county_format
+
+    tags = [f"{_RUN}-{splitter.name}-{seed}" for seed in range(50)]
+    numbers = {
+        tag: [harness._county_case_number(splitter.county, i, tag) for i in range(6)]
+        for tag in tags
+    }
+    every = [n for ns in numbers.values() for n in ns]
+    assert len(set(every)) == len(every)
+    for ns in numbers.values():
+        for i, a in enumerate(ns):
+            assert check_case_number_matches_county_format(a, splitter.county).result == "pass"
+            assert all(_distance(a, b) > 2 for b in ns[i + 1 :]), ns
+
+
 @_needs_pg
 @pytest.mark.parametrize("seed", _enrichment_seeds())
 @pytest.mark.parametrize(
