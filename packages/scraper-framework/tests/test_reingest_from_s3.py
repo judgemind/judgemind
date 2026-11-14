@@ -3086,6 +3086,132 @@ class TestFailedExtractionKeyIsRetried:
         assert (body.decode() if isinstance(body, bytes) else body) == self._key() + "\n"
 
 
+class TestUnextractableKeyIsNotRetried:
+    """A PDF with no text layer in a text-first county can never be
+    extracted: the worker raises ``NoExtractableTextError``, and the reingest
+    reports the key as ``unextractable`` instead of listing it in the
+    failed-keys retry manifest (#4983)."""
+
+    _CONTENT = b"%PDF-1.4 scanned page, no text layer"
+
+    def _key(self) -> str:
+        return f"ca/ventura/superior_court/raw/{hashlib.sha256(self._CONTENT).hexdigest()}.pdf"
+
+    def _process(self) -> tuple[dict[str, Any], MagicMock]:
+        from ingestion.worker import IngestionWorker
+
+        worker = IngestionWorker(
+            redis_client=MagicMock(),
+            pg_dsn="postgresql://localhost/test",
+            opensearch_client=MagicMock(),
+            s3_client=MagicMock(),
+            archive_bucket="test-bucket",
+        )
+        worker._enrichment_client = None
+        worker._extraction_required = True
+        worker._get_connection = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+        extractor = MagicMock()
+        worker._get_framework_extractor = lambda: extractor  # type: ignore[method-assign]
+        worker._get_county_extractor = lambda *_a, **_k: extractor  # type: ignore[method-assign]
+        write = MagicMock()
+        worker._write_one_ruling = write  # type: ignore[method-assign]
+        worker._write_split_batch = write  # type: ignore[method-assign]
+
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = self._CONTENT
+        mock_s3.get_object.return_value = {"Body": body}
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+        try:
+            with (
+                patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+                patch("ingestion.worker.IngestionWorker", return_value=worker),
+                patch("ingestion.worker.extract_text_from_pdf", return_value=""),
+                patch("redis.Redis.from_url", return_value=MagicMock()),
+            ):
+                result = reingest._process_prefix_document(
+                    self._key(),
+                    "test-bucket",
+                    "postgresql://test",
+                    "redis://localhost:6379",
+                    "",
+                )
+        finally:
+            if hasattr(reingest._process_prefix_document, "_worker"):
+                delattr(reingest._process_prefix_document, "_worker")
+        extractor.extract.assert_not_called()
+        return result, write
+
+    def test_no_text_pdf_is_an_unextractable_result_and_writes_nothing(self) -> None:
+        result, write = self._process()
+        assert result["status"] == reingest.UNEXTRACTABLE
+        assert result["error_class"] == "NoExtractableTextError"
+        write.assert_not_called()
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_unextractable_key_is_reported_apart_from_the_failed_manifest(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        result, _ = self._process()
+        failed = {"status": "error", "hash_mismatch": False, "error_class": "ValueError"}
+        other = "ca/ventura/superior_court/raw/" + "0" * 64 + ".pdf"
+        mock_list.return_value = [self._key(), other]
+        mock_discover.return_value = []
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+        s3_client = MagicMock()
+        mock_boto3.client.return_value = s3_client
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+        futures = [MagicMock(), MagicMock()]
+        futures[0].result.return_value = result
+        futures[1].result.return_value = failed
+        pool.submit.side_effect = futures
+
+        with patch("reingest_from_s3.as_completed", return_value=futures):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="ca/ventura/",
+                concurrency=1,
+                skip_judge_prepass=True,
+                write_failed_manifest="s3://manifest-bucket/failed/keys.txt",
+            )
+
+        assert stats["unextractable"] == 1
+        assert stats["unextractable_keys"] == [self._key()]
+        assert stats["failed_keys"] == [other]
+        assert stats["errors"] == 1
+        (call,) = [
+            c
+            for c in s3_client.put_object.call_args_list
+            if c.kwargs.get("Bucket") == "manifest-bucket"
+        ]
+        body = call.kwargs["Body"]
+        assert (body.decode() if isinstance(body, bytes) else body) == other + "\n"
+
+
 class TestPrefixPartialFailureStats:
     """run_reingest_from_prefix surfaces error_ratio / top class / failed_keys
     and writes the failed-keys manifest (#4619)."""

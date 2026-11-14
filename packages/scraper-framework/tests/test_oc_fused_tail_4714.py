@@ -45,6 +45,7 @@ from ingestion.worker import (
     WHOLE_DOCUMENT_KEY,
     ExtractorUnavailableError,
     IngestionWorker,
+    NoExtractableTextError,
     SplitExtractionFailedError,
     is_infrastructure_error,
 )
@@ -744,15 +745,16 @@ def test_text_first_county_pdf_without_text_is_a_failed_extraction(
 
 
 def test_text_first_county_pdf_without_text_is_reported_on_reingest() -> None:
-    """End to end: the reingest raises ``SplitExtractionFailedError`` (its
-    per-key handler counts the key as failed) and writes nothing (#4968)."""
+    """End to end: the reingest raises ``NoExtractableTextError``, the
+    ``SplitExtractionFailedError`` its per-key handler reports apart from the
+    retry list (#4983), and writes nothing (#4968)."""
     worker = _required_worker()
     event = {**_event(), **_VENTURA_PDF, "ruling_text": "", REPLACE_SPLIT_SET_KEY: True}
 
     with (
         patch.object(worker, "_write_split_batch") as split_write,
         patch.object(worker, "_write_one_ruling") as single_write,
-        pytest.raises(SplitExtractionFailedError, match="no extractable text"),
+        pytest.raises(NoExtractableTextError, match="no extractable text"),
     ):
         worker.process_event(event)
 

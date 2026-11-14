@@ -174,7 +174,7 @@ _EXTRACTION_PATH_SEEDS = {
     "county_provider": (1, ("harness.call.county.ok",)),
     "county_other_provider": (39, ("harness.call.county.ok",)),
     # A text-first county's PDF with no text: nothing could be read.
-    "no_extractable_text": (1, ("harness.raised.SplitExtractionFailedError",)),
+    "no_extractable_text": (1, ("harness.raised.NoExtractableTextError",)),
 }
 
 
