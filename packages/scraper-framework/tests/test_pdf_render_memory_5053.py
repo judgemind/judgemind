@@ -259,6 +259,9 @@ def test_memory_peak_rss_is_bounded_and_independent_of_page_count(
     short = _probe(scans[SHORT_SCAN_PAGES], mode)
     long = _probe(scans[LONG_SCAN_PAGES], mode)
     assert long["pages"] == LONG_SCAN_PAGES
+    # Rendering a 6.3 MB page always shows: 0 means the probe measured
+    # someone else's peak (a ru_maxrss inherited across exec).
+    assert long["growth_mb"] > 0, long
     assert long["growth_mb"] <= PEAK_GROWTH_BUDGET_MB, long
     assert long["growth_mb"] - short["growth_mb"] <= PAGE_SCALING_BUDGET_MB, (short, long)
 

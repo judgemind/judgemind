@@ -1,8 +1,8 @@
 """Peak-memory probe for the PDF image paths (#5053).
 
 Run by ``test_pdf_render_memory_5053.py`` in a fresh interpreter, so the
-process's peak RSS (``ru_maxrss``) reflects only this run, not the rest
-of the test suite:
+process's peak RSS (``VmHWM`` on Linux, ``ru_maxrss`` on macOS) reflects
+only this run, not the rest of the test suite:
 
     python tests/pdf_memory_probe.py <pdf-path> <mode>
 
@@ -55,6 +55,19 @@ def build_scanned_pdf(pages: int, size_pt: tuple[int, int] = LETTER, dpi: int = 
 
 
 def _peak_rss_mb() -> float:
+    """This process's peak RSS in MB.
+
+    On Linux, ``VmHWM`` from ``/proc/self/status``: ``ru_maxrss`` survives
+    ``execve``, so a probe forked from a 600 MB pytest worker would report
+    the worker's peak as its own and every growth as 0.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Bytes on macOS, KiB on Linux.
     return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
