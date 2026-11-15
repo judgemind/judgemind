@@ -1,8 +1,8 @@
 """Shared helpers for ``scripts/tests/test_*.py`` (#4430).
 
 The lightweight CI ``scripts-tests (python)`` shard installs only
-``pytest pytest-xdist boto3 -e packages/judgemind-config`` (see
-``scripts/tests/README.md``). Test files whose script-under-test imports
+``scripts/tests/requirements-ci.txt``, as does the pre-push hook's
+scripts/tests venv (see ``scripts/tests/README.md``, #5045). Test files whose script-under-test imports
 heavyweight packages at module load (``psycopg``, ``structlog``,
 ``framework.*``, ``ingestion.*``) must inject ``MagicMock`` entries into
 ``sys.modules`` BEFORE the import statement runs, then restore the prior
