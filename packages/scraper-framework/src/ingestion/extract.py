@@ -1151,7 +1151,9 @@ def case_number_supported_by_text(case_number: str | None, *texts: str | None) -
     A number wrapped inside a narrow table column extracts in pieces with
     the neighbouring column's words between them (``30-`` / ``2018-`` /
     ``009968 were approved by ...`` / ``52``, Orange Dept CX103); pieces
-    that spell the number in order, close together, count too.
+    that spell the number in order, close together, count too.  The first
+    piece may extract glued to the next column's first word (``26CV49241``
+    + ``3901 North First`` -> ``26CV492413901``, Santa Clara, #4997).
     """
     if not case_number:
         return False
@@ -1200,7 +1202,31 @@ def _spelled_by_wrapped_pieces(target: str, tokens: list[str]) -> bool:
         if len(token) >= 2 and target.startswith(token) and token != target:
             if extend(target[len(token) :], i, 1):
                 return True
+        elif len(token) > len(target):
+            # The first piece glued to the next column's first word, with no
+            # space between them (``26CV49241`` + ``3901 North First`` ->
+            # ``26CV492413901``, Santa Clara, #4997).  Only a token longer
+            # than the number can be one: a printed number of full length is
+            # not a piece, so a misread of its last digit stays unsupported.
+            prefix = _common_prefix_len(token, target)
+            for k in range(min(prefix, len(target) - 1), _min_glued_piece(target) - 1, -1):
+                if extend(target[k:], i, 1):
+                    return True
     return False
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _min_glued_piece(target: str) -> int:
+    """A glued first piece must carry at least half the number."""
+    return max(2, (len(target) + 1) // 2)
 
 
 def _double_chars(value: str) -> str:

@@ -4009,6 +4009,26 @@ class TestCaseNumberSupportedByText:
         assert case_number_supported_by_text("30-2018-00996852", text)
         assert not case_number_supported_by_text("2018-00912345", text)
 
+    def test_wrapped_number_glued_to_the_next_column_supports(self) -> None:
+        """Santa Clara summary table (#4997): the case-number cell wraps
+        ``26CV49241`` / ``6`` and the first piece extracts glued to the
+        party column's first word (``3901 North First, LLC``), with no
+        space between them."""
+        text = (
+            "LINE 1 26CV492413901 North First, Application for Pro Hac Vice Counsel\n"
+            "6 LLC c/o\n"
+            "Prospecthill I. BACKGROUND\n"
+        )
+        assert case_number_supported_by_text("26CV492416", text)
+        assert not case_number_supported_by_text("26CV492419", text)
+
+    def test_glued_piece_needs_a_token_longer_than_the_number(self) -> None:
+        """A printed number of full length is not a glued piece: a misread
+        of its last digit stays unsupported even when that digit stands
+        alone nearby (#4997)."""
+        text = "LINE 1 26CV492413 Application, continued to department 6 today\n"
+        assert not case_number_supported_by_text("26CV492416", text)
+
     def test_empty_tokens_text_does_not_crash(self) -> None:
         assert not case_number_supported_by_text("23STCV01234", "!!! ---")
 
