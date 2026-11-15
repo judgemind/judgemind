@@ -23,7 +23,7 @@ from .models import (
     ScraperHealthEvent,
     ValidationStatus,
 )
-from .storage import S3Archiver
+from .storage import S3Archiver, is_transient_archive_error
 
 if TYPE_CHECKING:
     from .fetch_tally import FetchTally
@@ -88,6 +88,94 @@ class EmptyListing(ScraperPreconditionFailure):
 # (listing page, session acquisition), matching retry_sync's defaults.
 _RETRY_BASE_DELAY_SECONDS = 2.0
 _RETRY_MAX_DELAY_SECONDS = 60.0
+
+# In-run retry of a transient S3 archive failure (#5009).  Archiving is
+# idempotent (content-addressed key, HeadObject first), so a retry is safe.
+_ARCHIVE_ATTEMPTS = 3
+_ARCHIVE_RETRY_BASE_DELAY_SECONDS = 1.0
+
+# Per-document failures kept in ScraperHealthEvent.failure_details (and so in
+# scraper_runs.error_details).  The counts are always exact; only the list of
+# examples is capped.
+_MAX_FAILURE_SAMPLES = 50
+
+#: Stages at which a fetched document can fail to be captured (#5009).
+#: ``process``: CSS inlining, hashing or parsing raised before the archive.
+#: ``archive``: the S3 write failed (after in-run retries); the raw is lost
+#: unless the next run still sees it on the court site.
+#: ``emit``: the raw is in S3 but no ``document.captured`` event exists, so
+#: the worker will not ingest it until a reconciler or reingest picks it up.
+CAPTURE_FAILURE_STAGES = ("process", "archive", "emit")
+
+
+class _DocumentStageError(Exception):
+    """Internal: tags a per-document exception with the stage that raised it."""
+
+    def __init__(self, stage: str, cause: BaseException) -> None:
+        super().__init__(f"{stage}: {cause}")
+        self.stage = stage
+        self.cause = cause
+
+
+class CaptureFailures:
+    """Per-run count of documents fetched but not fully captured (#5009).
+
+    Before #5009 ``run()`` caught each document's exception, logged it, and
+    still recorded ``success=True``.  A failed S3 write or a dropped ingest
+    event was invisible in ``telemetry.scraper_runs``.  This tally makes any
+    such document fail the run, with exact per-stage counts.
+    """
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = dict.fromkeys(CAPTURE_FAILURE_STAGES, 0)
+        self.samples: list[dict[str, str | None]] = []
+        self.last_error: str | None = None
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts.values())
+
+    def record(self, stage: str, doc: CapturedDocument, exc: BaseException) -> None:
+        self.counts[stage] += 1
+        self.last_error = f"{stage}: {exc}"
+        if len(self.samples) < _MAX_FAILURE_SAMPLES:
+            self.samples.append(
+                {
+                    "stage": stage,
+                    "source_url": doc.source_url,
+                    "s3_key": doc.s3_key,
+                    "error": str(exc)[:300],
+                }
+            )
+
+    def message(self, n_docs: int) -> str | None:
+        """One-line run error, or None when every document was captured."""
+        if not self.total:
+            return None
+        parts = []
+        if self.counts["archive"]:
+            parts.append(f"{self.counts['archive']} failed to archive to S3")
+        if self.counts["emit"]:
+            parts.append(f"{self.counts['emit']} archived but not emitted for ingestion")
+        if self.counts["process"]:
+            parts.append(f"{self.counts['process']} failed before archive")
+        return (
+            f"{self.total} of {n_docs} documents not captured "
+            f"({', '.join(parts)}); last error: {self.last_error}"
+        )
+
+    def details(self, n_docs: int) -> dict[str, object] | None:
+        """Structured counts for ``scraper_runs.error_details``, or None."""
+        if not self.total:
+            return None
+        return {
+            "documents_fetched": n_docs,
+            "records_failed_archive": self.counts["archive"],
+            "records_failed_emit": self.counts["emit"],
+            "records_failed_process": self.counts["process"],
+            "failed_documents": self.samples,
+            "failed_documents_truncated": self.total > len(self.samples),
+        }
 
 
 class BaseScraper(abc.ABC):
@@ -243,10 +331,13 @@ class BaseScraper(abc.ABC):
         records_captured = 0
         error_message: str | None = None
         self._partial_failure = None
+        failures = CaptureFailures()
+        n_docs = 0
 
         try:
             try:
                 docs = self._fetch_with_retry()
+                n_docs = len(docs)
 
                 for doc in docs:
                     try:
@@ -254,20 +345,35 @@ class BaseScraper(abc.ABC):
                         if captured:
                             records_captured += 1
                     except Exception as exc:
+                        if isinstance(exc, _DocumentStageError):
+                            stage, cause = exc.stage, exc.cause
+                        else:
+                            stage, cause = "process", exc
+                        failures.record(stage, doc, cause)
                         self._log.error(
-                            "Failed to process document",
+                            "capture.document_failed",
+                            stage=stage,
                             source_url=doc.source_url,
-                            error=str(exc),
+                            s3_bucket=doc.s3_bucket,
+                            s3_key=doc.s3_key,
+                            error=str(cause),
                         )
 
-                if self._partial_failure:
-                    # The captured docs are archived above; the run is still
-                    # a failure because the fetch skipped items (#4734).
+                # A fetch that skipped items (#4734) and a document that was
+                # fetched but not archived or not emitted (#5009) both make
+                # the run a failure.  Documents that were captured stay
+                # archived and emitted.
+                problems = [
+                    m for m in (self._partial_failure, failures.message(n_docs)) if m is not None
+                ]
+                if problems:
                     success = False
-                    error_message = self._partial_failure
+                    error_message = "; ".join(problems)
                     self._log.error(
                         "Run partially failed",
                         records=records_captured,
+                        records_failed=failures.total,
+                        **{f"records_failed_{k}": v for k, v in failures.counts.items()},
                         error=error_message,
                     )
                 else:
@@ -299,6 +405,8 @@ class BaseScraper(abc.ABC):
             scraper_id=self.config.scraper_id,
             success=success,
             records_captured=records_captured,
+            records_failed=failures.total,
+            failure_details=failures.details(n_docs),
             response_time_seconds=elapsed,
             error_message=error_message,
             run_timestamp=run_timestamp,
@@ -629,14 +737,46 @@ class BaseScraper(abc.ABC):
             )
 
         if self._archiver:
-            doc.s3_key = self._archiver.archive(doc)
+            doc.s3_key = self._archive_with_retry(doc)
             doc.s3_bucket = self._archiver.bucket
             doc.validation_status = ValidationStatus.PENDING
 
         if self._event_bus:
-            self._event_bus.emit_document_captured(doc, producer_id=self.config.scraper_id)
+            try:
+                self._event_bus.emit_document_captured(doc, producer_id=self.config.scraper_id)
+            except Exception as exc:
+                # The raw is in S3 but the worker will never see it.  run()
+                # counts this and logs the key (#5009).
+                raise _DocumentStageError("emit", exc) from exc
 
         return True
+
+    def _archive_with_retry(self, doc: CapturedDocument) -> str:
+        """Archive *doc*, retrying transient S3 errors within the run (#5009).
+
+        Raises :class:`_DocumentStageError` (stage ``archive``) when the
+        write still fails, or at once for a deterministic error (missing
+        bucket, access denied, content-hash mismatch).
+        """
+        assert self._archiver is not None
+        delay = _ARCHIVE_RETRY_BASE_DELAY_SECONDS
+        for attempt in range(1, _ARCHIVE_ATTEMPTS + 1):
+            try:
+                return self._archiver.archive(doc)
+            except Exception as exc:
+                if attempt == _ARCHIVE_ATTEMPTS or not is_transient_archive_error(exc):
+                    raise _DocumentStageError("archive", exc) from exc
+                self._log.warning(
+                    "archive.retrying",
+                    attempt=attempt,
+                    max_attempts=_ARCHIVE_ATTEMPTS,
+                    wait_seconds=delay,
+                    source_url=doc.source_url,
+                    error=str(exc),
+                )
+                time.sleep(delay)
+                delay *= 2
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _make_base_doc(
         self, source_url: str, raw_content: bytes, content_format: object

@@ -7,7 +7,8 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotoConnectionError
 
 from .hashing import sha256_hex
 from .models import CapturedDocument, ContentFormat
@@ -155,6 +156,47 @@ class S3Archiver:
             raise
         logger.info("Archived %s bytes to s3://%s/%s", len(doc.raw_content), self.bucket, key)
         return key
+
+
+#: S3 error codes that mean "try again" rather than "this will never work".
+#: A missing bucket, access denied or a malformed request is not here: a
+#: retry gives the same answer, so ``BaseScraper`` counts it at once (#5009).
+_TRANSIENT_S3_ERROR_CODES = frozenset(
+    {
+        "500",
+        "502",
+        "503",
+        "504",
+        "InternalError",
+        "ServiceUnavailable",
+        "SlowDown",
+        "RequestTimeout",
+        "RequestTimeTooSkewed",
+        "Throttling",
+        "ThrottlingException",
+    }
+)
+
+
+def is_transient_archive_error(exc: BaseException) -> bool:
+    """True when an exception from :meth:`S3Archiver.archive` is worth a retry.
+
+    Connection drops, timeouts, throttling and S3 5xx are transient.  A
+    content-hash mismatch (:class:`S3MislabelError`), a missing bucket and
+    access denied are deterministic and are not retried.
+    """
+    if isinstance(exc, S3MislabelError):
+        return False
+    if isinstance(exc, ClientError):
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        return code in _TRANSIENT_S3_ERROR_CODES
+    if isinstance(exc, BotoCoreError):
+        # botocore ConnectionError (EndpointConnectionError,
+        # ConnectTimeoutError) and HTTPClientError (ReadTimeoutError,
+        # ConnectionClosedError) are network-level.  Other BotoCoreErrors
+        # (NoCredentialsError, ParamValidationError) are configuration.
+        return isinstance(exc, (BotoConnectionError, HTTPClientError))
+    return isinstance(exc, (ConnectionError, TimeoutError))
 
 
 def _content_type(fmt: ContentFormat) -> str:

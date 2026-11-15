@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -144,8 +144,13 @@ def test_run_continues_after_single_doc_failure() -> None:
     scraper = PartialFailScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # The good document is still captured, but the bad one was never
+    # archived, so the run is a failure (#5009; it was success=True before).
     assert health.records_captured == 1
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.failure_details is not None
+    assert health.failure_details["records_failed_process"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -721,3 +726,214 @@ class TestAllFailedRetryPolicy:
         decisions = [e for e in logs if e["event"] == "all_fetches_failed.no_retry"]
         assert len(decisions) == 1
         assert "blocked" in decisions[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# A failed archive or emit fails the run (#5009)
+# ---------------------------------------------------------------------------
+
+
+def _client_error(code: str, op: str = "PutObject") -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": code}}, op)
+
+
+def _docs(config: ScraperConfig, n: int) -> list[CapturedDocument]:
+    docs = []
+    for i in range(n):
+        doc = _make_doc(config)
+        doc.source_url = f"https://example.com/ruling/{i}"
+        doc.raw_content = f"<html>ruling {i}</html>".encode()
+        docs.append(doc)
+    return docs
+
+
+def _archiver(side_effect: object) -> MagicMock:
+    archiver = MagicMock()
+    archiver.bucket = "judgemind-raw"
+    archiver.archive.side_effect = side_effect
+    return archiver
+
+
+class TestCaptureFailuresFailTheRun:
+    def test_archive_failure_fails_run(self, fake_clock: _FakeClock) -> None:
+        """One document's put_object raises: the run is not a success (#5009).
+
+        Before #5009 the exception was logged and swallowed, and the run
+        recorded success=True with the raw never written to S3.
+        """
+        config = _make_config()
+        docs = _docs(config, 3)
+        archiver = _archiver(["ca/key0.html", _client_error("AccessDenied"), "ca/key2.html"])
+        bus = MagicMock()
+
+        health = DummyScraper(docs=docs, config=config, archiver=archiver, event_bus=bus).run()
+
+        assert health.success is False
+        assert health.records_captured == 2
+        assert health.records_failed == 1
+        assert health.failure_details is not None
+        assert health.failure_details["records_failed_archive"] == 1
+        assert health.failure_details["records_failed_emit"] == 0
+        assert health.failure_details["documents_fetched"] == 3
+        sample = health.failure_details["failed_documents"][0]
+        assert sample["stage"] == "archive"
+        assert sample["source_url"] == "https://example.com/ruling/1"
+        assert "1 of 3 documents not captured" in (health.error_message or "")
+        assert "failed to archive to S3" in (health.error_message or "")
+        # The failed document was never emitted; the other two were.
+        assert bus.emit_document_captured.call_count == 2
+        # AccessDenied is deterministic: not retried.
+        assert archiver.archive.call_count == 3
+        assert fake_clock.sleeps == []
+
+    def test_archive_failure_fails_run_when_nothing_archived(self, fake_clock: _FakeClock) -> None:
+        config = _make_config()
+        archiver = _archiver(_client_error("NoSuchBucket"))
+
+        health = DummyScraper(docs=_docs(config, 4), config=config, archiver=archiver).run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert health.records_failed == 4
+        assert "4 of 4 documents not captured" in (health.error_message or "")
+
+    def test_transient_archive_failure_is_retried_within_run(self, fake_clock: _FakeClock) -> None:
+        config = _make_config()
+        archiver = _archiver([_client_error("SlowDown"), _client_error("503"), "ca/key.html"])
+
+        health = DummyScraper(docs=_docs(config, 1), config=config, archiver=archiver).run()
+
+        assert health.success is True
+        assert health.records_captured == 1
+        assert health.records_failed == 0
+        assert archiver.archive.call_count == 3
+        assert fake_clock.sleeps == [1.0, 2.0]
+
+    def test_transient_archive_failure_that_persists_fails_run(
+        self, fake_clock: _FakeClock
+    ) -> None:
+        from botocore.exceptions import EndpointConnectionError
+
+        config = _make_config()
+        archiver = _archiver(EndpointConnectionError(endpoint_url="https://s3"))
+
+        health = DummyScraper(docs=_docs(config, 1), config=config, archiver=archiver).run()
+
+        assert health.success is False
+        assert health.records_failed == 1
+        assert archiver.archive.call_count == 3
+
+    def test_failed_emit_counts_against_run(self, fake_clock: _FakeClock) -> None:
+        """A doc archived but not emitted fails the run and names its key."""
+        config = _make_config()
+        archiver = _archiver(["ca/key0.html", "ca/key1.html"])
+        bus = MagicMock()
+        bus.emit_document_captured.side_effect = [b"1-0", RuntimeError("emit failed: OOM")]
+
+        health = DummyScraper(
+            docs=_docs(config, 2), config=config, archiver=archiver, event_bus=bus
+        ).run()
+
+        assert health.success is False
+        assert health.records_captured == 1
+        assert health.records_failed == 1
+        assert health.failure_details is not None
+        assert health.failure_details["records_failed_emit"] == 1
+        sample = health.failure_details["failed_documents"][0]
+        assert sample["stage"] == "emit"
+        assert sample["s3_key"] == "ca/key1.html"
+        assert "archived but not emitted for ingestion" in (health.error_message or "")
+
+    def test_event_bus_unavailable_run_is_not_silent_success(self, fake_clock: _FakeClock) -> None:
+        """REDIS_URL set, Redis down at startup: the run records failure."""
+        import redis
+
+        from framework.event_bus import RedisEventBus
+
+        config = _make_config()
+        with patch(
+            "framework.event_bus.redis.Redis.from_url",
+            side_effect=redis.ConnectionError("Connection refused"),
+        ):
+            bus = RedisEventBus(redis_url="redis://unreachable:6379")
+            archiver = _archiver(["ca/key0.html", "ca/key1.html"])
+            health = DummyScraper(
+                docs=_docs(config, 2), config=config, archiver=archiver, event_bus=bus
+            ).run()
+
+        assert health.success is False
+        assert health.records_captured == 0
+        assert health.records_failed == 2
+        assert health.failure_details is not None
+        assert health.failure_details["records_failed_emit"] == 2
+        assert "unavailable" in (health.error_message or "")
+
+    def test_partial_failure_and_capture_failure_both_reported(
+        self, fake_clock: _FakeClock
+    ) -> None:
+        config = _make_config()
+
+        class SkippingScraper(DummyScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                self._mark_partial_failure("items aborted after 1 of 3")
+                return self._docs
+
+        archiver = _archiver(_client_error("AccessDenied"))
+        health = SkippingScraper(docs=_docs(config, 1), config=config, archiver=archiver).run()
+
+        assert health.success is False
+        assert "items aborted after 1 of 3" in (health.error_message or "")
+        assert "failed to archive to S3" in (health.error_message or "")
+
+    def test_failure_samples_are_capped_but_counts_exact(self, fake_clock: _FakeClock) -> None:
+        import framework.base as base_mod
+
+        config = _make_config()
+        n = base_mod._MAX_FAILURE_SAMPLES + 5
+        archiver = _archiver(_client_error("AccessDenied"))
+
+        health = DummyScraper(docs=_docs(config, n), config=config, archiver=archiver).run()
+
+        assert health.records_failed == n
+        assert health.failure_details is not None
+        assert len(health.failure_details["failed_documents"]) == base_mod._MAX_FAILURE_SAMPLES
+        assert health.failure_details["failed_documents_truncated"] is True
+
+    def test_clean_run_has_no_failure_details(self) -> None:
+        config = _make_config()
+        health = DummyScraper(docs=_docs(config, 2), config=config).run()
+        assert health.success is True
+        assert health.records_failed == 0
+        assert health.failure_details is None
+
+
+class TestIsTransientArchiveError:
+    @pytest.mark.parametrize(
+        "code,expected",
+        [
+            ("SlowDown", True),
+            ("InternalError", True),
+            ("503", True),
+            ("NoSuchBucket", False),
+            ("AccessDenied", False),
+            ("404", False),
+        ],
+    )
+    def test_client_error_codes(self, code: str, expected: bool) -> None:
+        from framework.storage import is_transient_archive_error
+
+        assert is_transient_archive_error(_client_error(code)) is expected
+
+    def test_other_errors(self) -> None:
+        from botocore.exceptions import NoCredentialsError, ReadTimeoutError
+
+        from framework.s3_integrity import S3MislabelError
+        from framework.storage import is_transient_archive_error
+
+        assert is_transient_archive_error(ReadTimeoutError(endpoint_url="https://s3")) is True
+        assert is_transient_archive_error(NoCredentialsError()) is False
+        assert is_transient_archive_error(S3MislabelError("mismatch")) is False
+        assert is_transient_archive_error(TimeoutError()) is True
+        assert is_transient_archive_error(ValueError("x")) is False

@@ -15,14 +15,21 @@ logger = logging.getLogger(__name__)
 STREAM_DOCUMENT_CAPTURED = "document.captured"
 STREAM_SCRAPER_HEALTH = "scraper.health"
 
-#: Backstop cap on ``document.captured`` length, applied by every XADD.
+#: Cap on ``document.captured`` length, checked before every XADD.
 #:
 #: This is NOT the normal retention mechanism.  The ingestion worker trims
 #: entries every consumer group has already acknowledged (see
 #: :func:`trim_consumed_entries`), so in steady state the stream holds only
 #: the unconsumed backlog.  The cap only bites when the worker is down long
-#: enough for the backlog to reach it; then the oldest unconsumed events are
-#: dropped (their raws are still in S3 and can be reingested).
+#: enough for the backlog to reach it.
+#:
+#: At the cap the producer never trims unconsumed events (#5009).  It first
+#: trims acknowledged entries itself; if the stream is still at the cap, the
+#: XADD is refused with :class:`StreamBacklogFull`.  The scraper counts that
+#: as a failed emit and the run records ``success=False``, so the loss is
+#: visible and the archived key is named in ``scraper_runs.error_details``.
+#: (Until #5009 every XADD carried ``MAXLEN ~``, which silently dropped the
+#: oldest unconsumed events once the backlog reached the cap.)
 #:
 #: Size it in bytes, not counts.  Measured on dev in 2026-11 (#4474), entries
 #: are ~22 KB on average (p50 14 KB, p90 60 KB, max 278 KB) because the
@@ -132,6 +139,15 @@ def trim_consumed_entries(
     return int(trimmed or 0), floor
 
 
+class StreamBacklogFull(RuntimeError):  # noqa: N818
+    """``document.captured`` already holds ``maxlen`` unconsumed events.
+
+    Raised instead of an XADD that would push the oldest unconsumed events
+    out of the stream (#5009).  Not retryable within a run: the backlog
+    drains only when the ingestion worker consumes it.
+    """
+
+
 class EventBus:
     """Thin wrapper around Redis Streams for event emission."""
 
@@ -185,14 +201,46 @@ class EventBus:
         # JSON-compatible (datetimes as ISO strings, enums as values, etc.)
         # without the redundant JSON string round-trip.  (#191)
         payload = event.model_dump(mode="json")
-        msg_id = self._redis.xadd(
-            STREAM_DOCUMENT_CAPTURED,
-            {"data": json.dumps(payload)},
-            maxlen=self._maxlen,
-            approximate=True,
-        )
+        self._ensure_backlog_room()
+        # No MAXLEN here: an approximate MAXLEN trims the oldest entries
+        # whether or not a consumer has read them (#5009).
+        msg_id = self._redis.xadd(STREAM_DOCUMENT_CAPTURED, {"data": json.dumps(payload)})
         logger.debug("Emitted %s → %s", STREAM_DOCUMENT_CAPTURED, msg_id)
         return msg_id
+
+    def _ensure_backlog_room(self) -> None:
+        """Raise :class:`StreamBacklogFull` when the stream is at its cap.
+
+        XLEN is O(1), so the common case costs one round trip.  At the cap,
+        acknowledged entries are trimmed first (``MINID`` at the consumed
+        floor, never past it); only a backlog that is still at the cap after
+        that is refused.
+        """
+        length = int(self._redis.xlen(STREAM_DOCUMENT_CAPTURED) or 0)
+        if length < self._maxlen:
+            return
+        trimmed, floor = trim_consumed_entries(self._redis, STREAM_DOCUMENT_CAPTURED)
+        length = int(self._redis.xlen(STREAM_DOCUMENT_CAPTURED) or 0)
+        if length < self._maxlen:
+            logger.info(
+                "document.captured at cap: trimmed %d acknowledged entries (floor %s)",
+                trimmed,
+                floor,
+            )
+            return
+        logger.error(
+            "document.captured backlog full: %d entries >= cap %d after trimming %d "
+            "acknowledged entries (floor %s); refusing XADD rather than dropping "
+            "unconsumed events",
+            length,
+            self._maxlen,
+            trimmed,
+            floor,
+        )
+        raise StreamBacklogFull(
+            f"{STREAM_DOCUMENT_CAPTURED} backlog full: {length} unconsumed entries "
+            f">= cap {self._maxlen} (ingestion worker not consuming)"
+        )
 
     def emit_health(self, event: ScraperHealthEvent) -> str:
         payload = event.model_dump(mode="json")

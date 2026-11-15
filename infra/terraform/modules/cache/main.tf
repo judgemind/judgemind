@@ -48,8 +48,9 @@ resource "aws_security_group" "redis" {
 # TTL, so Redis never silently evicts them. At maxmemory it rejects XADD
 # instead, which behaves like noeviction for the streams while letting the
 # expendable cache keys make room first. Stream memory is bounded in code:
-# the ingestion worker trims acknowledged entries, and every XADD carries a
-# MAXLEN backstop (framework/events.py).
+# the ingestion worker trims acknowledged entries, and the producer refuses
+# an XADD once document.captured holds STREAM_MAXLEN unconsumed entries
+# (framework/events.py). It never trims unconsumed entries (#5009).
 
 resource "aws_elasticache_cluster" "redis" {
   cluster_id           = "judgemind-${var.environment}"
