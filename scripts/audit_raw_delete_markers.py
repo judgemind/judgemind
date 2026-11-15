@@ -52,7 +52,11 @@ GetObject / GetObjectVersion / RestoreObject on ``ca/*/*/raw/*``; #4993)::
     # --restore needs s3:DeleteObjectVersion (to remove a delete marker)
     # and s3:PutObject on raw keys. No ECS role is granted those: IAM cannot
     # tell a delete marker from a data version, and deleting a data version
-    # is permanent. Run --restore with operator credentials for dev.
+    # is permanent. The archive's bucket policy also denies
+    # s3:DeleteObjectVersion on raw keys to every principal except the
+    # break-glass role (#5013), so run --restore under that role, which an
+    # operator creates for the job (docs/agent/infrastructure-reference.md
+    # §Raw-delete break-glass).
     packages/scraper-framework/.venv/bin/python \\
         scripts/audit_raw_delete_markers.py --restore \\
         --write-keys s3://judgemind-document-archive-dev/tmp/keys/restored-4991.txt

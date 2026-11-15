@@ -37,7 +37,9 @@
 # - `aws_iam_role.agent_task` — dev-admin equivalent assumed by the
 #   `task-runner`, `diagnoser`, and `scheduled-skill` task definitions.
 #   Includes:
-#     * Full S3 (read/write/delete on every bucket in this account).
+#     * Scoped S3 (#5013): read the document archive, write its scratch
+#       prefixes, oneshot-scripts/ in the assets bucket, the sessions
+#       bucket. Not raw deletes, not bucket configuration.
 #     * Full RDS (`rds-db:connect` against every DB user in the dev
 #       cluster).
 #     * ecs:RunTask + iam:PassRole — the agent may launch its own
@@ -69,6 +71,25 @@ data "aws_partition" "current" {}
 
 locals {
   role_name_prefix = "judgemind-dispatcher-v3"
+
+  # Document-archive prefixes the agent task role may write (#5013).
+  # None of them holds raws; raw keys are `<state>/.../raw/<sha>.<ext>`.
+  archive_write_prefixes = [
+    "spotcheck",
+    "tmp",
+    "scratch",
+    "ralph-reviews",
+    "keylists",
+    "llm-cache",
+  ]
+
+  # Throwaway prefixes the role may also delete from. llm-cache/ is not
+  # here: entries are kept indefinitely (#4831).
+  archive_delete_prefixes = [
+    "spotcheck",
+    "tmp",
+    "scratch",
+  ]
 
   # F2 task-def families. The launcher needs ecs:RunTask on the three
   # short-lived families (task-runner / diagnoser / scheduled-skill);
@@ -382,7 +403,9 @@ resource "aws_iam_role_policy" "launcher_logs_read" {
 # accepted there.
 #
 # What this role can do in dev:
-#   * Full S3: read, write, delete, list across every bucket.
+#   * S3, scoped (#5013): read the document archive, write its scratch
+#     prefixes, stage oneshot scripts, archive session logs. No raw
+#     delete, no bucket configuration. See `agent_task_s3` below.
 #   * Full RDS IAM-auth connect against every DB user in the dev cluster.
 #   * Launch any ECS task on the dev cluster (including its own
 #     `scripts/ecs-run-task.sh` one-offs).
@@ -408,24 +431,95 @@ resource "aws_iam_role" "agent_task" {
   assume_role_policy = local.ecs_tasks_assume_role_policy
 }
 
-# Full S3. The agent may read raw/, write spotcheck scratch, mirror
-# session logs to the sessions bucket, etc. We accept the broad scope
-# in dev because we cannot enumerate which buckets a given /task run
-# will need to touch.
+# S3, scoped (#5013). S3 is the one service carved out of the spec §10
+# dev-admin grant: raw objects in the document archive are the
+# irreplaceable source of truth, and a role holding `s3:*` on `*` could
+# delete them or install a lifecycle rule that expires them. The grant
+# below is what the v3 code and the /task workflow use:
+#   * Read (and list) the document archive: investigations, spotchecks,
+#     rebuild/reingest dry runs read raws and derived artifacts.
+#   * Write scratch prefixes of the archive (spotcheck/, tmp/, scratch/,
+#     ralph-reviews/, keylists/, llm-cache/). Delete only on the
+#     throwaway prefixes (spotcheck/, tmp/, scratch/). Never on raw.
+#   * Put/Get/Delete under oneshot-scripts/ in the assets bucket:
+#     `scripts/ecs-run-task.sh` stages scripts >8 KB there and removes
+#     them after the task.
+#   * Put/Get on the v3 sessions bucket: agent_runner.py and
+#     diagnoser_runner.py upload `<agent_id>.jsonl` / `.txt` on exit.
+# Raw writes happen in the oneshot / ingestion / scraper roles that
+# `ecs-run-task.sh` launches, not in this role. The archive's bucket
+# policy denies raw deletes to every principal regardless (#5013).
 resource "aws_iam_role_policy" "agent_task_s3" {
   name = "${local.role_name_prefix}-agent-task-s3-${var.environment}"
   role = aws_iam_role.agent_task.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "AllowFullS3"
-        Effect   = "Allow"
-        Action   = "s3:*"
-        Resource = "*"
-      }
-    ]
+    Statement = concat(
+      var.document_archive_bucket_arn != "" ? [
+        {
+          Sid    = "ListDocumentArchive"
+          Effect = "Allow"
+          Action = [
+            "s3:ListBucket",
+            "s3:ListBucketVersions",
+            "s3:GetBucketLocation",
+            "s3:GetBucketVersioning",
+          ]
+          Resource = [var.document_archive_bucket_arn]
+        },
+        {
+          Sid    = "ReadDocumentArchive"
+          Effect = "Allow"
+          Action = [
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+          ]
+          Resource = ["${var.document_archive_bucket_arn}/*"]
+        },
+        {
+          # Every statement in this list has the same shape (list Action,
+          # list Resource) so the conditional's two branches type-check.
+          Sid    = "WriteDocumentArchiveScratch"
+          Effect = "Allow"
+          Action = ["s3:PutObject"]
+          Resource = [
+            for prefix in local.archive_write_prefixes : "${var.document_archive_bucket_arn}/${prefix}/*"
+          ]
+        },
+        {
+          Sid    = "DeleteDocumentArchiveThrowaway"
+          Effect = "Allow"
+          Action = ["s3:DeleteObject"]
+          Resource = [
+            for prefix in local.archive_delete_prefixes : "${var.document_archive_bucket_arn}/${prefix}/*"
+          ]
+        },
+      ] : [],
+      var.oneshot_script_bucket_arn != "" ? [
+        {
+          Sid    = "StageOneshotScripts"
+          Effect = "Allow"
+          Action = [
+            "s3:PutObject",
+            "s3:GetObject",
+            "s3:DeleteObject",
+          ]
+          Resource = "${var.oneshot_script_bucket_arn}/oneshot-scripts/*"
+        },
+      ] : [],
+      var.sessions_bucket_arn != "" ? [
+        {
+          Sid    = "ArchiveSessionLogs"
+          Effect = "Allow"
+          Action = [
+            "s3:PutObject",
+            "s3:GetObject",
+          ]
+          Resource = "${var.sessions_bucket_arn}/*"
+        },
+      ] : [],
+    )
   })
 }
 

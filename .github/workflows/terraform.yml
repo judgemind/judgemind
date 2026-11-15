@@ -140,6 +140,14 @@ jobs:
       - name: iam_s3_raw_audit policy-shape check
         run: bash infra/terraform/modules/iam_s3_raw_audit/tests/policy-checks/check.sh
 
+      # Raw-archive backstop (#5013). Static analysis of the HCL -- no AWS
+      # credentials needed. Asserts the document archive's bucket policy
+      # denies raw deletes to every principal but an exact break-glass
+      # ARN, no lifecycle rule expires a raw-bearing prefix, and no IAM
+      # policy under infra/terraform/ grants an S3 wildcard action.
+      - name: storage raw-archive policy check
+        run: bash infra/terraform/modules/storage/tests/policy-checks/check.sh
+
       # Check-block fixture test for dispatcher-v3-scheduled-skills (#3890).
       # Verifies the module's two `check` blocks fire at plan time when
       # the input config violates them: a task-def-arn / family mismatch

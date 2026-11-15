@@ -9,6 +9,8 @@
 #     judgemind-document-archive-dev
 #
 # Object lock is intentionally disabled for dev so test objects can be deleted.
+# Raw objects are protected by the storage module's bucket policy instead
+# (#5013).
 
 data "aws_caller_identity" "current" {}
 
@@ -53,6 +55,15 @@ module "document_archive" {
   bucket_name        = "judgemind-document-archive-dev"
   environment        = "dev"
   enable_object_lock = false
+
+  # The bucket policy denies raw deletes to every principal but the
+  # (absent by default) judgemind-raw-break-glass-dev role, and lifecycle
+  # changes to every principal but the Terraform apply identity: the
+  # account's only IAM user, whose keys terraform.yml's dev-apply uses
+  # (#5013).
+  lifecycle_admin_principal_arns = [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:user/admin",
+  ]
 }
 
 module "iam_scraper" {
@@ -460,6 +471,14 @@ module "dispatcher_v3_iam" {
   # exact failure mode F4 (#3889) hit on first deploy.
   anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
   db_connection_secret_arn     = module.database.db_connection_secret_arn
+
+  # Scoped S3 for the agent task role (#5013), replacing `s3:*` on `*`.
+  # The sessions bucket ARN is spelled out rather than read from
+  # module.dispatcher_v3_sessions, which itself consumes this module's
+  # agent_task_role_arn.
+  document_archive_bucket_arn = module.document_archive.bucket_arn
+  oneshot_script_bucket_arn   = "arn:aws:s3:::judgemind-assets-dev"
+  sessions_bucket_arn         = "arn:aws:s3:::judgemind-dispatcher-v3-sessions"
 }
 
 # ─── Dispatcher v3 sessions bucket (#3891) ──────────────────────────────────

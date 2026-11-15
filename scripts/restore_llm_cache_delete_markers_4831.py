@@ -132,12 +132,12 @@ def list_versions(s3, bucket: str, prefix: str) -> list[Version]:
     return out
 
 
-# s3-delete-not-raw: removes only llm-cache/ delete markers chosen by select_restorable
 def remove_markers(s3, bucket: str, restores: list[Restore]) -> tuple[int, list[dict]]:
     removed = 0
     errors: list[dict] = []
     for i in range(0, len(restores), DELETE_BATCH):
         batch = restores[i : i + DELETE_BATCH]
+        # s3-delete-not-raw: removes only llm-cache/ delete markers chosen by select_restorable
         resp = s3.delete_objects(
             Bucket=bucket,
             Delete={

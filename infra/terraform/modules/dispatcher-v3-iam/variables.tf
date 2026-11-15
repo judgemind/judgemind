@@ -86,17 +86,28 @@ variable "db_connection_secret_arn" {
 }
 
 # ─── S3 buckets ─────────────────────────────────────────────────────────
-# The agent task role gets full S3 because dev `/task` runs may touch
-# raw/ (S3-as-source-of-truth, see CLAUDE.md §Project Context), spotcheck/
-# scratch areas, and the v3 sessions/ prefix (F6, #3893). We accept full
-# S3 in dev — the trade-off is documented in spec §10. Production
-# accounts are not in scope.
+# The agent task role's S3 grant is scoped per bucket (#5013): S3 is the
+# one service carved out of the spec §10 dev-admin grant, because raw
+# objects are the irreplaceable source of truth. Each empty ARN below
+# drops that bucket's statements.
 #
 # The launcher does NOT get S3 access at all (it never reads or writes
 # objects).
 
+variable "document_archive_bucket_arn" {
+  description = "ARN of the document-archive bucket. The agent task role may read and list it, write its scratch prefixes (spotcheck/, tmp/, scratch/, ralph-reviews/, keylists/, llm-cache/) and delete only from spotcheck/, tmp/ and scratch/. Empty drops the grant."
+  type        = string
+  default     = ""
+}
+
+variable "oneshot_script_bucket_arn" {
+  description = "ARN of the assets bucket (`judgemind-assets-<env>`) where scripts/ecs-run-task.sh stages oneshot scripts. The agent task role gets Put/Get/Delete on `oneshot-scripts/*` only. Empty drops the grant."
+  type        = string
+  default     = ""
+}
+
 variable "sessions_bucket_arn" {
-  description = "ARN of the v3 sessions bucket where session-log streaming writes per-agent jsonl. Reserved for forward compatibility with F6 (#3893) -- the agent task role's full-S3 grant already covers writes to any bucket, but we list the bucket here for documentation and future scope-narrowing without breaking the spec section 10 dev-admin invariant."
+  description = "ARN of the v3 sessions bucket where agent_runner.py / diagnoser_runner.py upload per-agent session logs on exit. The agent task role gets PutObject + GetObject on its objects. Empty drops the grant."
   type        = string
   default     = ""
 }

@@ -764,6 +764,20 @@ One-off scripts that have been run and verified should be moved to `scripts/arch
 
 The CI `script-headers-check` job and `.githooks/pre-push` both run `scripts/check-script-headers.sh`, which fails closed on any unmarked top-level script. Check marker counts locally with `scripts/check-script-headers.py --count`.
 
+### Raw-delete break-glass
+
+The document archive's bucket policy (`infra/terraform/modules/storage/main.tf`, #5013) denies `s3:DeleteObject` and `s3:DeleteObjectVersion` on `*/raw/*`, `raw/*` and `directories/*` to every principal: roles, the `admin` IAM user, and root. It also denies `s3:PutLifecycleConfiguration` to everyone except the Terraform apply identity (`user/admin`). An explicit Deny beats every Allow, so no IAM grant can bring a raw delete back.
+
+The one exception is the role `judgemind-raw-break-glass-<env>`. **It does not exist by default.** You need it only to remove a delete marker on a raw (`scripts/audit_raw_delete_markers.py --restore`) or to delete a raw through `framework.raw_delete_guard`. An agent never creates it; it is an operator-only step.
+
+1. Create the role with an MFA-gated trust policy for the operator, and grant it the archive actions the job needs. For example, `--assume-role-policy-document` allows `arn:aws:iam::155326049300:user/admin` with `"Bool": {"aws:MultiFactorAuthPresent": "true"}`, and an inline policy allows `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:GetObjectVersion`, `s3:PutObject` and `s3:DeleteObjectVersion` on `judgemind-document-archive-dev`.
+2. Assume the role with MFA (`aws sts assume-role --serial-number ... --token-code ...`) and run the job under those credentials.
+3. Delete the role (`aws iam delete-role-policy`, then `aws iam delete-role`) when the job is done.
+
+Do not loosen the bucket policy itself, and do not add a wildcard (`ArnLike`) exception. `infra/terraform/modules/storage/tests/policy-checks/check.sh` fails CI on either.
+
+Object Lock is not enabled on the dev archive. AWS can now enable it on an existing versioned bucket, but its default retention applies to the whole bucket. That would pin the `tmp/`, `migrations/` and `spotcheck/` objects the lifecycle rules expire, and it does not stop a plain `DeleteObject`, which only adds a delete marker. The bucket policy blocks both delete forms on raw prefixes only (#5013).
+
 ## Secrets Retrieval
 
 Use `scripts/with-secret.sh` — never run `aws secretsmanager get-secret-value` as a standalone command (the secret value will appear in chat output). Never write secrets to disk. Instead, use the wrapper script to inject secrets as env vars:
