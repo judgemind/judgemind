@@ -23,6 +23,12 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   write and left the key's rows as they were (#5057).  The detail lists
   the rejections.  A reingest / rebuild run with ``--allow-ruling-removal``
   removes the rows instead.
+- ``evidence_unavailable``: a scraper pre-split child's archived page,
+  the only evidence for its LLM case number, could not be read, so the
+  worker wrote nothing for it rather than trust the number unchecked
+  (#5012).  Recorded for a read error a retry cannot fix (a missing key,
+  access denied), and for any read error on a split-set replacement.  The
+  detail carries the error and whether it was transient.
 - ``stale_validation``: written by the raw-key reconciler, not the worker
   (#5027).  Every ruling of the key failed validation under a version of a
   rule since relaxed (``validation.rule_versions``), so the key is
@@ -60,6 +66,7 @@ INCOMPLETE_EXHAUSTED_CHILD = "exhausted_child"
 INCOMPLETE_DEAD_LETTER = "dead_letter"
 INCOMPLETE_REINGEST_FAILED = "reingest_failed"
 INCOMPLETE_ALL_CHILDREN_REJECTED = "all_children_rejected"
+INCOMPLETE_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
 #: Recorded by ``scripts/reconcile_raw_keys.py`` (#5027), never the worker.
 INCOMPLETE_STALE_VALIDATION = "stale_validation"
 
@@ -71,6 +78,7 @@ INCOMPLETE_REASONS = frozenset(
         INCOMPLETE_DEAD_LETTER,
         INCOMPLETE_REINGEST_FAILED,
         INCOMPLETE_ALL_CHILDREN_REJECTED,
+        INCOMPLETE_EVIDENCE_UNAVAILABLE,
         INCOMPLETE_STALE_VALIDATION,
     }
 )

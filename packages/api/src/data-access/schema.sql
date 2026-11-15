@@ -1000,7 +1000,7 @@ CREATE TABLE telemetry.ingest_incomplete (
 );
 
 
-COMMENT ON TABLE telemetry.ingest_incomplete IS 'One row per raw S3 key whose stored rows are not a complete split (single_document_fallback, partial_split, exhausted_child, dead_letter, reingest_failed), whose split rejected every child while the key held rulings, so they were kept (all_children_rejected, #5057), or whose recorded validation failure was judged by a since-relaxed rule (stale_validation, written by the reconciler, #5027). Deleted by a later complete write of the key. Re-ingested by scripts/reconcile_raw_keys.py up to its attempt cap. Issue #5008.';
+COMMENT ON TABLE telemetry.ingest_incomplete IS 'One row per raw S3 key whose stored rows are not a complete split (single_document_fallback, partial_split, exhausted_child, dead_letter, reingest_failed), whose split rejected every child while the key held rulings, so they were kept (all_children_rejected, #5057), whose pre-split child was not written because its archived page could not be read (evidence_unavailable, #5012), or whose recorded validation failure was judged by a since-relaxed rule (stale_validation, written by the reconciler, #5027). Deleted by a later complete write of the key. Re-ingested by scripts/reconcile_raw_keys.py up to its attempt cap. Issue #5008.';
 
 
 CREATE TABLE telemetry.ingest_skips (
