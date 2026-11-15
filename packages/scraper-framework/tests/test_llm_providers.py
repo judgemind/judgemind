@@ -8,21 +8,24 @@ API shape).
 from __future__ import annotations
 
 import importlib.metadata
+import time
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import anthropic
+import httpx
 import pytest
+import respx
+import structlog
 from google import genai
+from google.genai import errors as genai_errors
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from ingestion.llm_providers import (
-    _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS,
     LLMResponse,
     _call_anthropic,
     _call_google,
     _call_google_with_images,
-    _google_retry_log_event,
-    _is_retryable_google_error,
     _try_create,
     call_llm,
     call_llm_with_images,
@@ -232,34 +235,6 @@ class TestCallGoogle:
 
         assert result is None
 
-    def test_resource_exhausted_retries(self) -> None:
-        """ResourceExhausted error triggers retry with exponential backoff."""
-        mock_response = self._make_mock_response(text="ok")
-
-        # Create a custom exception class to simulate ResourceExhausted
-        class ResourceExhaustedError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            ResourceExhaustedError("quota exceeded"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google(
-                system_prompt="sys",
-                user_message="user",
-                model="test-model",
-                client=client,
-                max_retries=1,
-            )
-
-        assert result is not None
-        assert result.text == "ok"
-        # Exponential backoff: 2**0 = 1 for first attempt
-        mock_sleep.assert_called_once_with(1)
-
     def test_missing_api_key_returns_none(self) -> None:
         """When no client and no GOOGLE_API_KEY, returns None."""
         with patch.dict("os.environ", {}, clear=True):
@@ -291,299 +266,6 @@ class TestCallGoogle:
         assert result is not None
         assert result.input_tokens == 0
         assert result.output_tokens == 0
-
-    def test_service_unavailable_retries(self) -> None:
-        """ServiceUnavailable (503) error triggers retry with exponential backoff."""
-        mock_response = self._make_mock_response(text="recovered")
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            ServiceUnavailableError("503 UNAVAILABLE"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google(
-                system_prompt="sys",
-                user_message="user",
-                model="test-model",
-                client=client,
-                max_retries=1,
-            )
-
-        assert result is not None
-        assert result.text == "recovered"
-        mock_sleep.assert_called_once_with(1)
-        assert client.models.generate_content.call_count == 2
-
-    def test_unavailable_retries(self) -> None:
-        """Unavailable (gRPC status) error triggers retry."""
-        mock_response = self._make_mock_response(text="recovered")
-
-        class UnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            UnavailableError("UNAVAILABLE"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google(
-                system_prompt="sys",
-                user_message="user",
-                model="test-model",
-                client=client,
-                max_retries=1,
-            )
-
-        assert result is not None
-        assert result.text == "recovered"
-        mock_sleep.assert_called_once_with(1)
-
-    def test_503_exponential_backoff(self) -> None:
-        """Multiple 503 retries use exponential backoff (1s, 2s, 4s)."""
-        mock_response = self._make_mock_response(text="ok")
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            ServiceUnavailableError("503"),
-            ServiceUnavailableError("503"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google(
-                system_prompt="sys",
-                user_message="user",
-                model="test-model",
-                client=client,
-                max_retries=2,
-            )
-
-        assert result is not None
-        assert result.text == "ok"
-        assert mock_sleep.call_count == 2
-        # Exponential backoff: 2**0=1, 2**1=2
-        mock_sleep.assert_any_call(1)
-        mock_sleep.assert_any_call(2)
-
-    def test_503_exhausted_returns_none(self) -> None:
-        """503 errors exhaust retries and return None."""
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = ServiceUnavailableError("503")
-
-        with patch("ingestion.llm_providers.time.sleep"):
-            result = _call_google(
-                system_prompt="sys",
-                user_message="user",
-                model="test-model",
-                client=client,
-                max_retries=2,
-            )
-
-        assert result is None
-        # 1 initial + 2 retries = 3 calls
-        assert client.models.generate_content.call_count == 3
-
-    def test_default_max_retries_is_2(self) -> None:
-        """Default max_retries for _call_google is 2."""
-        import inspect
-
-        sig = inspect.signature(_call_google)
-        assert sig.parameters["max_retries"].default == 2
-
-
-# ---------------------------------------------------------------------------
-# Google with images 503 retry tests
-# ---------------------------------------------------------------------------
-
-
-class TestCallGoogleWithImages503:
-    """Tests for 503 UNAVAILABLE retry behavior in _call_google_with_images."""
-
-    def _make_mock_response(
-        self,
-        text: str = '{"judge_name": "Test"}',
-        input_tokens: int = 100,
-        output_tokens: int = 50,
-    ) -> MagicMock:
-        usage = MagicMock()
-        usage.prompt_token_count = input_tokens
-        usage.candidates_token_count = output_tokens
-
-        response = MagicMock()
-        response.text = text
-        response.usage_metadata = usage
-        return response
-
-    def test_service_unavailable_retries(self) -> None:
-        """ServiceUnavailable (503) in vision call triggers retry."""
-        mock_response = self._make_mock_response(text="recovered")
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            ServiceUnavailableError("503 UNAVAILABLE"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google_with_images(
-                system_prompt="sys",
-                text_message="user",
-                images=[(b"fake-image", "image/png")],
-                model="test-model",
-                client=client,
-                max_retries=1,
-            )
-
-        assert result is not None
-        assert result.text == "recovered"
-        mock_sleep.assert_called_once_with(1)
-        assert client.models.generate_content.call_count == 2
-
-    def test_503_exponential_backoff(self) -> None:
-        """Multiple 503 retries in vision use exponential backoff."""
-        mock_response = self._make_mock_response(text="ok")
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = [
-            ServiceUnavailableError("503"),
-            ServiceUnavailableError("503"),
-            mock_response,
-        ]
-
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
-            result = _call_google_with_images(
-                system_prompt="sys",
-                text_message="user",
-                images=[(b"fake-image", "image/png")],
-                model="test-model",
-                client=client,
-                max_retries=2,
-            )
-
-        assert result is not None
-        assert result.text == "ok"
-        assert mock_sleep.call_count == 2
-        mock_sleep.assert_any_call(1)
-        mock_sleep.assert_any_call(2)
-
-    def test_503_exhausted_returns_none(self) -> None:
-        """503 errors exhaust retries in vision and return None."""
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = ServiceUnavailableError("503")
-
-        with patch("ingestion.llm_providers.time.sleep"):
-            result = _call_google_with_images(
-                system_prompt="sys",
-                text_message="user",
-                images=[(b"fake-image", "image/png")],
-                model="test-model",
-                client=client,
-                max_retries=2,
-            )
-
-        assert result is None
-        assert client.models.generate_content.call_count == 3
-
-    def test_default_max_retries_is_2(self) -> None:
-        """Default max_retries for _call_google_with_images is 2."""
-        import inspect
-
-        sig = inspect.signature(_call_google_with_images)
-        assert sig.parameters["max_retries"].default == 2
-
-
-# ---------------------------------------------------------------------------
-# Retryable error helper tests
-# ---------------------------------------------------------------------------
-
-
-class TestRetryableGoogleErrors:
-    """Tests for the retryable error detection helpers."""
-
-    def test_is_retryable_resource_exhausted(self) -> None:
-        """ResourceExhausted is retryable."""
-
-        class ResourceExhaustedError(Exception):
-            pass
-
-        assert _is_retryable_google_error(ResourceExhaustedError("429"))
-
-    def test_is_retryable_service_unavailable(self) -> None:
-        """ServiceUnavailable is retryable."""
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        assert _is_retryable_google_error(ServiceUnavailableError("503"))
-
-    def test_is_retryable_unavailable(self) -> None:
-        """Unavailable (gRPC) is retryable."""
-
-        class UnavailableError(Exception):
-            pass
-
-        assert _is_retryable_google_error(UnavailableError("UNAVAILABLE"))
-
-    def test_not_retryable_generic_error(self) -> None:
-        """Generic RuntimeError is not retryable."""
-        assert not _is_retryable_google_error(RuntimeError("something broke"))
-
-    def test_not_retryable_deadline_exceeded(self) -> None:
-        """DeadlineExceeded is not retryable (handled separately as timeout)."""
-
-        class DeadlineExceededError(Exception):
-            pass
-
-        assert not _is_retryable_google_error(DeadlineExceededError("timeout"))
-
-    def test_retry_log_event_rate_limit(self) -> None:
-        """ResourceExhausted uses rate_limit log event."""
-
-        class ResourceExhaustedError(Exception):
-            pass
-
-        event = _google_retry_log_event(ResourceExhaustedError("429"))
-        assert event == "llm_providers.google_rate_limit"
-
-    def test_retry_log_event_unavailable(self) -> None:
-        """ServiceUnavailable uses unavailable log event."""
-
-        class ServiceUnavailableError(Exception):
-            pass
-
-        event = _google_retry_log_event(ServiceUnavailableError("503"))
-        assert event == "llm_providers.google_unavailable"
-
-    def test_retryable_error_substrings(self) -> None:
-        """_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS contains expected substrings."""
-        assert "ResourceExhausted" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
-        assert "ServiceUnavailable" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
-        assert "Unavailable" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
-        assert len(_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1038,51 +720,6 @@ class TestAnthropicTimeout:
         assert "timeout" not in call_kwargs
 
 
-class TestGoogleTimeout:
-    """Tests for timeout behavior in the Google adapter."""
-
-    def test_deadline_exceeded_returns_none(self) -> None:
-        """DeadlineExceeded error returns None immediately (no retries)."""
-
-        class DeadlineExceededError(Exception):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = DeadlineExceededError("deadline exceeded")
-
-        result = _call_google(
-            system_prompt="sys",
-            user_message="user",
-            model="test-model",
-            client=client,
-            timeout=10.0,
-            max_retries=3,
-        )
-
-        assert result is None
-        # Should NOT retry on timeout — only one call
-        assert client.models.generate_content.call_count == 1
-
-    def test_timeout_error_returns_none(self) -> None:
-        """TimeoutError returns None immediately."""
-
-        class HTTPTimeoutError(TimeoutError):
-            pass
-
-        client = MagicMock()
-        client.models.generate_content.side_effect = HTTPTimeoutError("timed out")
-
-        result = _call_google(
-            system_prompt="sys",
-            user_message="user",
-            model="test-model",
-            client=client,
-            timeout=10.0,
-        )
-
-        assert result is None
-
-
 class TestCallLlmTimeout:
     """Tests for timeout passthrough in the call_llm dispatcher."""
 
@@ -1241,3 +878,316 @@ class TestCreateClientTypes:
         """create_client returns None for an unsupported provider name."""
         with patch.dict("os.environ", {}, clear=True):
             assert create_client(provider="openai") is None
+
+
+# ---------------------------------------------------------------------------
+# Transient-error retries with the REAL google-genai exception types (#5056)
+# ---------------------------------------------------------------------------
+#
+# Before #5056 these tests raised made-up classes named
+# ``ServiceUnavailableError`` / ``ResourceExhaustedError``, which matched the
+# old class-name check, while google-genai actually raises
+# ``google.genai.errors.ClientError`` / ``ServerError``, which did not: no
+# Gemini error was ever retried in production.  Every test here builds the
+# SDK's own exception classes, the way the SDK does
+# (``APIError.raise_error(code, response_json, response)``).
+
+
+def _genai_error(
+    code: int, status: str, *, details: list | None = None, headers: dict | None = None
+) -> genai_errors.APIError:
+    """A real ``google.genai.errors`` exception for HTTP *code*."""
+    body: dict = {"error": {"code": code, "message": f"{status} message", "status": status}}
+    if details is not None:
+        body["error"]["details"] = details
+    response = httpx.Response(code, headers=headers or {}, json=body)
+    try:
+        genai_errors.APIError.raise_error(code, body, response)
+    except genai_errors.APIError as exc:
+        return exc
+    raise AssertionError("raise_error did not raise")  # pragma: no cover
+
+
+def _ok_response(text: str = "ok") -> MagicMock:
+    usage = MagicMock()
+    usage.prompt_token_count = 10
+    usage.candidates_token_count = 5
+    response = MagicMock()
+    response.text = text
+    response.usage_metadata = usage
+    response.candidates = []
+    return response
+
+
+@pytest.fixture
+def no_sleep() -> Iterator[MagicMock]:
+    with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
+        yield mock_sleep
+
+
+class TestGenaiErrorsRetry:
+    """``_call_google`` / ``_call_google_with_images`` retry real SDK errors."""
+
+    def test_genai_errors_are_the_sdk_classes(self) -> None:
+        assert type(_genai_error(503, "UNAVAILABLE")) is genai_errors.ServerError
+        assert type(_genai_error(429, "RESOURCE_EXHAUSTED")) is genai_errors.ClientError
+
+    @pytest.mark.parametrize(
+        ("code", "status"),
+        [
+            (429, "RESOURCE_EXHAUSTED"),
+            (500, "INTERNAL"),
+            (502, "BAD_GATEWAY"),
+            (503, "UNAVAILABLE"),
+            (504, "DEADLINE_EXCEEDED"),
+        ],
+    )
+    def test_genai_errors_transient_codes_are_retried(
+        self, code: int, status: str, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [_genai_error(code, status), _ok_response()]
+
+        result = _call_google("sys", "user", "test-model", client=client, max_retries=2)
+
+        assert result is not None
+        assert result.text == "ok"
+        assert client.models.generate_content.call_count == 2
+        assert no_sleep.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("code", "status"),
+        [
+            (400, "INVALID_ARGUMENT"),
+            (401, "UNAUTHENTICATED"),
+            (403, "PERMISSION_DENIED"),
+            (404, "NOT_FOUND"),
+        ],
+    )
+    def test_genai_errors_client_errors_are_not_retried(
+        self, code: int, status: str, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(code, status)
+
+        result = _call_google("sys", "user", "test-model", client=client, max_retries=3)
+
+        assert result is None
+        assert client.models.generate_content.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_genai_errors_vision_503_then_success(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            _genai_error(503, "UNAVAILABLE"),
+            _genai_error(504, "DEADLINE_EXCEEDED"),
+            _ok_response("page text"),
+        ]
+
+        result = _call_google_with_images(
+            "sys", "user", [(b"img", "image/png")], "test-model", client=client, max_retries=2
+        )
+
+        assert result is not None
+        assert result.text == "page text"
+        assert client.models.generate_content.call_count == 3
+
+    def test_genai_errors_vision_400_not_retried(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(400, "INVALID_ARGUMENT")
+
+        result = _call_google_with_images(
+            "sys", "user", [(b"img", "image/png")], "test-model", client=client, max_retries=2
+        )
+
+        assert result is None
+        assert client.models.generate_content.call_count == 1
+
+    def test_genai_errors_exhausted_returns_none(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(503, "UNAVAILABLE")
+
+        result = _call_google("sys", "user", "test-model", client=client, max_retries=2)
+
+        assert result is None
+        assert client.models.generate_content.call_count == 3  # 1 + 2 retries
+
+    def test_genai_errors_timeouts_and_resets_are_retried(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            httpx.ReadTimeout("timed out"),
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            ConnectionResetError(104, "Connection reset by peer"),
+            _ok_response(),
+        ]
+
+        result = _call_google("sys", "user", "test-model", client=client, max_retries=3)
+
+        assert result is not None
+        assert client.models.generate_content.call_count == 4
+
+    def test_genai_errors_retry_logs_events(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            _genai_error(429, "RESOURCE_EXHAUSTED"),
+            _genai_error(503, "UNAVAILABLE"),
+            _ok_response(),
+        ]
+
+        with structlog.testing.capture_logs() as logs:
+            _call_google("sys", "user", "test-model", client=client, max_retries=2)
+
+        events = [(e["event"], e.get("status")) for e in logs]
+        assert ("llm_providers.google_rate_limit", 429) in events
+        assert ("llm_providers.google_unavailable", 503) in events
+
+    def test_genai_errors_vision_retry_log_prefix(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            _genai_error(504, "DEADLINE_EXCEEDED"),
+            _ok_response(),
+        ]
+
+        with structlog.testing.capture_logs() as logs:
+            _call_google_with_images(
+                "sys", "u", [(b"i", "image/png")], "test-model", client=client, max_retries=1
+            )
+
+        assert [e["event"] for e in logs] == ["llm_providers.google_vision_unavailable"]
+
+    def test_genai_errors_final_failure_logs_status(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(400, "INVALID_ARGUMENT")
+
+        with structlog.testing.capture_logs() as logs:
+            _call_google("sys", "user", "test-model", client=client)
+
+        (entry,) = logs
+        assert entry["event"] == "llm_providers.google_api_error"
+        assert entry["status"] == 400
+        assert entry["retryable"] is False
+
+    def test_genai_errors_final_timeout_logs_timeout_event(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = httpx.ReadTimeout("timed out")
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_google(
+                "sys", "user", "test-model", client=client, max_retries=0, timeout=5.0
+            )
+
+        assert result is None
+        assert logs[-1]["event"] == "llm_providers.google_timeout"
+
+    def test_genai_errors_retry_after_header_is_honoured(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            _genai_error(429, "RESOURCE_EXHAUSTED", headers={"Retry-After": "7"}),
+            _ok_response(),
+        ]
+
+        result = _call_google("sys", "user", "test-model", client=client, max_retries=1)
+
+        assert result is not None
+        no_sleep.assert_called_once_with(7.0)
+
+    def test_genai_errors_retry_info_delay_is_honoured(self, no_sleep: MagicMock) -> None:
+        retry_info = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "5s"}
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            _genai_error(429, "RESOURCE_EXHAUSTED", details=[retry_info]),
+            _ok_response(),
+        ]
+
+        _call_google("sys", "user", "test-model", client=client, max_retries=1)
+
+        no_sleep.assert_called_once_with(5.0)
+
+    def test_genai_errors_deadline_stops_retries(self, no_sleep: MagicMock) -> None:
+        """A retry that would not finish before the deadline is not made."""
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(503, "UNAVAILABLE")
+
+        result = _call_google_with_images(
+            "sys",
+            "user",
+            [(b"img", "image/png")],
+            "test-model",
+            client=client,
+            max_retries=5,
+            timeout=30.0,
+            deadline=time.monotonic() + 1.2,
+        )
+
+        assert result is None
+        assert client.models.generate_content.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_genai_errors_past_deadline_makes_no_call(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+
+        result = _call_google(
+            "sys", "user", "test-model", client=client, deadline=time.monotonic() - 1
+        )
+
+        assert result is None
+        client.models.generate_content.assert_not_called()
+
+    def test_genai_errors_attempt_timeout_shortened_to_deadline(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.return_value = _ok_response()
+
+        _call_google(
+            "sys",
+            "user",
+            "test-model",
+            client=client,
+            timeout=30.0,
+            deadline=time.monotonic() + 5.0,
+        )
+
+        config = client.models.generate_content.call_args.kwargs["config"]
+        assert 1000 <= config.http_options.timeout <= 5000
+
+    def test_genai_errors_sdk_retry_stays_off(self, no_sleep: MagicMock) -> None:
+        """Our loop is the only retry layer: no ``retry_options`` reach the SDK."""
+        client = MagicMock()
+        client.models.generate_content.return_value = _ok_response()
+
+        _call_google("sys", "user", "test-model", client=client, timeout=10.0)
+
+        config = client.models.generate_content.call_args.kwargs["config"]
+        assert config.http_options.retry_options is None
+
+    def test_default_max_retries_is_2(self) -> None:
+        import inspect
+
+        assert inspect.signature(_call_google).parameters["max_retries"].default == 2
+        assert inspect.signature(_call_google_with_images).parameters["max_retries"].default == 2
+
+
+class TestGenaiErrorsRealTransport:
+    """A real ``genai.Client`` over a stubbed HTTP transport: 503, then 200."""
+
+    def test_genai_errors_real_client_retries_503(self, no_sleep: MagicMock) -> None:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/test-model:generateContent"
+        ok_body = {
+            "candidates": [
+                {"content": {"parts": [{"text": "ok"}], "role": "model"}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1},
+        }
+        busy_body = {
+            "error": {"code": 503, "message": "The model is overloaded.", "status": "UNAVAILABLE"}
+        }
+        with respx.mock(assert_all_called=True) as router:
+            route = router.post(url).mock(
+                side_effect=[httpx.Response(503, json=busy_body), httpx.Response(200, json=ok_body)]
+            )
+            client = genai.Client(api_key="fake-key")
+            result = _call_google("sys", "user", "test-model", client=client, timeout=10.0)
+
+        assert route.call_count == 2
+        assert result is not None
+        assert result.text == "ok"
+        assert result.finish_reason == "STOP"

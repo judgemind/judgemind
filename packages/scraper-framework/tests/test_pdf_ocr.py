@@ -171,6 +171,77 @@ class TestOcrPdfText:
         # structlog may not appear in caplog, but we verify the function runs
 
 
+class TestOcrTransientRetry:
+    """OCR pages survive a transient Gemini error, within the run deadline (#5056).
+
+    The provider path is real down to ``client.models.generate_content``,
+    which raises the real ``google.genai.errors.ServerError``.
+    """
+
+    @staticmethod
+    def _client(side_effect: object) -> MagicMock:
+        response = MagicMock()
+        response.text = "SUPERIOR COURT OF CALIFORNIA"
+        response.usage_metadata.prompt_token_count = 10
+        response.usage_metadata.candidates_token_count = 5
+        response.candidates = []
+        client = MagicMock()
+        client.models.generate_content.side_effect = (
+            side_effect(response) if callable(side_effect) else side_effect
+        )
+        return client
+
+    @staticmethod
+    def _unavailable() -> Exception:
+        from google.genai import errors as genai_errors
+
+        return genai_errors.ServerError(
+            503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}}
+        )
+
+    def test_page_503_is_retried_and_read(
+        self, image_only_pdf_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LLM_PROVIDER", "google")
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        client = self._client(lambda ok: [self._unavailable(), ok])
+
+        with (
+            patch("google.genai.Client", return_value=client),
+            patch("ingestion.llm_retry.time.sleep"),
+        ):
+            result = ocr_pdf_text(image_only_pdf_bytes)
+
+        assert result is not None
+        assert "SUPERIOR COURT" in result
+        assert client.models.generate_content.call_count == 2
+
+    def test_retry_never_runs_past_the_ocr_deadline(
+        self, image_only_pdf_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With 1.5 s of budget, a 503 is not retried: the page is incomplete."""
+        monkeypatch.setenv("LLM_PROVIDER", "google")
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+        client = self._client(self._unavailable())
+
+        with (
+            patch("google.genai.Client", return_value=client),
+            patch("ingestion.llm_retry.time.sleep") as mock_sleep,
+        ):
+            result = ocr_pdf_text(image_only_pdf_bytes, total_timeout=1.5)
+
+        assert result is None
+        assert client.models.generate_content.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_ocr_call_passes_run_deadline_to_provider(self, image_only_pdf_bytes: bytes) -> None:
+        mock_call = _mock_ocr_response("page text")
+        with patch("ingestion.llm_extract.call_llm_with_images", mock_call):
+            ocr_pdf_text(image_only_pdf_bytes, total_timeout=60.0)
+
+        assert mock_call.call_args.kwargs["deadline"] is not None
+
+
 # ---------------------------------------------------------------------------
 # extract_text_from_pdf — OCR integration
 # ---------------------------------------------------------------------------
@@ -673,32 +744,35 @@ class TestCallGoogleWithImagesErrors:
 
         assert result is not None
 
-    def test_deadline_exceeded_returns_none(self) -> None:
-        """DeadlineExceeded error returns None immediately."""
-        from ingestion.llm_providers import _call_google_with_images
+    def test_server_timeout_exhausted_returns_none(self) -> None:
+        """A real 504 DEADLINE_EXCEEDED is retried, then None (#5056)."""
+        from google.genai import errors as genai_errors
 
-        class DeadlineExceededError(Exception):
-            pass
+        from ingestion.llm_providers import _call_google_with_images
 
         client = MagicMock()
-        client.models.generate_content.side_effect = DeadlineExceededError("deadline exceeded")
-
-        result = _call_google_with_images(
-            system_prompt="sys",
-            text_message="user",
-            images=[(b"png", "image/png")],
-            model="test-model",
-            client=client,
+        client.models.generate_content.side_effect = genai_errors.ServerError(
+            504, {"error": {"code": 504, "status": "DEADLINE_EXCEEDED"}}
         )
 
+        with patch("ingestion.llm_retry.time.sleep"):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
         assert result is None
+        assert client.models.generate_content.call_count == 2
 
-    def test_resource_exhausted_retries_then_succeeds(self) -> None:
-        """ResourceExhausted triggers retry, then succeeds."""
+    def test_rate_limit_retries_then_succeeds(self) -> None:
+        """A real 429 ClientError triggers a retry, then succeeds (#5056)."""
+        from google.genai import errors as genai_errors
+
         from ingestion.llm_providers import _call_google_with_images
-
-        class ResourceExhaustedError(Exception):
-            pass
 
         mock_response = MagicMock()
         mock_response.text = "ok"
@@ -707,11 +781,11 @@ class TestCallGoogleWithImagesErrors:
 
         client = MagicMock()
         client.models.generate_content.side_effect = [
-            ResourceExhaustedError("quota exceeded"),
+            genai_errors.ClientError(429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}),
             mock_response,
         ]
 
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+        with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
             result = _call_google_with_images(
                 system_prompt="sys",
                 text_message="user",
@@ -723,19 +797,20 @@ class TestCallGoogleWithImagesErrors:
 
         assert result is not None
         assert result.text == "ok"
-        mock_sleep.assert_called_once_with(1)
+        mock_sleep.assert_called_once()
 
-    def test_resource_exhausted_no_retries_returns_none(self) -> None:
-        """ResourceExhausted with no retries left returns None."""
+    def test_rate_limit_no_retries_returns_none(self) -> None:
+        """A 429 with no retries left returns None."""
+        from google.genai import errors as genai_errors
+
         from ingestion.llm_providers import _call_google_with_images
 
-        class ResourceExhaustedError(Exception):
-            pass
-
         client = MagicMock()
-        client.models.generate_content.side_effect = ResourceExhaustedError("quota exceeded")
+        client.models.generate_content.side_effect = genai_errors.ClientError(
+            429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}
+        )
 
-        with patch("ingestion.llm_providers.time.sleep"):
+        with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
             result = _call_google_with_images(
                 system_prompt="sys",
                 text_message="user",
@@ -746,6 +821,7 @@ class TestCallGoogleWithImagesErrors:
             )
 
         assert result is None
+        mock_sleep.assert_not_called()
 
     def test_generic_api_error_returns_none(self) -> None:
         """Generic API error returns None."""

@@ -992,7 +992,12 @@ def _ocr_region(
             return None, "out of time"
         timeout = min(timeout, remaining)
     text, reason, splittable = _ocr_call(
-        image_bytes, media_type, page_index=page_index, timeout=timeout, depth=depth
+        image_bytes,
+        media_type,
+        page_index=page_index,
+        timeout=timeout,
+        depth=depth,
+        deadline=deadline,
     )
     if text is not None:
         return text, ""
@@ -1015,6 +1020,7 @@ def _ocr_region(
                 timeout=timeout,
                 depth=depth,
                 words=True,
+                deadline=deadline,
             )
             if text is not None:
                 return text, ""
@@ -1053,8 +1059,13 @@ def _ocr_call(
     timeout: float,
     depth: int,
     words: bool = False,
+    deadline: float | None = None,
 ) -> tuple[str | None, str, bool]:
     """One vision call: ``(text, "", False)``, or ``(None, reason, splittable)``.
+
+    Transient provider errors (429 / 5xx / timeouts) are retried inside
+    ``call_llm_with_images`` (``ingestion.llm_retry``, #5056), never past
+    *deadline* (the OCR run budget).
 
     *splittable* is true for an answer the provider did not finish
     (``RECITATION``, ``MAX_TOKENS``, ...), and *reason* names why: reading
@@ -1076,6 +1087,7 @@ def _ocr_call(
             images=[(image_bytes, media_type)],
             timeout=timeout,
             thinking_budget=_OCR_THINKING_BUDGET,
+            deadline=deadline,
         )
     except Exception:
         logger.warning("ocr_pdf_text.page_error", page_index=page_index, exc_info=True)

@@ -3175,15 +3175,14 @@ class TestMultimodalTokenUsage:
 class TestExtractSinglePageRetry:
     """Tests for retry and error handling in the per-page extraction path."""
 
-    def test_retries_on_none_response(self, sample_pdf_bytes: bytes) -> None:
-        """When LLM returns None for a page, retries before giving up."""
+    def test_page_retries_delegated_to_provider(self, sample_pdf_bytes: bytes) -> None:
+        """The provider owns the retries (#5056): one call per page, asked
+        for ``max_retries - 1`` retries, so nothing retries twice."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 3
 
         mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
-        # First two calls return None, third succeeds.
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -3191,13 +3190,36 @@ class TestExtractSinglePageRetry:
             ),
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
-                side_effect=[None, None, mock_response],
+                return_value=mock_response,
             ) as mock_call,
         ):
             rulings = ext.extract_from_pdf(sample_pdf_bytes)
 
         assert len(rulings) == 1
-        assert mock_call.call_count == 3
+        assert mock_call.call_count == 1
+        assert mock_call.call_args.kwargs["max_retries"] == 2
+
+    def test_none_response_is_not_retried_again(self, sample_pdf_bytes: bytes) -> None:
+        """``None`` means the provider already used its retries (or the error
+        was not retryable, e.g. a 400): the page is not re-sent (#5056)."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._max_retries = 3
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=None,
+            ) as mock_call,
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert rulings == []
+        assert mock_call.call_count == 1
 
     def test_exhausts_retries_on_none_response(self, sample_pdf_bytes: bytes) -> None:
         """When all retries return None, returns empty list."""
@@ -3220,14 +3242,11 @@ class TestExtractSinglePageRetry:
 
         assert rulings == []
 
-    def test_retries_on_exception(self, sample_pdf_bytes: bytes) -> None:
-        """When LLM call raises an exception, retries before giving up."""
+    def test_exception_fails_page_without_crashing(self, sample_pdf_bytes: bytes) -> None:
+        """An unexpected exception from the provider fails the page, not the doc."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
-        ext._max_retries = 3
 
-        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -3235,13 +3254,13 @@ class TestExtractSinglePageRetry:
             ),
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
-                side_effect=[RuntimeError("network"), RuntimeError("timeout"), mock_response],
+                side_effect=RuntimeError("bug"),
             ) as mock_call,
         ):
             rulings = ext.extract_from_pdf(sample_pdf_bytes)
 
-        assert len(rulings) == 1
-        assert mock_call.call_count == 3
+        assert rulings == []
+        assert mock_call.call_count == 1
 
     def test_partial_page_failure(self, sample_pdf_bytes: bytes) -> None:
         """If one page fails, other pages' results are still used."""
@@ -5101,16 +5120,12 @@ class TestAppendRulingFromCaseMetadataFallback:
 class TestMultimodalChunkFailureEnrichedPayload:
     """Multimodal per-page failure events carry the rich payload (#4253)."""
 
-    def test_page_api_failure_and_exhausted_carry_image_payload(
-        self, sample_pdf_bytes: bytes
-    ) -> None:
-        """Every retry-branch warning AND the terminal error get the image SHA-256."""
+    def test_page_api_exhausted_carries_image_payload(self, sample_pdf_bytes: bytes) -> None:
+        """The terminal page failure carries the image SHA-256 and length."""
         from framework import llm_extractor as mod
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.0
-        ext._max_retries = 3  # 2 retry-branch warnings + 1 terminal error
 
         page_image = b"\x89PNG_only_page"
         with (
@@ -5131,23 +5146,6 @@ class TestMultimodalChunkFailureEnrichedPayload:
         import hashlib
 
         expected_sha = hashlib.sha256(page_image).hexdigest()
-
-        # Retry-branch warnings: every page_api_failure carries the rich payload.
-        warn_events = [
-            c
-            for c in mock_logger.warning.call_args_list
-            if c.args and c.args[0] == "llm_extractor.page_api_failure"
-        ]
-        assert len(warn_events) == ext._max_retries - 1  # attempts 1, 2
-        for ev in warn_events:
-            payload = ev.kwargs
-            assert payload["document_id"] == "multimodal-doc"
-            assert payload["chunk_kind"] == "image"
-            assert payload["chunk_content_sha256"] == expected_sha
-            assert payload["chunk_preview"] == ""
-            assert payload["chunk_len"] == len(page_image)
-
-        # Terminal exhaustion: page_api_exhausted also carries the rich payload.
         err_events = [
             c
             for c in mock_logger.error.call_args_list
@@ -5167,8 +5165,6 @@ class TestMultimodalChunkFailureEnrichedPayload:
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.0
-        ext._max_retries = 3
 
         page_image = b"\x89PNG_x"
         with (
@@ -5192,17 +5188,16 @@ class TestMultimodalChunkFailureEnrichedPayload:
         ]
         assert threshold_events == []
 
-        # The rich payload still shows up on the per-attempt warnings, just with document_id=None.
-        warn_events = [
+        err_events = [
             c
-            for c in mock_logger.warning.call_args_list
-            if c.args and c.args[0] == "llm_extractor.page_api_failure"
+            for c in mock_logger.error.call_args_list
+            if c.args and c.args[0] == "llm_extractor.page_api_exhausted"
         ]
-        assert warn_events, "expected at least one page_api_failure warning"
+        assert err_events, "expected a page_api_exhausted error"
         import hashlib
 
         expected_sha = hashlib.sha256(page_image).hexdigest()
-        for ev in warn_events:
+        for ev in err_events:
             payload = ev.kwargs
             assert payload["document_id"] is None
             assert payload["chunk_content_sha256"] == expected_sha
