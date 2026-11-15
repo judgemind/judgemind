@@ -175,7 +175,10 @@ def test_failure_report_has_fix_block() -> None:
     assert "Fix:" in report
     assert "auto-closed issue 4673" in report
     assert "gh pr edit <PR> --body-file" in report
-    assert "gh run rerun <this-run-id> --failed" in report
+    # #5078: wait-for-ci.sh ignores a failure a newer run replaced, so the
+    # Fix: block must not send the author to rerun the failed run.
+    assert "gh run rerun" not in report
+    assert "no rerun" in report
     assert "git commit --amend" in report
     assert "Development sidebar" in report
     assert "Meant to close: #5058" in report

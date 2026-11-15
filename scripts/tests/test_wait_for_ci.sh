@@ -1620,6 +1620,188 @@ test_graphql_rate_limit_no_false_positive_info() {
     fi
 }
 
+# ── Superseded runs of the same check (#5078) ──────────────────────────────
+#
+# A `pull_request: edited` event re-runs `closing-refs` in a NEW check suite
+# on the SAME head SHA, so filter=latest still returns the old run. The
+# script must judge each check by its newest run only.
+
+# Two `closing-refs` runs from different workflow runs on the same SHA plus a
+# green `ci-passed`. Args: <file> <older-conclusion> <newer-status>
+# <newer-conclusion>. The newer run (higher id, later started_at) is listed
+# FIRST so the tests prove the script orders by id, not array position.
+write_superseded_closing_refs_response() {
+    local file="$1"
+    local older="$2"
+    local newer_status="$3"
+    local newer="$4"
+    local newer_json="\"$newer\""
+    if [ "$newer" = "null" ]; then
+        newer_json="null"
+    fi
+    cat > "$file" << JSON
+{
+  "check_runs": [
+    {"id": 43761502348, "name": "closing-refs", "app": {"id": 15368, "slug": "github-actions"}, "status": "$newer_status", "conclusion": $newer_json, "started_at": "2026-11-15T21:06:00Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/2002/job/43761502348"},
+    {"id": 43761406324, "name": "closing-refs", "app": {"id": 15368, "slug": "github-actions"}, "status": "completed", "conclusion": "$older", "started_at": "2026-11-15T21:03:00Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/2001/job/43761406324"},
+    {"id": 43761300000, "name": "lint",         "app": {"id": 15368, "slug": "github-actions"}, "status": "completed", "conclusion": "success", "started_at": "2026-11-15T21:00:00Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/1"},
+    {"id": 43761300100, "name": "ci-passed",    "app": {"id": 15368, "slug": "github-actions"}, "status": "completed", "conclusion": "success", "started_at": "2026-11-15T21:01:00Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/2"}
+  ]
+}
+JSON
+}
+
+# Old failure + newer success of the same check → success (exit 0), and the
+# replaced failure is not reported.
+test_superseded_failure_newer_success_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" failure completed success
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "superseded_failure: old failure + newer success of the same check exits 0"
+    else
+        fail "superseded_failure: old failure + newer success of the same check exits 0" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -q "check(s) failed"; then
+        fail "superseded_failure: the replaced failure must not be reported" "output=$output"
+    else
+        pass "superseded_failure: the replaced failure is not reported"
+    fi
+}
+
+# Old success + newer failure of the same check → failure (exit 1).
+test_newer_failure_after_success_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" success completed failure
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "newer_failure: old success + newer failure of the same check exits 1"
+    else
+        fail "newer_failure: old success + newer failure of the same check exits 1" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -q "closing-refs: conclusion=failure.*43761502348"; then
+        pass "newer_failure: reports the newest (failing) run"
+    else
+        fail "newer_failure: reports the newest (failing) run" "output=$output"
+    fi
+}
+
+# Two different checks, one failed → failure (exit 1). Collapsing by name
+# must not let one check's success hide another check's failure.
+test_two_checks_one_failed_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    cat > "$tmpdir/responses/01.json" << 'JSON'
+{
+  "check_runs": [
+    {"id": 300, "name": "closing-refs", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/2002/job/300"},
+    {"id": 200, "name": "validate-pr",  "app": {"id": 15368}, "status": "completed", "conclusion": "failure", "details_url": "https://github.com/judgemind/judgemind/actions/runs/2001/job/200"},
+    {"id": 100, "name": "ci-passed",    "app": {"id": 15368}, "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/100"}
+  ]
+}
+JSON
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ] && echo "$output" | grep -q "validate-pr: conclusion=failure"; then
+        pass "two_checks_one_failed: a failure in a different check still exits 1"
+    else
+        fail "two_checks_one_failed: a failure in a different check still exits 1" "exit=$exit_code output=$output"
+    fi
+}
+
+# Old failure + newer run of the same check still in progress → wait (no
+# exit 1 on the replaced failure, no exit 0 before the re-run's verdict).
+test_superseded_failure_rerun_in_progress_waits() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" failure in_progress null
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 124 ]; then
+        pass "rerun_in_progress: keeps waiting (exit 124) while the re-run is going"
+    else
+        fail "rerun_in_progress: keeps waiting (exit 124) while the re-run is going" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        fail "rerun_in_progress: must not report success before the re-run finishes" "output=$output"
+    else
+        pass "rerun_in_progress: does not report success"
+    fi
+    if echo "$output" | grep -q "re-run of previously failed check(s): closing-refs"; then
+        pass "rerun_in_progress: names the check it is waiting for"
+    else
+        fail "rerun_in_progress: names the check it is waiting for" "output=$output"
+    fi
+}
+
+# Same as above, then the re-run passes on the next poll → exit 0.
+test_superseded_failure_rerun_then_success_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" failure in_progress null
+    write_superseded_closing_refs_response "$tmpdir/responses/02.json" failure completed success
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    local calls
+    calls=$(cat "$tmpdir/counter")
+    if [ "$exit_code" -eq 0 ] && [ "$calls" -ge 2 ]; then
+        pass "rerun_then_success: exits 0 once the re-run passes (calls=$calls)"
+    else
+        fail "rerun_then_success: exits 0 once the re-run passes" "exit=$exit_code calls=$calls output=$output"
+    fi
+}
+
+# Same name from a DIFFERENT app is a different check: a newer success from
+# app B must not hide app A's failure.
+test_same_name_different_app_not_collapsed() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    cat > "$tmpdir/responses/01.json" << 'JSON'
+{
+  "check_runs": [
+    {"id": 300, "name": "build",     "app": {"id": 8329}, "status": "completed", "conclusion": "success", "details_url": "https://example.com/vercel-build"},
+    {"id": 200, "name": "build",     "app": {"id": 15368}, "status": "completed", "conclusion": "failure", "details_url": "https://github.com/judgemind/judgemind/actions/runs/2001/job/200"},
+    {"id": 100, "name": "ci-passed", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/100"}
+  ]
+}
+JSON
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "different_app: same check name from another app does not hide a failure"
+    else
+        fail "different_app: same check name from another app does not hide a failure" "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -1655,6 +1837,12 @@ test_help_documents_exit_3
 test_graphql_rate_limit_falls_back_to_rest
 test_graphql_rate_limit_info_emitted_once_per_session
 test_graphql_rate_limit_no_false_positive_info
+test_superseded_failure_newer_success_exits_0
+test_newer_failure_after_success_exits_1
+test_two_checks_one_failed_exits_1
+test_superseded_failure_rerun_in_progress_waits
+test_superseded_failure_rerun_then_success_exits_0
+test_same_name_different_app_not_collapsed
 
 echo ""
 echo "────────────────────────────────────────────"

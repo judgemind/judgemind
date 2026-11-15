@@ -787,7 +787,7 @@ The PR body must include `Closes #N` so the unblock workflow fires on merge.
 {worktree}/scripts/check-pr-closing-refs.py --title "<title>" --body-file {worktree}/tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
-Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. If it fails on the open PR and you fix the body with `gh pr edit`, also re-run the failed run (`gh run rerun <run-id> --failed --repo judgemind/judgemind`): the stale failure stays on the head commit and keeps `wait-for-ci.sh` red. See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
+Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. If it fails on the open PR, fix the body with `gh pr edit`: the edit starts a fresh run on the same head commit, and `wait-for-ci.sh` judges each check by its newest run, so no manual rerun is needed (#5078). See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
 
 **PR body template — use this structure for all PRs:**
 
@@ -865,7 +865,7 @@ Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
 scripts/wait-for-ci.sh <PR-N>
 ```
 
-This polls the check-runs API with `filter=latest` and exits 0 only when the PR can merge through the protected path (#4965): no `ci-passed` check run on the head SHA is still in progress, the newest `ci-passed` run is `success`, no latest check has failed, and `mergeStateStatus` is `CLEAN`, `UNSTABLE` or `HAS_HOOKS`. `BLOCKED` keeps it waiting: branch protection has not accepted the PR yet, so `gh pr merge` would refuse. Pending entries from non-required checks (Vercel, smoke tests) and `cancelled` checks do not block (#4407). Stdout names the path with `canonical merge gate green` (mergeable is `MERGEABLE`) or `all checks complete` (mergeable could not be read, but every check has finished). Exit 1 = failure.
+This polls the check-runs API with `filter=latest` and exits 0 only when the PR can merge through the protected path (#4965): no `ci-passed` check run on the head SHA is still in progress, the newest `ci-passed` run is `success`, no check's newest run has failed (a failure replaced by a newer run of the same check, e.g. after a `gh pr edit` re-ran a PR-text check, does not count; a newer run still in progress is waited for, #5078), and `mergeStateStatus` is `CLEAN`, `UNSTABLE` or `HAS_HOOKS`. `BLOCKED` keeps it waiting: branch protection has not accepted the PR yet, so `gh pr merge` would refuse. Pending entries from non-required checks (Vercel, smoke tests) and `cancelled` checks do not block (#4407). Stdout names the path with `canonical merge gate green` (mergeable is `MERGEABLE`) or `all checks complete` (mergeable could not be read, but every check has finished). Exit 1 = failure.
 
 **Exit 124 — still running (#4835).** The call's 480s budget ran out before CI finished. This is not a failure: re-run the exact command the script prints (`scripts/wait-for-ci.sh <PR-N>`). Re-running only reads check state; it never re-triggers CI (the flake auto-rerun fires at most once per run, tracked per head SHA). Keep re-running until it exits 0, 1 or 3. Do not raise `--timeout-secs` above 480: a call still running at 600s is moved to the background by the Bash tool.
 

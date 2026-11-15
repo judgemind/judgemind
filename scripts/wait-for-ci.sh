@@ -41,6 +41,14 @@
 # edge case addressed by the per_page=100 guard). No page-split races, no
 # stale history.
 #
+# filter=latest dedupes only within one check suite (one workflow run). A
+# check re-run by a non-push event (pull_request `edited` / `reopened`, a
+# manual dispatch) lands in a new suite on the same SHA, so the old run is
+# still listed. The poll loop therefore keeps only the newest run (highest
+# check-run id) per (check name, app) before it counts failures (#5078): a
+# failure replaced by a newer run of the same check does not block, and a
+# newer run still in progress makes the script wait for its verdict.
+#
 # ── Usage ────────────────────────────────────────────────────────────────────
 #
 # Usage: scripts/wait-for-ci.sh <pr-number> [options]
@@ -64,10 +72,11 @@
 # Exit codes:
 #   0 — Success: the PR is mergeable through the protected path. Requires
 #       ALL of (#4965): no `ci-passed` check run on the head SHA is still
-#       in progress, the newest `ci-passed` run is success, no latest check
-#       has a hard-failure conclusion (failure, timed_out, action_required),
-#       and mergeStateStatus is CLEAN, UNSTABLE or HAS_HOOKS (BLOCKED keeps
-#       waiting: GitHub's branch protection is not satisfied yet, so
+#       in progress, the newest `ci-passed` run is success, no check's newest
+#       run has a hard-failure conclusion (failure, timed_out,
+#       action_required), no re-run of an earlier failed check is still
+#       going (#5078), and mergeStateStatus is CLEAN, UNSTABLE or
+#       HAS_HOOKS (BLOCKED keeps waiting: GitHub's branch protection is not satisfied yet, so
 #       `gh pr merge` would refuse). Pending entries from other, non-required
 #       check names (Vercel, smoke tests) and `cancelled` checks do not
 #       block (#4407). Stdout names the path:
@@ -532,6 +541,39 @@ while true; do
     fi
     CONSECUTIVE_ERRORS=0
 
+    # ── Collapse to the newest run per check (#5078) ─────────────────────────
+    # filter=latest dedupes only WITHIN a check suite. Every workflow run is
+    # its own suite, so an event other than a push (pull_request `edited` /
+    # `reopened`, a manual dispatch) re-runs a check in a NEW suite on the
+    # SAME head SHA, and the old run stays in the response. Before #5078 a
+    # `closing-refs` failure fixed by `gh pr edit` kept this script red after
+    # the fresh run passed, until someone ran `gh run rerun --failed`.
+    #
+    # Evaluate each check by (name, app) using only its newest run: the
+    # highest check-run id (ids grow monotonically), then the latest
+    # started_at. That is the same rule branch protection applies to a
+    # required check. A failure that a newer run of the same check replaced
+    # (success, or still in progress) no longer counts as failed.
+    #
+    # CHECK_RUNS_ALL_JSON keeps every run: the `ci-passed` rule below (#4965)
+    # still requires that NO `ci-passed` run on the SHA is in progress.
+    CHECK_RUNS_ALL_JSON="$CHECK_RUNS_JSON"
+    CHECK_RUNS_JSON=$(printf '%s' "$CHECK_RUNS_ALL_JSON" | jq '
+        group_by([(.name // ""), ((.app.id // .app.slug // "") | tostring)])
+        | map(sort_by([(.id // 0), (.started_at // "")]) | last)')
+    # Checks whose newest run is still going and whose replaced run failed:
+    # the verdict is not known yet, so success must wait for them. Without
+    # this, a re-run of a failed non-required check (which no longer counts
+    # as failed) would let the script exit 0 before the re-run finishes.
+    RERUN_PENDING_NAMES=$(printf '%s' "$CHECK_RUNS_ALL_JSON" | jq -r '
+        group_by([(.name // ""), ((.app.id // .app.slug // "") | tostring)])
+        | map(sort_by([(.id // 0), (.started_at // "")]))
+        | map(select(
+            (last | .status != "completed")
+            and (.[:-1] | any(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")))
+          ) | last | .name)
+        | join(", ")')
+
     # Count pending, passed, failed (hard), and cancelled checks.
     #
     # `cancelled` is split out from `FAILED_COUNT` (#4407) because it is not a
@@ -670,8 +712,8 @@ EOF
     #   - the newest `ci-passed` entry (highest check-run id) is success.
     # A cancelled older run is fine (it is terminal); a cancelled newest run
     # is not green.
-    CI_PASSED_PENDING=$(echo "$CHECK_RUNS_JSON" | jq '[.[] | select(.name == "ci-passed" and .status != "completed")] | length')
-    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | sort_by(.id // 0) | (last | .conclusion) // ""')
+    CI_PASSED_PENDING=$(echo "$CHECK_RUNS_ALL_JSON" | jq '[.[] | select(.name == "ci-passed" and .status != "completed")] | length')
+    CI_PASSED_CONCLUSION=$(echo "$CHECK_RUNS_ALL_JSON" | jq -r '[.[] | select(.name == "ci-passed")] | sort_by(.id // 0) | (last | .conclusion) // ""')
     if [ "$CI_PASSED_PENDING" -eq 0 ] && [ "$CI_PASSED_CONCLUSION" = "success" ]; then
         CI_PASSED_SUCCESS=true
     else
@@ -679,6 +721,16 @@ EOF
     fi
     if [ "$CI_PASSED_PENDING" -gt 0 ]; then
         CI_PASSED_CONCLUSION="in_progress (${CI_PASSED_PENDING} ci-passed run(s) still running)"
+    fi
+
+    # A re-run of a check that failed earlier on this SHA is still going
+    # (#5078): its verdict decides the PR, so no success exit until it ends.
+    if [ -n "$RERUN_PENDING_NAMES" ]; then
+        echo "  waiting for the re-run of previously failed check(s): ${RERUN_PENDING_NAMES}"
+        if [ "$CI_PASSED_SUCCESS" = "true" ]; then
+            CI_PASSED_CONCLUSION="success (waiting for re-run of: ${RERUN_PENDING_NAMES})"
+        fi
+        CI_PASSED_SUCCESS=false
     fi
 
     # ── Rebase-required fast-path (#4412) ────────────────────────────────────
