@@ -66,6 +66,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -244,7 +245,7 @@ class TestSilentHangPerPhaseReaper:
     """End-to-end ``_check_stuck_agents`` behavior with the threshold split."""
 
     def test_silent_hang_fires_when_silent_exceeds_threshold(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
         """Ralph agent silent 100min, total runtime 2h — REAP fires.
 
@@ -258,6 +259,10 @@ class TestSilentHangPerPhaseReaper:
         Without the split, the silent-hang reaper had to wait until
         elapsed ≥ 15h to fire.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 3663 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, _h = _make_daemon(tmp_path)
 
         task_arn = "arn:aws:ecs:us-west-2:155326049300:task/cluster/silent-ralph"

@@ -98,6 +98,7 @@ if str(_SCRIPTS) not in sys.path:
 import psycopg  # noqa: E402  — stub installed by conftest.py
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402
 
 
@@ -623,6 +624,7 @@ class TestExtractPriority:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerGate:
     """``_maybe_spawn_orchestration_thread`` runs only when the gate allows.
 
@@ -885,6 +887,7 @@ class TestSchedulerTickFetchQueueHelper:
             None,
         ]
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_helper_output_drives_real_scheduler_tick(self, tmp_path: Path) -> None:
         """End-to-end: feed the helper output into a live ``scheduler_tick``.
 
@@ -904,6 +907,7 @@ class TestSchedulerTickFetchQueueHelper:
         assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerGateOrphanDetectionExample:
     """End-to-end demonstration that the helper supports AC3.
 
@@ -1101,6 +1105,7 @@ class TestActiveAgentCount:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerGateCapGreaterThanOne:
     """The ``scheduler_tick`` gate compares running-agent count to ``concurrency_cap``.
 
@@ -1690,7 +1695,13 @@ class TestPickCandidate:
 
 
 class TestAtomicClaim:
-    def test_happy_path_inserts_and_returns_true(self, tmp_path: Path) -> None:
+    def test_happy_path_inserts_and_returns_true(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
+        # The claim adds the status/in-progress interlock label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --add-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
         ok = d._atomic_claim(42, "agent-uuid", "/path")
         assert ok is True
@@ -1707,11 +1718,17 @@ class TestAtomicClaim:
         assert conn.commits == 1
         assert handler.events("claim_succeeded") != []
 
-    def test_priority_parameter_is_passed_to_insert(self, tmp_path: Path) -> None:
+    def test_priority_parameter_is_passed_to_insert(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """Issue #2899 — the daemon pipes the priority through to the
         INSERT so the admin cockpit can render the priority badge in
         the active-agents and recently-completed panels.
         """
+        # The claim adds the status/in-progress interlock label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --add-label status/in-progress"
+        )
         d, conn, _handler = _make_daemon(tmp_path)
         ok = d._atomic_claim(42, "agent-uuid", "/path", priority="p0")
         assert ok is True
@@ -1725,10 +1742,16 @@ class TestAtomicClaim:
         _sql, params = inserts[0]
         assert params[-2] == "p0"
 
-    def test_priority_default_none_passes_null(self, tmp_path: Path) -> None:
+    def test_priority_default_none_passes_null(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """Priority is optional; omitting it stores NULL (pre-migration-33
         fallback behaviour).
         """
+        # The claim adds the status/in-progress interlock label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --add-label status/in-progress"
+        )
         d, conn, _handler = _make_daemon(tmp_path)
         ok = d._atomic_claim(42, "agent-uuid", "/path")
         assert ok is True

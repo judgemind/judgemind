@@ -50,6 +50,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -189,6 +191,7 @@ class TestOrchestrationOrphanDetection:
         d, _conn, _handler = _make_daemon()
         assert d._orchestration_orphan_tick_count == 0
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_counter_increments_when_thread_alive_and_no_active_agent(
         self,
     ) -> None:
@@ -220,6 +223,7 @@ class TestOrchestrationOrphanDetection:
         # Thread handle untouched — one tick isn't enough yet.
         assert d._orchestration_thread is live
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_counter_resets_when_active_agent_exists(self) -> None:
         """An active agent row means the thread IS doing legitimate
         work; the orphan state is not present, so the counter resets.
@@ -240,6 +244,7 @@ class TestOrchestrationOrphanDetection:
         assert d._orchestration_orphan_tick_count == 0
         assert d._orchestration_thread is live
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_counter_resets_when_thread_dead(self) -> None:
         """No live thread → no orphan condition → counter resets."""
         d, conn, _handler = _make_daemon()
@@ -256,6 +261,7 @@ class TestOrchestrationOrphanDetection:
 
         assert d._orchestration_orphan_tick_count == 0
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_clears_thread_handle_after_threshold(self) -> None:
         """At the configured threshold (5 ticks ≈ 150s at 30s cadence)
         the daemon logs ``orchestration_orphaned`` and resets the
@@ -282,6 +288,7 @@ class TestOrchestrationOrphanDetection:
         assert d._orchestration_thread is None
         assert d._orchestration_orphan_tick_count == 0
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_event_payload_shape(self) -> None:
         """The log event carries enough context for CloudWatch filtering
         — run_id + the wedged thread's name + the number of ticks."""
@@ -319,6 +326,7 @@ class TestOrchestrationOrphanDetection:
             "between an agent terminal status write and the thread exit"
         )
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_detection_skipped_when_paused(self) -> None:
         """When the daemon is paused the orphan check is skipped —
         a paused daemon may legitimately have a long-running thread
@@ -343,6 +351,7 @@ class TestOrchestrationOrphanDetection:
         # We did NOT increment — a paused daemon is not the wedge state.
         assert d._orchestration_orphan_tick_count == 0
 
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
     def test_orphan_threshold_respawn_sequence(self) -> None:
         """End-to-end: five consecutive orphan ticks → handle cleared →
         event fires exactly once (covers AC #2: recovers in ≤5 ticks)."""

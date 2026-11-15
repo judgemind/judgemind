@@ -50,6 +50,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402 — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -204,13 +205,17 @@ class TestProcessRetryMarkersOnlyInfraPreemption:
         assert params is None
 
     def test_filtered_call_still_takes_terminal_and_reclaim_path(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """An infra-preemption row returned by the filtered SELECT still hits
         the terminal-and-reclaim branch (``_mark_agent_terminal`` + re-add
         ``agent/ready``) — the filter only narrows the SELECT, it does not
         change the per-row processing logic.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 123 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
             [

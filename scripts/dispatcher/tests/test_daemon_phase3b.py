@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -1673,6 +1675,7 @@ class TestAwaitingDeployNoDeployRun:
 
 
 class TestSupervisorTickIntegration:
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
     def test_supervisor_tick_invokes_advance(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         # First fetchone() = failures count.
@@ -1697,6 +1700,7 @@ class TestSupervisorTickIntegration:
         assert ticks
         assert getattr(ticks[0], "agents_advanced", None) == 0
 
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
     def test_supervisor_tick_survives_advance_exception(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [(0,)]

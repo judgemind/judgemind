@@ -43,6 +43,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 class _FakeCursor:
@@ -184,8 +185,14 @@ class TestDetectVerifySkipReason:
 
 class TestWriteMergedAt:
     def test_writes_status_succeeded_and_merged_at_in_one_update(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
+        # Post-merge cleanup (#3411) probes the issue state; the PR's
+        # Closes keyword already closed it, so the cleanup is skipped.
+        fake_gh.expect(
+            "issue view 42 --repo judgemind/judgemind --json state",
+            stdout='{"state": "CLOSED"}',
+        )
         d, conn, _handler = _make_daemon(tmp_path)
         # Best-effort side-effect paths are stubbed — we assert the
         # primary UPDATE here; sibling tests cover the side effects.
@@ -215,7 +222,15 @@ class TestWriteMergedAt:
         assert "failure_summary = NULL" in sql
         assert params == (123, "aaaa-bbbb")
 
-    def test_runs_best_effort_side_effects_on_success(self, tmp_path: Path) -> None:
+    def test_runs_best_effort_side_effects_on_success(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
+        # Post-merge cleanup (#3411) probes the issue state; the PR's
+        # Closes keyword already closed it, so the cleanup is skipped.
+        fake_gh.expect(
+            "issue view 17 --repo judgemind/judgemind --json state",
+            stdout='{"state": "CLOSED"}',
+        )
         d, _conn, _handler = _make_daemon(tmp_path)
         d._write_diagnosis_outcome_for_agent = MagicMock()  # type: ignore[method-assign]
         d._write_terminal_outcome = MagicMock()  # type: ignore[method-assign]
@@ -246,8 +261,16 @@ class TestWriteMergedAt:
 
         d._gh_issue_remove_labels.assert_not_called()
 
-    def test_side_effect_failure_does_not_propagate(self, tmp_path: Path) -> None:
+    def test_side_effect_failure_does_not_propagate(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """A failure in a best-effort side-effect must not unwind the flip."""
+        # Post-merge cleanup (#3411) probes the issue state; the PR's
+        # Closes keyword already closed it, so the cleanup is skipped.
+        fake_gh.expect(
+            "issue view 17 --repo judgemind/judgemind --json state",
+            stdout='{"state": "CLOSED"}',
+        )
         d, _conn, handler = _make_daemon(tmp_path)
         d._write_diagnosis_outcome_for_agent = MagicMock(  # type: ignore[method-assign]
             side_effect=RuntimeError("diagnoses table not yet migrated")

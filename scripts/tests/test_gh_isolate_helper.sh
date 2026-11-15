@@ -30,6 +30,8 @@ cat > "$TMPDIR_TEST/child.sh" <<EOF
 set -uo pipefail
 export GH_TOKEN=ghp_fake_token_5071 GITHUB_TOKEN=ghp_fake_token_5071
 export GH_ENTERPRISE_TOKEN=fake GITHUB_ENTERPRISE_TOKEN=fake
+# This child calls the shim on purpose, so a hit must not fail it (#5075).
+export GH_ISOLATE_ALLOW_HITS=1
 . "$HELPER"
 echo "gh_path=\$(command -v gh)"
 echo "gh_token=\${GH_TOKEN:-unset} github_token=\${GITHUB_TOKEN:-unset}"
@@ -70,6 +72,65 @@ printf '#!/bin/sh\necho "fake gh: $*"\n' > "$TMPDIR_TEST/bin/gh"
 chmod +x "$TMPDIR_TEST/bin/gh"
 stub_out="$(PATH="$TMPDIR_TEST/bin:$PATH" gh issue view 1)"
 assert_eq "a test's own gh stub wins" "$stub_out" "fake gh: issue view 1"
+
+# A shim hit fails the test that sourced the helper (#5075), even when the
+# gh call is buried in a script whose stderr is discarded, and even though
+# the test installed its own EXIT trap (which must still run).
+cat > "$TMPDIR_TEST/script-under-test.sh" <<'EOF'
+#!/usr/bin/env bash
+state=$(gh pr view 7 --repo judgemind/judgemind --json state 2>/dev/null) || state=unknown
+echo "state=$state"
+EOF
+chmod +x "$TMPDIR_TEST/script-under-test.sh"
+cat > "$TMPDIR_TEST/hit-test.sh" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+unset GH_ISOLATE_ALLOW_HITS
+. "$HELPER"
+cleanup() { echo cleanup-ran > "$TMPDIR_TEST/hit-cleanup-marker"; }
+trap cleanup EXIT
+echo "hits_file=\$GH_ISOLATE_HITS"
+out=\$("$TMPDIR_TEST/script-under-test.sh")
+echo "after-hit: \$out"
+exit 0
+EOF
+chmod +x "$TMPDIR_TEST/hit-test.sh"
+rc=0
+hit_out="$("$TMPDIR_TEST/hit-test.sh" 2>"$TMPDIR_TEST/hit-err")" || rc=$?
+hit_err="$(cat "$TMPDIR_TEST/hit-err")"
+assert_eq "shim hit: the test exits 1" "$rc" "1"
+assert_contains "shim hit: FAIL names the problem" "$hit_err" "FAIL: real gh called from a test (#5075): $TMPDIR_TEST/hit-test.sh"
+assert_contains "shim hit: FAIL lists the gh command" "$hit_err" "  gh pr view 7 --repo judgemind/judgemind --json state"
+assert_contains "shim hit: FAIL prints a Fix line" "$hit_err" "Fix: install a fake gh"
+case "$hit_out" in
+    *after-hit*) fail "shim hit: the test stops before its next command" "$hit_out" ;;
+    *) pass "shim hit: the test stops before its next command" ;;
+esac
+if [ -f "$TMPDIR_TEST/hit-cleanup-marker" ]; then
+    pass "shim hit: the test's own EXIT trap still runs"
+else
+    fail "shim hit: the test's own EXIT trap still runs" "no cleanup marker"
+fi
+hits_file="${hit_out#hits_file=}"
+hits_file="${hits_file%%$'\n'*}"
+if [ -n "$hits_file" ] && [ ! -e "$hits_file" ]; then
+    pass "shim hit: the hits file is removed"
+else
+    fail "shim hit: the hits file is removed" "hits_file=$hits_file"
+fi
+
+# GH_ISOLATE_ALLOW_HITS=1 (a test of the shim itself) keeps a hit non-fatal.
+rc=0
+allow_out="$(GH_ISOLATE_ALLOW_HITS=1 bash -c ". \"$HELPER\"; gh auth status 2>/dev/null; echo \"rc=\$?\"; echo still-running")" || rc=$?
+assert_eq "GH_ISOLATE_ALLOW_HITS=1: the process exits 0" "$rc" "0"
+assert_contains "GH_ISOLATE_ALLOW_HITS=1: gh exits 4" "$allow_out" "rc=4"
+assert_contains "GH_ISOLATE_ALLOW_HITS=1: the process keeps running" "$allow_out" "still-running"
+
+# A test's own fake gh never triggers the failure.
+rc=0
+fake_out="$(bash -c ". \"$HELPER\"; PATH=\"$TMPDIR_TEST/bin:\$PATH\"; gh issue view 2; echo still-running")" || rc=$?
+assert_eq "fake gh: no shim hit, the process exits 0" "$rc" "0"
+assert_contains "fake gh: the process keeps running" "$fake_out" "still-running"
 
 # The helper refuses to run when the fixture config dir holds a login.
 mkdir -p "$TMPDIR_TEST/copy-tests/fixtures"

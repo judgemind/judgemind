@@ -36,6 +36,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import GH_QUEUE_SCAN, FakeGh  # noqa: E402
 from dispatcher.tests._fixtures import psycopg_jsonb, psycopg_jsonb_legacy  # noqa: E402
 
 
@@ -666,13 +667,18 @@ class TestConsumeCommands:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerTickGracefulStop:
     """scheduler_tick observes cap=0 but respects _graceful_stop_requested."""
 
-    def test_graceful_stop_cap_zero_does_not_engage_killswitch(self) -> None:
+    def test_graceful_stop_cap_zero_does_not_engage_killswitch(
+        self, fake_gh: FakeGh
+    ) -> None:
         """AC3: stop finishes in-flight agent then sets cap=0.
         The flag (set by _handle_stop) tells scheduler_tick to NOT set
         _pause_requested, so the in-flight worker keeps running."""
+        # The tick still scans the agent/ready queue with cap=0.
+        fake_gh.expect(GH_QUEUE_SCAN, stdout="[]")
         d, conn, handler = _make_daemon_with_capture()
         d._graceful_stop_requested = True
         # SELECTs in scheduler_tick cap==0 branch:
@@ -687,10 +693,12 @@ class TestSchedulerTickGracefulStop:
         assert handler.events("graceful_stop_in_progress") != []
         assert handler.events("killswitch_engaged") == []
 
-    def test_force_stop_path_engages_killswitch(self) -> None:
+    def test_force_stop_path_engages_killswitch(self, fake_gh: FakeGh) -> None:
         """When NOT in graceful-stop mode, cap=0 still engages the
         killswitch — this is the default #2847 behaviour for config
         edits / circuit-breaker / force_stop."""
+        # The tick still scans the agent/ready queue with cap=0.
+        fake_gh.expect(GH_QUEUE_SCAN, stdout="[]")
         d, conn, handler = _make_daemon_with_capture()
         assert d._graceful_stop_requested is False
         conn.cursor_instance.fetch_queue = [(0,)]
@@ -786,6 +794,7 @@ class TestCheckKillswitchTerminalPhase:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestClaimGateLegacyPausedKey:
     """The ``dispatcher.config.paused`` key is no longer written by any
     command handler (pause/resume were removed in #2884), but

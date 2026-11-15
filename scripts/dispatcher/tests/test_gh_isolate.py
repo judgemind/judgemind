@@ -23,6 +23,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 _TOKEN_VARS = (
     "GH_TOKEN",
@@ -38,7 +39,7 @@ def _run_gh(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_gh_auth_status_fails_under_suite_env() -> None:
+def test_gh_auth_status_fails_under_suite_env(gh_shim_allowed: None) -> None:
     """``gh auth status`` must fail even when gh is logged in on this machine."""
     result = _run_gh("auth", "status")
     assert result.returncode != 0
@@ -46,7 +47,7 @@ def test_gh_auth_status_fails_under_suite_env() -> None:
 
 
 def test_gh_issue_close_with_fake_token_hits_shim(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, gh_shim_allowed: None
 ) -> None:
     """A token in the env does not help: ``gh issue close`` hits the shim.
 
@@ -125,3 +126,68 @@ def test_real_gh_healers_marker_keeps_real_methods() -> None:
     ):
         method = getattr(daemon.DispatcherDaemon, healer)
         assert method.__module__ == daemon.__name__, healer
+
+
+# --------------------------------------------------------------------------
+# FakeGh / fake_gh fixture (#5075)
+# --------------------------------------------------------------------------
+
+
+def _fake_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeGh:
+    fake = FakeGh(tmp_path / "fake")
+    monkeypatch.setenv("PATH", f"{fake.bin_dir}{os.pathsep}{os.environ['PATH']}")
+    return fake
+
+
+def test_fake_gh_answers_from_first_matching_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_on_path(tmp_path, monkeypatch)
+    fake.expect("issue view 7 --json state", stdout='{"state": "OPEN"}\n')
+    fake.expect("issue view * --json state", stdout='{"state": "CLOSED"}\n')
+    fake.allow("api *", stderr="HTTP 404\n", exit_code=1)
+
+    seven = _run_gh("issue", "view", "7", "--json", "state")
+    eight = _run_gh("issue", "view", "8", "--json", "state")
+    api = _run_gh("api", "repos/x/y/issues/1", "--jq", '"\\(.user.login)"')
+
+    assert (seven.returncode, seven.stdout) == (0, '{"state": "OPEN"}\n')
+    assert (eight.returncode, eight.stdout) == (0, '{"state": "CLOSED"}\n')
+    assert (api.returncode, api.stderr) == (1, "HTTP 404\n")
+    assert fake.calls == [
+        "issue view 7 --json state",
+        "issue view 8 --json state",
+        'api repos/x/y/issues/1 --jq "\\(.user.login)"',
+    ]
+    assert fake.calls_matching("issue view *") == fake.calls[:2]
+    fake.verify()
+
+
+def test_fake_gh_fails_an_unmatched_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_on_path(tmp_path, monkeypatch)
+    fake.allow("issue list *", stdout="[]")
+    result = _run_gh("issue", "close", "42", "--comment", "it's done")
+    assert result.returncode == 97
+    assert "no fake_gh rule matches: gh issue close 42" in result.stderr
+    with pytest.raises(AssertionError, match="gh calls with no fake_gh rule"):
+        fake.verify()
+
+
+def test_fake_gh_fails_a_missing_expected_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _fake_on_path(tmp_path, monkeypatch)
+    fake.expect("issue edit 42 --add-label status/in-progress")
+    fake.allow("api rate_limit *")
+    with pytest.raises(AssertionError, match="expected gh calls that were never"):
+        fake.verify()
+
+
+def test_fake_gh_fixture_keeps_the_shim_quiet(fake_gh: FakeGh) -> None:
+    """A gh call answered by ``fake_gh`` never reaches the gh shim (#5075)."""
+    fake_gh.expect("auth status", stdout="Logged in (fake)\n")
+    result = _run_gh("auth", "status")
+    assert result.stdout == "Logged in (fake)\n"
+    assert "real gh called from a test" not in result.stderr
