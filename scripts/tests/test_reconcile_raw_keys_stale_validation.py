@@ -181,7 +181,7 @@ def test_run_records_and_reingests_stale_keys_through_the_incomplete_path(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )

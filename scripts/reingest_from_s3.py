@@ -107,6 +107,13 @@ Options:
                         a run whose every key is deferred exits 5 (#5043).
                         Their reingest fails validation today and replaces
                         each key's rulings with nothing.
+    --write-crashed-manifest s3://bucket/key
+                        Write the keys whose worker process died (the pool
+                        broke, e.g. a worker was OOM-killed) to this S3
+                        object, one per line.  A subset of the failed keys:
+                        a key that failed inside the worker is not listed.
+                        ``reconcile_raw_keys.py`` reads it to find which keys
+                        a crash took down (#5054).
 
 Removed with the DB-row write path (#4845): ``--full-reparse`` and
 ``--multimodal`` (the worker always re-derives the split, with the county's
@@ -1288,6 +1295,7 @@ def run_reingest_from_prefix(
     s3_key_list: list[str] | None = None,
     write_failed_manifest: str | None = None,
     include_deferred: bool = False,
+    write_crashed_manifest: str | None = None,
 ) -> dict[str, Any]:
     """Prefix mode: re-ingest the S3 objects under *prefix*.
 
@@ -1325,6 +1333,9 @@ def run_reingest_from_prefix(
     write_failed_manifest:
         Optional ``s3://bucket/key``: when keys fail, write them there (one
         per line) for a retry with ``--s3-key-list`` (#4619).
+    write_crashed_manifest:
+        Optional ``s3://bucket/key``: the keys whose worker process died
+        (``BrokenProcessPool``), one per line (#5054).
     include_deferred:
         Also re-ingest keys of a deferred backlog (#5043), which are
         otherwise skipped (``deferred_skipped`` in the stats).
@@ -1422,6 +1433,7 @@ def run_reingest_from_prefix(
         parse_timeout=parse_timeout,
         skip_judge_prepass=skip_judge_prepass,
         write_failed_manifest=write_failed_manifest,
+        write_crashed_manifest=write_crashed_manifest,
         s3_client=s3_client,
     )
     return _with_deferred_count(stats, split)
@@ -1492,6 +1504,7 @@ def run_reingest(
     skip_judge_prepass: bool = False,
     write_failed_manifest: str | None = None,
     include_deferred: bool = False,
+    write_crashed_manifest: str | None = None,
 ) -> dict[str, Any]:
     """DB-row mode: re-ingest the S3 objects behind the matching rows.
 
@@ -1549,6 +1562,7 @@ def run_reingest(
         parse_timeout=parse_timeout,
         skip_judge_prepass=skip_judge_prepass,
         write_failed_manifest=write_failed_manifest,
+        write_crashed_manifest=write_crashed_manifest,
         s3_client=s3_client,
         mode="db",
     )
@@ -1568,6 +1582,7 @@ def _reingest_keys(
     write_failed_manifest: str | None,
     s3_client: object | None = None,
     mode: str = "prefix",
+    write_crashed_manifest: str | None = None,
 ) -> dict[str, Any]:
     """Run each S3 object in *keys* through ``IngestionWorker.process_event``.
 
@@ -1659,6 +1674,10 @@ def _reingest_keys(
     skipped = 0
     hash_mismatch_warnings = 0
     failed_keys: list[str] = []
+    # Keys whose future raised instead of returning a status: the worker
+    # process died (a broken pool, e.g. an OOM kill), not the key's
+    # processing (#5054).
+    crashed_keys: list[str] = []
     # Keys no extractor could read: reported, never retried (#4983).
     unextractable_keys: list[str] = []
     error_classes: Counter[str] = Counter()
@@ -1732,6 +1751,7 @@ def _reingest_keys(
             except Exception as exc:
                 errors += 1
                 failed_keys.append(key)
+                crashed_keys.append(key)
                 error_classes[type(exc).__name__] += 1
                 logger.error("Failed to process", key=key, error=str(exc))
 
@@ -1760,6 +1780,7 @@ def _reingest_keys(
         "error_ratio": error_ratio,
         "top_error_class": top_error_class,
         "failed_keys": failed_keys,
+        "crashed_keys": crashed_keys,
         "unextractable": len(unextractable_keys),
         "unextractable_keys": unextractable_keys,
     }
@@ -1773,7 +1794,9 @@ def _reingest_keys(
     # Spread the stats into the completion log but report ``failed_keys`` as a
     # count rather than dumping the full list (which can be hundreds of keys).
     log_stats = {
-        k: v for k, v in stats.items() if k not in ("failed_keys", "unextractable_keys")
+        k: v
+        for k, v in stats.items()
+        if k not in ("failed_keys", "crashed_keys", "unextractable_keys")
     }
     logger.info(
         "Key reingest complete",
@@ -1799,6 +1822,16 @@ def _reingest_keys(
             "Wrote failed-keys manifest",
             manifest_uri=write_failed_manifest,
             failed_key_count=len(failed_keys),
+        )
+
+    if write_crashed_manifest and crashed_keys:
+        manifest_bucket, manifest_key = _parse_s3_uri(write_crashed_manifest)
+        body = ("\n".join(crashed_keys) + "\n").encode("utf-8")
+        s3_client.put_object(Bucket=manifest_bucket, Key=manifest_key, Body=body)
+        logger.info(
+            "Wrote crashed-keys manifest",
+            manifest_uri=write_crashed_manifest,
+            crashed_key_count=len(crashed_keys),
         )
 
     if hash_mismatch_warnings > 0:
@@ -2022,6 +2055,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--write-crashed-manifest",
+        type=str,
+        default=None,
+        dest="write_crashed_manifest",
+        help=(
+            "An s3://bucket/key destination.  Write the keys whose worker "
+            "process died (a broken pool, e.g. an OOM kill) there, one per "
+            "line (#5054)."
+        ),
+    )
+    parser.add_argument(
         "--include-deferred",
         action="store_true",
         dest="include_deferred",
@@ -2070,6 +2114,7 @@ def main() -> None:
         "skip_judge_prepass": args.skip_judge_prepass,
         "s3_key_list": s3_key_list_values,
         "write_failed_manifest": args.write_failed_manifest,
+        "write_crashed_manifest": args.write_crashed_manifest,
         "include_deferred": args.include_deferred,
     }
     if args.prefix:

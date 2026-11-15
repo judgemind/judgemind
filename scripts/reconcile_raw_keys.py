@@ -42,9 +42,14 @@ only: no object is read) and sorts each one into a category:
                      the unrepresented keys wait for a human, but up to
                      ``--max-auto-reingest`` incomplete keys still
                      re-ingest on their own (``reingest_scope``
-                     ``incomplete_only``).  A reingest that runs to the
-                     end counts one ``retry_attempts``, and a complete
-                     reingest deletes the row (the worker).
+                     ``incomplete_only``).  Every launch of a reingest
+                     with the key counts one ``retry_attempts`` (at most
+                     one per run), committed before the subprocess starts,
+                     so a reingest that crashes, is OOM-killed or takes the
+                     whole task down still counts (#5054); only a launch
+                     that never happened is not counted.  A complete
+                     reingest deletes the row (the worker).  See "Crash
+                     isolation" below.
                      A key whose only explanation is a validation failure
                      judged by an older version of a since-relaxed rule
                      (``validation.rule_versions.RULE_VERSIONS``, #5027) is
@@ -118,6 +123,33 @@ Modes:
   ``over_threshold``, ``persistent`` or ``reingest_failed``
   (``issue_needed`` in the result).  No human alert.
 
+  Crash isolation (#5054).  One key that kills the reingest (a document
+  that exhausts memory) must not sink the other keys of its run:
+
+  - each ``<state>/`` prefix's keys run in one ``reingest_from_s3.py``
+    subprocess, except incomplete keys recorded ``dead_letter`` (they killed
+    the live worker, #5010), which run one key per subprocess after the
+    batched launches;
+  - a launch that does not come back clean is bisected in the same run:
+    a non-zero exit (a crash, or a signal: ``-9`` / ``137`` for an OOM kill)
+    implicates every key of the launch, an exit 0 with keys in its
+    ``--write-crashed-manifest`` (a pool worker died) implicates those keys.
+    The implicated keys re-run in halves until each crashing key is alone;
+    the halves that come back clean heal as usual.  No key is counted twice
+    in one run.  The keys that crash alone are ``REINGEST_CRASH`` lines and
+    ``reingest_crashed`` in the result; at the attempt cap they become
+    ``incomplete_stuck`` and are reported once;
+  - the reingest runs with ``oom_score_adj`` 1000, so the kernel's OOM
+    killer picks it (or its pool workers) before this process, which then
+    records the outcome.  If the whole task dies anyway, the attempt was
+    already counted, so the loop still ends at the cap.
+
+  Bisection only re-runs keys a crash implicated, so it costs nothing on a
+  clean run and about ``2 * log2(n)`` extra launches per crashing key.
+  ``--simulate-crash-key KEY`` (manual verification only, never in the
+  scheduled workflow) replaces any launch holding KEY with a subprocess that
+  SIGKILLs itself, to exercise this path on dev without crashing a worker.
+
 - ``--write-keys URI_STEM`` writes the unrepresented keys per scope to
   ``<stem>-<state>_<county>.txt`` (or ``-NN.txt`` chunks of
   ``--chunk-size``) for a manual ``reingest_from_s3.py --s3-key-list``.
@@ -141,7 +173,8 @@ Options: ``--prefix P`` (default: every capture prefix), ``--county NAME``
 "not available" notices as skipped; reads objects, so not for the daily
 run), ``--write-keys``, ``--chunk-size``, ``--sample``, ``--record``,
 ``--reingest``, ``--defer-reingest``, ``--max-auto-reingest``,
-``--persist-runs``, ``--reingest-concurrency``, ``--reingest-script``.
+``--persist-runs``, ``--reingest-concurrency``, ``--reingest-script``,
+``--simulate-crash-key``.
 """
 
 from __future__ import annotations
@@ -243,6 +276,19 @@ DEFAULT_MAX_INCOMPLETE_ATTEMPTS = 3
 #: incomplete reason this script records for a key whose validation failure
 #: was judged by a since-relaxed rule version (#5027).
 STALE_VALIDATION = "stale_validation"
+
+#: Incomplete reasons whose keys re-ingest one key per subprocess, after the
+#: batched launches (#5054).  A ``dead_letter`` key killed the live worker
+#: ``MAX_MESSAGE_DELIVERIES`` times (#5010), so it is the likeliest to kill a
+#: reingest too.
+ISOLATED_REASONS = frozenset({"dead_letter"})
+
+#: ``--simulate-crash-key``: the subprocess that stands in for a reingest
+#: holding the key.  It SIGKILLs itself, like the OOM killer would.
+SIMULATED_CRASH_ARGS = (
+    "-c",
+    "import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
+)
 
 #: Where the oneshot task role may read and write key lists (#4803).
 KEY_LIST_DIR = "tmp/keys/"
@@ -758,14 +804,30 @@ def fetch_explained(conn: Any) -> Explained:
 
 def count_incomplete_attempts(conn: Any, keys: Sequence[str]) -> None:
     """Count one reingest attempt for each incomplete key about to be
-    re-ingested (#5008).  A complete reingest deletes the record (the
-    worker), so the count only survives for a key that stays incomplete."""
+    re-ingested (#5008), committed before the launch so a crash still
+    counts (#5054).  A complete reingest deletes the record (the worker),
+    so the count only survives for a key that stays incomplete."""
     if not keys:
         return
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE telemetry.ingest_incomplete "
             "SET retry_attempts = retry_attempts + 1, last_retry_at = now() "
+            "WHERE s3_key = ANY(%s)",
+            (list(keys),),
+        )
+    conn.commit()
+
+
+def refund_incomplete_attempts(conn: Any, keys: Sequence[str]) -> None:
+    """Take back the attempt :func:`count_incomplete_attempts` counted for
+    *keys* when their reingest could not be launched at all (#5054)."""
+    if not keys:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE telemetry.ingest_incomplete "
+            "SET retry_attempts = GREATEST(retry_attempts - 1, 0) "
             "WHERE s3_key = ANY(%s)",
             (list(keys),),
         )
@@ -1126,43 +1188,164 @@ def find_reingest_script(explicit: str | None) -> str:
     raise FileNotFoundError(f"reingest_from_s3.py not found (tried {candidates})")
 
 
-def launch_reingest(
-    args: argparse.Namespace,
-    s3: Any,
-    groups: dict[str, list[str]],
-    script: str,
-    stamp: str,
-    out: Callable[[str], None],
-    runner: Callable[..., Any] = subprocess.run,
-) -> list[dict[str, Any]]:
-    """Write one key list per prefix and re-ingest it; return what ran."""
-    ran: list[dict[str, Any]] = []
-    for prefix, keys in groups.items():
-        name = _slug(prefix.rstrip("/"))
-        uri = f"s3://{args.bucket}/{KEY_LIST_DIR}raw-reconcile-{stamp}-{name}.txt"
-        failed_uri = (
-            f"s3://{args.bucket}/{KEY_LIST_DIR}raw-reconcile-{stamp}-{name}-failed.txt"
+def split_isolated(
+    batch: Sequence[RawKey], explained: Explained
+) -> tuple[list[RawKey], list[RawKey]]:
+    """The incomplete *batch* split into keys that share their prefix's
+    reingest and keys that run alone (:data:`ISOLATED_REASONS`, #5054)."""
+    batched: list[RawKey] = []
+    isolated: list[RawKey] = []
+    for raw in batch:
+        reason = explained.incomplete.get(raw.key, ("", 0))[0]
+        (isolated if reason in ISOLATED_REASONS else batched).append(raw)
+    return batched, isolated
+
+
+def read_keys(s3: Any, uri: str) -> set[str]:
+    """The keys listed one per line at *uri* (``s3://`` or local); empty when
+    it was never written (the reingest writes a manifest only when it has
+    keys to list)."""
+    try:
+        if uri.startswith("s3://"):
+            bucket, _, key = uri[len("s3://") :].partition("/")
+            text = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+        else:
+            with open(uri) as fh:
+                text = fh.read()
+    except Exception:  # noqa: BLE001 — no manifest: nothing to list
+        return set()
+    return {line.strip() for line in text.splitlines() if line.strip()}
+
+
+def _prefer_oom_kill() -> None:
+    """Subprocess pre-exec: make the reingest, and the pool workers that
+    inherit the setting, the OOM killer's first choice in the task's memory
+    cgroup, so a document that exhausts memory kills the reingest rather
+    than this process, which then records the outcome (#5054).  Raising
+    one's own score needs no privilege; a non-Linux host has no file."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
+
+
+def _no_db(keys: list[str]) -> None:
+    return None
+
+
+@dataclass
+class Reingester:
+    """Runs ``reingest_from_s3.py`` over key lists, isolating the keys that
+    crash it (#5054, see "Crash isolation" in the module docstring).
+
+    *charge* counts one attempt for incomplete keys (*chargeable*) before
+    the first launch that holds them in this run; *refund* takes it back
+    when the launch could not start.
+    """
+
+    args: argparse.Namespace
+    s3: Any
+    script: str
+    stamp: str
+    out: Callable[[str], None]
+    runner: Callable[..., Any] = subprocess.run
+    charge: Callable[[list[str]], None] = _no_db
+    refund: Callable[[list[str]], None] = _no_db
+    chargeable: frozenset[str] = frozenset()
+    simulate_crash: frozenset[str] = frozenset()
+    #: One entry per launch: prefix, key count, key list, exit (``crashed``:
+    #: keys of an exit-0 launch whose worker process died).
+    ran: list[dict[str, Any]] = field(default_factory=list)
+    #: Keys that crashed the reingest alone.
+    crashed: list[str] = field(default_factory=list)
+    charged: set[str] = field(default_factory=set)
+    _seq: int = 0
+
+    def launch(
+        self, prefix: str, keys: list[str], *, primary: bool = False
+    ) -> tuple[Any, set[str]]:
+        """Re-ingest *keys* under *prefix* once; return the exit code and
+        the keys a crash implicated (every key on a non-zero exit)."""
+        state = _slug(keys[0].split("/", 1)[0])
+        if primary:
+            name = state
+        else:
+            self._seq += 1
+            name = f"{state}-{self._seq:03d}"
+        base = (
+            f"s3://{self.args.bucket}/{KEY_LIST_DIR}raw-reconcile-{self.stamp}-{name}"
         )
-        write_text(s3, uri, "".join(f"{k}\n" for k in keys))
+        uri = f"{base}.txt"
+        crashed_uri = f"{base}-crashed.txt"
+        write_text(self.s3, uri, "".join(f"{k}\n" for k in keys))
         cmd = [
             sys.executable,
-            script,
+            self.script,
             "--prefix",
             prefix,
             "--s3-key-list",
             uri,
             "--concurrency",
-            str(args.reingest_concurrency),
+            str(self.args.reingest_concurrency if len(keys) > 1 else 1),
             "--write-failed-manifest",
-            failed_uri,
+            f"{base}-failed.txt",
+            "--write-crashed-manifest",
+            crashed_uri,
             "--no-fail-on-errors",
         ]
-        out(f"REINGEST_START prefix={prefix} keys={len(keys)} list={uri}")
-        result = runner(cmd, check=False)
+        simulated = sorted(self.simulate_crash.intersection(keys))
+        if simulated:
+            cmd = [sys.executable, *SIMULATED_CRASH_ARGS]
+            self.out(f"REINGEST_SIMULATED_CRASH keys={','.join(simulated)}")
+        to_charge = [k for k in keys if k in self.chargeable and k not in self.charged]
+        if to_charge:
+            self.charge(to_charge)
+            self.charged.update(to_charge)
+        self.out(f"REINGEST_START prefix={prefix} keys={len(keys)} list={uri}")
+        try:
+            result = self.runner(cmd, check=False, preexec_fn=_prefer_oom_kill)
+        except Exception:
+            # Never started: not an attempt.
+            if to_charge:
+                self.refund(to_charge)
+                self.charged.difference_update(to_charge)
+            raise
         code = getattr(result, "returncode", None)
-        out(f"REINGEST_DONE prefix={prefix} exit={code}")
-        ran.append({"prefix": prefix, "keys": len(keys), "key_list": uri, "exit": code})
-    return ran
+        crashed = (
+            read_keys(self.s3, crashed_uri).intersection(keys)
+            if code == 0
+            else set(keys)
+        )
+        self.out(f"REINGEST_DONE prefix={prefix} exit={code} crashed={len(crashed)}")
+        entry: dict[str, Any] = {
+            "prefix": prefix,
+            "keys": len(keys),
+            "key_list": uri,
+            "exit": code,
+        }
+        if code == 0 and crashed:
+            entry["crashed"] = len(crashed)
+        self.ran.append(entry)
+        return code, crashed
+
+    def heal(self, prefix: str, keys: list[str], *, primary: bool = False) -> None:
+        """:meth:`launch`, then bisect the keys a crash implicated until each
+        crashing key is alone."""
+        code, crashed = self.launch(prefix, keys, primary=primary)
+        if not crashed:
+            return
+        if len(keys) == 1:
+            self.crashed.append(keys[0])
+            self.out(f"REINGEST_CRASH exit={code} key={keys[0]}")
+            return
+        implicated = [k for k in keys if k in crashed]
+        if len(implicated) == 1:
+            self.heal(implicated[0], implicated)
+            return
+        mid = len(implicated) // 2
+        for half in (implicated[:mid], implicated[mid:]):
+            self.heal(os.path.commonprefix(half), half)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,37 +1565,50 @@ def run(
         out(f"RECORDED run_id={run_id}")
 
     if script is not None:
-        stamp = started_at.strftime("%Y%m%dT%H%MZ")
+        # Each launch counts an attempt for its incomplete keys before it
+        # starts, whatever its exit (#5054); keys that crash are bisected
+        # out so the rest of the run still heals.  Past the cap a key is
+        # reported as stuck (#5008).
+        batched, isolated = split_isolated(batch, explained)
+        reingester = Reingester(
+            args,
+            s3,
+            script,
+            started_at.strftime("%Y%m%dT%H%MZ"),
+            out,
+            runner=runner,
+            charge=(lambda keys: count_incomplete_attempts(conn, keys))
+            if conn is not None
+            else _no_db,
+            refund=(lambda keys: refund_incomplete_attempts(conn, keys))
+            if conn is not None
+            else _no_db,
+            chargeable=frozenset(raw.key for raw in batch),
+            simulate_crash=frozenset(args.simulate_crash_key),
+        )
         try:
-            detail["reingest"] = launch_reingest(
-                args,
-                s3,
-                reingest_groups(
-                    {
-                        s: ScopeReport(s, unrepresented=actionable[s])
-                        for s in ([] if incomplete_only else healing)
-                    },
-                    batch,
-                ),
-                script,
-                stamp,
-                out,
-                runner=runner,
+            groups = reingest_groups(
+                {
+                    s: ScopeReport(s, unrepresented=actionable[s])
+                    for s in ([] if incomplete_only else healing)
+                },
+                batched,
             )
+            for prefix, group in groups.items():
+                reingester.heal(prefix, group, primary=True)
+            for raw in isolated:
+                reingester.heal(raw.key, [raw.key])
         except Exception as exc:  # noqa: BLE001 — recorded, then reported as failed
             if not incomplete_only:
                 action = "reingest_failed"
                 mark_scopes_failed(scope_actions, healing)
             detail["reingest_error"] = f"{type(exc).__name__}: {exc}"
-        if conn is not None and "reingest" in detail:
-            # One attempt per incomplete key whose prefix's reingest ran to
-            # the end (exit 0; per-key failures do not change the exit, so
-            # the worker's record decides).  A reingest that crashed was no
-            # attempt.  Past the cap the key is reported as stuck (#5008).
-            finished = {r["prefix"] for r in detail["reingest"] if r.get("exit") == 0}
-            count_incomplete_attempts(
-                conn, [raw.key for raw in batch if f"{raw.state}/" in finished]
-            )
+        detail["reingest"] = reingester.ran
+        detail["reingest_isolated"] = len(isolated)
+        detail["reingest_crashed"] = len(reingester.crashed)
+        detail["reingest_crashed_sample"] = reingester.crashed[:10]
+        if args.simulate_crash_key:
+            detail["simulated_crash_keys"] = list(args.simulate_crash_key)
         if conn is not None and run_id is not None:
             update_run(conn, run_id, action, detail)
 
@@ -1549,6 +1745,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Reingest attempts after which an incomplete key is reported as stuck.",
     )
     parser.add_argument(
+        "--simulate-crash-key",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Manual verification only (#5054): any reingest launch holding KEY "
+        "runs a subprocess that SIGKILLs itself instead.  Never set by the "
+        "scheduled workflow.",
+    )
+    parser.add_argument(
         "--issue-summary",
         metavar="RESULT_JSON",
         help="Print the issue Markdown for a saved RECONCILE_RESULT JSON and exit "
@@ -1566,6 +1771,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--prefix must end with /")
     if args.reingest and not args.record:
         parser.error("--reingest needs --record (the threshold reads the run history)")
+    if args.simulate_crash_key and not args.reingest:
+        parser.error("--simulate-crash-key needs --reingest (it replaces a launch)")
     if args.reset_incomplete_attempts and not args.record:
         parser.error(
             "--reset-incomplete-attempts needs --record (it writes the database)"

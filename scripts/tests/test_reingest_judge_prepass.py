@@ -652,6 +652,66 @@ class TestReingestKeysPrePass:
         assert "judge_prepass_judges_seeded" not in stats
 
 
+class _CrashPipeline(_Pipeline):
+    """The surname key's worker process dies (its future raises, as in a
+    broken pool); the boilerplate key fails inside the worker."""
+
+    def _make_pool(self, *args: Any, **kwargs: Any) -> MagicMock:
+        cm = super()._make_pool(*args, **kwargs)
+        pool = cm.__enter__.return_value
+
+        def submit(fn: Any, key: str, *rest: Any) -> Future:
+            self.submitted.append(key)
+            fut: Future = Future()
+            if key == _SURNAME_KEY:
+                fut.set_exception(RuntimeError("A process in the pool died"))
+            else:
+                fut.set_result({"status": "error", "error_class": "LlmError"})
+            return fut
+
+        pool.submit.side_effect = submit
+        return cm
+
+
+class TestCrashedManifest:
+    """#5054: the keys a dead worker process took down are written apart
+    from the failed keys, so the reconciler can attribute a crash."""
+
+    def test_only_keys_whose_future_raised_are_listed(self) -> None:
+        s3 = MagicMock()
+        with _CrashPipeline():
+            stats = _run_keys(
+                s3_client=s3,
+                write_failed_manifest="s3://b/failed.txt",
+                write_crashed_manifest="s3://b/crashed.txt",
+            )
+
+        assert stats["crashed_keys"] == [_SURNAME_KEY]
+        assert sorted(stats["failed_keys"]) == sorted([_SURNAME_KEY, _BOILERPLATE_KEY])
+        bodies = {
+            c.kwargs["Key"]: c.kwargs["Body"] for c in s3.put_object.call_args_list
+        }
+        assert bodies["crashed.txt"] == f"{_SURNAME_KEY}\n".encode()
+        assert set(bodies["failed.txt"].decode().split()) == {
+            _SURNAME_KEY,
+            _BOILERPLATE_KEY,
+        }
+
+    def test_no_crash_writes_no_crashed_manifest(self) -> None:
+        s3 = MagicMock()
+        with _Pipeline():
+            stats = _run_keys(s3_client=s3, write_crashed_manifest="s3://b/crashed.txt")
+
+        assert stats["crashed_keys"] == []
+        s3.put_object.assert_not_called()
+
+    def test_cli_forwards_the_crashed_manifest(self) -> None:
+        args = reingest._build_parser().parse_args(
+            ["--prefix", "ca/", "--write-crashed-manifest", "s3://b/c.txt"]
+        )
+        assert args.write_crashed_manifest == "s3://b/c.txt"
+
+
 class TestPrePassRenamedJudges:
     """#4920: judges the pre-pass renames have their rulings re-indexed."""
 

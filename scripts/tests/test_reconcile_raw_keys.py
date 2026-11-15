@@ -752,7 +752,7 @@ def test_persistent_still_reingests_and_files_an_issue(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )
@@ -780,7 +780,7 @@ def test_reingest_launch_failure_is_recorded_and_reported(
     db = FakeDb({"RETURNING run_id": [("run-6",)]})
     lines: list[str] = []
 
-    def runner(cmd: list[str], check: bool) -> Any:
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
         raise OSError("exec format error")
 
     rec.run(
@@ -815,7 +815,7 @@ def test_missing_reingest_script_is_recorded_before_anything_runs(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: calls.append(cmd),
+        runner=lambda cmd, check, **kw: calls.append(cmd),
     )
     result = _result(lines)
     assert result["action"] == "reingest_failed"
@@ -839,7 +839,7 @@ def test_over_threshold_files_an_issue_and_does_not_reingest(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: calls.append(cmd),
+        runner=lambda cmd, check, **kw: calls.append(cmd),
         # federal is deferred, so every remaining scope is over 1
         deferrals=(CL_BACKLOG,),
     )
@@ -876,7 +876,7 @@ def test_per_scope_threshold_heals_a_county_beside_a_scope_over_it(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )
@@ -920,7 +920,7 @@ def test_deferred_backlog_is_reported_and_never_reingested_or_over_threshold(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
         deferrals=(CL_BACKLOG,),
@@ -973,7 +973,7 @@ def test_only_deferred_keys_left_means_nothing_to_do(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: pytest.fail("nothing to re-ingest"),
+        runner=lambda cmd, check, **kw: pytest.fail("nothing to re-ingest"),
         deferrals=(CL_BACKLOG,),
     )
     result = _result(lines)
@@ -993,7 +993,7 @@ def test_reingest_writes_key_lists_and_runs_per_state(
     calls: list[list[str]] = []
     lines: list[str] = []
 
-    def runner(cmd: list[str], check: bool) -> Any:
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
         calls.append(cmd)
         return types.SimpleNamespace(returncode=0)
 
@@ -1044,7 +1044,7 @@ def test_reingest_deferred_runs_nothing(s3: FakeS3, explained: rec.Explained) ->
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: calls.append(cmd),
+        runner=lambda cmd, check, **kw: calls.append(cmd),
     )
     assert _result(lines)["action"] == "reingest_deferred"
     assert calls == []
@@ -1170,7 +1170,7 @@ def test_retry_marker_run_reingests_incomplete_keys_and_counts_attempts(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )
@@ -1190,11 +1190,14 @@ def test_retry_marker_run_reingests_incomplete_keys_and_counts_attempts(
         line.startswith("INCOMPLETE_STUCK reason=single_document_fallback")
         for line in lines
     )
-    # The retryable key is in the reingest list; the stuck one is not.
-    uri = calls[0][calls[0].index("--s3-key-list") + 1]
-    listed = s3.puts[uri].decode().splitlines()
-    assert f"{LA}{_h('b')}.html" in listed
-    assert f"{LA}{_h('a')}.html" not in listed
+    # The retryable key is re-ingested (alone and last: it is dead-lettered,
+    # #5054); the stuck one is not.
+    listed = [
+        s3.puts[c[c.index("--s3-key-list") + 1]].decode().splitlines() for c in calls
+    ]
+    assert listed[-1] == [f"{LA}{_h('b')}.html"]
+    assert calls[-1][calls[-1].index("--prefix") + 1] == f"{LA}{_h('b')}.html"
+    assert all(f"{LA}{_h('a')}.html" not in keys for keys in listed)
     # One attempt counted for the retryable key, before the reingest.
     attempts = db.sql("SET retry_attempts = retry_attempts + 1")
     assert attempts[0][1] == ([f"{LA}{_h('b')}.html"],)
@@ -1277,7 +1280,7 @@ def test_retry_marker_over_threshold_still_drains_incomplete_keys(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )
@@ -1286,7 +1289,9 @@ def test_retry_marker_over_threshold_still_drains_incomplete_keys(
     assert result["issue_needed"] is True
     assert result["reingest_scope"] == "incomplete_only"
     assert result["incomplete_batch"] == 1
-    assert [c[c.index("--prefix") + 1] for c in calls] == ["ca/"]
+    # The dead-lettered key runs alone (#5054).
+    assert [c[c.index("--prefix") + 1] for c in calls] == [f"{LA}{_h('b')}.html"]
+    assert result["reingest_isolated"] == 1
     uri = calls[0][calls[0].index("--s3-key-list") + 1]
     assert s3.puts[uri].decode().splitlines() == [f"{LA}{_h('b')}.html"]
     attempts = db.sql("SET retry_attempts = retry_attempts + 1")
@@ -1315,7 +1320,7 @@ def test_retry_marker_over_threshold_incomplete_only_tolerates_missing_script(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: pytest.fail("no reingest without a script"),
+        runner=lambda cmd, check, **kw: pytest.fail("no reingest without a script"),
     )
     result = _result(lines)
     assert result["action"] == "over_threshold"
@@ -1329,7 +1334,7 @@ def test_retry_marker_over_threshold_incomplete_only_launch_error_keeps_action(
     db = FakeDb({"RETURNING run_id": [("run-14",)]})
     lines: list[str] = []
 
-    def runner(cmd: list[str], check: bool) -> Any:
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
         raise OSError("exec format error")
 
     rec.run(
@@ -1351,7 +1356,10 @@ def test_retry_marker_over_threshold_incomplete_only_launch_error_keeps_action(
     result = _result(lines)
     assert result["action"] == "over_threshold"
     assert "exec format error" in result["reingest_error"]
-    assert db.sql("retry_attempts + 1") == []
+    # Counted before the launch, taken back when it could not start (#5054).
+    key = [f"{LA}{_h('b')}.html"]
+    assert [q[1] for q in db.sql("retry_attempts + 1")] == [(key,)]
+    assert [q[1] for q in db.sql("GREATEST(retry_attempts - 1, 0)")] == [(key,)]
 
 
 def test_retry_marker_incomplete_backlog_never_blocks_the_unrepresented_heal(
@@ -1377,7 +1385,7 @@ def test_retry_marker_incomplete_backlog_never_blocks_the_unrepresented_heal(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: (
+        runner=lambda cmd, check, **kw: (
             calls.append(cmd) or types.SimpleNamespace(returncode=0)
         ),
     )
@@ -1391,9 +1399,10 @@ def test_retry_marker_incomplete_backlog_never_blocks_the_unrepresented_heal(
     assert attempts[0][1] == ([f"{LA}{_h('b')}.html"],)
 
 
-def test_retry_marker_crashed_reingest_counts_no_attempt(
+def test_retry_marker_crashed_reingest_counts_an_attempt(
     s3: FakeS3, explained: rec.Explained, tmp_path: Any
 ) -> None:
+    """#5054: a reingest that crashed was still an attempt."""
     _incomplete_explained(explained)
     db = FakeDb({"RETURNING run_id": [("run-11",)]})
     lines: list[str] = []
@@ -1404,9 +1413,363 @@ def test_retry_marker_crashed_reingest_counts_no_attempt(
         out=lines.append,
         now=NOW,
         conn=db,
-        runner=lambda cmd, check: types.SimpleNamespace(returncode=1),
+        runner=lambda cmd, check, **kw: types.SimpleNamespace(returncode=1),
     )
-    assert db.sql("retry_attempts + 1") == []
+    assert [q[1] for q in db.sql("retry_attempts + 1")] == [([f"{LA}{_h('b')}.html"],)]
+    assert f"REINGEST_CRASH exit=1 key={LA}{_h('b')}.html" in lines
+
+
+# -- crash isolation (#5054) -------------------------------------------------
+
+CRASH = f"{LA}{_h('c')}.html"  # the key that kills every reingest it is in
+HEALTHY = f"{LA}{_h('d')}.html"
+
+
+def _listed(s3: FakeS3, cmd: list[str]) -> list[str]:
+    return s3.puts[cmd[cmd.index("--s3-key-list") + 1]].decode().splitlines()
+
+
+def _crash_runner(
+    s3: FakeS3, calls: list[list[str]], code: int = 137, healed: set[str] | None = None
+) -> Any:
+    """A reingest that exits *code* whenever its key list holds CRASH; a
+    clean launch heals its keys (the worker deletes their records)."""
+
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
+        assert kw.get("preexec_fn") is rec._prefer_oom_kill
+        calls.append(cmd)
+        keys = _listed(s3, cmd)
+        if CRASH in keys:
+            return types.SimpleNamespace(returncode=code)
+        if healed is not None:
+            healed.update(keys)
+        return types.SimpleNamespace(returncode=0)
+
+    return runner
+
+
+def _crash_explained(
+    explained: rec.Explained, attempts: dict[str, int] | None = None
+) -> rec.Explained:
+    """LA c (the crasher) and d incomplete; the rest as the fixture."""
+    attempts = {CRASH: 0, HEALTHY: 0} if attempts is None else attempts
+    explained.incomplete = {k: ("reingest_failed", n) for k, n in attempts.items()}
+    return explained
+
+
+@pytest.mark.parametrize("code", [137, -9, 1])
+def test_crash_counts_attempts_for_every_key_launched_and_bisects(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any, code: int
+) -> None:
+    """A batch whose subprocess exits 137 (or dies of SIGKILL, -9) counts one
+    attempt for each incomplete key it was launched with, then the other
+    keys re-run without the crasher and heal in the same run."""
+    _crash_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-c",)]})
+    calls: list[list[str]] = []
+    healed: set[str] = set()
+    lines: list[str] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=_crash_runner(s3, calls, code, healed),
+    )
+    result = _result(lines)
+    # Charged once, before the first launch, for both incomplete keys.
+    assert [q[1] for q in db.sql("retry_attempts + 1")] == [([CRASH, HEALTHY],)]
+    first = _listed(s3, calls[0])
+    assert CRASH in first and HEALTHY in first
+    # Everything but the crasher healed; the crasher ended up alone.
+    assert HEALTHY in healed
+    assert set(first) - {CRASH} <= healed
+    assert CRASH not in healed
+    assert _listed(s3, calls[-1]) == [CRASH] or [CRASH] in [
+        _listed(s3, c) for c in calls
+    ]
+    assert result["reingest_crashed"] == 1
+    assert result["reingest_crashed_sample"] == [CRASH]
+    assert f"REINGEST_CRASH exit={code} key={CRASH}" in lines
+    # A crash in one run is not a failed run: the scopes still healed.
+    assert result["action"] == "reingest"
+    # Bisection singletons list just their key; sub-batches stay under the
+    # state.  (Primary launches, one per state, end in ``-<state>.txt``.)
+    subs = [c for c in calls if c[c.index("--s3-key-list") + 1][-8:-4].startswith("-")]
+    assert subs
+    for c in subs:
+        keys = _listed(s3, c)
+        prefix = c[c.index("--prefix") + 1]
+        assert all(k.startswith(prefix) for k in keys)
+        if len(keys) == 1:
+            assert prefix == keys[0]
+            assert c[c.index("--concurrency") + 1] == "1"
+    # Sub-launch key lists never overwrite the primary one.
+    uris = [c[c.index("--s3-key-list") + 1] for c in calls]
+    assert len(set(uris)) == len(uris)
+
+
+def test_crash_and_stuck_after_max_attempts_reported_once(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """A key that kills the reingest on every run reaches incomplete_stuck
+    after --max-incomplete-attempts runs, is reported once, and stops being
+    launched; the healthy key in its first batch converged on run 1."""
+    attempts = {CRASH: 0, HEALTHY: 0}
+    issue_needed: list[bool] = []
+    newly: list[int] = []
+    launched_crash: list[bool] = []
+    stamped = False
+    for n in range(5):
+        ex = rec.Explained(
+            documents=set(explained.documents),
+            skips=dict(explained.skips),
+            validation_fail=set(explained.validation_fail),
+            all_null_guard=set(explained.all_null_guard),
+        )
+        _crash_explained(ex, dict(attempts))
+        stuck_row = [(CRASH,)] if attempts[CRASH] >= 3 and not stamped else []
+        db = FakeDb(
+            {"RETURNING run_id": [(f"run-{n}",)], "stuck_at IS NULL": stuck_row}
+        )
+        calls: list[list[str]] = []
+        healed: set[str] = set()
+        lines: list[str] = []
+        rec.run(
+            _args(
+                "--record", "--reingest", "--reingest-script", _stub_script(tmp_path)
+            ),
+            s3,
+            ex,
+            out=lines.append,
+            now=NOW,
+            conn=db,
+            runner=_crash_runner(s3, calls, -9, healed),
+        )
+        result = _result(lines)
+        for _sql, params in db.sql("retry_attempts + 1"):
+            for key in params[0]:
+                attempts[key] += 1
+        for key in healed:
+            attempts.pop(key, None)  # a complete reingest deletes the record
+        stamped = stamped or bool(stuck_row)
+        issue_needed.append(result["issue_needed"])
+        newly.append(result["newly_stuck"])
+        launched_crash.append(any(CRASH in _listed(s3, c) for c in calls))
+    assert HEALTHY not in attempts  # healed on the first run
+    assert attempts[CRASH] == 3
+    assert launched_crash == [True, True, True, False, False]
+    assert newly == [0, 0, 0, 1, 0]
+    assert issue_needed[3] is True
+    assert issue_needed[4] is False
+
+
+def test_crashed_manifest_attributes_a_pool_crash(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """Exit 0 with keys in the crashed manifest (a pool worker died): only
+    those keys are re-run, until the crasher is alone."""
+    _crash_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-p",)]})
+    calls: list[list[str]] = []
+    healed: set[str] = set()
+
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
+        calls.append(cmd)
+        keys = _listed(s3, cmd)
+        if CRASH in keys:
+            # The pool broke: the crasher and one bystander raised.
+            down = [k for k in keys if k in (CRASH, HEALTHY)]
+            uri = cmd[cmd.index("--write-crashed-manifest") + 1]
+            s3.objects[uri.split("/", 3)[3]] = (
+                NOW,
+                "".join(f"{k}\n" for k in down).encode(),
+            )
+        else:
+            healed.update(keys)
+        return types.SimpleNamespace(returncode=0)
+
+    lines: list[str] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=runner,
+    )
+    result = _result(lines)
+    la = [_listed(s3, c) for c in calls if _listed(s3, c)[0].startswith(LA)]
+    assert la[1:] == [[CRASH], [HEALTHY]]
+    assert HEALTHY in healed
+    assert CRASH not in healed
+    assert result["reingest_crashed_sample"] == [CRASH]
+    assert result["reingest"][0]["crashed"] == 2
+
+
+def test_reingester_one_implicated_key_reruns_alone(s3: FakeS3) -> None:
+    """A manifest naming one key of a batch re-runs just that key; with no
+    database the attempt count is a no-op."""
+    calls: list[list[str]] = []
+    other = f"{LA}{_h('b')}.html"
+
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
+        calls.append(cmd)
+        if len(_listed(s3, cmd)) > 1:
+            uri = cmd[cmd.index("--write-crashed-manifest") + 1]
+            s3.objects[uri.split("/", 3)[3]] = (NOW, f"{CRASH}\n".encode())
+            return types.SimpleNamespace(returncode=0)
+        return types.SimpleNamespace(returncode=-9)
+
+    lines: list[str] = []
+    r = rec.Reingester(
+        _args(),
+        s3,
+        "reingest.py",
+        "STAMP",
+        lines.append,
+        runner=runner,
+        chargeable=frozenset({CRASH}),
+    )
+    r.heal("ca/", [other, CRASH, HEALTHY], primary=True)
+    assert [_listed(s3, c) for c in calls] == [[other, CRASH, HEALTHY], [CRASH]]
+    assert r.crashed == [CRASH]
+    assert r.charged == {CRASH}
+    assert r.ran[0]["crashed"] == 1
+
+
+def test_dead_letter_keys_run_alone_after_the_batches(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    explained.incomplete = {
+        CRASH: ("dead_letter", 0),
+        HEALTHY: ("partial_split", 0),
+    }
+    db = FakeDb({"RETURNING run_id": [("run-d",)]})
+    calls: list[list[str]] = []
+    lines: list[str] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=_crash_runner(s3, calls),
+    )
+    result = _result(lines)
+    listed = [_listed(s3, c) for c in calls]
+    # Batched launches first, without the dead-lettered key; it runs last,
+    # alone, under its own key as the prefix.
+    assert all(CRASH not in keys for keys in listed[:-1])
+    assert HEALTHY in listed[0]
+    assert listed[-1] == [CRASH]
+    assert calls[-1][calls[-1].index("--prefix") + 1] == CRASH
+    assert result["reingest_isolated"] == 1
+    assert result["reingest_crashed_sample"] == [CRASH]
+    # Each key charged once, at its own launch.
+    assert [q[1] for q in db.sql("retry_attempts + 1")] == [([HEALTHY],), ([CRASH],)]
+
+
+def test_simulate_crash_key_replaces_the_launch_with_a_sigkill(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    explained.incomplete = {HEALTHY: ("partial_split", 0), CRASH: ("partial_split", 0)}
+    db = FakeDb({"RETURNING run_id": [("run-s",)]})
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], check: bool, **kw: Any) -> Any:
+        calls.append(cmd)
+        if list(rec.SIMULATED_CRASH_ARGS) == cmd[1:]:
+            return types.SimpleNamespace(returncode=-9)
+        return types.SimpleNamespace(returncode=0)
+
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--reingest-script",
+            _stub_script(tmp_path),
+            "--simulate-crash-key",
+            CRASH,
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=runner,
+    )
+    result = _result(lines)
+    assert result["simulated_crash_keys"] == [CRASH]
+    assert result["reingest_crashed_sample"] == [CRASH]
+    assert any(line.startswith("REINGEST_SIMULATED_CRASH keys=") for line in lines)
+    # Real reingests ran for everything else.
+    real = [c for c in calls if c[1] != rec.SIMULATED_CRASH_ARGS[0]]
+    assert any(HEALTHY in _listed(s3, c) for c in real)
+
+
+def test_simulate_crash_key_needs_reingest_and_is_never_scheduled() -> None:
+    with pytest.raises(SystemExit):
+        rec.parse_args(["--simulate-crash-key", CRASH])
+    workflow = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        ".github",
+        "workflows",
+        "raw-key-reconcile.yml",
+    )
+    with open(workflow) as fh:
+        assert "simulate-crash" not in fh.read()
+
+
+def test_prefer_oom_kill_raises_the_childs_oom_score(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    target = tmp_path / "oom_score_adj"
+    real_open = open
+
+    def fake_open(path: str, *a: Any, **kw: Any) -> Any:
+        assert path == "/proc/self/oom_score_adj"
+        return real_open(target, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    rec._prefer_oom_kill()
+    monkeypatch.undo()
+    assert target.read_text() == "1000"
+
+    def no_proc(path: str, *a: Any, **kw: Any) -> Any:
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr("builtins.open", no_proc)
+    rec._prefer_oom_kill()  # a host without /proc: no-op
+
+
+def test_read_keys_local_missing_and_s3(s3: FakeS3, tmp_path: Any) -> None:
+    path = tmp_path / "crashed.txt"
+    path.write_text("k1\n\nk2\n")
+    assert rec.read_keys(s3, str(path)) == {"k1", "k2"}
+    assert rec.read_keys(s3, str(tmp_path / "nope.txt")) == set()
+    assert rec.read_keys(s3, f"s3://{BUCKET}/tmp/keys/none.txt") == set()
+
+
+def test_split_isolated_and_refund_helper() -> None:
+    ex = rec.Explained(
+        incomplete={CRASH: ("dead_letter", 1), HEALTHY: ("partial_split", 0)}
+    )
+    batched, isolated = rec.split_isolated([_raw(CRASH), _raw(HEALTHY)], ex)
+    assert [r.key for r in batched] == [HEALTHY]
+    assert [r.key for r in isolated] == [CRASH]
+    db = FakeDb()
+    rec.refund_incomplete_attempts(db, [])
+    assert db.queries == []
+    rec.refund_incomplete_attempts(db, [CRASH])
+    assert db.sql("GREATEST")[0][1] == ([CRASH],)
 
 
 def test_retry_marker_reset_and_count_helpers() -> None:
