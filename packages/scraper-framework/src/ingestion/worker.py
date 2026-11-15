@@ -52,7 +52,7 @@ from courts.ca.la_dept_judges import (
 )
 from framework.enrichment import EnrichmentEngine
 from framework.events import trim_consumed_entries
-from framework.llm_extractor import LlmExtractor, PageCapExceededError
+from framework.llm_extractor import LlmExtractor, PageCapExceededError, PartialExtractionError
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 from framework.search.ruling_doc import (
@@ -5249,7 +5249,11 @@ class IngestionWorker:
         as one ruling on the parent row, next to the key's split children.
         A live capture of a key with no rows yet still writes the document
         on its own (the per-field extraction fallback); a live capture of a
-        key that already holds rows writes nothing.
+        key that already holds rows writes nothing.  A partial extraction
+        (``PartialExtractionError``: a page or chunk failed while others
+        answered, #5000) is a failed extraction too, except that a live
+        capture of a key with no rows writes the rows the other parts
+        yielded (``_partial_rulings_for_new_key``).
 
         In ``required`` extraction mode (the default, #4953) a missing
         extractor is not "no extractor configured": the split raises
@@ -5369,6 +5373,56 @@ class IngestionWorker:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM documents WHERE s3_key = %s LIMIT 1", (s3_key,))
             return cur.fetchone() is not None
+
+    def _partial_rulings_for_new_key(
+        self,
+        event_data: dict[str, Any],
+        document_id: str,
+        county: str,
+        reason: str,
+        exc: PartialExtractionError,
+    ) -> list[Any] | None:
+        """The rulings to write after a partial extraction (#5000), or None
+        to refuse the split as a failed extraction.
+
+        A partial result (some pages or chunks failed, others answered) is
+        never written over rows a key already holds: a split-set
+        replacement (reingest / rebuild) refuses it, so the key's rows stay
+        as they are and the reingest reports the key for a retry
+        (``SplitExtractionFailedError``), and a live capture of a key that
+        holds rows writes nothing.
+
+        A live capture of a key that holds no rows yet writes the rows the
+        parts that answered yielded (``exc.rulings``).  Writing nothing (or
+        the whole document as one ruling, the fallback after a failed
+        extraction) would drop rows a later split must find again, and
+        nothing on the key is replaced.  A reingest of the key replaces
+        them with the complete split once every page answers (the per-page
+        cache re-sends only the failed pages, #4716); until then the
+        reingest refuses its partial result and leaves them.  Logs
+        ``SPLIT_EXTRACTION_FAILED_EVENT`` with ``action=partial_split_written``
+        so the key can be found and retried.
+        """
+        if not exc.rulings or event_data.get(REPLACE_SPLIT_SET_KEY) is True:
+            return None
+        s3_key = event_data.get("s3_key")
+        if not s3_key or self._key_has_rows(str(s3_key)):
+            return None
+        logger.warning(
+            "Partial extraction of a new key — writing the rows the parts that answered yielded",
+            extra={
+                "telemetry_event": SPLIT_EXTRACTION_FAILED_EVENT,
+                "document_id": document_id,
+                "s3_key": s3_key,
+                "county": county,
+                "scraper_id": event_data.get("scraper_id"),
+                "reason": reason[:500],
+                "action": "partial_split_written",
+                "failed_parts": exc.failed_parts,
+                "ruling_count": len(exc.rulings),
+            },
+        )
+        return list(exc.rulings)
 
     def _dispatch_split_child(self, batch: _SplitBatch, split_event: dict[str, Any]) -> None:
         """Extract, enrich and validate one split child (``process_event``)
@@ -5736,6 +5790,19 @@ class IngestionWorker:
                     )
                     batch.extraction_failed = f"multimodal: {type(exc).__name__}: {exc}"
                     return False
+                except PartialExtractionError as exc:
+                    # Some pages failed while others answered (#5000): the
+                    # failed pages' rulings are missing, so this is not a
+                    # complete split.  Nor is there a text fallback: it
+                    # would swap the page-image split for a text one.
+                    reason = f"multimodal: {type(exc).__name__}: {exc}"
+                    extracted_rulings = self._partial_rulings_for_new_key(
+                        event_data, document_id, county, reason, exc
+                    )
+                    if extracted_rulings is None:
+                        batch.extraction_failed = reason
+                        return False
+                    extraction_method = "multimodal"
                 except Exception as exc:
                     logger.warning(
                         "Multimodal extraction failed — falling back to text",
@@ -5815,6 +5882,16 @@ class IngestionWorker:
                     document_id=document_id,
                     strict=True,
                 )
+            except PartialExtractionError as exc:
+                # A chunk failed while others answered (#5000).
+                text_error = f"text: {type(exc).__name__}: {exc}"
+                reason = "; ".join(e for e in (multimodal_error, text_error) if e)
+                extracted_rulings = self._partial_rulings_for_new_key(
+                    event_data, document_id, county, reason, exc
+                )
+                if extracted_rulings is None:
+                    batch.extraction_failed = reason
+                    return False
             except Exception as exc:
                 llm_latency_ms = round((time.monotonic() - t0) * 1000)
                 logger.error(

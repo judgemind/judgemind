@@ -495,6 +495,7 @@ class TestExtractUsesCitationFilter:
             chunk_index: int = 0,  # noqa: ARG001
             system_prompt: str | None = None,  # noqa: ARG001
             document_id: str | None = None,  # noqa: ARG001
+            failed_parts: list[int] | None = None,  # noqa: ARG001
         ) -> list[ExtractionResult]:
             # Bypass the actual API + retry logic: return the stub directly.
             return [stub_result]

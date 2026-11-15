@@ -1164,12 +1164,23 @@ def extract_fields_llm(
 
     if not chunk_results:
         return None
+    # A failed chunk's fields are missing.  This is a field fill, not a split,
+    # so the other chunks' fields are still returned, but never cached: the
+    # cache would serve the gap on every later call (#5000).
+    partial = len(chunk_results) < len(chunks)
+    if partial:
+        logger.warning(
+            "llm_extract.partial_chunk_failure",
+            document_id=document_id,
+            failed_chunks=len(chunks) - len(chunk_results),
+            total_chunks=len(chunks),
+        )
 
     # Single chunk: return directly.  Multiple: merge.
     result = chunk_results[0] if len(chunk_results) == 1 else _merge_results(chunk_results)
 
     # Write to cache
-    if cache is not None and result is not None:
+    if cache is not None and result is not None and not partial:
         cache.put(_SYSTEM_PROMPT, cache_key, _serialize_result(result))
 
     return result
