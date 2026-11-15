@@ -4,19 +4,22 @@
 """Audit: is each active ruling's case number supported by its raw document?
 
 For every active ruling with a real case number (not ``UNKNOWN-``) in the
-given counties, fetch the document's raw S3 object, extract its text the way
-the ingestion worker does (``llm_extract.extract_text_from_pdf``), and ask the
-worker's own case-number gate (``ingestion.case_evidence``) whether that text
-refutes the number.  The audit uses the gate's predicate, not a copy of it, so
-it cannot disagree with ingest (#4924, #4927).
+given counties, fetch the document's raw S3 object, extract the text the
+ingestion worker's gate counts as evidence (a PDF's text layer,
+``llm_extract.extract_text_layer``), and ask the worker's own case-number
+gate (``ingestion.case_evidence``) whether that text refutes the number.  The
+audit uses the gate's predicate, not a copy of it, so it cannot disagree with
+ingest (#4924, #4927).  A PDF with no text layer is OCR'd by the worker, but
+OCR text is never evidence (#4986), so the audit skips the OCR: such a PDF's
+rulings are ``no_text``, exactly as the gate judges them.
 
 Verdicts, counted per ruling:
 
 - ``supported``    the document text carries the case number.
 - ``unsupported``  the text can settle the number and does not carry it: an
                    invented or fuzzy-corrected number (#4907, #4915).
-- ``no_text``      the text is too short to be evidence
-                   (``case_evidence.document_evidence`` is empty).
+- ``no_text``      the text is too short to be evidence, or there is no
+                   text layer (``case_evidence.document_evidence`` is empty).
 - ``timeout``      extracting the key's text took longer than ``--timeout``.
                    Each key runs in its own forked process, which is killed
                    at the deadline: pdfplumber cannot be interrupted in a
@@ -43,13 +46,16 @@ per county), ``--timeout SECS`` (per key, default 180), ``--workers N``
 
 No-text PDF mode (``--no-text-pdfs``, #4983): instead of judging rulings,
 list every archived PDF under ``ca/<county>/`` in S3 and report the ones
-whose extracted text is too short to be evidence (the same
-``document_evidence`` rule: a scanned PDF with no text layer), with how many
-active rulings each key holds today.  Output: one ``NO_TEXT`` line per such
-key and ``SUMMARY_NO_TEXT <county>: {json}`` per county (``pdf_keys``,
-``no_text``, ``no_text_zero_rulings``, ``timeout``, ``error``).
-``--write-keys s3://bucket/key`` also writes the no-text keys, one per line,
-for a reingest's ``--s3-key-list``.  This mode always exits 0.
+whose text layer is too short to be evidence (the same ``document_evidence``
+rule: a scanned PDF with no text layer, which the worker OCRs), with each
+key's page count and how many active rulings it holds today (#4986).
+Output: one ``NO_TEXT`` line per such key (``chars``, ``pages``,
+``rulings``) and ``SUMMARY_NO_TEXT <county>: {json}`` per county
+(``pdf_keys``, ``no_text``, ``no_text_zero_rulings``, ``no_text_rulings``,
+``no_text_over_10_pages``, ``timeout``, ``error``).  ``--min-pages N``
+reports only no-text keys of at least N pages.  ``--write-keys
+s3://bucket/key`` also writes the reported keys, one per line, for a
+reingest's ``--s3-key-list``.  This mode always exits 0.
 """
 
 from __future__ import annotations
@@ -191,6 +197,7 @@ class Gate:
     is_pdf: Callable[[Any], bool]
     evidence_for: Callable[[str | None], tuple[str, ...]]
     refuted: Callable[[str, tuple[str, ...]], bool]
+    page_count: Callable[[Any], int] = lambda content: 0
 
 
 def audit_key(key: str, rulings: list[Ruling], gate: Gate) -> KeyResult:
@@ -204,10 +211,11 @@ def audit_key(key: str, rulings: list[Ruling], gate: Gate) -> KeyResult:
 
 
 def production_gate() -> Gate:
-    """The worker's extractor and the ingest gate's predicate."""
+    """The worker's evidence text (a PDF's text layer: OCR text is never
+    evidence, #4986) and the ingest gate's predicate."""
     import boto3
     from ingestion.case_evidence import case_number_refuted, document_evidence
-    from ingestion.llm_extract import extract_text_from_pdf, is_pdf_binary
+    from ingestion.llm_extract import extract_text_layer, is_pdf_binary, pdf_page_count
 
     clients: dict[int, Any] = {}
 
@@ -220,10 +228,11 @@ def production_gate() -> Gate:
 
     return Gate(
         fetch=fetch,
-        extract_pdf=extract_text_from_pdf,
+        extract_pdf=extract_text_layer,
         is_pdf=is_pdf_binary,
         evidence_for=lambda text: document_evidence(text),
         refuted=case_number_refuted,
+        page_count=pdf_page_count,
     )
 
 
@@ -393,23 +402,31 @@ class TextProbe:
     """What one key's text extraction produced."""
 
     key: str
-    chars: int  # non-blank characters of the extracted text (stripped length)
+    chars: int  # non-blank characters of the text layer (stripped length)
     evidence: bool  # True when the gate counts the text as evidence
+    pages: int = 0  # page count, read only for a key with no evidence
+
+
+#: The page count past which the OCR fallback used to stop reading (#4986).
+OLD_OCR_PAGE_CAP = 10
 
 
 def probe_key_text(key: str, gate: Gate) -> TextProbe:
-    text = text_for(gate.fetch(key), key, gate.extract_pdf, gate.is_pdf)
+    body = gate.fetch(key)
+    text = text_for(body, key, gate.extract_pdf, gate.is_pdf)
     usable = text if text and not gate.is_pdf(text) else ""
-    return TextProbe(key, len(usable.strip()), bool(gate.evidence_for(text)))
+    evidence = bool(gate.evidence_for(text))
+    pages = 0 if evidence else gate.page_count(body)
+    return TextProbe(key, len(usable.strip()), evidence, pages)
 
 
 @dataclass
 class NoTextReport:
     county: str
     pdf_keys: int = 0
-    no_text: list[tuple[str, int, int]] = field(
+    no_text: list[tuple[str, int, int, int]] = field(
         default_factory=list
-    )  # key, chars, rulings
+    )  # key, chars, pages, rulings
     timeout_keys: list[str] = field(default_factory=list)
     error_keys: list[str] = field(default_factory=list)
 
@@ -417,8 +434,11 @@ class NoTextReport:
         return {
             "pdf_keys": self.pdf_keys,
             "no_text": len(self.no_text),
-            "no_text_zero_rulings": sum(1 for _, _, n in self.no_text if n == 0),
-            "no_text_rulings": sum(n for _, _, n in self.no_text),
+            "no_text_zero_rulings": sum(1 for *_, n in self.no_text if n == 0),
+            "no_text_rulings": sum(n for *_, n in self.no_text),
+            "no_text_over_10_pages": sum(
+                1 for _, _, p, _ in self.no_text if p > OLD_OCR_PAGE_CAP
+            ),
             "timeout": len(self.timeout_keys),
             "error": len(self.error_keys),
             "timeout_keys": self.timeout_keys,
@@ -435,6 +455,7 @@ def audit_no_text_county(
     workers: int,
     timeout: float,
     progress_every: int,
+    min_pages: int = 0,
     out: Callable[[str], None] = print,
 ) -> NoTextReport:
     report = NoTextReport(county=county, pdf_keys=len(keys))
@@ -447,10 +468,13 @@ def audit_no_text_county(
         elif status == "error":
             report.error_keys.append(key)
             out(f"ERROR {county} key={key} error={payload}")
-        elif not payload.evidence:
+        elif not payload.evidence and payload.pages >= min_pages:
             rulings = ruling_counts.get(key, 0)
-            report.no_text.append((key, payload.chars, rulings))
-            out(f"NO_TEXT {county} key={key} chars={payload.chars} rulings={rulings}")
+            report.no_text.append((key, payload.chars, payload.pages, rulings))
+            out(
+                f"NO_TEXT {county} key={key} chars={payload.chars} "
+                f"pages={payload.pages} rulings={rulings}"
+            )
         if progress_every and done % progress_every == 0 and done < report.pdf_keys:
             out(
                 f"PROGRESS {county}: {done}/{report.pdf_keys} keys no_text={len(report.no_text)}"
@@ -484,6 +508,7 @@ def run_no_text(
                 workers=args.workers,
                 timeout=args.timeout,
                 progress_every=args.progress_every,
+                min_pages=args.min_pages,
                 out=out,
             )
         )
@@ -491,7 +516,7 @@ def run_no_text(
 
 
 def no_text_key_list(reports: Iterable[NoTextReport]) -> str:
-    return "".join(f"{key}\n" for r in reports for key, _, _ in r.no_text)
+    return "".join(f"{key}\n" for r in reports for key, *_ in r.no_text)
 
 
 def list_county_pdf_keys(
@@ -608,6 +633,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--write-keys",
         help="With --no-text-pdfs: s3://bucket/key to write the no-text keys to.",
+    )
+    parser.add_argument(
+        "--min-pages",
+        type=int,
+        default=0,
+        help="With --no-text-pdfs: report only no-text keys of at least N pages.",
     )
     args = parser.parse_args(argv)
     if args.write_keys and (

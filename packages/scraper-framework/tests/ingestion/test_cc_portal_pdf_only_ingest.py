@@ -39,6 +39,7 @@ from courts.ca.cc_tentatives_portal import (
 )
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
 from framework.events import EventBus
+from ingestion.llm_extract import PdfText
 
 pytestmark = pytest.mark.regression
 
@@ -468,7 +469,7 @@ def test_pdf_without_header_date_keeps_event_date(caplog: pytest.LogCaptureFixtu
 
     worker = _worker({_S3_KEY: archived})
     with (
-        patch("ingestion.worker.extract_text_from_pdf", return_value=headerless),
+        patch("ingestion.worker.extract_pdf_text", return_value=PdfText(headerless)),
         caplog.at_level(logging.INFO, logger="ingestion.worker"),
     ):
         mock_ins = _process(worker, payload)

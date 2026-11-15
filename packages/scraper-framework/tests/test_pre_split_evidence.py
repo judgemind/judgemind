@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from ingestion.case_evidence import CASE_NUMBER_EVIDENCE_KEY
+from ingestion.llm_extract import PdfText
 from ingestion.worker import IngestionWorker, as_pre_split_child
 
 PAGE = "Case No. 23STCV12345 Alder v. Acme Corp. " + "The motion is GRANTED. " * 20
@@ -66,10 +67,20 @@ def test_split_into_one_ruling_adds_the_link_text() -> None:
 
 def test_pdf_page_text_is_extracted() -> None:
     worker = _worker({"ca/x/raw/a.pdf": b"%PDF-1.4 bytes"})
-    with patch("ingestion.worker.extract_text_from_pdf", return_value=PAGE) as extract:
+    with patch("ingestion.worker.extract_pdf_text", return_value=PdfText(PAGE)) as extract:
         out = worker._with_pre_split_evidence(_child(key="ca/x/raw/a.pdf", content_format="pdf"))
-    extract.assert_called_once_with(b"%PDF-1.4 bytes")
+    # The text layer only: OCR text is never evidence (#4986).
+    extract.assert_called_once_with(b"%PDF-1.4 bytes", ocr=False)
     assert out[CASE_NUMBER_EVIDENCE_KEY] == (PAGE,)
+
+
+def test_scanned_pdf_page_gives_empty_evidence() -> None:
+    """A page with no text layer is a scan: no evidence, and no OCR run
+    (#4986)."""
+    worker = _worker({"ca/x/raw/a.pdf": b"%PDF-1.4 bytes"})
+    with patch("ingestion.worker.extract_pdf_text", return_value=None):
+        out = worker._with_pre_split_evidence(_child(key="ca/x/raw/a.pdf", content_format="pdf"))
+    assert out[CASE_NUMBER_EVIDENCE_KEY] == ()
 
 
 def test_short_page_gives_empty_evidence() -> None:

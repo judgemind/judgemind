@@ -33,7 +33,9 @@ def _refuted(case_number: str, evidence: tuple[str, ...]) -> bool:
     return not any(case_number in t for t in evidence)
 
 
-def _gate(objects: dict[str, bytes], extract_pdf=None) -> audit.Gate:
+def _gate(
+    objects: dict[str, bytes], extract_pdf=None, page_count=None
+) -> audit.Gate:
     def fetch(key: str) -> bytes:
         if key not in objects:
             raise KeyError(key)
@@ -49,6 +51,7 @@ def _gate(objects: dict[str, bytes], extract_pdf=None) -> audit.Gate:
         ),
         evidence_for=_evidence,
         refuted=_refuted,
+        page_count=page_count or (lambda content: 0),
     )
 
 
@@ -114,7 +117,9 @@ def test_production_gate_uses_the_ingest_gate() -> None:
 
     gate = audit.production_gate()
     assert gate.refuted is case_evidence.case_number_refuted
-    assert gate.extract_pdf is llm_extract.extract_text_from_pdf
+    # OCR text is never evidence (#4986): the audit reads the text layer.
+    assert gate.extract_pdf is llm_extract.extract_text_layer
+    assert gate.page_count is llm_extract.pdf_page_count
     assert gate.evidence_for("short") == ()
     text = "The court rules in 30-2026-01234567-CU-BC-CJC as follows. " * 5
     assert gate.evidence_for(text) == (text,)
@@ -391,6 +396,7 @@ def test_no_text_mode_reports_scanned_pdfs_with_ruling_counts() -> None:
         extract_pdf=lambda content: {b"%PDF1": "", b"%PDF2": "  tiny  "}.get(
             content, LONG
         ),
+        page_count=lambda content: {b"%PDF1": 22, b"%PDF2": 1}.get(content, 99),
     )
     lines: list[str] = []
     reports = audit.run_no_text(
@@ -413,8 +419,10 @@ def test_no_text_mode_reports_scanned_pdfs_with_ruling_counts() -> None:
     assert summary["no_text"] == 2
     assert summary["no_text_zero_rulings"] == 1
     assert summary["no_text_rulings"] == 3
+    assert summary["no_text_over_10_pages"] == 1
     assert summary["error"] == 1
-    assert "NO_TEXT Riverside key=ca/x/c/raw/short.pdf chars=4 rulings=3" in lines
+    assert "NO_TEXT Riverside key=ca/x/c/raw/short.pdf chars=4 pages=1 rulings=3" in lines
+    assert "NO_TEXT Riverside key=ca/x/c/raw/scan.pdf chars=0 pages=22 rulings=0" in lines
     assert audit.no_text_key_list(reports) == (
         "ca/x/c/raw/scan.pdf\nca/x/c/raw/short.pdf\n"
     )
@@ -430,7 +438,7 @@ def test_no_text_mode_honours_keys_and_limit() -> None:
         {"a.pdf", "b.pdf"},
         out=lambda line: None,
     )
-    assert [k for k, _, _ in reports[0].no_text] == ["a.pdf"]
+    assert [k for k, *_ in reports[0].no_text] == ["a.pdf"]
 
 
 def test_write_keys_needs_no_text_mode_and_s3_uri() -> None:
@@ -518,3 +526,44 @@ def test_main_no_text_writes_key_list(monkeypatch) -> None:
         == 0
     )
     assert puts == [{"Bucket": "bkt", "Key": "tmp/k.txt", "Body": b"a.pdf\n"}]
+
+
+def test_no_text_mode_min_pages_keeps_long_scans_only() -> None:
+    """``--min-pages 11`` lists the scans the old 10-page OCR cap cut short
+    (#4986), for a reingest key list."""
+    gate = _gate(
+        {"long.pdf": b"%PDF1", "short.pdf": b"%PDF2", "text.pdf": b"%PDF3"},
+        extract_pdf=lambda c: "" if c != b"%PDF3" else LONG,
+        page_count=lambda c: {b"%PDF1": 22, b"%PDF2": 3}.get(c, 40),
+    )
+    lines: list[str] = []
+    reports = audit.run_no_text(
+        _args("--no-text-pdfs", "Santa Clara", "--min-pages", "11"),
+        {"Santa Clara": ["long.pdf", "short.pdf", "text.pdf"]},
+        {"long.pdf": 1},
+        gate,
+        None,
+        out=lines.append,
+    )
+    assert audit.no_text_key_list(reports) == "long.pdf\n"
+    summary = reports[0].summary()
+    assert summary["no_text"] == 1
+    assert summary["no_text_over_10_pages"] == 1
+    assert "NO_TEXT Santa Clara key=long.pdf chars=0 pages=22 rulings=1" in lines
+
+
+def test_probe_reads_page_count_only_without_evidence() -> None:
+    counted: list[bytes] = []
+
+    def page_count(content: bytes) -> int:
+        counted.append(content)
+        return 5
+
+    gate = _gate(
+        {"a.pdf": b"%PDF1", "b.pdf": b"%PDF2"},
+        extract_pdf=lambda c: LONG if c == b"%PDF1" else "",
+        page_count=page_count,
+    )
+    assert audit.probe_key_text("a.pdf", gate).pages == 0
+    assert audit.probe_key_text("b.pdf", gate).pages == 5
+    assert counted == [b"%PDF2"]

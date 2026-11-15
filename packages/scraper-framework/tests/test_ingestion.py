@@ -27,6 +27,7 @@ from ingestion.db import (
     upsert_case_party,
     upsert_party,
 )
+from ingestion.llm_extract import PdfText
 from ingestion.worker import (
     CONSUMER_NAME,
     DEFAULT_HEARTBEAT_INTERVAL,
@@ -3327,7 +3328,7 @@ def test_la_expansion_skipped_when_department_missing(
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.extract_pdf_text")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
@@ -3353,7 +3354,7 @@ def test_process_event_extracts_text_from_pdf_binary(
 
     # Simulate raw PDF binary content
     mock_is_pdf.return_value = True
-    mock_extract_pdf.return_value = "The motion for summary judgment is GRANTED."
+    mock_extract_pdf.return_value = PdfText("The motion for summary judgment is GRANTED.")
 
     # LLM returns None so regex fallback kicks in
     mock_llm.return_value = None
@@ -3368,7 +3369,7 @@ def test_process_event_extracts_text_from_pdf_binary(
 
     # PDF binary should have been detected and text extracted
     mock_is_pdf.assert_called_once()
-    mock_extract_pdf.assert_called_once_with("%PDF-1.4 fake binary content")
+    mock_extract_pdf.assert_called_once_with("%PDF-1.4 fake binary content", ocr_max_pages=10)
 
     # LLM should receive the extracted text, not raw binary
     mock_llm.assert_called_once()
@@ -3381,7 +3382,7 @@ def test_process_event_extracts_text_from_pdf_binary(
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.extract_pdf_text")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
@@ -3430,7 +3431,7 @@ def test_process_event_pdf_extraction_failure_continues(
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.extract_pdf_text")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.psycopg")
 def test_process_event_non_pdf_skips_pdf_extraction(
@@ -4670,7 +4671,7 @@ def test_process_event_no_pdf_warning_for_html_without_ruling_text(
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.extract_text_from_pdf", return_value="")
+@patch("ingestion.worker.extract_pdf_text", return_value=PdfText(""))
 @patch("ingestion.worker.is_pdf_binary", return_value=True)
 @patch("ingestion.worker.extract_fields_llm", return_value=None)
 @patch("ingestion.worker.psycopg")

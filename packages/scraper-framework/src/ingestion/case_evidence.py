@@ -21,6 +21,11 @@ What counts as evidence:
   images, so the text cannot confirm or refute anything.  There is no
   evidence then: the gate keeps whatever number the extractors produced,
   no fuzzy correction is refused, and no ruling is moved off its case.
+- A PDF with no text layer is a scanned PDF however long its text is: the
+  text ``llm_extract.extract_pdf_text`` returns for it is the LLM's OCR
+  transcription (``PdfText.from_ocr``), so it is no evidence at any length
+  (``from_ocr``, #4986), and nor is any slice of it.  The worker marks such
+  an event (``TEXT_FROM_OCR_KEY``) and its children inherit the mark.
 - A split child's own text, cut from the source by a deterministic
   splitter or a scraper, counts at any length (``own_text_evidence``): it
   is that ruling's whole source text, so a number the per-field LLM
@@ -58,25 +63,39 @@ CASE_NUMBER_EVIDENCE_KEY = "_case_number_evidence"
 #: LLM's.
 INHERITED_CASE_NUMBER_KEY = "_inherited_case_number"
 
+#: Event key the worker sets when the event's document text is the LLM's
+#: OCR transcription of a PDF with no text layer (``PdfText.from_ocr``,
+#: #4986).  Split children inherit it with the rest of the event.  The text
+#: of such an event, and any slice of it, is no evidence.
+TEXT_FROM_OCR_KEY = "_text_from_ocr"
+
 
 def _usable(text: str | None) -> bool:
     return bool(text and text.strip()) and not is_pdf_binary(text or "")
 
 
-def document_evidence(document_text: str | None, *supporting: str | None) -> tuple[str, ...]:
+def document_evidence(
+    document_text: str | None, *supporting: str | None, from_ocr: bool = False
+) -> tuple[str, ...]:
     """Evidence from a document's extracted text, plus *supporting* source
     text (the link text).  Empty when the document text cannot settle a
-    case number: no text, raw PDF bytes, or fewer than
-    ``MIN_DOCUMENT_TEXT_CHARS`` non-blank characters."""
-    if not _usable(document_text) or len((document_text or "").strip()) < MIN_DOCUMENT_TEXT_CHARS:
+    case number: no text, raw PDF bytes, fewer than
+    ``MIN_DOCUMENT_TEXT_CHARS`` non-blank characters, or text OCR
+    transcribed from page images (*from_ocr*: a scanned PDF, #4986)."""
+    if (
+        from_ocr
+        or not _usable(document_text)
+        or len((document_text or "").strip()) < MIN_DOCUMENT_TEXT_CHARS
+    ):
         return ()
     return (str(document_text), *(s for s in supporting if s))
 
 
-def own_text_evidence(text: str | None) -> tuple[str, ...]:
+def own_text_evidence(text: str | None, *, from_ocr: bool = False) -> tuple[str, ...]:
     """Evidence from a split child's own source text, at any length.
-    Empty when there is no text or it is raw PDF bytes."""
-    return (str(text),) if _usable(text) else ()
+    Empty when there is no text, it is raw PDF bytes, or it was cut from
+    OCR text (*from_ocr*, #4986)."""
+    return (str(text),) if _usable(text) and not from_ocr else ()
 
 
 def case_number_refuted(case_number: str | None, evidence: Iterable[str | None]) -> bool:

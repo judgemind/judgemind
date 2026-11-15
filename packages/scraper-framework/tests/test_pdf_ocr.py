@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingestion.llm_extract import (
+    PdfText,
     _render_pdf_pages,
     extract_text_from_pdf,
     ocr_pdf_text,
@@ -181,7 +182,7 @@ class TestExtractTextFromPdfOcrFallback:
     def test_text_pdf_uses_pdfplumber_no_ocr(self, text_pdf_bytes: bytes) -> None:
         """Normal PDFs with text layers should use pdfplumber, not OCR."""
         with patch(
-            "ingestion.llm_extract.ocr_pdf_text",
+            "ingestion.llm_extract.ocr_pdf_document",
         ) as mock_ocr:
             result = extract_text_from_pdf(text_pdf_bytes)
 
@@ -193,18 +194,18 @@ class TestExtractTextFromPdfOcrFallback:
         """Image-only PDFs should trigger the OCR fallback."""
         expected_text = "OCR extracted text from court ruling"
         with patch(
-            "ingestion.llm_extract.ocr_pdf_text",
-            return_value=expected_text,
+            "ingestion.llm_extract.ocr_pdf_document",
+            return_value=PdfText(expected_text, from_ocr=True, page_count=1),
         ) as mock_ocr:
             result = extract_text_from_pdf(image_only_pdf_bytes)
 
         assert result == expected_text
-        mock_ocr.assert_called_once_with(image_only_pdf_bytes)
+        mock_ocr.assert_called_once_with(image_only_pdf_bytes, max_pages=100)
 
     def test_image_pdf_returns_none_when_ocr_fails(self, image_only_pdf_bytes: bytes) -> None:
         """When OCR also fails, extract_text_from_pdf should return None."""
         with patch(
-            "ingestion.llm_extract.ocr_pdf_text",
+            "ingestion.llm_extract.ocr_pdf_document",
             return_value=None,
         ):
             result = extract_text_from_pdf(image_only_pdf_bytes)
@@ -216,8 +217,8 @@ class TestExtractTextFromPdfOcrFallback:
         pdf_string = image_only_pdf_bytes.decode("latin-1")
         expected_text = "OCR text from string input"
         with patch(
-            "ingestion.llm_extract.ocr_pdf_text",
-            return_value=expected_text,
+            "ingestion.llm_extract.ocr_pdf_document",
+            return_value=PdfText(expected_text, from_ocr=True, page_count=1),
         ) as mock_ocr:
             result = extract_text_from_pdf(pdf_string)
 
@@ -227,7 +228,7 @@ class TestExtractTextFromPdfOcrFallback:
     def test_invalid_pdf_returns_none_no_ocr(self) -> None:
         """Invalid PDF input should return None without triggering OCR."""
         with patch(
-            "ingestion.llm_extract.ocr_pdf_text",
+            "ingestion.llm_extract.ocr_pdf_document",
         ) as mock_ocr:
             result = extract_text_from_pdf(b"not a pdf at all")
 
