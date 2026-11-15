@@ -73,6 +73,15 @@
 #  54. PREPUSH_SCRIPTS_TESTS=0 / PREPUSH_SCRIPTS_TESTS_WORKERS=0 knobs (#5045)
 #  55. ci.yml and the hook's helper share scripts/tests/requirements-ci.txt (#5045)
 #  56. under a real `git push`, the tests run without git's GIT_DIR (#5045)
+#  57. a scripts/dispatcher change runs scripts/dispatcher/tests in the same
+#      venv and env, -m "not integration", no gh token or login (#5052)
+#  58. a scripts/dispatcher_v3 change runs scripts/dispatcher_v3/tests (#5052)
+#  59. a CI-only import in the dispatcher suite fails with a Fix: block (#5052)
+#  60. a requirements-ci.txt change runs all three suites (#5052)
+#  61. a non-dispatcher scripts change runs no dispatcher suite (#5052)
+#  62. PREPUSH_SCRIPTS_TESTS=0 skips the dispatcher suites (#5052)
+#  63. a real `git push`: dispatcher run sees no GIT_DIR / gh login, and
+#      both dispatcher conftests carry the isolation blocks (#5052)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2154,10 +2163,12 @@ commit_scripts_change() {
 # seed_st_stubs <helper_rc> <pytest_rc> [pytest output]
 seed_st_stubs() {
     local helper_rc="$1" pytest_rc="$2" pytest_output="${3-stub scripts/tests passed}"
-    rm -rf "$ST_VENV" "$TMPDIR/st-calls.txt" "$TMPDIR/st-pytest.txt"
+    rm -rf "$ST_VENV" "$TMPDIR/st-calls.txt" "$TMPDIR/st-pytest.txt" "$TMPDIR"/st-override-*
     mkdir -p "$ST_VENV/bin" "$WORK/scripts"
     printf '#!/usr/bin/env bash\necho stub-venv-python3\n' > "$ST_VENV/bin/python3"
     printf '%s\n' "$pytest_output" > "$TMPDIR/st-pytest-output.txt"
+    # One record per run, appended: a push can run several suites (#5052).
+    # st_override_suite gives one suite its own exit code and output.
     cat > "$ST_VENV/bin/pytest" <<SH
 #!/usr/bin/env bash
 {
@@ -2166,7 +2177,17 @@ seed_st_stubs() {
     echo "python3=\$(python3)"
     echo "cwd=\$PWD"
     echo "gitdir=\${GIT_DIR:-unset}"
-} > "$TMPDIR/st-pytest.txt"
+    echo "ghtoken=\${GH_TOKEN:-unset} githubtoken=\${GITHUB_TOKEN:-unset}"
+    echo "ghconfig_entries=\$(ls -A "\${GH_CONFIG_DIR:-/nonexistent-gh-config}" 2>/dev/null | wc -l | tr -d ' ') ghconfig=\${GH_CONFIG_DIR:-unset}"
+} > "$TMPDIR/st-pytest.\$\$.txt"
+# One append per run, so concurrent suites' records do not interleave.
+cat "$TMPDIR/st-pytest.\$\$.txt" >> "$TMPDIR/st-pytest.txt"
+rm -f "$TMPDIR/st-pytest.\$\$.txt"
+override="$TMPDIR/st-override-\$(printf '%s' "\$1" | tr '/' '_')"
+if [ -f "\$override.rc" ]; then
+    cat "\$override.out"
+    exit "\$(cat "\$override.rc")"
+fi
 cat "$TMPDIR/st-pytest-output.txt"
 exit $pytest_rc
 SH
@@ -2358,6 +2379,205 @@ elif ! echo "$st_seen" | grep -q "^gitdir=unset$"; then
     report_fail "expected GIT_DIR unset for the test run; saw: $st_seen" "$push_out"
 else
     report_pass "test runs do not inherit git's GIT_DIR (#5045)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 57-63 (#5052): the dispatcher and dispatcher_v3 suites run in
+# the same minimal venv and env as scripts/tests, as CI's scripts-tests
+# (python) job runs them. Same stubs as scenarios 49-56; the stub pytest
+# appends one record per run to st-pytest.txt.
+# ───────────────────────────────────────────────────────────────────────
+
+# st_override_suite <suite dir with trailing /> <rc> <output>: that suite's
+# stub pytest run exits <rc> after printing <output>; other suites keep the
+# seed_st_stubs result.
+st_override_suite() {
+    local base
+    base="$TMPDIR/st-override-$(printf '%s' "$1" | tr '/' '_')"
+    printf '%s\n' "$2" > "$base.rc"
+    printf '%s\n' "$3" > "$base.out"
+}
+
+# st_run_record <suite dir with trailing />: the stub record of that suite's run.
+st_run_record() {
+    awk -v suite="$1" '
+        /^args=/ { keep = (index($0, "args=" suite " ") == 1) }
+        keep { print }
+    ' "$TMPDIR/st-pytest.txt" 2>/dev/null || true
+}
+
+# A fake stored gh login the hook must hide from the test runs.
+FAKE_GH_LOGIN_DIR="$TMPDIR/fake-gh-login"
+mkdir -p "$FAKE_GH_LOGIN_DIR"
+echo "github.com: {oauth_token: fake-token-5052}" > "$FAKE_GH_LOGIN_DIR/hosts.yml"
+
+echo "[scenario 57] a scripts/dispatcher change runs the dispatcher suite in the minimal venv, CI-style (#5052)"
+init_workspace
+commit_scripts_change feature-disp-pass scripts/dispatcher/thing.py
+seed_st_stubs 0 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-disp-pass $feat_sha refs/heads/feature-disp-pass $ZERO_SHA" \
+    | GH_TOKEN=fake-token-5052 GITHUB_TOKEN=fake-token-5052 GH_CONFIG_DIR="$FAKE_GH_LOGIN_DIR" \
+      "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+disp_seen="$(st_run_record scripts/dispatcher/tests/)"
+st_seen="$(st_run_record scripts/tests/)"
+v3_seen="$(st_run_record scripts/dispatcher_v3/tests/)"
+work_abs="$(cd "$WORK" && pwd)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a passing dispatcher run to pass the push (#5052)" "$hook_out"
+elif [ -z "$disp_seen" ]; then
+    report_fail "expected the stub pytest to see scripts/dispatcher/tests/; saw: $(cat "$TMPDIR/st-pytest.txt" 2>/dev/null)" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^args=scripts/dispatcher/tests/ -m not integration .*-n auto"; then
+    report_fail "expected CI's args (-m \"not integration\", -n auto); saw: $disp_seen" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^pythonpath=scripts$"; then
+    report_fail "expected PYTHONPATH=scripts; saw: $disp_seen" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^python3=stub-venv-python3$"; then
+    report_fail "expected the minimal venv's python3 first on PATH; saw: $disp_seen" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^cwd=$work_abs$"; then
+    report_fail "expected pytest to run from the repo root; saw: $disp_seen" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^ghtoken=unset githubtoken=unset$"; then
+    report_fail "expected GitHub tokens unset for the test run; saw: $disp_seen" "$hook_out"
+elif ! echo "$disp_seen" | grep -q "^ghconfig_entries=0 " \
+        || echo "$disp_seen" | grep -q "ghconfig=$FAKE_GH_LOGIN_DIR$"; then
+    report_fail "expected an empty GH_CONFIG_DIR, not the stored login; saw: $disp_seen" "$hook_out"
+elif [ -z "$st_seen" ]; then
+    report_fail "expected scripts/tests to run too (scripts/**/*.py changed); saw: $(cat "$TMPDIR/st-pytest.txt")" "$hook_out"
+elif [ -n "$v3_seen" ]; then
+    report_fail "the dispatcher_v3 suite must not run for a scripts/dispatcher-only push; saw: $v3_seen" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/dispatcher/tests pytest"; then
+    report_fail "expected the dispatcher run in the timing summary (#5052)" "$hook_out"
+else
+    report_pass "dispatcher suite runs in the minimal venv, tokens and stored gh login hidden (#5052)"
+fi
+
+echo "[scenario 58] a scripts/dispatcher_v3 change runs only the dispatcher_v3 suite of the two (#5052)"
+init_workspace
+commit_scripts_change feature-v3-pass scripts/dispatcher_v3/thing.py
+seed_st_stubs 0 0
+run_hook "refs/heads/feature-v3-pass $feat_sha refs/heads/feature-v3-pass $ZERO_SHA"
+v3_seen="$(st_run_record scripts/dispatcher_v3/tests/)"
+disp_seen="$(st_run_record scripts/dispatcher/tests/)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a passing dispatcher_v3 run to pass the push (#5052)" "$hook_out"
+elif ! echo "$v3_seen" | grep -q "^args=scripts/dispatcher_v3/tests/ -n auto"; then
+    report_fail "expected scripts/dispatcher_v3/tests/ with CI's args; saw: $(cat "$TMPDIR/st-pytest.txt" 2>/dev/null)" "$hook_out"
+elif ! echo "$v3_seen" | grep -q "^ghtoken=unset githubtoken=unset$"; then
+    report_fail "expected GitHub tokens unset; saw: $v3_seen" "$hook_out"
+elif [ -n "$disp_seen" ]; then
+    report_fail "the dispatcher suite must not run for a dispatcher_v3-only push; saw: $disp_seen" "$hook_out"
+else
+    report_pass "dispatcher_v3 change runs the dispatcher_v3 suite (#5052)"
+fi
+
+echo "[scenario 59] an import only the full venv has, in a dispatcher test, fails the push with a Fix: block (#5052)"
+init_workspace
+commit_scripts_change feature-disp-import scripts/dispatcher/tests/test_thing.py
+seed_st_stubs 0 0
+st_override_suite scripts/dispatcher/tests/ 2 "ERROR scripts/dispatcher/tests/test_thing.py - ModuleNotFoundError: No module named 'structlog'
+E   ModuleNotFoundError: No module named 'structlog'
+1 error in 0.10s"
+run_hook "refs/heads/feature-disp-import $feat_sha refs/heads/feature-disp-import $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a dispatcher collection error to fail the push (#5052)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: scripts/dispatcher/tests pytest"; then
+    report_fail "expected 'FAILED: scripts/dispatcher/tests pytest' (#5052)" "$hook_out"
+elif echo "$hook_out" | grep -q "FAILED: scripts/tests pytest"; then
+    report_fail "only the dispatcher suite failed; scripts/tests must not be reported failed (#5052)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "    E   ModuleNotFoundError: No module named 'structlog'"; then
+    report_fail "expected the ModuleNotFoundError line quoted (#5052)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a Fix: block (#5052)" "$hook_out"
+elif ! echo "$hook_out" | grep -qF "PYTHONPATH=scripts $ST_VENV/bin/pytest scripts/dispatcher/tests/ -m not\\ integration --tb=short"; then
+    report_fail "expected a copy-pasteable reproduce command with CI's -m filter (#5052)" "$hook_out"
+else
+    report_pass "a CI-only import error in the dispatcher suite fails pre-push with a Fix: block (#5052)"
+fi
+
+echo "[scenario 60] a requirements-ci.txt change runs all three suites in one shared venv (#5052)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-req
+mkdir -p "$WORK/scripts/tests"
+echo "pytest" > "$WORK/scripts/tests/requirements-ci.txt"
+git -C "$WORK" add scripts/tests/requirements-ci.txt
+git -C "$WORK" commit --quiet -m "build: requirements"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+seed_st_stubs 0 0
+run_hook "refs/heads/feature-req $feat_sha refs/heads/feature-req $ZERO_SHA"
+runs="$(grep -c "^args=" "$TMPDIR/st-pytest.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#5052)" "$hook_out"
+elif [ -z "$(st_run_record scripts/tests/)" ] || [ -z "$(st_run_record scripts/dispatcher/tests/)" ] \
+        || [ -z "$(st_run_record scripts/dispatcher_v3/tests/)" ]; then
+    report_fail "expected all three suites to run; saw: $(cat "$TMPDIR/st-pytest.txt" 2>/dev/null)" "$hook_out"
+elif [ "$runs" -ne 3 ]; then
+    report_fail "expected exactly 3 pytest runs, saw $runs" "$hook_out"
+else
+    report_pass "requirements-ci.txt change runs scripts/tests, dispatcher and dispatcher_v3 suites (#5052)"
+fi
+
+echo "[scenario 61] a non-dispatcher scripts change does not run the dispatcher suites (#5052)"
+init_workspace
+commit_scripts_change feature-st-only scripts/thing.py
+seed_st_stubs 0 0
+run_hook "refs/heads/feature-st-only $feat_sha refs/heads/feature-st-only $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#5052)" "$hook_out"
+elif [ -z "$(st_run_record scripts/tests/)" ]; then
+    report_fail "expected scripts/tests to run (#5052)" "$hook_out"
+elif [ -n "$(st_run_record scripts/dispatcher/tests/)$(st_run_record scripts/dispatcher_v3/tests/)" ]; then
+    report_fail "the dispatcher suites must not run for scripts/thing.py; saw: $(cat "$TMPDIR/st-pytest.txt")" "$hook_out"
+else
+    report_pass "scripts/thing.py runs only scripts/tests (#5052)"
+fi
+
+echo "[scenario 62] PREPUSH_SCRIPTS_TESTS=0 skips the dispatcher suites with a WARNING (#5052)"
+init_workspace
+commit_scripts_change feature-disp-skip scripts/dispatcher/thing.py
+seed_st_stubs 0 1
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-disp-skip $feat_sha refs/heads/feature-disp-skip $ZERO_SHA" \
+    | PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected PREPUSH_SCRIPTS_TESTS=0 to skip the (failing) dispatcher run (#5052)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "WARNING: PREPUSH_SCRIPTS_TESTS=0, so the dispatcher suites did not run"; then
+    report_fail "expected the dispatcher bypass WARNING (#5052)" "$hook_out"
+elif [ -f "$TMPDIR/st-pytest.txt" ]; then
+    report_fail "no suite may run under PREPUSH_SCRIPTS_TESTS=0 (#5052)" "$hook_out"
+else
+    report_pass "PREPUSH_SCRIPTS_TESTS=0 skips the dispatcher suites (#5052)"
+fi
+
+echo "[scenario 63] a real 'git push' runs the dispatcher suite without GIT_DIR or a gh login; both conftests isolate (#5052)"
+init_workspace
+commit_scripts_change feature-disp-gitdir scripts/dispatcher/thing.py
+git -C "$WORK" checkout --quiet main
+rm -rf "$LINKED"
+git -C "$WORK" worktree add --quiet "$LINKED" feature-disp-gitdir
+saved_work="$WORK"
+WORK="$LINKED"
+seed_st_stubs 0 0
+WORK="$saved_work"
+git -C "$WORK" config core.hooksPath "$TMPDIR/push-hooks"
+push_out="$(GH_TOKEN=fake-token-5052 GH_CONFIG_DIR="$FAKE_GH_LOGIN_DIR" git -C "$LINKED" push origin feature-disp-gitdir 2>&1)" \
+    && push_rc=0 || push_rc=$?
+git -C "$WORK" worktree remove --force "$LINKED" 2>/dev/null || true
+disp_seen="$(st_run_record scripts/dispatcher/tests/)"
+missing_blocks=""
+for conftest in scripts/dispatcher/tests/conftest.py scripts/dispatcher_v3/tests/conftest.py; do
+    for block in "BEGIN git-env-scrub (#5058)" "BEGIN gh-isolate (#5071)"; do
+        grep -qF -- "# --- $block ---" "$REPO_ROOT/$conftest" || missing_blocks="$missing_blocks $conftest:$block;"
+    done
+done
+if [ "$push_rc" -ne 0 ]; then
+    report_fail "expected the push to succeed (#5052)" "$push_out"
+elif [ -z "$disp_seen" ]; then
+    report_fail "expected the hook to run the dispatcher suite during the push (#5052)" "$push_out"
+elif ! echo "$disp_seen" | grep -q "^gitdir=unset$"; then
+    report_fail "expected GIT_DIR unset for the dispatcher run; saw: $disp_seen" "$push_out"
+elif ! echo "$disp_seen" | grep -q "^ghtoken=unset " || ! echo "$disp_seen" | grep -q "^ghconfig_entries=0 "; then
+    report_fail "expected no gh token and an empty GH_CONFIG_DIR; saw: $disp_seen" "$push_out"
+elif [ -n "$missing_blocks" ]; then
+    report_fail "expected each dispatcher conftest.py to carry the isolation blocks; missing:$missing_blocks"
+else
+    report_pass "dispatcher runs under a real push see no GIT_DIR and no gh login; conftests isolate (#5052)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

@@ -73,13 +73,22 @@ installs it with `pip install -r`, and `.githooks/pre-push` runs
 `pytest scripts/tests/` in a cached per-checkout venv built from the same
 file (`scripts/ensure-scripts-tests-venv.sh`, at
 `tmp/scripts-tests-venv/`) whenever a push touches `scripts/**/*.py` or
-`scripts/tests/` (#5045). So an import the minimal environment cannot
-satisfy fails pre-push with a `Fix:` block, not one CI round trip later.
-To reproduce by hand:
+`scripts/tests/` (#5045). The same job runs `scripts/dispatcher/tests/`
+(`-m "not integration"`) and `scripts/dispatcher_v3/tests/` in that
+environment, and so does the hook, as parallel jobs sharing the venv, when a
+push touches `scripts/dispatcher/**` or `scripts/dispatcher_v3/**` (or
+`requirements-ci.txt`, the venv helper, `judgemind-config` or
+`scripts/tests/conftest.py`, which all suites share) (#5052). Every run gets
+git's `GIT_*` repository vars unset, no GitHub token and an empty
+`GH_CONFIG_DIR`, on top of each suite's conftest isolation blocks. So an
+import the minimal environment cannot satisfy fails pre-push with a `Fix:`
+block, not one CI round trip later. To reproduce by hand:
 
 ```
 VENV=$(scripts/ensure-scripts-tests-venv.sh)
 PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/tests/ --tb=short
+PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/dispatcher/tests/ -m "not integration" -n auto --tb=short
+PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/dispatcher_v3/tests/ -n auto --tb=short
 ```
 
 Add a dependency to `requirements-ci.txt` only when scripts/tests genuinely
