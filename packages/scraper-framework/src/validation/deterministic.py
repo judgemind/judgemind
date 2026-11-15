@@ -125,6 +125,13 @@ _SUPERIOR_COURT_CASE_NO_PATTERN = re.compile(
 )
 
 
+# Every rule's semantic version is in ``validation.rule_versions.RULE_VERSIONS``
+# (#5027).  BUMP A RULE'S VERSION THERE WHENEVER A CHANGE HERE CAN TURN ONE OF
+# ITS ``fail`` RESULTS INTO ``flag`` OR ``pass``: the raw-key reconciler then
+# re-ingests the keys the rule failed before.  Without the bump they stay
+# hidden for good.
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -160,6 +167,11 @@ class DeterministicValidationResult:
     def reasons(self) -> list[str]:
         """Return all non-None reasons from non-pass rules."""
         return [r.reason for r in self.rules if r.reason is not None and r.result != "pass"]
+
+    @property
+    def failed_rule_names(self) -> list[str]:
+        """Names of the rules that failed, for ``validation_results.failed_rules``."""
+        return [r.rule for r in self.failed_rules]
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 71 migrations.
+-- Generated from 73 migrations.
 
 
 
@@ -1000,7 +1000,7 @@ CREATE TABLE telemetry.ingest_incomplete (
 );
 
 
-COMMENT ON TABLE telemetry.ingest_incomplete IS 'One row per raw S3 key whose stored rows are not a complete split (single_document_fallback, partial_split, exhausted_child, dead_letter, reingest_failed). Deleted by a later complete write of the key. Re-ingested by scripts/reconcile_raw_keys.py up to its attempt cap. Issue #5008.';
+COMMENT ON TABLE telemetry.ingest_incomplete IS 'One row per raw S3 key whose stored rows are not a complete split (single_document_fallback, partial_split, exhausted_child, dead_letter, reingest_failed), or whose recorded validation failure was judged by a since-relaxed rule (stale_validation, written by the reconciler, #5027). Deleted by a later complete write of the key. Re-ingested by scripts/reconcile_raw_keys.py up to its attempt cap. Issue #5008.';
 
 
 CREATE TABLE telemetry.ingest_skips (
@@ -1125,6 +1125,8 @@ CREATE TABLE telemetry.validation_results (
     scraper_id text,
     s3_key text,
     hearing_date_source text,
+    failed_rules text[],
+    rule_versions jsonb,
     CONSTRAINT validation_results_result_check CHECK ((result = ANY (ARRAY['pass'::text, 'flag'::text, 'fail'::text, 'error'::text])))
 );
 
@@ -1154,6 +1156,12 @@ COMMENT ON COLUMN telemetry.validation_results.s3_key IS 'S3 key of the raw capt
 
 
 COMMENT ON COLUMN telemetry.validation_results.hearing_date_source IS 'Provenance of the hearing date the deterministic rules judged (see derived.rulings.hearing_date_source). NULL for rows written before migration 67 or with no hearing_date. Issue #4793.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.failed_rules IS 'Deterministic rules that failed the ruling (empty on a flag row). NULL for LLM-gate rows and rows written before migration 73. Issue #5027.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.rule_versions IS 'Version of every deterministic rule that judged the row (validation.rule_versions.RULE_VERSIONS). A failure judged by an older version of a since-relaxed rule makes the skipped key eligible for reingest (scripts/reconcile_raw_keys.py). NULL before migration 73. Issue #5027.';
 
 
 ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);

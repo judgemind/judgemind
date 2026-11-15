@@ -45,6 +45,13 @@ only: no object is read) and sorts each one into a category:
                      ``incomplete_only``).  A reingest that runs to the
                      end counts one ``retry_attempts``, and a complete
                      reingest deletes the row (the worker).
+                     A key whose only explanation is a validation failure
+                     judged by an older version of a since-relaxed rule
+                     (``validation.rule_versions.RULE_VERSIONS``, #5027) is
+                     incomplete too: with ``--record`` this script writes
+                     its row, reason ``stale_validation``, and deletes it
+                     once the key is represented or the current rules
+                     failed it again.
 - ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
                      (default 3): reported, not retried.  Keys that just
                      reached the cap set ``issue_needed`` once (``stuck_at``
@@ -155,6 +162,12 @@ for _path in (
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
 
+from validation.rule_versions import (
+    FailRow,
+    fail_row_from_db,
+    stale_rules,
+)
+
 BUCKET = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
 
 CONTENT_KEY_RE = re.compile(
@@ -202,6 +215,11 @@ CATEGORIES = (
 #: rather than retried again (#5008).
 DEFAULT_MAX_INCOMPLETE_ATTEMPTS = 3
 
+#: ``ingestion.ingest_incomplete.INCOMPLETE_STALE_VALIDATION``: the
+#: incomplete reason this script records for a key whose validation failure
+#: was judged by a since-relaxed rule version (#5027).
+STALE_VALIDATION = "stale_validation"
+
 #: Where the oneshot task role may read and write key lists (#4803).
 KEY_LIST_DIR = "tmp/keys/"
 
@@ -248,6 +266,11 @@ class Explained:
     #: s3_key -> (reason, retry_attempts), from ``telemetry.ingest_incomplete``:
     #: keys whose rows are not a complete split (#5008).
     incomplete: dict[str, tuple[str, int]] = field(default_factory=dict)
+    #: The failed validation rows behind ``validation_fail`` (by s3_key) and
+    #: ``validation_fail_documents`` (by document id), with the rule versions
+    #: that judged them (#5027).
+    validation_rows: dict[str, list[FailRow]] = field(default_factory=dict)
+    validation_rows_by_document: dict[str, list[FailRow]] = field(default_factory=dict)
 
 
 @dataclass
@@ -262,6 +285,12 @@ class ScopeReport:
     #: Incomplete keys under the attempt cap: re-ingested with the
     #: unrepresented ones (#5008).
     incomplete: list[RawKey] = field(default_factory=list)
+    #: Keys found pending re-validation this run, with no incomplete record
+    #: yet, and the since-relaxed rules that failed them (#5027).
+    new_stale: list[tuple[RawKey, list[str]]] = field(default_factory=list)
+    #: Keys whose ``stale_validation`` record is resolved: the key is now
+    #: represented, or the current rules failed it again (#5027).
+    resolved_stale: list[RawKey] = field(default_factory=list)
 
     def unrepresented_by_day(self) -> dict[str, int]:
         return dict(sorted(Counter(k.day for k in self.unrepresented).items()))
@@ -400,6 +429,29 @@ def raw_key_document_id(key: str) -> str | None:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, m["hash"]))
 
 
+def key_stale_rules(raw: RawKey, explained: Explained) -> list[str]:
+    """The since-relaxed rules that failed *raw*'s rulings and have not
+    judged it since (``validation.rule_versions.stale_rules``, #5027)."""
+    rows = list(explained.validation_rows.get(raw.key, ()))
+    document_id = raw_key_document_id(raw.key)
+    if document_id:
+        rows.extend(explained.validation_rows_by_document.get(document_id, ()))
+    return sorted(stale_rules(rows)) if rows else []
+
+
+def _intentional_skip(key: str) -> bool:
+    return any(key.startswith(prefix) for prefix in INTENTIONAL_SKIP_PREFIXES)
+
+
+def _stale_record_resolved(raw: RawKey, explained: Explained) -> bool:
+    """A ``stale_validation`` record whose re-validation is done: the key
+    is represented, or its failures stand under the current rules."""
+    record = explained.incomplete.get(raw.key)
+    if record is None or record[0] != STALE_VALIDATION:
+        return False
+    return raw.key in explained.documents or not key_stale_rules(raw, explained)
+
+
 def classify(
     raw: RawKey,
     explained: Explained,
@@ -415,10 +467,17 @@ def classify(
     is otherwise just unrepresented.  Under the attempt cap it is
     ``incomplete`` (re-ingested); at the cap, ``incomplete_stuck``
     (reported, not retried).  The reason is the recorded one.
+
+    A key whose only explanation is a validation failure judged by an older
+    version of a since-relaxed rule is ``incomplete`` too, with reason
+    ``stale_validation`` (#5027): it is re-ingested for the current rules
+    to judge.  Its record is resolved, and the key classified as usual,
+    once the key is represented or no failure is stale any more (the
+    current rules failed it again).
     """
     key = raw.key
     incomplete = explained.incomplete.get(key)
-    if incomplete is not None:
+    if incomplete is not None and not _stale_record_resolved(raw, explained):
         reason, attempts = incomplete
         if attempts >= max_incomplete_attempts:
             return "incomplete_stuck", reason
@@ -428,13 +487,18 @@ def classify(
     reason = explained.skips.get(key)
     if reason:
         return "skipped", reason
+    validation_reason = None
     if key in explained.validation_fail:
-        return "skipped", "validation_fail"
-    if (
+        validation_reason = "validation_fail"
+    elif (
         explained.validation_fail_documents
         and raw_key_document_id(key) in explained.validation_fail_documents
     ):
-        return "skipped", "validation_fail_by_document_id"
+        validation_reason = "validation_fail_by_document_id"
+    if validation_reason:
+        if not _intentional_skip(key) and key_stale_rules(raw, explained):
+            return "incomplete", STALE_VALIDATION
+        return "skipped", validation_reason
     if key in explained.all_null_guard:
         return "skipped", "all_null_guard"
     for prefix, prefix_reason in INTENTIONAL_SKIP_PREFIXES.items():
@@ -481,6 +545,12 @@ def reconcile(
             and placeholder_check(raw)
         ):
             category, reason = "skipped", "santa_clara_placeholder"
+        record = explained.incomplete.get(raw.key)
+        if record is not None and record[0] == STALE_VALIDATION:
+            if category not in ("incomplete", "incomplete_stuck"):
+                rep.resolved_stale.append(raw)
+        elif record is None and reason == STALE_VALIDATION:
+            rep.new_stale.append((raw, key_stale_rules(raw, explained)))
         rep.counts[category] += 1
         if category in ("incomplete", "incomplete_stuck"):
             rep.incomplete_by_reason[reason or "unknown"] += 1
@@ -547,6 +617,80 @@ def _fetch_set(cur: Any, sql: str) -> set[str]:
     return {row[0] for row in cur.fetchall() if row[0]}
 
 
+#: Failed validation rows with an s3_key, or (before #4773) a document id.
+_VALIDATION_FAIL_SQL = (
+    "SELECT s3_key, document_id::text, created_at, reason, {versions} "
+    "FROM telemetry.validation_results "
+    "WHERE result = 'fail' AND (s3_key IS NOT NULL OR document_id IS NOT NULL)"
+)
+_VERSION_COLUMNS = "failed_rules, rule_versions"
+_NO_VERSION_COLUMNS = "NULL::text[], NULL::jsonb"
+
+
+def _fetch_validation_fails(conn: Any, explained: Explained) -> None:
+    """The failed validation rows, by s3_key and (rows written before #4773
+    added the column) by document id, with the rule versions that judged
+    them (#5027; before migration 73 there are none)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_VALIDATION_FAIL_SQL.format(versions=_VERSION_COLUMNS))
+            rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001 — migration 73 not applied yet
+        conn.rollback()
+        print(f"WARNING validation rule versions unreadable ({exc}); inferring them")
+        with conn.cursor() as cur:
+            cur.execute(_VALIDATION_FAIL_SQL.format(versions=_NO_VERSION_COLUMNS))
+            rows = cur.fetchall()
+    for s3_key, document_id, created_at, reason, failed, versions in rows:
+        row = fail_row_from_db(created_at, reason, failed, versions)
+        if s3_key:
+            explained.validation_rows.setdefault(s3_key, []).append(row)
+        elif document_id:
+            explained.validation_rows_by_document.setdefault(document_id, []).append(
+                row
+            )
+    explained.validation_fail = set(explained.validation_rows)
+    explained.validation_fail_documents = set(explained.validation_rows_by_document)
+
+
+def record_stale_validation(
+    conn: Any, stale: Sequence[tuple[RawKey, list[str]]]
+) -> None:
+    """Record keys pending re-validation in ``telemetry.ingest_incomplete``
+    (reason ``stale_validation``, #5027), so their reingest goes through the
+    #5008 attempt count and cap.  A record the worker already wrote for the
+    key is left alone."""
+    if not stale:
+        return
+    with conn.cursor() as cur:
+        for raw, rules in stale:
+            cur.execute(
+                "INSERT INTO telemetry.ingest_incomplete "
+                "(s3_key, reason, document_id, detail) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (s3_key) DO NOTHING",
+                (
+                    raw.key,
+                    STALE_VALIDATION,
+                    raw_key_document_id(raw.key),
+                    json.dumps({"stale_rules": rules, "scope": raw.scope}),
+                ),
+            )
+    conn.commit()
+
+
+def clear_stale_validation(conn: Any, keys: Sequence[str]) -> None:
+    """Delete the resolved ``stale_validation`` records (#5027)."""
+    if not keys:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM telemetry.ingest_incomplete "
+            "WHERE s3_key = ANY(%s) AND reason = %s",
+            (list(keys), STALE_VALIDATION),
+        )
+    conn.commit()
+
+
 def fetch_explained(conn: Any) -> Explained:
     """Every s3_key the database accounts for, from all four sources."""
     explained = Explained()
@@ -555,22 +699,13 @@ def fetch_explained(conn: Any) -> Explained:
             cur,
             "SELECT DISTINCT s3_key FROM derived.documents WHERE s3_key IS NOT NULL",
         )
-        explained.validation_fail = _fetch_set(
-            cur,
-            "SELECT DISTINCT s3_key FROM telemetry.validation_results "
-            "WHERE result = 'fail' AND s3_key IS NOT NULL",
-        )
-        explained.validation_fail_documents = _fetch_set(
-            cur,
-            "SELECT DISTINCT document_id::text FROM telemetry.validation_results "
-            "WHERE result = 'fail' AND s3_key IS NULL AND document_id IS NOT NULL",
-        )
         explained.all_null_guard = _fetch_set(
             cur,
             "SELECT DISTINCT metadata->>'s3_key' FROM telemetry.data_quality_metrics "
             f"WHERE metric_name = '{NON_RULING_PDF_DROPPED_METRIC}' "
             "AND metadata->>'s3_key' IS NOT NULL",
         )
+    _fetch_validation_fails(conn, explained)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT s3_key, reason FROM telemetry.ingest_skips")
@@ -912,6 +1047,9 @@ def run(
         f"DB documents={len(explained.documents)} skips={len(explained.skips)} "
         f"validation_fail={len(explained.validation_fail)} "
         f"validation_fail_by_document_id={len(explained.validation_fail_documents)} "
+        "validation_rows="
+        f"{sum(len(v) for v in explained.validation_rows.values())}"
+        f"+{sum(len(v) for v in explained.validation_rows_by_document.values())} "
         f"all_null_guard={len(explained.all_null_guard)} "
         f"incomplete={len(explained.incomplete)}"
     )
@@ -936,6 +1074,21 @@ def run(
         placeholder_check=placeholder_check,
         max_incomplete_attempts=args.max_incomplete_attempts,
     )
+
+    # Keys pending re-validation under a relaxed rule (#5027) join the
+    # incomplete keys: recorded (with --record) so the reingest counts its
+    # attempts against the cap.  Resolved records go.
+    new_stale = [item for rep in reports.values() for item in rep.new_stale]
+    resolved_stale = [raw.key for rep in reports.values() for raw in rep.resolved_stale]
+    for raw, _rules in new_stale:
+        explained.incomplete[raw.key] = (STALE_VALIDATION, 0)
+    for key in resolved_stale:
+        explained.incomplete.pop(key, None)
+    if conn is not None:
+        record_stale_validation(conn, new_stale)
+        clear_stale_validation(conn, resolved_stale)
+    for raw, rules in new_stale[: args.sample]:
+        out(f"STALE_VALIDATION {raw.scope} rules={','.join(rules)} key={raw.key}")
 
     for scope in sorted(reports):
         rep = reports[scope]
@@ -1002,6 +1155,8 @@ def run(
         "incomplete_batch": len(batch),
         "newly_stuck": len(newly_stuck),
         "newly_stuck_sample": newly_stuck[:10],
+        "stale_validation_new": len(new_stale),
+        "stale_validation_resolved": len(resolved_stale),
     }
 
     script = None

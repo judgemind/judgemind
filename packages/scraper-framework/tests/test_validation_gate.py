@@ -5,6 +5,7 @@ All LLM calls are mocked so these tests run offline in CI.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -424,6 +425,111 @@ class TestInsertValidationResult:
             "ca/contra_costa/superior_court/raw/abc.json",
             None,
         )
+
+    @staticmethod
+    def _fail() -> ValidationResult:
+        return ValidationResult(
+            result="fail",
+            reason="hearing_date (2003-07-15) is 8000 days from captured_at",
+            model="deterministic",
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+        )
+
+    def test_insert_records_failed_rules_and_rule_versions(self) -> None:
+        """#5027: the rule versions that judged a failure are recorded, so a
+        later relaxation can re-open the skipped key."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        insert_validation_result(
+            mock_conn,
+            document_id="doc-1",
+            ruling_id=None,
+            result=self._fail(),
+            county="San Bernardino",
+            scraper_id="ca-sb",
+            s3_key="ca/san_bernardino/superior_court/raw/x.pdf",
+            failed_rules=["hearing_date_in_range"],
+            rule_versions={"hearing_date_in_range": 2, "no_html_in_ruling_text": 1},
+        )
+
+        statements = [c.args[0] for c in mock_cur.execute.call_args_list]
+        assert statements[0] == "SAVEPOINT validation_rule_versions"
+        assert statements[-1] == "RELEASE SAVEPOINT validation_rule_versions"
+        sql, params = mock_cur.execute.call_args_list[1].args
+        column_list = sql.split("(", 1)[1].split(")", 1)[0]
+        columns = [c.strip() for c in column_list.split(",")]
+        assert columns[-2:] == ["failed_rules", "rule_versions"]
+        assert len(params) == len(columns)
+        assert params[-2] == ["hearing_date_in_range"]
+        assert json.loads(params[-1]) == {
+            "hearing_date_in_range": 2,
+            "no_html_in_ruling_text": 1,
+        }
+
+    def test_insert_before_migration_73_falls_back_to_the_old_columns(self) -> None:
+        """The worker can deploy before the migration: the row is kept."""
+
+        class UndefinedColumnError(Exception):
+            sqlstate = "42703"
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        def execute(sql: str, params: tuple[object, ...] | None = None) -> None:
+            if "failed_rules" in sql:
+                raise UndefinedColumnError("column failed_rules does not exist")
+
+        mock_cur.execute.side_effect = execute
+
+        insert_validation_result(
+            mock_conn,
+            document_id="doc-1",
+            ruling_id=None,
+            result=self._fail(),
+            county=None,
+            scraper_id=None,
+            s3_key="k",
+            failed_rules=["hearing_date_in_range"],
+            rule_versions={"hearing_date_in_range": 2},
+        )
+
+        statements = [c.args[0] for c in mock_cur.execute.call_args_list]
+        assert statements[2] == "ROLLBACK TO SAVEPOINT validation_rule_versions"
+        sql, params = mock_cur.execute.call_args_list[3].args
+        assert "failed_rules" not in sql
+        assert params[2] == "fail"
+        assert params[-2:] == ("k", None)
+
+    def test_insert_reraises_other_errors(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        def execute(sql: str, params: tuple[object, ...] | None = None) -> None:
+            if "failed_rules" in sql:
+                raise RuntimeError("connection lost")
+
+        mock_cur.execute.side_effect = execute
+        with pytest.raises(RuntimeError):
+            insert_validation_result(
+                mock_conn,
+                document_id="doc-1",
+                ruling_id=None,
+                result=self._fail(),
+                county=None,
+                scraper_id=None,
+                s3_key=None,
+                failed_rules=[],
+                rule_versions=None,
+            )
 
     def test_insert_validation_result_county_requires_attribution_kwargs(self) -> None:
         """#4706: attribution is keyword-required so a new call site cannot

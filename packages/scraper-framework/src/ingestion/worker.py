@@ -76,6 +76,7 @@ from validation.hearing_date_source import (
     is_structured,
 )
 from validation.issue_filer import file_validation_issue
+from validation.rule_versions import RULE_VERSIONS
 
 from .case_evidence import (
     CASE_NUMBER_EVIDENCE_KEY,
@@ -4337,6 +4338,10 @@ class IngestionWorker:
                     scraper_id=scraper_id,
                     s3_key=s3_key,
                     hearing_date_source=hearing_date_source,
+                    # The rule versions that judged this failure: a later
+                    # relaxation makes the key eligible for reingest (#5027).
+                    failed_rules=det_result.failed_rule_names,
+                    rule_versions=RULE_VERSIONS,
                 )
                 conn.commit()
             except Exception as exc:
@@ -4374,6 +4379,8 @@ class IngestionWorker:
                     scraper_id=scraper_id,
                     s3_key=s3_key,
                     hearing_date_source=hearing_date_source,
+                    failed_rules=[],
+                    rule_versions=RULE_VERSIONS,
                 )
                 conn.commit()
             except Exception as exc:

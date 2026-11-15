@@ -14,6 +14,11 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   extraction and left the key's rows as they were (#4948, #5000).  Before
   #5008 the key was only listed in the reingest's failed manifest, under
   ``tmp/keys/``, which expires after 30 days.
+- ``stale_validation``: written by the raw-key reconciler, not the worker
+  (#5027).  Every ruling of the key failed validation under a version of a
+  rule since relaxed (``validation.rule_versions``), so the key is
+  re-ingested for the current rules to judge.  A reingest that writes the
+  key, or fails it again under the current rules, resolves it.
 
 Each upserts one ``telemetry.ingest_incomplete`` row per key, keyed by
 ``s3_key`` (the latest reason wins, ``occurrences`` counts them).  A later
@@ -45,6 +50,8 @@ INCOMPLETE_PARTIAL_SPLIT = "partial_split"
 INCOMPLETE_EXHAUSTED_CHILD = "exhausted_child"
 INCOMPLETE_DEAD_LETTER = "dead_letter"
 INCOMPLETE_REINGEST_FAILED = "reingest_failed"
+#: Recorded by ``scripts/reconcile_raw_keys.py`` (#5027), never the worker.
+INCOMPLETE_STALE_VALIDATION = "stale_validation"
 
 INCOMPLETE_REASONS = frozenset(
     {
@@ -53,6 +60,7 @@ INCOMPLETE_REASONS = frozenset(
         INCOMPLETE_EXHAUSTED_CHILD,
         INCOMPLETE_DEAD_LETTER,
         INCOMPLETE_REINGEST_FAILED,
+        INCOMPLETE_STALE_VALIDATION,
     }
 )
 

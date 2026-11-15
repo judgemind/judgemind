@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -254,6 +255,8 @@ def insert_validation_result(
     scraper_id: str | None,
     s3_key: str | None,
     hearing_date_source: str | None = None,
+    failed_rules: Sequence[str] | None = None,
+    rule_versions: Mapping[str, int] | None = None,
 ) -> None:
     """Insert a validation result into the validation_results table.
 
@@ -278,31 +281,73 @@ def insert_validation_result(
         Provenance of the hearing date the rules judged
         (``validation.hearing_date_source``, #4793).  ``None`` when the
         ruling had no hearing date or the caller does not track it.
+    failed_rules, rule_versions : optional
+        For a deterministic result (#5027): the rules that failed and the
+        version of every rule that judged it
+        (``validation.rule_versions.RULE_VERSIONS``).  The raw-key
+        reconciler re-ingests a skipped key whose failure was judged by a
+        since-relaxed rule version.  Written in a savepoint: before
+        migration 73 adds the columns, the row is written without them.
     """
+    params: tuple[Any, ...] = (
+        document_id,
+        ruling_id,
+        result.result,
+        result.reason,
+        result.model,
+        result.input_tokens,
+        result.output_tokens,
+        result.latency_ms,
+        county or None,
+        scraper_id or None,
+        s3_key or None,
+        hearing_date_source or None,
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        if failed_rules is not None or rule_versions is not None:
+            cur.execute("SAVEPOINT validation_rule_versions")
+            try:
+                cur.execute(
+                    _INSERT_WITH_RULE_VERSIONS_SQL,
+                    (
+                        *params,
+                        list(failed_rules) if failed_rules is not None else None,
+                        json.dumps(dict(rule_versions), sort_keys=True)
+                        if rule_versions is not None
+                        else None,
+                    ),
+                )
+            except Exception as exc:
+                if getattr(exc, "sqlstate", None) != _UNDEFINED_COLUMN:
+                    raise
+                # Migration 73 not applied yet: keep the row, without versions.
+                cur.execute("ROLLBACK TO SAVEPOINT validation_rule_versions")
+                cur.execute(_INSERT_SQL, params)
+            else:
+                cur.execute("RELEASE SAVEPOINT validation_rule_versions")
+            return
+        cur.execute(_INSERT_SQL, params)
+
+
+#: psycopg ``UndefinedColumn``: the worker deployed before its migration.
+_UNDEFINED_COLUMN = "42703"
+
+_INSERT_SQL = """
             INSERT INTO validation_results
                 (document_id, ruling_id, result, reason, model,
                  input_tokens, output_tokens, latency_ms,
                  county, scraper_id, s3_key, hearing_date_source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                document_id,
-                ruling_id,
-                result.result,
-                result.reason,
-                result.model,
-                result.input_tokens,
-                result.output_tokens,
-                result.latency_ms,
-                county or None,
-                scraper_id or None,
-                s3_key or None,
-                hearing_date_source or None,
-            ),
-        )
+            """
+
+_INSERT_WITH_RULE_VERSIONS_SQL = """
+            INSERT INTO validation_results
+                (document_id, ruling_id, result, reason, model,
+                 input_tokens, output_tokens, latency_ms,
+                 county, scraper_id, s3_key, hearing_date_source,
+                 failed_rules, rule_versions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """
 
 
 # ---------------------------------------------------------------------------

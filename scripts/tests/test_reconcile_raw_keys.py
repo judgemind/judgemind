@@ -483,23 +483,48 @@ class FakeDb:
 
 
 def test_fetch_explained_reads_all_four_sources() -> None:
+    versions = {"hearing_date_in_range": 2}
     db = FakeDb(
         {
             "derived.documents": [("k1",), (None,)],
-            "s3_key IS NULL": [("doc-5",)],
-            "validation_results": [("k2",)],
+            "validation_results": [
+                ("k2", "doc-2", OLD, "r2", ["hearing_date_in_range"], versions),
+                (None, "doc-5", OLD, "r5", None, None),
+            ],
             "data_quality_metrics": [("k3",)],
             "ingest_skips": [("k4", "governor_bio_route")],
         }
     )
     ex = rec.fetch_explained(db)
     assert ex == rec.Explained(
-        {"k1"}, {"k4": "governor_bio_route"}, {"k2"}, {"k3"}, {"doc-5"}
+        {"k1"},
+        {"k4": "governor_bio_route"},
+        {"k2"},
+        {"k3"},
+        {"doc-5"},
+        validation_rows={
+            "k2": [rec.FailRow(OLD, "r2", ("hearing_date_in_range",), versions)]
+        },
+        validation_rows_by_document={"doc-5": [rec.FailRow(OLD, "r5")]},
     )
-    assert "result = 'fail'" in db.sql("validation_results")[0][0]
-    unkeyed = db.sql("s3_key IS NULL")
-    assert len(unkeyed) == 1 and "result = 'fail'" in unkeyed[0][0]
+    sql = db.sql("validation_results")
+    assert len(sql) == 1
+    assert "result = 'fail'" in sql[0][0]
+    assert "failed_rules, rule_versions" in sql[0][0]
     assert "non_ruling_pdf_dropped" in db.sql("data_quality_metrics")[0][0]
+
+
+def test_fetch_explained_before_migration_73_reads_rows_without_versions(
+    capsys: Any,
+) -> None:
+    """#5027: the reconciler may run before the version columns exist."""
+    db = FakeDb({"NULL::text[]": [("k2", None, OLD, "r2", None, None)]})
+    db.fail_on = "failed_rules, rule_versions"
+    ex = rec.fetch_explained(db)
+    assert ex.validation_fail == {"k2"}
+    assert ex.validation_rows == {"k2": [rec.FailRow(OLD, "r2")]}
+    assert db.rollbacks == 1
+    assert "rule versions unreadable" in capsys.readouterr().out
 
 
 def test_fetch_explained_tolerates_missing_skips_table(capsys: Any) -> None:

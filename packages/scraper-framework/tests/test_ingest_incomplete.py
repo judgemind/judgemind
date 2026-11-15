@@ -154,6 +154,7 @@ def test_retry_marker_reasons_match_the_migration_comment() -> None:
         "exhausted_child",
         "dead_letter",
         "reingest_failed",
+        "stale_validation",
     }
 
 
