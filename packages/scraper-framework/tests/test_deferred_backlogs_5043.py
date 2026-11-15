@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ingestion import deferred_backlogs as db_mod
-from ingestion.deferred_backlogs import (
+from validation import deferred_backlogs as db_mod
+from validation.deferred_backlogs import (
     DEFERRED_BACKLOGS,
     ONLY_DEFERRED_EXIT_CODE,
     DeferredBacklog,

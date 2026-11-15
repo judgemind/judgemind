@@ -536,7 +536,7 @@ def test_deferral_list_is_the_shared_definition() -> None:
     """#5043: the reconciler, reingest_from_s3.py and rebuild_db.py read one
     definition, in the scraper-framework package (oneshot scripts cannot
     import each other)."""
-    from ingestion import deferred_backlogs
+    from validation import deferred_backlogs
 
     assert REAL_DEFERRALS is deferred_backlogs.DEFERRED_BACKLOGS
     assert rec.DeferredBacklog is deferred_backlogs.DeferredBacklog

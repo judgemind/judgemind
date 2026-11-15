@@ -176,7 +176,7 @@ for _path in (
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
 
-from ingestion.deferred_backlogs import (
+from validation.deferred_backlogs import (
     DEFERRED_BACKLOGS,
     DeferredBacklog,
 )
@@ -220,7 +220,7 @@ INTENTIONAL_SKIP_PREFIXES: dict[str, str] = {
 
 # Deferred backlogs (#5036) have one definition, shared with
 # reingest_from_s3.py and rebuild_db.py, which skip their keys by default
-# (#5043): ``ingestion.deferred_backlogs``.
+# (#5043): ``validation.deferred_backlogs``.
 
 
 #: ``ingestion.ruling_guards.NON_RULING_PDF_DROPPED_METRIC`` (all-NULL guard).

@@ -18,7 +18,10 @@ the worker reads it:
   ``--include-deferred``.
 
 It lives in the package, not in ``scripts/``, because ECS oneshot scripts
-cannot import other ``scripts/*.py`` files.  Remove an entry once its
+cannot import other ``scripts/*.py`` files; in ``validation/`` because that
+package imports nothing on its own (``ingestion/__init__`` pulls in the
+worker and psycopg, which the lightweight scripts-tests CI job lacks).  It
+uses only the standard library.  Remove an entry once its
 blocking issue is decided and its keys can go back to normal handling.
 """
 

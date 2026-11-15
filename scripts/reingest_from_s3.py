@@ -100,7 +100,7 @@ Options:
                         cannot succeed.  It is logged as ``unextractable_keys``
                         and leaves its rows as they are (#4983).
     --include-deferred  Also re-ingest the keys of a deferred backlog
-                        (``ingestion.deferred_backlogs``; today the May-June
+                        (``validation.deferred_backlogs``; today the May-June
                         2026 CourtListener raws, blocked on #3954).  Without
                         it they are skipped in both modes and logged as
                         ``deferred_backlog_skipped`` with the blocking issue;
@@ -153,15 +153,15 @@ from framework.storage import (  # noqa: E402
     capture_timestamp_from_s3_object,
 )
 from ingestion.db import _looks_like_valid_judge_name, resolve_judge  # noqa: E402
-from ingestion.deferred_backlogs import (  # noqa: E402
+from ingestion.extract import extract_header_judge_name  # noqa: E402
+from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
+from validation.deferred_backlogs import (  # noqa: E402
     DEFERRED_BACKLOGS,
     ONLY_DEFERRED_EXIT_CODE,
     DeferralSplit,
     log_deferral_split,
     split_deferred_keys,
 )
-from ingestion.extract import extract_header_judge_name  # noqa: E402
-from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
 
 # The same logging setup as the ingestion-worker service, so the worker's
 # stdlib INFO events and their extra= fields reach the log (#4860).  It runs
@@ -558,7 +558,7 @@ def _drop_deferred_keys(
 ) -> DeferralSplit:
     """Split off the keys of a deferred backlog (#5043).
 
-    Their reingest is on hold behind an issue (``ingestion.deferred_backlogs``;
+    Their reingest is on hold behind an issue (``validation.deferred_backlogs``;
     the May-June CourtListener raws wait on #3954): a reingest fails
     validation and the worker replaces each key's rulings with nothing.
     They are skipped and logged unless *include_deferred*.  The capture time
@@ -2027,7 +2027,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="include_deferred",
         help=(
             "Also re-ingest keys of a deferred backlog "
-            "(ingestion.deferred_backlogs, e.g. the May-June CourtListener "
+            "(validation.deferred_backlogs, e.g. the May-June CourtListener "
             "raws blocked on #3954), which are skipped by default (#5043).  "
             "Their reingest fails validation today and deletes their rulings."
         ),

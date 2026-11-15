@@ -30,8 +30,10 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
+import types
 import uuid
 from concurrent.futures import Future
 from typing import Any, Self
@@ -64,6 +66,31 @@ _mock_structlog.get_logger = MagicMock(return_value=MagicMock())
 _mock_framework_logging = MagicMock()
 _mock_framework_logging.configure_structlog = MagicMock(return_value=None)
 
+
+def _load_deferred_backlogs() -> types.ModuleType:
+    """Load ``validation/deferred_backlogs.py`` by path, without importing
+    the (mocked) ``validation`` package."""
+    path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "packages",
+        "scraper-framework",
+        "src",
+        "validation",
+        "deferred_backlogs.py",
+    )
+    spec = importlib.util.spec_from_file_location("validation.deferred_backlogs", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["validation.deferred_backlogs"] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules["validation.deferred_backlogs"]
+    return module
+
+
 _modules_to_mock: dict[str, MagicMock] = {
     "psycopg": MagicMock(),
     "structlog": _mock_structlog,
@@ -87,6 +114,9 @@ _modules_to_mock: dict[str, MagicMock] = {
     "validation": MagicMock(),
     "validation.deterministic": MagicMock(),
     "validation.gate": MagicMock(),
+    # Standard-library only, so the real module (#5043): the deferral split
+    # must behave, not return mocks.
+    "validation.deferred_backlogs": _load_deferred_backlogs(),
     "courts": MagicMock(),
 }
 

@@ -47,7 +47,7 @@
 #                     derived schema globally.
 #   --include-deferred
 #                     Also rebuild the keys of a deferred backlog
-#                     (``ingestion.deferred_backlogs``; today the May-June
+#                     (``validation.deferred_backlogs``; today the May-June
 #                     2026 CourtListener raws, blocked on #3954).  Without it
 #                     they are skipped (``deferred_backlog_skipped``), a run
 #                     whose every key is deferred exits 5, and a --reset whose
@@ -117,7 +117,7 @@ from framework.storage import (
     capture_provenance_from_s3_object,
     capture_timestamp_from_s3_object,
 )
-from ingestion.deferred_backlogs import (
+from validation.deferred_backlogs import (
     DEFERRED_BACKLOGS,
     ONLY_DEFERRED_EXIT_CODE,
     DeferralSplit,
@@ -381,7 +381,7 @@ def drop_deferred_keys(
 ) -> DeferralSplit:
     """Split off the keys of a deferred backlog (#5043).
 
-    Their reingest is on hold behind an issue (``ingestion.deferred_backlogs``;
+    Their reingest is on hold behind an issue (``validation.deferred_backlogs``;
     the May-June CourtListener raws wait on #3954): the worker fails their
     validation and replaces each key's rulings with nothing.  They are
     skipped and logged unless *include_deferred*.  The capture time is the
@@ -2027,7 +2027,7 @@ def main() -> None:
         dest="include_deferred",
         help=(
             "Also rebuild keys of a deferred backlog "
-            "(ingestion.deferred_backlogs, e.g. the May-June CourtListener "
+            "(validation.deferred_backlogs, e.g. the May-June CourtListener "
             "raws blocked on #3954), which are skipped by default, and allow "
             "a --reset that would delete their rows (#5043).  Their reingest "
             "fails validation today and leaves them with no rulings."
