@@ -14,9 +14,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from framework.pdf_render import PdfPageImages
 from ingestion.llm_extract import (
     PdfText,
-    _render_pdf_pages,
     extract_text_from_pdf,
     ocr_pdf_text,
 )
@@ -60,7 +60,7 @@ def _mock_ocr_failure() -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# _render_pdf_pages
+# PdfPageImages (the shared streaming renderer, #5053)
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,7 @@ class TestRenderPdfPages:
     """Tests for rendering PDF pages to PNG images."""
 
     def test_renders_single_page(self, image_only_pdf_bytes: bytes) -> None:
-        pages = _render_pdf_pages(image_only_pdf_bytes, max_pages=10)
+        pages = PdfPageImages(image_only_pdf_bytes, max_pages=10)
         assert len(pages) == 1
         png_bytes, media_type = pages[0]
         assert media_type == "image/png"
@@ -78,12 +78,12 @@ class TestRenderPdfPages:
 
     def test_respects_max_pages(self, image_only_pdf_bytes: bytes) -> None:
         # Our fixture has 1 page, so max_pages=0 should return nothing
-        pages = _render_pdf_pages(image_only_pdf_bytes, max_pages=0)
+        pages = PdfPageImages(image_only_pdf_bytes, max_pages=0)
         assert len(pages) == 0
 
     def test_returns_empty_for_invalid_pdf(self) -> None:
         with pytest.raises(Exception):
-            _render_pdf_pages(b"not a pdf", max_pages=10)
+            PdfPageImages(b"not a pdf", max_pages=10)
 
 
 # ---------------------------------------------------------------------------

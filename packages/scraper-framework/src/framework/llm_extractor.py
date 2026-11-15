@@ -50,6 +50,7 @@ from .llm_schema import (
     FieldConfidence,
 )
 from .llm_utils import parse_llm_json, rulings_array_shape_error, strip_llm_json_fences
+from .pdf_render import RENDER_DPI, PdfPageImages
 from .title_heuristics import (
     BRACKETED_PLACEHOLDER_TITLE_RE as _BRACKETED_PLACEHOLDER_TITLE_RE,
 )
@@ -3700,6 +3701,9 @@ class LlmExtractor:
                 rulings = _apply_pdf_cache_hit_filters(rulings, content_key=content_key)
                 return _apply_pdf_metadata_overrides(rulings, metadata)
 
+        # Lazy: the loop below renders one page at a time, right before its
+        # cache lookup / LLM call, so a 500-page PDF holds one page image,
+        # not 500, in the 512 MB live worker (#5053).
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
             logger.warning("llm_extractor.no_pages_rendered")
@@ -5692,7 +5696,7 @@ def _join_page_rows(
 # ---------------------------------------------------------------------------
 
 # Resolution for rendering PDF pages to images (DPI).
-_PDF_RENDER_RESOLUTION = 150
+_PDF_RENDER_RESOLUTION = RENDER_DPI
 
 # Maximum PDF pages the multimodal extractor reads.  The cap was 50, and a
 # longer PDF silently lost every ruling past page 50 while its split passed
@@ -5726,41 +5730,19 @@ def _pdf_page_count(pdf_bytes: bytes) -> int:
         return 0
 
 
-def _render_pdf_pages(
-    pdf_bytes: bytes,
-    max_pages: int,
-) -> list[tuple[bytes, str]]:
-    """Render PDF pages to PNG images using pymupdf.
+def _render_pdf_pages(pdf_bytes: bytes, max_pages: int) -> PdfPageImages:
+    """The PDF's first *max_pages* pages as lazily rendered PNGs.
 
-    Uses pymupdf (fitz) for higher quality image rendering compared to
-    pdfplumber, which was validated in the OC multimodal eval (PR #1692).
-    Renders at most *max_pages* pages; ``extract_from_pdf`` checks the page
-    count first and flags a longer PDF (#4995).
-
-    Returns a list of ``(png_bytes, media_type)`` tuples.
+    A ``framework.pdf_render.PdfPageImages``: ``extract_from_pdf`` walks
+    it, so each page is rendered just before its LLM call (or its per-page
+    cache lookup, which is keyed on the image) and released after it, with
+    MuPDF's store emptied per page.  Rendering every page up front held up
+    to 500 page images in the 512 MB live worker (#5053).
+    ``extract_from_pdf`` checks the page count first and flags a longer PDF
+    (#4995).  Raises when the PDF cannot be opened.
     """
-    import pymupdf
-
-    results: list[tuple[bytes, str]] = []
-    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-        zoom = _PDF_RENDER_RESOLUTION / 72.0
-        matrix = pymupdf.Matrix(zoom, zoom)
-
-        for i, page in enumerate(doc):
-            # page-cap: extract_from_pdf flags a PDF over max_pages (#4995).
-            if i >= max_pages:
-                logger.info(
-                    "llm_extractor.page_limit_reached",
-                    max_pages=max_pages,
-                    total_pages=len(doc),
-                )
-                break
-
-            pix = page.get_pixmap(matrix=matrix)
-            png_bytes = pix.tobytes("png")
-            results.append((png_bytes, "image/png"))
-
-    return results
+    # page-cap: extract_from_pdf flags a PDF over max_pages (#4995).
+    return PdfPageImages(pdf_bytes, max_pages, dpi=_PDF_RENDER_RESOLUTION)
 
 
 def _pdf_page_text_layers(pdf_bytes: bytes, max_pages: int) -> list[str]:
@@ -5775,6 +5757,10 @@ def _pdf_page_text_layers(pdf_bytes: bytes, max_pages: int) -> list[str]:
     try:
         import pymupdf
 
+        # Text blocks only: with image blocks MuPDF decodes every page's
+        # scan into its store just to report the image's box (#5053), and
+        # the box's "<image: ...>" placeholder is not text anyway.
+        flags = pymupdf.TEXTFLAGS_BLOCKS & ~pymupdf.TEXT_PRESERVE_IMAGES
         layers: list[str] = []
         with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
             for i, page in enumerate(doc):
@@ -5782,7 +5768,8 @@ def _pdf_page_text_layers(pdf_bytes: bytes, max_pages: int) -> list[str]:
                 # page-cap: max_pages = pages already rendered; cannot drop rulings.
                 if i >= max_pages:
                     break
-                blocks = page.get_text("blocks", sort=True)
+                blocks = page.get_text("blocks", sort=True, flags=flags)
+                pymupdf.TOOLS.store_shrink(100)
                 paragraphs = [
                     " ".join(str(block[4]).split())
                     for block in blocks

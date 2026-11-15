@@ -34,6 +34,7 @@ from framework.llm_schema import (
     FieldConfidence,
 )
 from framework.llm_utils import parse_llm_json, rulings_array_shape_error
+from framework.pdf_render import RENDER_DPI, render_page
 
 from .llm_providers import (
     FINISH_RECITATION,
@@ -574,7 +575,7 @@ _OCR_CONCURRENCY = 4
 
 # Resolution (DPI) for rendering PDF pages to images for OCR.
 # 150 DPI balances readability with image size (token cost).
-_OCR_RESOLUTION = 150
+_OCR_RESOLUTION = RENDER_DPI
 
 # Per-page timeout for the LLM vision call (seconds).
 _OCR_PAGE_TIMEOUT = 30.0
@@ -818,61 +819,9 @@ def _ocr_pages_counted(
 
 def _render_page(doc: object, index: int) -> bytes:
     """Page *index* of an open pymupdf document as a PNG, at
-    ``_OCR_RESOLUTION`` DPI."""
-    import pymupdf
-
-    zoom = _OCR_RESOLUTION / 72.0
-    pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))  # type: ignore[index]
-    png = pix.tobytes("png")
-    del pix
-    # MuPDF keeps decoded page images in its store (up to 256 MB by
-    # default): a scan's full-resolution images, one per page.  Empty it,
-    # so a long scan costs one page's memory, not the whole document's.
-    pymupdf.TOOLS.store_shrink(100)
-    return png
-
-
-def _render_pdf_pages(
-    pdf_bytes: bytes,
-    max_pages: int,
-) -> list[tuple[bytes, str]]:
-    """Render PDF pages to PNG images using pymupdf.
-
-    Uses pymupdf (fitz) for higher quality image rendering compared to
-    pdfplumber, matching the implementation in ``llm_extractor.py``
-    (validated in the OC multimodal eval, PR #1692).
-
-    Returns a list of ``(png_bytes, media_type)`` tuples.
-    """
-    return [image for _, image in _render_pdf_pages_counted(pdf_bytes, max_pages)[0]]
-
-
-def _render_pdf_pages_counted(
-    pdf_bytes: bytes,
-    max_pages: int,
-    indexes: list[int] | None = None,
-) -> tuple[list[tuple[int, tuple[bytes, str]]], int]:
-    """The 0-based pages *indexes* (every page when ``None``), at most
-    *max_pages* of them, rendered as ``(index, (png_bytes, media_type))``,
-    plus the PDF's total page count."""
-    import pymupdf
-
-    results: list[tuple[int, tuple[bytes, str]]] = []
-    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-        total_pages = len(doc)
-        zoom = _OCR_RESOLUTION / 72.0
-        matrix = pymupdf.Matrix(zoom, zoom)
-        wanted = range(total_pages) if indexes is None else indexes
-
-        for index in wanted:
-            # page-cap: _ocr_pages_counted marks the result incomplete (#4986).
-            if len(results) >= max_pages:
-                break
-            pix = doc[index].get_pixmap(matrix=matrix)
-            png_bytes = pix.tobytes("png")
-            results.append((index, (png_bytes, "image/png")))
-
-    return results, total_pages
+    ``_OCR_RESOLUTION`` DPI, with MuPDF's store emptied afterwards: the
+    shared streaming renderer (``framework.pdf_render``, #5053)."""
+    return render_page(doc, index, dpi=_OCR_RESOLUTION)
 
 
 def _ocr_single_page(
