@@ -922,7 +922,11 @@ class TestInsertDocument:
         # ON CONFLICT clause should update last_seen_at = NOW()
         assert "last_seen_at = NOW()" in sql
 
-    def test_format_mapping_unknown_defaults_html(self) -> None:
+    @pytest.mark.parametrize("content_format", ["txt", "TXT", "text"])
+    def test_insert_document_txt_and_text_store_txt(self, content_format: str) -> None:
+        """A ``.txt`` raw's event (``'txt'``, from a reingest / rebuild built
+        before #5026) and a live capture's (``'text'``) both store ``txt``,
+        never ``html`` (#5026)."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         cur.fetchone.return_value = (True,)
@@ -931,17 +935,66 @@ class TestInsertDocument:
             document_id="doc-1",
             case_id="case-1",
             court_id="court-1",
-            content_format="rtf",
+            content_format=content_format,
             content_hash="abc",
-            s3_key=None,
+            s3_key="ca/contra_costa/superior/raw/abc.txt",
             s3_bucket=None,
             source_url="https://example.com",
-            scraper_id="scraper-1",
+            scraper_id="reingest-ca-contra_costa",
             captured_at=datetime(2026, 3, 5),
             hearing_date=None,
         )
         args = _get_execute_args(conn)
-        assert args[3] == "html"
+        assert args[3] == "txt"
+
+    @pytest.mark.parametrize("force_update", [False, True])
+    def test_insert_document_txt_upsert_corrects_stored_format(self, force_update: bool) -> None:
+        """The upsert overwrites ``format``, so a reingest repairs a ``.txt``
+        row stored as ``html`` before #5026."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (False,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="txt",
+            content_hash="abc",
+            s3_key="ca/contra_costa/superior/raw/abc.txt",
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="reingest-ca-contra_costa",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+            force_update=force_update,
+        )
+        sql = cur.execute.call_args[0][0]
+        on_conflict = sql.split("ON CONFLICT", 1)[1]
+        assert "format = EXCLUDED.format" in on_conflict
+
+    @pytest.mark.parametrize("content_format", ["rtf", "bin", ""])
+    def test_insert_document_unknown_format_raises(self, content_format: str) -> None:
+        """An unknown format is an error, never silently stored as ``html``
+        (#5026)."""
+        conn = _mock_conn()
+        with pytest.raises(ValueError, match="content_format"):
+            insert_document(
+                conn,
+                document_id="doc-1",
+                case_id="case-1",
+                court_id="court-1",
+                content_format=content_format,
+                content_hash="abc",
+                s3_key=None,
+                s3_bucket=None,
+                source_url="https://example.com",
+                scraper_id="scraper-1",
+                captured_at=datetime(2026, 3, 5),
+                hearing_date=None,
+            )
+        conn.execute.assert_not_called()
+        conn.cursor.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

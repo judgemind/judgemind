@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import psycopg.errors
 
+from framework.models import ContentFormat
 from framework.party_utils import is_contaminated_party_name
 
 if TYPE_CHECKING:
@@ -505,7 +506,7 @@ def insert_document(
     """Upsert a document row using the scraper-assigned document_id as the PK.
 
     Returns True if a new row was inserted, False if it already existed.
-    On conflict, updates mutable fields (hearing_date, case_id, last_seen_at)
+    On conflict, updates mutable fields (hearing_date, case_id, format, last_seen_at)
     while preserving immutable fields (s3_key, content_hash, captured_at).
 
     ``last_seen_at`` is always set to the current timestamp on both insert and
@@ -527,6 +528,10 @@ def insert_document(
     ``hearing_date`` correctable fact    incoming wins when non-NULL — a later,
                                          higher-quality extraction legitimately
                                          updates the hearing date.
+    ``format``       raw-object fact     always the incoming value: the format is
+                                         fixed by the content-addressed raw, so a
+                                         re-ingest corrects a row stored with the
+                                         wrong format (#5026).
     ``last_seen_at`` timestamp           always NOW() on every conflict.
     ===============  ==================  ==========================================
 
@@ -548,9 +553,11 @@ def insert_document(
     A split child's case link is decided by ``write_split_rulings``, which
     re-links its document row to the case its ruling ends on (#4700, #4845).
     """
-    # Map ContentFormat string to PostgreSQL document_format enum value
-    format_map = {"html": "html", "pdf": "pdf", "docx": "docx", "text": "txt"}
-    pg_format = format_map.get(content_format.lower(), "html")
+    # Map the event's content_format to the document_format enum value.
+    # ``'text'`` (live captures) and ``'txt'`` (events built from a ``.txt``
+    # S3 key before #5026) are both plain text; an unknown format raises
+    # instead of being stored as ``html`` (#5026).
+    pg_format = ContentFormat.from_event_value(content_format).db_value
 
     # Build ON CONFLICT set clauses.  ``case_id`` is an identity anchor: in the
     # default (live-ingestion) path we preserve the first non-NULL case link to
@@ -587,6 +594,7 @@ def insert_document(
         ON CONFLICT (id) DO UPDATE SET
             {hearing_date_clause},
             {case_id_clause},
+            format = EXCLUDED.format,
             last_seen_at = NOW()
         RETURNING (xmax = 0) AS is_new
     """

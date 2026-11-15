@@ -69,6 +69,34 @@ class ContentFormat(StrEnum):
         except KeyError as exc:
             raise ValueError(f"{db_value!r} is not a valid derived.documents.format value") from exc
 
+    @classmethod
+    def from_event_value(cls, value: str) -> ContentFormat:
+        """Parse an ingestion event's ``content_format`` (#5026).
+
+        The canonical event spelling is the member value (``'text'`` for
+        plain text), which is what live captures publish.  ``'txt'`` (the
+        raw object's file extension and the DB enum spelling) is accepted as
+        an alias, because events built from S3 keys before #5026 used it.
+        Case-insensitive.  Anything else raises ``ValueError``: an unknown
+        format must never be silently treated as HTML.
+        """
+        normalized = str(value).strip().lower()
+        if normalized == "txt":
+            return cls.TEXT
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{value!r} is not a valid content_format") from exc
+
+    @property
+    def db_value(self) -> str:
+        """The ``derived.documents.format`` enum value for this format.
+
+        The inverse of :meth:`from_db_value`: ``TEXT`` is stored as ``'txt'``,
+        every other member under its own value.
+        """
+        return "txt" if self is ContentFormat.TEXT else self.value
+
 
 # ---------------------------------------------------------------------------
 # Scraper configuration

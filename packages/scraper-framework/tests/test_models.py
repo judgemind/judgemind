@@ -17,6 +17,34 @@ import pytest
 from framework.models import ContentFormat
 
 
+class TestContentFormatFromEventValue:
+    """``ContentFormat.from_event_value`` / ``db_value`` (#5026)."""
+
+    @pytest.mark.parametrize(
+        ("value", "member"),
+        [
+            ("text", ContentFormat.TEXT),
+            ("txt", ContentFormat.TEXT),
+            ("TXT", ContentFormat.TEXT),
+            (" html ", ContentFormat.HTML),
+            ("pdf", ContentFormat.PDF),
+            ("docx", ContentFormat.DOCX),
+        ],
+    )
+    def test_parses_both_text_spellings(self, value: str, member: ContentFormat) -> None:
+        assert ContentFormat.from_event_value(value) is member
+
+    @pytest.mark.parametrize("value", ["rtf", "bin", ""])
+    def test_unknown_value_raises(self, value: str) -> None:
+        with pytest.raises(ValueError, match="content_format"):
+            ContentFormat.from_event_value(value)
+
+    def test_db_value_round_trips_through_from_db_value(self) -> None:
+        for member in ContentFormat:
+            assert ContentFormat.from_db_value(member.db_value) is member
+        assert ContentFormat.TEXT.db_value == "txt"
+
+
 class TestContentFormatFromDbValue:
     """``ContentFormat.from_db_value`` maps DB enum values to enum members.
 

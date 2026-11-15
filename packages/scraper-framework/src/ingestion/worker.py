@@ -53,6 +53,7 @@ from courts.ca.la_dept_judges import (
 from framework.enrichment import EnrichmentEngine
 from framework.events import trim_consumed_entries
 from framework.llm_extractor import LlmExtractor, PageCapExceededError, PartialExtractionError
+from framework.models import ContentFormat
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 from framework.search.ruling_doc import (
@@ -479,6 +480,22 @@ def _split_child_case_fields(
             child_case_title or event_data.get("case_title"),
         )
     return child_case_number, child_case_title
+
+
+def event_content_format(event_data: dict[str, Any]) -> ContentFormat | None:
+    """The event's ``content_format`` as a :class:`ContentFormat`, or
+    ``None`` when it is missing or unknown.
+
+    Accepts both plain-text spellings (``'text'`` from live captures,
+    ``'txt'`` from events built from a ``.txt`` key), so a branch on the
+    result cannot miss one of them (#5026)."""
+    value = event_data.get("content_format")
+    if not value:
+        return None
+    try:
+        return ContentFormat.from_event_value(value)
+    except ValueError:
+        return None
 
 
 def _ocr_incomplete_reason(event_data: dict[str, Any]) -> str | None:
@@ -2442,15 +2459,15 @@ class IngestionWorker:
         cache_key = (str(bucket), str(s3_key))
         if cache_key in self._page_text_cache:
             return self._page_text_cache[cache_key]
-        content_format = event_data.get("content_format")
+        content_format = event_content_format(event_data)
         text: str | None = None
         try:
             raw = self._s3_client.get_object(Bucket=bucket, Key=s3_key)["Body"].read()
             if not isinstance(raw, bytes):
                 raise TypeError(f"S3 body is {type(raw).__name__}, not bytes")
-            if content_format in ("html", "txt"):
+            if content_format in (ContentFormat.HTML, ContentFormat.TEXT):
                 text = raw.decode("utf-8", errors="replace")
-            elif content_format == "pdf":
+            elif content_format is ContentFormat.PDF:
                 # The text layer only: OCR text is never evidence (#4986),
                 # so a scanned page gives none, as the reingest's OCR'd
                 # text of the same key does.
@@ -2510,7 +2527,7 @@ class IngestionWorker:
 
     def _resolve_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
         """Body of :meth:`_unwrap_cc_portal_envelope` (which adds the error guard)."""
-        if event_data.get("content_format") not in ("text", "txt"):
+        if event_content_format(event_data) is not ContentFormat.TEXT:
             return event_data
         if event_data.get("_split_processed") or event_data.get("_llm_extracted"):
             return event_data

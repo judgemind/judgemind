@@ -1237,7 +1237,8 @@ class TestBuildPrefixEvent:
             parsed,
             "test-bucket",
         )
-        assert event["content_format"] == "txt"
+        # The live capture's spelling, ContentFormat.TEXT (#5026).
+        assert event["content_format"] == "text"
         assert event["ruling_text"] == "Plain text ruling content"
 
     def test_builds_event_for_docx(self) -> None:
