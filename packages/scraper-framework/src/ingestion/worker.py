@@ -324,7 +324,7 @@ OCR_INCOMPLETE = "incomplete OCR of a PDF's scanned pages"
 #: redelivery.  OCR now renders one page at a time and empties the store
 #: (``llm_extract._render_page``; that scan peaks about 100 MB over the
 #: worker's baseline instead of 300 MB), and a message that still kills the
-#: worker is dead-lettered after ``MAX_MESSAGE_DELIVERIES``.  Off, such an
+#: worker is dead-lettered after ``MAX_MESSAGE_CRASHES``.  Off, such an
 #: event is marked incomplete and left to the reconciler's reingest.
 LIVE_SCANNED_PAGE_REREAD = True
 
@@ -2031,14 +2031,34 @@ STALE_CONSUMER_IDLE_MS = 3_600_000
 # consumer processing a slow message won't lose it.
 PENDING_RECLAIM_MIN_IDLE_MS = 30_000
 
-#: Deliveries after which a reclaimed message is dead-lettered unprocessed
-#: (#5010).  A message is only redelivered without an ack when the worker
-#: died processing it (an OOM kill, a crash): ``_process_message`` acks or
-#: dead-letters every error it sees.  Processing such a message again kills
-#: the worker again, so live ingestion stalls behind it forever.  Past this
-#: count it is recorded ``dead_letter`` (#5008), so the raw-key reconciler
-#: re-ingests its key in a one-off task, under its attempt cap.
-MAX_MESSAGE_DELIVERIES = 3
+#: Times the worker may die while processing one message before the message
+#: is dead-lettered unprocessed (#5010).  Processing a message that OOM-kills
+#: the worker kills it again on every redelivery, so live ingestion stalls
+#: behind it forever.  Past this count it is recorded ``dead_letter``
+#: (#5008), so the raw-key reconciler re-ingests its key in a one-off task,
+#: under its attempt cap.
+#:
+#: The count is the worker's own, kept in Redis under
+#: ``PROCESSING_CRASHES_KEY_PREFIX`` + message id, not XPENDING's
+#: ``times_delivered`` (#5055).  XAUTOCLAIM raises ``times_delivered`` for
+#: every message it claims, so after a few restarts the messages queued
+#: behind a poison message, and the whole pending list after an
+#: ``InfrastructureError`` crash loop (#1044), looked like poison too.
+#: ``_process_message`` adds one just before it processes a message and takes
+#: it back whenever processing ends in Python: an ack, a dead-letter, or an
+#: exception that exits the worker (an ``InfrastructureError``, Ctrl-C).
+#: Only a death that runs no Python (the OOM killer's SIGKILL, a segfault,
+#: and ECS's stop signal, which the worker does not handle) leaves the count
+#: raised, and only on the one message in flight.
+MAX_MESSAGE_CRASHES = 3
+
+#: Redis key prefix of a message's crash count (``MAX_MESSAGE_CRASHES``).
+PROCESSING_CRASHES_KEY_PREFIX = "ingestion:processing-crashes:"
+
+#: Lifetime of a crash-count key (seconds), renewed whenever the count is
+#: raised.  An acked message's key is deleted; this only bounds the keys of
+#: messages trimmed or deleted from the stream while still pending.
+PROCESSING_CRASHES_TTL_S = 7 * 24 * 3600
 
 # How often (in empty-poll cycles) to attempt PEL reclamation during the
 # main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
@@ -2061,6 +2081,13 @@ def redis_socket_timeout_for_block(block_ms: int) -> float:
 
 
 _UNKNOWN = object()
+
+
+def _crashes_key(msg_id: bytes | str) -> str:
+    """Redis key of *msg_id*'s crash count (``MAX_MESSAGE_CRASHES``)."""
+    if isinstance(msg_id, bytes):
+        msg_id = msg_id.decode()
+    return f"{PROCESSING_CRASHES_KEY_PREFIX}{msg_id}"
 
 
 def _client_socket_timeout(redis_client: Any) -> float | None | object:
@@ -7289,64 +7316,68 @@ class IngestionWorker:
                 # Message was deleted from the stream but still in PEL.
                 # Acknowledge it to clear the PEL entry.
                 logger.debug("Acknowledging deleted PEL entry %s", msg_id)
-                self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+                self._ack(msg_id)
                 continue
-            deliveries = self._delivery_count(msg_id)
-            if deliveries is not None and deliveries > MAX_MESSAGE_DELIVERIES:
-                self._dead_letter_poison_message(msg_id, data, deliveries)
-                continue
-            self._process_message(msg_id, data)
-            processed += 1
+            if self._process_message(msg_id, data):
+                processed += 1
 
         return processed
 
-    def _delivery_count(self, msg_id: bytes) -> int | None:
-        """How many times *msg_id* has been delivered (``XPENDING``'s
-        ``times_delivered``, the claim that returned it included), or
-        ``None`` when Redis cannot say."""
+    def _ack(self, msg_id: bytes) -> None:
+        """Acknowledge *msg_id* and drop its crash count (#5055)."""
+        self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
         try:
-            rows = self._redis.xpending_range(
-                STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, min=msg_id, max=msg_id, count=1
-            )
+            self._redis.delete(_crashes_key(msg_id))
         except Exception as exc:
-            logger.warning("XPENDING failed for %s: %s", msg_id, exc)
-            return None
-        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
-            return None
-        count = rows[0].get("times_delivered")
-        return count if isinstance(count, int) else None
+            logger.warning("Could not clear the crash count of %s: %s", msg_id, exc)
 
-    def _dead_letter_poison_message(
-        self, msg_id: bytes, data: dict[bytes, bytes], deliveries: int
-    ) -> None:
-        """Dead-letter a message the worker died on *deliveries* times,
-        without processing it again (``MAX_MESSAGE_DELIVERIES``)."""
-        raw = data.get(b"data", data.get("data", "{}"))  # type: ignore[call-overload]
-        if isinstance(raw, bytes):
-            raw = raw.decode()
+    def _begin_processing(self, msg_id: bytes) -> int | None:
+        """Charge *msg_id* one crash before processing it, and return how many
+        times the worker already died processing it (``MAX_MESSAGE_CRASHES``).
+
+        The charge stays only if the worker dies without running Python;
+        every other end takes it back (``_ack``, ``_end_processing``).
+        ``None`` when Redis cannot say, so the message is processed."""
+        key = _crashes_key(msg_id)
         try:
-            event_data = json.loads(raw)
-        except json.JSONDecodeError:
-            event_data = None
+            count = self._redis.incr(key)
+            self._redis.expire(key, PROCESSING_CRASHES_TTL_S)
+        except Exception as exc:
+            logger.warning("Could not record processing of %s: %s", msg_id, exc)
+            return None
+        return max(count - 1, 0) if isinstance(count, int) else None
+
+    def _end_processing(self, msg_id: bytes) -> None:
+        """Take back ``_begin_processing``'s charge when processing ends in
+        an exception that exits the worker: the worker did not die on the
+        message, so a crash loop over a broken database or schema (#1044)
+        never dead-letters anything."""
+        try:
+            self._redis.decr(_crashes_key(msg_id))
+        except Exception as exc:
+            logger.warning("Could not clear the processing mark of %s: %s", msg_id, exc)
+
+    def _dead_letter_poison_message(self, msg_id: bytes, event_data: Any, crashes: int) -> None:
+        """Dead-letter a message the worker died processing *crashes* times,
+        without processing it again (``MAX_MESSAGE_CRASHES``)."""
         event = event_data if isinstance(event_data, dict) else {}
         logger.critical(
-            "Dead-lettering message %s unprocessed: delivered %d times without an "
-            "ack, so it killed the worker each time",
+            "Dead-lettering message %s unprocessed: the worker died processing it %d times",
             msg_id,
-            deliveries,
+            crashes,
             extra={
                 "telemetry_event": "poison_message_dead_lettered",
                 "document_id": event.get("document_id"),
                 "s3_key": event.get("s3_key"),
-                "deliveries": deliveries,
+                "crashes": crashes,
             },
         )
         self._record_dead_letter(
             event_data,
-            RuntimeError(f"worker died on this message {deliveries} times (OOM or crash)"),
-            attempts=deliveries,
+            RuntimeError(f"worker died processing this message {crashes} times (OOM or crash)"),
+            attempts=crashes,
         )
-        self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+        self._ack(msg_id)
 
     def _process_batch(self, batch_size: int, block_ms: int) -> None:
         messages = self._redis.xreadgroup(
@@ -7379,7 +7410,9 @@ class IngestionWorker:
             for msg_id, data in entries:
                 self._process_message(msg_id, data)
 
-    def _process_message(self, msg_id: bytes, data: dict[bytes, bytes]) -> None:
+    def _process_message(self, msg_id: bytes, data: dict[bytes, bytes]) -> bool:
+        """Process one stream message; ``False`` when it was dropped
+        unprocessed (malformed, or a poison message dead-lettered)."""
         raw = data.get(b"data", data.get("data", "{}"))
         if isinstance(raw, bytes):
             raw = raw.decode()
@@ -7388,15 +7421,35 @@ class IngestionWorker:
             event_data = json.loads(raw)
         except json.JSONDecodeError as exc:
             logger.error("Malformed event message %s: %s — dead-lettering", msg_id, exc)
-            self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
-            return
+            self._ack(msg_id)
+            return False
 
+        crashes = self._begin_processing(msg_id)
+        if crashes is not None and crashes >= MAX_MESSAGE_CRASHES:
+            self._dead_letter_poison_message(msg_id, event_data, crashes)
+            return False
+        if crashes:
+            logger.warning(
+                "Processing message %s again: the worker died processing it %d time(s)",
+                msg_id,
+                crashes,
+                extra={"telemetry_event": "message_crash_retry", "crashes": crashes},
+            )
+        try:
+            self._process_event_data(msg_id, event_data)
+        except BaseException:
+            self._end_processing(msg_id)
+            raise
+        return True
+
+    def _process_event_data(self, msg_id: bytes, event_data: Any) -> None:
+        """Run ``process_event`` with retries, then ack or dead-letter."""
         attempt = 0
         last_exc: Exception | None = None
         while attempt < self._max_retries:
             try:
                 self.process_event(event_data)
-                self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+                self._ack(msg_id)
                 return
             except Exception as exc:
                 if is_infrastructure_error(exc):
@@ -7420,7 +7473,7 @@ class IngestionWorker:
                         exc,
                     )
                     self._record_dead_letter(event_data, exc, attempts=attempt + 1)
-                    self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+                    self._ack(msg_id)
                     return
                 attempt += 1
                 last_exc = exc
@@ -7440,7 +7493,7 @@ class IngestionWorker:
             last_exc,
         )
         self._record_dead_letter(event_data, last_exc, attempts=attempt)
-        self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+        self._ack(msg_id)
 
     def _record_dead_letter(
         self, event_data: Any, exc: BaseException | None, *, attempts: int
