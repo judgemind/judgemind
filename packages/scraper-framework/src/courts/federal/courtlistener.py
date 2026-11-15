@@ -50,6 +50,7 @@ DEFAULT_REQUEST_DELAY = 2.0
 DEFAULT_MAX_RESULTS = 100
 
 # Maximum pages of cluster results to paginate through.
+# page-cap: API result pages, not a document's; fetch_clusters warns when hit.
 DEFAULT_MAX_PAGES = 10
 
 # Maximum concurrent opinion fetches.  CourtListener's soft rate limit is
@@ -157,6 +158,7 @@ class CourtListenerClient:
         next_url: str | None = "/clusters/"
         pages_fetched = 0
 
+        # page-cap: API result pages, newest first; a hit warns below (#4995).
         while next_url and pages_fetched < max_pages:
             if pages_fetched == 0:
                 data = self._get(next_url, params=params)
@@ -176,6 +178,15 @@ class CourtListenerClient:
                 total_so_far=len(clusters),
             )
 
+        if next_url:
+            # Older clusters remain: the next run's window picks them up only
+            # if it reaches back this far, so say so.
+            logger.warning(
+                "courtlistener.page_limit_reached",
+                max_pages=max_pages,
+                clusters=len(clusters),
+                date_modified_after=date_modified_after,
+            )
         return clusters
 
     def fetch_opinions_for_cluster(self, cluster_id: int) -> list[dict[str, Any]]:

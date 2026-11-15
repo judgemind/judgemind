@@ -70,6 +70,17 @@ class ExtractionIncompleteError(RuntimeError):
     """
 
 
+class PageCapExceededError(ExtractionIncompleteError):
+    """The PDF has more pages than the multimodal extractor reads (#4995).
+
+    Raised by ``LlmExtractor.extract_from_pdf`` under ``strict=True`` before
+    any page is sent to the LLM.  Rulings past the cap would be lost, so the
+    result is not a split at all: the ingestion worker records a failed
+    extraction (the key's rows are left alone and a reingest reports the
+    key), and does not fall back to a text split either.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Token usage tracking
 # ---------------------------------------------------------------------------
@@ -104,7 +115,11 @@ _DEFAULT_MAX_DELAY = 60.0
 # system prompt and output tokens within the model's context window.
 _DEFAULT_MAX_CHARS = 80_000
 
-# Maximum number of chunks per document.
+# Maximum number of chunks per document (10 x 80K chars, ~250 pages of
+# calendar text).  A longer document is not silently truncated: ``extract``
+# logs ``llm_extractor.chunk_cap_reached`` and, under ``strict``, raises
+# ``ExtractionIncompleteError`` so the worker refuses the split.
+# page-cap: extract() flags text the chunks do not cover (#4995).
 _MAX_CHUNKS = 10
 
 # Overlap characters between consecutive chunks.
@@ -3382,7 +3397,24 @@ class LlmExtractor:
                 rulings = [ExtractedRuling(**r) for r in cached]
                 return _apply_text_cache_hit_filters(rulings, content_key=content_key)
 
-        chunks = self._split_into_chunks(text)
+        chunks, covered = self._split_text(text)
+        # ``_MAX_CHUNKS`` chunks may not reach the end of a huge document.
+        # The tail's rulings would be lost, so the result is incomplete:
+        # an error under ``strict``, and never cached (#4995).
+        truncated = not covered
+        if truncated:
+            logger.warning(
+                "llm_extractor.chunk_cap_reached",
+                max_chunks=_MAX_CHUNKS,
+                max_chars_per_chunk=self._max_chars_per_chunk,
+                total_chars=len(text),
+                document_id=document_id,
+            )
+            if strict:
+                raise ExtractionIncompleteError(
+                    f"text of {len(text)} chars exceeds {_MAX_CHUNKS} chunks of "
+                    f"{self._max_chars_per_chunk} chars"
+                )
         usage = TokenUsage()
         failed_chunks: list[int] = []
 
@@ -3460,7 +3492,7 @@ class LlmExtractor:
             raise ExtractionIncompleteError(f"text extraction failed on chunks {failed_chunks}")
 
         # Write to cache
-        if self._cache is not None and rulings:
+        if self._cache is not None and rulings and not truncated:
             self._cache.put(
                 effective_prompt,
                 content_key,
@@ -3474,7 +3506,7 @@ class LlmExtractor:
         pdf_bytes: bytes,
         *,
         metadata: dict[str, str] | None = None,
-        max_pages: int = 50,
+        max_pages: int | None = None,
         bust_cache: bool = False,
         document_id: str | None = None,
         strict: bool = False,
@@ -3499,8 +3531,12 @@ class LlmExtractor:
                 is never sent to the LLM and is not part of any cache key,
                 so the same bytes split the same way for every caller
                 (#4815).
-            max_pages: Maximum number of PDF pages to render.  Pages beyond
-                this limit are silently skipped.
+            max_pages: Maximum number of PDF pages to read (default
+                ``_MULTIMODAL_MAX_PAGES``).  A longer PDF is never silently
+                truncated (#4995): it logs ``llm_extractor.page_limit_reached``
+                with ``total_pages``, raises :class:`PageCapExceededError`
+                under ``strict``, and otherwise returns the first
+                *max_pages* pages' rulings without caching them.
             bust_cache: When ``True``, skip the cache read on this call.
                 Cache writes still happen so subsequent calls benefit
                 from the fresh result.  See ``self._bust_cache`` for a
@@ -3543,8 +3579,34 @@ class LlmExtractor:
         legacy_content_key = _content_hash_for_cache(pdf_bytes, metadata) if metadata else None
         effective_bust = bust_cache or self._bust_cache
 
-        # Check cache
-        if self._cache is not None and not effective_bust:
+        max_pages = _MULTIMODAL_MAX_PAGES if max_pages is None else max_pages
+        total_pages = _pdf_page_count(pdf_bytes)
+        # page-cap: picks the all-pages cache key; reads every page (#4995).
+        if total_pages > _LEGACY_MULTIMODAL_PAGE_CAP:
+            # Before #4995 the extractor silently stopped at page 50, so a
+            # longer PDF's document-level entry (current or pre-#4815 key)
+            # holds only the first 50 pages' rulings.  Its entries live
+            # under their own key; the per-page cache still serves every
+            # page already read, so only the missing pages reach the LLM.
+            content_key = _content_hash_for_cache(pdf_bytes, _ALL_PAGES_CACHE_SALT)
+            legacy_content_key = None
+        # page-cap: this is the flag: warns, raises PageCapExceededError (#4995).
+        truncated = total_pages > max_pages
+        if truncated:
+            logger.warning(
+                "llm_extractor.page_limit_reached",
+                max_pages=max_pages,
+                total_pages=total_pages,
+                document_id=document_id,
+            )
+            if strict:
+                raise PageCapExceededError(
+                    f"PDF has {total_pages} pages, over the multimodal cap of {max_pages}"
+                )
+
+        # Check cache (a truncated result is never cached, so there is
+        # nothing complete to serve for a PDF over the cap).
+        if self._cache is not None and not effective_bust and not truncated:
             cached = self._cached_document(content_key, legacy_content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])
@@ -3634,8 +3696,9 @@ class LlmExtractor:
         # the retry) makes the result partial; caching it would serve the
         # incomplete ruling set permanently, producing UNKNOWN-prefixed
         # rulings for cases whose case number is on the missing page (#3517).
-        # Valid zero-row pages do not block the write (#4716).
-        if self._cache is not None and rulings and not failed_pages:
+        # Valid zero-row pages do not block the write (#4716).  Nor is a
+        # result truncated at the page cap cached (#4995).
+        if self._cache is not None and rulings and not failed_pages and not truncated:
             self._cache.put(
                 PDF_PER_PAGE_PROMPT,
                 content_key,
@@ -4301,9 +4364,15 @@ class LlmExtractor:
         Uses natural boundaries (page breaks, case-number headers) when
         available; falls back to double-newline paragraph breaks.
         """
+        return self._split_text(text)[0]
+
+    def _split_text(self, text: str) -> tuple[list[str], bool]:
+        """``_split_into_chunks``, and whether the chunks reach the end of
+        *text*: at most ``_MAX_CHUNKS`` chunks are made, and ``extract``
+        flags a document they do not cover (#4995)."""
         max_chars = self._max_chars_per_chunk
         if len(text) <= max_chars:
-            return [text]
+            return [text], True
 
         # Try page breaks first, then case boundaries, then paragraphs.
         boundaries = [m.start() for m in _PAGE_BREAK_RE.finditer(text)]
@@ -4312,7 +4381,7 @@ class LlmExtractor:
         if not boundaries:
             boundaries = [m.start() for m in re.finditer(r"\n\n", text)]
         if not boundaries:
-            return _force_split(text, max_chars)
+            return _force_split_covered(text, max_chars)
 
         chunks: list[str] = []
         chunk_start = 0
@@ -4324,24 +4393,27 @@ class LlmExtractor:
                 split_at = last_boundary if last_boundary > chunk_start else boundary
                 chunks.append(text[chunk_start:split_at])
                 chunk_start = max(split_at - _CHUNK_OVERLAP, 0)
+                # page-cap: _split_text reports the uncovered tail (#4995).
                 if len(chunks) >= _MAX_CHUNKS:
                     break
             last_boundary = boundary
 
-        if len(chunks) < _MAX_CHUNKS and chunk_start < len(text):
+        covered = chunk_start >= len(text)
+        # page-cap: _split_text reports the uncovered tail (#4995).
+        room = _MAX_CHUNKS - len(chunks)
+        if room > 0 and chunk_start < len(text):
             remaining = text[chunk_start:]
             if len(remaining) > max_chars:
-                for sc in _force_split(remaining, max_chars):
-                    if len(chunks) >= _MAX_CHUNKS:
-                        break
-                    chunks.append(sc)
+                tail, tail_covered = _force_split_covered(remaining, max_chars)
+                chunks.extend(tail[:room])
+                covered = tail_covered and len(tail) <= room
             else:
                 chunks.append(remaining)
+                covered = True
 
         if not chunks:
-            chunks = [text[:max_chars]]
-
-        return chunks
+            return [text[:max_chars]], False
+        return chunks, covered
 
     # ------------------------------------------------------------------
     # Internal: merge multi-chunk results
@@ -4525,13 +4597,20 @@ def _parse_confidence(raw: dict | None) -> FieldConfidence:  # noqa: ANN001
 
 def _force_split(text: str, max_chars: int) -> list[str]:
     """Split text into fixed-size chunks with overlap."""
+    return _force_split_covered(text, max_chars)[0]
+
+
+def _force_split_covered(text: str, max_chars: int) -> tuple[list[str], bool]:
+    """``_force_split``, and whether the chunks reach the end of *text*
+    (#4995)."""
     chunks: list[str] = []
     pos = 0
+    # page-cap: the caller is told when the chunks stop short (#4995).
     while pos < len(text) and len(chunks) < _MAX_CHUNKS:
         end = min(pos + max_chars, len(text))
         chunks.append(text[pos:end])
         pos = end - _CHUNK_OVERLAP if end < len(text) else end
-    return chunks
+    return chunks, pos >= len(text)
 
 
 # ---------------------------------------------------------------------------
@@ -5448,6 +5527,37 @@ def _join_page_rows(
 # Resolution for rendering PDF pages to images (DPI).
 _PDF_RENDER_RESOLUTION = 150
 
+# Maximum PDF pages the multimodal extractor reads.  The cap was 50, and a
+# longer PDF silently lost every ruling past page 50 while its split passed
+# as complete (#4995).  It now only bounds a runaway document: a PDF over
+# it raises ``PageCapExceededError`` under ``strict`` (the worker records
+# a failed extraction and leaves the key's rows alone), never a silent
+# truncation.  Cost: one vision call per page (Flash Lite, one rendered
+# 150 DPI page each, per-page cached), so a 500-page PDF is 500 calls once.
+# When it was set, dev's multimodal-county archive (Orange plus the
+# unconfigured counties) held 42 PDFs over 50 pages, all Orange, the
+# longest 97 pages (#4995).
+# page-cap: PageCapExceededError marks a longer PDF incomplete (#4995).
+_MULTIMODAL_MAX_PAGES = 500
+
+# The silent cap before #4995.  Document-level cache entries of longer PDFs
+# written under it hold only the first 50 pages' rulings, so those PDFs
+# read and write their document entry under ``_ALL_PAGES_CACHE_SALT``.
+# page-cap: not a cap; picks the cache key of PDFs the old cap cut (#4995).
+_LEGACY_MULTIMODAL_PAGE_CAP = 50
+_ALL_PAGES_CACHE_SALT = {"pages": "all"}
+
+
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    """The PDF's page count (pymupdf); 0 when it cannot be read."""
+    try:
+        import pymupdf
+
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return len(doc)
+    except Exception:  # noqa: BLE001 — unreadable: rendering reports it
+        return 0
+
 
 def _render_pdf_pages(
     pdf_bytes: bytes,
@@ -5457,6 +5567,8 @@ def _render_pdf_pages(
 
     Uses pymupdf (fitz) for higher quality image rendering compared to
     pdfplumber, which was validated in the OC multimodal eval (PR #1692).
+    Renders at most *max_pages* pages; ``extract_from_pdf`` checks the page
+    count first and flags a longer PDF (#4995).
 
     Returns a list of ``(png_bytes, media_type)`` tuples.
     """
@@ -5468,6 +5580,7 @@ def _render_pdf_pages(
         matrix = pymupdf.Matrix(zoom, zoom)
 
         for i, page in enumerate(doc):
+            # page-cap: extract_from_pdf flags a PDF over max_pages (#4995).
             if i >= max_pages:
                 logger.info(
                     "llm_extractor.page_limit_reached",

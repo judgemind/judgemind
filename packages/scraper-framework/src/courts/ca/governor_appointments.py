@@ -45,6 +45,7 @@ SEARCH_QUERY = "judicial+appointment"
 USER_AGENT = "Judgemind/1.0 (+https://judgemind.org/scraper)"
 
 # Maximum search result pages to paginate through.
+# page-cap: search result pages, not a document's; a hit warns (#4995).
 DEFAULT_MAX_PAGES = 10
 
 # ---------------------------------------------------------------------------
@@ -459,6 +460,7 @@ class GovernorAppointmentsScraper(BaseScraper):
         search_url = f"{SEARCH_URL}?s={SEARCH_QUERY}"
         pages_fetched = 0
 
+        # page-cap: search result pages, newest first; a hit warns below.
         while search_url and pages_fetched < self._max_pages:
             self._log.info("Fetching search page", url=search_url, page=pages_fetched + 1)
 
@@ -496,6 +498,12 @@ class GovernorAppointmentsScraper(BaseScraper):
                 total=len(all_results),
             )
 
+        if search_url:
+            self._log.warning(
+                "governor_appointments.page_limit_reached",
+                max_pages=self._max_pages,
+                results=len(all_results),
+            )
         return all_results
 
     def _fetch_press_release(

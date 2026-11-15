@@ -56,6 +56,17 @@ Output: one ``NO_TEXT`` line per such key (``chars``, ``pages``,
 reports only no-text keys of at least N pages.  ``--write-keys
 s3://bucket/key`` also writes the reported keys, one per line, for a
 reingest's ``--s3-key-list``.  This mode always exits 0.
+
+Long PDF mode (``--long-pdfs``, #4995): list every archived PDF under
+``ca/<county>/`` of at least ``--min-pages`` pages (default 51: past the
+multimodal extractor's old silent 50-page cap), text layer or not, with its
+page count and active ruling count.  ``--multimodal-counties`` audits every
+county under ``ca/`` whose extraction strategy reads page images (Orange and
+every unconfigured county, ``decide_extraction_strategy``) instead of naming
+counties.  Output: one ``LONG_PDF`` line per key (``pages``, ``rulings``) and
+``SUMMARY_LONG_PDF <county>: {json}`` per county (``pdf_keys``, ``long``,
+``long_zero_rulings``, ``long_rulings``, ``max_pages``, ``timeout``,
+``error``).  ``--write-keys`` works here too.  This mode always exits 0.
 """
 
 from __future__ import annotations
@@ -408,6 +419,7 @@ class TextProbe:
 
 
 #: The page count past which the OCR fallback used to stop reading (#4986).
+# page-cap: not a cap; the old OCR cap, for the report.
 OLD_OCR_PAGE_CAP = 10
 
 
@@ -437,7 +449,9 @@ class NoTextReport:
             "no_text_zero_rulings": sum(1 for *_, n in self.no_text if n == 0),
             "no_text_rulings": sum(n for *_, n in self.no_text),
             "no_text_over_10_pages": sum(
-                1 for _, _, p, _ in self.no_text if p > OLD_OCR_PAGE_CAP
+                1
+                for _, _, p, _ in self.no_text
+                if p > OLD_OCR_PAGE_CAP  # page-cap: a report count, not a cap.
             ),
             "timeout": len(self.timeout_keys),
             "error": len(self.error_keys),
@@ -493,11 +507,7 @@ def run_no_text(
 ) -> list[NoTextReport]:
     reports = []
     for county in args.all_counties:
-        keys = sorted(
-            k for k in keys_by_county.get(county, []) if only is None or k in only
-        )
-        if args.limit is not None:
-            keys = keys[: args.limit]
+        keys = county_keys(args, keys_by_county, county, only)
         out(f"START_NO_TEXT {county}: {len(keys)} pdf keys")
         reports.append(
             audit_no_text_county(
@@ -508,7 +518,7 @@ def run_no_text(
                 workers=args.workers,
                 timeout=args.timeout,
                 progress_every=args.progress_every,
-                min_pages=args.min_pages,
+                min_pages=args.min_pages or 0,
                 out=out,
             )
         )
@@ -517,6 +527,161 @@ def run_no_text(
 
 def no_text_key_list(reports: Iterable[NoTextReport]) -> str:
     return "".join(f"{key}\n" for r in reports for key, *_ in r.no_text)
+
+
+def county_keys(
+    args: argparse.Namespace,
+    keys_by_county: dict[str, list[str]],
+    county: str,
+    only: set[str] | None,
+) -> list[str]:
+    keys = sorted(
+        k for k in keys_by_county.get(county, []) if only is None or k in only
+    )
+    return keys if args.limit is None else keys[: args.limit]
+
+
+# ---------------------------------------------------------------------------
+# Long PDF mode (#4995)
+# ---------------------------------------------------------------------------
+
+#: The page count past which the multimodal extractor used to stop reading,
+#: silently (#4995).
+# page-cap: not a cap; the old multimodal cap, the report's default floor.
+OLD_MULTIMODAL_PAGE_CAP = 50
+
+
+@dataclass(frozen=True)
+class PageProbe:
+    key: str
+    pages: int
+
+
+def probe_key_pages(key: str, gate: Gate) -> PageProbe:
+    return PageProbe(key, gate.page_count(gate.fetch(key)))
+
+
+@dataclass
+class LongPdfReport:
+    county: str
+    pdf_keys: int = 0
+    long: list[tuple[str, int, int]] = field(
+        default_factory=list
+    )  # key, pages, rulings
+    most_pages: int = 0
+    timeout_keys: list[str] = field(default_factory=list)
+    error_keys: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "pdf_keys": self.pdf_keys,
+            "long": len(self.long),
+            "long_zero_rulings": sum(1 for *_, n in self.long if n == 0),
+            "long_rulings": sum(n for *_, n in self.long),
+            "max_pages": self.most_pages,
+            "timeout": len(self.timeout_keys),
+            "error": len(self.error_keys),
+            "timeout_keys": self.timeout_keys,
+            "error_keys": self.error_keys,
+        }
+
+
+def audit_long_county(
+    county: str,
+    keys: list[str],
+    ruling_counts: dict[str, int],
+    gate: Gate,
+    *,
+    workers: int,
+    timeout: float,
+    progress_every: int,
+    min_pages: int,
+    out: Callable[[str], None] = print,
+) -> LongPdfReport:
+    report = LongPdfReport(county=county, pdf_keys=len(keys))
+    jobs = ((key, (key, gate)) for key in keys)
+    results = run_with_deadline(jobs, probe_key_pages, workers=workers, timeout=timeout)
+    for done, (key, status, payload) in enumerate(results, start=1):
+        if status == "timeout":
+            report.timeout_keys.append(key)
+            out(f"TIMEOUT {county} key={key} after={timeout:g}s")
+        elif status == "error":
+            report.error_keys.append(key)
+            out(f"ERROR {county} key={key} error={payload}")
+        else:
+            report.most_pages = max(report.most_pages, payload.pages)
+            if payload.pages >= min_pages:
+                rulings = ruling_counts.get(key, 0)
+                report.long.append((key, payload.pages, rulings))
+                out(
+                    f"LONG_PDF {county} key={key} pages={payload.pages} rulings={rulings}"
+                )
+        if progress_every and done % progress_every == 0 and done < report.pdf_keys:
+            out(
+                f"PROGRESS {county}: {done}/{report.pdf_keys} keys long={len(report.long)}"
+            )
+    out(f"SUMMARY_LONG_PDF {county}: {json.dumps(report.summary(), sort_keys=True)}")
+    return report
+
+
+def run_long_pdfs(
+    args: argparse.Namespace,
+    keys_by_county: dict[str, list[str]],
+    ruling_counts: dict[str, int],
+    gate: Gate,
+    only: set[str] | None,
+    out: Callable[[str], None] = print,
+) -> list[LongPdfReport]:
+    min_pages = (
+        OLD_MULTIMODAL_PAGE_CAP + 1 if args.min_pages is None else args.min_pages
+    )
+    reports = []
+    for county in args.all_counties:
+        keys = county_keys(args, keys_by_county, county, only)
+        out(f"START_LONG_PDF {county}: {len(keys)} pdf keys, min_pages={min_pages}")
+        reports.append(
+            audit_long_county(
+                county,
+                keys,
+                ruling_counts,
+                gate,
+                workers=args.workers,
+                timeout=args.timeout,
+                progress_every=args.progress_every,
+                min_pages=min_pages,
+                out=out,
+            )
+        )
+    return reports
+
+
+def long_pdf_key_list(reports: Iterable[LongPdfReport]) -> str:
+    return "".join(f"{key}\n" for r in reports for key, *_ in r.long)
+
+
+def reads_page_images(state: str, county: str) -> bool:
+    """The worker's own strategy: does this county's split read page images?"""
+    from framework.extraction_config import decide_extraction_strategy
+
+    return decide_extraction_strategy(state, county).use_multimodal
+
+
+def multimodal_counties(
+    s3: Any,
+    bucket: str,
+    state: str = "ca",
+    use_multimodal: Callable[[str, str], bool] = reads_page_images,
+) -> list[str]:
+    """Every county under ``<state>/`` whose split reads page images (#4995):
+    Orange and every county with no extraction config."""
+    paginator = s3.get_paginator("list_objects_v2")
+    names = [
+        p["Prefix"].split("/")[1]
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{state}/", Delimiter="/")
+        for p in page.get("CommonPrefixes", [])
+    ]
+    counties = [n.replace("_", " ").title() for n in names if n]
+    return [c for c in counties if use_multimodal(state, c)]
 
 
 def list_county_pdf_keys(
@@ -547,20 +712,30 @@ def fetch_ruling_counts(database_url: str, counties: list[str]) -> dict[str, int
 
 
 def main_no_text(args: argparse.Namespace, only: set[str] | None) -> int:
+    """``--no-text-pdfs`` or ``--long-pdfs``: list the county PDFs, probe
+    each, and optionally write the reported keys."""
     import boto3
 
     s3 = boto3.client("s3")
+    if args.multimodal_counties:
+        args.all_counties = multimodal_counties(s3, BUCKET)
+        _print(f"MULTIMODAL_COUNTIES {json.dumps(args.all_counties)}")
     keys = list_county_pdf_keys(s3, BUCKET, args.all_counties)
     counts = fetch_ruling_counts(os.environ["DATABASE_URL"], args.all_counties)
-    reports = run_no_text(args, keys, counts, production_gate(), only, out=_print)
+    if args.long_pdfs:
+        long_reports = run_long_pdfs(
+            args, keys, counts, production_gate(), only, out=_print
+        )
+        body = long_pdf_key_list(long_reports)
+        found = sum(len(r.long) for r in long_reports)
+    else:
+        reports = run_no_text(args, keys, counts, production_gate(), only, out=_print)
+        body = no_text_key_list(reports)
+        found = sum(len(r.no_text) for r in reports)
     if args.write_keys:
         bucket, _, key = args.write_keys.removeprefix("s3://").partition("/")
-        s3.put_object(
-            Bucket=bucket, Key=key, Body=no_text_key_list(reports).encode("utf-8")
-        )
-        _print(
-            f"WROTE {sum(len(r.no_text) for r in reports)} keys to {args.write_keys}"
-        )
+        s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
+        _print(f"WROTE {found} keys to {args.write_keys}")
     return 0
 
 
@@ -631,20 +806,45 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Report archived PDFs with no usable text layer instead (#4983).",
     )
     parser.add_argument(
+        "--long-pdfs",
+        action="store_true",
+        help="Report archived PDFs of at least --min-pages pages instead (#4995).",
+    )
+    parser.add_argument(
+        "--multimodal-counties",
+        action="store_true",
+        help=(
+            "With --no-text-pdfs / --long-pdfs: audit every county whose split "
+            "reads page images (Orange and unconfigured counties)."
+        ),
+    )
+    parser.add_argument(
         "--write-keys",
-        help="With --no-text-pdfs: s3://bucket/key to write the no-text keys to.",
+        help=(
+            "With --no-text-pdfs / --long-pdfs: s3://bucket/key to write the "
+            "reported keys to."
+        ),
     )
     parser.add_argument(
         "--min-pages",
         type=int,
-        default=0,
-        help="With --no-text-pdfs: report only no-text keys of at least N pages.",
+        default=None,
+        help=(
+            "With --no-text-pdfs: report only no-text keys of at least N pages "
+            "(default 0).  With --long-pdfs: report keys of at least N pages "
+            f"(default {OLD_MULTIMODAL_PAGE_CAP + 1})."
+        ),
     )
     args = parser.parse_args(argv)
-    if args.write_keys and (
-        not args.no_text_pdfs or not args.write_keys.startswith("s3://")
-    ):
-        parser.error("--write-keys needs --no-text-pdfs and an s3:// URI")
+    pdf_mode = args.no_text_pdfs or args.long_pdfs
+    if args.no_text_pdfs and args.long_pdfs:
+        parser.error("--no-text-pdfs and --long-pdfs are separate modes")
+    if args.write_keys and (not pdf_mode or not args.write_keys.startswith("s3://")):
+        parser.error(
+            "--write-keys needs --no-text-pdfs or --long-pdfs and an s3:// URI"
+        )
+    if args.multimodal_counties and not pdf_mode:
+        parser.error("--multimodal-counties needs --no-text-pdfs or --long-pdfs")
     args.all_counties = list(dict.fromkeys([*args.counties, *args.county])) or list(
         DEFAULT_COUNTIES
     )
@@ -699,7 +899,7 @@ def main(argv: list[str] | None = None) -> int:
         only = load_key_list(
             args.keys, lambda b, k: s3.get_object(Bucket=b, Key=k)["Body"].read()
         )
-    if args.no_text_pdfs:
+    if args.no_text_pdfs or args.long_pdfs:
         return main_no_text(args, only)
     rows = fetch_county_rows(os.environ["DATABASE_URL"], args.all_counties)
     return run(args, rows, production_gate(), only, out=_print)

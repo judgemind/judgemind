@@ -52,7 +52,7 @@ from courts.ca.la_dept_judges import (
 )
 from framework.enrichment import EnrichmentEngine
 from framework.events import trim_consumed_entries
-from framework.llm_extractor import LlmExtractor
+from framework.llm_extractor import LlmExtractor, PageCapExceededError
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 from framework.search.ruling_doc import (
@@ -262,6 +262,7 @@ OCR_INCOMPLETE = "incomplete OCR of a PDF with no text layer"
 #: reads the page images itself (every page); the OCR text is only the
 #: fallback when that fails, and a fallback built on a capped OCR is
 #: refused as incomplete like any other (``OCR_INCOMPLETE_KEY``).
+# page-cap: OCR past it is PdfText.incomplete; the worker refuses (#4986).
 _MULTIMODAL_OCR_FALLBACK_PAGES = 10
 
 
@@ -5721,6 +5722,20 @@ class IngestionWorker:
                                 "extraction_method": "multimodal",
                             },
                         )
+                except PageCapExceededError as exc:
+                    # Rulings past the page cap would be lost: a failed
+                    # extraction, never a split, and no text fallback for a
+                    # county whose split reads page images (#4995).
+                    logger.warning(
+                        "Multimodal extraction refused: PDF over the page cap",
+                        extra={
+                            "document_id": document_id,
+                            "error": str(exc),
+                            "extraction_method": "multimodal",
+                        },
+                    )
+                    batch.extraction_failed = f"multimodal: {type(exc).__name__}: {exc}"
+                    return False
                 except Exception as exc:
                     logger.warning(
                         "Multimodal extraction failed — falling back to text",

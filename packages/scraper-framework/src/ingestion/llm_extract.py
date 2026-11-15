@@ -384,6 +384,7 @@ def pdf_page_count(content: str | bytes) -> int:
 # and a PDF that hits it is OCR'd up to the cap and marked incomplete
 # (``PdfText.incomplete``), with an ``ocr_pdf_text.page_limit_reached``
 # warning, never silently truncated.
+# page-cap: OCR past it is PdfText.incomplete; the worker refuses (#4986).
 _OCR_MAX_PAGES = 100
 
 # Pages OCR'd concurrently.  Each page is one vision call; a 22-page scan
@@ -605,6 +606,7 @@ def _render_pdf_pages_counted(
         matrix = pymupdf.Matrix(zoom, zoom)
 
         for i, page in enumerate(doc):
+            # page-cap: ocr_pdf_document marks the result incomplete (#4986).
             if i >= max_pages:
                 break
 
@@ -792,6 +794,7 @@ def _parse_date(raw: str | None) -> date | None:
 # Hard cap on chunks per document to control cost.
 # 10 chunks x 80K chars/chunk = ~800K effective coverage (minus overlap),
 # sufficient for the largest LA Superior Court multi-ruling documents.
+# page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
 _MAX_CHUNKS = 10
 
 # Overlap characters between consecutive chunks for context continuity.
@@ -873,11 +876,13 @@ def _split_text_into_chunks(
             split_at = last_boundary if last_boundary > chunk_start else boundary
             chunks.append(text[chunk_start:split_at])
             chunk_start = max(split_at - _CHUNK_OVERLAP, 0)
+            # page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
             if len(chunks) >= _MAX_CHUNKS:
                 break
         last_boundary = boundary
 
     # Append the remaining text.
+    # page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
     if len(chunks) < _MAX_CHUNKS and chunk_start < len(text):
         remaining = text[chunk_start:]
         if len(remaining) > max_chars:
@@ -885,6 +890,7 @@ def _split_text_into_chunks(
             # force-split as a fallback.
             sub_chunks = _force_split(remaining, max_chars)
             for sc in sub_chunks:
+                # page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
                 if len(chunks) >= _MAX_CHUNKS:
                     break
                 chunks.append(sc)
@@ -894,6 +900,7 @@ def _split_text_into_chunks(
     if not chunks:
         chunks = [text[:max_chars]]
 
+    # page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
     if len(chunks) >= _MAX_CHUNKS:
         # Check if we covered the full text.
         covered = sum(len(c) for c in chunks)
@@ -911,6 +918,7 @@ def _force_split(text: str, max_chars: int) -> list[str]:
     """Split *text* into fixed-size chunks with overlap (no natural boundaries)."""
     chunks: list[str] = []
     pos = 0
+    # page-cap: field fill, not a split; llm_extract.chunk_truncated warns.
     while pos < len(text) and len(chunks) < _MAX_CHUNKS:
         end = min(pos + max_chars, len(text))
         chunks.append(text[pos:end])

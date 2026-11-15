@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pytest
 
+from framework import llm_extractor
 from framework.llm_extractor import (
     PDF_PER_PAGE_PROMPT,
     LlmExtractor,
@@ -2770,7 +2771,7 @@ class TestExtractFromPdf:
         ):
             ext.extract_from_pdf(sample_pdf_bytes)
 
-        mock_render.assert_called_once_with(sample_pdf_bytes, 50)
+        mock_render.assert_called_once_with(sample_pdf_bytes, llm_extractor._MULTIMODAL_MAX_PAGES)
         # One call per page = 2 calls for 2 pages.
         assert mock_call.call_count == 2
         # Each call should have exactly one image.
