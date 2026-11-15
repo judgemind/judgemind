@@ -218,11 +218,12 @@ def test_run_placeholder_check_error_leaves_key_unexplained(
 def test_is_sc_placeholder_pdf_uses_worker_predicate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import courts.ca.sc_tentatives as sc
-    import ingestion.llm_extract as le
-
-    monkeypatch.setattr(le, "extract_text_layer", lambda body: body.decode())
-    monkeypatch.setattr(sc, "is_placeholder_notice", lambda text: text == "notice")
+    # Stub modules: the scripts-tests CI job does not install the
+    # scraper-framework dependencies the real modules import.
+    sc = types.SimpleNamespace(is_placeholder_notice=lambda text: text == "notice")
+    le = types.SimpleNamespace(extract_text_layer=lambda body: body.decode())
+    monkeypatch.setitem(sys.modules, "courts.ca.sc_tentatives", sc)
+    monkeypatch.setitem(sys.modules, "ingestion.llm_extract", le)
     assert rec.is_sc_placeholder_pdf(b"notice") is True
     assert rec.is_sc_placeholder_pdf(b"ruling") is False
 
