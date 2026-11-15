@@ -840,61 +840,84 @@ for prepush_git_var in $(git rev-parse --local-env-vars 2>/dev/null); do
 done
 
 # -------------------------------------------------------------------
-# scripts_tests_checks — pytest scripts/tests/ in CI's minimal env (#5045)
+# minimal_env_pytest_checks — a CI scripts-tests suite in CI's minimal
+# env (#5045, #5052)
 #
-# CI's `scripts-tests` job runs scripts/tests in a bare Python with only
-# scripts/tests/requirements-ci.txt installed: no psycopg, no
-# scraper-framework dependencies. A script that imports a package whose
+# CI's `scripts-tests (python)` job runs three pytest suites in a bare
+# Python with only scripts/tests/requirements-ci.txt installed (no
+# psycopg, no scraper-framework dependencies): scripts/tests/,
+# scripts/dispatcher/tests/ (-m "not integration") and
+# scripts/dispatcher_v3/tests/. A script that imports a package whose
 # __init__ needs one of those (#5043: `ingestion`, whose __init__ loads
 # the worker and psycopg) passes in a full package venv and fails CI at
 # collection. scripts/ensure-scripts-tests-venv.sh builds a cached
-# per-checkout venv from the same requirements file CI installs, and the
-# suite runs there with PYTHONPATH=scripts as CI sets it, and with the
-# venv first on PATH so `python3` subprocesses see the same packages.
+# per-checkout venv from the same requirements file CI installs (it
+# builds under a lock, so the suites' jobs can call it concurrently and
+# share one venv), and each suite runs there with PYTHONPATH=scripts as
+# CI sets it, and with the venv first on PATH so `python3` subprocesses
+# see the same packages.
 #
-# Knobs: PREPUSH_SCRIPTS_TESTS=0 skips it (WARNING; CI still runs it).
-# PREPUSH_SCRIPTS_TESTS_WORKERS: xdist workers (default auto; 0 = serial,
-# exactly as CI runs it). The suite is xdist-safe today and takes ~5s
-# under xdist against ~30s serial.
+# No test run can reach real GitHub or write to this repository:
+#   * git's repository env vars (PREPUSH_GIT_ENV_UNSET) are unset, and
+#     every suite's conftest.py carries the git-env-scrub block (#5058);
+#   * GitHub tokens are unset and GH_CONFIG_DIR points at an empty
+#     directory, and every suite's conftest.py carries the gh-isolate
+#     block, whose gh shim fails any test that reaches it (#5071, #5075).
+#
+# Usage: minimal_env_pytest_checks <suite dir> [extra pytest args...]
+#
+# Knobs: PREPUSH_SCRIPTS_TESTS=0 skips every suite (WARNING; CI still
+# runs them). PREPUSH_SCRIPTS_TESTS_WORKERS: xdist workers (default
+# auto; 0 = serial). scripts/tests takes ~5s under xdist against ~30s
+# serial; the dispatcher suite ~40s under xdist.
 # -------------------------------------------------------------------
-scripts_tests_checks() {
+PREPUSH_GH_TOKEN_UNSET=(-u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN)
+
+minimal_env_pytest_checks() {
+    local suite="${1%/}"
+    shift
     local helper="scripts/ensure-scripts-tests-venv.sh"
+    local suite_safe="${suite//\//_}"
     if [ "${#PREPUSH_GIT_ENV_UNSET[@]}" -eq 0 ]; then
         # Without it, tests that run git in a scratch dir act on this repo.
         echo "  FAILED: could not list git's repository env vars (git rev-parse --local-env-vars);" >&2
-        echo "  scripts/tests did not run (#5045)." >&2
+        echo "  $suite did not run (#5045)." >&2
         echo "  Fix:" >&2
         echo "    git rev-parse --local-env-vars     # must print GIT_DIR etc.; check that git works here" >&2
         failures=$((failures + 1))
         return 0
     fi
     if [ ! -x "$helper" ]; then
-        echo "  WARNING: $helper not found or not executable — skipping scripts/tests (#5045)" >&2
+        echo "  WARNING: $helper not found or not executable — skipping $suite (#5045)" >&2
         return 0
     fi
-    local log="$PREPUSH_LOG_DIR/prepush-_-ensure-scripts-tests-venv.log"
+    local log="$PREPUSH_LOG_DIR/prepush-_-ensure-scripts-tests-venv-${suite_safe}.log"
     local out rc=0 start end venv
     start=$(date +%s)
     out="$("$helper" 2>"$log")" || rc=$?
     end=$(date +%s)
-    printf '%s\t%s\t%s\t%s\n' "$((end - start))" "_" "ensure-scripts-tests-venv" "$rc" >> "$PREPUSH_TIMINGS"
+    printf '%s\t%s\t%s\t%s\n' "$((end - start))" "_" "ensure-scripts-tests-venv ($suite)" "$rc" >> "$PREPUSH_TIMINGS"
     case "$rc" in
         0)
             venv="$(printf '%s\n' "$out" | tail -n 1)"
             ;;
         3)
-            echo "  WARNING: no venv for scripts/tests, so it did not run; CI still runs it (#5045)" >&2
+            echo "  WARNING: no venv for $suite, so it did not run; CI still runs it (#5045)" >&2
             sed 's/^/  /' "$log" >&2
             return 0
             ;;
         *)
             echo "" >&2
-            echo "  FAILED: could not prepare the scripts/tests venv (#5045)" >&2
+            echo "  FAILED: could not prepare the scripts/tests venv for $suite (#5045)" >&2
             sed 's/^/  /' "$log" >&2
             failures=$((failures + 1))
             return 0
             ;;
     esac
+
+    # An empty gh config dir: no stored login for any gh a test reaches.
+    local gh_config="$PREPUSH_JOB_DIR/gh-config-empty-${suite_safe}"
+    mkdir -p "$gh_config"
 
     local xdist_flag=""
     case "${PREPUSH_SCRIPTS_TESTS_WORKERS:-auto}" in
@@ -902,23 +925,24 @@ scripts_tests_checks() {
         *) xdist_flag="-n ${PREPUSH_SCRIPTS_TESTS_WORKERS:-auto}" ;;
     esac
     local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
-    local pytest_log="$PREPUSH_LOG_DIR/prepush-_-scripts_tests-pytest.log"
+    local pytest_log="$PREPUSH_LOG_DIR/prepush-_-${suite_safe}-pytest.log"
     # shellcheck disable=SC2086  # xdist_flag is intentionally word-split
-    run_check "_" "scripts/tests pytest" run_capped "$max_secs" \
-        env "${PREPUSH_GIT_ENV_UNSET[@]}" \
+    run_check "_" "$suite pytest" run_capped "$max_secs" \
+        env "${PREPUSH_GIT_ENV_UNSET[@]}" "${PREPUSH_GH_TOKEN_UNSET[@]}" \
+        GH_CONFIG_DIR="$gh_config" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
         PATH="$venv/bin:$PATH" VIRTUAL_ENV="$venv" PYTHONPATH=scripts \
-        "$venv/bin/pytest" scripts/tests/ $xdist_flag -q --tb=short -p no:cacheprovider \
+        "$venv/bin/pytest" "$suite/" "$@" $xdist_flag -q --tb=short -p no:cacheprovider \
         || pytest_rc=$?
     [ "$pytest_rc" -eq 0 ] && return 0
 
     failures=$((failures + 1))
     if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
-        echo "  scripts/tests did not finish within ${max_secs}s awake (PREPUSH_PYTEST_MAX_SECS) and was killed." >&2
+        echo "  $suite did not finish within ${max_secs}s awake (PREPUSH_PYTEST_MAX_SECS) and was killed." >&2
     fi
     local import_errors
     import_errors="$(grep -E "^E +(ModuleNotFoundError|ImportError)|^ERROR .* - (ModuleNotFoundError|ImportError)" \
         "$pytest_log" 2>/dev/null | sort -u | head -n 10)"
-    echo "  scripts/tests runs in the minimal environment of CI's scripts-tests job:" >&2
+    echo "  $suite runs in the minimal environment of CI's scripts-tests job:" >&2
     echo "  only scripts/tests/requirements-ci.txt is installed (no psycopg, no" >&2
     echo "  scraper-framework dependencies). This run used the same packages." >&2
     if [ -n "$import_errors" ]; then
@@ -930,14 +954,22 @@ scripts_tests_checks() {
         echo "    # Import the leaf module, not a package whose __init__ pulls in heavy" >&2
         echo "    # deps (e.g. not 'ingestion'), import the dependency lazily inside the" >&2
         echo "    # function that needs it, or mock it in the test with" >&2
-        echo "    # scripts/tests/_mock_helpers.py:mock_sys_modules." >&2
-        echo "    # Only if scripts/tests genuinely needs it: add it to" >&2
+        echo "    # scripts/tests/_mock_helpers.py:mock_sys_modules (the dispatcher" >&2
+        echo "    # suite's conftest.py already stubs psycopg)." >&2
+        echo "    # Only if the suite genuinely needs it: add it to" >&2
         echo "    # scripts/tests/requirements-ci.txt (CI installs the same file)." >&2
     fi
+    local extra=""
+    [ "$#" -gt 0 ] && extra=" $(printf '%q ' "$@")" && extra="${extra% }"
     echo "    # Reproduce exactly what CI runs:" >&2
-    echo "    PATH=$venv/bin:\$PATH PYTHONPATH=scripts $venv/bin/pytest scripts/tests/ --tb=short" >&2
+    echo "    PATH=$venv/bin:\$PATH PYTHONPATH=scripts $venv/bin/pytest $suite/$extra --tb=short" >&2
     return 0
 }
+
+# One job per suite (#5052); each mirrors a CI scripts-tests (python) step.
+scripts_tests_checks() { minimal_env_pytest_checks scripts/tests; }
+dispatcher_tests_checks() { minimal_env_pytest_checks scripts/dispatcher/tests -m "not integration"; }
+dispatcher_v3_tests_checks() { minimal_env_pytest_checks scripts/dispatcher_v3/tests; }
 
 # -------------------------------------------------------------------
 # Determine the range of commits being pushed
@@ -1217,6 +1249,36 @@ if [ -n "$changed_scripts_tests_inputs" ]; then
     else
         echo "pre-push: running scripts/tests in CI's minimal environment (scripts/tests/requirements-ci.txt)..." >&2
         start_job "scripts-tests" scripts_tests_checks
+    fi
+fi
+
+# -------------------------------------------------------------------
+# scripts/dispatcher/tests and scripts/dispatcher_v3/tests in CI's
+# minimal environment (#5052). CI's scripts-tests (python) job runs both
+# in the same venv as scripts/tests. Each suite runs when its own tree
+# changes, or when something every suite shares does: the requirements
+# file, the venv helper, judgemind-config (installed into the venv), the
+# canonical conftest blocks in scripts/tests/conftest.py, or a top-level
+# script the dispatcher imports (scripts/audit_llm_carry_forward.py).
+# Background jobs alongside scripts/tests; all share its cached venv.
+# -------------------------------------------------------------------
+minimal_env_shared_re='scripts/tests/requirements-ci\.txt|scripts/ensure-scripts-tests-venv\.sh|scripts/tests/conftest\.py|packages/judgemind-config/.*'
+changed_dispatcher_tests_inputs=$(echo "$changed_files" \
+    | grep -E "^(scripts/dispatcher/.*|scripts/audit_llm_carry_forward\.py|${minimal_env_shared_re})$" || true)
+changed_dispatcher_v3_tests_inputs=$(echo "$changed_files" \
+    | grep -E "^(scripts/dispatcher_v3/.*|${minimal_env_shared_re})$" || true)
+if [ -n "$changed_dispatcher_tests_inputs$changed_dispatcher_v3_tests_inputs" ]; then
+    if [ "${PREPUSH_SCRIPTS_TESTS:-1}" = "0" ]; then
+        echo "pre-push: WARNING: PREPUSH_SCRIPTS_TESTS=0, so the dispatcher suites did not run; CI still runs them (#5052)" >&2
+    else
+        if [ -n "$changed_dispatcher_tests_inputs" ]; then
+            echo "pre-push: running scripts/dispatcher/tests in CI's minimal environment..." >&2
+            start_job "dispatcher-tests" dispatcher_tests_checks
+        fi
+        if [ -n "$changed_dispatcher_v3_tests_inputs" ]; then
+            echo "pre-push: running scripts/dispatcher_v3/tests in CI's minimal environment..." >&2
+            start_job "dispatcher-v3-tests" dispatcher_v3_tests_checks
+        fi
     fi
 fi
 
