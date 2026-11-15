@@ -44,6 +44,17 @@ from ingestion.split_ids import make_split_document_id  # noqa: E402
 
 reingest = importlib.import_module("reingest_from_s3")
 
+#: The shipped deferral list, captured before the autouse fixture empties it.
+REAL_DEFERRALS = reingest.DEFERRED_BACKLOGS
+
+
+@pytest.fixture(autouse=True)
+def _no_default_deferrals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most tests use ``federal/`` keys, which the shipped deferral list
+    (the CourtListener backlog, #3954) would skip; the deferral itself is
+    tested in ``TestReingestDeferredBacklog`` (#5043)."""
+    monkeypatch.setattr(reingest, "DEFERRED_BACKLOGS", ())
+
 
 def _cursor_conn(rows: list[tuple]) -> tuple[MagicMock, MagicMock]:
     """A mock connection whose cursor returns *rows*; returns (conn, cursor)."""

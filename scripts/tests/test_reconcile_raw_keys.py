@@ -532,6 +532,26 @@ def test_default_deferral_is_the_courtlistener_backlog_on_3954() -> None:
     assert not cl.matches(_raw(f"{GOV}{_h('5')}.html"))
 
 
+def test_deferral_list_is_the_shared_definition() -> None:
+    """#5043: the reconciler, reingest_from_s3.py and rebuild_db.py read one
+    definition, in the scraper-framework package (oneshot scripts cannot
+    import each other)."""
+    from validation import deferred_backlogs
+
+    assert REAL_DEFERRALS is deferred_backlogs.DEFERRED_BACKLOGS
+    assert rec.DeferredBacklog is deferred_backlogs.DeferredBacklog
+
+
+def test_incomplete_batch_leaves_out_deferred_keys() -> None:
+    """#5043: the reconciler never hands the reingest a deferred incomplete
+    key; the reingest would skip it, and its retry attempt must not count."""
+    fed = _raw(f"{FED}{_h('7')}.txt", _lm("2026-06-01"))
+    la = _raw(f"{LA}{_h('8')}.html", _lm("2026-06-02"))
+    rep = types.SimpleNamespace(incomplete=[fed, la])
+    assert rec.incomplete_batch({"x": rep}, 0, 10, REAL_DEFERRALS) == [la]
+    assert rec.incomplete_batch({"x": rep}, 0, 10) == [fed, la]
+
+
 def test_split_deferred_and_report() -> None:
     fed = [_raw(f"{FED}{_h(c)}.txt") for c in "78"]
     late = _raw(f"{FED}{_h('9')}.txt", _lm("2026-07-01"))

@@ -147,7 +147,6 @@ run), ``--write-keys``, ``--chunk-size``, ``--sample``, ``--record``,
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 import os
 import re
@@ -177,6 +176,10 @@ for _path in (
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
 
+from validation.deferred_backlogs import (
+    DEFERRED_BACKLOGS,
+    DeferredBacklog,
+)
 from validation.rule_versions import (
     FailRow,
     fail_row_from_db,
@@ -215,56 +218,9 @@ INTENTIONAL_SKIP_PREFIXES: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
-class DeferredBacklog:
-    """Unrepresented keys whose reingest is deliberately on hold (#5036).
-
-    They are real losses, not skips: they stay ``unrepresented`` in the
-    per-scope counts (and on ``/admin/data-quality``), but they are reported
-    as "deferred (blocked on #<issue>)", never re-ingested and never make a
-    scope ``over_threshold``.  A scope matches when it fits one of
-    *scopes* and none of *exclude* (``fnmatch`` patterns on
-    ``<state>/<county>``).  With *captured_before*, only keys captured
-    before that day are deferred: the known backlog waits, while a later
-    loss in the same scope heals as usual.  Remove the entry once the
-    blocking issue is decided and the keys go back to normal handling.
-
-    Intentional skips (the governor bio route, ``telemetry.ingest_skips``)
-    are not deferrals: they are never meant to produce a document.
-    """
-
-    name: str
-    issue: int
-    scopes: tuple[str, ...]
-    exclude: tuple[str, ...] = ()
-    captured_before: date | None = None
-
-    def matches(self, raw: RawKey) -> bool:
-        if not any(fnmatch.fnmatchcase(raw.scope, p) for p in self.scopes):
-            return False
-        if any(fnmatch.fnmatchcase(raw.scope, p) for p in self.exclude):
-            return False
-        return self.captured_before is None or raw.utc.date() < self.captured_before
-
-    @property
-    def label(self) -> str:
-        return f"deferred (blocked on #{self.issue})"
-
-
-#: Deliberately deferred backlogs (#5036).  CourtListener raws (``federal/``,
-#: ``unknown/`` and ``<state name>/statewide``; the ``ca/`` capture prefix is
-#: never CourtListener) lost in the May-June 2026 ElastiCache window (#4470)
-#: wait on the operator decision #3954 (reingest tracked by #5022).  Every one
-#: was captured by 2026-06-18; a later CourtListener loss heals as usual.
-DEFERRED_BACKLOGS: tuple[DeferredBacklog, ...] = (
-    DeferredBacklog(
-        name="courtlistener_oom_window",
-        issue=3954,
-        scopes=("federal/*", "unknown/*", "*/statewide"),
-        exclude=("ca/*",),
-        captured_before=date(2026, 6, 21),
-    ),
-)
+# Deferred backlogs (#5036) have one definition, shared with
+# reingest_from_s3.py and rebuild_db.py, which skip their keys by default
+# (#5043): ``validation.deferred_backlogs``.
 
 
 #: ``ingestion.ruling_guards.NON_RULING_PDF_DROPPED_METRIC`` (all-NULL guard).
@@ -1118,7 +1074,10 @@ def overall_action(
 
 
 def incomplete_batch(
-    reports: dict[str, ScopeReport], unrepresented: int, max_auto_reingest: int
+    reports: dict[str, ScopeReport],
+    unrepresented: int,
+    max_auto_reingest: int,
+    backlogs: Sequence[DeferredBacklog] = (),
 ) -> list[RawKey]:
     """The incomplete (retryable) keys this run re-ingests, oldest first
     (#5008): as many as fit beside the *unrepresented* keys being re-ingested
@@ -1126,13 +1085,20 @@ def incomplete_batch(
     *max_auto_reingest* on their own.  An
     incomplete key is a known key with a recorded reason and an attempt
     cap, so it keeps draining while a lost-key backlog waits for a human.
-    The rest wait for the next run."""
+    The rest wait for the next run.  Keys of a deferred backlog are left
+    out: ``reingest_from_s3.py`` would skip them (#5043), and their retry
+    attempts must not count."""
     if unrepresented > max_auto_reingest:
         room = max_auto_reingest
     else:
         room = max(0, max_auto_reingest - unrepresented)
     keys = sorted(
-        (raw for rep in reports.values() for raw in rep.incomplete),
+        (
+            raw
+            for rep in reports.values()
+            for raw in rep.incomplete
+            if not any(b.matches(raw) for b in backlogs)
+        ),
         key=lambda k: (k.utc, k.key),
     )
     return keys[:room]
@@ -1323,7 +1289,10 @@ def run(
     healing = [s for s, a in scope_actions.items() if a in REINGEST_ACTIONS]
     heal_count = sum(len(actionable[s]) for s in healing)
     batch = incomplete_batch(
-        reports, min(heal_count, args.max_auto_reingest), args.max_auto_reingest
+        reports,
+        min(heal_count, args.max_auto_reingest),
+        args.max_auto_reingest,
+        backlogs,
     )
     action = overall_action(
         scope_actions,

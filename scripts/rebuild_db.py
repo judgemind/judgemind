@@ -45,6 +45,15 @@
 #                     with --county, the reset is scoped to just that county's
 #                     rows (per-county reset); otherwise it truncates the
 #                     derived schema globally.
+#   --include-deferred
+#                     Also rebuild the keys of a deferred backlog
+#                     (``validation.deferred_backlogs``; today the May-June
+#                     2026 CourtListener raws, blocked on #3954).  Without it
+#                     they are skipped (``deferred_backlog_skipped``), a run
+#                     whose every key is deferred exits 5, and a --reset whose
+#                     scope holds deferred rows (a global reset, or e.g.
+#                     ``--state federal --county federal``) is refused with
+#                     exit 5 before anything is deleted (#5043).
 #
 # Decision: use --reset?
 #
@@ -107,6 +116,15 @@ from framework.s3_cache import make_s3_client
 from framework.storage import (
     capture_provenance_from_s3_object,
     capture_timestamp_from_s3_object,
+)
+from validation.deferred_backlogs import (
+    DEFERRED_BACKLOGS,
+    ONLY_DEFERRED_EXIT_CODE,
+    DeferralSplit,
+    DeferredBacklog,
+    backlogs_for_scope,
+    log_deferral_split,
+    split_deferred_keys,
 )
 
 # The same logging setup as the ingestion-worker service, so the worker's
@@ -314,13 +332,20 @@ def reindex_renamed_courts(
     logger.info("renamed_courts_reindexed", court_ids=sorted(court_ids), rulings=count)
 
 
-def list_s3_keys(s3_client: Any, bucket: str, prefix: str = "ca/") -> list[str]:
+def list_s3_keys(
+    s3_client: Any,
+    bucket: str,
+    prefix: str = "ca/",
+    last_modified: dict[str, datetime] | None = None,
+) -> list[str]:
     """List all content-addressed keys from S3 (or local cache).
 
     Keys that don't match ``KEY_PATTERN`` are skipped, and the count is
     logged (``s3_keys_skipped_non_matching``) so a key-layout drift is
     visible instead of silent: legacy dated ``raw/YYYY/MM/DD/`` raws sat
-    unlisted for months (#4988).
+    unlisted for months (#4988).  When *last_modified* is given, each listed
+    key's ``LastModified`` is recorded in it (the deferred-backlog cutoff
+    reads it, #5043).
     """
     paginator = s3_client.get_paginator("list_objects_v2")
     keys: list[str] = []
@@ -330,6 +355,10 @@ def list_s3_keys(s3_client: Any, bucket: str, prefix: str = "ca/") -> list[str]:
             key = obj["Key"]
             if KEY_PATTERN.match(key):
                 keys.append(key)
+                if last_modified is not None and isinstance(
+                    obj.get("LastModified"), datetime
+                ):
+                    last_modified[key] = obj["LastModified"]
             else:
                 skipped.append(key)
     if skipped:
@@ -342,6 +371,81 @@ def list_s3_keys(s3_client: Any, bucket: str, prefix: str = "ca/") -> list[str]:
             sample=skipped[:5],
         )
     return keys
+
+
+def drop_deferred_keys(
+    keys: list[str],
+    *,
+    include_deferred: bool,
+    last_modified: dict[str, datetime] | None = None,
+) -> DeferralSplit:
+    """Split off the keys of a deferred backlog (#5043).
+
+    Their reingest is on hold behind an issue (``validation.deferred_backlogs``;
+    the May-June CourtListener raws wait on #3954): the worker fails their
+    validation and replaces each key's rulings with nothing.  They are
+    skipped and logged unless *include_deferred*.  The capture time is the
+    listing's ``LastModified``; a key without one (the local cache) counts
+    as deferred when its scope matches.
+    """
+    known = last_modified or {}
+    split = split_deferred_keys(
+        keys,
+        known.get,
+        include_deferred=include_deferred,
+        backlogs=DEFERRED_BACKLOGS,
+    )
+    log_deferral_split(logger, split, backlogs=DEFERRED_BACKLOGS)
+    return split
+
+
+def reset_deferred_backlogs(state: str, county: str | None) -> list[DeferredBacklog]:
+    """The deferred backlogs a ``--reset`` of this scope would wipe (#5043).
+
+    A global reset (*county* ``None``) truncates every state's rows, so it
+    wipes every backlog's rows; a county or court reset wipes the backlogs
+    whose scopes match ``<state>/<county>``.  The rebuild then skips those
+    keys, so their rows would be gone with nothing to replace them.
+    """
+    if county is None:
+        return list(DEFERRED_BACKLOGS)
+    return backlogs_for_scope(
+        f"{sluggify(state)}/{sluggify(county)}", DEFERRED_BACKLOGS
+    )
+
+
+def refuse_deferred_reset(
+    state: str, county: str | None, include_deferred: bool
+) -> None:
+    """Exit before a ``--reset`` that would wipe deferred-backlog rows."""
+    hit = reset_deferred_backlogs(state, county)
+    if not hit or include_deferred:
+        if hit:
+            logger.error(
+                "deferred_backlog_reset_included",
+                backlogs=[b.name for b in hit],
+                blocking_issues=[b.issue for b in hit],
+                warning=(
+                    "--include-deferred: resetting rows of a deferred backlog; "
+                    "their rebuild fails validation today"
+                ),
+            )
+        return
+    issues = ", ".join(f"#{b.issue}" for b in hit)
+    logger.error(
+        "deferred_backlog_reset_refused",
+        state=state,
+        county=county,
+        backlogs=[b.name for b in hit],
+        blocking_issues=[b.issue for b in hit],
+    )
+    print(
+        f"ERROR: --reset of this scope deletes rows of a deferred backlog "
+        f"(blocked on {issues}) that the rebuild would not recreate.  Narrow "
+        "the scope, or pass --include-deferred to proceed anyway.",
+        file=sys.stderr,
+    )
+    sys.exit(ONLY_DEFERRED_EXIT_CODE)
 
 
 def list_local_keys(cache_dir: Path, prefix: str = "ca/") -> list[str]:
@@ -1917,6 +2021,18 @@ def main() -> None:
             "absolute count cap.  Set to 0 to disable the ratio cap.  See #2572."
         ),
     )
+    parser.add_argument(
+        "--include-deferred",
+        action="store_true",
+        dest="include_deferred",
+        help=(
+            "Also rebuild keys of a deferred backlog "
+            "(validation.deferred_backlogs, e.g. the May-June CourtListener "
+            "raws blocked on #3954), which are skipped by default, and allow "
+            "a --reset that would delete their rows (#5043).  Their reingest "
+            "fails validation today and leaves them with no rulings."
+        ),
+    )
     args = parser.parse_args()
 
     if args.force_split_child_loss:
@@ -1960,6 +2076,7 @@ def main() -> None:
             _court_id, _court_state, _court_county, _court_name = (
                 _resolve_court_for_reset(conn, args.court)
             )
+            refuse_deferred_reset(_court_state, _court_county, args.include_deferred)
             if os_url:
                 delete_opensearch_docs_for_court(
                     os_url, _court_state, _court_county, _court_name
@@ -1974,6 +2091,7 @@ def main() -> None:
             # Delete the county's OS docs FIRST so a failure there aborts
             # before we reset the DB — otherwise we'd be left with a fresh
             # DB and stale OS orphans.  See #2568.
+            refuse_deferred_reset(args.state, args.county, args.include_deferred)
             if os_url:
                 delete_opensearch_docs_for_county(os_url, args.county)
             else:
@@ -1983,6 +2101,7 @@ def main() -> None:
                 )
             reset_derived_tables_for_county(conn, args.state, args.county)
         else:
+            refuse_deferred_reset(args.state, None, args.include_deferred)
             reset_derived_tables(conn)
             if os_url:
                 reset_opensearch_index(os_url)
@@ -2044,14 +2163,30 @@ def main() -> None:
             )
             s3_prefix = f"{sluggify(_c_state)}/{sluggify(_c_county)}/"
         logger.info("Discovering S3 objects...", prefix=s3_prefix)
+        last_modified: dict[str, datetime] = {}
         if cache_dir:
             keys = list_local_keys(Path(cache_dir), prefix=s3_prefix)
             logger.info(
                 "Found keys from local cache", count=len(keys), cache_dir=cache_dir
             )
         else:
-            keys = list_s3_keys(s3, BUCKET, prefix=s3_prefix)
+            keys = list_s3_keys(
+                s3, BUCKET, prefix=s3_prefix, last_modified=last_modified
+            )
             logger.info("Found keys from S3", count=len(keys))
+
+        # Skip deferred-backlog keys (#5043) unless --include-deferred.
+        deferral = drop_deferred_keys(
+            keys, include_deferred=args.include_deferred, last_modified=last_modified
+        )
+        if deferral.only_deferred:
+            logger.error(
+                "only_deferred_backlog_keys",
+                deferred_skipped=deferral.deferred_count,
+                hint="every listed key is deferred; nothing was rebuilt",
+            )
+            sys.exit(ONLY_DEFERRED_EXIT_CODE)
+        keys = deferral.kept
 
         if not keys:
             logger.error("No content-addressed keys found.")

@@ -99,6 +99,14 @@ Options:
                         layer in a text-first county) is not listed: a retry
                         cannot succeed.  It is logged as ``unextractable_keys``
                         and leaves its rows as they are (#4983).
+    --include-deferred  Also re-ingest the keys of a deferred backlog
+                        (``validation.deferred_backlogs``; today the May-June
+                        2026 CourtListener raws, blocked on #3954).  Without
+                        it they are skipped in both modes and logged as
+                        ``deferred_backlog_skipped`` with the blocking issue;
+                        a run whose every key is deferred exits 5 (#5043).
+                        Their reingest fails validation today and replaces
+                        each key's rulings with nothing.
 
 Removed with the DB-row write path (#4845): ``--full-reparse`` and
 ``--multimodal`` (the worker always re-derives the split, with the county's
@@ -147,6 +155,13 @@ from framework.storage import (  # noqa: E402
 from ingestion.db import _looks_like_valid_judge_name, resolve_judge  # noqa: E402
 from ingestion.extract import extract_header_judge_name  # noqa: E402
 from ingestion.llm_extract import extract_text_from_pdf  # noqa: E402
+from validation.deferred_backlogs import (  # noqa: E402
+    DEFERRED_BACKLOGS,
+    ONLY_DEFERRED_EXIT_CODE,
+    DeferralSplit,
+    log_deferral_split,
+    split_deferred_keys,
+)
 
 # The same logging setup as the ingestion-worker service, so the worker's
 # stdlib INFO events and their extra= fields reach the log (#4860).  It runs
@@ -482,12 +497,19 @@ def _parse_s3_key(key: str) -> dict[str, str] | None:
     return m.groupdict()
 
 
-def _list_s3_keys(s3_client: object, bucket: str, prefix: str) -> list[str]:
+def _list_s3_keys(
+    s3_client: object,
+    bucket: str,
+    prefix: str,
+    last_modified: dict[str, datetime] | None = None,
+) -> list[str]:
     """List all content-addressed S3 keys under *prefix*.
 
     Non-matching keys are skipped and counted in one
     ``s3_keys_skipped_non_matching`` warning, so a key-layout drift is
-    visible instead of silent (#4988).
+    visible instead of silent (#4988).  When *last_modified* is given, each
+    listed key's ``LastModified`` is recorded in it (the deferred-backlog
+    cutoff reads it, #5043).
     """
     paginator = s3_client.get_paginator("list_objects_v2")  # type: ignore[union-attr]
     keys: list[str] = []
@@ -497,6 +519,10 @@ def _list_s3_keys(s3_client: object, bucket: str, prefix: str) -> list[str]:
             key = obj["Key"]
             if _S3_KEY_PATTERN.match(key):
                 keys.append(key)
+                if last_modified is not None and isinstance(
+                    obj.get("LastModified"), datetime
+                ):
+                    last_modified[key] = obj["LastModified"]
             else:
                 skipped.append(key)
     if skipped:
@@ -509,6 +535,68 @@ def _list_s3_keys(s3_client: object, bucket: str, prefix: str) -> list[str]:
             sample=skipped[:5],
         )
     return keys
+
+
+def _head_last_modified(s3_client: object, bucket: str, key: str) -> datetime | None:
+    """A raw object's ``LastModified``, or ``None`` when it cannot be read."""
+    try:
+        head = s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - unknown age counts as deferred
+        return None
+    lm = head.get("LastModified") if isinstance(head, dict) else None
+    return lm if isinstance(lm, datetime) else None
+
+
+def _drop_deferred_keys(
+    keys: list[str],
+    *,
+    s3_client: object,
+    bucket: str,
+    include_deferred: bool,
+    mode: str,
+    last_modified: dict[str, datetime] | None = None,
+) -> DeferralSplit:
+    """Split off the keys of a deferred backlog (#5043).
+
+    Their reingest is on hold behind an issue (``validation.deferred_backlogs``;
+    the May-June CourtListener raws wait on #3954): a reingest fails
+    validation and the worker replaces each key's rulings with nothing.
+    They are skipped and logged unless *include_deferred*.  The capture time
+    is the listing's ``LastModified`` (prefix mode) or a HEAD, made only for
+    keys in a deferred scope.
+    """
+    known = last_modified or {}
+
+    def capture_time(key: str) -> datetime | None:
+        if key in known:
+            return known[key]
+        return _head_last_modified(s3_client, bucket, key)
+
+    split = split_deferred_keys(
+        keys,
+        capture_time,
+        include_deferred=include_deferred,
+        backlogs=DEFERRED_BACKLOGS,
+    )
+    log_deferral_split(logger, split, backlogs=DEFERRED_BACKLOGS, mode=mode)
+    return split
+
+
+def _only_deferred_stats(split: DeferralSplit) -> dict[str, Any]:
+    """Stats of a run whose every selected key was a skipped deferred key."""
+    logger.error(
+        "only_deferred_backlog_keys",
+        deferred_skipped=split.deferred_count,
+        hint="every selected key is deferred; nothing was re-ingested",
+    )
+    return {
+        "total_keys": 0,
+        "processed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "deferred_skipped": split.deferred_count,
+        "only_deferred": True,
+    }
 
 
 def _derive_court_code(state: str, county: str) -> str:
@@ -1199,6 +1287,7 @@ def run_reingest_from_prefix(
     skip_judge_prepass: bool = False,
     s3_key_list: list[str] | None = None,
     write_failed_manifest: str | None = None,
+    include_deferred: bool = False,
 ) -> dict[str, Any]:
     """Prefix mode: re-ingest the S3 objects under *prefix*.
 
@@ -1236,6 +1325,9 @@ def run_reingest_from_prefix(
     write_failed_manifest:
         Optional ``s3://bucket/key``: when keys fail, write them there (one
         per line) for a retry with ``--s3-key-list`` (#4619).
+    include_deferred:
+        Also re-ingest keys of a deferred backlog (#5043), which are
+        otherwise skipped (``deferred_skipped`` in the stats).
 
     Returns
     -------
@@ -1252,7 +1344,8 @@ def run_reingest_from_prefix(
 
     # Step 1: List S3 keys matching the prefix.
     logger.info("Listing S3 objects...", prefix=prefix, bucket=bucket)
-    keys = _list_s3_keys(s3_client, bucket, prefix)
+    last_modified: dict[str, datetime] = {}
+    keys = _list_s3_keys(s3_client, bucket, prefix, last_modified=last_modified)
     logger.info("Found S3 objects", count=len(keys), prefix=prefix)
 
     if not keys:
@@ -1298,6 +1391,20 @@ def run_reingest_from_prefix(
                 "wall_time_seconds": 0.0,
             }
 
+    # Step 1c: Skip deferred-backlog keys (#5043), before --limit so the
+    # limit counts keys that will actually run.
+    split = _drop_deferred_keys(
+        keys,
+        s3_client=s3_client,
+        bucket=bucket,
+        include_deferred=include_deferred,
+        mode="prefix",
+        last_modified=last_modified,
+    )
+    if split.only_deferred:
+        return _only_deferred_stats(split)
+    keys = split.kept
+
     if limit is not None:
         total_available = len(keys)
         keys = keys[:limit]
@@ -1305,7 +1412,7 @@ def run_reingest_from_prefix(
             "Limited to first N keys", limit=limit, total_available=total_available
         )
 
-    return _reingest_keys(
+    stats = _reingest_keys(
         dsn,
         keys,
         bucket=bucket,
@@ -1317,6 +1424,14 @@ def run_reingest_from_prefix(
         write_failed_manifest=write_failed_manifest,
         s3_client=s3_client,
     )
+    return _with_deferred_count(stats, split)
+
+
+def _with_deferred_count(stats: dict[str, Any], split: DeferralSplit) -> dict[str, Any]:
+    """Add ``deferred_skipped`` to *stats* when the run skipped any key."""
+    if split.deferred_count and not split.included:
+        stats["deferred_skipped"] = split.deferred_count
+    return stats
 
 
 #: DB-row mode: the S3 keys of the ``documents`` rows that match the filters,
@@ -1376,12 +1491,14 @@ def run_reingest(
     s3_key_list: list[str] | None = None,
     skip_judge_prepass: bool = False,
     write_failed_manifest: str | None = None,
+    include_deferred: bool = False,
 ) -> dict[str, Any]:
     """DB-row mode: re-ingest the S3 objects behind the matching rows.
 
-    Selects the keys (:func:`select_db_keys`), then runs each object through
-    the worker exactly like prefix mode (:func:`_reingest_keys`).  Returns
-    the same stats as :func:`run_reingest_from_prefix`.
+    Selects the keys (:func:`select_db_keys`), skips deferred-backlog keys
+    unless *include_deferred* (#5043), then runs each object through the
+    worker exactly like prefix mode (:func:`_reingest_keys`).  Returns the
+    same stats as :func:`run_reingest_from_prefix`.
     """
     filters, filter_params = _build_filters(
         county,
@@ -1409,20 +1526,33 @@ def run_reingest(
         )
     if not keys:
         return {"total_keys": 0, "processed": 0, "errors": 0, "skipped": 0}
-    return _reingest_keys(
-        dsn,
+    bucket = os.environ.get(
+        "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
+    )
+    s3_client = boto3.client("s3")
+    split = _drop_deferred_keys(
         keys,
-        bucket=os.environ.get(
-            "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
-        ),
+        s3_client=s3_client,
+        bucket=bucket,
+        include_deferred=include_deferred,
+        mode="db",
+    )
+    if split.only_deferred:
+        return _only_deferred_stats(split)
+    stats = _reingest_keys(
+        dsn,
+        split.kept,
+        bucket=bucket,
         concurrency=concurrency,
         dry_run=dry_run,
         bust_llm_cache=bust_llm_cache,
         parse_timeout=parse_timeout,
         skip_judge_prepass=skip_judge_prepass,
         write_failed_manifest=write_failed_manifest,
+        s3_client=s3_client,
         mode="db",
     )
+    return _with_deferred_count(stats, split)
 
 
 def _reingest_keys(
@@ -1891,6 +2021,17 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Use {CANONICAL_KEY_LIST_PREFIX}<name>.txt."
         ),
     )
+    parser.add_argument(
+        "--include-deferred",
+        action="store_true",
+        dest="include_deferred",
+        help=(
+            "Also re-ingest keys of a deferred backlog "
+            "(validation.deferred_backlogs, e.g. the May-June CourtListener "
+            "raws blocked on #3954), which are skipped by default (#5043).  "
+            "Their reingest fails validation today and deletes their rulings."
+        ),
+    )
     return parser
 
 
@@ -1929,6 +2070,7 @@ def main() -> None:
         "skip_judge_prepass": args.skip_judge_prepass,
         "s3_key_list": s3_key_list_values,
         "write_failed_manifest": args.write_failed_manifest,
+        "include_deferred": args.include_deferred,
     }
     if args.prefix:
         stats = run_reingest_from_prefix(dsn, prefix=args.prefix, **common)
@@ -1953,8 +2095,13 @@ def main() -> None:
         processed=stats["processed"],
         errors=stats["errors"],
         skipped=stats["skipped"],
+        deferred_skipped=stats.get("deferred_skipped", 0),
         judge_prepass_judges_seeded=stats.get("judge_prepass_judges_seeded"),
     )
+    if stats.get("only_deferred") is True:
+        # Every selected key is deferred (#5043): nothing ran.  Non-zero so a
+        # caller sees the run did nothing rather than a clean success.
+        sys.exit(ONLY_DEFERRED_EXIT_CODE)
     effective_max_error_ratio = _resolve_effective_max_error_ratio(
         explicit_max_error_ratio=args.max_error_ratio,
         no_fail_on_errors=args.no_fail_on_errors,
