@@ -453,6 +453,35 @@ def _s3_returning(body: bytes | None) -> MagicMock:
     return s3
 
 
+@pytest.fixture()
+def live_reread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The live re-read, off in production until OCR streams pages in
+    bounded memory (the 512 MB live worker OOM'd on a 25-page scan)."""
+    from ingestion import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "LIVE_SCANNED_PAGE_REREAD", True)
+
+
+def test_live_capture_scanned_pages_deferred_without_reading_the_archive(
+    mixed: bytes,
+) -> None:
+    """Off (the default): no S3 read, no OCR in the live worker; the event
+    is marked incomplete so no split is built on its partial text."""
+    worker, _ = _sc_worker()
+    worker._s3_client = _s3_returning(mixed)
+    extra: dict[str, Any] = {}
+    layer = scraper_pdf_text(mixed, extra=extra)
+    with patch("ingestion.llm_extract.call_llm_with_images", _ocr()) as ocr:
+        event, text = worker._with_scanned_pages_reread(
+            _sc_event(layer, live=True, extra=extra), layer
+        )
+    assert text == layer
+    assert "page(s) [4] are scanned" in event[OCR_INCOMPLETE_KEY]
+    worker._s3_client.get_object.assert_not_called()
+    ocr.assert_not_called()
+
+
+@pytest.mark.usefixtures("live_reread")
 @patch("ingestion.worker.insert_validation_result")
 def test_live_capture_with_scanned_pages_reads_the_archived_pdf(
     mock_validation: MagicMock, mixed: bytes
@@ -471,6 +500,7 @@ def test_live_capture_with_scanned_pages_reads_the_archived_pdf(
     assert SCANNED_RULING in text_extractor.extract.call_args.args[0]
 
 
+@pytest.mark.usefixtures("live_reread")
 @patch("ingestion.worker.insert_validation_result")
 def test_live_capture_read_again_once_for_a_whole_document(
     mock_validation: MagicMock, mixed: bytes
@@ -494,6 +524,7 @@ def test_live_capture_read_again_once_for_a_whole_document(
     assert SCANNED_PAGES_KEY not in event["extra"]
 
 
+@pytest.mark.usefixtures("live_reread")
 def test_live_capture_with_unreadable_archive_refuses_the_split(mixed: bytes) -> None:
     worker, text_extractor = _sc_worker()
     worker._s3_client = _s3_returning(None)
@@ -504,6 +535,7 @@ def test_live_capture_with_unreadable_archive_refuses_the_split(mixed: bytes) ->
     assert "page(s) [4] have no text layer" in event[OCR_INCOMPLETE_KEY]
 
 
+@pytest.mark.usefixtures("live_reread")
 def test_reread_leaves_other_events_alone(mixed: bytes) -> None:
     worker, _ = _sc_worker()
     worker._s3_client = _s3_returning(mixed)
