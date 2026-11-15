@@ -166,7 +166,8 @@ class TestProviderParameter:
             mock_cls.return_value = MagicMock()
             ext = LlmExtractor(provider="anthropic", api_key="test-key")
         assert ext._provider == "anthropic"
-        mock_cls.assert_called_once_with(api_key="test-key")
+        # The SDK's own retry is off: ingestion.llm_retry retries (#5066).
+        mock_cls.assert_called_once_with(max_retries=0, api_key="test-key")
 
     def test_google_provider_creates_google_client(self) -> None:
         """provider='google' creates a Google GenAI client."""
@@ -2873,7 +2874,6 @@ class TestExtractFromPdf:
         """If the LLM API call fails on all pages, returns empty list."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 1
 
         with (
@@ -3225,7 +3225,6 @@ class TestExtractSinglePageRetry:
         """When all retries return None, returns empty list."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 2
 
         with (
@@ -3266,7 +3265,6 @@ class TestExtractSinglePageRetry:
         """If one page fails, other pages' results are still used."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 1
 
         page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
@@ -3302,7 +3300,6 @@ class TestExtractSinglePageRetry:
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 1
 
         # Wire up a cache mock.
@@ -3343,7 +3340,6 @@ class TestExtractSinglePageRetry:
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._base_delay = 0.01
         ext._max_retries = 1
 
         mock_cache = MagicMock()

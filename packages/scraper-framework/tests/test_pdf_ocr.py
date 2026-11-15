@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from helpers.anthropic_errors import status_error
 
 from framework.pdf_render import PdfPageImages
 from ingestion.llm_extract import (
@@ -554,16 +555,13 @@ class TestCallAnthropicWithImagesErrors:
         mock_response.usage.input_tokens = 10
         mock_response.usage.output_tokens = 5
 
-        rate_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
+        rate_error = status_error(429)
+        assert type(rate_error) is anthropic.RateLimitError
 
         client = MagicMock()
         client.messages.create.side_effect = [rate_error, mock_response]
 
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+        with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
             result = _call_anthropic_with_images(
                 system_prompt="sys",
                 text_message="user",
@@ -575,7 +573,8 @@ class TestCallAnthropicWithImagesErrors:
 
         assert result is not None
         assert result.text == "ok"
-        mock_sleep.assert_called_once_with(1)
+        mock_sleep.assert_called_once()
+        assert client.messages.create.call_count == 2
 
     def test_rate_limit_exhausted_returns_none(self) -> None:
         """Double rate limit returns None."""
@@ -583,16 +582,13 @@ class TestCallAnthropicWithImagesErrors:
 
         from ingestion.llm_providers import _call_anthropic_with_images
 
-        rate_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
+        rate_error = status_error(429)
+        assert type(rate_error) is anthropic.RateLimitError
 
         client = MagicMock()
         client.messages.create.side_effect = rate_error
 
-        with patch("ingestion.llm_providers.time.sleep"):
+        with patch("ingestion.llm_retry.time.sleep"):
             result = _call_anthropic_with_images(
                 system_prompt="sys",
                 text_message="user",

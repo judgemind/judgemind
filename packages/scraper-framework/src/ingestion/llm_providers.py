@@ -14,11 +14,11 @@ Configuration is via environment variables:
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 
 import anthropic
 import structlog
+from anthropic import Anthropic as _AnthropicClient
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from .llm_retry import KIND_TIMEOUT, call_with_retries, classify_error
@@ -249,15 +249,92 @@ def _anthropic_finish_reason(response: object) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def new_anthropic_client(**kwargs: object) -> anthropic.Anthropic:
+    """An ``anthropic.Anthropic`` client with the SDK's own retry off.
+
+    The SDK retries 408/409/429/5xx and dropped connections twice by
+    default.  ``llm_retry.call_with_retries`` is our one retry layer
+    (deadline-aware, honours ``Retry-After``), so every client we build
+    passes ``max_retries=0`` and nothing retries twice (#5066).
+    """
+    return anthropic.Anthropic(max_retries=0, **kwargs)  # type: ignore[arg-type]
+
+
+def without_sdk_retries(client: object) -> object:
+    """*client* with the Anthropic SDK's own retry turned off.
+
+    A caller may hand in a client it built itself with the SDK default
+    ``max_retries=2``; ``with_options`` returns a copy sharing the same
+    connection pool, with ``max_retries=0``.  Anything that is not a real
+    ``anthropic.Anthropic`` (a test double) is returned unchanged.
+    """
+    if not isinstance(client, _AnthropicClient):
+        return client
+    retries = getattr(client, "max_retries", None)  # absent on a spec'd mock
+    if isinstance(retries, int) and retries > 0:
+        return client.with_options(max_retries=0)
+    return client
+
+
+def anthropic_messages_create(
+    client: object,
+    request: dict,
+    *,
+    max_retries: int,
+    timeout: float | None,
+    deadline: float | None,
+    event_prefix: str,
+) -> object:
+    """``client.messages.create(**request)`` under the shared retry policy.
+
+    Transient errors (429 / 5xx / 529 / timeouts / dropped connections)
+    are retried by ``llm_retry.call_with_retries``, within *deadline*;
+    each attempt's HTTP timeout is *timeout* shortened to the time left
+    (no ``timeout`` keyword is sent when neither is set).  The SDK's own
+    retry is off (:func:`without_sdk_retries`).  Returns the SDK
+    ``Message``; the last exception propagates when every attempt failed.
+    """
+    sdk_client = without_sdk_retries(client)
+
+    def attempt(attempt_timeout: float | None) -> object:
+        kwargs = dict(request)
+        if attempt_timeout is not None:
+            kwargs["timeout"] = attempt_timeout
+        return sdk_client.messages.create(**kwargs)  # type: ignore[attr-defined]
+
+    return call_with_retries(
+        attempt,
+        max_retries=max_retries,
+        timeout=timeout,
+        deadline=deadline,
+        event_prefix=event_prefix,
+    )
+
+
+def _log_final_failure(event_prefix: str, exc: Exception, timeout: float | None) -> None:
+    """Log ``<event_prefix>timeout`` or ``<event_prefix>api_error``."""
+    decision = classify_error(exc)
+    event = "timeout" if decision.kind == KIND_TIMEOUT else "api_error"
+    logger.warning(
+        f"{event_prefix}{event}",
+        timeout=timeout,
+        status=decision.status,
+        kind=decision.kind,
+        retryable=decision.retryable,
+        error=str(exc),
+    )
+
+
 def _call_anthropic(
     system_prompt: str,
     user_message: str,
     model: str,
     *,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
     """Call the Anthropic Messages API.
 
@@ -268,60 +345,44 @@ def _call_anthropic(
         client: Optional pre-created ``anthropic.Anthropic`` client for
             connection reuse.  If ``None``, creates one from the
             ``ANTHROPIC_API_KEY`` env var.
-        max_retries: Number of retries on rate-limit errors.
-        timeout: Per-call timeout in seconds.  If ``None``, no timeout
-            is applied.  On timeout, returns ``None``.
+        max_retries: Number of retries on transient errors (429, 5xx, 529,
+            timeouts, dropped connections; see ``ingestion.llm_retry``),
+            with exponential backoff and jitter.
+        timeout: Per-attempt timeout in seconds.  If ``None``, the SDK
+            default applies.
+        deadline: ``time.monotonic()`` value no attempt or retry may run
+            past.  If ``None``, only *max_retries* bounds the retries.
 
     Returns:
         An ``LLMResponse`` or ``None`` on unrecoverable failure.
     """
-
-    if client is None:
-        try:
-            client = anthropic.Anthropic()
-        except anthropic.AuthenticationError:
-            logger.warning("llm_providers.anthropic_auth_error")
-            return None
-
-    # Build optional timeout kwarg for the Anthropic SDK.
-    timeout_kwargs: dict = {}
-    if timeout is not None:
-        timeout_kwargs["timeout"] = timeout
-
-    for attempt in range(1 + max_retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-                **timeout_kwargs,
-            )
-            return LLMResponse(
-                text=response.content[0].text.strip(),
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                finish_reason=_anthropic_finish_reason(response),
-            )
-        except anthropic.APITimeoutError:
-            logger.warning(
-                "llm_providers.anthropic_timeout",
-                timeout=timeout,
-                attempt=attempt + 1,
-            )
-            return None
-        except anthropic.RateLimitError:
-            if attempt < max_retries:
-                logger.warning("llm_providers.anthropic_rate_limit", attempt=attempt + 1)
-                time.sleep(1)
-                continue
-            logger.warning("llm_providers.anthropic_rate_limit_exhausted")
-            return None
-        except anthropic.APIError as exc:
-            logger.warning("llm_providers.anthropic_api_error", error=str(exc))
-            return None
-    return None  # pragma: no cover — defensive unreachable
+    event_prefix = "llm_providers.anthropic_"
+    try:
+        if client is None:
+            client = new_anthropic_client()
+        response = anthropic_messages_create(
+            client,
+            {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            },
+            max_retries=max_retries,
+            timeout=timeout,
+            deadline=deadline,
+            event_prefix=event_prefix,
+        )
+        return LLMResponse(
+            text=response.content[0].text.strip(),  # type: ignore[attr-defined]
+            input_tokens=response.usage.input_tokens,  # type: ignore[attr-defined]
+            output_tokens=response.usage.output_tokens,  # type: ignore[attr-defined]
+            finish_reason=_anthropic_finish_reason(response),
+        )
+    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+        _log_final_failure(event_prefix, exc, timeout)
+        return None
 
 
 def _call_google(
@@ -436,16 +497,7 @@ def _google_generate(
             event_prefix=event_prefix,
         )
     except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
-        decision = classify_error(exc)
-        event = "timeout" if decision.kind == KIND_TIMEOUT else "api_error"
-        logger.warning(
-            f"{event_prefix}{event}",
-            timeout=timeout,
-            status=decision.status,
-            kind=decision.kind,
-            retryable=decision.retryable,
-            error=str(exc),
-        )
+        _log_final_failure(event_prefix, exc, timeout)
         return None
 
 
@@ -480,15 +532,14 @@ def call_llm(
         model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
-        max_retries: Number of retries on transient errors.  For Google,
-            ``ingestion.llm_retry`` decides: 429, 500, 502, 503, 504,
-            timeouts and dropped connections.  For Anthropic, retries are
-            limited to rate-limit errors.
+        max_retries: Number of retries on transient errors, for every
+            provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
+            504, 529, timeouts and dropped connections).
         timeout: Per-attempt timeout in seconds.  If ``None``, no timeout
             is applied.  When every attempt fails, returns ``None`` so the
             caller can fall back to the next extraction tier (e.g. regex).
-        deadline: Google only: ``time.monotonic()`` value no attempt or
-            retry may run past.
+        deadline: ``time.monotonic()`` value no attempt or retry may run
+            past.
 
     Returns:
         An ``LLMResponse`` with the text and token counts, or ``None``
@@ -506,6 +557,7 @@ def call_llm(
             max_retries=max_retries,
             timeout=timeout,
             max_tokens=max_tokens,
+            deadline=deadline,
         )
     elif resolved_provider == "google":
         return _call_google(
@@ -552,13 +604,12 @@ def call_llm_with_images(
         provider: Provider name — ``"google"`` or ``"anthropic"``.
         model: Model ID.
         client: Optional pre-created provider client.
-        max_retries: Number of retries on transient errors.  For Google,
-            ``ingestion.llm_retry`` decides: 429, 500, 502, 503, 504,
-            timeouts and dropped connections.  For Anthropic, retries are
-            limited to rate-limit errors.
+        max_retries: Number of retries on transient errors, for every
+            provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
+            504, 529, timeouts and dropped connections).
         timeout: Per-attempt timeout in seconds.
-        deadline: Google only: ``time.monotonic()`` value no attempt or
-            retry may run past (the OCR run budget, #4986).
+        deadline: ``time.monotonic()`` value no attempt or retry may run
+            past (the OCR run budget, #4986), for every provider.
         max_tokens: Maximum output tokens.
         json_mode: Ask Google for a JSON response
             (``response_mime_type="application/json"``), which constrains
@@ -584,6 +635,7 @@ def call_llm_with_images(
             max_retries=max_retries,
             timeout=timeout,
             max_tokens=max_tokens,
+            deadline=deadline,
         )
     elif resolved_provider == "google":
         return _call_google_with_images(
@@ -611,19 +663,16 @@ def _call_anthropic_with_images(
     model: str,
     *,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
-    """Call the Anthropic Messages API with image content blocks."""
-    import base64
+    """Call the Anthropic Messages API with image content blocks.
 
-    if client is None:
-        try:
-            client = anthropic.Anthropic()
-        except anthropic.AuthenticationError:
-            logger.warning("llm_providers.anthropic_auth_error")
-            return None
+    Retries and *deadline* work as in :func:`_call_anthropic`.
+    """
+    import base64
 
     # Build content blocks: images first, then text
     content: list[dict] = []
@@ -640,54 +689,40 @@ def _call_anthropic_with_images(
         )
     content.append({"type": "text", "text": text_message})
 
-    timeout_kwargs: dict = {}
-    if timeout is not None:
-        timeout_kwargs["timeout"] = timeout
-
-    for attempt in range(1 + max_retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": content}],
-                **timeout_kwargs,
-            )
-            # Vision responses may contain non-text blocks; find the first
-            # text block rather than assuming content[0] is text.
-            text_content = ""
-            for block in response.content:
-                if hasattr(block, "type") and block.type == "text":
-                    text_content = block.text
-                    break
-            return LLMResponse(
-                text=text_content.strip(),
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                finish_reason=_anthropic_finish_reason(response),
-            )
-        except anthropic.APITimeoutError:
-            logger.warning(
-                "llm_providers.anthropic_vision_timeout",
-                timeout=timeout,
-                attempt=attempt + 1,
-            )
-            return None
-        except anthropic.RateLimitError:
-            if attempt < max_retries:
-                logger.warning(
-                    "llm_providers.anthropic_vision_rate_limit",
-                    attempt=attempt + 1,
-                )
-                time.sleep(1)
-                continue
-            logger.warning("llm_providers.anthropic_vision_rate_limit_exhausted")
-            return None
-        except anthropic.APIError as exc:
-            logger.warning("llm_providers.anthropic_vision_api_error", error=str(exc))
-            return None
-    return None  # pragma: no cover — defensive unreachable
+    event_prefix = "llm_providers.anthropic_vision_"
+    try:
+        if client is None:
+            client = new_anthropic_client()
+        response = anthropic_messages_create(
+            client,
+            {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": content}],
+            },
+            max_retries=max_retries,
+            timeout=timeout,
+            deadline=deadline,
+            event_prefix=event_prefix,
+        )
+    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+        _log_final_failure(event_prefix, exc, timeout)
+        return None
+    # Vision responses may contain non-text blocks; find the first
+    # text block rather than assuming content[0] is text.
+    text_content = ""
+    for block in response.content:  # type: ignore[attr-defined]
+        if hasattr(block, "type") and block.type == "text":
+            text_content = block.text
+            break
+    return LLMResponse(
+        text=text_content.strip(),
+        input_tokens=response.usage.input_tokens,  # type: ignore[attr-defined]
+        output_tokens=response.usage.output_tokens,  # type: ignore[attr-defined]
+        finish_reason=_anthropic_finish_reason(response),
+    )
 
 
 def _call_google_with_images(
@@ -767,7 +802,7 @@ def _try_create(provider: str) -> object | None:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None
-        return anthropic.Anthropic()
+        return new_anthropic_client()
     elif provider == "google":
         from google import genai
 
