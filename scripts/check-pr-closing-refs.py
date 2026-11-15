@@ -208,6 +208,15 @@ def format_failure(verdict: Verdict, label: str) -> str:
     ]
     if any(h.source == "PR body" for h in bad):
         lines.append("  PR body: gh pr edit <PR> --body-file <reworded-body-file>")
+        lines.append(
+            "    The edit starts a fresh closing-refs run, but this failed run stays on"
+        )
+        lines.append(
+            "    the head commit (wait-for-ci.sh still sees it): re-run it once the body"
+        )
+        lines.append(
+            "    is fixed with: gh run rerun <this-run-id> --failed --repo <owner/repo>"
+        )
     if any(h.source.startswith("commit message") for h in bad):
         lines.append(
             "  Commit message (the squash merge copies it to main): "

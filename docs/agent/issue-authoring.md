@@ -437,6 +437,8 @@ Rules for PR bodies and commit messages:
 scripts/check-pr-closing-refs.py --title "<title>" --body-file tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
+If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh, passing run, but the failed run stays on the same head commit and `scripts/wait-for-ci.sh` keeps reporting it. Re-run it once: `gh run rerun <failed-run-id> --failed --repo judgemind/judgemind` (the check reads the live PR, so the re-run passes).
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:

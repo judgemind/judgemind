@@ -787,7 +787,7 @@ The PR body must include `Closes #N` so the unblock workflow fires on merge.
 {worktree}/scripts/check-pr-closing-refs.py --title "<title>" --body-file {worktree}/tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
-Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
+Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. If it fails on the open PR and you fix the body with `gh pr edit`, also re-run the failed run (`gh run rerun <run-id> --failed --repo judgemind/judgemind`): the stale failure stays on the head commit and keeps `wait-for-ci.sh` red. See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
 
 **PR body template — use this structure for all PRs:**
 
