@@ -101,13 +101,149 @@ def resolve_model(provider: str | None = None, model: str | None = None) -> str:
     )
 
 
+# Finish reasons, normalized across providers to Gemini's names (#5007).
+FINISH_STOP = "STOP"
+FINISH_MAX_TOKENS = "MAX_TOKENS"
+FINISH_RECITATION = "RECITATION"
+
+# Anthropic ``stop_reason`` values mapped onto the Gemini names.
+_ANTHROPIC_FINISH_REASONS: dict[str, str] = {
+    "end_turn": FINISH_STOP,
+    "stop_sequence": FINISH_STOP,
+    "max_tokens": FINISH_MAX_TOKENS,
+    "refusal": "SAFETY",
+}
+
+
 @dataclass
 class LLMResponse:
-    """Unified response from any LLM provider."""
+    """Unified response from any LLM provider.
+
+    ``finish_reason`` says why the model stopped, normalized to Gemini's
+    names: ``"STOP"`` (a complete answer), ``"MAX_TOKENS"`` (cut off at the
+    output budget), ``"RECITATION"`` / ``"SAFETY"`` / ``"OTHER"`` (the
+    provider withheld the text), or ``None`` when the provider did not say.
+    ``block_reason`` is set when the prompt itself was blocked, and
+    ``safety_ratings`` lists each rating above ``NEGLIGIBLE`` or that
+    blocked the answer.  Callers log :meth:`diagnostics` when a response
+    is empty or does not parse, so a deterministic failure names its
+    cause (#5007).
+    """
 
     text: str
     input_tokens: int
     output_tokens: int
+    finish_reason: str | None = None
+    block_reason: str | None = None
+    safety_ratings: list[str] | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """True when the answer was cut off at the output-token budget."""
+        return self.finish_reason == FINISH_MAX_TOKENS
+
+    @property
+    def incomplete(self) -> bool:
+        """True when the provider did not finish the answer normally.
+
+        A truncated or withheld answer is never a complete result, even
+        when its text happens to parse: it must not be cached or written.
+        """
+        if self.block_reason:
+            return True
+        return self.finish_reason is not None and self.finish_reason != FINISH_STOP
+
+    def diagnostics(self) -> dict[str, object]:
+        """Fields to log with an empty, truncated, or unparseable response."""
+        return {
+            "finish_reason": self.finish_reason,
+            "block_reason": self.block_reason,
+            "safety_ratings": self.safety_ratings or [],
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "response_chars": len(self.text),
+        }
+
+
+def response_diagnostics(response: object) -> dict[str, object]:
+    """``response.diagnostics()``, or ``{}`` for an object without it.
+
+    Safe to splat into a log call for any response-like object, including
+    test doubles that are not an ``LLMResponse``.
+    """
+    if not isinstance(response, LLMResponse):
+        return {}
+    return response.diagnostics()
+
+
+def _enum_name(value: object) -> str | None:
+    """Return an SDK enum's name (``FinishReason.STOP`` -> ``"STOP"``)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.rsplit(".", 1)[-1] or None
+    name = getattr(value, "name", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _google_response(response: object) -> LLMResponse:
+    """Build an ``LLMResponse`` from a google-genai ``GenerateContentResponse``.
+
+    Reads the first candidate's ``finish_reason`` and ``safety_ratings`` and
+    the prompt's ``block_reason``.  Every attribute is read defensively: a
+    missing or malformed field leaves its value ``None`` instead of raising.
+    """
+    input_tokens = 0
+    output_tokens = 0
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+
+    finish_reason: str | None = None
+    safety: list[str] = []
+    candidates = getattr(response, "candidates", None)
+    if isinstance(candidates, (list, tuple)) and candidates:
+        candidate = candidates[0]
+        finish_reason = _enum_name(getattr(candidate, "finish_reason", None))
+        ratings = getattr(candidate, "safety_ratings", None)
+        if isinstance(ratings, (list, tuple)):
+            for rating in ratings:
+                probability = _enum_name(getattr(rating, "probability", None))
+                blocked = getattr(rating, "blocked", None) is True
+                if blocked or probability not in (None, "NEGLIGIBLE"):
+                    category = _enum_name(getattr(rating, "category", None))
+                    safety.append(f"{category}:{probability}{':blocked' if blocked else ''}")
+
+    block_reason: str | None = None
+    feedback = getattr(response, "prompt_feedback", None)
+    if feedback is not None:
+        block_reason = _enum_name(getattr(feedback, "block_reason", None))
+        if block_reason == "BLOCKED_REASON_UNSPECIFIED":
+            block_reason = None
+
+    try:
+        raw_text = response.text  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — the SDK raises on some blocked responses
+        raw_text = None
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+
+    return LLMResponse(
+        text=text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        finish_reason=finish_reason,
+        block_reason=block_reason,
+        safety_ratings=safety or None,
+    )
+
+
+def _anthropic_finish_reason(response: object) -> str | None:
+    """Normalize an Anthropic ``stop_reason`` to the Gemini finish names."""
+    stop_reason = getattr(response, "stop_reason", None)
+    if not isinstance(stop_reason, str):
+        return None
+    return _ANTHROPIC_FINISH_REASONS.get(stop_reason, stop_reason.upper())
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +304,7 @@ def _call_anthropic(
                 text=response.content[0].text.strip(),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
+                finish_reason=_anthropic_finish_reason(response),
             )
         except anthropic.APITimeoutError:
             logger.warning(
@@ -255,17 +392,7 @@ def _call_google(
                 contents=user_message,
                 config=config,
             )
-            input_tokens = 0
-            output_tokens = 0
-            if response.usage_metadata:
-                input_tokens = response.usage_metadata.prompt_token_count or 0
-                output_tokens = response.usage_metadata.candidates_token_count or 0
-
-            return LLMResponse(
-                text=response.text.strip() if response.text else "",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
+            return _google_response(response)
         except Exception as exc:  # noqa: BLE001
             # google-genai raises google.api_core.exceptions for rate limits
             # and other API errors.  Catch broadly and check for retryable.
@@ -368,6 +495,7 @@ def call_llm_with_images(
     max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    json_mode: bool = False,
 ) -> LLMResponse | None:
     """Call an LLM provider with text and image content (vision API).
 
@@ -388,6 +516,9 @@ def call_llm_with_images(
             For Anthropic, retries are limited to rate-limit errors.
         timeout: Per-call timeout in seconds.
         max_tokens: Maximum output tokens.
+        json_mode: Ask Google for a JSON response
+            (``response_mime_type="application/json"``), which constrains
+            the output to valid JSON.  Ignored for Anthropic.
 
     Returns:
         An ``LLMResponse`` or ``None`` on failure.
@@ -416,6 +547,7 @@ def call_llm_with_images(
             max_retries=max_retries,
             timeout=timeout,
             max_tokens=max_tokens,
+            json_mode=json_mode,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)
@@ -483,6 +615,7 @@ def _call_anthropic_with_images(
                 text=text_content.strip(),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
+                finish_reason=_anthropic_finish_reason(response),
             )
         except anthropic.APITimeoutError:
             logger.warning(
@@ -517,6 +650,7 @@ def _call_google_with_images(
     max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    json_mode: bool = False,
 ) -> LLMResponse | None:
     """Call the Google GenAI API with image content (multimodal)."""
     from google import genai
@@ -547,6 +681,8 @@ def _call_google_with_images(
         "temperature": 0,
         "max_output_tokens": max_tokens,
     }
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
     if timeout is not None:
         config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
     config = types.GenerateContentConfig(**config_kwargs)
@@ -558,17 +694,7 @@ def _call_google_with_images(
                 contents=parts,
                 config=config,
             )
-            input_tokens = 0
-            output_tokens = 0
-            if response.usage_metadata:
-                input_tokens = response.usage_metadata.prompt_token_count or 0
-                output_tokens = response.usage_metadata.candidates_token_count or 0
-
-            return LLMResponse(
-                text=response.text.strip() if response.text else "",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
+            return _google_response(response)
         except Exception as exc:  # noqa: BLE001
             exc_name = type(exc).__name__
             if "DeadlineExceeded" in exc_name or "Timeout" in exc_name:

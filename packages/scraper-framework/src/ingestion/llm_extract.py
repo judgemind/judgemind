@@ -34,7 +34,7 @@ from framework.llm_schema import (
 )
 from framework.llm_utils import parse_llm_json
 
-from .llm_providers import call_llm, call_llm_with_images
+from .llm_providers import call_llm, call_llm_with_images, response_diagnostics
 
 logger = structlog.get_logger(__name__)
 
@@ -643,6 +643,17 @@ def _ocr_single_page(
             )
             return None
 
+        if getattr(response, "incomplete", False) is True:
+            # A withheld (RECITATION / SAFETY) answer comes back empty and a
+            # cut-off one is partial: neither is the page's text, and an
+            # empty one would pass for a blank page (#5007).
+            logger.warning(
+                "ocr_pdf_text.page_incomplete",
+                page_index=page_index,
+                **response_diagnostics(response),
+            )
+            return None
+
         text = response.text.strip()
         if text:
             logger.debug(
@@ -1147,7 +1158,20 @@ def extract_fields_llm(
             return None
         if token_tracker is not None:
             token_tracker.add(llm_response.input_tokens, llm_response.output_tokens)
-        return _parse_response(llm_response.text, metadata)
+        # A cut-off or withheld answer is a failed chunk even when its text
+        # happens to parse, so it is never cached (#5007).
+        parsed = None
+        if getattr(llm_response, "incomplete", False) is not True:
+            parsed = _parse_response(llm_response.text, metadata)
+        if parsed is None:
+            logger.warning(
+                "llm_extract.chunk_response_failed",
+                chunk_index=i,
+                document_id=document_id,
+                chunk_len=len(chunk),
+                **response_diagnostics(llm_response),
+            )
+        return parsed
 
     if len(chunks) == 1:
         # Single chunk — no thread overhead needed.
