@@ -449,8 +449,9 @@ class NoTextReport:
             "no_text_zero_rulings": sum(1 for *_, n in self.no_text if n == 0),
             "no_text_rulings": sum(n for *_, n in self.no_text),
             "no_text_over_10_pages": sum(
-                # page-cap: report count of scans past the old OCR cap.
-                1 for _, _, p, _ in self.no_text if p > OLD_OCR_PAGE_CAP
+                1
+                for _, _, p, _ in self.no_text
+                if p > OLD_OCR_PAGE_CAP  # page-cap: a report count, not a cap.
             ),
             "timeout": len(self.timeout_keys),
             "error": len(self.error_keys),
@@ -658,11 +659,21 @@ def long_pdf_key_list(reports: Iterable[LongPdfReport]) -> str:
     return "".join(f"{key}\n" for r in reports for key, *_ in r.long)
 
 
-def multimodal_counties(s3: Any, bucket: str, state: str = "ca") -> list[str]:
-    """Every county under ``<state>/`` whose split reads page images (#4995):
-    Orange and every county with no extraction config."""
+def reads_page_images(state: str, county: str) -> bool:
+    """The worker's own strategy: does this county's split read page images?"""
     from framework.extraction_config import decide_extraction_strategy
 
+    return decide_extraction_strategy(state, county).use_multimodal
+
+
+def multimodal_counties(
+    s3: Any,
+    bucket: str,
+    state: str = "ca",
+    use_multimodal: Callable[[str, str], bool] = reads_page_images,
+) -> list[str]:
+    """Every county under ``<state>/`` whose split reads page images (#4995):
+    Orange and every county with no extraction config."""
     paginator = s3.get_paginator("list_objects_v2")
     names = [
         p["Prefix"].split("/")[1]
@@ -670,7 +681,7 @@ def multimodal_counties(s3: Any, bucket: str, state: str = "ca") -> list[str]:
         for p in page.get("CommonPrefixes", [])
     ]
     counties = [n.replace("_", " ").title() for n in names if n]
-    return [c for c in counties if decide_extraction_strategy(state, c).use_multimodal]
+    return [c for c in counties if use_multimodal(state, c)]
 
 
 def list_county_pdf_keys(

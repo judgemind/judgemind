@@ -663,9 +663,32 @@ def test_multimodal_counties_lists_counties_that_read_page_images() -> None:
             assert name == "list_objects_v2"
             return Paginator()
 
+    asked: list[tuple[str, str]] = []
+
+    def use_multimodal(state: str, county: str) -> bool:
+        asked.append((state, county))
+        return county in ("Orange", "Los Angeles")
+
+    assert audit.multimodal_counties(S3(), "bkt", use_multimodal=use_multimodal) == [
+        "Orange",
+        "Los Angeles",
+    ]
+    assert asked == [
+        ("ca", "Orange"),
+        ("ca", "Riverside"),
+        ("ca", "Los Angeles"),
+        ("ca", "Santa Clara"),
+    ]
+
+
+def test_reads_page_images_is_the_worker_strategy() -> None:
+    pytest.importorskip("framework.extraction_config")
     # Orange is configured multimodal; Los Angeles has no config (multimodal
     # by default); Riverside and Santa Clara are text-first.
-    assert audit.multimodal_counties(S3(), "bkt") == ["Orange", "Los Angeles"]
+    assert audit.reads_page_images("ca", "Orange")
+    assert audit.reads_page_images("ca", "Los Angeles")
+    assert not audit.reads_page_images("ca", "Riverside")
+    assert not audit.reads_page_images("ca", "Santa Clara")
 
 
 def test_main_long_pdfs_writes_key_list(monkeypatch) -> None:
