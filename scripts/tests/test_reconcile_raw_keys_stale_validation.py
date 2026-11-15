@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sys
 import types
 from datetime import UTC, datetime, timedelta
@@ -22,7 +23,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import reconcile_raw_keys as rec
-from ingestion.ingest_incomplete import INCOMPLETE_STALE_VALIDATION
 from validation.rule_versions import RULE_VERSIONS, stale_rules
 
 from tests.test_reconcile_raw_keys import (  # noqa: F401 — fixtures
@@ -63,7 +63,14 @@ def _stale(ex: rec.Explained, key: str = SD_KEY) -> rec.Explained:
 
 
 def test_stale_validation_reason_matches_the_worker_constant() -> None:
-    assert rec.STALE_VALIDATION == INCOMPLETE_STALE_VALIDATION
+    # ``ingestion.ingest_incomplete`` imports the worker (psycopg), which the
+    # scripts test environment lacks: read the constant from the source.
+    source = pathlib.Path(rec.__file__).resolve().parent.parent / (
+        "packages/scraper-framework/src/ingestion/ingest_incomplete.py"
+    )
+    assert (
+        f'INCOMPLETE_STALE_VALIDATION = "{rec.STALE_VALIDATION}"' in source.read_text()
+    )
 
 
 def test_failure_under_a_relaxed_rule_is_pending_revalidation(
