@@ -80,6 +80,7 @@ from validation.issue_filer import file_validation_issue
 from .case_evidence import (
     CASE_NUMBER_EVIDENCE_KEY,
     INHERITED_CASE_NUMBER_KEY,
+    TEXT_FROM_OCR_KEY,
     CaseNumberCandidate,
     case_number_refuted,
     document_evidence,
@@ -131,7 +132,7 @@ from .llm_extract import (
     LLMExtractionResult,
     LLMRulingResult,
     extract_fields_llm,
-    extract_text_from_pdf,
+    extract_pdf_text,
     is_pdf_binary,
 )
 from .llm_providers import create_client as create_llm_client
@@ -245,6 +246,23 @@ SPLIT_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 #: as they are and reports it (``NoExtractableTextError``), apart from the
 #: retryable failures in ``--write-failed-manifest`` (#4983).
 NO_EXTRACTABLE_TEXT = "no extractable text: no text layer and no page images to extract from"
+
+#: Event key naming why OCR of a scanned PDF did not read every page (the
+#: page cap, the time budget, failed page calls; ``PdfText.incomplete``,
+#: #4986), or ``None`` when it read them all.  A text split built on such
+#: text would silently miss the unread pages' rulings, so it is a failed
+#: extraction instead (``OCR_INCOMPLETE``): the key's rows are left alone
+#: and a reingest reports the key for a retry.
+OCR_INCOMPLETE_KEY = "_ocr_incomplete"
+
+#: Prefix of the failure reason of a text split refused over incomplete OCR.
+OCR_INCOMPLETE = "incomplete OCR of a PDF with no text layer"
+
+#: Pages OCR'd for a multimodal county's scanned PDF (#4986).  Its split
+#: reads the page images itself (every page); the OCR text is only the
+#: fallback when that fails, and a fallback built on a capped OCR is
+#: refused as incomplete like any other (``OCR_INCOMPLETE_KEY``).
+_MULTIMODAL_OCR_FALLBACK_PAGES = 10
 
 
 class SplitExtractionFailedError(RuntimeError):
@@ -438,6 +456,13 @@ def _split_child_case_fields(
     return child_case_number, child_case_title
 
 
+def _ocr_incomplete_reason(event_data: dict[str, Any]) -> str | None:
+    """The failure reason of a split built on the event's OCR text, when
+    that OCR did not read every page (``OCR_INCOMPLETE_KEY``, #4986)."""
+    detail = event_data.get(OCR_INCOMPLETE_KEY)
+    return f"{OCR_INCOMPLETE}: {detail}" if detail else None
+
+
 def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -> tuple[str, ...]:
     """Return the source evidence the event's case number is checked
     against (``case_evidence``, #4927).
@@ -454,24 +479,29 @@ def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -
       pre-split child) is checked against its own text, at any length.
     - A whole document is checked against its extracted text and link text,
       when the text is long enough to settle it.
+    - Text OCR transcribed from a scanned PDF (``TEXT_FROM_OCR_KEY``), and
+      any child cut from it, is no evidence (#4986).
     """
     if CASE_NUMBER_EVIDENCE_KEY in event_data:
         return tuple(t for t in event_data[CASE_NUMBER_EVIDENCE_KEY] or () if t)
     extra = event_data.get("extra")
     extra = extra if isinstance(extra, dict) else {}
+    from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
     if event_data.get("_split_processed"):
         if extra.get("_llm_extracted"):
             return ()
-        return own_text_evidence(ruling_text)
-    return document_evidence(ruling_text, extra.get("link_text"))
+        return own_text_evidence(ruling_text, from_ocr=from_ocr)
+    return document_evidence(ruling_text, extra.get("link_text"), from_ocr=from_ocr)
 
 
 def _read_text_evidence(event_data: dict[str, Any], ruling_text: str | None) -> tuple[str, ...]:
     """Evidence for a number an extractor read from a whole document's own
     text (the per-field LLM, the regex fallback): that text and the link
     text, at any length, since the extractor saw nothing else (#4907).
-    ``()`` for a split child, whose write evidence already covers it."""
-    if event_data.get("_split_processed") or not own_text_evidence(ruling_text):
+    ``()`` for a split child, whose write evidence already covers it, and
+    for OCR text (``TEXT_FROM_OCR_KEY``, #4986)."""
+    from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
+    if event_data.get("_split_processed") or not own_text_evidence(ruling_text, from_ocr=from_ocr):
         return ()
     extra = event_data.get("extra")
     link_text = extra.get("link_text") if isinstance(extra, dict) else None
@@ -672,7 +702,7 @@ def _canonical_split_text(text: str) -> str:
 
     A live capture joins pdfplumber pages with ``"\\n"``
     (``pdf_link_scraper._extract_pdf_text``); the worker's raw-PDF path
-    joins them with ``"\\n\\f\\n"`` (``llm_extract.extract_text_from_pdf``).
+    joins them with ``"\\n\\f\\n"`` (``llm_extract.extract_pdf_text``).
     The split must not depend on which one produced the text (#4796).
     """
     return text.replace("\n\f\n", "\n")
@@ -2328,10 +2358,11 @@ class IngestionWorker:
     def _archived_page_text(self, event_data: dict[str, Any]) -> str | None:
         """The text of the event's archived raw object, as a reingest of the
         key gives the worker: an HTML / text page decoded as UTF-8
-        (``reingest_from_s3._build_prefix_event``), a PDF's extracted text
-        (``extract_text_from_pdf``, as ``_process_event_timed`` extracts
-        the reingest event's bytes).  ``None`` when there is no key, the
-        read fails or the format has no text.  Cached per key."""
+        (``reingest_from_s3._build_prefix_event``), a PDF's text layer
+        (``extract_pdf_text``, as ``_process_event_timed`` extracts the
+        reingest event's bytes; ``""`` for a scanned PDF, whose OCR text is
+        no evidence, #4986).  ``None`` when there is no key, the read fails
+        or the format has no text.  Cached per key."""
         s3_key = event_data.get("s3_key")
         if not s3_key:
             return None
@@ -2348,7 +2379,11 @@ class IngestionWorker:
             if content_format in ("html", "txt"):
                 text = raw.decode("utf-8", errors="replace")
             elif content_format == "pdf":
-                text = extract_text_from_pdf(raw)
+                # The text layer only: OCR text is never evidence (#4986),
+                # so a scanned page gives none, as the reingest's OCR'd
+                # text of the same key does.
+                layer = extract_pdf_text(raw, ocr=False)
+                text = layer.text if layer is not None else ""
         except Exception as exc:
             logger.warning(
                 "Failed to read a pre-split child's archived page",
@@ -2448,9 +2483,21 @@ class IngestionWorker:
                 )
                 return event_data
 
-        result = portal.transcribe_envelope_pdf(envelope, extract_text_from_pdf)
+        from_ocr: list[bool] = []
+
+        def extract(pdf: bytes) -> str | None:
+            pdf_text = extract_pdf_text(pdf)
+            if pdf_text is None:
+                return None
+            from_ocr.append(pdf_text.from_ocr)
+            return pdf_text.text or None
+
+        result = portal.transcribe_envelope_pdf(envelope, extract)
         if result.text:
             updates["ruling_text"] = result.text
+            if any(from_ocr):
+                # Cut from OCR text: no case-number evidence (#4986).
+                updates[TEXT_FROM_OCR_KEY] = True
         if result.outcome not in ("no_pdf", "inline_ruling"):
             # The hearing date printed in the calendar PDF's preamble wins
             # over whatever the event carries (the capture-time filename
@@ -3252,7 +3299,8 @@ class IngestionWorker:
         # PHASE: parse_document_ms (#4116)
         # ------------------------------------------------------------------
         # Cover the raw-PDF text extraction (pdfplumber via
-        # extract_text_from_pdf) plus the S3 multimodal-PDF download.  Both
+        # extract_pdf_text, with its OCR fallback) plus the S3 multimodal-PDF
+        # download.  Both
         # are bounded by IO + C-extension parsing latency, distinct from the
         # downstream LLM call and DB write.
         # ------------------------------------------------------------------
@@ -3268,7 +3316,25 @@ class IngestionWorker:
                 raw_pdf_bytes = (
                     ruling_text.encode("latin-1") if isinstance(ruling_text, str) else ruling_text
                 )
-                extracted_pdf_text = extract_text_from_pdf(ruling_text)
+                # A text-first county's split reads this text, so a scanned
+                # PDF is OCR'd page by page up to the cap; a multimodal
+                # county reads the page images itself and needs the OCR
+                # text only as a fallback (#4986).
+                pdf_text = extract_pdf_text(
+                    ruling_text,
+                    ocr_max_pages=(
+                        _MULTIMODAL_OCR_FALLBACK_PAGES if strategy.use_multimodal else None
+                    ),
+                )
+                extracted_pdf_text = pdf_text.text if pdf_text is not None else None
+                if pdf_text is not None and pdf_text.from_ocr:
+                    # LLM output: never case-number evidence, and a split
+                    # built on OCR that skipped pages is incomplete (#4986).
+                    event_data = {
+                        **event_data,
+                        TEXT_FROM_OCR_KEY: True,
+                        OCR_INCOMPLETE_KEY: pdf_text.incomplete,
+                    }
                 if extracted_pdf_text:
                     logger.info(
                         "Extracted text from raw PDF binary",
@@ -5393,6 +5459,26 @@ class IngestionWorker:
                 batch.extraction_failed = NO_EXTRACTABLE_TEXT
             return False
 
+        # A scanned PDF whose OCR skipped pages: every text path below (the
+        # deterministic splitters, the text LLM split) would miss the unread
+        # pages' rulings and pass for complete.  Refuse it as a failed
+        # extraction, so the key's rows stay and a reingest retries the key
+        # (#4986).  A multimodal county reads the page images itself; its
+        # text fallback is refused further down if it is needed.
+        ocr_incomplete = _ocr_incomplete_reason(event_data)
+        if ocr_incomplete:
+            from framework.extraction_config import decide_extraction_strategy
+
+            reads_images = (
+                raw_pdf_bytes is not None
+                and decide_extraction_strategy(
+                    state, county, scraper_id=event_data.get("scraper_id", "")
+                ).use_multimodal
+            )
+            if not reads_images:
+                batch.extraction_failed = ocr_incomplete
+                return False
+
         # ------------------------------------------------------------------
         # Santa Clara "rulings not available" placeholder (#4725)
         # ------------------------------------------------------------------
@@ -5655,6 +5741,12 @@ class IngestionWorker:
                     "state": state,
                 },
             )
+
+        # A multimodal county's text fallback built on OCR that skipped pages
+        # would miss their rulings: a failed extraction too (#4986).
+        if extracted_rulings is None and ocr_incomplete:
+            batch.extraction_failed = "; ".join(e for e in (multimodal_error, ocr_incomplete) if e)
+            return False
 
         # Text-based fallback (or primary path when no raw PDF available).
         # Use `is None` to distinguish between failed extraction (None) and
@@ -6102,11 +6194,13 @@ class IngestionWorker:
         # checks the child's number, from the LLM, the regex fallback or the
         # parent, against it.  A reingest also moves a ruling off a number
         # it does not carry when the child found none (#4915).  A scanned
-        # PDF gives no evidence (``document_evidence``).
+        # PDF gives no evidence (``document_evidence``), nor does its OCR
+        # text, however long (#4986).
         extra = event_data.get("extra")
         link_text = extra.get("link_text") if isinstance(extra, dict) else None
-        split_evidence = document_evidence(ruling_text)
-        whole_document_evidence = document_evidence(ruling_text, link_text)
+        from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
+        split_evidence = document_evidence(ruling_text, from_ocr=from_ocr)
+        whole_document_evidence = document_evidence(ruling_text, link_text, from_ocr=from_ocr)
 
         for cr in converted:
             # Multimodal rows with no ruling body are not rulings (#4714).

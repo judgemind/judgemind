@@ -24,6 +24,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ingestion.llm_extract import PdfText
+
 _SCRIPTS_DIR = os.path.join(
     os.path.dirname(__file__),
     "..",
@@ -827,7 +829,7 @@ class TestExtractTextFromContent:
 
         # Should use OCR result, not garbled UTF-8 decode
         assert result == ocr_text
-        mock_ocr.assert_called_once_with(fake_pdf)
+        mock_ocr.assert_called_once_with(fake_pdf, ocr_max_pages=1)
 
     def test_pdf_falls_back_to_utf8_when_ocr_also_fails(self) -> None:
         """When both pdfplumber and OCR fail, falls back to UTF-8 decode."""
@@ -3127,7 +3129,7 @@ class TestUnextractableKeyIsNotRetried:
             with (
                 patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
                 patch("ingestion.worker.IngestionWorker", return_value=worker),
-                patch("ingestion.worker.extract_text_from_pdf", return_value=""),
+                patch("ingestion.worker.extract_pdf_text", return_value=PdfText("")),
                 patch("redis.Redis.from_url", return_value=MagicMock()),
             ):
                 result = reingest._process_prefix_document(

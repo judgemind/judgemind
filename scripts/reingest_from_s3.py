@@ -406,7 +406,9 @@ def _extract_text_from_content(
     pdfplumber's C PDF parser, leading to hung threads and blocked batches.
 
     When pdfplumber returns no text (image-only PDFs), falls back to OCR
-    via the framework's ``extract_text_from_pdf()`` which uses LLM vision.
+    via the framework's ``extract_text_from_pdf()`` which uses LLM vision,
+    of the first page only: the judge pre-pass, this helper's one caller,
+    reads header fields (#4986; the worker OCRs every page itself).
 
     For other formats (HTML, plain text), decodes as UTF-8.
     """
@@ -419,7 +421,7 @@ def _extract_text_from_content(
         # which renders pages and uses LLM vision for OCR (#1334).
         # Pass the original raw bytes to avoid lossy UTF-8 round-trip.
         logger.debug("PDF subprocess extraction returned no text, trying OCR fallback")
-        ocr_text = extract_text_from_pdf(raw_content)
+        ocr_text = extract_text_from_pdf(raw_content, ocr_max_pages=_PREPASS_OCR_PAGES)
         if ocr_text and ocr_text.strip():
             return ocr_text
         # OCR also failed — fall back to UTF-8 decode as last resort.
@@ -632,6 +634,10 @@ def _build_prefix_event(
 
 #: Keys the judge pre-pass fetches and scans at a time.
 _PREPASS_CHUNK = 200
+
+#: Pages of a scanned PDF the judge pre-pass OCRs: the header is on page 1
+#: (#4986).
+_PREPASS_OCR_PAGES = 1
 
 
 def _seed_judges_from_keys(

@@ -21,6 +21,7 @@ from framework.llm_schema import (
     ExtractedRuling,
     ExtractionOutcome,
 )
+from ingestion.llm_extract import PdfText
 from ingestion.worker import IngestionWorker
 
 
@@ -1602,8 +1603,8 @@ class TestMultimodalExtractionPath:
         with (
             patch("ingestion.worker.is_pdf_binary", return_value=True),
             patch(
-                "ingestion.worker.extract_text_from_pdf",
-                return_value=(
+                "ingestion.worker.extract_pdf_text",
+                return_value=PdfText(
                     "Case No. 2024CUBC038456\nThompson v. Anderson\nThe motion is GRANTED."
                 ),
             ),
@@ -1705,8 +1706,8 @@ class TestMultimodalExtractionPath:
         with (
             patch("ingestion.worker.is_pdf_binary", return_value=True),
             patch(
-                "ingestion.worker.extract_text_from_pdf",
-                return_value="Case No. 123\nSmith v. Jones\nGranted.",
+                "ingestion.worker.extract_pdf_text",
+                return_value=PdfText("Case No. 123\nSmith v. Jones\nGranted."),
             ),
             patch(
                 "framework.extraction_config.get_county_extraction_config",
@@ -2120,7 +2121,7 @@ class TestS3PdfDownloadInProcessEvent:
             s3_key="ca/orange/raw/abc.pdf",
         )
 
-        with patch("ingestion.worker.extract_text_from_pdf", return_value="extracted text"):
+        with patch("ingestion.worker.extract_pdf_text", return_value=PdfText("extracted text")):
             worker.process_event(event)
 
         # S3 should NOT have been called — raw_pdf_bytes came from ruling_text
