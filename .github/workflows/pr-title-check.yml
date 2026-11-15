@@ -20,3 +20,25 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/check-pr-title.sh
+
+  # Issue #5071: fail when the PR would close an issue it is not meant to
+  # close. A closing word directly before an issue number in the body (or in
+  # a commit message, which the squash merge copies to main) closes that
+  # issue on merge: PR #5072 re-closed an open, blocked issue that way.
+  # "Meant" = a number in the branch name, a #N in the title, or an explicit
+  # closing line in the body. Runs on body edits too, so rewording re-checks.
+  closing-refs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the PR closes only the issues it is meant to close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: scripts/check-pr-closing-refs.py --pr "$PR_NUMBER" --repo "$REPO"

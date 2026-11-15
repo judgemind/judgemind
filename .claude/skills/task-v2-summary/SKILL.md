@@ -259,6 +259,8 @@ Set `pr_title` equal to the subject line only (no body — GitHub uses the title
 
 Set `commit_message` to the subject plus an optional body (separated by a blank line). Include `Closes #<N>` in the body if applicable.
 
+**Closing words only for this task's issue (#5071).** In `commit_message` and `pr_body_md`, never put a closing word (`close`/`closes`/`closed`, `fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved`) directly before any issue number other than `<N>`: GitHub closes that issue on merge even mid-sentence. Write "the run auto-closed issue 4673" or "see #4673" instead. The `closing-refs` CI job (`scripts/check-pr-closing-refs.py`) fails the PR otherwise. See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
+
 **How the commit message reaches main.** The daemon's `push_and_pr` phase runs `git commit --amend -F <message-file>` to rewrite ralph's placeholder commit (`"WIP: ralph output"`) with the `commit_message` from this skill's output. When the PR is squash-merged, GitHub uses the **PR title** for the merged-main commit subject (not the constituent commit messages). So `pr_title` is the on-main authoritative subject; the amended `commit_message` is what maintainers see on the PR's commits tab and in `git log` on the feature branch. Keeping the two in sync (pr_title == subject line of commit_message) is intentional.
 
 ## Step 5 — Write the PR body

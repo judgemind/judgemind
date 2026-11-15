@@ -52,6 +52,7 @@
 #   1 — one or more tests failed.
 
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_UNDER_TEST="$REPO_ROOT/scripts/check-ingestion-worker-task-def-fingerprint.sh"

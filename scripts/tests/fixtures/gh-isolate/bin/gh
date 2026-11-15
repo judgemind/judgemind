@@ -1,0 +1,8 @@
+#!/bin/sh
+# gh shim from the gh-isolate test fixture (#5071). Never calls GitHub.
+echo "FAIL: real gh called from a test (#5071): gh $*" >&2
+echo "Fix: stub gh in this test (put a fake gh first on PATH, or mock the call)." >&2
+if [ -n "${GH_ISOLATE_LOG:-}" ]; then
+    printf '%s\tgh %s\n' "${PYTEST_CURRENT_TEST:-${GH_ISOLATE_TEST:-?}}" "$*" >>"$GH_ISOLATE_LOG"
+fi
+exit 4

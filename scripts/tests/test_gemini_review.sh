@@ -16,6 +16,7 @@
 #   1 — One or more tests failed.
 
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GEMINI_REVIEW="$SCRIPT_DIR/gemini-review.sh"

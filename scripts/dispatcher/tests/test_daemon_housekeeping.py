@@ -1411,6 +1411,7 @@ _THREE_PRS = _json.dumps(
 )
 
 
+@pytest.mark.real_gh_healers  # drives the real healer with stubbed subprocess calls (#5071)
 class TestHousekeepingCloseOrphanPRs:
     """``_housekeeping_close_orphan_prs`` closes only ``agent/*`` PRs whose
     every closing-issue is CLOSED, leaves all others alone (#3852)."""
@@ -1757,6 +1758,7 @@ class TestHousekeepingTickWiresInOrphanPRGC:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.real_gh_healers  # drives the real healer with stubbed subprocess calls (#5071)
 class TestHousekeepingSweepCompletedParents:
     """``_housekeeping_sweep_completed_parents`` invokes the sweep script (#4499).
 

@@ -35,6 +35,7 @@
 #   1 — one or more assertions failed.
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../tests/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HELPER="$SCRIPT_DIR/dispatcher/progress.sh"
