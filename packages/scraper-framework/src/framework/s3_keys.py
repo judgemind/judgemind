@@ -2,8 +2,8 @@
 
 A "flat-hash" key has shape ``{state}/{county}/{court}/raw/{hex64}.{ext}``
 — the content-addressed scheme where the filename is the SHA-256 of the
-bytes. The 2026-03-28 migration in commit ``fbf8e38`` (archived as
-``scripts/archive/migrate_s3_keys.py``) rewrote objects under this shape;
+bytes. The 2026-03-28 migration in commit ``fbf8e38`` (``migrate_s3_keys.py``,
+removed in #4991) rewrote objects under this shape;
 its ``CopyObject`` step preserved the original metadata ``content-hash``,
 so a mislabel is detectable by comparing filename hex64 to metadata
 ``content-hash``.
@@ -11,9 +11,9 @@ so a mislabel is detectable by comparing filename hex64 to metadata
 These helpers were duplicated verbatim across
 ``scripts/cleanup_mislabeled_s3_2661.py`` and
 ``scripts/repoint_mislabeled_documents_4439.py`` (both archived in
-#4565 after their runtime applies landed; the post-#4447 import shape
-is preserved verbatim at ``scripts/archive/cleanup_mislabeled_s3_2661.py``
-and ``scripts/archive/repoint_mislabeled_documents_4439.py``) — both
+#4565 after their runtime applies landed; the cleanup script, which
+deleted raws, was removed in #4991; the post-#4447 import shape is
+preserved at ``scripts/archive/repoint_mislabeled_documents_4439.py``) — both
 are ECS oneshot scripts run via ``scripts/ecs-run-task.sh`` which
 uploads only the single requested script to S3 at run time, so
 peer-script imports are not available. Importing from ``framework.*``

@@ -89,7 +89,7 @@
 #   scripts/ecs-run-task.sh scripts/backfill_summaries.py
 #   scripts/ecs-run-task.sh --detach scripts/backfill_summaries.py
 #   scripts/ecs-wait-task.sh      # re-run while it exits 124
-#   scripts/ecs-run-task.sh --role judgemind-<custom>-dev scripts/migrate_s3_keys.py -- --cleanup-orphans
+#   scripts/ecs-run-task.sh --role judgemind-<custom>-dev scripts/<script>.py -- --apply
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 
@@ -409,6 +409,7 @@ cleanup() {
 
     if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" && "$TASK_STILL_RUNNING" == "false" ]]; then
         echo "Cleaning up: removing script from S3..." >&2
+        # s3-delete-not-raw: the uploaded oneshot script under oneshot-scripts/ in the assets bucket
         wait_budget_call --max 15 "aws s3 rm" aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null 2>&1 || true
     elif [[ -n "$S3_SCRIPT_KEY" ]]; then

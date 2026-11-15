@@ -19,7 +19,7 @@ from .hashing import sha256_hex
 logger = logging.getLogger(__name__)
 
 # Matches content-addressed keys: .../raw/{64-hex-char-hash}.{ext}
-# Mirrors the shape in scripts/archive/migrate_s3_keys.py:40 but captures
+# Mirrors the shape in the 2026-03-28 migrate_s3_keys.py (fbf8e38) but captures
 # the hash group for extraction.
 KEY_PATTERN = re.compile(r".*/raw/([0-9a-f]{64})\.\w+$")
 

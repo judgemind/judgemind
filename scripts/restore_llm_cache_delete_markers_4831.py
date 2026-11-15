@@ -132,6 +132,7 @@ def list_versions(s3, bucket: str, prefix: str) -> list[Version]:
     return out
 
 
+# s3-delete-not-raw: removes only llm-cache/ delete markers chosen by select_restorable
 def remove_markers(s3, bucket: str, restores: list[Restore]) -> tuple[int, list[dict]]:
     removed = 0
     errors: list[dict] = []
