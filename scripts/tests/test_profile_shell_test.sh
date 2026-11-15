@@ -5,7 +5,9 @@
 #   * Section markers are detected and timed.
 #   * Exit code from the wrapped test is preserved verbatim.
 #   * The TSV output has the expected shape (sections × 2 columns).
-#   * Top-N summary appears in stdout in sorted order.
+#   * Top-N summary appears in stdout in sorted order (asserted under a
+#     fake python3 clock, never on real sleep timing — #4817).
+#   * A 50k-row TSV does not SIGPIPE the summary pipeline (#4817).
 #   * The custom --section-pattern argument works.
 #   * EXIT-trap clobbering (user installs ``trap cleanup EXIT``) is
 #     handled — _section_close still runs.
@@ -55,33 +57,68 @@ make_fixture() {
     echo "$path"
 }
 
+# ─── Fake clock (#4817) ──────────────────────────────────────────────────
+# The profiler reads the time via `python3 -c '...time.time()...'` in
+# `_section_now_ms`. Ordering assertions used to depend on real `sleep`
+# gaps (0.05 / 0.20 / 0.50 after #4188), but the measured elapsed time
+# also includes the python3 start-up in the NEXT section boundary. On a
+# loaded CI runner that start-up alone can exceed the 0.3s gap, so the
+# "sorted by elapsed desc" check flaked (#4817; PR #4992 CI run
+# 43662822823 attempt 1: "expected Test 3: gamma, actual Test 2: beta").
+# Widening the sleeps again only moves the threshold.
+#
+# Instead, put a stub `python3` first on PATH that replays a fixed list
+# of epoch-ms values, one per call. Each section's elapsed time is then
+# exactly known, so ordering and arithmetic are asserted on content and
+# never on scheduling. The values are set in an order that does NOT match
+# file order, so the assertions prove the summary really sorts.
+FAKE_CLOCK_BIN="$TMPDIR_TEST/fake-clock-bin"
+mkdir -p "$FAKE_CLOCK_BIN"
+cat > "$FAKE_CLOCK_BIN/python3" <<'FAKE_CLOCK_EOF'
+#!/usr/bin/env bash
+# Stand-in for _section_now_ms's python3 call: print the next queued
+# epoch-ms value from $FAKE_CLOCK_FILE and drop it from the queue.
+f="${FAKE_CLOCK_FILE:?FAKE_CLOCK_FILE not set}"
+[ -s "$f" ] || exit 0
+head -n 1 "$f"
+tail -n +2 "$f" > "$f.next"
+mv "$f.next" "$f"
+FAKE_CLOCK_EOF
+chmod +x "$FAKE_CLOCK_BIN/python3"
+
+# fake_clock_set FILE MS... — queue the epoch-ms values the stub returns.
+fake_clock_set() {
+    local f="$1"
+    shift
+    printf '%s\n' "$@" > "$f"
+}
+
+# summary_rows OUTPUT — print the rows between the "Top N longest
+# sections:" header and the "----- end -----" footer.
+summary_rows() {
+    printf '%s\n' "$1" | awk '/^Top [0-9]+ longest sections:/{flag=1; next} /^----- end -----/{flag=0} flag'
+}
+
 # ─── Test 1: Three-section fixture; preserves exit code 0 ────────────────
-# NOTE — timing-jitter constraint (#4188): the sort-by-elapsed-desc
-# assertion below (Test 2) requires a strict ordering Test 3 > Test 2 >
-# Test 1 by wall-clock elapsed time. On a busy CI runner, scheduling
-# jitter can add 10s-100s of milliseconds to a `sleep` call, so the gaps
-# between sleeps must be wide enough that no realistic jitter can
-# reorder them. The 0.05 / 0.20 / 0.50 schedule below leaves a 4× gap
-# between successive sleeps, which makes a flip statistically
-# infeasible. The previous 0.02 / 0.04 / 0.06 schedule had only a 1.5×
-# gap and flaked under load (see #4188 / PR #4187 CI run 25433409933).
-# If you are tempted to reduce these sleeps to "speed up the test" —
-# don't. The deterministic ordering matters more than the ~0.7s of
-# extra wall-clock time.
+# Runs under the fake clock. The four python3 calls are: open alpha,
+# close alpha / open beta, close beta / open gamma, close gamma (EXIT
+# trap). Queued values give alpha=0.200s, beta=0.500s, gamma=0.050s.
 fixture1=$(make_fixture "fixture_basic.sh" '#!/usr/bin/env bash
 set -euo pipefail
 
 # Test 1: alpha
-sleep 0.05
+true
 
 # Test 2: beta
-sleep 0.20
+true
 
 # Test 3: gamma
-sleep 0.50
+true
 exit 0
 ')
 tsv1="$TMPDIR_TEST/fixture1.tsv"
+clock1="$TMPDIR_TEST/fixture1.clock"
+fake_clock_set "$clock1" 1000000 1000200 1000700 1000750
 # #4528 / #4540: capture stderr (do NOT discard) so a future flake
 # records the profiler's diagnostic output alongside the wrapped
 # fixture's stdout. Without this capture the only signal on rc
@@ -89,7 +126,7 @@ tsv1="$TMPDIR_TEST/fixture1.tsv"
 # #4383 failure mode this issue is generalising. The dump fires only
 # on the rc assertion failing, via the shared helper's --err-file.
 err1="$TMPDIR_TEST/fixture1.err"
-out1=$("$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
+out1=$(PATH="$FAKE_CLOCK_BIN:$PATH" FAKE_CLOCK_FILE="$clock1" "$PROFILER" --tsv "$tsv1" --top 5 "$fixture1" 2>"$err1")
 exit1=$?
 assert_eq "basic fixture exits 0" "$exit1" "0" --err-file "$err1"
 sections1=$(wc -l < "$tsv1" | tr -d ' ')
@@ -97,11 +134,15 @@ assert_eq "basic fixture records 3 sections" "$sections1" "3"
 assert_contains "basic fixture summary names section 3" "$out1" "Test 3: gamma"
 assert_contains "basic fixture summary names section 1" "$out1" "Test 1: alpha"
 assert_contains "basic fixture summary header present" "$out1" "Top 5 longest sections:"
+# The TSV is in file order with the exact elapsed times from the clock.
+expected_tsv1=$(printf '0.200\tTest 1: alpha\n0.500\tTest 2: beta\n0.050\tTest 3: gamma')
+assert_eq "TSV elapsed values match the fake clock exactly" "$(cat "$tsv1")" "$expected_tsv1"
 
-# ─── Test 2: Top of summary is the longest section ───────────────────────
-# Section 3 is 0.06s so it should appear first (sorted desc).
-first_label=$(sort -t '	' -k1,1 -n -r "$tsv1" | head -1 | cut -f2-)
-assert_eq "summary is sorted by elapsed desc" "$first_label" "Test 3: gamma"
+# ─── Test 2: The profiler's summary is sorted by elapsed desc ────────────
+# Asserts on the profiler's own stdout (not a re-sort of the TSV), and on
+# content fixed by the fake clock, so it cannot flake on CI load (#4817).
+expected_summary1=$(printf '0.500\tTest 2: beta\n0.200\tTest 1: alpha\n0.050\tTest 3: gamma')
+assert_eq "summary is sorted by elapsed desc" "$(summary_rows "$out1")" "$expected_summary1"
 
 # ─── Test 3: Exit code is preserved on non-zero exits ────────────────────
 fixture2=$(make_fixture "fixture_fail.sh" '#!/usr/bin/env bash
@@ -181,8 +222,10 @@ assert_eq "no-section fixture records 0 sections" "$sections5" "0"
 assert_contains "no-section fixture reports 0 sections" "$out5" "Sections recorded: 0"
 
 # ─── Test 7: TSV format is exactly two tab-separated columns ─────────────
-# Verify the first row of fixture1.tsv has format "<float>\t<label>".
-first_row=$(head -1 "$tsv1")
+# Verify the first row of fixture3.tsv has format "<float>\t<label>".
+# fixture3 ran with the real clock (fixture1 uses the fake one), so this
+# also checks the real python3 timing path end to end.
+first_row=$(head -1 "$tsv3")
 # Count tabs.
 tab_count=$(printf '%s' "$first_row" | tr -cd '\t' | wc -c | tr -d ' ')
 assert_eq "TSV row has exactly one tab" "$tab_count" "1"
@@ -205,11 +248,15 @@ fi
 # as the fixture1/fixture5 sites above. Dump-on-mismatch handled by
 # the shared helper's --err-file flag.
 err6="$TMPDIR_TEST/top1.err"
-out6=$("$PROFILER" --tsv "$TMPDIR_TEST/top1.tsv" --top 1 "$fixture1" 2>"$err6")
+clock6="$TMPDIR_TEST/top1.clock"
+fake_clock_set "$clock6" 1000000 1000200 1000700 1000750
+out6=$(PATH="$FAKE_CLOCK_BIN:$PATH" FAKE_CLOCK_FILE="$clock6" "$PROFILER" --tsv "$TMPDIR_TEST/top1.tsv" --top 1 "$fixture1" 2>"$err6")
 exit6=$?
+assert_eq "--top 1 run exits 0" "$exit6" "0" --err-file "$err6"
 # Count rows after "Top 1 longest sections:" header. Stop at "----- end -----".
-top_rows=$(printf '%s' "$out6" | awk '/^Top 1 longest sections:/{flag=1; next} /^----- end -----/{flag=0} flag' | wc -l | tr -d ' ')
+top_rows=$(summary_rows "$out6" | wc -l | tr -d ' ')
 assert_eq "--top 1 prints 1 row" "$top_rows" "1" --err-file "$err6"
+assert_eq "--top 1 row is the longest section" "$(summary_rows "$out6")" "$(printf '0.500\tTest 2: beta')"
 
 # ─── Test 9: Bash 3.2 compatibility check ────────────────────────────────
 TESTS=$((TESTS + 1))
@@ -445,6 +492,35 @@ assert_contains "fixture5 site captures stderr to err5 (#4528)" \
     "$self_body" 'err5="$TMPDIR_TEST/fixture5.err"'
 assert_contains "Test 8 site captures stderr to err6 (#4528)" \
     "$self_body" 'err6="$TMPDIR_TEST/top1.err"'
+
+# ─── Test T_issue4817: large TSV does not SIGPIPE the summary ─────────────
+# Issue #4817: the summary used to run `sort ... | head -n TOP_N` under
+# `set -euo pipefail`. When the TSV is bigger than one pipe/stdio buffer,
+# head exits after TOP_N lines, sort dies of SIGPIPE (rc 141) or EPIPE
+# ("sort: fflush failed: 'standard output': Broken pipe", rc 2), and the
+# profiler exits with that rc even though the wrapped test passed. In CI
+# it raced on the ~55-row entrypoint TSV (PR #4816 run 36301672616).
+# A 50k-row TSV (~1.5 MB) overflows every pipe buffer, which makes the
+# old pipeline fail on every run (20/20 locally before the fix), so this
+# is a deterministic regression test. The fixture appends the rows
+# straight to the injected $_PROFILE_TSV.
+fixture_t4817=$(make_fixture "fixture_t_issue4817.sh" '#!/usr/bin/env bash
+set -euo pipefail
+
+# Test 1: bulk
+awk '"'"'BEGIN { for (i = 1; i <= 50000; i++) printf "%d.%03d\tTest T%d: bulk row\n", i / 1000, i % 1000, i }'"'"' >> "$_PROFILE_TSV"
+exit 0
+')
+tsv_t4817="$TMPDIR_TEST/fixture_t4817.tsv"
+err_t4817="$TMPDIR_TEST/fixture_t4817.err"
+out_t4817=$("$PROFILER" --tsv "$tsv_t4817" --top 5 "$fixture_t4817" 2>"$err_t4817")
+rc_t4817=$?
+assert_eq "50k-row TSV: all-green wrapped test gives rc=0 (#4817)" "$rc_t4817" "0" --err-file "$err_t4817"
+sections_t4817=$(wc -l < "$tsv_t4817" | tr -d ' ')
+assert_eq "50k-row TSV: 50000 bulk rows + the real section" "$sections_t4817" "50001"
+rows_t4817=$(summary_rows "$out_t4817")
+assert_eq "50k-row TSV: summary prints exactly --top 5 rows" "$(printf '%s\n' "$rows_t4817" | wc -l | tr -d ' ')" "5"
+assert_eq "50k-row TSV: summary leads with the largest row" "$(printf '%s\n' "$rows_t4817" | awk 'NR == 1')" "$(printf '50.000\tTest T50000: bulk row')"
 
 # ─── Summary ─────────────────────────────────────────────────────────────
 echo ""
