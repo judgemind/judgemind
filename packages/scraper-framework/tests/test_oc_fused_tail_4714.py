@@ -348,6 +348,53 @@ def test_worker_skips_textless_rows_without_emitting_drop_telemetry(
     ]
 
 
+@pytest.mark.parametrize("replace_set", [True, False], ids=["reingest", "live"])
+@patch("ingestion.worker.record_ingest_skip", return_value=True)
+@patch("ingestion.worker.delete_stale_split_children", return_value=0)
+@patch("ingestion.worker.write_split_rulings", return_value={})
+def test_all_rows_textless_skip_is_recorded(
+    mock_write: MagicMock,
+    _mock_delete: MagicMock,
+    mock_record: MagicMock,
+    replace_set: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An OC calendar whose every row has an empty tentative cell writes no
+    ruling and records ``no_ruling_text`` in ``telemetry.ingest_skips``, in
+    the empty split set's transaction, so the raw-key reconciler counts the
+    key as skipped, not lost (#5015, #5032).  The shape of dev keys
+    ``dbdf0d10``, ``15eb8f02`` and ``9d74992b``: numbered entries
+    (``row_class=empty_cell``) with a caption and no ruling body."""
+    worker = _make_worker()
+    worker._indexer = MagicMock()
+    multimodal = MagicMock()
+    multimodal.extract_from_pdf.return_value = [
+        _ruling(text="", entry=n, case_number=f"2026-0150000{n}", title=f"Party {n} vs. Other")
+        for n in (1, 2, 3)
+    ]
+    worker._multimodal_extractor = multimodal
+    worker._fetch_raw_pdf_from_s3 = MagicMock(return_value=b"%PDF-1.7")  # type: ignore[method-assign]
+    event = {**_event(), "ruling_text": ""}
+    if replace_set:
+        event[REPLACE_SPLIT_SET_KEY] = True
+
+    with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+        worker.process_event(event)
+
+    skipped = [r for r in caplog.records if r.getMessage() == "llm_split.textless_row_skipped"]
+    assert [r.row_class for r in skipped] == ["empty_cell"] * 3
+    # The key's split set is replaced by the empty one: no ruling is written.
+    mock_write.assert_called_once()
+    assert mock_write.call_args.kwargs["children"] == []
+    mock_record.assert_called_once()
+    kwargs = mock_record.call_args.kwargs
+    assert kwargs["s3_key"] == event["s3_key"]
+    assert kwargs["reason"] == "no_ruling_text"
+    assert kwargs["detail"]["textless_rows"] == 3
+    assert mock_record.call_args.args[0] is worker._get_connection.return_value
+    worker._get_connection.return_value.commit.assert_called()
+
+
 @patch("ingestion.worker.delete_stale_split_children", return_value=0)
 def test_worker_skips_zero_ruling_pdf_with_no_text(
     _mock_delete: MagicMock, caplog: pytest.LogCaptureFixture
