@@ -469,6 +469,7 @@ def build_event(
     bucket: str,
     capture_timestamp: datetime | None = None,
     provenance: dict[str, str] | None = None,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Construct an ingestion event dict from an S3 object.
 
@@ -490,6 +491,10 @@ def build_event(
     ``capture_scraper_id``.  The worker's ``hearing_date_for_raw`` hooks need
     both to reproduce the live scraper's hearing date (#4774).  A local-cache
     read has no metadata, so ``source_url`` stays empty.
+
+    ``allow_ruling_removal`` (``--allow-ruling-removal``) sets
+    ``ingestion.worker.ALLOW_RULING_REMOVAL_KEY``: a split that rejects every
+    child may then remove the key's rulings (#5057).
     """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
@@ -512,6 +517,9 @@ def build_event(
         # ``ingestion.worker.REPLACE_SPLIT_SET_KEY``.
         "_replace_split_set": True,
     }
+    if allow_ruling_removal:
+        # ``ingestion.worker.ALLOW_RULING_REMOVAL_KEY`` (#5057).
+        event["_allow_ruling_removal"] = True
     event.update(provenance or {})
 
     # For text-based formats (HTML, TXT), pass content as ruling_text.
@@ -573,6 +581,7 @@ def _process_one_document(
     database_url: str,
     redis_url: str,
     os_url: str,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Process a single document in a child process.
 
@@ -587,6 +596,9 @@ def _process_one_document(
         bytes' SHA-256.  Non-fatal — rebuild proceeds using the key hash as
         the canonical ``content_hash`` so the worker's LLM split path can
         re-derive any split-children from the raw PDF (see #2494).
+      - ``rows_kept_all_rejected``: True on an ``"error"`` result whose
+        split rejected every child of a key that holds rulings, so the
+        worker kept them (``AllChildrenRejectedError``, #5057).
     """
     parsed = parse_s3_key(key)
     if not parsed:
@@ -647,6 +659,7 @@ def _process_one_document(
         bucket,
         capture_timestamp=capture_timestamp,
         provenance=provenance,
+        allow_ruling_removal=allow_ruling_removal,
     )
     had_hearing_date = bool(event.get("hearing_date"))
 
@@ -685,11 +698,16 @@ def _process_one_document(
             "had_hearing_date": had_hearing_date,
             "hash_mismatch": hash_mismatch,
         }
-    except Exception:
+    except Exception as exc:
+        from ingestion.worker import AllChildrenRejectedError
+
+        rows_kept = isinstance(exc, AllChildrenRejectedError)
         logger.error(
             "Error processing document",
             key=key,
             document_id=event.get("document_id"),
+            # Every child was rejected: the key's rulings were kept (#5057).
+            rows_kept_all_rejected=rows_kept,
             exc_info=True,
         )
         return {
@@ -697,6 +715,7 @@ def _process_one_document(
             "content_format": content_format,
             "had_hearing_date": had_hearing_date,
             "hash_mismatch": hash_mismatch,
+            "rows_kept_all_rejected": rows_kept,
         }
 
 
@@ -1202,6 +1221,7 @@ def _retry_crashed_keys_serially(
     database_url: str,
     redis_url: str,
     os_url: str,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Retry keys that crashed a worker in the concurrent pass.
 
@@ -1246,6 +1266,7 @@ def _retry_crashed_keys_serially(
                 database_url,
                 redis_url,
                 os_url,
+                allow_ruling_removal,
             )
             try:
                 result = future.result()
@@ -2030,7 +2051,21 @@ def main() -> None:
             "(validation.deferred_backlogs, e.g. the May-June CourtListener "
             "raws blocked on #3954), which are skipped by default, and allow "
             "a --reset that would delete their rows (#5043).  Their reingest "
-            "fails validation today and leaves them with no rulings."
+            "fails validation today: without --reset the worker keeps their "
+            "rulings and reports them failed (#5057)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-ruling-removal",
+        action="store_true",
+        dest="allow_ruling_removal",
+        help=(
+            "Let a key whose every split child is rejected (validation, the "
+            "all-NULL guard) lose its rulings.  Without it the worker keeps "
+            "them, records the key all_children_rejected in "
+            "telemetry.ingest_incomplete and counts it in "
+            "rows_kept_all_rejected (#5057).  For a rule tightening meant to "
+            "remove rows.  --reset removes every row of the scope anyway."
         ),
     )
     args = parser.parse_args()
@@ -2298,6 +2333,15 @@ def main() -> None:
         # serially after the concurrent pass.  See #2495.
         crashed_keys: list[str] = []
         pool_break_events = 0
+        # Keys whose split rejected every child, so the worker kept their
+        # rulings (#5057).
+        rows_kept_all_rejected = 0
+        if args.allow_ruling_removal:
+            logger.warning(
+                "--allow-ruling-removal is set: a key whose every split child "
+                "is rejected loses its rulings in this rebuild (#5057)",
+                total=len(keys),
+            )
 
         with ProcessPoolExecutor(max_workers=concurrency) as pool:
             futures = {
@@ -2309,6 +2353,7 @@ def main() -> None:
                     database_url,
                     redis_url,
                     os_url,
+                    args.allow_ruling_removal,
                 ): key
                 for key in keys
             }
@@ -2343,6 +2388,8 @@ def main() -> None:
                         skipped += 1
                     else:
                         errors += 1
+                        if isinstance(result, dict) and result.get("rows_kept_all_rejected"):
+                            rows_kept_all_rejected += 1
 
                     if content_format:
                         format_counts[content_format] = (
@@ -2449,6 +2496,7 @@ def main() -> None:
                     database_url,
                     redis_url,
                     os_url,
+                    allow_ruling_removal=args.allow_ruling_removal,
                 )
         # Fold retry counters back into the overall totals only when the
         # retry pass actually ran.  If we aborted before entering it
@@ -2487,6 +2535,9 @@ def main() -> None:
             total=len(keys),
             format_counts=format_counts,
             hash_mismatch_warnings=hash_mismatch_warnings,
+            # Failed keys whose rulings were kept because every split child
+            # was rejected (#5057), from the concurrent pass.
+            rows_kept_all_rejected=rows_kept_all_rejected,
             pool_break_events=pool_break_events,
             pool_break_keys_recovered=(
                 (retry_summary["processed"] + retry_summary["skipped"])

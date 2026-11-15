@@ -17,6 +17,12 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   extraction and left the key's rows as they were (#4948, #5000).  Before
   #5008 the key was only listed in the reingest's failed manifest, under
   ``tmp/keys/``, which expires after 30 days.
+- ``all_children_rejected``: a split rejected every child (validation, the
+  all-NULL guard, a child that raised) of a key that holds rulings, and
+  nothing says the document holds none, so the worker refused the empty
+  write and left the key's rows as they were (#5057).  The detail lists
+  the rejections.  A reingest / rebuild run with ``--allow-ruling-removal``
+  removes the rows instead.
 - ``stale_validation``: written by the raw-key reconciler, not the worker
   (#5027).  Every ruling of the key failed validation under a version of a
   rule since relaxed (``validation.rule_versions``), so the key is
@@ -53,6 +59,7 @@ INCOMPLETE_PARTIAL_SPLIT = "partial_split"
 INCOMPLETE_EXHAUSTED_CHILD = "exhausted_child"
 INCOMPLETE_DEAD_LETTER = "dead_letter"
 INCOMPLETE_REINGEST_FAILED = "reingest_failed"
+INCOMPLETE_ALL_CHILDREN_REJECTED = "all_children_rejected"
 #: Recorded by ``scripts/reconcile_raw_keys.py`` (#5027), never the worker.
 INCOMPLETE_STALE_VALIDATION = "stale_validation"
 
@@ -63,6 +70,7 @@ INCOMPLETE_REASONS = frozenset(
         INCOMPLETE_EXHAUSTED_CHILD,
         INCOMPLETE_DEAD_LETTER,
         INCOMPLETE_REINGEST_FAILED,
+        INCOMPLETE_ALL_CHILDREN_REJECTED,
         INCOMPLETE_STALE_VALIDATION,
     }
 )
