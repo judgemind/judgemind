@@ -22,6 +22,8 @@ describe('toReconcileScope', () => {
       unrepresented: 5282,
       pending: 0,
       dated_excluded: 4705,
+      incomplete: '7',
+      incomplete_stuck: 2,
       skipped_by_reason: { validation_fail: 1, governor_bio_route: 2 },
       unrepresented_by_day: { '2026-06-19': 76, '2026-05-21': 169, '2026-06-02': 272 },
     });
@@ -33,6 +35,8 @@ describe('toReconcileScope', () => {
       unrepresented: 5282,
       pending: 0,
       datedExcluded: 4705,
+      incomplete: 7,
+      incompleteStuck: 2,
       skippedByReason: [
         { reason: 'governor_bio_route', count: 2 },
         { reason: 'validation_fail', count: 1 },
@@ -85,6 +89,9 @@ describe('queryRawKeyReconciliation', () => {
             pending: '0',
             dated_excluded: '9431',
             action: 'over_threshold',
+            incomplete: '12',
+            incomplete_stuck: '3',
+            incomplete_by_reason: { dead_letter: 1, partial_split: 14 },
           },
         ],
       })
@@ -104,6 +111,12 @@ describe('queryRawKeyReconciliation', () => {
       unrepresented: 13153,
       datedExcluded: 9431,
       action: 'over_threshold',
+      incomplete: 12,
+      incompleteStuck: 3,
+      incompleteByReason: [
+        { reason: 'partial_split', count: 14 },
+        { reason: 'dead_letter', count: 1 },
+      ],
     });
     expect(run?.scopes.map((s) => s.scope)).toEqual(['ca/los_angeles', 'ca/fresno']);
   });
@@ -115,6 +128,18 @@ describe('queryRawKeyReconciliation', () => {
       .mockResolvedValueOnce({ rows: [] });
     const run = await queryRawKeyReconciliation({ query } as unknown as Pool);
     expect(run?.action).toBe('none');
+    // A run recorded before #5008 has no incomplete counts.
+    expect(run?.incomplete).toBe(0);
+    expect(run?.incompleteStuck).toBe(0);
+    expect(run?.incompleteByReason).toEqual([]);
+  });
+
+  it('reads the incomplete counts and orders scopes by what needs work', () => {
+    expect(RAW_RECONCILE_LATEST_RUN_SQL).toContain('incomplete_stuck');
+    expect(RAW_RECONCILE_LATEST_RUN_SQL).toContain("detail->'incomplete_by_reason'");
+    expect(RAW_RECONCILE_SCOPES_SQL).toContain(
+      'ORDER BY unrepresented + incomplete + incomplete_stuck DESC',
+    );
   });
 });
 

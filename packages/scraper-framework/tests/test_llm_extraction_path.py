@@ -390,8 +390,13 @@ class TestLlmExtractionPath:
         )
         worker.process_event(event)
 
-        # Should still process the document (single-document path).
-        mock_conn.commit.assert_called_once()
+        # Should still process the document (single-document path), after
+        # committing the key's incomplete record (#5008): two commits.
+        assert mock_conn.commit.call_count == 2
+        sqls = [c.args[0] for c in mock_cur.execute.call_args_list]
+        assert any("INSERT INTO telemetry.ingest_incomplete" in s for s in sqls)
+        # The fallback write keeps the record rather than clearing it.
+        assert not any("DELETE FROM telemetry.ingest_incomplete" in s for s in sqls)
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value=None)

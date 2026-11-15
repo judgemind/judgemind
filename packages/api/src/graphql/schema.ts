@@ -385,6 +385,10 @@ const coreTypeDefs = `#graphql
     pending: Int!
     """Legacy dated-layout keys, not reconciled (#4988)."""
     datedExcluded: Int!
+    """Keys whose rows are not a complete split (telemetry.ingest_incomplete), under the retry cap: re-ingested. Issue #5008."""
+    incomplete: Int!
+    """Incomplete keys at the retry cap: reported, not retried. Issue #5008."""
+    incompleteStuck: Int!
     """Skipped keys per reason, largest first."""
     skippedByReason: [ReasonCount!]!
     """Earliest capture day (YYYY-MM-DD, UTC) of an unrepresented key."""
@@ -404,9 +408,15 @@ const coreTypeDefs = `#graphql
     unrepresented: Int!
     pending: Int!
     datedExcluded: Int!
+    """Keys whose rows are not a complete split, under the retry cap (re-ingested). Issue #5008."""
+    incomplete: Int!
+    """Incomplete keys at the retry cap (reported, not retried). Issue #5008."""
+    incompleteStuck: Int!
+    """Incomplete keys (retrying and stuck) per recorded reason, largest first. Issue #5008."""
+    incompleteByReason: [ReasonCount!]!
     """none, reingest, persistent, reingest_failed, reingest_deferred, report_only or over_threshold."""
     action: String!
-    """Per-scope counts, most unrepresented first."""
+    """Per-scope counts, most unrepresented or incomplete first."""
     scopes: [RawKeyReconcileScope!]!
   }
 

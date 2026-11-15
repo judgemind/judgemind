@@ -797,6 +797,9 @@ export interface RawKeyReconcileScope {
   unrepresented: number;
   pending: number;
   datedExcluded: number;
+  /** Keys whose rows are not a complete split, under / at the retry cap (#5008). */
+  incomplete: number;
+  incompleteStuck: number;
   skippedByReason: ReasonCount[];
   /** Earliest and latest LastModified day (YYYY-MM-DD) of the unrepresented keys. */
   oldestUnrepresentedDay: string | null;
@@ -813,8 +816,17 @@ export interface RawKeyReconciliation {
   unrepresented: number;
   pending: number;
   datedExcluded: number;
+  incomplete: number;
+  incompleteStuck: number;
+  incompleteByReason: ReasonCount[];
   action: string;
   scopes: RawKeyReconcileScope[];
+}
+
+function toReasonCounts(value: unknown): ReasonCount[] {
+  return Object.entries(asObject(value))
+    .map(([reason, count]) => ({ reason, count: toInt(count) }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
 }
 
 function toInt(value: unknown): number {
@@ -837,7 +849,6 @@ function asObject(value: unknown): Record<string, unknown> {
 
 /** Turn one raw_reconcile_counts row into the API shape. */
 export function toReconcileScope(row: Row): RawKeyReconcileScope {
-  const reasons = asObject(row.skipped_by_reason);
   const days = Object.keys(asObject(row.unrepresented_by_day)).sort();
   return {
     scope: String(row.scope),
@@ -847,9 +858,9 @@ export function toReconcileScope(row: Row): RawKeyReconcileScope {
     unrepresented: toInt(row.unrepresented),
     pending: toInt(row.pending),
     datedExcluded: toInt(row.dated_excluded),
-    skippedByReason: Object.entries(reasons)
-      .map(([reason, count]) => ({ reason, count: toInt(count) }))
-      .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
+    incomplete: toInt(row.incomplete),
+    incompleteStuck: toInt(row.incomplete_stuck),
+    skippedByReason: toReasonCounts(row.skipped_by_reason),
     oldestUnrepresentedDay: days.length > 0 ? days[0] : null,
     newestUnrepresentedDay: days.length > 0 ? days[days.length - 1] : null,
   };
@@ -857,7 +868,9 @@ export function toReconcileScope(row: Row): RawKeyReconcileScope {
 
 export const RAW_RECONCILE_LATEST_RUN_SQL = `
   SELECT run_id, started_at, finished_at, raw_keys, represented, skipped,
-         unrepresented, pending, dated_excluded, action
+         unrepresented, pending, dated_excluded, action,
+         incomplete, incomplete_stuck,
+         detail->'incomplete_by_reason' AS incomplete_by_reason
   FROM telemetry.raw_reconcile_runs
   ORDER BY finished_at DESC
   LIMIT 1
@@ -865,10 +878,11 @@ export const RAW_RECONCILE_LATEST_RUN_SQL = `
 
 export const RAW_RECONCILE_SCOPES_SQL = `
   SELECT scope, raw_keys, represented, skipped, unrepresented, pending,
-         dated_excluded, skipped_by_reason, unrepresented_by_day
+         dated_excluded, skipped_by_reason, unrepresented_by_day,
+         incomplete, incomplete_stuck
   FROM telemetry.raw_reconcile_counts
   WHERE run_id = $1
-  ORDER BY unrepresented DESC, scope
+  ORDER BY unrepresented + incomplete + incomplete_stuck DESC, scope
 `;
 
 /**
@@ -890,6 +904,9 @@ async function queryRawKeyReconciliation(pool: Pool): Promise<RawKeyReconciliati
     unrepresented: toInt(run.unrepresented),
     pending: toInt(run.pending),
     datedExcluded: toInt(run.dated_excluded),
+    incomplete: toInt(run.incomplete),
+    incompleteStuck: toInt(run.incomplete_stuck),
+    incompleteByReason: toReasonCounts(run.incomplete_by_reason),
     action: String(run.action ?? 'none'),
     scopes: scopes.rows.map(toReconcileScope),
   };

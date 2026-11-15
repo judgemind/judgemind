@@ -784,8 +784,10 @@ describe('rawKeyReconciliation', () => {
   const QUERY = `{
     rawKeyReconciliation {
       runId finishedAt rawKeys represented skipped unrepresented pending datedExcluded action
+      incomplete incompleteStuck incompleteByReason { reason count }
       scopes {
         scope rawKeys represented skipped unrepresented pending datedExcluded
+        incomplete incompleteStuck
         skippedByReason { reason count }
         oldestUnrepresentedDay newestUnrepresentedDay
       }
@@ -815,21 +817,23 @@ describe('rawKeyReconciliation', () => {
     const { rows: latest } = await pool.query<{ run_id: string }>(
       `INSERT INTO telemetry.raw_reconcile_runs
          (started_at, finished_at, raw_keys, represented, skipped, unrepresented, pending,
-          dated_excluded, action, detail)
-       VALUES ('2099-01-02T00:00Z', '2099-01-02T00:01Z', 120, 100, 6, 13, 1, 40,
-               'reingest', '{"test": "5015"}')
+          dated_excluded, action, detail, incomplete, incomplete_stuck)
+       VALUES ('2099-01-02T00:00Z', '2099-01-02T00:01Z', 124, 100, 6, 13, 1, 40,
+               'reingest',
+               '{"test": "5015", "incomplete_by_reason": {"partial_split": 3, "dead_letter": 1}}',
+               3, 1)
        RETURNING run_id`,
     );
     const runId = latest[0].run_id;
     await pool.query(
       `INSERT INTO telemetry.raw_reconcile_counts
          (run_id, scope, raw_keys, represented, skipped, unrepresented, pending, dated_excluded,
-          skipped_by_reason, unrepresented_by_day)
+          skipped_by_reason, unrepresented_by_day, incomplete, incomplete_stuck)
        VALUES
-         ($1, 'ca/los_angeles', 100, 85, 2, 12, 1, 40, '{"validation_fail": 2}',
-          '{"2026-06-02": 5, "2026-05-21": 7}'),
+         ($1, 'ca/los_angeles', 104, 85, 2, 12, 1, 40, '{"validation_fail": 2}',
+          '{"2026-06-02": 5, "2026-05-21": 7}', 3, 1),
          ($1, 'ca/santa_clara', 20, 15, 4, 1, 0, 0,
-          '{"santa_clara_placeholder": 3, "validation_fail": 1}', '{"2026-11-10": 1}')`,
+          '{"santa_clara_placeholder": 3, "validation_fail": 1}', '{"2026-11-10": 1}', 0, 0)`,
       [runId],
     );
   });
@@ -848,12 +852,22 @@ describe('rawKeyReconciliation', () => {
     expect(body.errors).toBeUndefined();
     const run = body.data?.rawKeyReconciliation as Record<string, unknown>;
     expect(run.action).toBe('reingest');
-    expect(run.rawKeys).toBe(120);
+    expect(run.rawKeys).toBe(124);
     expect(run.unrepresented).toBe(13);
     expect(run.pending).toBe(1);
     expect(run.datedExcluded).toBe(40);
+    // Keys whose rows are not a complete split (#5008).
+    expect(run.incomplete).toBe(3);
+    expect(run.incompleteStuck).toBe(1);
+    expect(run.incompleteByReason).toEqual([
+      { reason: 'partial_split', count: 3 },
+      { reason: 'dead_letter', count: 1 },
+    ]);
     const scopes = run.scopes as Array<Record<string, unknown>>;
     expect(scopes.map((s) => s.scope)).toEqual(['ca/los_angeles', 'ca/santa_clara']);
+    expect(scopes[0].incomplete).toBe(3);
+    expect(scopes[0].incompleteStuck).toBe(1);
+    expect(scopes[1].incomplete).toBe(0);
     expect(scopes[0].oldestUnrepresentedDay).toBe('2026-05-21');
     expect(scopes[0].newestUnrepresentedDay).toBe('2026-06-02');
     expect(scopes[1].skippedByReason).toEqual([

@@ -25,6 +25,7 @@ import {
   RawKeyReconciliationTable,
   formatActionLabel,
   formatDayRange,
+  formatIncompleteReasons,
   formatSkipReasons,
 } from '../src/app/(main)/admin/data-quality/RawKeyReconciliationPanel';
 
@@ -37,6 +38,8 @@ function makeScope(overrides: Partial<RawKeyReconcileScopeItem>): RawKeyReconcil
     unrepresented: 0,
     pending: 0,
     datedExcluded: 21,
+    incomplete: 0,
+    incompleteStuck: 0,
     skippedByReason: [{ reason: 'validation_fail', count: 2 }],
     oldestUnrepresentedDay: null,
     newestUnrepresentedDay: null,
@@ -67,6 +70,9 @@ function makeRun(overrides: Partial<RawKeyReconciliationRun> = {}): RawKeyReconc
     unrepresented: 5282,
     pending: 3,
     datedExcluded: 4726,
+    incomplete: 0,
+    incompleteStuck: 0,
+    incompleteByReason: [],
     action: 'over_threshold',
     scopes: [la, makeScope({})],
     ...overrides,
@@ -108,6 +114,40 @@ describe('RawKeyReconciliationTable', () => {
     expect(summary).toHaveTextContent('None unrepresented');
     expect(summary).toHaveTextContent('Nothing to heal');
     expect(summary).not.toHaveTextContent('pending');
+    expect(screen.queryByTestId('raw-reconcile-incomplete')).toBeNull();
+  });
+
+  it('shows incomplete keys retrying and stuck, with reasons (#5008)', () => {
+    render(
+      <RawKeyReconciliationTable
+        run={makeRun({
+          incomplete: 12,
+          incompleteStuck: 3,
+          incompleteByReason: [
+            { reason: 'partial_split', count: 14 },
+            { reason: 'dead_letter', count: 1 },
+          ],
+          scopes: [makeScope({ scope: 'ca/orange', incomplete: 12, incompleteStuck: 3 })],
+        })}
+      />,
+    );
+    const line = screen.getByTestId('raw-reconcile-incomplete');
+    expect(line).toHaveTextContent('12 incomplete retrying, 3 stuck at the retry cap');
+    expect(line).toHaveTextContent('(partial split 14, dead-lettered 1)');
+    const row = screen.getByTestId('raw-reconcile-row-ca/orange');
+    expect(within(row).getByText('12')).toBeInTheDocument();
+    expect(within(row).getByText('3 stuck')).toBeInTheDocument();
+  });
+
+  it('shows retrying incomplete keys without a stuck count', () => {
+    render(
+      <RawKeyReconciliationTable
+        run={makeRun({ incomplete: 2, incompleteStuck: 0, incompleteByReason: [] })}
+      />,
+    );
+    const line = screen.getByTestId('raw-reconcile-incomplete');
+    expect(line).toHaveTextContent('2 incomplete retrying');
+    expect(line).not.toHaveTextContent('stuck');
   });
 
   it('shows an empty state before the first run', () => {
@@ -163,6 +203,16 @@ describe('formatters', () => {
         }),
       ),
     ).toBe('SC placeholder 1,200, brand_new 1');
+  });
+
+  it('formats incomplete reasons', () => {
+    expect(formatIncompleteReasons([])).toBe('');
+    expect(
+      formatIncompleteReasons([
+        { reason: 'single_document_fallback', count: 1000 },
+        { reason: 'brand_new', count: 2 },
+      ]),
+    ).toBe('whole-document fallback 1,000, brand_new 2');
   });
 
   it('formats day ranges', () => {
