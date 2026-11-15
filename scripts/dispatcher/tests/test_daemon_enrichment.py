@@ -37,6 +37,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -513,7 +514,11 @@ class TestLatestQueueSnapshotTitleFor:
 class TestAtomicClaimWithTitle:
     """``_atomic_claim`` accepts and persists ``issue_title``."""
 
-    def test_insert_includes_issue_title(self) -> None:
+    def test_insert_includes_issue_title(self, fake_gh: FakeGh) -> None:
+        # The claim adds the status/in-progress interlock label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --add-label status/in-progress"
+        )
         d, conn, _handler = _make_daemon_with_capture()
         ok = d._atomic_claim(
             issue_number=42,
@@ -533,8 +538,12 @@ class TestAtomicClaimWithTitle:
         # Params: (agent_id, run_id, issue_number, issue_title, worktree_path).
         assert params[3] == "Do the thing"
 
-    def test_insert_tolerates_null_title(self) -> None:
+    def test_insert_tolerates_null_title(self, fake_gh: FakeGh) -> None:
         """Title missing from the snapshot → insert NULL."""
+        # The claim adds the status/in-progress interlock label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --add-label status/in-progress"
+        )
         d, conn, _handler = _make_daemon_with_capture()
         ok = d._atomic_claim(
             issue_number=42,

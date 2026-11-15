@@ -36,9 +36,11 @@ Every shell test sources `_gh-isolate.sh` right after `set -euo pipefail`
 (after the `_git-env-scrub.sh` line, if any). It empties `GH_CONFIG_DIR`,
 unsets the GitHub token variables and puts the `gh` shim from
 `fixtures/gh-isolate/bin/` first on `PATH`; the shim exits 4 with "real gh
-called from a test" and never touches the network (#5071). A test that needs
-`gh` prepends its own fake `gh` to `PATH` afterwards. pytest tests get the
-same protection from the `gh-isolate` block in `conftest.py`.
+called from a test" and never touches the network (#5071). A shim hit fails
+the test (#5075): the shim signals the test process and the helper's USR1
+trap exits 1, naming each gh command. A test that needs `gh` prepends its
+own fake `gh` to `PATH` afterwards and asserts the calls it receives. pytest
+tests get the same protection from the `gh-isolate` block in `conftest.py`.
 `scripts/check-test-gh-isolate.sh` enforces both. See
 `docs/agent/code-standards.md` §Tests never reach real GitHub.
 

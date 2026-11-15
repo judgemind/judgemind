@@ -28,6 +28,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import GH_QUEUE_SCAN, FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +275,7 @@ class TestSchedulerTick:
 class TestSupervisorTick:
     """§7 — UPDATE heartbeat_ts every tick; read failures count for smoke test."""
 
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
     def test_heartbeat_update_and_failures_read(self) -> None:
         fake_conn = _FakeConnection()
         # count(*) from failures → 7 rows in the last hour.
@@ -349,8 +351,16 @@ class TestShutdown:
 class TestRunLoop:
     """Smoke-test ``run_forever`` wires initial ticks + exits on stop event."""
 
-    def test_stop_before_first_tick_still_runs_initial_ticks(self) -> None:
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
+    def test_stop_before_first_tick_still_runs_initial_ticks(
+        self, fake_gh: FakeGh
+    ) -> None:
         """run_forever does the initial boot-tick pair before checking _stop."""
+        # Boot scheduler tick scans the queue (and the blocked list, via
+        # the fake_gh_blocked_scan fixture); boot supervisor tick probes
+        # the rate limit (fake_gh_rate_limit_ok).
+        fake_gh.expect(GH_QUEUE_SCAN, stdout="[]")
         fake_conn = _FakeConnection()
         # Boot scheduler + supervisor ticks each need one fetchone result:
         # scheduler: config → (5,); supervisor: failures count → (0,).
@@ -367,8 +377,13 @@ class TestRunLoop:
         assert d._scheduler_ticks == 1
         assert d._supervisor_ticks == 1
 
-    def test_run_forever_honors_stop_event_within_one_second(self) -> None:
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
+    @pytest.mark.usefixtures("fake_gh_blocked_scan")
+    def test_run_forever_honors_stop_event_within_one_second(
+        self, fake_gh: FakeGh
+    ) -> None:
         """Trigger ``request_stop`` from another thread; loop exits quickly."""
+        fake_gh.expect(GH_QUEUE_SCAN, stdout="[]")
         fake_conn = _FakeConnection()
         # Initial boot ticks only — don't need fetches for further ticks
         # because we stop the loop before the next cadence fires.

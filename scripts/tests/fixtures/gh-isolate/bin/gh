@@ -5,4 +5,10 @@ echo "Fix: stub gh in this test (put a fake gh first on PATH, or mock the call).
 if [ -n "${GH_ISOLATE_LOG:-}" ]; then
     printf '%s\tgh %s\n' "${PYTEST_CURRENT_TEST:-${GH_ISOLATE_TEST:-?}}" "$*" >>"$GH_ISOLATE_LOG"
 fi
+# A hit fails the shell test that sourced _gh-isolate.sh (#5075): record the
+# call where the test's USR1 trap reads it, then signal the test process.
+if [ -n "${GH_ISOLATE_PID:-}" ] && [ -z "${GH_ISOLATE_ALLOW_HITS:-}" ]; then
+    printf 'gh %s\n' "$*" >>"${GH_ISOLATE_HITS:-/dev/null}"
+    kill -USR1 "$GH_ISOLATE_PID" 2>/dev/null || true
+fi
 exit 4

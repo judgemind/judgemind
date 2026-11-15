@@ -29,6 +29,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -927,12 +928,16 @@ class TestClearFailureSummaryOnSuccessTerminal:
     up when the retry-recovery path flips it to ``succeeded``."""
 
     def test_succeeded_terminal_clears_failure_summary_in_same_update(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
         """The terminal UPDATE must include ``failure_summary = NULL`` so
         the write is atomic with the status transition — no second
         round-trip, no window where the admin cockpit can read a
         ``succeeded`` row with a stale ``failure_summary``."""
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 2908 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.rowcount = 1
 

@@ -104,6 +104,27 @@ export PREPUSH_LOG_DIR="$TMPDIR/prepush-logs"
 REMOTE="$TMPDIR/remote.git"
 WORK="$TMPDIR/work"
 
+# On a push to an existing non-main branch the hook asks gh whether the
+# branch has an open PR (`gh pr list --head <branch> ... --jq length`). A
+# fake gh answers it (#5075): it prints $FAKE_GH_PR_COUNT (default 1, "a PR
+# exists") and records every call in $FAKE_GH_LOG. Any other call fails.
+FAKE_GH_DIR="$TMPDIR/fake-gh"
+FAKE_GH_LOG="$TMPDIR/fake-gh-calls.log"
+mkdir -p "$FAKE_GH_DIR"
+cat > "$FAKE_GH_DIR/gh" <<'FAKEGH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+case "$*" in
+    "pr list --head "*" --repo judgemind/judgemind --json number --jq length")
+        echo "${FAKE_GH_PR_COUNT:-1}" ;;
+    *) echo "fake gh: unexpected call: gh $*" >&2; exit 97 ;;
+esac
+FAKEGH
+chmod +x "$FAKE_GH_DIR/gh"
+: > "$FAKE_GH_LOG"
+export FAKE_GH_LOG
+PATH="$FAKE_GH_DIR:$PATH"
+
 # ───────────────────────────────────────────────────────────────────────
 # Helpers
 # ───────────────────────────────────────────────────────────────────────
@@ -268,12 +289,35 @@ echo "[scenario 3] existing-branch push — hook still detects testpkg"
 # Reuse workspace from scenario 2.
 prev_sha="$(git -C "$WORK" rev-parse main)"
 
+: > "$FAKE_GH_LOG"
 run_hook "refs/heads/feature-new-branch $feat_sha refs/heads/feature-new-branch $prev_sha"
 
 if echo "$hook_out" | grep -q "checking Python package 'testpkg'"; then
     report_pass "hook detected testpkg on existing-branch push"
 else
     report_fail "hook did NOT detect testpkg on existing-branch push" "$hook_out"
+fi
+
+# The existing-branch push asked gh for the branch's open PRs, once, and
+# stayed quiet because one exists.
+gh_calls="$(cat "$FAKE_GH_LOG")"
+if [ "$gh_calls" != "pr list --head feature-new-branch --repo judgemind/judgemind --json number --jq length" ]; then
+    report_fail "existing-branch push: expected one gh pr list --head feature-new-branch call, saw: $gh_calls" "$hook_out"
+elif echo "$hook_out" | grep -q "No PR exists"; then
+    report_fail "existing-branch push with an open PR printed the no-PR warning" "$hook_out"
+else
+    report_pass "existing-branch push checks for an open PR with gh (one exists: no warning)"
+fi
+
+echo "[scenario 3b] existing-branch push with no open PR — hook warns"
+: > "$FAKE_GH_LOG"
+export FAKE_GH_PR_COUNT=0
+run_hook "refs/heads/feature-new-branch $feat_sha refs/heads/feature-new-branch $prev_sha"
+unset FAKE_GH_PR_COUNT
+if echo "$hook_out" | grep -q "WARNING: No PR exists for branch 'feature-new-branch'"; then
+    report_pass "existing-branch push with no open PR prints the create-a-PR warning"
+else
+    report_fail "existing-branch push with no open PR did not warn" "$hook_out"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

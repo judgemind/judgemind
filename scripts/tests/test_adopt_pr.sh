@@ -128,9 +128,15 @@ fi
 
 # This will still fail (not in worktree), but should get past the argument
 # validation. We check the error message mentions "worktree", not "integer".
+# Run it from a directory outside any git repo: from the test's own cwd it
+# would pass the worktree check whenever the suite runs inside an agent
+# worktree, and then call `gh pr view 123` (#5075).
+NO_GIT_DIR=$(mktemp -d)
+TEMP_DIRS+=("$NO_GIT_DIR")
 exit_code=0
-output=$("$ADOPT_SCRIPT" "#123" 2>&1) || exit_code=$?
-if [[ "$exit_code" -ne 0 ]] && echo "$output" | grep -q -i "worktree\|git"; then
+output=$(cd "$NO_GIT_DIR" && "$ADOPT_SCRIPT" "#123" 2>&1) || exit_code=$?
+if [[ "$exit_code" -ne 0 ]] && echo "$output" | grep -q -i "worktree\|git" \
+    && ! echo "$output" | grep -q "integer"; then
     pass "strips leading # from PR number"
 else
     fail "strips leading # from PR number" "output: $output"

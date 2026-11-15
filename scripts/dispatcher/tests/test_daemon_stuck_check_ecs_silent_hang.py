@@ -57,6 +57,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +165,7 @@ class TestEcsSilentHangReaper:
     """Issue #3656 — ECS-mode agents are reaped on phase-stuck threshold."""
 
     def test_ecs_agent_over_threshold_reaped_as_silent_hang(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
         """ECS agent at elapsed 2000s on push_and_pr (1800s default) is reaped.
 
@@ -178,6 +179,10 @@ class TestEcsSilentHangReaper:
         * ``daemon.agent_silent_hang_reaped`` log event is emitted.
         * NO retry marker is enqueued (diagnoser owns the decision).
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 3608 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         # Seeded row: ECS agent on push_and_pr, elapsed 2000s.
@@ -321,7 +326,7 @@ class TestEcsSilentHangReaper:
         assert handler.events("agent_silent_hang_reaped") == []
 
     def test_ecs_agent_with_null_task_arn_still_routes_failure(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
         """ECS row with agent_task_arn=NULL still gets a failure row.
 
@@ -330,6 +335,10 @@ class TestEcsSilentHangReaper:
         StopTask it, but we still want the row off the cap-slot count
         with a failure routed through the diagnoser.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 3656 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         # Post-#3731 7-tuple: silent=2000 over 900s silent threshold →
@@ -444,7 +453,7 @@ class TestEcsSilentHangReaper:
         assert marker_inserts[0][1][1] == daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
 
     def test_mixed_batch_ecs_and_subprocess_routed_correctly(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
         """One ECS + one subprocess in the same scan — distinct routing.
 
@@ -453,6 +462,10 @@ class TestEcsSilentHangReaper:
         StopTask call must not stall the subprocess flag (and vice
         versa).
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 3656 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         ecs_arn = "arn:aws:ecs:us-west-2:155326049300:task/cluster/ecs1"

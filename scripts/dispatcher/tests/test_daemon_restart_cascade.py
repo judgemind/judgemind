@@ -55,6 +55,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402 — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -163,8 +164,12 @@ class TestRecoverAbandonedAgents:
     """
 
     def test_abandoned_agent_reclaimed_and_retry_marker_enqueued(
-        self, tmp_path: Path
+        self, fake_gh: FakeGh, tmp_path: Path
     ) -> None:
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 2807 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         # One abandoned agent from a prior run.
@@ -392,8 +397,14 @@ class TestRecoverAbandonedAgentsEcsExecutionMode:
         assert getattr(record, "prior_phase") == "ralph"
         assert getattr(record, "agent_task_arn") == task_arn
 
-    def test_subprocess_agent_still_abandoned(self, tmp_path: Path) -> None:
+    def test_subprocess_agent_still_abandoned(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """Explicit ``execution_mode='subprocess'`` preserves legacy behavior."""
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 2807 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         conn.cursor_instance.fetchall_queue = [
@@ -427,7 +438,9 @@ class TestRecoverAbandonedAgentsEcsExecutionMode:
         # No ECS survival event.
         assert handler.events("agent_ecs_survived_daemon_restart") == []
 
-    def test_null_execution_mode_defaults_to_subprocess(self, tmp_path: Path) -> None:
+    def test_null_execution_mode_defaults_to_subprocess(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """Pre-#3091 rows with NULL ``execution_mode`` keep the legacy path.
 
         Migration 41 set ``execution_mode TEXT NOT NULL DEFAULT 'subprocess'``
@@ -436,6 +449,10 @@ class TestRecoverAbandonedAgentsEcsExecutionMode:
         (or a hand-edited row) can't accidentally opt into the
         ECS-survives branch and leave an orphaned agent.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 2500 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         conn.cursor_instance.fetchall_queue = [
@@ -466,8 +483,14 @@ class TestRecoverAbandonedAgentsEcsExecutionMode:
         assert len(handler.events("agent_recovered_from_restart")) == 1
         assert handler.events("agent_ecs_survived_daemon_restart") == []
 
-    def test_mixed_fleet_only_subprocess_abandoned(self, tmp_path: Path) -> None:
+    def test_mixed_fleet_only_subprocess_abandoned(
+        self, fake_gh: FakeGh, tmp_path: Path
+    ) -> None:
         """One subprocess + one ECS agent → only subprocess is abandoned."""
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 100 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
 
         ecs_arn = (
@@ -1273,7 +1296,7 @@ class TestProcessRetryMarkersInfraPreemption:
         return d, conn, handler
 
     def test_restart_abandoned_terminates_old_and_unblocks_claim(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """``daemon_restart_abandoned`` marks the row failed + adds agent/ready.
 
@@ -1286,6 +1309,10 @@ class TestProcessRetryMarkersInfraPreemption:
         - No ``phase_transitions ('retry_reset')`` INSERT emitted.
         - ``daemon.retry_terminal_and_reclaim`` log event emitted.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = self._make_infra_marker_row(
             tmp_path, daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
         )
@@ -1347,9 +1374,13 @@ class TestProcessRetryMarkersInfraPreemption:
         assert handler.events("retry_processed") == []
 
     def test_paused_by_killswitch_takes_same_terminal_path(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """``paused_by_killswitch`` follows the same terminal-and-reclaim flow."""
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = self._make_infra_marker_row(
             tmp_path, daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
         )
@@ -1379,13 +1410,17 @@ class TestProcessRetryMarkersInfraPreemption:
         )
 
     def test_mark_agent_terminal_called_with_correct_args(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """``_mark_agent_terminal`` receives status='failed', phase=reason, issue_number.
 
         Integration-style: verify the _mark_agent_terminal call shape
         mirrors the ``recover_abandoned_agents`` precedent (line 3660).
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 2925 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = self._make_infra_marker_row(
             tmp_path,
             daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,

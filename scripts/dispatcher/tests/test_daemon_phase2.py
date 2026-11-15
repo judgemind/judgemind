@@ -464,6 +464,7 @@ class TestScanQueueAndSnapshot:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerTickPhase2:
     """Scheduler tick runs the queue scan and writes a snapshot row."""
 
@@ -612,6 +613,7 @@ class TestEmitHeartbeatMetric:
 class TestSupervisorTickPhase2:
     """Supervisor tick now also emits the CloudWatch metric."""
 
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
     def test_emits_metric_after_successful_heartbeat(self) -> None:
         d, conn, handler = _make_daemon_with_capture()
         # The failures count(*) returns 0.
@@ -635,6 +637,7 @@ class TestSupervisorTickPhase2:
         assert len(ticks) == 1
         assert ticks[0].heartbeat_metric_emitted is True
 
+    @pytest.mark.usefixtures("fake_gh_rate_limit_ok")
     def test_metric_failure_does_not_crash_supervisor(self) -> None:
         d, conn, _handler = _make_daemon_with_capture()
         conn.cursor_instance.fetch_queue = [(0,)]

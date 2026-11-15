@@ -35,6 +35,25 @@ TMPDIR_TEST=$(mktemp -d)
 cleanup() { rm -rf "$TMPDIR_TEST"; }
 trap cleanup EXIT
 
+# fleet-status.sh keeps a daemon-shipped green only when `gh pr view` says
+# its PR is MERGED (#3752). A fake gh answers those calls and records them
+# (#5075): PR 3194 is MERGED, PR 3195 is still OPEN. Any other call fails.
+FAKE_GH_DIR="$TMPDIR_TEST/fake-gh"
+FAKE_GH_LOG="$TMPDIR_TEST/gh-calls.log"
+mkdir -p "$FAKE_GH_DIR"
+cat >"$FAKE_GH_DIR/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+case "$*" in
+    "pr view 3194 --repo judgemind/judgemind --json state -q .state") echo MERGED ;;
+    "pr view 3195 --repo judgemind/judgemind --json state -q .state") echo OPEN ;;
+    *) echo "fake gh: unexpected call: gh $*" >&2; exit 97 ;;
+esac
+EOF
+chmod +x "$FAKE_GH_DIR/gh"
+export FAKE_GH_LOG
+PATH="$FAKE_GH_DIR:$PATH"
+
 pass() {
     TESTS=$((TESTS + 1))
     echo "PASS: $1"
@@ -102,7 +121,7 @@ DIAG
 # greens
 elif [[ "$sql" == *"merged_at IS NOT NULL"* && "$sql" == *"ORDER BY merged_at DESC"* ]]; then
     cat <<'GREENS'
-[{"agent_id":"def67890-aaaa-bbbb-cccc-deadbeefaa00","issue_number":3193,"pr_number":3194,"merged_utc":"2026-04-24T11:11:54Z","merged_pt":"04:11:54 PT","lifetime":"0:28:43","issue_title":"dx(tests): test_agent_runner_entrypoint"}]
+[{"agent_id":"def67890-aaaa-bbbb-cccc-deadbeefaa00","issue_number":3193,"pr_number":3194,"merged_utc":"2026-04-24T11:11:54Z","merged_pt":"04:11:54 PT","lifetime":"0:28:43","issue_title":"dx(tests): test_agent_runner_entrypoint"},{"agent_id":"fed09876-aaaa-bbbb-cccc-deadbeefaa11","issue_number":3196,"pr_number":3195,"merged_utc":"2026-04-24T11:20:00Z","merged_pt":"04:20:00 PT","lifetime":"0:10:00","issue_title":"not actually merged"}]
 GREENS
 # pending commands
 elif [[ "$sql" == *"dispatcher.commands"* ]]; then
@@ -175,6 +194,28 @@ if printf '%s' "$out" | grep -q "#3193.*cleanup_blocked/succeeded.*PR #3194"; th
     pass "happy path: terminal row renders with PR number"
 else
     fail "happy path: terminal row" "out: $out"
+fi
+
+# ─── Test 4b: Greens keep only MERGED PRs, checked via gh (#3752) ───────
+greens_section=$(printf '%s\n' "$out" | awk '/── daemon-shipped greens/{on=1; next} /^── /{on=0} on')
+if printf '%s' "$greens_section" | grep -q "PR #3194  #3193"; then
+    pass "greens: merged PR #3194 is listed"
+else
+    fail "greens: merged PR #3194 listed" "greens: $greens_section"
+fi
+if printf '%s' "$greens_section" | grep -q "PR #3195"; then
+    fail "greens: open PR #3195 is dropped" "greens: $greens_section"
+else
+    pass "greens: open PR #3195 is dropped"
+fi
+want_calls="pr view 3194 --repo judgemind/judgemind --json state -q .state
+pr view 3195 --repo judgemind/judgemind --json state -q .state"
+got_calls=$(cat "$FAKE_GH_LOG" 2>/dev/null || true)
+if [[ "$got_calls" == "$want_calls" ]]; then
+    pass "greens: one gh pr view per green, with the expected arguments"
+else
+    fail "greens: gh calls" "want: $want_calls
+got: $got_calls"
 fi
 
 # ─── Test 5: Cap/breaker section renders config ─────────────────────────

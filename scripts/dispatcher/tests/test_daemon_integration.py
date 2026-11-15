@@ -48,6 +48,11 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
+
+#: ``ensure_baseline_clone`` runs ``gh auth setup-git`` before cloning so git
+#: can use gh's credentials. Tests answer it with success (#5075).
+GH_SETUP_GIT = "auth setup-git"
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +204,7 @@ def _make_bare_origin(tmp_path: Path) -> Path:
 
 
 def test_ensure_baseline_clone_against_local_bare_origin(
-    monkeypatch: Any, tmp_path: Path
+    monkeypatch: Any, tmp_path: Path, fake_gh: FakeGh
 ) -> None:
     """Real ``git clone`` against a local bare repo succeeds and produces a
     valid ``.git`` directory.
@@ -216,11 +221,9 @@ def test_ensure_baseline_clone_against_local_bare_origin(
 
     d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
 
-    # ensure_baseline_clone() calls ``gh auth setup-git`` first; that will
-    # raise FileNotFoundError in a test environment without ``gh`` installed,
-    # but the daemon already handles that case gracefully (logs
-    # ``gh_setup_git_missing`` and continues).  The integration test must
-    # succeed whether or not ``gh`` is present.
+    # ensure_baseline_clone() calls ``gh auth setup-git`` first; the fake
+    # gh answers it (#5075) and the test asserts it was called.
+    fake_gh.expect(GH_SETUP_GIT)
     d.ensure_baseline_clone()
 
     # Clone created a valid git repo.
@@ -239,7 +242,7 @@ def test_ensure_baseline_clone_against_local_bare_origin(
 
 
 def test_create_worktree_against_real_baseline(
-    monkeypatch: Any, tmp_path: Path
+    monkeypatch: Any, tmp_path: Path, fake_gh: FakeGh
 ) -> None:
     """``_create_worktree`` runs ``git -C <baseline> worktree add`` against a
     real cloned baseline and produces a valid worktree on disk.
@@ -255,6 +258,7 @@ def test_create_worktree_against_real_baseline(
     monkeypatch.setattr(daemon, "BASELINE_CLONE_URL", str(origin))
 
     d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+    fake_gh.expect(GH_SETUP_GIT)
     d.ensure_baseline_clone()
 
     # Now exercise the real worktree creation.
@@ -285,7 +289,7 @@ def test_create_worktree_against_real_baseline(
 
 
 def test_ensure_baseline_clone_fetches_when_path_exists(
-    monkeypatch: Any, tmp_path: Path
+    monkeypatch: Any, tmp_path: Path, fake_gh: FakeGh
 ) -> None:
     """Calling ``ensure_baseline_clone()`` a second time on an existing clone
     follows the fetch branch, not the clone branch.
@@ -300,6 +304,7 @@ def test_ensure_baseline_clone_fetches_when_path_exists(
     monkeypatch.setattr(daemon, "BASELINE_CLONE_URL", str(origin))
 
     d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+    fake_gh.expect(GH_SETUP_GIT)
 
     # First call — should clone.
     d.ensure_baseline_clone()
@@ -326,25 +331,43 @@ def test_ensure_baseline_clone_fetches_when_path_exists(
 # ---------------------------------------------------------------------------
 
 
-def test_check_issue_author_script_is_executable_and_routes_exit_codes() -> None:
-    """``scripts/check-issue-author.sh`` exists, is executable, and returns a
-    non-zero exit code with non-empty stderr for a nonexistent issue number.
+@pytest.mark.parametrize(
+    ("gh_stdout", "gh_stderr", "gh_exit", "want_rc", "want_text"),
+    [
+        ("MEMBER drewthaler\n", "", 0, 0, "TRUSTED: Issue #999999999"),
+        ("NONE outsider\n", "", 0, 1, "UNTRUSTED: Issue #999999999"),
+        ("", "gh: Not Found (HTTP 404)\n", 1, 2, "ERROR: Failed to fetch issue"),
+    ],
+    ids=["trusted", "untrusted", "api-404"],
+)
+def test_check_issue_author_script_is_executable_and_routes_exit_codes(
+    fake_gh: FakeGh,
+    gh_stdout: str,
+    gh_stderr: str,
+    gh_exit: int,
+    want_rc: int,
+    want_text: str,
+) -> None:
+    """``scripts/check-issue-author.sh`` exists, is executable, and routes the
+    ``gh api`` answer to its documented exit codes (0 trusted, 1 untrusted,
+    2 API error).
 
-    Issue 999999999 does not exist on GitHub, so ``gh api`` returns a 404 or
-    the ``set -euo pipefail`` script exits non-zero.  This test verifies:
-    * The script is on disk at the expected path.
-    * The script is executable (mode bit set).
-    * A non-zero exit is returned for a clearly invalid input.
-    * ``stderr`` is non-empty (the script or ``gh`` emits an error message).
-
-    The test does NOT require ``gh`` to be authenticated — an unauthenticated
-    ``gh api`` call still returns a deterministic non-zero exit code.
+    ``gh`` is the ``fake_gh`` fixture (#5075): the test asserts the exact
+    ``gh api`` call the script makes and never reaches GitHub.
     """
     repo_root = Path(__file__).resolve().parents[3]  # worktree root
     script = repo_root / "scripts" / "check-issue-author.sh"
 
     assert script.exists(), f"script not found: {script}"
     assert script.stat().st_mode & 0o111, f"script not executable: {script}"
+
+    fake_gh.expect(
+        "api repos/judgemind/judgemind/issues/999999999 "
+        '--jq "\\(.author_association) \\(.user.login)"',
+        stdout=gh_stdout,
+        stderr=gh_stderr,
+        exit_code=gh_exit,
+    )
 
     result = subprocess.run(
         [str(script), "999999999"],
@@ -353,11 +376,8 @@ def test_check_issue_author_script_is_executable_and_routes_exit_codes() -> None
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"expected non-zero exit for nonexistent issue, got {result.returncode}; "
+    assert result.returncode == want_rc, (
+        f"expected exit {want_rc}, got {result.returncode}; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert result.stderr.strip(), (
-        f"expected non-empty stderr for nonexistent issue, got empty; "
-        f"stdout={result.stdout!r}"
-    )
+    assert want_text in result.stdout + result.stderr

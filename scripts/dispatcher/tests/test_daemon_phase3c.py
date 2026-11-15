@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -42,6 +44,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fake_gh import FakeGh  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -731,7 +734,7 @@ class TestProcessRetryMarkers:
     # ------------------------------------------------------------------
 
     def test_daemon_restart_takes_terminal_and_reclaim_path(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """After #2925: ``daemon_restart_abandoned`` takes the terminal-and-reclaim path.
 
@@ -743,6 +746,10 @@ class TestProcessRetryMarkers:
         The ``retries_used`` column is still not incremented (preservation
         semantics carry over to the terminal-and-reclaim path).
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 42 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
             [
@@ -792,7 +799,7 @@ class TestProcessRetryMarkers:
         assert handler.events("retry_processed") == []
 
     def test_killswitch_takes_terminal_and_reclaim_path(
-        self, monkeypatch: Any, tmp_path: Path
+        self, fake_gh: FakeGh, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """After #2925: ``paused_by_killswitch`` takes the terminal-and-reclaim path.
 
@@ -800,6 +807,10 @@ class TestProcessRetryMarkers:
         asserted reset-to-retrying behavior; after #2925 it asserts
         the terminal path.
         """
+        # The terminal path releases the status/in-progress label (#2927).
+        fake_gh.expect(
+            "issue edit 43 --repo judgemind/judgemind --remove-label status/in-progress"
+        )
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
             [
@@ -1650,6 +1661,7 @@ class TestResumeRetryingAgent:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("fake_gh_blocked_scan")
 class TestSchedulerTickRateLimit:
     def test_scheduler_tick_skips_claim_when_rate_limited(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)

@@ -26,6 +26,18 @@
 # to PATH afterwards; the fake wins over the shim. pytest suites get the same
 # protection from the gh-isolate block in each test root's conftest.py.
 #
+# A shim hit FAILS the test (#5075). A test that falls through to the shim
+# only exercises a "gh exited 4" branch, and the shim's stderr is often
+# captured and lost. The shim appends the call to $GH_ISOLATE_HITS
+# (${TMPDIR:-/tmp}/gh-isolate-hits.<test pid>) and sends the test process
+# (GH_ISOLATE_PID, set here to $$) SIGUSR1. The USR1 trap below prints
+# "FAIL: real gh called from a test", the test name and each gh command, and
+# exits 1 once the current command finishes. A signal trap is used rather
+# than an EXIT trap because most tests install their own `trap cleanup EXIT`,
+# which would replace ours; that EXIT trap still runs after our `exit 1`.
+# A test that calls the shim on purpose (a test of this helper) exports
+# GH_ISOLATE_ALLOW_HITS=1 in the process that sources the helper.
+#
 # bash 3.2 compatible.
 
 _gh_isolate_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/gh-isolate"
@@ -41,6 +53,21 @@ GH_CONFIG_DIR="$_gh_isolate_dir/config"
 GH_NO_UPDATE_NOTIFIER=1
 GH_PROMPT_DISABLED=1
 GH_ISOLATE_TEST="$0"
+GH_ISOLATE_PID=$$
+GH_ISOLATE_HITS="${TMPDIR:-/tmp}/gh-isolate-hits.$$"
 PATH="$_gh_isolate_dir/bin:$PATH"
-export GH_CONFIG_DIR GH_NO_UPDATE_NOTIFIER GH_PROMPT_DISABLED GH_ISOLATE_TEST PATH
+export GH_CONFIG_DIR GH_NO_UPDATE_NOTIFIER GH_PROMPT_DISABLED GH_ISOLATE_TEST \
+    GH_ISOLATE_PID GH_ISOLATE_HITS PATH
 unset _gh_isolate_dir
+rm -f "$GH_ISOLATE_HITS"  # a leftover from an earlier process with this pid
+
+_gh_isolate_on_hit() {
+    echo "FAIL: real gh called from a test (#5075): $GH_ISOLATE_TEST ran gh commands that reached the gh shim:" >&2
+    if [ -f "$GH_ISOLATE_HITS" ]; then
+        sed 's/^/  /' "$GH_ISOLATE_HITS" >&2
+        rm -f "$GH_ISOLATE_HITS"
+    fi
+    echo "Fix: install a fake gh for these calls (write a gh script, prepend its directory to PATH) and assert the calls it receives." >&2
+    exit 1
+}
+trap _gh_isolate_on_hit USR1
