@@ -12,8 +12,10 @@
 # The cache filled up again in 2026-11 (#4474) after a node bump in 2026-06:
 # the real cause was that nothing removed already-consumed stream entries, so
 # a bigger node only delayed the OOM. The ingestion worker now trims acked
-# entries every minute (framework.events.trim_consumed_entries), and every
-# XADD carries a MAXLEN backstop, so memory stays bounded.
+# entries every minute (framework.events.trim_consumed_entries), and the
+# producer refuses an XADD once the unconsumed backlog reaches STREAM_MAXLEN
+# (counted as a failed emit on the scraper run, #5009), so memory stays
+# bounded without dropping unconsumed events.
 #
 # Two thresholds:
 #   - 80% warn: dashboard-only (no notification). It shows up on the

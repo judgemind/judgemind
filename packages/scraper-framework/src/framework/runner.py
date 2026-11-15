@@ -7,7 +7,13 @@ local-only mode (no archival) for development.
 
 Reads REDIS_URL from the environment. When set, document.captured and
 scraper.health events are emitted to Redis Streams. When unset, event
-emission is silently skipped.
+emission is skipped. When set but Redis is unreachable, or an emit still
+fails after retries, each affected document counts as a failed emit and the
+run is recorded as a failure (#5009).
+
+A document that was fetched but failed to archive or emit counts in
+``scraper_runs.records_failed``, with per-stage counts and the affected
+source URLs / S3 keys in ``scraper_runs.error_details``.
 
 Reads DATABASE_URL from the environment. When set, each scraper run is
 recorded in the ``scraper_runs`` table. When unset, run recording is
@@ -32,6 +38,7 @@ from typing import Any
 
 import psycopg
 import structlog
+from psycopg.types.json import Jsonb
 
 from .event_bus import RedisEventBus
 from .models import ScraperConfig, ScraperHealthEvent
@@ -268,8 +275,9 @@ def record_scraper_run(
                 """
                 INSERT INTO scraper_runs
                     (scraper_id, court_id, started_at, completed_at, status,
-                     records_captured, records_failed, error_message, response_time_ms)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     records_captured, records_failed, error_message, response_time_ms,
+                     error_details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     health.scraper_id,
@@ -278,9 +286,11 @@ def record_scraper_run(
                     completed_at,
                     status,
                     health.records_captured,
-                    0,  # records_failed not tracked by ScraperHealthEvent
+                    # Documents fetched but not archived / not emitted (#5009).
+                    health.records_failed,
                     health.error_message,
                     response_time_ms,
+                    Jsonb(health.failure_details) if health.failure_details else None,
                 ),
             )
         logger.info(
@@ -288,6 +298,7 @@ def record_scraper_run(
             scraper_id=health.scraper_id,
             status=status,
             records=health.records_captured,
+            records_failed=health.records_failed,
         )
     except Exception as exc:
         logger.warning("Failed to record scraper run", scraper_id=health.scraper_id, error=str(exc))

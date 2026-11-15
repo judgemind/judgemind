@@ -109,6 +109,58 @@ class TestRunScrapersWithoutArchival:
         assert exit_code == 0
 
 
+class TestRunScrapersCaptureFailures:
+    """End-to-end through run_scrapers: lost captures are not a green run (#5009)."""
+
+    def _run(self, env: dict[str, str], **patches: Any) -> tuple[int, list[ScraperHealthEvent]]:
+        import redis
+
+        recorded: list[ScraperHealthEvent] = []
+        entries = [("test-stub", lambda **kw: StubScraper(docs=[_make_doc()], **kw), _stub_config)]
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, env),
+            patch("framework.runner._connect_db", return_value=MagicMock()),
+            patch("framework.runner._fetch_rosters"),
+            patch("framework.base.content_hash_seen_at", return_value=None),
+            patch(
+                "framework.runner.record_scraper_run",
+                side_effect=lambda conn, health, config, cache: recorded.append(health),
+            ),
+            patch(
+                "framework.event_bus.redis.Redis.from_url",
+                side_effect=redis.ConnectionError("Connection refused"),
+            ),
+            patch(
+                "framework.runner.S3Archiver.archive",
+                **patches.get("archive", {"return_value": "ca/test/key.html"}),
+            ),
+        ):
+            exit_code = run_scrapers()
+        return exit_code, recorded
+
+    def test_event_bus_unavailable_with_redis_url_fails_run(self) -> None:
+        exit_code, recorded = self._run(
+            {"JUDGEMIND_ARCHIVE_BUCKET": "my-bucket", "REDIS_URL": "redis://unreachable:6379"}
+        )
+        assert exit_code == 1
+        assert recorded[0].success is False
+        assert recorded[0].records_failed == 1
+        assert recorded[0].failure_details["records_failed_emit"] == 1
+
+    def test_archive_failure_fails_run(self) -> None:
+        from botocore.exceptions import ClientError
+
+        err = ClientError({"Error": {"Code": "NoSuchBucket", "Message": "x"}}, "PutObject")
+        env = {"JUDGEMIND_ARCHIVE_BUCKET": "no-such-bucket"}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("REDIS_URL", None)
+            exit_code, recorded = self._run(env, archive={"side_effect": err})
+        assert exit_code == 1
+        assert recorded[0].success is False
+        assert recorded[0].failure_details["records_failed_archive"] == 1
+
+
 class TestRunScrapersWithArchival:
     def test_creates_archiver_when_bucket_set(self) -> None:
         doc = _make_doc()
@@ -121,9 +173,12 @@ class TestRunScrapersWithArchival:
 
         entries = [("test-stub", CapturingStub, _stub_config)]
 
+        # The S3 write is stubbed: this test once passed only because a failed
+        # archive was swallowed and the run still recorded success (#5009).
         with (
             _patch_registry(entries),
             patch.dict(os.environ, {"JUDGEMIND_ARCHIVE_BUCKET": "my-bucket"}),
+            patch("framework.runner.S3Archiver.archive", return_value="ca/test/key.html"),
         ):
             exit_code = run_scrapers()
 
@@ -988,6 +1043,49 @@ class TestRecordScraperRun:
         assert params[6] == 0  # records_failed
         assert params[7] is None  # error_message
         assert params[8] == 1500  # response_time_ms
+
+    def test_records_capture_failure_counts_and_details(self) -> None:
+        """records_failed and error_details carry the #5009 per-stage counts."""
+        from psycopg.types.json import Jsonb
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        details = {
+            "documents_fetched": 3,
+            "records_failed_archive": 1,
+            "records_failed_emit": 1,
+            "records_failed_process": 0,
+            "failed_documents": [],
+            "failed_documents_truncated": False,
+        }
+        health = self._make_health(success=False, records=1, error="2 of 3 not captured")
+        health.records_failed = 2
+        health.failure_details = details
+
+        record_scraper_run(mock_conn, health, self._make_config(), {("CA", "Test"): None})
+
+        sql, params = mock_cursor.execute.call_args[0]
+        assert "error_details" in sql
+        assert params[4] == "failure"
+        assert params[6] == 2  # records_failed
+        assert isinstance(params[9], Jsonb)
+        assert params[9].obj == details
+
+    def test_clean_run_writes_null_error_details(self) -> None:
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        record_scraper_run(
+            mock_conn, self._make_health(), self._make_config(), {("CA", "Test"): None}
+        )
+
+        _sql, params = mock_cursor.execute.call_args[0]
+        assert params[6] == 0
+        assert params[9] is None
 
     def test_records_failed_run(self) -> None:
         """Should insert a row with status 'failure' and error message."""

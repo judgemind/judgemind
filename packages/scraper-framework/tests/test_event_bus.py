@@ -11,7 +11,7 @@ import pytest
 import redis
 
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
-from framework.event_bus import RedisEventBus
+from framework.event_bus import EventBusUnavailable, EventEmitError, RedisEventBus
 from framework.events import DEFAULT_HEALTH_STREAM_MAXLEN, DEFAULT_STREAM_MAXLEN, EventBus
 
 # ---------------------------------------------------------------------------
@@ -163,19 +163,21 @@ class TestRedisEventBusConnected:
 
 
 class TestRedisEventBusErrorHandling:
-    def test_connection_failure_degrades_gracefully(self) -> None:
+    """With REDIS_URL set, a document.captured emit never fails silently (#5009)."""
+
+    def test_event_bus_unavailable_at_startup_raises_on_emit(self) -> None:
         with patch(
             "framework.event_bus.redis.Redis.from_url",
             side_effect=redis.ConnectionError("Connection refused"),
         ):
             bus = RedisEventBus(redis_url="redis://bad-host:6379")
+            assert bus._inner is None
+            # Before #5009 this returned None and the document counted as
+            # captured although no event existed.
+            with pytest.raises(EventBusUnavailable, match="Connection refused"):
+                bus.emit_document_captured(_make_doc(), producer_id="test")
 
-        assert bus._inner is None
-        # Should still work (no-op)
-        result = bus.emit_document_captured(_make_doc(), producer_id="test")
-        assert result is None
-
-    def test_ping_failure_degrades_gracefully(self) -> None:
+    def test_ping_failure_leaves_bus_unconnected(self) -> None:
         mock_client = MagicMock(spec=redis.Redis)
         mock_client.ping.side_effect = redis.ConnectionError("Connection refused")
 
@@ -183,17 +185,81 @@ class TestRedisEventBusErrorHandling:
             bus = RedisEventBus(redis_url="redis://bad-host:6379")
 
         assert bus._inner is None
+        assert bus.enabled is True
 
-    def test_emit_failure_returns_none(self) -> None:
+    def test_event_bus_unavailable_reconnect_is_rate_limited(self) -> None:
+        from_url = MagicMock(side_effect=redis.ConnectionError("down"))
+        with (
+            patch("framework.event_bus.redis.Redis.from_url", from_url),
+            patch("framework.event_bus.time.monotonic", side_effect=[100.0, 110.0, 131.0, 131.0]),
+        ):
+            bus = RedisEventBus(redis_url="redis://bad-host:6379")  # t=100: attempt 1
+            with pytest.raises(EventBusUnavailable):
+                bus.emit_document_captured(_make_doc(), producer_id="test")  # t=110: skip
+            with pytest.raises(EventBusUnavailable):
+                bus.emit_document_captured(_make_doc(), producer_id="test")  # t=131: retry
+        assert from_url.call_count == 2
+
+    def test_event_bus_unavailable_recovers_when_redis_returns(self) -> None:
+        good = MagicMock(spec=redis.Redis)
+        good.ping.return_value = True
+        good.xlen.return_value = 0
+        good.xadd.return_value = b"1-0"
+        from_url = MagicMock(side_effect=[redis.ConnectionError("down"), good])
+        with (
+            patch("framework.event_bus.redis.Redis.from_url", from_url),
+            patch("framework.event_bus.time.monotonic", side_effect=[100.0, 200.0, 200.0]),
+        ):
+            bus = RedisEventBus(redis_url="redis://flaky:6379")
+            assert bus.emit_document_captured(_make_doc(), producer_id="test") == b"1-0"
+
+    def test_failed_emit_is_retried_then_succeeds(self) -> None:
         mock_client = MagicMock(spec=redis.Redis)
         mock_client.ping.return_value = True
+        mock_client.xlen.return_value = 0
+        mock_client.xadd.side_effect = [redis.ConnectionError("blip"), b"1-0"]
+
+        with patch("framework.event_bus.redis.Redis.from_url", return_value=mock_client):
+            bus = RedisEventBus(redis_url="redis://localhost:6379")
+
+        with patch("framework.event_bus.time.sleep") as sleep:
+            assert bus.emit_document_captured(_make_doc(), producer_id="test") == b"1-0"
+        assert mock_client.xadd.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    def test_failed_emit_retried_then_raises(self) -> None:
+        mock_client = MagicMock(spec=redis.Redis)
+        mock_client.ping.return_value = True
+        mock_client.xlen.return_value = 0
         mock_client.xadd.side_effect = redis.ConnectionError("Lost connection")
 
         with patch("framework.event_bus.redis.Redis.from_url", return_value=mock_client):
             bus = RedisEventBus(redis_url="redis://localhost:6379")
 
-        result = bus.emit_document_captured(_make_doc(), producer_id="test")
-        assert result is None
+        with (
+            patch("framework.event_bus.time.sleep") as sleep,
+            pytest.raises(EventEmitError, match="after 3 attempts: Lost connection"),
+        ):
+            bus.emit_document_captured(_make_doc(), producer_id="test")
+        assert mock_client.xadd.call_count == 3
+        assert [c.args[0] for c in sleep.call_args_list] == [0.5, 1.0]
+
+    def test_backlog_full_is_not_retried(self) -> None:
+        mock_client = MagicMock(spec=redis.Redis)
+        mock_client.ping.return_value = True
+        mock_client.xlen.return_value = 20_000
+        mock_client.xinfo_groups.return_value = []  # nothing provably consumed
+
+        with patch("framework.event_bus.redis.Redis.from_url", return_value=mock_client):
+            bus = RedisEventBus(redis_url="redis://localhost:6379")
+
+        with (
+            patch("framework.event_bus.time.sleep") as sleep,
+            pytest.raises(EventEmitError, match="backlog full"),
+        ):
+            bus.emit_document_captured(_make_doc(), producer_id="test")
+        mock_client.xadd.assert_not_called()
+        sleep.assert_not_called()
 
     def test_emit_health_failure_returns_none(self) -> None:
         mock_client = MagicMock(spec=redis.Redis)
@@ -314,25 +380,27 @@ class TestHearingDateSerialization:
 
 
 # ---------------------------------------------------------------------------
-# Tests: MAXLEN trimming (#168)
+# Tests: stream caps (#168, #4474, #5009)
 # ---------------------------------------------------------------------------
 
 
 class TestStreamMaxlen:
-    """Verify that xadd calls include MAXLEN ~ to bound stream size."""
+    """document.captured is capped by refusing XADDs, never by MAXLEN trimming
+    (#5009); scraper.health keeps its MAXLEN ~ cap (nothing consumes it)."""
 
-    def test_emit_document_captured_passes_maxlen(self) -> None:
-        """xadd for document.captured must include maxlen and approximate."""
+    def test_emit_document_captured_never_passes_maxlen(self) -> None:
+        """An approximate MAXLEN drops the oldest entries whether or not they
+        were consumed, so the document.captured XADD must not carry one."""
         mock_redis = MagicMock()
         mock_redis.xadd.return_value = b"1234-0"
+        mock_redis.xlen.return_value = 0
         bus = EventBus(mock_redis)
 
-        doc = _make_doc()
-        bus.emit_document_captured(doc, producer_id="test")
+        bus.emit_document_captured(_make_doc(), producer_id="test")
 
         call_args = mock_redis.xadd.call_args
-        assert call_args.kwargs["maxlen"] == DEFAULT_STREAM_MAXLEN
-        assert call_args.kwargs["approximate"] is True
+        assert "maxlen" not in call_args.kwargs
+        assert "minid" not in call_args.kwargs
 
     def test_emit_health_passes_maxlen(self) -> None:
         """xadd for scraper.health must include maxlen and approximate."""
@@ -340,74 +408,39 @@ class TestStreamMaxlen:
         mock_redis.xadd.return_value = b"1234-0"
         bus = EventBus(mock_redis)
 
-        health = _make_health()
-        bus.emit_health(health)
+        bus.emit_health(_make_health())
 
         call_args = mock_redis.xadd.call_args
         assert call_args.kwargs["maxlen"] == DEFAULT_HEALTH_STREAM_MAXLEN
         assert call_args.kwargs["approximate"] is True
 
-    def test_custom_maxlen_via_constructor(self) -> None:
-        """EventBus accepts an explicit maxlen override."""
-        mock_redis = MagicMock()
-        mock_redis.xadd.return_value = b"1234-0"
-        bus = EventBus(mock_redis, maxlen=500)
-
-        doc = _make_doc()
-        bus.emit_document_captured(doc, producer_id="test")
-
-        call_args = mock_redis.xadd.call_args
-        assert call_args.kwargs["maxlen"] == 500
-
-    def test_stream_maxlen_env_var_override(self) -> None:
-        """STREAM_MAXLEN env var overrides the default."""
-        mock_redis = MagicMock()
-        mock_redis.xadd.return_value = b"1234-0"
-
-        with patch.dict(os.environ, {"STREAM_MAXLEN": "5000"}):
-            bus = EventBus(mock_redis)
-
-        doc = _make_doc()
-        bus.emit_document_captured(doc, producer_id="test")
-
-        call_args = mock_redis.xadd.call_args
-        assert call_args.kwargs["maxlen"] == 5000
-
     def test_default_stream_maxlen_value(self) -> None:
-        """The default document.captured MAXLEN backstop is 20_000 (#4474)."""
+        """The default document.captured cap is 20_000 (#4474)."""
         assert DEFAULT_STREAM_MAXLEN == 20_000
+        assert EventBus(MagicMock())._maxlen == DEFAULT_STREAM_MAXLEN
 
     @pytest.mark.parametrize(
         "maxlen_str,expected",
         [("1", 1), ("100", 100), ("5000", 5000), ("12345", 12345), ("50000", 50000)],
     )
     def test_stream_maxlen_env_var_parametrized(self, maxlen_str: str, expected: int) -> None:
-        """STREAM_MAXLEN env var override works for each parametrized value."""
-        mock_redis = MagicMock()
-        mock_redis.xadd.return_value = b"1234-0"
-
+        """STREAM_MAXLEN env var sets the cap."""
         with patch.dict(os.environ, {"STREAM_MAXLEN": maxlen_str}):
-            bus = EventBus(mock_redis)
+            bus = EventBus(MagicMock())
+        assert bus._maxlen == expected
 
-        doc = _make_doc()
-        bus.emit_document_captured(doc, producer_id="test")
+    @pytest.mark.parametrize("maxlen", [1, 100, 5000, 12345, 50000])
+    def test_stream_maxlen_constructor_parametrized(self, maxlen: int) -> None:
+        """EventBus constructor maxlen= sets the cap."""
+        assert EventBus(MagicMock(), maxlen=maxlen)._maxlen == maxlen
 
-        assert mock_redis.xadd.call_args.kwargs["maxlen"] == expected
-
-    @pytest.mark.parametrize(
-        "maxlen,expected",
-        [(1, 1), (100, 100), (5000, 5000), (12345, 12345), (50000, 50000)],
-    )
-    def test_stream_maxlen_constructor_parametrized(self, maxlen: int, expected: int) -> None:
-        """EventBus constructor maxlen= arg works for each parametrized value."""
+    def test_emit_under_cap_skips_trim(self) -> None:
         mock_redis = MagicMock()
         mock_redis.xadd.return_value = b"1234-0"
-        bus = EventBus(mock_redis, maxlen=maxlen)
-
-        doc = _make_doc()
-        bus.emit_document_captured(doc, producer_id="test")
-
-        assert mock_redis.xadd.call_args.kwargs["maxlen"] == expected
+        mock_redis.xlen.return_value = 499
+        EventBus(mock_redis, maxlen=500).emit_document_captured(_make_doc(), producer_id="t")
+        mock_redis.xinfo_groups.assert_not_called()
+        mock_redis.xadd.assert_called_once()
 
     def test_stream_maxlen_emit_document_propagates_xadd_exception(self) -> None:
         """Raw EventBus does not swallow xadd exceptions for document.captured."""

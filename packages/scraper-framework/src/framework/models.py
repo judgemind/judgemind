@@ -213,6 +213,13 @@ class ScraperHealthEvent(EventEnvelope):
     scraper_id: str
     success: bool
     records_captured: int
+    #: Documents fetched but not fully captured: failed before archive, failed
+    #: to archive, or archived but not emitted (#5009).  Any non-zero value
+    #: makes ``success`` False.
+    records_failed: int = 0
+    #: Per-stage counts and sample failures (``CaptureFailures.details``),
+    #: written to ``scraper_runs.error_details``.  None when nothing failed.
+    failure_details: dict[str, Any] | None = None
     response_time_seconds: float
     error_message: str | None = None
     run_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))

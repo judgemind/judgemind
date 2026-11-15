@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,10 +28,11 @@ from framework.events import (
     STREAM_DOCUMENT_CAPTURED,
     STREAM_SCRAPER_HEALTH,
     EventBus,
+    StreamBacklogFull,
     consumed_floor_id,
     trim_consumed_entries,
 )
-from framework.models import ScraperHealthEvent
+from framework.models import CapturedDocument, ContentFormat, ScraperHealthEvent
 from ingestion import worker as worker_mod
 from ingestion.worker import IngestionWorker
 
@@ -223,6 +225,91 @@ def _health() -> ScraperHealthEvent:
         records_captured=1,
         response_time_seconds=1.0,
     )
+
+
+class AppendingStreamRedis(FakeStreamRedis):
+    """FakeStreamRedis that also models XADD (append-only, no implicit trim)."""
+
+    def __init__(self, n_entries: int) -> None:
+        super().__init__(n_entries)
+        self.xadd_calls: list[dict] = []
+        self._next = n_entries
+
+    def xadd(self, stream: str, fields: dict, **kwargs: object) -> str:
+        self.xadd_calls.append(kwargs)
+        sid = _sid(self._next)
+        self._next += 1
+        self.entries.append(sid)
+        return sid
+
+
+def _doc() -> CapturedDocument:
+    return CapturedDocument(
+        scraper_id="s",
+        state="CA",
+        county="Orange",
+        court="Superior Court",
+        source_url="https://example.com/r",
+        capture_timestamp=datetime(2026, 11, 1, tzinfo=UTC),
+        content_format=ContentFormat.PDF,
+        raw_content=b"%PDF",
+        content_hash="h",
+        s3_key="ca/orange/superior_court/raw/h.pdf",
+    )
+
+
+class TestProducerNeverDropsUnconsumed:
+    """Trimming with consumer lag must never drop an unconsumed event (#5009).
+
+    Before #5009 every XADD carried ``MAXLEN ~ 20000``: once a stalled worker
+    let the backlog reach the cap, each new event silently pushed the oldest
+    *unconsumed* event out of the stream.
+    """
+
+    def test_trimming_with_lag_keeps_every_unconsumed_entry(self) -> None:
+        # Cap 10, stream full, worker has consumed through entry 4.
+        r = AppendingStreamRedis(10)
+        r.groups["ingestion-workers"] = (4, [])
+        unconsumed = [_sid(i) for i in range(5, 10)]
+
+        EventBus(r, maxlen=10).emit_document_captured(_doc(), producer_id="s")
+
+        # Room was made by trimming acknowledged entries only.
+        assert all(sid in r.entries for sid in unconsumed)
+        assert r.entries[-1] == _sid(10)
+        assert len(r.entries) <= 10
+        assert r.xadd_calls == [{}]  # no MAXLEN / MINID on the XADD itself
+
+    def test_trimming_with_lag_respects_pending_entries(self) -> None:
+        r = AppendingStreamRedis(10)
+        r.groups["ingestion-workers"] = (9, [2])  # entry 2 delivered, never acked
+        EventBus(r, maxlen=10).emit_document_captured(_doc(), producer_id="s")
+        assert _sid(2) in r.entries
+
+    def test_backlog_of_unconsumed_entries_at_cap_refuses_xadd(self) -> None:
+        # Worker stalled before reading anything: every entry is unconsumed.
+        r = AppendingStreamRedis(10)
+        r.groups["ingestion-workers"] = (None, [])
+        before = list(r.entries)
+
+        with pytest.raises(StreamBacklogFull, match="10 unconsumed entries >= cap 10"):
+            EventBus(r, maxlen=10).emit_document_captured(_doc(), producer_id="s")
+
+        assert r.entries == before  # nothing dropped, nothing added
+        assert r.xadd_calls == []
+
+    def test_no_consumer_group_at_cap_refuses_xadd(self) -> None:
+        r = AppendingStreamRedis(10)
+        with pytest.raises(StreamBacklogFull):
+            EventBus(r, maxlen=10).emit_document_captured(_doc(), producer_id="s")
+        assert len(r.entries) == 10
+
+    def test_under_cap_appends_without_trimming(self) -> None:
+        r = AppendingStreamRedis(5)
+        r.groups["ingestion-workers"] = (None, [])
+        EventBus(r, maxlen=10).emit_document_captured(_doc(), producer_id="s")
+        assert len(r.entries) == 6
+        assert r.xtrim_calls == []
 
 
 class TestProducerCaps:
