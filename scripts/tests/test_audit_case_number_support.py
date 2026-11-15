@@ -7,6 +7,7 @@ rows and a stand-in for the ingest gate.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -118,6 +119,8 @@ def test_production_gate_uses_the_ingest_gate() -> None:
     # OCR text is never evidence (#4986): the audit reads the text layer.
     assert gate.extract_pdf is llm_extract.extract_text_layer
     assert gate.page_count is llm_extract.pdf_page_count
+    # The worker's own scanned-page rule (#5010).
+    assert gate.scanned_pages is llm_extract.pdf_scanned_pages
     assert gate.evidence_for("short") == ()
     text = "The court rules in 30-2026-01234567-CU-BC-CJC as follows. " * 5
     assert gate.evidence_for(text) == (text,)
@@ -552,6 +555,37 @@ def test_no_text_mode_min_pages_keeps_long_scans_only() -> None:
     assert summary["no_text"] == 1
     assert summary["no_text_over_10_pages"] == 1
     assert "NO_TEXT Santa Clara key=long.pdf chars=0 pages=22 rulings=1" in lines
+
+
+def test_no_text_mode_reports_text_pdfs_with_scanned_pages() -> None:
+    """#5010: a PDF whose text layer is evidence but which has scanned
+    pages is a ``MIXED`` key, written to the key list for a reingest."""
+    gate = _gate(
+        {"mixed.pdf": b"%PDF1", "text.pdf": b"%PDF2", "scan.pdf": b"%PDF3"},
+        extract_pdf=lambda c: "" if c == b"%PDF3" else LONG,
+        page_count=lambda c: 4,
+    )
+    gate = dataclasses.replace(
+        gate, scanned_pages=lambda c: [4] if c == b"%PDF1" else []
+    )
+    lines: list[str] = []
+    reports = audit.run_no_text(
+        _args("--no-text-pdfs", "Santa Clara", "--workers", "1"),
+        {"Santa Clara": ["mixed.pdf", "scan.pdf", "text.pdf"]},
+        {"mixed.pdf": 7},
+        gate,
+        None,
+        out=lines.append,
+    )
+    summary = reports[0].summary()
+    assert summary["mixed"] == 1
+    assert summary["mixed_scanned_pages"] == 1
+    assert summary["mixed_rulings"] == 7
+    assert summary["no_text"] == 1
+    assert (
+        "MIXED Santa Clara key=mixed.pdf pages=4 scanned_pages=[4] rulings=7" in lines
+    )
+    assert audit.no_text_key_list(reports) == "scan.pdf\nmixed.pdf\n"
 
 
 def test_probe_reads_page_count_only_without_evidence() -> None:

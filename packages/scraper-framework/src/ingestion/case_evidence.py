@@ -26,6 +26,11 @@ What counts as evidence:
   transcription (``PdfText.from_ocr``), so it is no evidence at any length
   (``from_ocr``, #4986), and nor is any slice of it.  The worker marks such
   an event (``TEXT_FROM_OCR_KEY``) and its children inherit the mark.
+- A text PDF with some scanned pages is OCR'd page by page (#5010).  Its
+  text as a whole is no evidence: the text-layer pages cannot refute a
+  number printed only on a scanned page.  A split child cut wholly from
+  the text-layer pages (``TEXT_LAYER_KEY``) keeps its own text as evidence
+  (``text_from_ocr``); one that reaches into OCR text has none.
 - A split child's own text, cut from the source by a deterministic
   splitter or a scraper, counts at any length (``own_text_evidence``): it
   is that ruling's whole source text, so a number the per-field LLM
@@ -65,9 +70,43 @@ INHERITED_CASE_NUMBER_KEY = "_inherited_case_number"
 
 #: Event key the worker sets when the event's document text is the LLM's
 #: OCR transcription of a PDF with no text layer (``PdfText.from_ocr``,
-#: #4986).  Split children inherit it with the rest of the event.  The text
-#: of such an event, and any slice of it, is no evidence.
+#: #4986), or a PDF's text that holds OCR text or lacks scanned pages
+#: (#5010).  Split children inherit it with the rest of the event.  The text
+#: of such an event, and any slice of it outside ``TEXT_LAYER_KEY``, is no
+#: evidence.
 TEXT_FROM_OCR_KEY = "_text_from_ocr"
+
+#: Event key the worker sets next to ``TEXT_FROM_OCR_KEY`` when only some
+#: of the PDF's pages were scanned (``PdfText.text_layer``, #5010): the
+#: runs of text-layer pages around the OCR'd and unread pages.  Split
+#: children inherit it.  A child whose text lies inside one of them was
+#: cut from the court's own text, so its text is evidence; the document as
+#: a whole, and any slice that reaches past a run, is not.
+TEXT_LAYER_KEY = "_text_layer"
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def text_from_ocr(event_data: dict, text: str | None) -> bool:
+    """Whether *text*, a split child's slice of the event's document text,
+    holds OCR output or reaches past the court's text layer (#4986, #5010).
+
+    False when the event's text is all text layer.  Otherwise True, unless
+    *text* lies wholly inside one run of text-layer pages
+    (``TEXT_LAYER_KEY``; whitespace is ignored, since splitters normalise
+    page joins): only the OCR'd parts are excluded from evidence.  The
+    document as a whole is judged by ``TEXT_FROM_OCR_KEY`` alone: when it
+    holds OCR text or lacks pages, its text layer cannot refute a number
+    printed only on a scanned page.
+    """
+    if not event_data.get(TEXT_FROM_OCR_KEY):
+        return False
+    needle = _squash(text or "")
+    if not needle:
+        return True
+    return not any(needle in _squash(run) for run in event_data.get(TEXT_LAYER_KEY) or ())
 
 
 def _usable(text: str | None) -> bool:

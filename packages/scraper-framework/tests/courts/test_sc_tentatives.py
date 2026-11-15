@@ -509,7 +509,7 @@ def test_issue_4667_parse_document_uses_header_date(
     from framework import CapturedDocument, ContentFormat
 
     text = (FIXTURES / fixture).read_text()
-    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw: text)
+    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw, **_kw: text)
     scraper = SCTentativeRulingsScraper(config=sc_default_config())
     doc = CapturedDocument(
         scraper_id="ca-sc-tentatives-civil",
@@ -532,7 +532,7 @@ def test_issue_4667_parse_document_corrects_header_year_typo(
     from framework import CapturedDocument, ContentFormat
 
     text = "Department 16\nDATE: 9/16/2025 TIME: 9:00 A.M. and 9:01 A.M\nbody\n"
-    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw: text)
+    monkeypatch.setattr(sc_mod, "extract_pdf_text", lambda _raw, **_kw: text)
     scraper = SCTentativeRulingsScraper(config=sc_default_config())
     doc = CapturedDocument(
         scraper_id="ca-sc-tentatives-civil",

@@ -149,7 +149,7 @@ def test_oc_probate_header_variants_4808_parse_document(
     from framework import CapturedDocument, ContentFormat
 
     text = (FIXTURES / fixture).read_text(encoding="utf-8")
-    monkeypatch.setattr(pdf_mod, "_extract_pdf_text", lambda _raw: text)
+    monkeypatch.setattr(pdf_mod, "_extract_pdf_text", lambda _raw, **_kw: text)
     scraper = OCProbateTentativeRulingsScraper(config=probate_default_config())
     doc = CapturedDocument(
         scraper_id="ca-oc-tentatives-probate",

@@ -462,6 +462,22 @@ def test_partial_extraction_leaves_the_key_untouched(seed: int, kind: str) -> No
 
 
 @_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "live"])
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_incomplete_input_blank_page_leaves_the_key_untouched(seed: int, kind: str) -> None:
+    """A re-ingest of a text PDF whose scanned page OCR could not read
+    (``INCOMPLETE_INPUT``, #5010) after a generated history leaves the
+    key's rows and search docs as they were (``untouched``); a reingest
+    reports the key (``failed_manifest``).  Before the fix the scanned page
+    was dropped and the text pages were split as if complete."""
+    events = harness.run_incomplete_input(_DSN, seed, _RUN, kind=kind, name=f"blank-{kind}")
+    assert events["harness.incomplete_input"] > 0, dict(events)
+    assert events["harness.fail_mode.incomplete_input.failed"] > 0, dict(events)
+    if kind == "reingest":
+        assert events["harness.raised.SplitExtractionFailedError"] > 0, dict(events)
+
+
+@_needs_pg
 @pytest.mark.parametrize("seed", _extraction_failure_seeds())
 def test_partial_live_capture_of_a_new_key_converges(seed: int) -> None:
     """A live capture of a new key whose split is partial writes the parts

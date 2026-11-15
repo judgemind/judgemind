@@ -243,26 +243,64 @@ def is_pdf_binary(content: str | bytes) -> bool:
     return content.startswith("%PDF")
 
 
+#: How ``extract_pdf_text`` joins a PDF's pages.
+PAGE_SEPARATOR = "\n\f\n"
+
+#: A page with fewer non-blank text-layer characters than this, and a
+#: picture over at least ``_SCANNED_PAGE_IMAGE_SHARE`` of it, is a scanned
+#: page (#5010): its text layer is at most a stamp or a footer, and its
+#: content is the picture.  A page with no text layer and any picture is
+#: one too.  A text page with a logo stays a text page.
+_SCANNED_PAGE_MAX_TEXT_CHARS = 200
+_SCANNED_PAGE_IMAGE_SHARE = 0.5
+
+#: OCR that adds fewer non-blank characters than this to a scanned page's
+#: own text layer found nothing the text layer lacks (a blank page, a page
+#: of one footer), so the page keeps its text layer and no OCR span.
+_MIN_OCR_GAIN_CHARS = 20
+
+#: ``CapturedDocument.extra`` key a scraper sets when it read a PDF's text
+#: layer (``scraper_pdf_text``) and some pages are scanned (#5010): the
+#: 1-based page numbers.  The scraper's text lacks those pages, so the
+#: worker reads the archived PDF again and OCRs them, as a reingest of the
+#: key does.
+SCANNED_PAGES_KEY = "pdf_scanned_pages"
+
+
 @dataclass(frozen=True)
 class PdfText:
-    """A PDF's extracted text and where it came from (#4986).
+    """A PDF's extracted text and where it came from (#4986, #5010).
 
-    ``from_ocr`` marks text the LLM transcribed from page images
-    (``ocr_pdf_text``) because the PDF has no text layer.  That text is LLM
-    output, so it is never case-number evidence (``case_evidence``): a
-    scanned PDF follows the scanned-PDF rules whatever its OCR text says.
+    ``from_ocr`` marks text that is, wholly or in part, the LLM's
+    transcription of page images (``ocr_pdf_document``): the PDF's scanned
+    pages.  That text is LLM output, so it is never case-number evidence
+    (``case_evidence``).  When only some pages were scanned and the text
+    holds OCR text or lacks pages, ``text_layer`` holds the rest: each run
+    of consecutive text-layer pages, joined as in ``text``.  A slice of
+    ``text`` inside one of them is source text
+    (``case_evidence.text_from_ocr``); the text as a whole is not.
 
-    ``incomplete`` says why OCR did not read every page (the page cap, the
-    time budget, pages whose LLM call failed), or is ``None`` when it read
-    them all.  An extraction built on incomplete OCR text is missing
-    rulings, so the worker treats it as a failed extraction rather than a
-    complete one.  ``page_count`` is the PDF's page count.
+    ``incomplete`` says why the text lacks part of the document (the OCR
+    page cap, the time budget, pages whose LLM call failed, or, with OCR
+    off, the scanned pages themselves), or is ``None`` when it has every
+    page.  An extraction built on incomplete text is missing rulings, so
+    the worker treats it as a failed extraction rather than a complete
+    one.  ``page_count`` is the PDF's page count.
     """
 
     text: str
     from_ocr: bool = False
     page_count: int = 0
     incomplete: str | None = None
+    text_layer: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _PdfPage:
+    """One page's text layer, and whether the page is scanned."""
+
+    text: str
+    scanned: bool
 
 
 def _pdf_bytes(content: str | bytes) -> bytes:
@@ -276,73 +314,210 @@ def _pdf_bytes(content: str | bytes) -> bytes:
         return content.encode("utf-8", errors="replace")
 
 
+def _non_blank(text: str) -> int:
+    return sum(1 for c in text if not c.isspace())
+
+
+def _image_share(page: object) -> float:
+    """The share of *page* its pictures cover (overlaps counted twice)."""
+    width = float(getattr(page, "width", 0) or 0)
+    height = float(getattr(page, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return 0.0
+    covered = 0.0
+    for image in getattr(page, "images", None) or ():
+        x0, x1 = max(0.0, float(image["x0"])), min(width, float(image["x1"]))
+        top, bottom = max(0.0, float(image["top"])), min(height, float(image["bottom"]))
+        covered += max(0.0, x1 - x0) * max(0.0, bottom - top)
+    return covered / (width * height)
+
+
+def _read_pdf_pages(raw_bytes: bytes) -> list[_PdfPage]:
+    """Each page's pdfplumber text layer, and whether it is scanned.
+
+    Raises when *raw_bytes* is not a readable PDF.  The one place a PDF's
+    text layer is read (#5010): the worker, the scrapers and the audits all
+    come through here, so a scanned page inside a text PDF is never
+    silently skipped.
+    """
+    import pdfplumber
+
+    pages: list[_PdfPage] = []
+    with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            chars = _non_blank(text)
+            scanned = chars < _SCANNED_PAGE_MAX_TEXT_CHARS and (
+                _image_share(page) >= _SCANNED_PAGE_IMAGE_SHARE
+                or (chars == 0 and bool(page.images))
+            )
+            pages.append(_PdfPage(text, scanned))
+    return pages
+
+
+def _scanned_page_indexes(pages: list[_PdfPage]) -> list[int]:
+    """0-based indexes of the pages whose content needs OCR.  A PDF with no
+    text layer on any page is all scanned, pictures or not (#1332)."""
+    if pages and not any(_non_blank(p.text) for p in pages):
+        return list(range(len(pages)))
+    return [i for i, p in enumerate(pages) if p.scanned]
+
+
+def _page_list(indexes: list[int]) -> list[int]:
+    return [i + 1 for i in indexes]
+
+
 def extract_pdf_text(
     content: str | bytes,
     *,
     ocr: bool = True,
     ocr_max_pages: int | None = None,
+    separator: str = PAGE_SEPARATOR,
 ) -> PdfText | None:
-    """Extract a PDF's text with pdfplumber, and say where it came from.
+    """Extract a PDF's text, page by page, and say where it came from.
 
     Accepts either raw ``bytes`` or a ``str`` that was produced by decoding
     raw PDF bytes (common when PDF content is stored as a text field).
 
-    When pdfplumber returns no text (an image-only PDF) and *ocr* is set,
-    falls back to OCR via the LLM vision API (``ocr_pdf_text``, at most
-    *ocr_max_pages* pages, default ``_OCR_MAX_PAGES``) and returns its text
-    with ``from_ocr=True``.  OCR that read nothing because pages failed is
+    Each page's text layer is read with pdfplumber.  A scanned page (no
+    usable text layer, its content a picture, ``_read_pdf_pages``) is
+    OCR'd with the LLM vision API when *ocr* is set (``ocr_pdf_document``,
+    at most *ocr_max_pages* pages, default ``_OCR_MAX_PAGES``), and its
+    text takes the page's place, in page order (#5010).  Text that holds
+    OCR output has ``from_ocr`` set; the text-layer runs around it are in
+    ``text_layer``.  Pages OCR could not read (the cap, the time budget,
+    a failed call) leave the result ``incomplete``; with *ocr* off every
+    scanned page does.  OCR that read nothing because pages failed is
     returned too, with empty text and ``incomplete`` set, so a caller can
     tell a transient failure from a PDF with nothing on it.
 
+    Pages are joined with *separator*.
+
     Returns ``None`` when the content is not a readable PDF, or when there
-    is no text at all (no text layer, and OCR off, blank or unavailable).
+    is no text at all and nothing went unread (or *ocr* is off).
     """
+    raw_bytes = _pdf_bytes(content)
     try:
-        import pdfplumber
+        pages = _read_pdf_pages(raw_bytes)
     except ImportError:
         logger.warning("pdfplumber not installed — cannot extract PDF text")
         return None
-
-    raw_bytes = _pdf_bytes(content)
-    try:
-        pages_text: list[str] = []
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-            page_count = len(pdf.pages)
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    pages_text.append(text)
     except Exception:
         logger.warning("PDF text extraction failed", exc_info=True)
         return None
-    if pages_text:
-        return PdfText("\n\f\n".join(pages_text), page_count=page_count)
-    if not page_count or not ocr:
-        return None
+    page_count = len(pages)
+    scanned = _scanned_page_indexes(pages)
 
-    # No text extracted but the PDF has pages — an image-only PDF.  Try the
-    # OCR fallback via the LLM vision API (#1332).
-    logger.info(
-        "pdf_extraction.no_text_layer",
-        pdf_size=len(raw_bytes),
+    if scanned and len(scanned) == page_count and ocr:
+        # No text layer at all: an image-only PDF.  OCR every page via the
+        # LLM vision API (#1332).
+        logger.info(
+            "pdf_extraction.no_text_layer",
+            pdf_size=len(raw_bytes),
+            page_count=page_count,
+            fallback="ocr_llm_vision",
+        )
+        max_pages = _OCR_MAX_PAGES if ocr_max_pages is None else ocr_max_pages
+        try:
+            result = ocr_pdf_document(raw_bytes, max_pages=max_pages)
+        except Exception:
+            logger.warning("PDF OCR fallback failed", exc_info=True)
+            return None
+        if result is None or (not result.text and result.incomplete is None):
+            return None
+        return result
+
+    texts = [p.text for p in pages]
+    ocr_read: set[int] = set()
+    blank: set[int] = set()
+    problems: list[str] = []
+    if scanned and ocr:
+        # A text PDF with scanned pages (a calendar with scanned orders
+        # appended): OCR exactly those pages (#5010).
+        logger.info(
+            "pdf_extraction.scanned_pages",
+            pdf_size=len(raw_bytes),
+            page_count=page_count,
+            scanned_pages=_page_list(scanned),
+            fallback="ocr_llm_vision",
+        )
+        max_pages = _OCR_MAX_PAGES if ocr_max_pages is None else ocr_max_pages
+        try:
+            ocr_texts, ocr_problems = _ocr_pages(raw_bytes, scanned, max_pages=max_pages)
+        except Exception:
+            logger.warning("PDF OCR of scanned pages failed", exc_info=True)
+            ocr_texts, ocr_problems = {}, [f"OCR of page(s) {_page_list(scanned)} failed"]
+        problems.extend(ocr_problems)
+        for index, text in ocr_texts.items():
+            if text is None:
+                continue
+            if _non_blank(text) >= _non_blank(texts[index]) + _MIN_OCR_GAIN_CHARS:
+                texts[index] = text
+                ocr_read.add(index)
+            else:
+                # Read, and nothing on it the text layer lacks.
+                blank.add(index)
+    elif scanned:
+        problems.append(f"page(s) {_page_list(scanned)} have no text layer")
+
+    # The text-layer runs break at every scanned page that is not plain
+    # text layer: OCR'd, or never read (#5010).
+    breaks = set(scanned) - blank
+    joined: list[str] = []
+    layer_runs: list[list[str]] = [[]]
+    for index, text in enumerate(texts):
+        if index in breaks:
+            layer_runs.append([])
+        elif text:
+            layer_runs[-1].append(text)
+        if text:
+            joined.append(text)
+    incomplete = "; ".join(problems) or None
+    if not joined and (incomplete is None or not ocr):
+        return None
+    from_ocr = bool(ocr_read)
+    mixed = from_ocr or incomplete is not None
+    return PdfText(
+        separator.join(joined),
+        from_ocr=from_ocr,
         page_count=page_count,
-        fallback="ocr_llm_vision",
+        incomplete=incomplete,
+        text_layer=tuple(separator.join(run) for run in layer_runs if run) if mixed else (),
     )
-    max_pages = _OCR_MAX_PAGES if ocr_max_pages is None else ocr_max_pages
-    try:
-        result = ocr_pdf_document(raw_bytes, max_pages=max_pages)
-    except Exception:
-        logger.warning("PDF OCR fallback failed", exc_info=True)
-        return None
-    if result is None or (not result.text and result.incomplete is None):
-        return None
-    return result
+
+
+def scraper_pdf_text(pdf_bytes: bytes, *, extra: dict | None = None) -> str:
+    """A PDF's text layer for a scraper's parse, pages joined with ``"\\n"``
+    as the scrapers always joined them (#5010).
+
+    No OCR: a scraper runs no LLM.  When some pages are scanned, their
+    1-based numbers go in *extra* (the document's ``extra``) under
+    ``SCANNED_PAGES_KEY``, so the worker reads the archived PDF again and
+    OCRs them; the text returned lacks them.  Raises when *pdf_bytes* is
+    not a readable PDF.
+    """
+    pages = _read_pdf_pages(_pdf_bytes(pdf_bytes))
+    scanned = _scanned_page_indexes(pages)
+    if extra is not None:
+        if scanned:
+            extra[SCANNED_PAGES_KEY] = _page_list(scanned)
+        else:
+            extra.pop(SCANNED_PAGES_KEY, None)
+    return "\n".join(p.text for p in pages if p.text)
+
+
+def pdf_scanned_pages(content: str | bytes) -> list[int]:
+    """The 1-based numbers of a PDF's scanned pages (``_read_pdf_pages``):
+    the pages ``extract_pdf_text`` OCRs.  Raises when *content* is not a
+    readable PDF.  For audits sizing the text PDFs with scanned pages
+    (#5010)."""
+    return _page_list(_scanned_page_indexes(_read_pdf_pages(_pdf_bytes(content))))
 
 
 def extract_text_from_pdf(content: str | bytes, *, ocr_max_pages: int | None = None) -> str | None:
     """Extract readable text from PDF binary content (``extract_pdf_text``).
 
-    Falls back to OCR for an image-only PDF.  Returns the text, or ``None``
+    Falls back to OCR for scanned pages.  Returns the text, or ``None``
     when extraction fails or produces no text.  A caller that judges case
     numbers by the text must use ``extract_pdf_text`` instead: OCR text is
     LLM output, not evidence (#4986).
@@ -359,7 +534,7 @@ def extract_text_layer(content: str | bytes) -> str | None:
     no text layer or the content is not a readable PDF.
     """
     result = extract_pdf_text(content, ocr=False)
-    return result.text if result is not None else None
+    return result.text if result is not None and result.text else None
 
 
 def pdf_page_count(content: str | bytes) -> int:
@@ -451,46 +626,105 @@ def ocr_pdf_document(
 ) -> PdfText | None:
     """OCR an image-only PDF with the LLM vision API (#1332, #4986).
 
-    Renders each page to a PNG with pymupdf and sends the pages to the
-    configured provider's vision API, *concurrency* at a time, each with
-    *page_timeout* seconds.  Pages are joined in page order with form-feed
-    separators.  The fallback for PDFs where ``pdfplumber.extract_text()``
-    returns no text (scanned / image-only documents).
-
-    At most *max_pages* pages are read.  The whole run gets *total_timeout*
-    seconds (default: one *page_timeout* per round of *concurrency* pages,
-    at least ``_OCR_TOTAL_TIMEOUT``); pages not answered by then are
-    abandoned.  A page cap hit, a timeout or a failed page call leaves the
+    Every page goes through ``_ocr_pages``: at most *max_pages* pages,
+    *concurrency* at a time, each with *page_timeout* seconds, the whole
+    run *total_timeout* seconds.  Pages are joined in page order with
+    form-feed separators.  The fallback for PDFs where
+    ``pdfplumber.extract_text()`` returns no text (scanned / image-only
+    documents).  A page cap hit, a timeout or a failed page call leaves the
     result ``incomplete`` (with a warning naming the pages read): a blank
     page is not a failure.
 
     Returns a ``PdfText`` with ``from_ocr=True`` (its text empty when no
     page produced text), or ``None`` when the PDF cannot be rendered.
     """
+    try:
+        texts, problems, total_pages = _ocr_pages_counted(
+            pdf_bytes,
+            None,
+            max_pages=max_pages,
+            page_timeout=page_timeout,
+            total_timeout=total_timeout,
+            concurrency=concurrency,
+        )
+    except Exception:
+        logger.warning("ocr_pdf_text.render_failed", exc_info=True)
+        return None
+    ordered = [text for _, text in sorted(texts.items()) if text]
+    result = PdfText(
+        PAGE_SEPARATOR.join(ordered),
+        from_ocr=True,
+        page_count=total_pages,
+        incomplete="; ".join(problems) or None,
+    )
+    if result.text:
+        logger.info(
+            "ocr_pdf_text.success",
+            pages_ocrd=len(ordered),
+            total_pages=total_pages,
+            text_length=len(result.text),
+            complete=result.incomplete is None,
+        )
+    elif texts:
+        logger.warning("ocr_pdf_text.no_text_extracted", pages_attempted=len(texts))
+    return result
+
+
+def _ocr_pages(
+    pdf_bytes: bytes,
+    indexes: list[int],
+    *,
+    max_pages: int = _OCR_MAX_PAGES,
+) -> tuple[dict[int, str | None], list[str]]:
+    """OCR the 0-based pages *indexes* of a PDF (its scanned pages, #5010).
+
+    Returns each answered page's text (``""`` blank, ``None`` a failed
+    call) and the reasons any page went unread: the page cap (at most
+    *max_pages* pages are read), the time budget, failed calls.  Raises
+    when the PDF cannot be rendered.
+    """
+    texts, problems, _total = _ocr_pages_counted(pdf_bytes, indexes, max_pages=max_pages)
+    return texts, problems
+
+
+def _ocr_pages_counted(
+    pdf_bytes: bytes,
+    indexes: list[int] | None,
+    *,
+    max_pages: int = _OCR_MAX_PAGES,
+    page_timeout: float = _OCR_PAGE_TIMEOUT,
+    total_timeout: float | None = None,
+    concurrency: int = _OCR_CONCURRENCY,
+) -> tuple[dict[int, str | None], list[str], int]:
+    """``_ocr_pages`` of *indexes* (every page when ``None``), plus the
+    PDF's page count.
+
+    Renders each page to a PNG with pymupdf and sends the pages to the
+    configured provider's vision API, *concurrency* at a time, each with
+    *page_timeout* seconds.  The whole run gets *total_timeout* seconds
+    (default: one *page_timeout* per round of *concurrency* pages, at least
+    ``_OCR_TOTAL_TIMEOUT``); pages not answered by then are abandoned.
+    """
     import time as time_mod
     from concurrent.futures import FIRST_COMPLETED, wait
 
     start_time = time_mod.monotonic()
-
-    try:
-        page_images, total_pages = _render_pdf_pages_counted(pdf_bytes, max_pages)
-    except Exception:
-        logger.warning("ocr_pdf_text.render_failed", exc_info=True)
-        return None
+    page_images, total_pages = _render_pdf_pages_counted(pdf_bytes, max_pages, indexes)
+    wanted = total_pages if indexes is None else len(indexes)
 
     problems: list[str] = []
-    if total_pages > len(page_images):
+    if wanted > len(page_images):
         logger.warning(
             "ocr_pdf_text.page_limit_reached",
             max_pages=max_pages,
             total_pages=total_pages,
+            pages_to_read=wanted,
         )
-        problems.append(f"page cap {max_pages} of {total_pages} pages")
+        problems.append(f"page cap {max_pages} of {wanted} pages")
 
     if not page_images:
         logger.warning("ocr_pdf_text.no_pages_rendered", total_pages=total_pages)
-        incomplete = "; ".join(problems) or None
-        return PdfText("", from_ocr=True, page_count=total_pages, incomplete=incomplete)
+        return {}, problems, total_pages
 
     budget = (
         _ocr_total_timeout(len(page_images), page_timeout, concurrency)
@@ -517,10 +751,10 @@ def ocr_pdf_document(
                     _ocr_single_page,
                     image_bytes,
                     media_type,
-                    page_index=i,
+                    page_index=index,
                     timeout=min(page_timeout, budget),
-                ): i
-                for i, (image_bytes, media_type) in enumerate(page_images)
+                ): index
+                for index, (image_bytes, media_type) in page_images
             }
         pending = set(futures)
         while pending:
@@ -549,32 +783,14 @@ def ocr_pdf_document(
     failed = sorted(i + 1 for i, text in texts.items() if text is None)
     if failed:
         problems.append(f"page(s) {failed} failed")
-
-    ordered = [text for _, text in sorted(texts.items()) if text]
-    result = PdfText(
-        "\n\f\n".join(ordered),
-        from_ocr=True,
-        page_count=total_pages,
-        incomplete="; ".join(problems) or None,
-    )
-    if result.incomplete:
+    if problems:
         logger.warning(
             "ocr_pdf_text.incomplete",
             pages_read=len(texts) - len(failed),
             total_pages=total_pages,
-            reason=result.incomplete,
+            reason="; ".join(problems),
         )
-    if result.text:
-        logger.info(
-            "ocr_pdf_text.success",
-            pages_ocrd=len(ordered),
-            total_pages=total_pages,
-            text_length=len(result.text),
-            complete=result.incomplete is None,
-        )
-    else:
-        logger.warning("ocr_pdf_text.no_text_extracted", pages_attempted=len(page_images))
-    return result
+    return texts, problems, total_pages
 
 
 def _render_pdf_pages(
@@ -589,30 +805,33 @@ def _render_pdf_pages(
 
     Returns a list of ``(png_bytes, media_type)`` tuples.
     """
-    return _render_pdf_pages_counted(pdf_bytes, max_pages)[0]
+    return [image for _, image in _render_pdf_pages_counted(pdf_bytes, max_pages)[0]]
 
 
 def _render_pdf_pages_counted(
     pdf_bytes: bytes,
     max_pages: int,
-) -> tuple[list[tuple[bytes, str]], int]:
-    """``_render_pdf_pages``, plus the PDF's total page count."""
+    indexes: list[int] | None = None,
+) -> tuple[list[tuple[int, tuple[bytes, str]]], int]:
+    """The 0-based pages *indexes* (every page when ``None``), at most
+    *max_pages* of them, rendered as ``(index, (png_bytes, media_type))``,
+    plus the PDF's total page count."""
     import pymupdf
 
-    results: list[tuple[bytes, str]] = []
+    results: list[tuple[int, tuple[bytes, str]]] = []
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         total_pages = len(doc)
         zoom = _OCR_RESOLUTION / 72.0
         matrix = pymupdf.Matrix(zoom, zoom)
+        wanted = range(total_pages) if indexes is None else indexes
 
-        for i, page in enumerate(doc):
-            # page-cap: ocr_pdf_document marks the result incomplete (#4986).
-            if i >= max_pages:
+        for index in wanted:
+            # page-cap: _ocr_pages_counted marks the result incomplete (#4986).
+            if len(results) >= max_pages:
                 break
-
-            pix = page.get_pixmap(matrix=matrix)
+            pix = doc[index].get_pixmap(matrix=matrix)
             png_bytes = pix.tobytes("png")
-            results.append((png_bytes, "image/png"))
+            results.append((index, (png_bytes, "image/png")))
 
     return results, total_pages
 

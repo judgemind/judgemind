@@ -1,7 +1,8 @@
 """Shared fixtures for scraper-framework tests.
 
 Performance optimisation (see GitHub issues #66, #1207, #1219):
-``_extract_pdf_text`` / ``extract_pdf_text`` uses pdfplumber which takes ~2 s
+reading a PDF's text layer with pdfplumber (``llm_extract._read_pdf_pages``,
+the one reader every scraper and the worker use since #5010) takes ~2 s
 per call on a multi-page PDF.  In "full run" tests the mock HTTP layer returns
 the *same* PDF bytes for every department link (300+ for CC, 33 for OC, 20 for
 Fresno, 17 for Riverside), so parsing is repeated hundreds of times for the
@@ -11,14 +12,9 @@ Phase 1 (#1207) added a per-worker in-memory LRU cache.  Phase 2 (#1219)
 replaces it with a **disk-based, cross-worker cache** so that all pytest-xdist
 workers share extracted text.  The cache uses ``tmp_path_factory`` to locate
 the shared temp root (the parent of per-worker temp dirs).  Each entry is
-keyed by the combination of the extraction function's ``__qualname__`` and the
-SHA-256 hash of the input PDF bytes; the first worker to parse a given PDF
-writes the result to disk and all subsequent workers (including from other
-xdist processes) read from it.
-
-Including the function identifier in the key prevents collisions between
-different extractors called on the same PDF bytes (e.g. ``_extract_pdf_text``
-for different courts).
+keyed by the SHA-256 hash of the input PDF bytes; the first worker to parse a
+given PDF writes the result to disk and all subsequent workers (including
+from other xdist processes) read from it.
 
 No external dependencies are needed — the cache uses stdlib ``hashlib`` and
 ``pathlib``.  Race conditions between workers writing the same key are harmless
@@ -32,6 +28,7 @@ instantly.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Callable, Generator
 from pathlib import Path
@@ -39,12 +36,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from courts.ca import cc_tentatives as _cc
-from courts.ca import fresno_tentatives as _fresno
-from courts.ca import pdf_link_scraper as _pls
-from courts.ca import riverside_tentatives as _riv
-from courts.ca import sc_tentatives as _sc
-from courts.ca import ventura_tentatives as _ven
+from ingestion import llm_extract as _llm_extract
 
 # ---------------------------------------------------------------------------
 # Disk-based cross-worker PDF text cache
@@ -55,36 +47,32 @@ _pdf_cache_dir: Path | None = None
 
 
 def _make_disk_cached(
-    real_fn: Callable[[bytes], str],
-) -> Callable[[bytes], str]:
-    """Wrap a PDF extraction function with a disk-backed cache.
+    real_fn: Callable[[bytes], list[_llm_extract._PdfPage]],
+) -> Callable[[bytes], list[_llm_extract._PdfPage]]:
+    """Wrap the PDF page reader with a disk-backed cache.
 
-    On cache miss the real function is called and the result is written to
-    ``<cache_dir>/<fn_qualname>_<sha256>.txt``.  On cache hit the file is
-    read directly.
-
-    The cache key includes ``real_fn.__qualname__`` so that different
-    extractors called on the same PDF bytes get separate cache entries.
-    Without this, e.g. ``_extract_pdf_text`` and ``_extract_oc_pdf_text``
-    on the same bytes would collide — whichever ran first would win the
-    cache slot and the other would silently return the wrong result.
+    On cache miss the real function is called and the pages are written to
+    ``<cache_dir>/pdf_pages_<sha256>.json``.  On cache hit the file is read
+    directly.  An unreadable PDF raises, uncached, as the reader does.
     """
-    fn_id = real_fn.__qualname__
 
-    def _cached(pdf_bytes: bytes) -> str:
+    def _cached(pdf_bytes: bytes) -> list[_llm_extract._PdfPage]:
         cache_dir = _pdf_cache_dir
         if cache_dir is None:
             # Fixture not yet initialised — fall back to uncached call
             return real_fn(pdf_bytes)
 
         key = hashlib.sha256(pdf_bytes).hexdigest()
-        cache_file = cache_dir / f"{fn_id}_{key}.txt"
+        cache_file = cache_dir / f"pdf_pages_{key}.json"
 
         # Fast path: cache hit
         if cache_file.exists():
-            return cache_file.read_text(encoding="utf-8")
+            return [
+                _llm_extract._PdfPage(text, scanned)
+                for text, scanned in json.loads(cache_file.read_text(encoding="utf-8"))
+            ]
 
-        # Slow path: call real extractor, write to cache
+        # Slow path: call the real reader, write to cache
         result = real_fn(pdf_bytes)
 
         # Atomic-ish write: write to a PID-unique temp file then rename.
@@ -93,7 +81,7 @@ def _make_disk_cached(
         # .tmp path.  On POSIX, os.rename atomically replaces the target
         # so the last writer wins — both produce identical content.
         tmp = cache_file.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(result, encoding="utf-8")
+        tmp.write_text(json.dumps([[p.text, p.scanned] for p in result]), encoding="utf-8")
         try:
             os.rename(tmp, cache_file)
         except OSError:
@@ -137,38 +125,17 @@ def _setup_pdf_cache_dir(tmp_path_factory: pytest.TempPathFactory) -> Generator[
 def _cache_pdf_text_extraction(
     _setup_pdf_cache_dir: None,
 ) -> Generator[None, None, None]:
-    """Wrap PDF text extraction with a cross-worker disk cache.
+    """Wrap the PDF page reader with a cross-worker disk cache.
 
     Uses ``unittest.mock.patch`` instead of ``monkeypatch`` because
-    ``monkeypatch`` is limited to function scope.  Every module that
-    defines *or imports* ``_extract_pdf_text`` / ``extract_pdf_text``
-    must be patched so that the imported reference in each module's
-    namespace is replaced.
+    ``monkeypatch`` is limited to function scope.  Every PDF text path (the
+    scrapers' ``scraper_pdf_text``, the worker's ``extract_pdf_text``)
+    reads pages through ``llm_extract._read_pdf_pages`` (#5010).
     """
-    # --- pdf_link_scraper._extract_pdf_text (Riverside, SB, Fresno, CC) ---
-    _cached_pls = _make_disk_cached(_pls._extract_pdf_text)
-
-    # --- sc_tentatives.extract_pdf_text (Santa Clara) ---
-    _cached_sc = _make_disk_cached(_sc.extract_pdf_text)
-
-    # --- ventura_tentatives._extract_pdf_text (local copy) ---
-    _cached_ven = _make_disk_cached(_ven._extract_pdf_text)
-
-    # Patch every module that holds its own reference to the function.
-    patches = [
-        patch.object(_pls, "_extract_pdf_text", _cached_pls),
-        patch.object(_cc, "_extract_pdf_text", _cached_pls),
-        patch.object(_riv, "_extract_pdf_text", _cached_pls),
-        patch.object(_fresno, "_extract_pdf_text", _cached_pls),
-        patch.object(_sc, "extract_pdf_text", _cached_sc),
-        patch.object(_ven, "_extract_pdf_text", _cached_ven),
-    ]
-
-    for p in patches:
-        p.start()
-    yield
-    for p in reversed(patches):
-        p.stop()
+    with patch.object(
+        _llm_extract, "_read_pdf_pages", _make_disk_cached(_llm_extract._read_pdf_pages)
+    ):
+        yield
 
 
 @pytest.fixture(autouse=True, scope="session")
