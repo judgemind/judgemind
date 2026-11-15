@@ -49,7 +49,7 @@ from .llm_schema import (
     ExtractionResult,
     FieldConfidence,
 )
-from .llm_utils import parse_llm_json, strip_llm_json_fences
+from .llm_utils import parse_llm_json, rulings_array_shape_error, strip_llm_json_fences
 from .title_heuristics import (
     BRACKETED_PLACEHOLDER_TITLE_RE as _BRACKETED_PLACEHOLDER_TITLE_RE,
 )
@@ -4509,6 +4509,16 @@ class LlmExtractor:
 
         Handles markdown code fences, validates enum values, normalizes
         case numbers, and applies authoritative metadata overrides.
+
+        Returns ``None`` (a failed chunk: retried in halves, never cached,
+        and under ``strict`` an incomplete extraction) when the response is
+        not JSON or has no valid ``rulings`` array (#5011): missing, null,
+        not a list, or holding a non-object item.  An explicit
+        ``"rulings": []`` is a valid chunk with no rulings, and stays one
+        even when the chunk's text looks like it holds rulings: an empty
+        answer is the extractor's verdict (#4940), and no-ruling calendars
+        (continuance lists, "no tentative rulings" notices) print case
+        numbers too, so second-guessing it would retry them forever.
         """
         try:
             parsed = parse_llm_json(raw_text)
@@ -4516,6 +4526,15 @@ class LlmExtractor:
             logger.warning(
                 "llm_extractor.json_parse_error",
                 error=str(exc),
+                raw_preview=raw_text[:200],
+            )
+            return None
+
+        shape_error = rulings_array_shape_error(parsed)
+        if shape_error is not None:
+            logger.warning(
+                "llm_extractor.chunk_shape_error",
+                shape=shape_error,
                 raw_preview=raw_text[:200],
             )
             return None
@@ -4534,16 +4553,8 @@ class LlmExtractor:
             if metadata.get("hearing_date"):
                 hearing_date = metadata["hearing_date"]
 
-        # Parse rulings array.
-        raw_rulings = parsed.get("rulings", [])
-        if not isinstance(raw_rulings, list):
-            raw_rulings = []
-
-        rulings: list[ExtractedRuling] = []
-        for r in raw_rulings:
-            if not isinstance(r, dict):
-                continue
-            rulings.append(_parse_single_ruling(r))
+        # The rulings array: a list of objects (``rulings_array_shape_error``).
+        rulings = [_parse_single_ruling(r) for r in parsed["rulings"]]
 
         return ExtractionResult(
             extracted_judge_name=judge_name,

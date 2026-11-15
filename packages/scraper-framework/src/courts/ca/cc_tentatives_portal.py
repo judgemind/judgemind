@@ -587,6 +587,27 @@ def load_envelope(raw: bytes | str | None) -> dict[str, Any] | None:
     return payload
 
 
+#: How every archived envelope starts: ``json.dumps`` of a dict whose first
+#: key is ``row`` (``_fetch_single_ruling``).
+_ENVELOPE_PREFIX = '{"row"'
+
+
+def looks_like_envelope(raw: str | None) -> bool:
+    """Whether *raw* is shaped like a portal envelope, readable or not (#5011).
+
+    For text :func:`load_envelope` rejected: an envelope that is truncated,
+    not valid JSON, or missing ``row`` / ``detail_html_b64`` must not be
+    processed as ruling text.  True when the text starts like an archived
+    envelope or names its ``detail_html_b64`` key.
+    """
+    if not raw:
+        return False
+    stripped = raw.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    return stripped.startswith(_ENVELOPE_PREFIX) or '"detail_html_b64"' in stripped
+
+
 def _decode_detail_html(envelope: dict[str, Any]) -> tuple[bytes, str]:
     """Return the envelope's detail HTML as (bytes, text); empty on bad base64."""
     detail_html_b64 = envelope.get("detail_html_b64") or ""

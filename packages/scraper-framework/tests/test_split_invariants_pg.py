@@ -478,6 +478,29 @@ def test_incomplete_input_blank_page_leaves_the_key_untouched(seed: int, kind: s
 
 
 @_needs_pg
+@pytest.mark.parametrize("whole", [False, True])
+@pytest.mark.parametrize("kind", ["reingest", "live"])
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_wrong_shape_response_leaves_the_key_untouched(seed: int, kind: str, whole: bool) -> None:
+    """A re-ingest whose model answers ``{"rulings": null}`` (``WRONG_SHAPE``,
+    #5011), parsed by the real ``LlmExtractor``, leaves the key's rows and
+    search docs as they were (``untouched``); a reingest reports the key
+    (``failed_manifest``) and records it ``reingest_failed``.  Before the fix
+    the answer was a complete extraction with no rulings, so a single-chunk
+    document replaced the key's split with one whole-document row."""
+    events = harness.run_wrong_shape(
+        _DSN, seed, _RUN, kind=kind, whole=whole, name=f"wrong-{kind}-{int(whole)}"
+    )
+    failed_calls = sum(n for e, n in events.items() if e.endswith(".wrong_shape_failed"))
+    assert failed_calls > 0, dict(events)
+    assert not any(e.endswith(".wrong_shape_returned") for e in events), dict(events)
+    assert events["harness.fail_mode.wrong_shape.failed"] > 0, dict(events)
+    if kind == "reingest":
+        assert events["harness.raised.SplitExtractionFailedError"] > 0, dict(events)
+        assert events["harness.marker.reingest_failed"] > 0, dict(events)
+
+
+@_needs_pg
 @pytest.mark.parametrize("seed", _extraction_failure_seeds())
 def test_partial_live_capture_of_a_new_key_converges(seed: int) -> None:
     """A live capture of a new key whose split is partial writes the parts
@@ -601,6 +624,8 @@ def test_partial_steps_keep_the_seed_s_other_draws(monkeypatch: pytest.MonkeyPat
     """The partial steps come from their own random stream (#5000): with
     them off, a seed's steps are the same apart from those steps' fail
     mode, so the seeds pinned against the other fail modes keep theirs."""
+    # The wrong-shape stream (#5011) only takes steps the partial one left.
+    monkeypatch.setattr(harness, "WRONG_SHAPE_STEPS", False)
     on = {seed: harness.generate(seed) for seed in range(200)}
     monkeypatch.setattr(harness, "PARTIAL_STEPS", False)
     for seed, steps in on.items():
@@ -610,6 +635,24 @@ def test_partial_steps_keep_the_seed_s_other_draws(monkeypatch: pytest.MonkeyPat
         ]
         assert restored == off
     assert any(s.fail_mode == harness.PARTIAL for steps in on.values() for s in steps)
+
+
+def test_wrong_shape_steps_keep_the_seed_s_other_draws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The malformed-response steps come from their own random stream
+    (#5011): with them off, a seed's steps are the same apart from those
+    steps' fail mode.  Whole documents get them too (the single-chunk case
+    #5011 found)."""
+    on = {seed: harness.generate(seed) for seed in range(200)}
+    monkeypatch.setattr(harness, "WRONG_SHAPE_STEPS", False)
+    for seed, steps in on.items():
+        off = harness.generate(seed)
+        restored = [
+            replace(s, fail_mode="") if s.fail_mode == harness.WRONG_SHAPE else s for s in steps
+        ]
+        assert restored == off
+    wrong = [s for steps in on.values() for s in steps if s.fail_mode == harness.WRONG_SHAPE]
+    assert any(s.whole for s in wrong)
+    assert any(not s.whole for s in wrong)
 
 
 @_needs_pg

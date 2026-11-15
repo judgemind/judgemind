@@ -40,6 +40,7 @@ from courts.ca.cc_tentatives_portal import (
 from courts.ca.cc_tentatives_portal import default_config as portal_default_config
 from framework.events import EventBus
 from ingestion.llm_extract import PdfText
+from ingestion.worker import IngestionWorker
 
 pytestmark = pytest.mark.regression
 
@@ -250,20 +251,39 @@ def test_rebuild_path_stale_envelope_is_written_with_the_header_date() -> None:
     assert mock_ins.call_args.kwargs["hearing_date_source"] == "structured_header"
 
 
-def test_live_path_s3_fetch_failure_leaves_text_empty_and_warns(
+def _unwrap_failures(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "telemetry_event", None) == "cc_portal_envelope_unwrap_failed"
+    ]
+
+
+def test_live_path_s3_fetch_failure_is_a_failed_extraction(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """#5011: the envelope of a PDF-only ruling cannot be read, so the event
+    has no ruling text.  That is a failed extraction (retried, then
+    dead-lettered), never an empty ruling written for the key."""
+    from ingestion.worker import CcPortalEnvelopeError
+
     payload, _archived = _capture(_recent_hearing())
 
     worker = _worker({})  # the envelope is not in S3
-    with caplog.at_level(logging.WARNING, logger="ingestion.worker"):
-        mock_ins = _process(worker, payload)
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.insert_document_and_ruling", return_value=True) as mock_ins,
+        caplog.at_level(logging.WARNING, logger="ingestion.worker"),
+        pytest.raises(CcPortalEnvelopeError, match="missing or unreadable"),
+    ):
+        mock_psycopg.connect.return_value = _conn()
+        worker.process_event(payload)
 
     mock_ins.assert_not_called()
     messages = [r.getMessage() for r in caplog.records]
     assert any("CC portal envelope could not be read" in m for m in messages)
-    fails = [r for r in caplog.records if "Deterministic validation FAIL" in r.getMessage()]
-    assert fails and "ruling_text_not_empty" in fails[0].det_failed_rules
+    failed = _unwrap_failures(caplog)
+    assert failed and failed[0].action == "retry"
 
 
 def _rebuild_event(envelope_bytes: bytes) -> dict[str, Any]:
@@ -354,10 +374,12 @@ def test_non_envelope_text_event_is_untouched() -> None:
     worker._s3_client.get_object.assert_not_called()
 
 
-def test_malformed_envelope_is_processed_as_is_not_dropped(
+def test_unwrap_error_is_a_failed_extraction_not_processed_as_is(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An unwrap error is logged and the event goes on unchanged."""
+    """#5011: an unwrap error raises instead of sending the event on unchanged."""
+    from ingestion.worker import CcPortalEnvelopeError
+
     event = {
         "document_id": "d1",
         "content_format": "text",
@@ -369,9 +391,67 @@ def test_malformed_envelope_is_processed_as_is_not_dropped(
     with (
         patch.object(worker, "_fetch_archived_bytes", side_effect=RuntimeError("boom")),
         caplog.at_level(logging.WARNING, logger="ingestion.worker"),
+        pytest.raises(CcPortalEnvelopeError, match="RuntimeError: boom"),
     ):
-        assert worker._unwrap_cc_portal_envelope(event) is event
-    assert any("CC portal envelope unwrap failed" in r.getMessage() for r in caplog.records)
+        worker._unwrap_cc_portal_envelope(event)
+    assert _unwrap_failures(caplog)
+
+
+def _malformed_envelope(archived: bytes, shape: str) -> str:
+    text = archived.decode("utf-8")
+    if shape == "truncated":
+        return text[: len(text) // 2]
+    envelope = json.loads(text)
+    dropped = {"no_row": "row", "no_detail_html": "detail_html_b64"}[shape]
+    return json.dumps({k: v for k, v in envelope.items() if k != dropped})
+
+
+@pytest.mark.parametrize("shape", ["truncated", "no_row", "no_detail_html"])
+def test_rebuild_path_envelope_malformed_writes_no_ruling_and_reports_failed(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#5011: a reingest / rebuild of a .txt raw whose envelope is malformed
+    never extracts the envelope JSON as ruling text.  Nothing is written, the
+    key is recorded ``reingest_failed`` in ``telemetry.ingest_incomplete``
+    and the reingest counts it failed (``SplitExtractionFailedError``)."""
+    from ingestion.ingest_incomplete import INCOMPLETE_REINGEST_FAILED
+    from ingestion.worker import CcPortalEnvelopeError, SplitExtractionFailedError
+
+    _payload, archived = _capture(_recent_hearing())
+    event = _rebuild_event(archived)
+    event["ruling_text"] = _malformed_envelope(archived, shape)
+    event["_replace_split_set"] = True
+
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.record_ingest_incomplete", return_value=True) as record,
+        patch("ingestion.worker.insert_document_and_ruling", return_value=True) as mock_ins,
+        patch.object(IngestionWorker, "_split_document") as split,
+        caplog.at_level(logging.WARNING, logger="ingestion.worker"),
+        pytest.raises(CcPortalEnvelopeError, match="malformed CC portal envelope") as exc_info,
+    ):
+        mock_psycopg.connect.return_value = _conn()
+        _worker().process_event(event)
+
+    assert isinstance(exc_info.value, SplitExtractionFailedError)
+    mock_ins.assert_not_called()
+    split.assert_not_called()
+    record.assert_called_once()
+    assert record.call_args.kwargs["s3_key"] == _S3_KEY
+    assert record.call_args.kwargs["reason"] == INCOMPLETE_REINGEST_FAILED
+    failed = _unwrap_failures(caplog)
+    assert failed and failed[0].action == "reported_failed"
+
+
+def test_looks_like_envelope() -> None:
+    from courts.ca.cc_tentatives_portal import looks_like_envelope
+
+    assert looks_like_envelope('{"row": {"case_number": "C22-01081"')
+    assert looks_like_envelope('  {"pdf_url": null, "detail_html_b64": "PGh0')
+    assert not looks_like_envelope("{ not an envelope")
+    assert not looks_like_envelope("Plain ruling text.")
+    assert not looks_like_envelope("")
+    assert not looks_like_envelope(None)
 
 
 @respx.mock
