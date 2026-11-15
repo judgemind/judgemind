@@ -477,6 +477,25 @@ class TestGovernorAppointmentsScraper:
         assert len(docs) == 13
 
     @respx.mock
+    def test_page_cap_hit_warns(self) -> None:
+        """Stopping at max_pages with a next page left is logged (#4995)."""
+        from structlog.testing import capture_logs
+
+        page1 = _load_fixture("search_results_page1.html")
+        respx.get(f"{SEARCH_URL}?s=judicial+appointment").mock(
+            return_value=httpx.Response(200, text=page1)
+        )
+        respx.get(url__startswith="https://www.gov.ca.gov/202").mock(
+            return_value=httpx.Response(200, text=_load_fixture("press_release_sample.html"))
+        )
+        scraper = GovernorAppointmentsScraper(_make_scraper_config(), max_pages=1)
+        with capture_logs() as logs:
+            scraper.fetch_documents()
+        (warning,) = [e for e in logs if e["event"] == "governor_appointments.page_limit_reached"]
+        assert warning["max_pages"] == 1
+        assert warning["results"] == 10
+
+    @respx.mock
     def test_handles_fetch_errors_gracefully(self) -> None:
         """Scraper continues when individual press release fetches fail."""
         minimal_search = """

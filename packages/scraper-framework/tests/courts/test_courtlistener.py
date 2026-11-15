@@ -187,10 +187,15 @@ class TestCourtListenerClient:
         respx.get(f"{API_BASE_URL}/clusters/").mock(return_value=httpx.Response(200, json=page))
 
         client = CourtListenerClient(request_delay=0)
-        clusters = client.fetch_clusters(date_modified_after="2026-03-01", max_pages=1)
+        with structlog.testing.capture_logs() as logs:
+            clusters = client.fetch_clusters(date_modified_after="2026-03-01", max_pages=1)
         client.close()
 
         assert len(clusters) == 1
+        # The cap stopped pagination with a next page left: said so (#4995).
+        (warning,) = [e for e in logs if e["event"] == "courtlistener.page_limit_reached"]
+        assert warning["max_pages"] == 1
+        assert warning["clusters"] == 1
 
     @respx.mock
     def test_fetch_opinions_for_cluster(self) -> None:

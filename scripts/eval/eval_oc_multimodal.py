@@ -202,6 +202,7 @@ def render_pdf_to_images(
     pdf_path: Path,
     *,
     dpi: int = 150,
+    # page-cap: offline eval harness, not ingestion; mirrors the old cap.
     max_pages: int = 50,
 ) -> list[bytes]:
     """Render PDF pages to PNG images using pymupdf."""
@@ -214,6 +215,7 @@ def render_pdf_to_images(
     matrix = pymupdf.Matrix(zoom, zoom)
 
     for i, page in enumerate(doc):
+        # page-cap: offline eval harness, not ingestion; mirrors the old cap.
         if i >= max_pages:
             break
         pix = page.get_pixmap(matrix=matrix)

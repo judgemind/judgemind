@@ -659,6 +659,7 @@ _PREPASS_CHUNK = 200
 
 #: Pages of a scanned PDF the judge pre-pass OCRs: the header is on page 1
 #: (#4986).
+# page-cap: reads the judge header only; the split itself OCRs every page.
 _PREPASS_OCR_PAGES = 1
 
 

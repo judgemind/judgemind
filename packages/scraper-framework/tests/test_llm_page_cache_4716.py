@@ -751,7 +751,7 @@ class TestStrictEmptyResult:
         ext = _make_extractor(None)
         answered = [ExtractionResult(rulings=[])]
         with (
-            patch.object(ext, "_split_into_chunks", return_value=["first", "second"]),
+            patch.object(ext, "_split_text", return_value=(["first", "second"], True)),
             patch.object(ext, "_extract_chunk_with_retry", side_effect=[answered, []]),
             pytest.raises(ExtractionIncompleteError),
         ):
@@ -762,7 +762,7 @@ class TestStrictEmptyResult:
 
         ext = _make_extractor(None)
         with (
-            patch.object(ext, "_split_into_chunks", return_value=["first", "second"]),
+            patch.object(ext, "_split_text", return_value=(["first", "second"], True)),
             patch.object(ext, "_extract_chunk_with_retry", return_value=[]),
             pytest.raises(ExtractionIncompleteError),
         ):

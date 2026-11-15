@@ -33,9 +33,7 @@ def _refuted(case_number: str, evidence: tuple[str, ...]) -> bool:
     return not any(case_number in t for t in evidence)
 
 
-def _gate(
-    objects: dict[str, bytes], extract_pdf=None, page_count=None
-) -> audit.Gate:
+def _gate(objects: dict[str, bytes], extract_pdf=None, page_count=None) -> audit.Gate:
     def fetch(key: str) -> bytes:
         if key not in objects:
             raise KeyError(key)
@@ -421,8 +419,12 @@ def test_no_text_mode_reports_scanned_pdfs_with_ruling_counts() -> None:
     assert summary["no_text_rulings"] == 3
     assert summary["no_text_over_10_pages"] == 1
     assert summary["error"] == 1
-    assert "NO_TEXT Riverside key=ca/x/c/raw/short.pdf chars=4 pages=1 rulings=3" in lines
-    assert "NO_TEXT Riverside key=ca/x/c/raw/scan.pdf chars=0 pages=22 rulings=0" in lines
+    assert (
+        "NO_TEXT Riverside key=ca/x/c/raw/short.pdf chars=4 pages=1 rulings=3" in lines
+    )
+    assert (
+        "NO_TEXT Riverside key=ca/x/c/raw/scan.pdf chars=0 pages=22 rulings=0" in lines
+    )
     assert audit.no_text_key_list(reports) == (
         "ca/x/c/raw/scan.pdf\nca/x/c/raw/short.pdf\n"
     )
@@ -567,3 +569,147 @@ def test_probe_reads_page_count_only_without_evidence() -> None:
     assert audit.probe_key_text("a.pdf", gate).pages == 0
     assert audit.probe_key_text("b.pdf", gate).pages == 5
     assert counted == [b"%PDF2"]
+
+
+# ---------------------------------------------------------------------------
+# Long PDF mode (#4995)
+# ---------------------------------------------------------------------------
+
+
+def test_long_pdf_mode_reports_pdfs_past_the_old_multimodal_cap() -> None:
+    """Every PDF over 50 pages, text layer or not, with its ruling count."""
+    gate = _gate(
+        {
+            "ca/orange/c/raw/long.pdf": b"%PDF1",
+            "ca/orange/c/raw/edge.pdf": b"%PDF2",
+            "ca/orange/c/raw/short.pdf": b"%PDF3",
+        },
+        page_count=lambda c: {b"%PDF1": 97, b"%PDF2": 50}.get(c, 3),
+    )
+    lines: list[str] = []
+    reports = audit.run_long_pdfs(
+        _args("--long-pdfs", "Orange", "--workers", "2"),
+        {
+            "Orange": [
+                "ca/orange/c/raw/long.pdf",
+                "ca/orange/c/raw/edge.pdf",
+                "ca/orange/c/raw/short.pdf",
+                "ca/orange/c/raw/missing.pdf",
+            ]
+        },
+        {"ca/orange/c/raw/long.pdf": 6},
+        gate,
+        None,
+        out=lines.append,
+    )
+    summary = reports[0].summary()
+    assert summary["pdf_keys"] == 4
+    assert summary["long"] == 1
+    assert summary["long_rulings"] == 6
+    assert summary["long_zero_rulings"] == 0
+    assert summary["max_pages"] == 97
+    assert summary["error"] == 1
+    assert "START_LONG_PDF Orange: 4 pdf keys, min_pages=51" in lines
+    assert "LONG_PDF Orange key=ca/orange/c/raw/long.pdf pages=97 rulings=6" in lines
+    assert audit.long_pdf_key_list(reports) == "ca/orange/c/raw/long.pdf\n"
+
+
+def test_long_pdf_mode_min_pages_and_timeout() -> None:
+    def page_count(content: bytes) -> int:
+        if content == b"%PDFslow":
+            time.sleep(5)
+        return 12
+
+    gate = _gate({"a.pdf": b"%PDF", "slow.pdf": b"%PDFslow"}, page_count=page_count)
+    lines: list[str] = []
+    reports = audit.run_long_pdfs(
+        _args("--long-pdfs", "Fresno", "--min-pages", "10", "--timeout", "1"),
+        {"Fresno": ["a.pdf", "slow.pdf"]},
+        {},
+        gate,
+        None,
+        out=lines.append,
+    )
+    assert audit.long_pdf_key_list(reports) == "a.pdf\n"
+    assert reports[0].summary()["long_zero_rulings"] == 1
+    assert reports[0].timeout_keys == ["slow.pdf"]
+
+
+def test_long_pdf_mode_args() -> None:
+    assert _args("--long-pdfs").min_pages is None
+    assert _args("--long-pdfs", "--write-keys", "s3://b/k").write_keys == "s3://b/k"
+    with pytest.raises(SystemExit):
+        _args("--long-pdfs", "--no-text-pdfs")
+    with pytest.raises(SystemExit):
+        _args("--multimodal-counties")
+    assert _args("--long-pdfs", "--multimodal-counties").multimodal_counties
+
+
+def test_multimodal_counties_lists_counties_that_read_page_images() -> None:
+    class Paginator:
+        def paginate(self, Bucket, Prefix, Delimiter):
+            assert (Bucket, Prefix, Delimiter) == ("bkt", "ca/", "/")
+            yield {
+                "CommonPrefixes": [
+                    {"Prefix": "ca/orange/"},
+                    {"Prefix": "ca/riverside/"},
+                    {"Prefix": "ca/los_angeles/"},
+                    {"Prefix": "ca/santa_clara/"},
+                ]
+            }
+
+    class S3:
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return Paginator()
+
+    # Orange is configured multimodal; Los Angeles has no config (multimodal
+    # by default); Riverside and Santa Clara are text-first.
+    assert audit.multimodal_counties(S3(), "bkt") == ["Orange", "Los Angeles"]
+
+
+def test_main_long_pdfs_writes_key_list(monkeypatch) -> None:
+    puts: list[dict] = []
+
+    class S3:
+        def put_object(self, **kw):
+            puts.append(kw)
+
+    class FakeBoto3:
+        @staticmethod
+        def client(name):
+            return S3()
+
+    printed: list[str] = []
+    monkeypatch.setitem(sys.modules, "boto3", FakeBoto3)
+    monkeypatch.setenv("DATABASE_URL", "postgres://x")
+    monkeypatch.setattr(audit, "_print", printed.append)
+    monkeypatch.setattr(audit, "multimodal_counties", lambda s3, bucket: ["Orange"])
+    monkeypatch.setattr(
+        audit,
+        "list_county_pdf_keys",
+        lambda s3, b, counties: (
+            {"Orange": ["a.pdf", "b.pdf"]} if counties == ["Orange"] else {}
+        ),
+    )
+    monkeypatch.setattr(
+        audit, "fetch_ruling_counts", lambda url, counties: {"a.pdf": 3}
+    )
+    monkeypatch.setattr(
+        audit,
+        "production_gate",
+        lambda: _gate(
+            {"a.pdf": b"%PDF1", "b.pdf": b"%PDF2"},
+            page_count=lambda c: 60 if c == b"%PDF1" else 20,
+        ),
+    )
+    argv = [
+        "--long-pdfs",
+        "--multimodal-counties",
+        "--write-keys",
+        "s3://bkt/tmp/long.txt",
+    ]
+    assert audit.main(argv) == 0
+    assert puts == [{"Bucket": "bkt", "Key": "tmp/long.txt", "Body": b"a.pdf\n"}]
+    assert 'MULTIMODAL_COUNTIES ["Orange"]' in printed
+    assert "WROTE 1 keys to s3://bkt/tmp/long.txt" in printed
