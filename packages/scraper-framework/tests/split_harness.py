@@ -98,7 +98,9 @@ properties that must hold for any sequence of re-splits:
   records ``single_document_fallback`` / ``partial_split``; a split-set
   replacement that reports the key failed records ``reingest_failed``; a
   split with an exhausted child records ``exhausted_child``
-  (:func:`run_enrichment_failure`).  A complete step (a verdict of no
+  (:func:`run_enrichment_failure`), and so does a whole-document step whose
+  one child's enrichment is exhausted, on every step kind
+  (:func:`run_whole_document_exhaustion`, #5035).  A complete step (a verdict of no
   rulings, or nothing readable, included) leaves no record; a step that
   writes nothing for another reason (a live capture of a key with rows, an
   unavailable extractor) leaves the record as it was.  Dead-lettering is
@@ -1305,6 +1307,11 @@ class KeyHarness:
         #: (:func:`run_enrichment_failure`): their split is incomplete, so
         #: ``marker`` expects an ``exhausted_child`` record (#5008).
         self.expect_exhausted = False
+        #: The next whole-document steps exhaust the enrichment of their one
+        #: child (:func:`run_whole_document_exhaustion`, #5035): the step
+        #: raises ``LlmEnrichmentExhaustedError`` before any write, so the
+        #: key is ``untouched`` and ``marker`` expects ``exhausted_child``.
+        self.exhaust_whole = False
         #: S3 keys this harness has run a step on.
         self._keys: set[str] = set()
         #: Every judge a ruling on those keys has been on (``_check_votes``).
@@ -1499,6 +1506,15 @@ class KeyHarness:
         doc = self._step_doc(step)
         marker_before = self._incomplete_marker(key)
         outcome = self.expected_outcome(step, has_rows=bool(before_rows))
+        if self.exhaust_whole:
+            if not step.whole or outcome != "ok":
+                self._fail(
+                    "error",
+                    f"an exhausted whole-document step needs a whole step whose extraction "
+                    f"is complete (whole={step.whole}, outcome={outcome}): the scenario "
+                    "would prove nothing",
+                )
+            outcome = "exhausted"
         self.events[f"harness.outcome.{outcome}"] += 1
         complete = outcome in ("ok", "skipped")
         unavailable = outcome == "unavailable"
@@ -1522,7 +1538,12 @@ class KeyHarness:
         # key as failed (#4948, #4968); a live capture does not raise.  A
         # missing extractor raises on every step kind (#4953).
         expect_failed = unavailable or (outcome == "failed" and step.kind != "live")
-        if unavailable:
+        # An exhausted enrichment raises on every step kind: a live worker
+        # retries the message, a reingest counts the key failed (#5035).
+        expect_failed = expect_failed or outcome == "exhausted"
+        if outcome == "exhausted":
+            expected_error = "LlmEnrichmentExhaustedError"
+        elif unavailable:
             expected_error = "ExtractorUnavailableError"
         elif self._unextractable(step):
             # Nothing could be read: reported, never retried (#4983).
@@ -1532,7 +1553,7 @@ class KeyHarness:
         reported_failed = False
         logged_before = self.events[_EXTRACTION_FAILED_EVENT]
         try:
-            with _real_enrichment():
+            with _real_enrichment(), self._exhausted_enrichment(outcome == "exhausted"):
                 if step.kind == "db":
                     DB_MODE_DRIVER(self, key, step)
                 elif step.kind == "presplit":
@@ -1581,7 +1602,9 @@ class KeyHarness:
                 before_rows,
                 after_rows,
                 search_before,
-                not_logged,
+                # An exhausted enrichment is no failed extraction: its raise
+                # (``reported_failed``) shows the step took its branch.
+                not_logged and outcome != "exhausted",
             )
         if step.kind == "presplit":
             # One event per ruling, each blind to its siblings (see the
@@ -1745,6 +1768,13 @@ class KeyHarness:
 
     def _check_reported(self, step: Step, outcome: str) -> None:
         """Called when an incomplete extraction raised nothing."""
+        if outcome == "exhausted":
+            self._fail(
+                "failed_manifest",
+                f"a {step.kind} step whose whole-document enrichment was exhausted raised "
+                "no LlmEnrichmentExhaustedError, so neither the live worker's retry nor "
+                "the reingest's failed-keys manifest sees it",
+            )
         if outcome == "unavailable":
             self._fail(
                 "failed_manifest",
@@ -1973,6 +2003,12 @@ class KeyHarness:
         if self.expect_exhausted:
             expect((_MARKER_EXHAUSTED_CHILD,), "a split with an exhausted child")
             return
+        if outcome == "exhausted":
+            expect(
+                (_MARKER_EXHAUSTED_CHILD,),
+                f"a whole-document {step.kind} step whose enrichment was exhausted",
+            )
+            return
         if fallback:
             expect(_MARKER_FALLBACK_REASONS, "a live capture of a new key that took the fallback")
             return
@@ -2000,6 +2036,39 @@ class KeyHarness:
                 f"a {step.kind} step that wrote nothing changed the key's incomplete "
                 f"record: before {before}, after {after}",
             )
+
+    @contextmanager
+    def _exhausted_enrichment(self, on: bool) -> Iterator[None]:
+        """With *on*, every per-field enrichment call of the step is
+        exhausted (``_llm_enrich_fields`` returns ``errored``, as after its
+        retries, #5035).  Counts the calls, so a scenario that never reached
+        the enrichment fails instead of passing vacuously.
+
+        The whole-document child reaches its enrichment as in production: its
+        per-field LLM extraction (``extract_fields_llm``) reads a case title,
+        so the child is no bad-split fragment, and enrichment is asked for
+        the fields still missing."""
+        if not on:
+            yield
+            return
+        from ingestion import worker as worker_mod
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        def exhausted(_ruling_text: str, _document_id: str) -> tuple[Any, str]:
+            self.events["harness.enrichment_exhausted"] += 1
+            return None, "errored"
+
+        def per_field(**_kwargs: Any) -> LLMExtractionResult:
+            return LLMExtractionResult(
+                case_count=1, rulings=[LLMRulingResult(case_title="Harness v. Exhausted")]
+            )
+
+        with (
+            patch.object(self.worker, "_llm_enrich_fields", exhausted),
+            patch.object(self.worker, "_llm_client", MagicMock()),
+            patch.object(worker_mod, "extract_fields_llm", per_field),
+        ):
+            yield
 
     def _check_telemetry(self, key: Key) -> None:
         gone = self._validation_seen - self._validation_ids(key)
@@ -2984,6 +3053,55 @@ def run_enrichment_failure(
                         f"(had {held.ruling_id}, now "
                         f"{None if now is None else now.ruling_id})",
                     )
+    finally:
+        harness.close()
+    return harness.events
+
+
+def run_whole_document_exhaustion(
+    dsn: str, seed: int, run_token: str, *, kind: str, name: str = "whole-exhausted"
+) -> Counter[str]:
+    """*seed*'s generated history on a key, then a *kind* step on which the
+    split finds no rulings and the whole document's one child exhausts its
+    per-field enrichment, then a healthy reingest of the same whole
+    document (#5035).
+
+    The exhausted step raises ``LlmEnrichmentExhaustedError`` before any
+    write, so it must leave the key ``untouched`` and record it
+    ``exhausted_child`` (``marker``), on a split-set replacement as on a live
+    capture; the healthy reingest must clear the record.  Before the fix only
+    a live capture's dead-letter recorded the key, and a reingest left it
+    only in the failed manifest under ``tmp/keys/``, which expires.  Returns
+    the run's event counts.
+    """
+    steps = generate(seed, extraction_modes=False)
+    harness = KeyHarness(dsn, run_token, seed)
+    try:
+        key = make_key(f"{run_token}-{seed}-{name}-{kind}")
+        for n, step in enumerate(steps):
+            harness.run_step(key, step, f"step {n + 1}/{len(steps)}")
+        # A document with no text has nothing to enrich: give it the few
+        # characters of a scanned PDF's text layer.
+        doc = steps[-1].doc or "harness scanned page"
+        whole = replace(steps[-1], whole=True, fail=False, fail_mode="", doc=doc)
+        if kind == "db" and not read_key(harness.checker, key.s3_key):
+            # A DB-row reingest selects only keys that have rows.
+            harness.events["harness.whole_exhausted.db_without_rows"] += 1
+            kind = "reingest"
+        exhausted = replace(whole, kind=kind, ops=("whole", "exhausted"))
+        harness.exhaust_whole = True
+        try:
+            harness.run_step(key, exhausted, "whole-document enrichment exhausted")
+        finally:
+            harness.exhaust_whole = False
+        if not harness.events["harness.enrichment_exhausted"]:
+            raise InvariantError(
+                "error",
+                f"seed={seed} {exhausted.describe()}: the whole-document child never "
+                "reached its enrichment (the scenario would prove nothing)",
+            )
+        healthy = replace(whole, kind="reingest", ops=("whole", "healthy"))
+        harness.run_step(key, healthy, "whole-document reingest")
     finally:
         harness.close()
     return harness.events

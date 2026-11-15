@@ -7,7 +7,10 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
 - ``partial_split``: a live capture of a new key whose extraction was
   partial writes only the rulings the parts that answered yielded (#5000);
 - ``exhausted_child``: a split child whose per-child LLM enrichment was
-  exhausted keeps its slot as it was (on a new key: missing, #4878);
+  exhausted keeps its slot as it was (on a new key: missing, #4878).  A
+  whole-document child (the split's only one) raises before any write, so
+  it is recorded on its own transaction before the error propagates, on a
+  reingest as on a live capture (#5035);
 - ``dead_letter``: the live worker gave up on the event (retries exhausted,
   or a schema error), so nothing reached ``derived.*``;
 - ``reingest_failed``: a reingest / rebuild refused an incomplete

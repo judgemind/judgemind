@@ -525,6 +525,35 @@ def test_retry_marker_exhausted_child(splitter: harness.DeterministicSplitter) -
     assert events["harness.marker.exhausted_child"] > 0, dict(events)
 
 
+@_needs_pg
+@pytest.mark.parametrize(
+    ("kind", "seed"),
+    # Seed 3's history leaves rows, which a DB-row reingest needs.
+    [("reingest", 0), ("live", 0), ("db", 3)],
+)
+def test_retry_marker_whole_document_exhausted_then_cleared(kind: str, seed: int) -> None:
+    """A step whose split finds no rulings and whose whole-document child
+    exhausts its enrichment leaves the key untouched and records
+    ``exhausted_child``; the healthy reingest after it clears the record
+    (#5035).  Before the fix a reingest left no record, only the failed
+    manifest under ``tmp/keys/``, which expires."""
+    events = harness.run_whole_document_exhaustion(_DSN, seed, _RUN, kind=kind)
+    assert not events["harness.whole_exhausted.db_without_rows"], dict(events)
+    assert events["harness.raised.LlmEnrichmentExhaustedError"] > 0, dict(events)
+    assert events["harness.marker.exhausted_child"] > 0, dict(events)
+    assert events["harness.marker.cleared"] > 0, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_whole_document_exhaustion_holds_invariants(seed: int) -> None:
+    """Every seed's history, then an exhausted whole-document step of a kind
+    the seed picks, then a healthy reingest: ``untouched``, ``marker`` and
+    the other invariants hold (#5035)."""
+    kind = ("reingest", "db", "live")[seed % 3]
+    harness.run_whole_document_exhaustion(_DSN, seed, _RUN, kind=kind, name="whole-sweep")
+
+
 #: A default-set seed per partial-extraction branch the generated stream
 #: reaches (#5000), with the events that show it: a multimodal county's
 #: reingest and a text-first county's reingest, each reported failed.
