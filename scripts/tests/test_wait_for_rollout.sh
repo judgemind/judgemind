@@ -97,6 +97,45 @@ case "$*" in
     "ecs describe-services"*)
         :
         ;;
+    "ecs describe-task-definition"*)
+        # Superseded-deployment image check (#5073): emit
+        # $TASKDEFS_DIR/<family:rev>.json for --task-definition <arn>.
+        td=""
+        prev=""
+        for a in "$@"; do
+            if [[ "$prev" == "--task-definition" ]]; then td="$a"; fi
+            prev="$a"
+        done
+        f="${TASKDEFS_DIR:-/nonexistent}/${td##*/}.json"
+        if [[ -f "$f" ]]; then
+            cat "$f"
+            exit 0
+        fi
+        echo "MOCK: no task definition for $td" >&2
+        exit 254
+        ;;
+    "ecr describe-images"*)
+        # Emit the digest stored in $ECR_DIR/<tag>; a missing file is a
+        # deleted tag. $ECR_FAIL=1 simulates an outright API failure.
+        if [[ "${ECR_FAIL:-0}" == "1" ]]; then
+            echo "MOCK: ExpiredTokenException" >&2
+            exit 255
+        fi
+        ids=""
+        prev=""
+        for a in "$@"; do
+            if [[ "$prev" == "--image-ids" ]]; then ids="$a"; fi
+            prev="$a"
+        done
+        tag="${ids#imageTag=}"
+        f="${ECR_DIR:-/nonexistent}/$tag"
+        if [[ -f "$f" ]]; then
+            printf '{"imageDetails":[{"imageDigest":"%s"}]}\n' "$(cat "$f")"
+            exit 0
+        fi
+        echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2
+        exit 254
+        ;;
     *)
         # Unknown mock call — just exit 0.
         exit 0
@@ -251,11 +290,13 @@ run_script() {
 
     AWS_CLI="$mock_aws" \
     RESPONSES_DIR="$tmpdir/responses" \
+    TASKDEFS_DIR="$tmpdir/taskdefs" \
+    ECR_DIR="$tmpdir/ecr" \
     CALL_LOG="$tmpdir/calls.log" \
     CALL_COUNTER_FILE="$tmpdir/counter" \
     ECS_CLUSTER="test-cluster" \
     ECS_SERVICE="test-svc" \
-    NEW_TASK_DEF_ARN="arn:test:new" \
+    NEW_TASK_DEF_ARN="${RUN_TASK_DEF_ARN:-arn:test:new}" \
     ROLLOUT_POLL_INTERVAL="${ROLLOUT_POLL_INTERVAL:-0}" \
     ROLLOUT_TIMEOUT_SECS="${ROLLOUT_TIMEOUT_SECS:-5}" \
         "$SCRIPT_UNDER_TEST" "$@"
@@ -271,6 +312,8 @@ run_script_by_deployment_id() {
 
     AWS_CLI="$mock_aws" \
     RESPONSES_DIR="$tmpdir/responses" \
+    TASKDEFS_DIR="$tmpdir/taskdefs" \
+    ECR_DIR="$tmpdir/ecr" \
     CALL_LOG="$tmpdir/calls.log" \
     CALL_COUNTER_FILE="$tmpdir/counter" \
     ECS_CLUSTER="test-cluster" \
@@ -694,6 +737,308 @@ test_deployment_id_timeout() {
     fi
 }
 
+# ── Superseded deployments (#5073) ─────────────────────────────────────────
+#
+# Models the PR #5070 incident: deploy-scraper registers :808 with
+# image scraper:<sha7>, then terraform dev-apply force-deploys :809 with
+# image scraper:latest. Both tags point at the same pushed image when the
+# deploy-scraper build pushed them together.
+
+TD_FAMILY_ARN="arn:aws:ecs:us-west-2:123456789012:task-definition/judgemind-ingestion-worker-dev"
+OUR_TD="${TD_FAMILY_ARN}:808"
+TF_TD="${TD_FAMILY_ARN}:809"
+ECR_REPO_URI="123456789012.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper"
+OUR_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
+OLD_DIGEST="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# write_services <file> <deployments-json-array>
+write_services() {
+    cat > "$1" << JSON
+{"services": [{"serviceName": "test-svc", "desiredCount": 1, "runningCount": 1,
+  "pendingCount": 0, "deployments": $2, "events": []}]}
+JSON
+}
+
+# dep_json <id> <task-def> <status> <rollout-state> <running> <desired>
+dep_json() {
+    printf '{"id":"%s","taskDefinition":"%s","status":"%s","rolloutState":"%s","rolloutStateReason":"","runningCount":%s,"desiredCount":%s,"pendingCount":0}' \
+        "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+# write_taskdef <tmpdir> <task-def-arn> <image>
+write_taskdef() {
+    mkdir -p "$1/taskdefs"
+    printf '{"taskDefinition":{"taskDefinitionArn":"%s","containerDefinitions":[{"name":"ingestion-worker","image":"%s"}]}}\n' \
+        "$2" "$3" > "$1/taskdefs/${2##*/}.json"
+}
+
+# write_ecr_tag <tmpdir> <tag> <digest>
+write_ecr_tag() {
+    mkdir -p "$1/ecr"
+    printf '%s' "$3" > "$1/ecr/$2"
+}
+
+# Our :808 (sha tag) and terraform's :809 (latest tag). latest's digest
+# decides whether :809 carries our image.
+setup_incident_taskdefs() {
+    local tmpdir="$1" latest_digest="$2"
+    write_taskdef "$tmpdir" "$OUR_TD" "${ECR_REPO_URI}:c05deff"
+    write_taskdef "$tmpdir" "$TF_TD" "${ECR_REPO_URI}:latest"
+    write_ecr_tag "$tmpdir" "c05deff" "$OUR_DIGEST"
+    write_ecr_tag "$tmpdir" "latest" "$latest_digest"
+}
+
+describe_calls() {
+    grep -c "ecs describe-services" "$1/calls.log" || true
+}
+
+# Test 15: superseded by a newer revision carrying our image → follow it and
+# exit 0 when it completes. This is the PR #5070 race.
+test_superseded_same_image_follows_and_succeeds() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/808 "$OUR_TD" PRIMARY IN_PROGRESS 0 1)]"
+    write_services "$tmpdir/responses/02.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+    write_services "$tmpdir/responses/03.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY COMPLETED 1 1)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "superseded by same image: exits 0 once the superseding deployment completes"
+    else
+        fail "superseded by same image: exits 0 once the superseding deployment completes" "exit=$exit_code output=$output"
+    fi
+    if grep -q "was superseded by deployment ecs-svc/809" <<< "$output" \
+        && grep -q "carries this run's image" <<< "$output"; then
+        pass "superseded by same image: names the superseding deployment and the image match"
+    else
+        fail "superseded by same image: names the superseding deployment and the image match" "output=$output"
+    fi
+    if grep -q "Superseding deployment ecs-svc/809 .* completed" <<< "$output"; then
+        pass "superseded by same image: success line names the followed deployment"
+    else
+        fail "superseded by same image: success line names the followed deployment" "output=$output"
+    fi
+    if grep -q "not yet visible" <<< "$output"; then
+        fail "superseded by same image: never reports 'not yet visible'" "output=$output"
+    else
+        pass "superseded by same image: never reports 'not yet visible'"
+    fi
+}
+
+# Test 16: superseded by a deployment running an OLDER image → exit 3 with
+# the reason, promptly (no waiting out the timeout).
+test_superseded_older_image_fails_clearly() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OLD_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/808 "$OUR_TD" PRIMARY IN_PROGRESS 0 1)]"
+    write_services "$tmpdir/responses/02.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+
+    local output exit_code=0 t0=$SECONDS
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" ROLLOUT_TIMEOUT_SECS=30 run_script "$tmpdir" 2>&1) || exit_code=$?
+    local took=$((SECONDS - t0))
+
+    if [[ "$exit_code" -eq 3 ]]; then
+        pass "superseded by older image: exits 3"
+    else
+        fail "superseded by older image: exits 3" "exit=$exit_code output=$output"
+    fi
+    if grep -q "SUPERSEDED: .* does not carry this run's image" <<< "$output" \
+        && grep -q "$OLD_DIGEST" <<< "$output" && grep -q "$OUR_DIGEST" <<< "$output"; then
+        pass "superseded by older image: says why, with both digests"
+    else
+        fail "superseded by older image: says why, with both digests" "output=$output"
+    fi
+    if [[ "$took" -lt 10 ]]; then
+        pass "superseded by older image: fails promptly (${took}s, budget 30s)"
+    else
+        fail "superseded by older image: fails promptly" "took ${took}s"
+    fi
+}
+
+# Test 17: AC for #5073 — our deployment was never seen in this call (e.g.
+# a re-run after exit 124) and a newer PRIMARY revision is present. The
+# verdict comes on the FIRST poll, not after a grace period or the timeout.
+test_superseded_newer_revision_detected_on_first_poll() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY COMPLETED 1 1)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" ROLLOUT_TIMEOUT_SECS=60 run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "newer PRIMARY revision, ours never seen: exits 0"
+    else
+        fail "newer PRIMARY revision, ours never seen: exits 0" "exit=$exit_code output=$output"
+    fi
+    if grep -q "newer revision of our family" <<< "$output" && [[ "$(describe_calls "$tmpdir")" -eq 1 ]]; then
+        pass "newer PRIMARY revision, ours never seen: superseded verdict on the first poll"
+    else
+        fail "newer PRIMARY revision, ours never seen: superseded verdict on the first poll" \
+            "describe calls=$(describe_calls "$tmpdir") output=$output"
+    fi
+}
+
+# Test 18: our deployment is still listed but DRAINING with COMPLETED 0/0
+# (what ECS shows for a replaced deployment). That must NOT read as a
+# scale-to-zero success; with a different image on the PRIMARY it is exit 3.
+test_demoted_deployment_is_not_success() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OLD_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 1 1), $(dep_json ecs-svc/808 "$OUR_TD" DRAINING COMPLETED 0 0)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 3 ]]; then
+        pass "demoted (DRAINING COMPLETED 0/0) deployment with another image: exits 3, not 0"
+    else
+        fail "demoted (DRAINING COMPLETED 0/0) deployment with another image: exits 3, not 0" "exit=$exit_code output=$output"
+    fi
+    if grep -q "our deployment is now DRAINING" <<< "$output"; then
+        pass "demoted deployment: names the DRAINING status"
+    else
+        fail "demoted deployment: names the DRAINING status" "output=$output"
+    fi
+}
+
+# Test 19: no revision signal (ARNs without revisions) — superseded only
+# after ROLLOUT_SUPERSEDE_GRACE_POLLS missing polls, then followed when the
+# image strings are identical (no ECR lookup needed).
+test_superseded_after_grace_polls() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_taskdef "$tmpdir" "arn:test:new" "${ECR_REPO_URI}:abc1234"
+    write_taskdef "$tmpdir" "arn:test:other" "${ECR_REPO_URI}:abc1234"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/other arn:test:other PRIMARY IN_PROGRESS 0 1)]"
+    write_services "$tmpdir/responses/04.json" \
+        "[$(dep_json ecs-svc/other arn:test:other PRIMARY COMPLETED 1 1)]"
+    cp "$tmpdir/responses/01.json" "$tmpdir/responses/02.json"
+    cp "$tmpdir/responses/01.json" "$tmpdir/responses/03.json"
+
+    local output exit_code=0
+    output=$(ROLLOUT_SUPERSEDE_GRACE_POLLS=3 run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "grace-poll supersession with identical image: exits 0"
+    else
+        fail "grace-poll supersession with identical image: exits 0" "exit=$exit_code output=$output"
+    fi
+    if [[ "$(grep -c "not yet visible" <<< "$output")" -eq 2 ]] \
+        && grep -q "missing for 3 polls" <<< "$output"; then
+        pass "grace-poll supersession: 2 'not yet visible' polls, superseded on the 3rd"
+    else
+        fail "grace-poll supersession: 2 'not yet visible' polls, superseded on the 3rd" "output=$output"
+    fi
+    if grep -q "ecr describe-images" "$tmpdir/calls.log"; then
+        fail "grace-poll supersession: identical image refs skip the ECR lookup" "calls=$(cat "$tmpdir/calls.log")"
+    else
+        pass "grace-poll supersession: identical image refs skip the ECR lookup"
+    fi
+}
+
+# Test 20: budget — the superseding deployment never finishes. Exit 124
+# (still rolling out, #4835) and say how to keep waiting on it.
+test_superseded_follow_times_out_124() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" ROLLOUT_TIMEOUT_SECS=1 run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        pass "following a superseding deployment that never completes: exits 124"
+    else
+        fail "following a superseding deployment that never completes: exits 124" "exit=$exit_code output=$output"
+    fi
+    if grep -q "NEW_DEPLOYMENT_ID=ecs-svc/809" <<< "$output"; then
+        pass "timeout while following: prints how to wait on the superseding deployment"
+    else
+        fail "timeout while following: prints how to wait on the superseding deployment" "output=$output"
+    fi
+}
+
+# Test 21: the ECR lookup fails outright (expired credentials) → exit 125,
+# state unknown — not a superseded verdict and not a timeout.
+test_superseded_image_lookup_failure_125() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+
+    local output exit_code=0
+    output=$(ECR_FAIL=1 RUN_TASK_DEF_ARN="$OUR_TD" run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 125 ]]; then
+        pass "ECR lookup failure during the image check: exits 125"
+    else
+        fail "ECR lookup failure during the image check: exits 125" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 22: deleted tag (ImageNotFoundException) is an answer, not an
+# unknown state: the images cannot be matched → exit 3.
+test_superseded_deleted_tag_is_mismatch() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    rm -f "$tmpdir/ecr/latest"
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 3 ]] && grep -q "could not resolve both images" <<< "$output"; then
+        pass "deleted tag on the superseding image: exits 3 with reason"
+    else
+        fail "deleted tag on the superseding image: exits 3 with reason" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 23: normal rollout is unchanged — no task-def or ECR lookups at all.
+test_normal_rollout_makes_no_image_lookups() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/808 "$OUR_TD" PRIMARY IN_PROGRESS 0 1), $(dep_json ecs-svc/807 "${TD_FAMILY_ARN}:807" ACTIVE COMPLETED 1 1)]"
+    write_services "$tmpdir/responses/02.json" \
+        "[$(dep_json ecs-svc/808 "$OUR_TD" PRIMARY COMPLETED 1 1)]"
+
+    local output exit_code=0
+    output=$(RUN_TASK_DEF_ARN="$OUR_TD" run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]] && grep -q "Service updated successfully" <<< "$output"; then
+        pass "normal rollout with an older ACTIVE deployment: exits 0"
+    else
+        fail "normal rollout with an older ACTIVE deployment: exits 0" "exit=$exit_code output=$output"
+    fi
+    if grep -qE "describe-task-definition|ecr describe-images" "$tmpdir/calls.log" \
+        || grep -q "superseded" <<< "$output"; then
+        fail "normal rollout: no supersession logic fires" "output=$output calls=$(cat "$tmpdir/calls.log")"
+    else
+        pass "normal rollout: no supersession logic fires"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_immediate_completed
@@ -712,6 +1057,15 @@ test_deployment_id_immediate_completed
 test_deployment_id_disambiguates_shared_taskdef
 test_deployment_id_failed_rollout
 test_deployment_id_timeout
+test_superseded_same_image_follows_and_succeeds
+test_superseded_older_image_fails_clearly
+test_superseded_newer_revision_detected_on_first_poll
+test_demoted_deployment_is_not_success
+test_superseded_after_grace_polls
+test_superseded_follow_times_out_124
+test_superseded_image_lookup_failure_125
+test_superseded_deleted_tag_is_mismatch
+test_normal_rollout_makes_no_image_lookups
 
 echo ""
 echo "────────────────────────────────────────────"

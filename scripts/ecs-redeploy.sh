@@ -21,7 +21,11 @@
 #
 # Exit codes:
 #   0     the deployment completed
+#         (also when a newer deployment with the same image replaced it
+#         and that one completed, #5073)
 #   1     usage error, update-service failed, or the rollout FAILED
+#   3     a newer deployment replaced ours and does not carry the same
+#         image (#5073; see scripts/wait-for-rollout.sh)
 #   124   the wait ran out while the deployment is still rolling out.  NOT a
 #         failure.  Do NOT re-run the plain command (that would force yet
 #         another deployment).  Re-run with `--deployment-id <id>`, as
@@ -169,6 +173,12 @@ if [[ $ROLLOUT_RC -eq 124 || $ROLLOUT_RC -eq 125 ]]; then
     echo "To keep waiting on this deployment:" >&2
     echo "  scripts/ecs-redeploy.sh $SERVICE $CLUSTER --deployment-id $NEW_DEPLOYMENT_ID" >&2
     exit "$ROLLOUT_RC"
+fi
+if [[ $ROLLOUT_RC -eq 3 ]]; then
+    # Another deployment replaced ours and does not carry the same image
+    # (wait-for-rollout.sh printed the reason, #5073).
+    echo "ERROR: Deployment $NEW_DEPLOYMENT_ID was superseded by a deployment with a different image." >&2
+    exit 3
 fi
 if [[ $ROLLOUT_RC -ne 0 ]]; then
     echo "ERROR: Deployment did not complete successfully." >&2
