@@ -1,10 +1,12 @@
 /**
  * Data quality metrics resolvers and data access.
  *
- * Provides three queries:
+ * Provides four queries:
  * - dataQualityMetrics: time-series metrics with filtering
  * - dataQualityOverview: per-county health status summary
  * - rosterFreshness: per-court judge-roster fetch health (#4872)
+ * - rawKeyReconciliation: latest archived-raw vs derived.documents
+ *   reconciliation, per scope (#5015)
  *
  * All queries are admin-only.
  */
@@ -779,6 +781,121 @@ async function queryRosterFreshness(pool: Pool, now: Date = new Date()): Promise
 }
 
 // ---------------------------------------------------------------------------
+// Data access — rawKeyReconciliation (issue #5015)
+// ---------------------------------------------------------------------------
+
+export interface ReasonCount {
+  reason: string;
+  count: number;
+}
+
+export interface RawKeyReconcileScope {
+  scope: string;
+  rawKeys: number;
+  represented: number;
+  skipped: number;
+  unrepresented: number;
+  pending: number;
+  datedExcluded: number;
+  skippedByReason: ReasonCount[];
+  /** Earliest and latest LastModified day (YYYY-MM-DD) of the unrepresented keys. */
+  oldestUnrepresentedDay: string | null;
+  newestUnrepresentedDay: string | null;
+}
+
+export interface RawKeyReconciliation {
+  runId: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  rawKeys: number;
+  represented: number;
+  skipped: number;
+  unrepresented: number;
+  pending: number;
+  datedExcluded: number;
+  action: string;
+  scopes: RawKeyReconcileScope[];
+}
+
+function toInt(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  if (value === null || value === undefined) return {};
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === 'object' ? (value as Record<string, unknown>) : {};
+}
+
+/** Turn one raw_reconcile_counts row into the API shape. */
+export function toReconcileScope(row: Row): RawKeyReconcileScope {
+  const reasons = asObject(row.skipped_by_reason);
+  const days = Object.keys(asObject(row.unrepresented_by_day)).sort();
+  return {
+    scope: String(row.scope),
+    rawKeys: toInt(row.raw_keys),
+    represented: toInt(row.represented),
+    skipped: toInt(row.skipped),
+    unrepresented: toInt(row.unrepresented),
+    pending: toInt(row.pending),
+    datedExcluded: toInt(row.dated_excluded),
+    skippedByReason: Object.entries(reasons)
+      .map(([reason, count]) => ({ reason, count: toInt(count) }))
+      .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
+    oldestUnrepresentedDay: days.length > 0 ? days[0] : null,
+    newestUnrepresentedDay: days.length > 0 ? days[days.length - 1] : null,
+  };
+}
+
+export const RAW_RECONCILE_LATEST_RUN_SQL = `
+  SELECT run_id, started_at, finished_at, raw_keys, represented, skipped,
+         unrepresented, pending, dated_excluded, action
+  FROM telemetry.raw_reconcile_runs
+  ORDER BY finished_at DESC
+  LIMIT 1
+`;
+
+export const RAW_RECONCILE_SCOPES_SQL = `
+  SELECT scope, raw_keys, represented, skipped, unrepresented, pending,
+         dated_excluded, skipped_by_reason, unrepresented_by_day
+  FROM telemetry.raw_reconcile_counts
+  WHERE run_id = $1
+  ORDER BY unrepresented DESC, scope
+`;
+
+/**
+ * The latest raw-key reconciliation run with its per-scope counts, or null
+ * when no run has been recorded yet.
+ */
+async function queryRawKeyReconciliation(pool: Pool): Promise<RawKeyReconciliation | null> {
+  const { rows } = await pool.query<Row>(RAW_RECONCILE_LATEST_RUN_SQL);
+  if (rows.length === 0) return null;
+  const run = rows[0];
+  const scopes = await pool.query<Row>(RAW_RECONCILE_SCOPES_SQL, [run.run_id]);
+  return {
+    runId: String(run.run_id),
+    startedAt: toIso(run.started_at),
+    finishedAt: toIso(run.finished_at),
+    rawKeys: toInt(run.raw_keys),
+    represented: toInt(run.represented),
+    skipped: toInt(run.skipped),
+    unrepresented: toInt(run.unrepresented),
+    pending: toInt(run.pending),
+    datedExcluded: toInt(run.dated_excluded),
+    action: String(run.action ?? 'none'),
+    scopes: scopes.rows.map(toReconcileScope),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Context type
 // ---------------------------------------------------------------------------
 
@@ -811,6 +928,11 @@ export const dataQualityResolvers = {
       requireAdmin(user);
       return queryRosterFreshness(pool);
     },
+
+    rawKeyReconciliation: async (_: unknown, __: unknown, { pool, user }: DataQualityContext) => {
+      requireAdmin(user);
+      return queryRawKeyReconciliation(pool);
+    },
   },
 
   DataQualityMetric: {
@@ -832,4 +954,4 @@ export const dataQualityResolvers = {
 };
 
 // Export for testing (non-function types and requireAdmin which is not inline-exported)
-export { requireAdmin, queryRosterFreshness, type CountyMetrics, type CountyThresholds, type CountyConfig, type MetricResolution };
+export { requireAdmin, queryRosterFreshness, queryRawKeyReconciliation, type CountyMetrics, type CountyThresholds, type CountyConfig, type MetricResolution };

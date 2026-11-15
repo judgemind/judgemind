@@ -1110,6 +1110,9 @@ fi
 # GitHub Actions workflow lint (actionlint)
 # -------------------------------------------------------------------
 changed_workflows=$(echo "$changed_files" | grep '^\.github/workflows/' || true)
+# A deleted workflow is in the diff but not on disk; actionlint would fail
+# to open it (#5015).
+changed_workflows=$(for f in $changed_workflows; do [ -f "$f" ] && echo "$f"; done)
 if [ -n "$changed_workflows" ]; then
     echo "pre-push: checking GitHub Actions workflow files..." >&2
     if command -v actionlint &>/dev/null; then

@@ -88,6 +88,7 @@ import {
   DATA_QUALITY_OVERVIEW_QUERY,
   DATA_QUALITY_METRICS_QUERY,
   ROSTER_FRESHNESS_QUERY,
+  RAW_KEY_RECONCILIATION_QUERY,
 } from '@/lib/data-quality-queries';
 import { REFRESH_TOKEN_MUTATION } from '@/lib/auth-mutations';
 import {
@@ -200,6 +201,13 @@ function rosterFreshnessMock(): MockedResponse {
   return {
     request: { query: ROSTER_FRESHNESS_QUERY },
     result: { data: { rosterFreshness: [] } },
+  };
+}
+
+function rawKeyReconciliationMock(): MockedResponse {
+  return {
+    request: { query: RAW_KEY_RECONCILIATION_QUERY },
+    result: { data: { rawKeyReconciliation: null } },
   };
 }
 
@@ -496,6 +504,7 @@ describe('Auth lifecycle integration', () => {
         dataQualityOverviewMock(),
         dataQualityMetricsMock(),
         rosterFreshnessMock(),
+        rawKeyReconciliationMock(),
       ];
 
       renderWithProviders(<DataQualityDashboard />, mocks);

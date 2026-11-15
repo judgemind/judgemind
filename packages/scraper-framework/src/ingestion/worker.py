@@ -128,6 +128,14 @@ from .extract import (
     strip_trailing_case_number,
     strip_trailing_connectors,
 )
+from .ingest_skips import (
+    SKIP_GOVERNOR_BIO_ROUTE,
+    SKIP_NO_EXTRACTABLE_TEXT,
+    SKIP_NO_RULING_TEXT,
+    SKIP_SANTA_CLARA_PLACEHOLDER,
+    SKIP_ZERO_RULINGS_NO_TEXT,
+    record_ingest_skip,
+)
 from .llm_extract import (
     LLMExtractionResult,
     LLMRulingResult,
@@ -1743,10 +1751,29 @@ class _SplitBatch:
     keep_ids: set[str] = field(default_factory=set)
     replace: bool = False
     no_rulings_reason: str | None = None
+    #: Multimodal rows skipped for having no ruling text (#4714); when they
+    #: are all the split found, that is why the key holds no rows (#5015).
+    textless_rows: int = 0
     whole_document: bool = False
     extraction_failed: str | None = None
     pre_split: SplitSet | None = None
     extractor_unavailable: bool = False
+
+
+def _empty_split_skip_reason(batch: _SplitBatch) -> str | None:
+    """Why a split that writes no child leaves its key with no rows (#5015).
+
+    ``None`` when the split wrote or kept a child, or when nothing here
+    explains the empty set (a child rejected by validation or the all-NULL
+    guard has its own durable row).
+    """
+    if batch.children or batch.keep_ids or batch.pre_split is not None:
+        return None
+    if batch.no_rulings_reason:
+        return batch.no_rulings_reason
+    if batch.textless_rows:
+        return SKIP_NO_RULING_TEXT
+    return None
 
 
 class InfrastructureError(Exception):
@@ -3224,6 +3251,9 @@ class IngestionWorker:
                     "telemetry_event": "governor_appointment_routed_to_bio_path",
                 },
             )
+            # The key holds no document on purpose: record why, so the
+            # raw-key reconciler does not count it as lost (#5015).
+            self._record_skip_and_commit(event_data, SKIP_GOVERNOR_BIO_ROUTE)
             return
 
         timing = DocTiming(
@@ -5057,6 +5087,22 @@ class IngestionWorker:
                 held=held_votes,
                 renamed_judge_ids=split_changes.judge_ids,
             )
+            skip_reason = _empty_split_skip_reason(batch)
+            if skip_reason:
+                # The document holds no rulings on purpose (a placeholder
+                # notice, a PDF with no rulings and no text, rows with no
+                # ruling text): record why in the same transaction as the
+                # empty split set, so the raw-key reconciler does not count
+                # the key as lost (#5015).
+                record_ingest_skip(
+                    conn,
+                    s3_key=s3_key,
+                    reason=skip_reason,
+                    county=event_data.get("county"),
+                    scraper_id=event_data.get("scraper_id"),
+                    document_id=parent_document_id,
+                    detail={"removed_rows": len(removed), "textless_rows": batch.textless_rows},
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5359,6 +5405,11 @@ class IngestionWorker:
             if reason == NO_EXTRACTABLE_TEXT:
                 # Nothing could be read: a retry cannot succeed (#4983).
                 error = NoExtractableTextError
+                # Nothing is written for the key on purpose: record why
+                # before raising, so the reconciler does not count it as
+                # lost (#5015).  The split wrote nothing, so the commit
+                # only keeps this record and the best-effort telemetry.
+                self._record_skip_and_commit(event_data, SKIP_NO_EXTRACTABLE_TEXT)
             raise error(f"extraction failed for {s3_key or document_id}: {reason[:500]}")
         if key_has_rows:
             # Nothing is written for this event: end the transaction the
@@ -5366,6 +5417,38 @@ class IngestionWorker:
             # for the document (``zero_ruling_extraction``).
             self._get_connection().commit()
         return key_has_rows
+
+    def _record_skip_and_commit(
+        self,
+        event_data: dict[str, Any],
+        reason: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record why the event's raw key holds no document, and commit (#5015).
+
+        For non-write paths that end the event without a split-set write.
+        Best-effort: a failure is logged and never fails the event.
+        """
+        if not event_data.get("s3_key"):
+            return
+        try:
+            conn = self._get_connection()
+            if record_ingest_skip(
+                conn,
+                s3_key=event_data.get("s3_key"),
+                reason=reason,
+                county=event_data.get("county"),
+                scraper_id=event_data.get("scraper_id"),
+                document_id=event_data.get("document_id"),
+                detail=detail,
+            ):
+                conn.commit()
+        except Exception:  # noqa: BLE001 — the record is best-effort
+            logger.warning(
+                "ingest skip record commit failed",
+                exc_info=True,
+                extra={"s3_key": event_data.get("s3_key"), "skip_reason": reason},
+            )
 
     def _key_has_rows(self, s3_key: str) -> bool:
         """Whether any document row is stored for *s3_key*."""
@@ -5554,7 +5637,7 @@ class IngestionWorker:
                 },
             )
             batch.replace = True
-            batch.no_rulings_reason = "santa_clara_placeholder"
+            batch.no_rulings_reason = SKIP_SANTA_CLARA_PLACEHOLDER
             return True
 
         # Every deterministic splitter below dispatches its children through
@@ -5999,7 +6082,7 @@ class IngestionWorker:
                 # replaced by the empty one, as a fresh ingest leaves it
                 # (#4940).
                 batch.replace = True
-                batch.no_rulings_reason = "zero_rulings_no_text"
+                batch.no_rulings_reason = SKIP_ZERO_RULINGS_NO_TEXT
                 return True
             # A complete extraction (every page or chunk answered) that
             # found no rulings is a verdict: the document is one ruling, the
@@ -6318,6 +6401,7 @@ class IngestionWorker:
                         "county": county,
                     },
                 )
+                batch.textless_rows += 1
                 continue
 
             # For multimodal-extracted PDFs, ruling_text is markdown.

@@ -1,0 +1,230 @@
+name: Raw-Key Reconciler
+
+# Daily, dev only (#5015). Every archived raw key must be represented in
+# derived.documents or have a recorded skip reason. scripts/reconcile_raw_keys.py
+# lists the whole archive (S3 listing only, no object reads), records the
+# per-scope counts for /admin/data-quality, and re-ingests small sets of
+# unrepresented keys itself (reingest_from_s3.py --concurrency 4, inside the
+# same ECS task). This workflow only launches it, defers the reingest while
+# another reingest or rebuild runs, and files or updates one GitHub issue when
+# the count is too large to auto-heal or does not heal over repeated runs.
+#
+# Dashboard + issue only, never a human alert (CLAUDE.md "Human Alerts").
+# Replaces the retired S3 orphan-rate check.
+
+on:
+  schedule:
+    # 13:30 UTC (05:30 PT): after the overnight captures are ingested and
+    # before the 06:15 PT scraper run.
+    - cron: '30 13 * * *'
+  workflow_dispatch:
+    inputs:
+      reingest:
+        description: "Re-ingest unrepresented keys when under the threshold"
+        required: false
+        type: boolean
+        default: true
+      max_auto_reingest:
+        description: "Largest unrepresented count to re-ingest automatically"
+        required: false
+        type: string
+        default: "500"
+
+concurrency:
+  group: raw-key-reconcile
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  CLUSTER: judgemind-dev
+  ISSUE_LABEL: raw-reconcile-alert
+  ISSUE_TITLE: "Raw-key reconciler: archived raws missing from derived.documents"
+
+jobs:
+  reconcile:
+    name: Reconcile archived raw keys (dev)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check for a running reingest or rebuild
+        id: busy
+        run: |
+          set -euo pipefail
+          busy=false
+          tasks=$(aws ecs list-tasks --cluster "$CLUSTER" --desired-status RUNNING \
+            --query 'taskArns' --output text)
+          if [ -n "$tasks" ] && [ "$tasks" != "None" ]; then
+            # shellcheck disable=SC2086
+            for td in $(aws ecs describe-tasks --cluster "$CLUSTER" --tasks $tasks \
+                --query 'tasks[].taskDefinitionArn' --output text); do
+              case "$td" in
+                *judgemind-oneshot-*)
+                  cmd=$(aws ecs describe-task-definition --task-definition "$td" \
+                    --query 'taskDefinition.containerDefinitions[0].command' --output text || true)
+                  if printf '%s' "$cmd" | grep -Eq 'reingest_from_s3|rebuild_db'; then
+                    echo "Running reingest/rebuild oneshot: $td"
+                    busy=true
+                  fi
+                  ;;
+              esac
+            done
+          fi
+          echo "busy=$busy" >> "$GITHUB_OUTPUT"
+
+      - name: Run the reconciler on ECS
+        id: run
+        env:
+          REINGEST: ${{ github.event_name == 'schedule' || inputs.reingest }}
+          MAX_AUTO: ${{ inputs.max_auto_reingest || '500' }}
+          BUSY: ${{ steps.busy.outputs.busy }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          args=(--record --max-auto-reingest "$MAX_AUTO")
+          if [ "$REINGEST" = "true" ]; then
+            args+=(--reingest)
+            if [ "$BUSY" = "true" ]; then
+              args+=(--defer-reingest)
+            fi
+          fi
+          scripts/ecs-run-task.sh --detach --max-runtime 14400 \
+            scripts/reconcile_raw_keys.py -- "${args[@]}"
+          arn=$(cat tmp/last-ecs-task.arn)
+          echo "task_id=${arn##*/}" >> "$GITHUB_OUTPUT"
+          set +e
+          scripts/ecs-wait-task.sh "$arn" --timeout 270 --poll-interval 60 --quiet
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Read the result line
+        id: result
+        env:
+          TASK_ID: ${{ steps.run.outputs.task_id }}
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          aws logs filter-log-events \
+            --log-group-name /ecs/judgemind-ingestion-worker-dev \
+            --log-stream-names "oneshot/oneshot/${TASK_ID}" \
+            --filter-pattern '"RECONCILE_RESULT"' \
+            --query 'events[].message' --output text > tmp/result_lines.txt || true
+          line=$(grep -o 'RECONCILE_RESULT {.*}' tmp/result_lines.txt | tail -1 || true)
+          if [ -z "$line" ]; then
+            # Fail closed: no result means the reconciler did not finish.
+            echo "::error::No RECONCILE_RESULT line from task ${TASK_ID} (exit ${EXIT_CODE})."
+            exit 1
+          fi
+          printf '%s\n' "${line#RECONCILE_RESULT }" > tmp/result.json
+          jq . tmp/result.json
+          {
+            echo "action=$(jq -r .action tmp/result.json)"
+            echo "issue_needed=$(jq -r .issue_needed tmp/result.json)"
+            echo "unrepresented=$(jq -r .unrepresented tmp/result.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the issue text
+        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.unrepresented == '0'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TASK_ID: ${{ steps.run.outputs.task_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**Action:** \`$(jq -r .action tmp/result.json)\`"
+            echo "**Unrepresented:** $(jq -r .unrepresented tmp/result.json) of $(jq -r .raw tmp/result.json) raw keys"
+            echo "(represented $(jq -r .represented tmp/result.json), skipped $(jq -r .skipped tmp/result.json), pending $(jq -r .pending tmp/result.json))"
+            echo "**Previous runs (unrepresented, newest first):** $(jq -c .previous_unrepresented tmp/result.json)"
+            echo ""
+            echo "| Scope | Unrepresented |"
+            echo "|---|---|"
+            jq -r '.top_scopes[] | "| \(.[0]) | \(.[1]) |"' tmp/result.json
+            echo ""
+            echo "- Workflow run: ${RUN_URL}"
+            echo "- ECS task: \`${TASK_ID}\` (log group \`/ecs/judgemind-ingestion-worker-dev\`, stream \`oneshot/oneshot/${TASK_ID}\`)"
+            echo "- Per-scope counts: /admin/data-quality, Raw-Key Reconciliation panel"
+          } > tmp/summary.md
+          cat tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: File or update the reconciler issue
+        if: steps.result.outputs.issue_needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Raw-key reconciler: unrepresented archived raws" --force
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label "$ISSUE_LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            {
+              echo "### Still unhealed: $(date -u +%Y-%m-%dT%H:%MZ)"
+              echo ""
+              cat tmp/summary.md
+            } > tmp/comment.md
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file tmp/comment.md
+            exit 0
+          fi
+          {
+            echo "## Archived raw keys are missing from derived.documents"
+            echo ""
+            echo "The daily raw-key reconciler (\`scripts/reconcile_raw_keys.py\`, #5015) found"
+            echo "archived raw captures with no \`derived.documents\` row and no recorded skip"
+            echo "reason that the daily auto-reingest cannot heal: more than the auto-reingest"
+            echo "threshold (\`over_threshold\`), keys back after several daily reingests"
+            echo "(\`persistent\`), or a reingest that could not be launched (\`reingest_failed\`)."
+            echo ""
+            cat tmp/summary.md
+            echo ""
+            echo "### Next steps"
+            echo ""
+            echo "1. Write the key lists: \`scripts/ecs-run-task.sh --detach scripts/reconcile_raw_keys.py -- --prefix <state>/ --write-keys s3://judgemind-document-archive-dev/tmp/keys/<name> --chunk-size 1500\`."
+            echo "2. Find why they never reached the database (an ingestion outage window, a worker path that writes nothing without recording a skip reason)."
+            echo "3. Heal with \`scripts/reingest_from_s3.py --prefix <state>/ --s3-key-list <uri> --concurrency 4\`."
+            echo ""
+            echo "This issue is updated by each daily run while the condition holds and closed"
+            echo "automatically when a run finds nothing unrepresented."
+          } > tmp/issue.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" \
+            --body-file tmp/issue.md \
+            --label "$ISSUE_LABEL,priority/p1,area/ingestion,type/bug,agent/ready"
+
+      - name: Close the reconciler issue when healed
+        if: steps.result.outputs.unrepresented == '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --label "$ISSUE_LABEL" --json number --jq '.[].number'); do
+            {
+              echo "The raw-key reconciler found nothing unrepresented. Closing."
+              echo ""
+              cat tmp/summary.md
+            } > tmp/close.md
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body-file tmp/close.md
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed
+          done
+
+      - name: Fail when the reconciler task failed
+        if: steps.run.outputs.exit_code != '0'
+        env:
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+        run: |
+          echo "::error::Reconciler task exited ${EXIT_CODE} (action $(jq -r .action tmp/result.json))."
+          exit 1

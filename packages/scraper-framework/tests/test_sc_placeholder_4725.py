@@ -205,6 +205,28 @@ def test_sc_placeholder_worker_skips_without_llm_or_rulings(
     assert not any("every child was rejected" in m for m in messages)
 
 
+@patch("ingestion.worker.record_ingest_skip", return_value=True)
+@patch("ingestion.worker.delete_stale_split_children", return_value=0)
+@patch("ingestion.worker.write_split_rulings", return_value={})
+def test_skip_reason_santa_clara_placeholder_is_recorded(
+    mock_write: MagicMock, mock_delete_stale: MagicMock, mock_record: MagicMock
+) -> None:
+    """The placeholder records a durable skip reason keyed by s3_key, in the
+    empty split set's transaction (#5015)."""
+    worker, _, _ = _make_worker()
+    worker._indexer = MagicMock()
+    event = _sc_event()
+
+    worker.process_event(event)
+
+    mock_record.assert_called_once()
+    kwargs = mock_record.call_args.kwargs
+    assert kwargs["s3_key"] == event["s3_key"]
+    assert kwargs["reason"] == "santa_clara_placeholder"
+    assert kwargs["scraper_id"] == "ca-sc-tentatives-civil"
+    assert mock_record.call_args.args[0] is worker._get_connection.return_value
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

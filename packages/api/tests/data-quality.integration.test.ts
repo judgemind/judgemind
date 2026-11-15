@@ -775,3 +775,90 @@ describe('rosterFreshness', () => {
     expect(emptySnap.lastSuccessAt).toBe(emptySnap.lastSnapshotAt);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests — rawKeyReconciliation (issue #5015)
+// ---------------------------------------------------------------------------
+
+describe('rawKeyReconciliation', () => {
+  const QUERY = `{
+    rawKeyReconciliation {
+      runId finishedAt rawKeys represented skipped unrepresented pending datedExcluded action
+      scopes {
+        scope rawKeys represented skipped unrepresented pending datedExcluded
+        skippedByReason { reason count }
+        oldestUnrepresentedDay newestUnrepresentedDay
+      }
+    }
+  }`;
+
+  async function cleanupRuns(): Promise<void> {
+    await pool.query(`DELETE FROM telemetry.raw_reconcile_runs WHERE detail->>'test' = '5015'`);
+  }
+
+  beforeAll(async () => {
+    await cleanupRuns();
+    // An older run, then the latest one (finished in the future so no real
+    // run in the test database can be newer).
+    const { rows: older } = await pool.query<{ run_id: string }>(
+      `INSERT INTO telemetry.raw_reconcile_runs
+         (started_at, finished_at, raw_keys, represented, skipped, unrepresented, action, detail)
+       VALUES ('2099-01-01T00:00Z', '2099-01-01T00:01Z', 10, 10, 0, 0, 'none', '{"test": "5015"}')
+       RETURNING run_id`,
+    );
+    await pool.query(
+      `INSERT INTO telemetry.raw_reconcile_counts
+         (run_id, scope, raw_keys, represented, skipped, unrepresented)
+       VALUES ($1, 'ca/old_county', 10, 10, 0, 0)`,
+      [older[0].run_id],
+    );
+    const { rows: latest } = await pool.query<{ run_id: string }>(
+      `INSERT INTO telemetry.raw_reconcile_runs
+         (started_at, finished_at, raw_keys, represented, skipped, unrepresented, pending,
+          dated_excluded, action, detail)
+       VALUES ('2099-01-02T00:00Z', '2099-01-02T00:01Z', 120, 100, 6, 13, 1, 40,
+               'reingest', '{"test": "5015"}')
+       RETURNING run_id`,
+    );
+    const runId = latest[0].run_id;
+    await pool.query(
+      `INSERT INTO telemetry.raw_reconcile_counts
+         (run_id, scope, raw_keys, represented, skipped, unrepresented, pending, dated_excluded,
+          skipped_by_reason, unrepresented_by_day)
+       VALUES
+         ($1, 'ca/los_angeles', 100, 85, 2, 12, 1, 40, '{"validation_fail": 2}',
+          '{"2026-06-02": 5, "2026-05-21": 7}'),
+         ($1, 'ca/santa_clara', 20, 15, 4, 1, 0, 0,
+          '{"santa_clara_placeholder": 3, "validation_fail": 1}', '{"2026-11-10": 1}')`,
+      [runId],
+    );
+  });
+
+  afterAll(async () => {
+    await cleanupRuns();
+  });
+
+  it('rejects non-admin users', async () => {
+    const body = await gql(QUERY, undefined, userToken);
+    expect(body.errors?.[0].extensions?.code).toBe('FORBIDDEN');
+  });
+
+  it('returns the latest run with per-scope counts, most unrepresented first', async () => {
+    const body = await gql(QUERY, undefined, adminToken);
+    expect(body.errors).toBeUndefined();
+    const run = body.data?.rawKeyReconciliation as Record<string, unknown>;
+    expect(run.action).toBe('reingest');
+    expect(run.rawKeys).toBe(120);
+    expect(run.unrepresented).toBe(13);
+    expect(run.pending).toBe(1);
+    expect(run.datedExcluded).toBe(40);
+    const scopes = run.scopes as Array<Record<string, unknown>>;
+    expect(scopes.map((s) => s.scope)).toEqual(['ca/los_angeles', 'ca/santa_clara']);
+    expect(scopes[0].oldestUnrepresentedDay).toBe('2026-05-21');
+    expect(scopes[0].newestUnrepresentedDay).toBe('2026-06-02');
+    expect(scopes[1].skippedByReason).toEqual([
+      { reason: 'santa_clara_placeholder', count: 3 },
+      { reason: 'validation_fail', count: 1 },
+    ]);
+  });
+});
