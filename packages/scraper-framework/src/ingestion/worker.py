@@ -5382,7 +5382,10 @@ class IngestionWorker:
         number, a real number its text does not print left for the
         placeholder), and a document rejected by validation leaves the key
         with no rows, as a fresh ingest does.  Before, it was written on its
-        own and kept whatever earlier splits had left on the key.
+        own and kept whatever earlier splits had left on the key.  When its
+        per-field enrichment is exhausted the error propagates before any
+        write, after ``_record_unwritten_split`` records the key
+        ``exhausted_child`` (#5035).
 
         A failed extraction (an extractor call raised, e.g.
         ``ExtractionIncompleteError``) is not a verdict, so the key's rows
@@ -5427,7 +5430,11 @@ class IngestionWorker:
                 # An exhausted per-field enrichment propagates from here,
                 # before any write: the result is unknown, so the key's rows
                 # stay as they are.
-                self._dispatch_split_child(batch, {**event_data, WHOLE_DOCUMENT_KEY: True})
+                try:
+                    self._dispatch_split_child(batch, {**event_data, WHOLE_DOCUMENT_KEY: True})
+                except Exception:
+                    self._record_unwritten_split(event_data, document_id, batch)
+                    raise
                 split = True
         finally:
             self._split_batch = outer
@@ -5611,6 +5618,41 @@ class IngestionWorker:
                 exc_info=True,
                 extra={"s3_key": event_data.get("s3_key"), "incomplete_reason": reason},
             )
+
+    def _record_unwritten_split(
+        self, event_data: dict[str, Any], document_id: str, batch: _SplitBatch
+    ) -> None:
+        """Record an incomplete split that raises before its write (#5035).
+
+        A split's write records why it is incomplete with the write
+        (``_write_split_batch``, #5008).  The whole-document child
+        (``batch.whole_document``) is the split's only child, so its
+        exhausted enrichment raises out of the split and no write follows:
+        record the same reason (``_incomplete_split_reason``) here, on a
+        transaction of its own, before the error propagates.  The same call
+        on every event kind: a reingest / rebuild then counts the key failed
+        and the raw-key reconciler retries it after the failed manifest
+        under ``tmp/keys/`` expires; a live capture retries the message,
+        and a later complete write clears the record (a dead-letter
+        replaces it with ``dead_letter``).  Any other error records nothing.
+        """
+        reason = _incomplete_split_reason(batch)
+        if reason is None:
+            return
+        self._record_incomplete_and_commit(
+            {**event_data, "document_id": document_id},
+            reason,
+            {
+                **batch.incomplete_detail,
+                "written": 0,
+                "exhausted": sorted(batch.exhausted_ids),
+                "whole_document": batch.whole_document,
+                "replace_set": event_data.get(REPLACE_SPLIT_SET_KEY) is True,
+            },
+            # Whatever the failed child left in the transaction goes, as the
+            # raise would have it.
+            rollback_first=True,
+        )
 
     def _key_has_rows(self, s3_key: str) -> bool:
         """Whether any document row is stored for *s3_key*."""

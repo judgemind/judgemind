@@ -2,10 +2,11 @@
 
 Unit tests for ``ingestion.ingest_incomplete`` and the worker paths that
 write or clear a record: the single-document fallback, a failed reingest, a
-recorded skip, a whole-document write, and the dead-letter (which the split
-harness does not drive).  The split paths (partial split, exhausted child,
-complete split) are covered against a real Postgres by the split harness's
-``marker`` invariant (``test_split_invariants_pg.py -k retry_marker``).
+recorded skip, a whole-document write, an exhausted whole-document child
+(#5035), and the dead-letter (which the split harness does not drive).
+The split paths (partial split, exhausted child, complete split) are
+covered against a real Postgres by the split harness's ``marker``
+invariant (``test_split_invariants_pg.py -k retry_marker``).
 """
 
 from __future__ import annotations
@@ -290,6 +291,39 @@ def test_retry_marker_reingest_failed_recorded() -> None:
     assert [w[:2] for w in _incomplete_writes(cur)] == [(S3_KEY, "reingest_failed")]
     # The failed event's writes are rolled back first, as the raise would.
     assert order == ["rollback", "commit"]
+
+
+@pytest.mark.parametrize("replace_set", [True, False], ids=["reingest", "live"])
+def test_retry_marker_unwritten_whole_document_exhausted_child(replace_set: bool) -> None:
+    """An exhausted whole-document child raises before the split's write:
+    the key is recorded on a transaction of its own, by the same call on a
+    reingest as on a live capture (#5035)."""
+    worker, _redis, conn, cur = _worker()
+    order: list[str] = []
+    conn.rollback.side_effect = lambda: order.append("rollback")
+    conn.commit.side_effect = lambda: order.append("commit")
+    batch = _SplitBatch("parent-1", whole_document=True, exhausted_ids={"parent-1"})
+    event = _event(**({REPLACE_SPLIT_SET_KEY: True} if replace_set else {}))
+    worker._record_unwritten_split(event, "parent-1", batch)
+    writes = _incomplete_writes(cur)
+    assert [w[:2] for w in writes] == [(S3_KEY, "exhausted_child")]
+    assert writes[0][4] == "parent-1"
+    assert json.loads(writes[0][5]) == {
+        "written": 0,
+        "exhausted": ["parent-1"],
+        "whole_document": True,
+        "replace_set": replace_set,
+    }
+    # The failed child's writes are rolled back first, as the raise would.
+    assert order == ["rollback", "commit"]
+
+
+def test_retry_marker_unwritten_split_other_error_records_nothing() -> None:
+    worker, _redis, conn, cur = _worker()
+    batch = _SplitBatch("parent-1", whole_document=True)
+    worker._record_unwritten_split(_event(**{REPLACE_SPLIT_SET_KEY: True}), "parent-1", batch)
+    assert _incomplete_writes(cur) == []
+    conn.rollback.assert_not_called()
 
 
 def test_retry_marker_no_extractable_text_is_a_verdict_that_clears() -> None:
