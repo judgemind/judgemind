@@ -444,7 +444,10 @@ _S3_KEY_PATTERN = re.compile(
 # content-addressed keys (#4988).  Counted separately in the skip warning.
 _LEGACY_DATED_RAW_RE = re.compile(r"/raw/\d{4}/\d{2}/\d{2}/")
 
-_EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
+# Raw key extension -> the event's ``content_format``.  Event values are the
+# ``framework.models.ContentFormat`` member values, so a ``.txt`` raw is
+# ``"text"``, as a live capture of the same raw publishes it (#5026).
+_EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "text"}
 
 # Timezone lookup by state (expand as states are added)
 _STATE_TIMEZONES = {
@@ -646,7 +649,7 @@ def _build_prefix_event(
     # For text-based formats (HTML, TXT), pass content as ruling_text.
     # For binary formats (PDF, DOCX), pass raw bytes as latin-1 string
     # (the worker handles extraction from binary formats).
-    if content_format in ("html", "txt"):
+    if content_format in ("html", "text"):
         event["ruling_text"] = content.decode("utf-8", errors="replace")
     elif content_format in ("pdf", "docx"):
         event["ruling_text"] = content.decode("latin-1")

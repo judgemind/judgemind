@@ -129,7 +129,10 @@ KEY_PATTERN = re.compile(
 # (#4988); the dated originals are kept, so they show up in the skip count.
 LEGACY_DATED_RAW_RE = re.compile(r"/raw/\d{4}/\d{2}/\d{2}/")
 
-EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
+# Raw key extension -> the event's ``content_format``.  Event values are the
+# ``framework.models.ContentFormat`` member values, so a ``.txt`` raw is
+# ``"text"``, as a live capture of the same raw publishes it (#5026).
+EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "text"}
 
 # Best-effort courthouse name extraction from HTML body text (#4014).
 # Used in build_event to set event["courthouse"] so that the ingestion worker's
@@ -410,7 +413,7 @@ def build_event(
     # For text-based formats (HTML, TXT), pass content as ruling_text.
     # For binary formats (PDF, DOCX), pass raw bytes as latin-1 string
     # (the worker handles extraction from binary formats).
-    if content_format in ("html", "txt"):
+    if content_format in ("html", "text"):
         text = content.decode("utf-8", errors="replace")
         event["ruling_text"] = text
 

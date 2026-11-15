@@ -174,7 +174,8 @@ class TestBuildEvent:
 
         event = rebuild_db.build_event(key, txt_content, parsed, "test-bucket")
 
-        assert event["content_format"] == "txt"
+        # The live capture's spelling, ContentFormat.TEXT (#5026).
+        assert event["content_format"] == "text"
         assert event["ruling_text"] == txt_content.decode("utf-8")
 
     def test_docx_content_decoded_as_latin1(self) -> None:

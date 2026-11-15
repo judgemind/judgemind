@@ -13,9 +13,12 @@ import io
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from framework.models import ContentFormat
 from ingestion.case_evidence import CASE_NUMBER_EVIDENCE_KEY
 from ingestion.llm_extract import PdfText
-from ingestion.worker import IngestionWorker, as_pre_split_child
+from ingestion.worker import IngestionWorker, as_pre_split_child, event_content_format
 
 PAGE = "Case No. 23STCV12345 Alder v. Acme Corp. " + "The motion is GRANTED. " * 20
 
@@ -56,6 +59,17 @@ def _child(key: str = "ca/x/raw/a.html", count: int = 2, **overrides: Any) -> di
 def test_html_page_is_the_evidence() -> None:
     worker = _worker({"ca/x/raw/a.html": PAGE.encode()})
     out = worker._with_pre_split_evidence(_child())
+    assert out[CASE_NUMBER_EVIDENCE_KEY] == (PAGE,)
+
+
+@pytest.mark.parametrize("content_format", ["text", "txt"])
+def test_text_page_is_the_evidence_under_either_spelling(content_format: str) -> None:
+    """A live capture's ``.txt`` raw (``'text'``) and a pre-#5026 reingest's
+    (``'txt'``) are both read as the evidence page (#5026)."""
+    worker = _worker({"ca/x/raw/a.txt": PAGE.encode()})
+    out = worker._with_pre_split_evidence(
+        _child(key="ca/x/raw/a.txt", content_format=content_format)
+    )
     assert out[CASE_NUMBER_EVIDENCE_KEY] == (PAGE,)
 
 
@@ -121,3 +135,12 @@ def test_page_is_read_once_per_key_and_the_cache_is_bounded() -> None:
         worker._with_pre_split_evidence(_child(key=k))
     assert len(worker._page_text_cache) == 8
     assert ("bucket", keys[0]) not in worker._page_text_cache
+
+
+def test_event_content_format_accepts_both_text_spellings() -> None:
+    """The worker's single parse of an event's format (#5026)."""
+    assert event_content_format({"content_format": "text"}) is ContentFormat.TEXT
+    assert event_content_format({"content_format": "txt"}) is ContentFormat.TEXT
+    assert event_content_format({"content_format": "pdf"}) is ContentFormat.PDF
+    assert event_content_format({"content_format": "rtf"}) is None
+    assert event_content_format({}) is None
