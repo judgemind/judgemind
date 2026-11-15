@@ -131,15 +131,17 @@ jobs:
           fi
           printf '%s\n' "${line#RECONCILE_RESULT }" > tmp/result.json
           jq . tmp/result.json
-          # Healed: nothing unrepresented and no incomplete key stuck at the
-          # retry cap (#5008). Retryable incomplete keys heal on their own
-          # (live captures add a few every day), so they do not hold the
-          # issue open; a stuck key does, until it is fixed or reset.
-          healed=$(jq -r '((.unrepresented // 0) + (.incomplete_stuck // 0)) == 0' tmp/result.json)
+          # Healed: nothing unrepresented outside the deferred backlogs
+          # (#5036) and no incomplete key stuck at the retry cap (#5008).
+          # Retryable incomplete keys heal on their own (live captures add a
+          # few every day), so they do not hold the issue open; a stuck key
+          # does, until it is fixed or reset. Deferred keys are tracked by
+          # their blocking issue, not this one.
+          healed=$(jq -r '((.actionable_unrepresented // .unrepresented // 0) + (.incomplete_stuck // 0)) == 0' tmp/result.json)
           {
             echo "action=$(jq -r .action tmp/result.json)"
             echo "issue_needed=$(jq -r .issue_needed tmp/result.json)"
-            echo "unrepresented=$(jq -r .unrepresented tmp/result.json)"
+            echo "unrepresented=$(jq -r '.actionable_unrepresented // .unrepresented' tmp/result.json)"
             echo "stuck=$(jq -r '.incomplete_stuck // 0' tmp/result.json)"
             echo "healed=$healed"
           } >> "$GITHUB_OUTPUT"
@@ -152,18 +154,9 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "**Action:** \`$(jq -r .action tmp/result.json)\`"
-            echo "**Unrepresented:** $(jq -r .unrepresented tmp/result.json) of $(jq -r .raw tmp/result.json) raw keys"
-            echo "(represented $(jq -r .represented tmp/result.json), skipped $(jq -r .skipped tmp/result.json), pending $(jq -r .pending tmp/result.json))"
-            echo "**Incomplete (rows not a complete split, #5008):** $(jq -r '.incomplete // 0' tmp/result.json) retrying, $(jq -r '.incomplete_stuck // 0' tmp/result.json) stuck at $(jq -r '.max_incomplete_attempts // 3' tmp/result.json) attempts ($(jq -r '.newly_stuck // 0' tmp/result.json) newly stuck); by reason $(jq -c '.incomplete_by_reason // {}' tmp/result.json)"
-            if [ "$(jq -r '.newly_stuck // 0' tmp/result.json)" != "0" ]; then
-              echo "Newly stuck (sample): $(jq -r '(.newly_stuck_sample // []) | join(", ")' tmp/result.json)"
-            fi
-            echo "**Previous runs (unrepresented, newest first):** $(jq -c .previous_unrepresented tmp/result.json)"
-            echo ""
-            echo "| Scope | Unrepresented |"
-            echo "|---|---|"
-            jq -r '.top_scopes[] | "| \(.[0]) | \(.[1]) |"' tmp/result.json
+            # Totals, the action per scope and the deferred backlogs (#5036);
+            # unit-tested in scripts/tests/test_reconcile_raw_keys.py.
+            python3 scripts/reconcile_raw_keys.py --issue-summary tmp/result.json
             echo ""
             echo "- Workflow run: ${RUN_URL}"
             echo "- ECS task: \`${TASK_ID}\` (log group \`/ecs/judgemind-ingestion-worker-dev\`, stream \`oneshot/oneshot/${TASK_ID}\`)"
@@ -203,9 +196,12 @@ jobs:
             echo ""
             echo "The daily raw-key reconciler (\`scripts/reconcile_raw_keys.py\`, #5015) found"
             echo "archived raw captures with no \`derived.documents\` row and no recorded skip"
-            echo "reason that the daily auto-reingest cannot heal: more than the auto-reingest"
-            echo "threshold (\`over_threshold\`), keys back after several daily reingests"
-            echo "(\`persistent\`), or a reingest that could not be launched (\`reingest_failed\`)."
+            echo "reason that the daily auto-reingest cannot heal: a scope (\`<state>/<county>\`)"
+            echo "with more than the per-scope auto-reingest threshold (\`over_threshold\`; other"
+            echo "scopes still heal, #5036), a scope whose keys are back after several daily"
+            echo "reingests (\`persistent\`), or a reingest that could not be launched (\`reingest_failed\`)."
+            echo "Deliberately deferred backlogs (\`DEFERRED_BACKLOGS\` in the script) are listed"
+            echo "as \"deferred (blocked on #N)\" and tracked on that issue, not here."
             echo "It also reports keys whose rows are not a complete split (a fallback, partial"
             echo "split, exhausted child, dead-letter or failed reingest, \`telemetry.ingest_incomplete\`)"
             echo "that are still incomplete after the attempt cap (\`incomplete_stuck\`, #5008)."
@@ -220,7 +216,8 @@ jobs:
             echo "4. Stuck incomplete keys: \`SELECT s3_key, reason, detail FROM telemetry.ingest_incomplete WHERE stuck_at IS NOT NULL\` (\`scripts/dev-db-query.sh\`); fix the cause, then run the reconciler once with \`--record --reingest --reset-incomplete-attempts\`."
             echo ""
             echo "This issue is updated by each daily run that needs it and closed automatically"
-            echo "when a run finds nothing unrepresented and no key stuck at the retry cap."
+            echo "when a run finds nothing unrepresented (outside the deferred backlogs) and no"
+            echo "key stuck at the retry cap."
           } > tmp/issue.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" \
             --body-file tmp/issue.md \
@@ -236,7 +233,7 @@ jobs:
           for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
               --label "$ISSUE_LABEL" --json number --jq '.[].number'); do
             {
-              echo "The raw-key reconciler found nothing unrepresented and no stuck incomplete key. Closing."
+              echo "The raw-key reconciler found nothing unrepresented outside the deferred backlogs and no stuck incomplete key. Closing."
               echo ""
               cat tmp/summary.md
             } > tmp/close.md

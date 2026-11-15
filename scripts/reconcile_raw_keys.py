@@ -80,29 +80,43 @@ Modes:
 
 - ``--record`` writes the run and its per-scope counts to
   ``telemetry.raw_reconcile_runs`` / ``raw_reconcile_counts`` (the
-  ``/admin/data-quality`` panel reads them) and decides the run's action:
+  ``/admin/data-quality`` panel reads them) and decides an action for each
+  ``<state>/<county>`` scope with unrepresented keys (``scope_actions`` in
+  the result, ``SCOPE_ACTION`` lines; #5036):
 
-  - ``none``             nothing unrepresented;
-  - ``over_threshold``   more than ``--max-auto-reingest`` keys (default
-                         500): too many to heal blindly, a GitHub issue is
-                         filed or updated instead (by the workflow);
-  - ``reingest``         with ``--reingest``: the unrepresented keys are
-                         written to ``s3://<bucket>/tmp/keys/`` and
+  - ``over_threshold``   more than ``--max-auto-reingest`` keys in the scope
+                         (default 500): too many to heal blindly, a GitHub
+                         issue is filed or updated instead (by the
+                         workflow).  Other scopes still heal;
+  - ``reingest``         with ``--reingest``: the scope's unrepresented keys
+                         are written to ``s3://<bucket>/tmp/keys/`` and
                          re-ingested by ``reingest_from_s3.py --prefix
                          <state>/ --s3-key-list <uri> --concurrency 4``;
-  - ``persistent``       a ``reingest`` whose previous ``--persist-runs - 1``
-                         runs (default 2) also re-ingested and still found
-                         keys: it re-ingests again (new losses keep
+  - ``persistent``       a ``reingest`` of a scope that each of the previous
+                         ``--persist-runs - 1`` runs (default 2) also
+                         re-ingested: it re-ingests again (new losses keep
                          healing) and the issue is filed or updated, since
                          something is not healing;
-  - ``reingest_failed``  the reingest could not be launched (exit 1);
   - ``reingest_deferred``  ``--defer-reingest``: another reingest is
                          running, so this run only reports;
-  - ``report_only``      unrepresented keys, no ``--reingest``.
+  - ``report_only``      no ``--reingest``.
 
-  The workflow files or updates the issue for ``over_threshold``,
-  ``persistent`` and ``reingest_failed`` (``issue_needed`` in the result).
-  No human alert.
+  The run's own action: ``none`` (nothing to do), ``reingest`` /
+  ``persistent`` (some scope healed), else ``over_threshold``,
+  ``report_only`` or ``reingest_deferred``; ``reingest_failed`` when the
+  reingest could not be launched (exit 1).
+
+  Deferred backlogs (:data:`DEFERRED_BACKLOGS`, #5036) are unrepresented
+  keys whose reingest is deliberately on hold behind an issue (the May-June
+  CourtListener raws, #3954).  They stay ``unrepresented`` in the per-scope
+  counts but are reported as "deferred (blocked on #N)" (``DEFERRED``
+  lines, ``deferred_backlogs`` in the result): never re-ingested, never
+  ``over_threshold``, and not counted in ``actionable_unrepresented``,
+  which decides whether the issue can close.
+
+  The workflow files or updates the issue when the run or any scope is
+  ``over_threshold``, ``persistent`` or ``reingest_failed``
+  (``issue_needed`` in the result).  No human alert.
 
 - ``--write-keys URI_STEM`` writes the unrepresented keys per scope to
   ``<stem>-<state>_<county>.txt`` (or ``-NN.txt`` chunks of
@@ -133,6 +147,7 @@ run), ``--write-keys``, ``--chunk-size``, ``--sample``, ``--record``,
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -198,6 +213,59 @@ DEFAULT_EXCLUDE_PREFIXES = (
 INTENTIONAL_SKIP_PREFIXES: dict[str, str] = {
     "ca/statewide/governor/": "governor_bio_route",
 }
+
+
+@dataclass(frozen=True)
+class DeferredBacklog:
+    """Unrepresented keys whose reingest is deliberately on hold (#5036).
+
+    They are real losses, not skips: they stay ``unrepresented`` in the
+    per-scope counts (and on ``/admin/data-quality``), but they are reported
+    as "deferred (blocked on #<issue>)", never re-ingested and never make a
+    scope ``over_threshold``.  A scope matches when it fits one of
+    *scopes* and none of *exclude* (``fnmatch`` patterns on
+    ``<state>/<county>``).  With *captured_before*, only keys captured
+    before that day are deferred: the known backlog waits, while a later
+    loss in the same scope heals as usual.  Remove the entry once the
+    blocking issue is decided and the keys go back to normal handling.
+
+    Intentional skips (the governor bio route, ``telemetry.ingest_skips``)
+    are not deferrals: they are never meant to produce a document.
+    """
+
+    name: str
+    issue: int
+    scopes: tuple[str, ...]
+    exclude: tuple[str, ...] = ()
+    captured_before: date | None = None
+
+    def matches(self, raw: RawKey) -> bool:
+        if not any(fnmatch.fnmatchcase(raw.scope, p) for p in self.scopes):
+            return False
+        if any(fnmatch.fnmatchcase(raw.scope, p) for p in self.exclude):
+            return False
+        return self.captured_before is None or raw.utc.date() < self.captured_before
+
+    @property
+    def label(self) -> str:
+        return f"deferred (blocked on #{self.issue})"
+
+
+#: Deliberately deferred backlogs (#5036).  CourtListener raws (``federal/``,
+#: ``unknown/`` and ``<state name>/statewide``; the ``ca/`` capture prefix is
+#: never CourtListener) lost in the May-June 2026 ElastiCache window (#4470)
+#: wait on the operator decision #3954 (reingest tracked by #5022).  Every one
+#: was captured by 2026-06-18; a later CourtListener loss heals as usual.
+DEFERRED_BACKLOGS: tuple[DeferredBacklog, ...] = (
+    DeferredBacklog(
+        name="courtlistener_oom_window",
+        issue=3954,
+        scopes=("federal/*", "unknown/*", "*/statewide"),
+        exclude=("ca/*",),
+        captured_before=date(2026, 6, 21),
+    ),
+)
+
 
 #: ``ingestion.ruling_guards.NON_RULING_PDF_DROPPED_METRIC`` (all-NULL guard).
 NON_RULING_PDF_DROPPED_METRIC = "non_ruling_pdf_dropped"
@@ -796,6 +864,32 @@ def fetch_recent_runs(conn: Any, n: int) -> list[tuple[int, str]]:
         return [(int(row[0]), str(row[1])) for row in cur.fetchall()]
 
 
+def fetch_recent_scope_actions(conn: Any, n: int) -> list[dict[str, str]]:
+    """Each of the last *n* recorded runs' per-scope actions
+    (``detail.scope_actions``, #5036), newest first; ``{}`` for a run
+    recorded before scopes had their own action."""
+    if n <= 0:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail->'scope_actions' FROM telemetry.raw_reconcile_runs "
+            "ORDER BY started_at DESC LIMIT %s",
+            (n,),
+        )
+        rows = cur.fetchall()
+    out: list[dict[str, str]] = []
+    for row in rows:
+        value = row[0]
+        if isinstance(value, str):
+            value = json.loads(value)
+        out.append(
+            {str(k): str(v) for k, v in value.items()}
+            if isinstance(value, dict)
+            else {}
+        )
+    return out
+
+
 def record_run(
     conn: Any,
     *,
@@ -885,35 +979,70 @@ REINGEST_ACTIONS = frozenset({"reingest", "persistent"})
 ISSUE_ACTIONS = frozenset({"over_threshold", "persistent", "reingest_failed"})
 
 
-def decide_action(
+def split_deferred(
+    reports: dict[str, ScopeReport], backlogs: Sequence[DeferredBacklog]
+) -> tuple[dict[str, list[RawKey]], dict[str, Counter[str]]]:
+    """The unrepresented keys per scope that the run acts on, and the
+    deferred ones counted per backlog name and scope (#5036).  A key goes to
+    the first backlog that matches it."""
+    actionable: dict[str, list[RawKey]] = {}
+    deferred: dict[str, Counter[str]] = {}
+    for scope in sorted(reports):
+        for raw in reports[scope].unrepresented:
+            backlog = next((b for b in backlogs if b.matches(raw)), None)
+            if backlog is None:
+                actionable.setdefault(scope, []).append(raw)
+            else:
+                deferred.setdefault(backlog.name, Counter())[scope] += 1
+    return actionable, deferred
+
+
+def deferred_report(
+    backlogs: Sequence[DeferredBacklog], deferred: dict[str, Counter[str]]
+) -> list[dict[str, Any]]:
+    """One entry per backlog with deferred keys this run: its blocking
+    issue, key and scope counts, and its ten largest scopes."""
+    out: list[dict[str, Any]] = []
+    for backlog in backlogs:
+        counts = deferred.get(backlog.name)
+        if not counts:
+            continue
+        top = sorted(counts.items(), key=lambda t: (-t[1], t[0]))
+        out.append(
+            {
+                "name": backlog.name,
+                "issue": backlog.issue,
+                "label": backlog.label,
+                "keys": sum(counts.values()),
+                "scope_count": len(counts),
+                "top_scopes": [[s, n] for s, n in top[:10]],
+            }
+        )
+    return out
+
+
+def decide_scope_action(
     unrepresented: int,
-    previous: Sequence[tuple[int, str]],
+    previous: Sequence[str | None],
     *,
     max_auto_reingest: int,
     persist_runs: int,
     reingest: bool,
     defer: bool,
-    incomplete: int = 0,
 ) -> str:
-    """What to do about *unrepresented* keys and this run's batch of
-    *incomplete* (retryable) keys, given ``(unrepresented, action)`` of the
-    previous recorded runs, newest first.  Both are re-ingested together
-    (#5008).
+    """What to do about one scope's *unrepresented* (non-deferred) keys,
+    given the scope's action in each previous recorded run, newest first
+    (``None``: the scope had nothing to act on in that run).
 
-    Only the unrepresented keys decide ``over_threshold``: the caller sizes
-    the incomplete batch to the threshold's remaining room
-    (:func:`incomplete_batch`), so a backlog of incomplete keys drains a
-    batch a day and never blocks the unrepresented heal.
+    The threshold is per scope (#5036): a county with a dozen lost keys
+    heals while another scope's backlog waits for a human.
 
     ``persistent`` still re-ingests (new losses keep healing), and also
-    files the issue: each of the previous ``persist_runs - 1`` runs already
-    re-ingested and unrepresented keys are back.  Runs that did not
-    re-ingest (deferred, report-only, over the threshold) do not count as a
-    failed heal.  Incomplete keys do not make a run persistent: their
-    attempt cap reports them as stuck instead.
+    files the issue: the scope was re-ingested in each of the previous
+    ``persist_runs - 1`` runs and its keys are back.  Runs that did not
+    re-ingest the scope (deferred, report-only, over the threshold, nothing
+    to do) do not count as a failed heal.
     """
-    if unrepresented + incomplete == 0:
-        return "none"
     if unrepresented > max_auto_reingest:
         return "over_threshold"
     if not reingest:
@@ -922,12 +1051,69 @@ def decide_action(
         return "reingest_deferred"
     earlier = list(previous[: max(0, persist_runs - 1)])
     if (
-        unrepresented > 0
-        and persist_runs > 1
+        persist_runs > 1
         and len(earlier) == persist_runs - 1
-        and all(n > 0 and action in REINGEST_ACTIONS for n, action in earlier)
+        and all(action in REINGEST_ACTIONS for action in earlier)
     ):
         return "persistent"
+    return "reingest"
+
+
+def decide_scope_actions(
+    actionable: dict[str, list[RawKey]],
+    previous: Sequence[dict[str, str]],
+    *,
+    max_auto_reingest: int,
+    persist_runs: int,
+    reingest: bool,
+    defer: bool,
+) -> dict[str, str]:
+    """:func:`decide_scope_action` for every scope with keys to act on;
+    *previous* is each earlier run's ``scope_actions``, newest first."""
+    return {
+        scope: decide_scope_action(
+            len(keys),
+            [run.get(scope) for run in previous],
+            max_auto_reingest=max_auto_reingest,
+            persist_runs=persist_runs,
+            reingest=reingest,
+            defer=defer,
+        )
+        for scope, keys in sorted(actionable.items())
+        if keys
+    }
+
+
+def mark_scopes_failed(scope_actions: dict[str, str], healing: Iterable[str]) -> None:
+    """The reingest could not be launched: the healing scopes were not
+    re-ingested, so a later run must not count this one as a heal attempt
+    (``persistent``)."""
+    for scope in healing:
+        scope_actions[scope] = "reingest_failed"
+
+
+def overall_action(
+    scope_actions: dict[str, str], *, incomplete: int, reingest: bool, defer: bool
+) -> str:
+    """The run's action from its per-scope actions and its *incomplete*
+    batch size (#5008, #5036).
+
+    Any scope healing makes the run ``reingest`` (``persistent`` when one
+    of them is).  Otherwise a scope over the threshold makes it
+    ``over_threshold`` (the incomplete batch still re-ingests on its own).
+    The incomplete batch alone is a ``reingest``.
+    """
+    if not scope_actions and incomplete == 0:
+        return "none"
+    acts = set(scope_actions.values())
+    if acts & REINGEST_ACTIONS:
+        return "persistent" if "persistent" in acts else "reingest"
+    if "over_threshold" in acts:
+        return "over_threshold"
+    if not reingest:
+        return "report_only"
+    if defer:
+        return "reingest_deferred"
     return "reingest"
 
 
@@ -935,9 +1121,9 @@ def incomplete_batch(
     reports: dict[str, ScopeReport], unrepresented: int, max_auto_reingest: int
 ) -> list[RawKey]:
     """The incomplete (retryable) keys this run re-ingests, oldest first
-    (#5008): as many as fit beside the unrepresented ones under
-    *max_auto_reingest*, or, when the unrepresented keys are over it (they
-    are not re-ingested then), up to *max_auto_reingest* on their own.  An
+    (#5008): as many as fit beside the *unrepresented* keys being re-ingested
+    under *max_auto_reingest*, or, when that count is over it, up to
+    *max_auto_reingest* on their own.  An
     incomplete key is a known key with a recorded reason and an attempt
     cap, so it keeps draining while a lost-key backlog waits for a human.
     The rest wait for the next run."""
@@ -1027,7 +1213,9 @@ def run(
     now: datetime | None = None,
     conn: Any = None,
     runner: Callable[..., Any] = subprocess.run,
+    deferrals: Sequence[DeferredBacklog] | None = None,
 ) -> dict[str, Any]:
+    """One reconcile pass; *deferrals* defaults to :data:`DEFERRED_BACKLOGS`."""
     started_at = now or datetime.now(UTC)
     objects = list_all_raw_objects(
         s3, args.bucket, args.prefix, args.exclude_prefix, args.workers
@@ -1116,20 +1304,46 @@ def run(
     out(f"SUMMARY_ALL: {json.dumps(total, sort_keys=True)}")
 
     previous: list[tuple[int, str]] = []
+    previous_scopes: list[dict[str, str]] = []
     if conn is not None:
         previous = fetch_recent_runs(conn, max(0, args.persist_runs - 1))
-    batch = incomplete_batch(reports, total["unrepresented"], args.max_auto_reingest)
-    action = decide_action(
-        total["unrepresented"],
-        previous,
+        previous_scopes = fetch_recent_scope_actions(
+            conn, max(0, args.persist_runs - 1)
+        )
+    backlogs = DEFERRED_BACKLOGS if deferrals is None else tuple(deferrals)
+    actionable, deferred = split_deferred(reports, backlogs)
+    scope_actions = decide_scope_actions(
+        actionable,
+        previous_scopes,
         max_auto_reingest=args.max_auto_reingest,
         persist_runs=args.persist_runs if conn is not None else 0,
         reingest=args.reingest,
         defer=args.defer_reingest,
-        incomplete=len(batch),
     )
+    healing = [s for s, a in scope_actions.items() if a in REINGEST_ACTIONS]
+    heal_count = sum(len(actionable[s]) for s in healing)
+    batch = incomplete_batch(
+        reports, min(heal_count, args.max_auto_reingest), args.max_auto_reingest
+    )
+    action = overall_action(
+        scope_actions,
+        incomplete=len(batch),
+        reingest=args.reingest,
+        defer=args.defer_reingest,
+    )
+    for scope, scope_action in scope_actions.items():
+        out(
+            f"SCOPE_ACTION {scope} action={scope_action} "
+            f"unrepresented={len(actionable[scope])}"
+        )
+    deferred_detail = deferred_report(backlogs, deferred)
+    for d in deferred_detail:
+        out(
+            f"DEFERRED {d['name']} {d['label']} keys={d['keys']} "
+            f"scopes={d['scope_count']}"
+        )
     top = sorted(
-        ((rep.scope, rep.counts.get("unrepresented", 0)) for rep in reports.values()),
+        ((scope, len(keys)) for scope, keys in actionable.items()),
         key=lambda t: (-t[1], t[0]),
     )
     incomplete_by_reason: Counter[str] = Counter()
@@ -1149,6 +1363,12 @@ def run(
         "previous_unrepresented": [n for n, _ in previous],
         "previous_actions": [a for _, a in previous],
         "top_scopes": [[s, n] for s, n in top if n > 0][:10],
+        # Per-scope threshold and deferred backlogs (#5036).
+        "scope_actions": scope_actions,
+        "scope_unrepresented": {s: len(actionable[s]) for s in scope_actions},
+        "actionable_unrepresented": sum(len(k) for k in actionable.values()),
+        "deferred": sum(d["keys"] for d in deferred_detail),
+        "deferred_backlogs": deferred_detail,
         "max_auto_reingest": args.max_auto_reingest,
         "max_incomplete_attempts": args.max_incomplete_attempts,
         "incomplete_by_reason": dict(sorted(incomplete_by_reason.items())),
@@ -1175,6 +1395,7 @@ def run(
         except FileNotFoundError as exc:
             if not incomplete_only:
                 action = "reingest_failed"
+                mark_scopes_failed(scope_actions, healing)
             detail["reingest_error"] = str(exc)
     if incomplete_only:
         detail["reingest_scope"] = "incomplete_only"
@@ -1197,7 +1418,13 @@ def run(
             detail["reingest"] = launch_reingest(
                 args,
                 s3,
-                reingest_groups({} if incomplete_only else reports, batch),
+                reingest_groups(
+                    {
+                        s: ScopeReport(s, unrepresented=actionable[s])
+                        for s in ([] if incomplete_only else healing)
+                    },
+                    batch,
+                ),
                 script,
                 stamp,
                 out,
@@ -1206,6 +1433,7 @@ def run(
         except Exception as exc:  # noqa: BLE001 — recorded, then reported as failed
             if not incomplete_only:
                 action = "reingest_failed"
+                mark_scopes_failed(scope_actions, healing)
             detail["reingest_error"] = f"{type(exc).__name__}: {exc}"
         if conn is not None and "reingest" in detail:
             # One attempt per incomplete key whose prefix's reingest ran to
@@ -1222,13 +1450,71 @@ def run(
     result = {
         "run_id": run_id,
         "action": action,
-        # Keys that just reached the attempt cap are reported once (#5008).
-        "issue_needed": action in ISSUE_ACTIONS or bool(newly_stuck),
+        # Keys that just reached the attempt cap are reported once (#5008);
+        # a scope over the threshold or not healing files it even while
+        # other scopes heal (#5036).
+        "issue_needed": action in ISSUE_ACTIONS
+        or bool(set(scope_actions.values()) & ISSUE_ACTIONS)
+        or bool(newly_stuck),
         **total,
         **detail,
     }
     out(f"RECONCILE_RESULT {json.dumps(result, sort_keys=True, default=str)}")
     return {"reports": reports, "result": result}
+
+
+def issue_summary(result: dict[str, Any]) -> str:
+    """The Markdown the workflow posts on the reconciler issue (and the job
+    summary) for one ``RECONCILE_RESULT`` (#5036): totals, the action per
+    scope, and the deferred backlogs on their own lines."""
+    g = result.get
+    unrep = g("unrepresented", 0)
+    actionable = g("actionable_unrepresented", unrep)
+    cap = g("max_incomplete_attempts", DEFAULT_MAX_INCOMPLETE_ATTEMPTS)
+    reasons = json.dumps(g("incomplete_by_reason") or {}, sort_keys=True)
+    lines = [
+        f"**Action:** `{g('action')}`",
+        (
+            f"**Unrepresented:** {actionable} to act on, of {g('raw', 0)} raw keys "
+            f"({unrep} including deferred backlogs)"
+        ),
+        (
+            f"(represented {g('represented', 0)}, skipped {g('skipped', 0)}, "
+            f"pending {g('pending', 0)})"
+        ),
+        (
+            f"**Incomplete (rows not a complete split, #5008):** "
+            f"{g('incomplete', 0)} retrying, {g('incomplete_stuck', 0)} stuck at "
+            f"{cap} attempts ({g('newly_stuck', 0)} newly stuck); by reason {reasons}"
+        ),
+    ]
+    if g("newly_stuck"):
+        lines.append(
+            f"Newly stuck (sample): {', '.join(g('newly_stuck_sample') or [])}"
+        )
+    lines.append(
+        "**Previous runs (unrepresented, newest first):** "
+        f"{json.dumps(g('previous_unrepresented') or [])}"
+    )
+    for d in g("deferred_backlogs") or []:
+        scopes = ", ".join(f"{s} {n}" for s, n in d.get("top_scopes", []))
+        lines.append(
+            f"**Deferred (blocked on #{d['issue']}):** {d['keys']} keys in "
+            f"{d['scope_count']} scopes, not re-ingested and not counted toward "
+            f"the threshold (largest: {scopes})"
+        )
+    scope_actions = g("scope_actions") or {}
+    counts = g("scope_unrepresented") or dict(g("top_scopes") or [])
+    lines += ["", f"Threshold: {g('max_auto_reingest')} keys per scope.", ""]
+    if scope_actions:
+        lines += ["| Scope | Unrepresented | Action |", "|---|---|---|"]
+        order = sorted(scope_actions, key=lambda s: (-counts.get(s, 0), s))
+        for scope in order:
+            n = counts.get(scope, "")
+            lines.append(f"| {scope} | {n} | `{scope_actions[scope]}` |")
+    else:
+        lines.append("No scope has unrepresented keys to act on.")
+    return "\n".join(lines) + "\n"
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1294,6 +1580,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Reingest attempts after which an incomplete key is reported as stuck.",
     )
     parser.add_argument(
+        "--issue-summary",
+        metavar="RESULT_JSON",
+        help="Print the issue Markdown for a saved RECONCILE_RESULT JSON and exit "
+        "(the workflow; no database or S3).",
+    )
+    parser.add_argument(
         "--reset-incomplete-attempts",
         action="store_true",
         help="Make every stuck incomplete key retryable again (after a fix) before the run.",
@@ -1319,10 +1611,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.issue_summary:
+        with open(args.issue_summary) as fh:
+            print(issue_summary(json.load(fh)), end="")
+        return 0
+
     import boto3
     import psycopg
 
-    args = parse_args(argv)
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         print("DATABASE_URL is required", file=sys.stderr)
