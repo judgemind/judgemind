@@ -1088,8 +1088,12 @@ class TestMainPerCountyResetDispatch:
         }
 
     def test_reset_without_county_truncates_globally(self, tmp_path: Any) -> None:
-        """``--reset`` without ``--county`` → global TRUNCATE."""
-        ctx = self._common_patches(tmp_path, ["rebuild_db.py", "--reset"])
+        """``--reset`` without ``--county`` → global TRUNCATE.
+
+        A global reset wipes the deferred CourtListener rows too, so it needs
+        ``--include-deferred`` (#5043; the refusal is tested in
+        ``TestRebuildDeferredBacklog``)."""
+        ctx = self._common_patches(tmp_path, ["rebuild_db.py", "--reset", "--include-deferred"])
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
