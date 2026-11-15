@@ -32,8 +32,8 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pymupdf
 import pytest
-from structlog.testing import capture_logs
 
+from framework import llm_extractor as llm_extractor_mod
 from framework.llm_extractor import (
     PAGE_TEXT_LAYER_HEADER,
     LlmExtractor,
@@ -70,6 +70,13 @@ def _resp(text: str, finish_reason: str | None = "STOP", **kwargs: object) -> LL
     return LLMResponse(
         text=text, input_tokens=2099, output_tokens=len(text), finish_reason=finish_reason, **kwargs
     )
+
+
+def _warnings(logger: MagicMock, event: str) -> list[dict[str, object]]:
+    """The keyword fields of each ``logger.warning(event, ...)`` call.  The
+    module logger is patched: structlog's cached loggers can escape
+    ``capture_logs`` once another test configured structlog."""
+    return [c.kwargs for c in logger.warning.call_args_list if c.args == (event,)]
 
 
 def _recitation() -> LLMResponse:
@@ -248,7 +255,7 @@ class TestPageFinishReason:
 
         with (
             patch("ingestion.llm_providers.call_llm_with_images", calls),
-            capture_logs() as logs,
+            patch.object(llm_extractor_mod, "logger") as logger,
         ):
             page = ext._extract_single_page(
                 b"img",
@@ -261,7 +268,7 @@ class TestPageFinishReason:
 
         assert page.status == "ok"
         assert len(page.rows) == 1
-        failed = [e for e in logs if e["event"] == "llm_extractor.page_response_failed"]
+        failed = _warnings(logger, "llm_extractor.page_response_failed")
         assert len(failed) == 1
         assert failed[0]["finish_reason"] == "RECITATION"
         assert failed[0]["page_index"] == 48
@@ -446,12 +453,15 @@ class TestIncompleteTextResponses:
             side_effect=[_resp(good, finish_reason="MAX_TOKENS"), _resp(good), _resp(good)]
         )
 
-        with patch("ingestion.llm_providers.call_llm", calls), capture_logs() as logs:
+        with (
+            patch("ingestion.llm_providers.call_llm", calls),
+            patch.object(llm_extractor_mod, "logger") as logger,
+        ):
             rulings = ext.extract("paragraph text.\n\n" * 400, strict=True)
 
         assert calls.call_count == 3
         assert [r.extracted_case_number for r in rulings] == ["C25-01093"]
-        failed = [e for e in logs if e["event"] == "llm_extractor.chunk_response_failed"]
+        failed = _warnings(logger, "llm_extractor.chunk_response_failed")
         assert failed[0]["finish_reason"] == "MAX_TOKENS"
 
     def test_anthropic_chunk_max_tokens_is_failure(self) -> None:
@@ -481,10 +491,10 @@ class TestIncompleteTextResponses:
             patch.object(
                 llm_extract, "call_llm", return_value=_resp(good, finish_reason="MAX_TOKENS")
             ),
-            capture_logs() as logs,
+            patch.object(llm_extract, "logger") as logger,
         ):
             result = llm_extract.extract_fields_llm("Some ruling text.", "html")
 
         assert result is None
-        failed = [e for e in logs if e["event"] == "llm_extract.chunk_response_failed"]
+        failed = _warnings(logger, "llm_extract.chunk_response_failed")
         assert failed[0]["finish_reason"] == "MAX_TOKENS"
