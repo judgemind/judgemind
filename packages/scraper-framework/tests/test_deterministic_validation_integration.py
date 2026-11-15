@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingestion.worker import IngestionWorker
+from validation.rule_versions import RULE_VERSIONS
 
 
 @pytest.fixture(autouse=True)
@@ -223,6 +224,12 @@ def test_det_validation_fail_wrong_date_skips_db_write(
     assert result.model == "deterministic"
     assert "exceeds" in (result.reason or "")
     assert "2003-07-15" in (result.reason or "")
+    # The rule versions that judged the failure are recorded, so a later
+    # relaxation of the rule re-opens the key for reingest (#5027).
+    kwargs = mock_insert_validation.call_args.kwargs
+    assert kwargs["failed_rules"] == ["hearing_date_in_range"]
+    assert kwargs["rule_versions"] == RULE_VERSIONS
+    assert kwargs["rule_versions"]["hearing_date_in_range"] == 2
 
     # OpenSearch indexing should NOT have happened
     os_mock.index.assert_not_called()
