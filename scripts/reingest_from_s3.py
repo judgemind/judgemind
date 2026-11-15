@@ -350,6 +350,11 @@ def _extract_pdf_text_subprocess(
     extensions — this subprocess approach is the only reliable timeout.
 
     Returns the extracted text, or ``None`` if extraction failed or timed out.
+
+    Its one caller is the judge pre-pass, which reads the judge header on
+    page 1: a scanned page further in changes nothing it reads, so it skips
+    pages with no text layer.  The split never reads this text; the worker
+    OCRs every scanned page (``llm_extract.extract_pdf_text``, #5010).
     """
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
     try:

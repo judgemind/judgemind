@@ -83,11 +83,13 @@ from .case_evidence import (
     CASE_NUMBER_EVIDENCE_KEY,
     INHERITED_CASE_NUMBER_KEY,
     TEXT_FROM_OCR_KEY,
+    TEXT_LAYER_KEY,
     CaseNumberCandidate,
     case_number_refuted,
     document_evidence,
     own_text_evidence,
     settle_case_number,
+    text_from_ocr,
 )
 from .case_type_resolver import resolve_case_type
 from .db import (
@@ -148,8 +150,10 @@ from .ingest_skips import (
     record_ingest_skip,
 )
 from .llm_extract import (
+    SCANNED_PAGES_KEY,
     LLMExtractionResult,
     LLMRulingResult,
+    PdfText,
     extract_fields_llm,
     extract_pdf_text,
     is_pdf_binary,
@@ -272,16 +276,19 @@ SPLIT_EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 #: retryable failures in ``--write-failed-manifest`` (#4983).
 NO_EXTRACTABLE_TEXT = "no extractable text: no text layer and no page images to extract from"
 
-#: Event key naming why OCR of a scanned PDF did not read every page (the
-#: page cap, the time budget, failed page calls; ``PdfText.incomplete``,
-#: #4986), or ``None`` when it read them all.  A text split built on such
-#: text would silently miss the unread pages' rulings, so it is a failed
-#: extraction instead (``OCR_INCOMPLETE``): the key's rows are left alone
-#: and a reingest reports the key for a retry.
+#: Event key naming why the PDF text lacks pages: OCR of its scanned
+#: pages did not read every one (the page cap, the time budget, failed
+#: page calls; ``PdfText.incomplete``, #4986), whether the whole PDF is
+#: scanned or only some pages of a text PDF are (#5010), or a live
+#: capture's scanned pages could not be read again.  ``None`` when the
+#: text has every page.  A text split built on such text would silently
+#: miss the unread pages' rulings, so it is a failed extraction instead
+#: (``OCR_INCOMPLETE``): the key's rows are left alone and a reingest
+#: reports the key for a retry.
 OCR_INCOMPLETE_KEY = "_ocr_incomplete"
 
 #: Prefix of the failure reason of a text split refused over incomplete OCR.
-OCR_INCOMPLETE = "incomplete OCR of a PDF with no text layer"
+OCR_INCOMPLETE = "incomplete OCR of a PDF's scanned pages"
 
 #: Pages OCR'd for a multimodal county's scanned PDF (#4986).  Its split
 #: reads the page images itself (every page); the OCR text is only the
@@ -498,6 +505,29 @@ def event_content_format(event_data: dict[str, Any]) -> ContentFormat | None:
         return None
 
 
+def _pdf_text_marks(pdf_texts: list[PdfText]) -> dict[str, Any]:
+    """The event keys for text extracted from *pdf_texts* (#4986, #5010):
+    ``TEXT_FROM_OCR_KEY`` when any holds OCR text or lacks pages (neither
+    is evidence as a whole), with the text-layer runs around the OCR text
+    and the missing pages (``TEXT_LAYER_KEY``), and ``OCR_INCOMPLETE_KEY``
+    when any lacks pages.  Empty for complete text-layer text."""
+    marks: dict[str, Any] = {}
+
+    def partial(p: PdfText) -> bool:
+        return p.from_ocr or p.incomplete is not None
+
+    if any(partial(p) for p in pdf_texts):
+        marks[TEXT_FROM_OCR_KEY] = True
+        runs: list[str] = []
+        for p in pdf_texts:
+            runs.extend(p.text_layer if partial(p) else (p.text,) if p.text else ())
+        marks[TEXT_LAYER_KEY] = runs
+    incomplete = "; ".join(p.incomplete for p in pdf_texts if p.incomplete)
+    if incomplete:
+        marks[OCR_INCOMPLETE_KEY] = incomplete
+    return marks
+
+
 def _ocr_incomplete_reason(event_data: dict[str, Any]) -> str | None:
     """The failure reason of a split built on the event's OCR text, when
     that OCR did not read every page (``OCR_INCOMPLETE_KEY``, #4986)."""
@@ -522,17 +552,19 @@ def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -
     - A whole document is checked against its extracted text and link text,
       when the text is long enough to settle it.
     - Text OCR transcribed from a scanned PDF (``TEXT_FROM_OCR_KEY``), and
-      any child cut from it, is no evidence (#4986).
+      any child cut from it, is no evidence (#4986).  In a text PDF with
+      some scanned pages, a child cut wholly from the text-layer pages
+      keeps its own text as evidence (``text_from_ocr``, #5010).
     """
     if CASE_NUMBER_EVIDENCE_KEY in event_data:
         return tuple(t for t in event_data[CASE_NUMBER_EVIDENCE_KEY] or () if t)
     extra = event_data.get("extra")
     extra = extra if isinstance(extra, dict) else {}
-    from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
     if event_data.get("_split_processed"):
         if extra.get("_llm_extracted"):
             return ()
-        return own_text_evidence(ruling_text, from_ocr=from_ocr)
+        return own_text_evidence(ruling_text, from_ocr=text_from_ocr(event_data, ruling_text))
+    from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
     return document_evidence(ruling_text, extra.get("link_text"), from_ocr=from_ocr)
 
 
@@ -541,7 +573,8 @@ def _read_text_evidence(event_data: dict[str, Any], ruling_text: str | None) -> 
     text (the per-field LLM, the regex fallback): that text and the link
     text, at any length, since the extractor saw nothing else (#4907).
     ``()`` for a split child, whose write evidence already covers it, and
-    for OCR text (``TEXT_FROM_OCR_KEY``, #4986)."""
+    for OCR text or text missing pages (``TEXT_FROM_OCR_KEY``, #4986,
+    #5010)."""
     from_ocr = bool(event_data.get(TEXT_FROM_OCR_KEY))
     if event_data.get("_split_processed") or not own_text_evidence(ruling_text, from_ocr=from_ocr):
         return ()
@@ -743,7 +776,7 @@ def _canonical_split_text(text: str) -> str:
     """Normalise page joins so one PDF splits the same way on every path.
 
     A live capture joins pdfplumber pages with ``"\\n"``
-    (``pdf_link_scraper._extract_pdf_text``); the worker's raw-PDF path
+    (``llm_extract.scraper_pdf_text``); the worker's raw-PDF path
     joins them with ``"\\n\\f\\n"`` (``llm_extract.extract_pdf_text``).
     The split must not depend on which one produced the text (#4796).
     """
@@ -2472,7 +2505,9 @@ class IngestionWorker:
                 # so a scanned page gives none, as the reingest's OCR'd
                 # text of the same key does.
                 layer = extract_pdf_text(raw, ocr=False)
-                text = layer.text if layer is not None else ""
+                # A text layer missing scanned pages cannot refute a number
+                # printed on them (#5010).
+                text = layer.text if layer is not None and layer.incomplete is None else ""
         except Exception as exc:
             logger.warning(
                 "Failed to read a pre-split child's archived page",
@@ -2572,21 +2607,22 @@ class IngestionWorker:
                 )
                 return event_data
 
-        from_ocr: list[bool] = []
+        pdf_texts: list[PdfText] = []
 
         def extract(pdf: bytes) -> str | None:
             pdf_text = extract_pdf_text(pdf)
             if pdf_text is None:
                 return None
-            from_ocr.append(pdf_text.from_ocr)
+            pdf_texts.append(pdf_text)
             return pdf_text.text or None
 
         result = portal.transcribe_envelope_pdf(envelope, extract)
         if result.text:
             updates["ruling_text"] = result.text
-            if any(from_ocr):
-                # Cut from OCR text: no case-number evidence (#4986).
-                updates[TEXT_FROM_OCR_KEY] = True
+            # Cut from OCR text: no case-number evidence (#4986), except a
+            # slice of the text-layer pages (#5010); cut from text missing
+            # pages: incomplete.
+            updates.update(_pdf_text_marks(pdf_texts))
         if result.outcome not in ("no_pdf", "inline_ruling"):
             # The hearing date printed in the calendar PDF's preamble wins
             # over whatever the event carries (the capture-time filename
@@ -2620,6 +2656,60 @@ class IngestionWorker:
         if not updates:
             return event_data
         return {**event_data, **updates}
+
+    def _with_scanned_pages_reread(
+        self, event_data: dict[str, Any], ruling_text: str | None
+    ) -> tuple[dict[str, Any], str | None]:
+        """The event and its text, with a live capture's scanned pages
+        read again from the archived PDF (#5010).
+
+        A scraper reads a PDF's text layer (``scraper_pdf_text``) and runs
+        no OCR; when some pages are scanned it names them in
+        ``extra[SCANNED_PAGES_KEY]``, and its text lacks them.  The event's
+        text becomes the archived PDF's bytes, as a reingest of the key
+        sends them, so ``extract_pdf_text`` OCRs those pages.  When the
+        PDF cannot be read, the text stands but is marked incomplete
+        (``OCR_INCOMPLETE_KEY``), so no split is built on it.
+        """
+        extra = event_data.get("extra")
+        scanned = extra.get(SCANNED_PAGES_KEY) if isinstance(extra, dict) else None
+        if (
+            not scanned
+            or event_data.get("_split_processed")
+            or event_content_format(event_data) is not ContentFormat.PDF
+            or (ruling_text and is_pdf_binary(ruling_text))
+        ):
+            return event_data, ruling_text
+        document_id = str(event_data.get("document_id"))
+        raw = self._fetch_archived_bytes(
+            event_data.get("s3_key"), event_data.get("s3_bucket"), document_id
+        )
+        if raw is None or not is_pdf_binary(raw):
+            logger.warning(
+                "Scanned pages of a live PDF capture could not be read again",
+                extra={
+                    "document_id": document_id,
+                    "s3_key": event_data.get("s3_key"),
+                    "scanned_pages": scanned,
+                    "telemetry_event": "pdf_scanned_pages_unread",
+                },
+            )
+            reason = f"page(s) {scanned} have no text layer and the archived PDF is unreadable"
+            return {**event_data, OCR_INCOMPLETE_KEY: reason}, ruling_text
+        logger.info(
+            "Reading a live PDF capture's scanned pages from the archive",
+            extra={
+                "document_id": document_id,
+                "s3_key": event_data.get("s3_key"),
+                "scanned_pages": scanned,
+                "telemetry_event": "pdf_scanned_pages_reread",
+            },
+        )
+        text = raw.decode("latin-1")
+        # Read once: the event's children (a whole-document child too)
+        # inherit the PDF's extracted text, not the scraper's.
+        rest = {k: v for k, v in extra.items() if k != SCANNED_PAGES_KEY}
+        return {**event_data, "ruling_text": text, "extra": rest}, text
 
     def _fetch_archived_bytes(
         self,
@@ -3408,6 +3498,11 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         raw_pdf_bytes: bytes | None = None
         with timing.phase("parse_document_ms"):
+            # A live capture whose scraper read a PDF with scanned pages
+            # carries a text layer without them: read the archived PDF
+            # again, as a reingest of the key does, so they are OCR'd
+            # (#5010).
+            event_data, ruling_text = self._with_scanned_pages_reread(event_data, ruling_text)
             # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
             # This handles documents where the scraper stored raw PDF bytes instead of
             # extracted text (e.g. Riverside, Orange county PDFs).
@@ -3429,14 +3524,11 @@ class IngestionWorker:
                     ),
                 )
                 extracted_pdf_text = pdf_text.text if pdf_text is not None else None
-                if pdf_text is not None and pdf_text.from_ocr:
-                    # LLM output: never case-number evidence, and a split
-                    # built on OCR that skipped pages is incomplete (#4986).
-                    event_data = {
-                        **event_data,
-                        TEXT_FROM_OCR_KEY: True,
-                        OCR_INCOMPLETE_KEY: pdf_text.incomplete,
-                    }
+                if pdf_text is not None:
+                    # OCR text is LLM output: never case-number evidence,
+                    # bar the text-layer pages around it; and a split built
+                    # on text that lacks pages is incomplete (#4986, #5010).
+                    event_data = {**event_data, **_pdf_text_marks([pdf_text])}
                 if extracted_pdf_text:
                     logger.info(
                         "Extracted text from raw PDF binary",

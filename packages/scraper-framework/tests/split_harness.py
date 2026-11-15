@@ -65,8 +65,11 @@ properties that must hold for any sequence of re-splits:
   worker, in ``required`` extraction mode, finds an extractor it needs
   could not be built (#4953), when no extractor could run at all (no
   text to read and no page images, #4968), and when a page or chunk failed
-  while others answered (``PartialExtractionError``, #5000).  Checked on every generated
-  step whose extraction is incomplete, and by :func:`run_extraction_failure`.
+  while others answered (``PartialExtractionError``, #5000), and when the
+  input itself is incomplete: a text PDF's scanned (``blank_page``) page
+  whose OCR failed (:data:`INCOMPLETE_INPUT`, #5010).  Checked on every generated
+  step whose extraction is incomplete, by :func:`run_extraction_failure`
+  and by :func:`run_incomplete_input`.
 - ``failed_manifest``: a step whose extraction did not produce a complete
   result reports the key as failed.  A split-set replacement (``reingest`` /
   ``db``) raises ``SplitExtractionFailedError``, which the reingest's
@@ -546,6 +549,38 @@ PARTIAL = "partial"
 
 #: Whether generated seeds include :data:`PARTIAL` steps (#5000).
 PARTIAL_STEPS = True
+
+#: Incomplete input (#5010): the step's PDF is a text page followed by a
+#: scanned (``blank_page``: image only, no text layer) page whose OCR call
+#: fails.  The extractors answer, but the text they would read lacks the
+#: scanned page, so a text-first county's split is no complete result
+#: (``untouched`` / ``failed_manifest``).  A reingest sends the PDF; a live
+#: capture sends the scraper's text layer, names the page in
+#: ``extra[SCANNED_PAGES_KEY]``, and the worker reads the archived PDF
+#: again.  Run by :func:`run_incomplete_input`, not drawn by the generator.
+INCOMPLETE_INPUT = "incomplete_input"
+
+#: The text page of an :data:`INCOMPLETE_INPUT` PDF.
+_BLANK_PAGE_TEXT_LAYER = (
+    "SUPERIOR COURT OF CALIFORNIA. Tentative rulings, calendar page 1. "
+    "The rulings on the following pages are scanned."
+)
+
+
+def blank_page_pdf() -> bytes:
+    """A text page, then a scanned page: a picture with no text layer."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_textbox(pymupdf.Rect(40, 40, 572, 752), _BLANK_PAGE_TEXT_LAYER, fontsize=11)
+    blank_page = doc.new_page(width=612, height=792)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8), False)
+    pix.clear_with(200)
+    blank_page.insert_image(pymupdf.Rect(20, 20, 592, 772), pixmap=pix)
+    data = doc.tobytes()
+    doc.close()
+    return data
 
 
 def profile_config(profile: str) -> Any:
@@ -1560,7 +1595,9 @@ class KeyHarness:
                     for event in self.presplit_events(key, step):
                         self.worker.process_event(event)
                 else:
-                    self.worker.process_event(self._event(key, step.kind, step.doc))
+                    event = self._event(key, step.kind, step.doc)
+                    with self._incomplete_input(key, event, fail_mode == INCOMPLETE_INPUT):
+                        self.worker.process_event(event)
         except InvariantError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
@@ -1660,6 +1697,26 @@ class KeyHarness:
         )
         self._judges_seen.update(j for _d, _t, j, _n in judges_before + judges_after)
         self._guard("judge_converge", self._check_votes)
+
+    @contextmanager
+    def _incomplete_input(self, key: Key, event: dict[str, Any], on: bool) -> Iterator[None]:
+        """Make *event* an :data:`INCOMPLETE_INPUT` step's (#5010): its PDF
+        has a scanned page, and every OCR call fails."""
+        if not on:
+            yield
+            return
+        from ingestion.llm_extract import SCANNED_PAGES_KEY
+
+        pdf = blank_page_pdf()
+        self.raw_objects[key.s3_key] = pdf
+        if event.get("_replace_split_set"):
+            event["ruling_text"] = pdf.decode("latin-1")
+        else:
+            # The scraper read the text layer and named the scanned page.
+            event["extra"] = {**(event.get("extra") or {}), SCANNED_PAGES_KEY: [2]}
+        self.events["harness.incomplete_input"] += 1
+        with patch("ingestion.llm_extract.call_llm_with_images", return_value=None):
+            yield
 
     def write_legacy_row(self, key: Key, document_id: str, spec: Spec) -> None:
         """Write one document + ruling on *key* directly, the way an older
@@ -1836,7 +1893,8 @@ class KeyHarness:
         needed = "county" if config is not None and config.provider else "framework"
         if all_missing or mode == f"{needed}_missing":
             return "unavailable"
-        return "failed" if mode in ("all", PARTIAL) else "ok"
+        # Incomplete input: the text lacks a scanned page (#5010).
+        return "failed" if mode in ("all", PARTIAL, INCOMPLETE_INPUT) else "ok"
 
     def _unextractable(self, step: Step) -> bool:
         """A text-first county's step with no text: no extractor can run,
@@ -3197,6 +3255,34 @@ def run_partial_extraction(
         return run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
     partial = replace(steps[-1], kind=kind, fail_mode=PARTIAL, whole=False, ops=("partial",))
     return run_steps(dsn, [*steps, partial], run_token, seed=seed, name=name)
+
+
+def run_incomplete_input(
+    dsn: str, seed: int, run_token: str, *, kind: str, name: str = "blank_page"
+) -> Counter[str]:
+    """Incomplete input (:data:`INCOMPLETE_INPUT`, #5010) on *seed*'s key.
+
+    *seed*'s history runs, then a step of *kind* (``reingest`` or
+    ``live``) in a text-first county whose PDF has a scanned page that OCR
+    fails to read.  Before #5010 the scanned page was dropped and the text
+    pages split as if complete.  The step must leave the key's rows and
+    search docs as they were (``untouched``), and a reingest must report
+    the key (``failed_manifest``).  The convergence checks then re-ingest
+    healthily.  Returns the run's event counts.
+    """
+    steps = generate(seed, extraction_modes=False)
+    last = steps[-1]
+    blank = replace(
+        last,
+        kind=kind,
+        fail_mode=INCOMPLETE_INPUT,
+        whole=False,
+        profile="llm_county",
+        # A live capture's scraper text: the text page's layer.
+        doc=last.doc or _BLANK_PAGE_TEXT_LAYER,
+        ops=("blank_page",),
+    )
+    return run_steps(dsn, [*steps, blank], run_token, seed=seed, name=name)
 
 
 # ---------------------------------------------------------------------------

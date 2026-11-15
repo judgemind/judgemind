@@ -68,6 +68,7 @@ from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperCo
 from framework.extraction_config import get_county_extraction_config
 from framework.fetch_tally import FetchTally
 from framework.llm_utils import parse_llm_json
+from ingestion.llm_extract import SCANNED_PAGES_KEY
 
 from .pdf_link_scraper import (
     NOT_A_PDF_REASON,
@@ -639,12 +640,18 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                     hearing_date = _cc_hearing_date_from_filename(filename)
 
                     # Check for boilerplate
+                    gaps: dict[str, Any] = {}
                     try:
-                        text = _extract_pdf_text(pdf_content)
+                        text = _extract_pdf_text(pdf_content, extra=gaps)
                     except Exception:
                         text = None
+                    # Scanned pages (#5010): the text layer is not the whole
+                    # PDF, so it is neither judged boilerplate nor split
+                    # here; the single-doc path names the pages for the
+                    # worker, which OCRs them.
+                    scanned_pages = SCANNED_PAGES_KEY in gaps
 
-                    if text is not None and self._is_boilerplate(text):
+                    if text is not None and not scanned_pages and self._is_boilerplate(text):
                         self._log.info(
                             "Skipping boilerplate PDF",
                             department=department,
@@ -661,7 +668,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
                     # LLM extraction path: send PDF text to LLM, get back
                     # structured rulings with all fields.
-                    if use_llm and text is not None:
+                    if use_llm and text is not None and not scanned_pages:
                         # Refine judge name from PDF header for authoritative
                         # metadata passed to LLM-extracted docs.
                         pdf_judge = _cc_judge_from_pdf(text)
@@ -824,7 +831,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
             return doc
 
         try:
-            text = _extract_pdf_text(doc.raw_content)
+            text = _extract_pdf_text(doc.raw_content, extra=doc.extra)
             doc.ruling_text = text
         except Exception as exc:
             self._log.warning("PDF text extraction failed", error=str(exc))

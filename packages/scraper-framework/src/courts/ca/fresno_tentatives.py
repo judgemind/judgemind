@@ -584,7 +584,8 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
 
         for doc in raw_docs:
             try:
-                text = _extract_pdf_text(doc.raw_content)
+                # Names scanned pages for the worker to OCR (#5010).
+                text = _extract_pdf_text(doc.raw_content, extra=doc.extra)
             except Exception as exc:
                 logger.warning("PDF text extraction failed", error=str(exc))
                 continue

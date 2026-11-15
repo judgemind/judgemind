@@ -11,7 +11,9 @@ gate (``ingestion.case_evidence``) whether that text refutes the number.  The
 audit uses the gate's predicate, not a copy of it, so it cannot disagree with
 ingest (#4924, #4927).  A PDF with no text layer is OCR'd by the worker, but
 OCR text is never evidence (#4986), so the audit skips the OCR: such a PDF's
-rulings are ``no_text``, exactly as the gate judges them.
+rulings are ``no_text``, exactly as the gate judges them.  So are a text
+PDF's rulings when some of its pages are scanned: its text layer cannot
+refute a number printed only on a scanned page (#5010).
 
 Verdicts, counted per ruling:
 
@@ -53,9 +55,14 @@ Output: one ``NO_TEXT`` line per such key (``chars``, ``pages``,
 ``rulings``) and ``SUMMARY_NO_TEXT <county>: {json}`` per county
 (``pdf_keys``, ``no_text``, ``no_text_zero_rulings``, ``no_text_rulings``,
 ``no_text_over_10_pages``, ``timeout``, ``error``).  ``--min-pages N``
-reports only no-text keys of at least N pages.  ``--write-keys
-s3://bucket/key`` also writes the reported keys, one per line, for a
-reingest's ``--s3-key-list``.  This mode always exits 0.
+reports only no-text keys of at least N pages.  The same mode sizes the
+text PDFs with scanned pages (#5010): a PDF whose text layer is evidence
+but some of whose pages are scanned (``llm_extract.pdf_scanned_pages``,
+the pages the worker OCRs) gets one ``MIXED`` line (``pages``,
+``scanned_pages``, ``rulings``), counted in the summary as ``mixed``,
+``mixed_scanned_pages`` and ``mixed_rulings``.  ``--write-keys
+s3://bucket/key`` also writes the reported keys (no-text and mixed), one
+per line, for a reingest's ``--s3-key-list``.  This mode always exits 0.
 
 Long PDF mode (``--long-pdfs``, #4995): list every archived PDF under
 ``ca/<county>/`` of at least ``--min-pages`` pages (default 51: past the
@@ -209,11 +216,18 @@ class Gate:
     evidence_for: Callable[[str | None], tuple[str, ...]]
     refuted: Callable[[str, tuple[str, ...]], bool]
     page_count: Callable[[Any], int] = lambda content: 0
+    scanned_pages: Callable[[Any], list[int]] = lambda content: []
 
 
 def audit_key(key: str, rulings: list[Ruling], gate: Gate) -> KeyResult:
     try:
-        text = text_for(gate.fetch(key), key, gate.extract_pdf, gate.is_pdf)
+        body = gate.fetch(key)
+        text = text_for(body, key, gate.extract_pdf, gate.is_pdf)
+        if text and gate.is_pdf(body) and gate.scanned_pages(body):
+            # A text PDF with scanned pages: its text layer cannot refute a
+            # number printed on them, so the worker counts no evidence
+            # (#5010).
+            text = None
     except Exception as exc:  # noqa: BLE001 — every failure is reported per key
         return KeyResult(
             key, [("error", r) for r in rulings], f"{type(exc).__name__}: {exc}"
@@ -226,7 +240,12 @@ def production_gate() -> Gate:
     evidence, #4986) and the ingest gate's predicate."""
     import boto3
     from ingestion.case_evidence import case_number_refuted, document_evidence
-    from ingestion.llm_extract import extract_text_layer, is_pdf_binary, pdf_page_count
+    from ingestion.llm_extract import (
+        extract_text_layer,
+        is_pdf_binary,
+        pdf_page_count,
+        pdf_scanned_pages,
+    )
 
     clients: dict[int, Any] = {}
 
@@ -244,6 +263,7 @@ def production_gate() -> Gate:
         evidence_for=lambda text: document_evidence(text),
         refuted=case_number_refuted,
         page_count=pdf_page_count,
+        scanned_pages=pdf_scanned_pages,
     )
 
 
@@ -415,7 +435,9 @@ class TextProbe:
     key: str
     chars: int  # non-blank characters of the text layer (stripped length)
     evidence: bool  # True when the gate counts the text as evidence
-    pages: int = 0  # page count, read only for a key with no evidence
+    pages: int = 0  # page count, read for a key with no evidence or scanned pages
+    #: The scanned pages of a PDF whose text layer is evidence (#5010).
+    scanned_pages: tuple[int, ...] = ()
 
 
 #: The page count past which the OCR fallback used to stop reading (#4986).
@@ -428,8 +450,9 @@ def probe_key_text(key: str, gate: Gate) -> TextProbe:
     text = text_for(body, key, gate.extract_pdf, gate.is_pdf)
     usable = text if text and not gate.is_pdf(text) else ""
     evidence = bool(gate.evidence_for(text))
-    pages = 0 if evidence else gate.page_count(body)
-    return TextProbe(key, len(usable.strip()), evidence, pages)
+    scanned = tuple(gate.scanned_pages(body)) if evidence else ()
+    pages = gate.page_count(body) if not evidence or scanned else 0
+    return TextProbe(key, len(usable.strip()), evidence, pages, scanned)
 
 
 @dataclass
@@ -439,12 +462,17 @@ class NoTextReport:
     no_text: list[tuple[str, int, int, int]] = field(
         default_factory=list
     )  # key, chars, pages, rulings
+    #: Text PDFs with scanned pages (#5010): key, pages, scanned pages, rulings.
+    mixed: list[tuple[str, int, tuple[int, ...], int]] = field(default_factory=list)
     timeout_keys: list[str] = field(default_factory=list)
     error_keys: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         return {
             "pdf_keys": self.pdf_keys,
+            "mixed": len(self.mixed),
+            "mixed_scanned_pages": sum(len(s) for _, _, s, _ in self.mixed),
+            "mixed_rulings": sum(n for *_, n in self.mixed),
             "no_text": len(self.no_text),
             "no_text_zero_rulings": sum(1 for *_, n in self.no_text if n == 0),
             "no_text_rulings": sum(n for *_, n in self.no_text),
@@ -489,6 +517,13 @@ def audit_no_text_county(
                 f"NO_TEXT {county} key={key} chars={payload.chars} "
                 f"pages={payload.pages} rulings={rulings}"
             )
+        elif payload.evidence and payload.scanned_pages:
+            rulings = ruling_counts.get(key, 0)
+            report.mixed.append((key, payload.pages, payload.scanned_pages, rulings))
+            out(
+                f"MIXED {county} key={key} pages={payload.pages} "
+                f"scanned_pages={list(payload.scanned_pages)} rulings={rulings}"
+            )
         if progress_every and done % progress_every == 0 and done < report.pdf_keys:
             out(
                 f"PROGRESS {county}: {done}/{report.pdf_keys} keys no_text={len(report.no_text)}"
@@ -526,7 +561,10 @@ def run_no_text(
 
 
 def no_text_key_list(reports: Iterable[NoTextReport]) -> str:
-    return "".join(f"{key}\n" for r in reports for key, *_ in r.no_text)
+    """The reported keys: no-text PDFs, then text PDFs with scanned pages."""
+    return "".join(
+        f"{key}\n" for r in reports for key, *_ in (*r.no_text, *r.mixed)
+    )
 
 
 def county_keys(
@@ -731,7 +769,7 @@ def main_no_text(args: argparse.Namespace, only: set[str] | None) -> int:
     else:
         reports = run_no_text(args, keys, counts, production_gate(), only, out=_print)
         body = no_text_key_list(reports)
-        found = sum(len(r.no_text) for r in reports)
+        found = sum(len(r.no_text) + len(r.mixed) for r in reports)
     if args.write_keys:
         bucket, _, key = args.write_keys.removeprefix("s3://").partition("/")
         s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))

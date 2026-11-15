@@ -48,6 +48,10 @@ from bs4 import BeautifulSoup
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 from framework.fetch_tally import FetchTally
 
+# The one PDF text-layer reader (#5010): it names a PDF's scanned pages in
+# the document's ``extra`` so the worker OCRs them.
+from .pdf_link_scraper import _extract_pdf_text
+
 logger = structlog.get_logger(__name__)
 
 SEARCH_URL = "https://www2.ventura.courts.ca.gov/CaseInquiry/TentativeRulings"
@@ -634,7 +638,7 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         if doc.raw_content:
             try:
                 if doc.content_format == ContentFormat.PDF:
-                    text = _extract_pdf_text(doc.raw_content)
+                    text = _extract_pdf_text(doc.raw_content, extra=doc.extra)
                 else:
                     text = _extract_html_text(doc.raw_content)
 
@@ -751,21 +755,6 @@ class VenturaTentativeRulingsScraper(BaseScraper):
 # ---------------------------------------------------------------------------
 # Document text extraction helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract full text from a PDF using pdfplumber."""
-    import io
-
-    import pdfplumber
-
-    lines: list[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.append(text)
-    return "\n".join(lines)
 
 
 def _extract_html_text(html_bytes: bytes) -> str:

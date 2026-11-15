@@ -61,6 +61,10 @@ from framework.fetch_tally import FetchTally
 
 from .pdf_link_scraper import NOT_A_PDF_REASON, looks_like_pdf
 
+# The one PDF text-layer reader (#5010): it names a PDF's scanned pages in
+# the document's ``extra`` so the worker OCRs them.
+from .pdf_link_scraper import _extract_pdf_text as extract_pdf_text
+
 logger = structlog.get_logger(__name__)
 
 LANDING_URL = "https://santaclara.courts.ca.gov/online-services/tentative-rulings"
@@ -414,19 +418,6 @@ def is_placeholder_notice(text: str | None) -> bool:
     if len(normalized) > PLACEHOLDER_NOTICE_MAX_CHARS:
         return False
     return bool(_PLACEHOLDER_NOTICE_RE.match(normalized))
-
-
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract full text from a PDF using pdfplumber."""
-    import io
-
-    lines: list[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.append(text)
-    return "\n".join(lines)
 
 
 def parse_judge_name(text: str) -> str | None:
@@ -2134,7 +2125,7 @@ class SCTentativeRulingsScraper(BaseScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract structured fields from PDF text."""
         try:
-            text = extract_pdf_text(doc.raw_content)
+            text = extract_pdf_text(doc.raw_content, extra=doc.extra)
             doc.ruling_text = text
 
             # Extract case numbers

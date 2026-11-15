@@ -360,7 +360,7 @@ def test_ocr_page_budget_follows_the_extraction_strategy(
     assert extract.call_args.kwargs["ocr_max_pages"] == pages
     split_event = mock_split.call_args.args[0]
     assert split_event[TEXT_FROM_OCR_KEY] is True
-    assert split_event[OCR_INCOMPLETE_KEY] is None
+    assert split_event.get(OCR_INCOMPLETE_KEY) is None
 
 
 # ---------------------------------------------------------------------------

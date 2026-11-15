@@ -27,12 +27,17 @@ from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
-import pdfplumber
 import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.fetch_tally import FetchTally
+from ingestion.llm_extract import SCANNED_PAGES_KEY
+
+# The one PDF text-layer reader (#5010): it names a PDF's scanned pages in
+# the document's ``extra`` so the worker OCRs them.  Fresno, Riverside and
+# Contra Costa import it from here.
+from ingestion.llm_extract import scraper_pdf_text as _extract_pdf_text
 
 logger = structlog.get_logger(__name__)
 
@@ -267,12 +272,19 @@ class PdfLinkScraper(BaseScraper):
                     # Check for boilerplate before adding to results (#322).
                     # Extract text early so subclasses that override
                     # _is_boilerplate can inspect it.
+                    gaps: dict[str, Any] = {}
                     try:
-                        text = _extract_pdf_text(doc.raw_content)
+                        text = _extract_pdf_text(doc.raw_content, extra=gaps)
                     except Exception:
                         text = None
 
-                    if text is not None and self._is_boilerplate(text):
+                    # A PDF with scanned pages is never judged boilerplate
+                    # by its text layer alone (#5010).
+                    if (
+                        text is not None
+                        and SCANNED_PAGES_KEY not in gaps
+                        and self._is_boilerplate(text)
+                    ):
                         self._log.info(
                             "Skipping boilerplate PDF",
                             department=doc.department,
@@ -302,7 +314,7 @@ class PdfLinkScraper(BaseScraper):
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         try:
-            text = _extract_pdf_text(doc.raw_content)
+            text = _extract_pdf_text(doc.raw_content, extra=doc.extra)
             doc.ruling_text = text
 
             case_numbers = self._pdf_config.case_number_re.findall(text)
@@ -375,16 +387,3 @@ def _extract_pdf_links(html: str, index_url: str, pdf_base_url: str) -> list[tup
         results.append((abs_url, link_text))
 
     return results
-
-
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract full text from a PDF using pdfplumber."""
-    import io
-
-    lines = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.append(text)
-    return "\n".join(lines)
