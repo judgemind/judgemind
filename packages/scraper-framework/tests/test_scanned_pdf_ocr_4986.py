@@ -92,7 +92,7 @@ def _ocr(fail_pages: frozenset[int] = frozenset(), delay: float = 0.0) -> MagicM
     """A stand-in for ``call_llm_with_images``: each page's text, ``None``
     (a failed call) for *fail_pages*."""
 
-    def call(*, system_prompt: str, text_message: str, images: Any, timeout: float) -> Any:
+    def call(*, system_prompt: str, text_message: str, images: Any, **_: Any) -> Any:
         page = _page_number(text_message)
         if delay:
             threading.Event().wait(delay)  # conftest patches time.sleep

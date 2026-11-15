@@ -233,6 +233,7 @@ class TestProviderFinishReason:
             "safety_ratings": [],
             "input_tokens": 2099,
             "output_tokens": 3,
+            "thinking_tokens": None,
             "response_chars": 3,
         }
         assert response_diagnostics(response) == response.diagnostics()

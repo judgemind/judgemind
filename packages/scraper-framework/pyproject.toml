@@ -26,6 +26,7 @@ dependencies = [
     "lxml>=5.1,<7",
     "pdfplumber>=0.11,<0.12",
     "pymupdf>=1.24,<2",
+    "pillow>=9.1,<14",  # crops OCR page tiles (#5046); already installed via pdfplumber
     "redis>=5.0,<9",
     "boto3>=1.34,<2",
     "pydantic>=2.6,<3",

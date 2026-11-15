@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -34,7 +35,12 @@ from framework.llm_schema import (
 )
 from framework.llm_utils import parse_llm_json, rulings_array_shape_error
 
-from .llm_providers import call_llm, call_llm_with_images, response_diagnostics
+from .llm_providers import (
+    FINISH_RECITATION,
+    call_llm,
+    call_llm_with_images,
+    response_diagnostics,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -713,6 +719,7 @@ def _ocr_pages_counted(
     start_time = time_mod.monotonic()
     texts: dict[int, str | None] = {}
     problems: list[str] = []
+    failures: dict[int, str] = {}
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         total_pages = len(doc)
         wanted = list(range(total_pages)) if indexes is None else list(indexes)
@@ -767,6 +774,8 @@ def _ocr_pages_counted(
                         "image/png",
                         page_index=index,
                         timeout=min(page_timeout, budget),
+                        failures=failures,
+                        deadline=deadline,
                     )
                     pending[future] = index
                 remaining = deadline - time_mod.monotonic()
@@ -793,7 +802,10 @@ def _ocr_pages_counted(
         problems.append(f"{unanswered} page(s) unanswered after {budget:g}s")
     failed = sorted(i + 1 for i, text in texts.items() if text is None)
     if failed:
-        problems.append(f"page(s) {failed} failed")
+        # Name each page's cause, so a page no reader can finish (#5046)
+        # shows why in the recorded reason.
+        causes = ", ".join(f"{p}={failures[p - 1]}" for p in failed if failures.get(p - 1))
+        problems.append(f"page(s) {failed} failed" + (f" ({causes})" if causes else ""))
     if problems:
         logger.warning(
             "ocr_pdf_text.incomplete",
@@ -869,54 +881,330 @@ def _ocr_single_page(
     *,
     page_index: int,
     timeout: float,
+    failures: dict[int, str] | None = None,
+    deadline: float | None = None,
 ) -> str | None:
     """OCR a single page image via the LLM vision API.
 
-    Returns the extracted text (``""`` for a blank page), or ``None`` when
-    the call failed.
+    A page the model will not finish in one call is read in tiles
+    (``_ocr_region``, #5046), until the ``time.monotonic()`` *deadline*
+    (the OCR run's budget) passes.  Returns the extracted text (``""`` for
+    a blank page), or ``None`` when the page could not be read: then, when
+    *failures* is given, ``failures[page_index]`` says why (the provider's
+    ``finish_reason``, e.g. ``"RECITATION"``).
     """
+    text, reason = _ocr_region(
+        image_bytes,
+        media_type,
+        page_index=page_index,
+        timeout=timeout,
+        depth=0,
+        deadline=deadline,
+    )
+    if text is None and reason and failures is not None:
+        failures[page_index] = reason
+    return text
+
+
+# Tile fallback for a page the model will not finish in one call (#5046).
+# Gemini withholds a transcription that matches published text
+# (``RECITATION``: the boilerplate of a Judicial Council form attached to a
+# ruling), and on dense tables it can loop on spaces or a digit until
+# ``MAX_TOKENS``.  Both are deterministic for the same image, but not for a
+# part of it: the region is cut in two between lines of text
+# (``_split_image``) and each half is read on its own, down to
+# ``_OCR_TILE_MAX_DEPTH`` cuts and within the OCR run's time budget.  Only
+# a failing region is cut again, so a page costs a handful of extra calls:
+# the worst San Francisco page needed six cuts, down to one line of
+# statutory notice read in two halves.  Six cuts take a letter page to a
+# line; eight leave room for a denser page.  A region that still fails at
+# the last depth (after ``_OCR_WORDS_SYSTEM_PROMPT``) leaves the page
+# unread.
+_OCR_TILE_MAX_DEPTH = 8
+
+# No tile is cut narrower or shorter than this many pixels (at 150 DPI a
+# line of 10-12 pt text is about 25 px tall).
+_OCR_TILE_MIN_PX = 10
+
+# A grey level darker than this is ink (``_split_image`` works on a black
+# and white copy of the region).
+_OCR_INK_LEVEL = 160
+
+# A run of fewer inked pixel rows than this is a speck, not a line of text.
+_OCR_MIN_LINE_PX = 4
+
+# The cut is placed at the emptiest pixel line within this fraction of the
+# region's middle, so it falls between text lines rather than through one
+# (wide enough to reach a gap in a region of three lines).
+_OCR_CUT_WINDOW = 0.25
+
+# A pixel row whose average darkness (0 white, 255 black, on the black and
+# white copy) is above this holds text: over 2% of its pixels inked.  A
+# thin vertical rule (a form's box border, a table's grid) inks every row
+# of a region a little and must not merge its lines into one.
+_OCR_LINE_INK = 5
+
+# A region is cut left/right (as one line of text) only when at most this
+# tall: about two lines at 150 DPI.  A taller region is never one line,
+# whatever ``_text_line_count`` makes of touching or ruled lines.
+_OCR_SINGLE_LINE_MAX_PX = 60
+
+# OCR is transcription: a thinking model's reasoning only uses up the output
+# budget (``_google_thinking_config``, #5046).
+_OCR_THINKING_BUDGET = 0
+
+# The last resort for a strip of a page still withheld as a recitation at
+# the last cut: the same words, separated by bars, are not a verbatim copy
+# of the published text.  On the San Francisco FL-180 page a two-line strip
+# of statutory notice was withheld however it was cut, and read this way.
+_OCR_WORDS_SYSTEM_PROMPT = (
+    "You are an OCR system for court documents. "
+    "Transcribe every word in the provided image of part of a court document page, "
+    "in reading order, separating consecutive words with ' | ' "
+    "(space, vertical bar, space) and ending each line with a newline. "
+    "Do NOT interpret, summarize, or restructure the text. "
+    "Output ONLY the transcription. If the image is blank or unreadable, output nothing."
+)
+_BAR_SEPARATOR_RE = re.compile(r"\s*\|\s*")
+
+
+def _ocr_region(
+    image_bytes: bytes,
+    media_type: str,
+    *,
+    page_index: int,
+    timeout: float,
+    depth: int,
+    deadline: float | None = None,
+) -> tuple[str | None, str]:
+    """``(text, "")`` for one page image or tile of one, else ``(None, reason)``
+    (*reason* ``""`` when the call got no answer at all).
+
+    An incomplete answer (withheld or cut off) is retried as two halves of
+    the image (``_split_image``), recursively; a failed call (no response,
+    an error) is not, and nothing is tried once *deadline* has passed, so
+    an abandoned page stops making calls.  The halves' texts are joined in
+    reading order.
+    """
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, "out of time"
+        timeout = min(timeout, remaining)
+    text, reason, splittable = _ocr_call(
+        image_bytes, media_type, page_index=page_index, timeout=timeout, depth=depth
+    )
+    if text is not None:
+        return text, ""
+    if not splittable:
+        return None, reason
+    split = _split_image(image_bytes) if depth < _OCR_TILE_MAX_DEPTH else None
+    if split is None:
+        if reason == FINISH_RECITATION:
+            # The last resort for a strip of a few lines that is still
+            # withheld: the same words, separated by bars.
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, reason
+                timeout = min(timeout, remaining)
+            text, word_reason, _ = _ocr_call(
+                image_bytes,
+                media_type,
+                page_index=page_index,
+                timeout=timeout,
+                depth=depth,
+                words=True,
+            )
+            if text is not None:
+                return text, ""
+            reason = word_reason or reason
+        return None, reason
+    halves, joiner = split
+    parts: list[str] = []
+    for half in halves:
+        part, part_reason = _ocr_region(
+            half,
+            "image/png",
+            page_index=page_index,
+            timeout=timeout,
+            depth=depth + 1,
+            deadline=deadline,
+        )
+        if part is None:
+            return None, part_reason
+        if part:
+            parts.append(part)
+    if depth == 0:
+        logger.info(
+            "ocr_pdf_text.page_recovered_in_tiles",
+            page_index=page_index,
+            reason=reason,
+            text_length=sum(len(p) for p in parts),
+        )
+    return joiner.join(parts), ""
+
+
+def _ocr_call(
+    image_bytes: bytes,
+    media_type: str,
+    *,
+    page_index: int,
+    timeout: float,
+    depth: int,
+    words: bool = False,
+) -> tuple[str | None, str, bool]:
+    """One vision call: ``(text, "", False)``, or ``(None, reason, splittable)``.
+
+    *splittable* is true for an answer the provider did not finish
+    (``RECITATION``, ``MAX_TOKENS``, ...), and *reason* names why: reading
+    a smaller region can succeed where the whole failed.  A call that got
+    no answer (an outage, a timeout) is ``(None, "", False)``.  With
+    *words*, the model separates the words with bars
+    (``_OCR_WORDS_SYSTEM_PROMPT``) and they are joined back with spaces.
+    """
+    message = f"Extract all text from this court document page (page {page_index + 1})."
+    if depth:
+        message = (
+            f"Extract all text from this part of a court document page "
+            f"(page {page_index + 1}). It may start or end mid-sentence."
+        )
     try:
         response = call_llm_with_images(
-            system_prompt=_OCR_SYSTEM_PROMPT,
-            text_message=f"Extract all text from this court document page (page {page_index + 1}).",
+            system_prompt=_OCR_WORDS_SYSTEM_PROMPT if words else _OCR_SYSTEM_PROMPT,
+            text_message=message,
             images=[(image_bytes, media_type)],
             timeout=timeout,
+            thinking_budget=_OCR_THINKING_BUDGET,
         )
-        if response is None:
-            logger.warning(
-                "ocr_pdf_text.page_failed",
-                page_index=page_index,
-            )
-            return None
-
-        if getattr(response, "incomplete", False) is True:
-            # A withheld (RECITATION / SAFETY) answer comes back empty and a
-            # cut-off one is partial: neither is the page's text, and an
-            # empty one would pass for a blank page (#5007).
-            logger.warning(
-                "ocr_pdf_text.page_incomplete",
-                page_index=page_index,
-                **response_diagnostics(response),
-            )
-            return None
-
-        text = response.text.strip()
-        if text:
-            logger.debug(
-                "ocr_pdf_text.page_success",
-                page_index=page_index,
-                text_length=len(text),
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
-            )
-        return text
     except Exception:
+        logger.warning("ocr_pdf_text.page_error", page_index=page_index, exc_info=True)
+        return None, "", False
+    if response is None:
+        logger.warning("ocr_pdf_text.page_failed", page_index=page_index, tile_depth=depth)
+        return None, "", False
+
+    if getattr(response, "incomplete", False) is True:
+        # A withheld (RECITATION / SAFETY) answer comes back empty and a
+        # cut-off one is partial: neither is the page's text, and an empty
+        # one would pass for a blank page (#5007).
         logger.warning(
-            "ocr_pdf_text.page_error",
+            "ocr_pdf_text.page_incomplete",
             page_index=page_index,
-            exc_info=True,
+            tile_depth=depth,
+            **response_diagnostics(response),
         )
+        reason = (
+            getattr(response, "finish_reason", None)
+            or getattr(response, "block_reason", None)
+            or "incomplete"
+        )
+        return None, str(reason), True
+
+    text = (getattr(response, "text", "") or "").strip()
+    if words:
+        text = _join_bar_separated(text)
+    if text:
+        logger.debug(
+            "ocr_pdf_text.page_success",
+            page_index=page_index,
+            tile_depth=depth,
+            words=words,
+            text_length=len(text),
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+        )
+    return text, "", False
+
+
+def _join_bar_separated(text: str) -> str:
+    """Bar-separated words (``_OCR_WORDS_SYSTEM_PROMPT``) as plain lines."""
+    lines = (_BAR_SEPARATOR_RE.sub(" ", line).strip(" |") for line in text.splitlines())
+    return "\n".join(lines).strip()
+
+
+def _split_image(image_bytes: bytes) -> tuple[list[bytes], str] | None:
+    """The image cut in two PNGs, plus the separator to join their texts.
+
+    Reading order decides the cut (#5046).  A region of several lines is
+    cut top/bottom at the emptiest row near the middle, between lines: a
+    left/right cut through several lines would join the left half of every
+    line to the right half of every line.  A region holding one line of
+    text is cut left/right at the emptiest column near the middle (a space
+    between words), and the halves' texts are joined with a space.
+
+    ``None`` when the image cannot be decoded or is too small to cut.
+    """
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as opened:
+            image = opened.convert("L")
+    except Exception:
         return None
+    width, height = image.size
+    # Black and white, so a line's darkness counts its inked pixels.
+    ink = image.point(lambda level: 0 if level < _OCR_INK_LEVEL else 255)
+    horizontal, joiner = True, "\n"
+    one_line = height <= _OCR_SINGLE_LINE_MAX_PX and _text_line_count(ink) <= 1
+    if one_line and width >= 2 * _OCR_TILE_MIN_PX:
+        horizontal, joiner = False, " "
+    elif height < 2 * _OCR_TILE_MIN_PX:
+        return None
+    cut = _emptiest_line(ink, horizontal=horizontal)[0]
+    boxes = (
+        [(0, 0, width, cut), (0, cut, width, height)]
+        if horizontal
+        else [(0, 0, cut, height), (cut, 0, width, height)]
+    )
+    halves: list[bytes] = []
+    for box in boxes:
+        buffer = io.BytesIO()
+        image.crop(box).save(buffer, format="PNG")
+        halves.append(buffer.getvalue())
+    return halves, joiner
+
+
+def _text_line_count(image: object) -> int:
+    """How many lines of text a black-and-white image holds: runs of at
+    least ``_OCR_MIN_LINE_PX`` inked pixel rows, separated by blank rows."""
+    from PIL import Image
+
+    assert isinstance(image, Image.Image)
+    width, height = image.size
+    rows = image.resize((1, height), Image.Resampling.BOX).tobytes()
+    lines = run = 0
+    for level in rows:
+        if 255 - level > _OCR_LINE_INK:
+            run += 1
+            continue
+        lines += run >= _OCR_MIN_LINE_PX
+        run = 0
+    return lines + (run >= _OCR_MIN_LINE_PX)
+
+
+def _emptiest_line(image: object, *, horizontal: bool) -> tuple[int, int]:
+    """``(position, ink)`` of the brightest pixel row (*horizontal*) or
+    column within ``_OCR_CUT_WINDOW`` of the middle of a greyscale image.
+
+    *ink* is how dark that line is on average (0 white, 255 black).  Among
+    equally bright lines, the one nearest the middle wins.
+    """
+    from PIL import Image
+
+    assert isinstance(image, Image.Image)
+    width, height = image.size
+    length = height if horizontal else width
+    lo = int(length * (0.5 - _OCR_CUT_WINDOW))
+    hi = max(lo + 1, int(length * (0.5 + _OCR_CUT_WINDOW)))
+    if horizontal:
+        band = image.crop((0, lo, width, hi)).resize((1, hi - lo), Image.Resampling.BOX)
+    else:
+        band = image.crop((lo, 0, hi, height)).resize((hi - lo, 1), Image.Resampling.BOX)
+    profile = list(band.tobytes())  # one 8-bit grey level per line
+    middle = (hi - lo) / 2
+    best = max(range(len(profile)), key=lambda i: (profile[i], -abs(i - middle)))
+    return lo + best, 255 - profile[best]
 
 
 # ---------------------------------------------------------------------------
