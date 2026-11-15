@@ -152,3 +152,27 @@ class TestFrameworkExtractorBustCachePropagation:
             second = worker._get_framework_extractor()
         assert first is second
         assert mock_extractor_cls.call_count == 1
+
+
+class TestCountyExtractorBustCachePropagation:
+    """``_get_county_extractor`` must construct LlmExtractor with
+    ``bust_cache=True`` when the worker busts the cache (#4994): a bad
+    cached county text split was replayed on every busted reingest."""
+
+    def test_propagates_true(self) -> None:
+        worker = _make_worker(bust_llm_cache=True)
+        with patch("ingestion.worker.LlmExtractor") as mock_extractor_cls:
+            mock_extractor_cls.return_value = MagicMock()
+            worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, None)
+        mock_extractor_cls.assert_called_once()
+        kwargs = mock_extractor_cls.call_args.kwargs
+        assert kwargs.get("bust_cache") is True
+        assert kwargs.get("max_output_tokens") == 32768
+
+    def test_not_busted_by_default(self) -> None:
+        worker = _make_worker(bust_llm_cache=False)
+        with patch("ingestion.worker.LlmExtractor") as mock_extractor_cls:
+            mock_extractor_cls.return_value = MagicMock()
+            worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, None)
+        mock_extractor_cls.assert_called_once()
+        assert not mock_extractor_cls.call_args.kwargs.get("bust_cache")
