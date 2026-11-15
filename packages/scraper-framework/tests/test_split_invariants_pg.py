@@ -827,6 +827,28 @@ def test_presplit_steps_reach_the_split_set_write(seed: int) -> None:
 
 
 @_needs_pg
+@pytest.mark.parametrize("seed", [3, 4, 8, 15, 44])
+@pytest.mark.parametrize("fault", [harness.S3_FLAKY, harness.S3_DOWN])
+def test_presplit_s3_read_fault_holds_every_invariant(seed: int, fault: str) -> None:
+    """An S3 error reading a pre-split child's archived page never lets its
+    LLM case number in unchecked (#5012).  A transient error the read's
+    retry gets past gives the normal evidence (``evidence`` holds); a read
+    that keeps failing writes nothing (``untouched``) and raises
+    ``PreSplitEvidenceUnavailableError``.  Before #5012 the child was
+    written with its LLM number trusted."""
+    steps = harness.with_presplit_s3_faults(harness.generate(seed), fault)
+    assert any(s.s3_read == fault for s in steps)
+    events = harness.run_steps(_DSN, steps, _RUN, seed=seed, name=f"s3-{fault}")
+    assert events[f"harness.s3_fault.{fault}"] > 0, dict(events)
+    if fault == harness.S3_FLAKY:
+        assert events["pre_split_evidence_read_retried"] > 0, dict(events)
+        assert not events["harness.raised.PreSplitEvidenceUnavailableError"], dict(events)
+    else:
+        assert events["harness.raised.PreSplitEvidenceUnavailableError"] > 0, dict(events)
+        assert events["pre_split_evidence_unavailable"] > 0, dict(events)
+
+
+@_needs_pg
 @pytest.mark.parametrize("kind", ["reingest", "db", "live"])
 def test_known_bug_4953_extractor_unavailable_keeps_the_three_child_split(kind: str) -> None:
     """A key holding a three-child split set, re-ingested while the

@@ -169,6 +169,12 @@ Step kinds:
   again (its alert detached, a gap between the two commits): ``gap`` and
   ``alert`` are not checked on these steps.  ``alert_case`` is: a retired
   row's alert is detached, never moved to another ruling.
+  :func:`with_presplit_s3_faults` makes the page read fail (#5012): once,
+  transiently (``flaky``: the worker's in-call retry reads it, and every
+  invariant, ``evidence`` included, holds as without the fault), or on
+  every attempt (``down``: each child raises
+  ``PreSplitEvidenceUnavailableError`` and writes nothing, checked as
+  ``untouched``, so no LLM number goes in unchecked).
 
 Extraction modes (#4968), from a fourth random stream (:func:`_with_extraction_modes`):
 
@@ -366,6 +372,10 @@ class Step:
     #: Which extractor fails or cannot be built (:data:`FAIL_MODES`), or
     #: ``""`` for none.
     fail_mode: str = ""
+    #: A ``presplit`` step's S3 read fault on the archived page (#5012):
+    #: :data:`S3_FLAKY` or :data:`S3_DOWN`, ``""`` for none.  Never
+    #: generated: :func:`with_presplit_s3_faults` sets it.
+    s3_read: str = ""
 
     def describe(self) -> str:
         parts = []
@@ -391,6 +401,8 @@ class Step:
             fail += f" fail_mode={self.fail_mode}"
         if (self.profile, self.env) != ("default", "google"):
             fail += f" profile={self.profile} env={self.env}"
+        if self.s3_read:
+            fail += f" s3={self.s3_read}"
         return f"{self.kind}[{' '.join(parts)}] doc={doc}{whole}{fail} ops={list(self.ops)}"
 
 
@@ -742,6 +754,23 @@ def _with_presplit_steps(seed: int, steps: list[Step]) -> list[Step]:
             step = replace(step, kind="presplit")
         out.append(step)
     return out
+
+
+#: ``Step.s3_read``: the first read of the archived page fails with a
+#: transient error (``SlowDown``), the in-call retry reads it (#5012).
+S3_FLAKY = "flaky"
+#: ``Step.s3_read``: every read fails with a transient error
+#: (``ServiceUnavailable``), so the step's children fail closed (#5012).
+S3_DOWN = "down"
+#: The expected outcome of a ``presplit`` step whose page cannot be read.
+EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+
+
+def with_presplit_s3_faults(steps: list[Step], fault: str) -> list[Step]:
+    """*steps* with every ``presplit`` step's archived-page read given
+    *fault* (:data:`S3_FLAKY` / :data:`S3_DOWN`, #5012).  Opt-in, not
+    generated, so the generated seeds and the paths they pin are unchanged."""
+    return [replace(s, s3_read=fault) if s.kind == "presplit" else s for s in steps]
 
 
 # ---------------------------------------------------------------------------
@@ -1437,6 +1466,10 @@ class KeyHarness:
         #: The archived raw object of each S3 key, which the worker's S3
         #: client returns (a pre-split child's page, #4976).
         self.raw_objects: dict[str, bytes] = {}
+        #: The S3 read fault of the running ``presplit`` step
+        #: (``Step.s3_read``, #5012), and whether its one flaky read failed.
+        self._s3_fault = ""
+        self._s3_flaked = False
         #: The run's county extraction config and env shape (#4968).
         self.profile = profile
         self.env = env
@@ -1536,9 +1569,19 @@ class KeyHarness:
         worker._fetch_raw_pdf_from_s3 = lambda *_a, **_k: b"%PDF-1.4 harness"  # type: ignore[method-assign]
 
         def get_object(*, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803 — boto3's names
+            from botocore.exceptions import ClientError
+
+            # A pre-split step's S3 fault (``Step.s3_read``, #5012).
+            if self._s3_fault == S3_DOWN or (self._s3_fault == S3_FLAKY and not self._s3_flaked):
+                self._s3_flaked = True
+                self.events[f"harness.s3_fault.{self._s3_fault}"] += 1
+                code = "ServiceUnavailable" if self._s3_fault == S3_DOWN else "SlowDown"
+                raise ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
             return {"Body": io.BytesIO(self.raw_objects[Key])}
 
         worker._s3_client.get_object.side_effect = get_object
+        # The read's transient retries, without the waits.
+        worker._PAGE_READ_RETRY_DELAYS_S = (0.0, 0.0, 0.0)
         worker._validation_enabled = False
         worker._formatting_enabled = False
         worker._summarization_enabled = False
@@ -1585,6 +1628,8 @@ class KeyHarness:
         # key; the harness gives one key new bytes each step.
         self.raw_objects[key.s3_key] = step.doc.encode()
         self.worker._page_text_cache.clear()
+        self._s3_fault = step.s3_read
+        self._s3_flaked = False
         events = []
         for position, ruling in enumerate(rulings):
             event = self._event(key, "live")
@@ -1663,7 +1708,12 @@ class KeyHarness:
         # An exhausted enrichment raises on every step kind: a live worker
         # retries the message, a reingest counts the key failed (#5035).
         expect_failed = expect_failed or outcome == "exhausted"
-        if outcome == "exhausted":
+        # An unreadable pre-split page fails closed: the child raises and
+        # writes nothing (#5012).
+        expect_failed = expect_failed or outcome == EVIDENCE_UNAVAILABLE
+        if outcome == EVIDENCE_UNAVAILABLE:
+            expected_error = "PreSplitEvidenceUnavailableError"
+        elif outcome == "exhausted":
             expected_error = "LlmEnrichmentExhaustedError"
         elif unavailable:
             expected_error = "ExtractorUnavailableError"
@@ -1703,6 +1753,7 @@ class KeyHarness:
         finally:
             self.extractor.fail_mode = ""
             self.extractor.broken = set()
+            self._s3_fault = ""
             try:
                 self.real.rollback()
             except Exception:  # noqa: BLE001
@@ -1754,7 +1805,7 @@ class KeyHarness:
                 # An exhausted enrichment is no failed extraction: its raise
                 # (``reported_failed``) shows the step took its branch.  A
                 # refused empty split set logged its own event (#5057).
-                not_logged and outcome not in ("exhausted", "rejected"),
+                not_logged and outcome not in ("exhausted", "rejected", EVIDENCE_UNAVAILABLE),
             )
         if step.kind == "presplit":
             # One event per ruling, each blind to its siblings (see the
@@ -1942,6 +1993,13 @@ class KeyHarness:
 
     def _check_reported(self, step: Step, outcome: str) -> None:
         """Called when an incomplete extraction raised nothing."""
+        if outcome == EVIDENCE_UNAVAILABLE:
+            self._fail(
+                "failed_manifest",
+                "a pre-split child whose archived page could not be read raised no "
+                "PreSplitEvidenceUnavailableError, so its LLM case number went on "
+                "without evidence (#5012)",
+            )
         if outcome == "exhausted":
             self._fail(
                 "failed_manifest",
@@ -1990,6 +2048,9 @@ class KeyHarness:
         if step.kind == "db" and not has_rows:
             return "skipped"
         if step.kind == "presplit":
+            if step.s3_read == S3_DOWN and any(r.ruling_text for r in extracted_rulings(step)):
+                # The archived page cannot be read: no child is written (#5012).
+                return EVIDENCE_UNAVAILABLE
             return "ok"  # the scraper extracted the fields
         config = profile_config(step.profile)
         if config is not None and config.method == ExtractionMethod.NONE:
@@ -2949,7 +3010,7 @@ def run_steps(
         # The convergence checks extract the final bytes healthily: a failed
         # extraction's result is no result (#4968).
         last = steps[-1]
-        final = replace(last, fail_mode="", fail=False)
+        final = replace(last, fail_mode="", fail=False, s3_read="")
         no_rows = not read_key(harness.checker, key.s3_key)
         if final.kind in ("live", "presplit") or (final.kind == "db" and no_rows) or final != last:
             # A live write keeps an established case link (preserve-first,

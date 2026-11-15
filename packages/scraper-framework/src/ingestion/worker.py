@@ -41,7 +41,7 @@ from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import psycopg
 import psycopg.errors
@@ -62,6 +62,7 @@ from framework.search.ruling_doc import (
     load_search_events,
     reindex_dependent_rulings,
 )
+from framework.storage import is_transient_archive_error
 from validation.deterministic import (
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
@@ -137,6 +138,7 @@ from .extract import (
 from .ingest_incomplete import (
     INCOMPLETE_ALL_CHILDREN_REJECTED,
     INCOMPLETE_DEAD_LETTER,
+    INCOMPLETE_EVIDENCE_UNAVAILABLE,
     INCOMPLETE_EXHAUSTED_CHILD,
     INCOMPLETE_PARTIAL_SPLIT,
     INCOMPLETE_REINGEST_FAILED,
@@ -384,6 +386,32 @@ class CcPortalEnvelopeError(SplitExtractionFailedError):
     """
 
 
+class PreSplitEvidenceUnavailableError(SplitExtractionFailedError):
+    """A scraper pre-split child whose archived page could not be read
+    (#5012).
+
+    The page is the only evidence for the child's LLM case number
+    (``_with_pre_split_evidence``, #4976).  Before, a failed read left the
+    event without ``CASE_NUMBER_EVIDENCE_KEY``, so the gate took the LLM's
+    number as a scraper's and trusted it.  Now nothing is written for the
+    event (fail closed).
+
+    ``permanent`` is True when a retry cannot succeed (a missing key or
+    bucket, access denied): the key is recorded ``evidence_unavailable`` in
+    ``telemetry.ingest_incomplete`` and a live worker acknowledges the
+    message at once, so the raw-key reconciler retries the key, under its
+    attempt cap, once the cause is fixed.  A transient error (throttling,
+    S3 5xx, a timeout) was already retried within the read: a live worker
+    retries the message, and dead-letters it (recorded ``dead_letter``) if
+    the read keeps failing; a split-set replacement (reingest / rebuild)
+    records ``evidence_unavailable`` and counts the key failed.
+    """
+
+    def __init__(self, message: str, *, permanent: bool) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+
+
 #: Environment variable naming the worker's extraction mode (#4953).
 EXTRACTION_MODE_ENV = "JUDGEMIND_EXTRACTION"
 #: The default mode, and the one every deployed process (the ECS worker, the
@@ -607,8 +635,10 @@ def _case_number_evidence(event_data: dict[str, Any], ruling_text: str | None) -
       does a scraper's pre-split child whose fields the scraper filled
       with an LLM (``extra["_llm_extracted"]``): the worker reads its
       archived page (``_with_pre_split_evidence``, #4976).
-    - Such a pre-split child whose page could not be read has none: its
-      text is the LLM's transcription.
+    - Such a pre-split child whose page has no text (no key, a textless
+      format) carries empty evidence; one whose page cannot be read is
+      never written (#5012).  Without the key it still has none: its text
+      is the LLM's transcription.
     - Any other split child (a deterministic splitter's, a scraper's
       pre-split child) is checked against its own text, at any length.
     - A whole document is checked against its extracted text and link text,
@@ -2601,8 +2631,26 @@ class IngestionWorker:
         live capture and a reingest of one key judge it the same way.
 
         A page with too little text (a scanned PDF) gives no evidence, so
-        the number stays (#4927).  A page that cannot be read leaves the
-        event unchanged.  Any other event is returned unchanged.
+        the number stays (#4927).  So does a child with no archived key, or
+        a page in a format with no text: the child gets empty evidence, so
+        its number is the LLM's, judged like a scanned page's, never a
+        scraper's trusted one.
+
+        A page that cannot be read fails closed (#5012): nothing is written
+        for the event and ``PreSplitEvidenceUnavailableError`` is raised.
+        Before, the event went on unchanged, so the gate trusted the LLM's
+        number (``trusted = CASE_NUMBER_EVIDENCE_KEY not in event_data``).
+        Writing the child with empty evidence instead would keep the number
+        unchecked too, when a retry once S3 answers would check it.
+        Transient read errors are retried within the read
+        (``_read_archived_page``).  A permanent one (a missing key, access
+        denied), and any read error on a split-set replacement, records the
+        key ``evidence_unavailable`` in ``telemetry.ingest_incomplete``, so
+        the raw-key reconciler retries it; a live capture's transient
+        failure is retried with the message instead (dead-lettered, and
+        recorded ``dead_letter``, if it keeps failing).
+
+        Any other event is returned unchanged.
         """
         extra = event_data.get("extra")
         if (
@@ -2615,7 +2663,7 @@ class IngestionWorker:
             return event_data
         page = self._archived_page_text(event_data)
         if page is None:
-            return event_data
+            return {**event_data, CASE_NUMBER_EVIDENCE_KEY: ()}
         single = int(event_data.get("_split_count") or 1) == 1
         evidence = document_evidence(page, extra.get("link_text") if single else None)
         return {**event_data, CASE_NUMBER_EVIDENCE_KEY: evidence}
@@ -2626,24 +2674,26 @@ class IngestionWorker:
         (``reingest_from_s3._build_prefix_event``), a PDF's text layer
         (``extract_pdf_text``, as ``_process_event_timed`` extracts the
         reingest event's bytes; ``""`` for a scanned PDF, whose OCR text is
-        no evidence, #4986).  ``None`` when there is no key, the read fails
-        or the format has no text.  Cached per key."""
+        no evidence, #4986, and for a PDF whose text cannot be extracted).
+        ``None`` when there is no key or the format has no text.  Raises
+        ``PreSplitEvidenceUnavailableError`` when the object cannot be read
+        (#5012).  Cached per key."""
         s3_key = event_data.get("s3_key")
-        if not s3_key:
+        content_format = event_content_format(event_data)
+        if not s3_key or content_format not in (
+            ContentFormat.HTML,
+            ContentFormat.TEXT,
+            ContentFormat.PDF,
+        ):
             return None
         bucket = event_data.get("s3_bucket") or self._archive_bucket
         cache_key = (str(bucket), str(s3_key))
         if cache_key in self._page_text_cache:
             return self._page_text_cache[cache_key]
-        content_format = event_content_format(event_data)
-        text: str | None = None
+        raw = self._read_archived_page(event_data, str(bucket), str(s3_key))
+        text = ""
         try:
-            raw = self._s3_client.get_object(Bucket=bucket, Key=s3_key)["Body"].read()
-            if not isinstance(raw, bytes):
-                raise TypeError(f"S3 body is {type(raw).__name__}, not bytes")
-            if content_format in (ContentFormat.HTML, ContentFormat.TEXT):
-                text = raw.decode("utf-8", errors="replace")
-            elif content_format is ContentFormat.PDF:
+            if content_format is ContentFormat.PDF:
                 # The text layer only: OCR text is never evidence (#4986),
                 # so a scanned page gives none, as the reingest's OCR'd
                 # text of the same key does.
@@ -2651,20 +2701,108 @@ class IngestionWorker:
                 # A text layer missing scanned pages cannot refute a number
                 # printed on them (#5010).
                 text = layer.text if layer is not None and layer.incomplete is None else ""
-        except Exception as exc:
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 — the same bytes fail every time
+            # The page was read but its text cannot be extracted (a corrupt
+            # PDF): no evidence, as for a scanned page.
             logger.warning(
-                "Failed to read a pre-split child's archived page",
+                "Failed to extract a pre-split child's archived page text",
                 extra={
                     "document_id": event_data.get("document_id"),
                     "s3_key": s3_key,
-                    "error": str(exc),
+                    "error": f"{type(exc).__name__}: {exc}",
                 },
             )
-            return None
         if len(self._page_text_cache) >= 8:
             self._page_text_cache.pop(next(iter(self._page_text_cache)))
         self._page_text_cache[cache_key] = text
         return text
+
+    #: Seconds slept before each retry of a transient archived-page read
+    #: error (#5012): three retries after the first attempt.
+    _PAGE_READ_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+    def _read_archived_page(self, event_data: dict[str, Any], bucket: str, s3_key: str) -> bytes:
+        """Read a pre-split child's archived page from S3 (#5012).
+
+        Transient errors (``is_transient_archive_error``: throttling, S3
+        5xx, connection drops, timeouts) are retried after the delays in
+        ``_PAGE_READ_RETRY_DELAYS_S``.  Any other error (a missing key or
+        bucket, access denied, a body that is not bytes) is permanent.  A
+        read that still fails raises ``PreSplitEvidenceUnavailableError``;
+        a permanent failure, and any failure on a split-set replacement,
+        first records the key ``evidence_unavailable``.
+        """
+        delays = self._PAGE_READ_RETRY_DELAYS_S
+        attempt = 0
+        while True:
+            try:
+                raw = self._s3_client.get_object(Bucket=bucket, Key=s3_key)["Body"].read()
+                if not isinstance(raw, bytes):
+                    raise TypeError(f"S3 body is {type(raw).__name__}, not bytes")
+                if attempt:
+                    logger.info(
+                        "Read a pre-split child's archived page after a retry",
+                        extra={
+                            "document_id": event_data.get("document_id"),
+                            "s3_key": s3_key,
+                            "attempts": attempt + 1,
+                            "telemetry_event": "pre_split_evidence_read_retried",
+                        },
+                    )
+                return raw
+            except Exception as exc:
+                transient = is_transient_archive_error(exc)
+                if transient and attempt < len(delays):
+                    time.sleep(delays[attempt])
+                    attempt += 1
+                    continue
+                self._refuse_unreadable_page(
+                    event_data, s3_key, exc, transient=transient, attempts=attempt + 1
+                )
+
+    def _refuse_unreadable_page(
+        self,
+        event_data: dict[str, Any],
+        s3_key: str,
+        exc: Exception,
+        *,
+        transient: bool,
+        attempts: int,
+    ) -> NoReturn:
+        """Fail a pre-split child whose page could not be read (#5012)."""
+        error = f"{type(exc).__name__}: {exc}"[:500]
+        replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
+        record = not transient or replace_set
+        logger.warning(
+            "Could not read a pre-split child's archived page — nothing written: "
+            "its LLM case number has no evidence",
+            extra={
+                "document_id": event_data.get("document_id"),
+                "s3_key": s3_key,
+                "error": error,
+                "transient": transient,
+                "attempts": attempts,
+                "action": "recorded" if record else "retry",
+                "telemetry_event": "pre_split_evidence_unavailable",
+            },
+        )
+        if record:
+            self._record_incomplete_and_commit(
+                event_data,
+                INCOMPLETE_EVIDENCE_UNAVAILABLE,
+                {
+                    "error": error,
+                    "transient": transient,
+                    "attempts": attempts,
+                    "replace_set": replace_set,
+                },
+                rollback_first=True,
+            )
+        raise PreSplitEvidenceUnavailableError(
+            f"{s3_key}: archived page unreadable ({error})", permanent=not transient
+        ) from exc
 
     def _unwrap_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
         """Resolve a CC portal JSON envelope into ruling text and fields (#4753).
@@ -7569,6 +7707,19 @@ class IngestionWorker:
                         exc,
                     )
                     self._record_dead_letter(event_data, exc, attempts=attempt + 1)
+                    self._ack(msg_id)
+                    return
+                if isinstance(exc, PreSplitEvidenceUnavailableError) and exc.permanent:
+                    # The page cannot be read however often the message is
+                    # retried; its key is already recorded
+                    # ``evidence_unavailable`` for the raw-key reconciler,
+                    # which a dead-letter record would overwrite (#5012).
+                    logger.error(
+                        "Pre-split child's archived page is unreadable — message %s "
+                        "acknowledged unwritten (no retry): %s",
+                        msg_id,
+                        exc,
+                    )
                     self._ack(msg_id)
                     return
                 attempt += 1

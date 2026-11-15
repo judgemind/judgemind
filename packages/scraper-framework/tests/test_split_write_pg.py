@@ -670,9 +670,13 @@ def presplit() -> Iterator[Any]:
         summary = summaries.pop(0) if summaries else None
         return summary, ("stub-model" if summary else None)
 
+    key = split_harness.make_key(f"presplit-{tag}")
+    # The archived page: too short to settle a number unless a test sets
+    # its own.  A page that cannot be read fails closed (#5012).
+    h.raw_objects[key.s3_key] = b"Page 1 of 2"
     try:
         with patch("ingestion.worker.summarize_ruling", side_effect=summarize):
-            yield h, split_harness.make_key(f"presplit-{tag}"), summaries
+            yield h, key, summaries
     finally:
         h.close()
 
@@ -862,12 +866,59 @@ def test_presplit_scanned_page_keeps_the_llm_number(presplit: Any) -> None:
     assert first is not None and first["case_number"] == "2025-00912345"
 
 
-def test_presplit_unreadable_page_keeps_the_llm_number(presplit: Any) -> None:
-    """#4976: when the archived page cannot be read, the capture is still
-    written, with no evidence (the #4927 rule for a page without text)."""
+def _s3_error(code: str) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
+
+
+def _incomplete_reason(h: Any, s3_key: str) -> str | None:
+    with h.checker.cursor() as cur:
+        cur.execute("SELECT reason FROM telemetry.ingest_incomplete WHERE s3_key = %s", (s3_key,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def test_presplit_unreadable_page_writes_nothing_and_records_the_key(presplit: Any) -> None:
+    """#5012: a page that cannot be read fails closed.
+
+    Before, the child went on without ``CASE_NUMBER_EVIDENCE_KEY``, so the
+    gate trusted the LLM's number (``2025-00912345`` was written as is).
+    Now nothing is written, and a permanent error (``NoSuchKey``) records
+    the key ``evidence_unavailable`` for the raw-key reconciler.
+    """
+    from ingestion.worker import PreSplitEvidenceUnavailableError
+
     h, key, _summaries = presplit
+    h.worker._s3_client.get_object.side_effect = _s3_error("NoSuchKey")
+
+    with pytest.raises(PreSplitEvidenceUnavailableError) as raised:
+        _capture_presplit(h, key, "2025-00912345")
+
+    assert raised.value.permanent is True
+    assert _slot_ruling(h, split_child_document_id(key.parent, 0, 2)) is None
+    assert _incomplete_reason(h, key.s3_key) == "evidence_unavailable"
+
+
+def test_presplit_page_read_after_a_transient_error_is_the_evidence(presplit: Any) -> None:
+    """#5012: a transient error (``SlowDown``) is retried within the read;
+    the page then refutes the invented number as usual, and nothing is
+    recorded."""
+    h, key, _summaries = presplit
+    h.raw_objects[key.s3_key] = _PAGE.encode()
+    serve = h.worker._s3_client.get_object.side_effect
+    failures = [_s3_error("SlowDown")]
+
+    def flaky(**kwargs: Any) -> dict[str, Any]:
+        if failures:
+            raise failures.pop()
+        return serve(**kwargs)
+
+    h.worker._s3_client.get_object.side_effect = flaky
 
     first, second = _capture_presplit(h, key, "2025-00912345")
 
-    assert first is not None and first["case_number"] == "2025-00912345"
+    assert first is not None and first["case_number"].startswith("UNKNOWN-")
     assert second is not None and second["case_number"] == _PRINTED_SECOND
+    assert h.worker._s3_client.get_object.call_count == 2
+    assert _incomplete_reason(h, key.s3_key) is None

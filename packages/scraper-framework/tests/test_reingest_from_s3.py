@@ -4833,6 +4833,11 @@ class TestPreSplitIdParity:
         multi-ruling split and no stale-child cleanup with it as parent."""
         event = self._pre_split_event(_llm_extracted=True, split_position=1, split_count=3)
         worker = _split_set_change_worker()
+        # The archived page the case-number evidence is read from (#4976);
+        # an unreadable one would refuse the child (#5012).
+        worker._s3_client.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=b"%PDF"))
+        }
         with patch.object(worker, "_llm_split_document") as mock_split:
             written, cleanups = _run_worker_capture([event], worker)
 
