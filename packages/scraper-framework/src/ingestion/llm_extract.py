@@ -32,7 +32,7 @@ from framework.llm_schema import (
     ConfidenceLevel,
     FieldConfidence,
 )
-from framework.llm_utils import parse_llm_json
+from framework.llm_utils import parse_llm_json, rulings_array_shape_error
 
 from .llm_providers import call_llm, call_llm_with_images, response_diagnostics
 
@@ -1566,11 +1566,21 @@ def _parse_response(
     raw_text: str,
     metadata: dict[str, str] | None,
 ) -> LLMExtractionResult | None:
-    """Parse the JSON response from the model into an ``LLMExtractionResult``."""
+    """Parse the JSON response from the model into an ``LLMExtractionResult``.
+
+    ``None`` (a failed chunk, never cached) when the response is not JSON or
+    has no valid ``rulings`` array (#5011, ``rulings_array_shape_error``);
+    an explicit ``"rulings": []`` is a valid answer.
+    """
     try:
         parsed = parse_llm_json(raw_text)
     except json.JSONDecodeError as exc:
         logger.warning("llm_extract.json_parse_error", error=str(exc), raw=raw_text[:200])
+        return None
+
+    shape_error = rulings_array_shape_error(parsed)
+    if shape_error is not None:
+        logger.warning("llm_extract.chunk_shape_error", shape=shape_error, raw=raw_text[:200])
         return None
 
     # Extract top-level fields — support both old field names (judge_name)
@@ -1591,16 +1601,9 @@ def _parse_response(
         if metadata.get("department"):
             department = metadata["department"]
 
-    # Parse rulings array
-    raw_rulings = parsed.get("rulings", [])
-    if not isinstance(raw_rulings, list):
-        raw_rulings = []
-
+    # Parse rulings array: a list of objects (``rulings_array_shape_error``).
     rulings: list[LLMRulingResult] = []
-    for r in raw_rulings:
-        if not isinstance(r, dict):
-            continue
-
+    for r in parsed["rulings"]:
         # Normalize case number — support both old and new field names
         case_number = r.get("extracted_case_number") or r.get("case_number")
         case_number_prefix: str | None = None

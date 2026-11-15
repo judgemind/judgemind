@@ -182,6 +182,10 @@ Extraction modes (#4968), from a fourth random stream (:func:`_with_extraction_m
   (``PartialExtractionError``).  That is no complete split, so it is
   checked like a failed one (``untouched``, ``failed_manifest``), except
   that a live capture of a new key writes the parts that answered;
+- a step can instead get a malformed LLM response (:data:`WRONG_SHAPE`,
+  #5011, from a sixth stream): the real ``LlmExtractor`` parses a
+  ``{"rulings": null}`` answer, which must fail the extraction, not pass
+  for a verdict of no rulings;
 - a whole-document step can have no text at all, so a multimodal county
   reaches ``zero_rulings_no_text`` and a text-first one has nothing to read.
 
@@ -550,6 +554,21 @@ PARTIAL = "partial"
 #: Whether generated seeds include :data:`PARTIAL` steps (#5000).
 PARTIAL_STEPS = True
 
+#: A malformed LLM response (#5011): the text extraction runs the real
+#: ``LlmExtractor`` against a model that answers ``{"rulings": null}`` (valid
+#: JSON, no rulings array), and the multimodal call fails.  The parser must
+#: count that a failed chunk, so the result is the ``all`` mode's: no
+#: complete extraction, never an empty one (before #5011 it passed for a
+#: verdict of no rulings, replacing a key's split with a whole document).
+#: Drawn from its own random stream (:func:`_with_wrong_shape_responses`).
+WRONG_SHAPE = "wrong_shape"
+
+#: The malformed response :data:`WRONG_SHAPE` steps get.
+WRONG_SHAPE_RESPONSE = '{"rulings": null}'
+
+#: Whether generated seeds include :data:`WRONG_SHAPE` steps (#5011).
+WRONG_SHAPE_STEPS = True
+
 #: Incomplete input (#5010): the step's PDF is a text page followed by a
 #: scanned (``blank_page``: image only, no text layer) page whose OCR call
 #: fails.  The extractors answer, but the text they would read lacks the
@@ -636,6 +655,26 @@ def _with_extraction_modes(seed: int, steps: list[Step]) -> list[Step]:
         )
     if PARTIAL_STEPS:
         out = _with_partial_failures(seed, out)
+    if WRONG_SHAPE_STEPS:
+        out = _with_wrong_shape_responses(seed, out)
+    return out
+
+
+def _with_wrong_shape_responses(seed: int, steps: list[Step]) -> list[Step]:
+    """Give some of *steps*' healthy extractions a malformed LLM response
+    (:data:`WRONG_SHAPE`).
+
+    A sixth random stream, one draw per step whatever the step, so a seed's
+    other streams are unchanged.  A whole document is eligible: a malformed
+    answer on its one chunk is the case #5011 found.  Not a pre-split step
+    (no extraction) nor an ``ExtractionMethod.NONE`` county's step.
+    """
+    rng = random.Random(f"{seed}:wrong_shape")
+    out = []
+    for step in steps:
+        draw = rng.random()
+        eligible = step.kind != "presplit" and not step.fail_mode and step.profile != "none"
+        out.append(replace(step, fail_mode=WRONG_SHAPE) if eligible and draw < 0.08 else step)
     return out
 
 
@@ -1085,7 +1124,9 @@ class FakeExtractor:
         #: ``harness.call.<extractor>.<ok|fail>`` counts (#4968).
         self.events: Counter[str] = events if events is not None else Counter()
 
-    def result(self, role: str) -> list[ExtractedRuling]:
+    def result(self, role: str, text: str | None = None, **kwargs: Any) -> list[ExtractedRuling]:
+        if self.fail_mode == WRONG_SHAPE and not self.failing and role != "multimodal":
+            return self._wrong_shape_result(role, text or "", **kwargs)
         if self.fail_mode == PARTIAL and not self.failing:
             # Every part but the last answered (#5000).
             from framework.llm_extractor import PartialExtractionError
@@ -1098,7 +1139,7 @@ class FakeExtractor:
                 failed_parts=[len(self.rulings) - 1],
             )
         fails = self.failing or self.fail_mode == "all"
-        if role == "multimodal" and self.fail_mode in FAIL_MODES:
+        if role == "multimodal" and self.fail_mode in (*FAIL_MODES, WRONG_SHAPE):
             fails = True
         self.events[f"harness.call.{role}.{'fail' if fails else 'ok'}"] += 1
         if fails:
@@ -1106,6 +1147,33 @@ class FakeExtractor:
 
             raise ExtractionIncompleteError(f"harness: every {role} API call failed")
         return [r.model_copy() for r in self.rulings]
+
+    def _wrong_shape_result(self, role: str, text: str, **kwargs: Any) -> list[ExtractedRuling]:
+        """The real ``LlmExtractor.extract`` on *text*, called as the worker
+        called it (*kwargs*), against a model answering
+        :data:`WRONG_SHAPE_RESPONSE` (#5011).  Whatever it returns or raises
+        is the worker's to handle: a parser that took the answer for "no
+        rulings" returns ``[]`` here, which the harness then sees replace
+        the key's rows."""
+        from framework.llm_extractor import ExtractionIncompleteError, LlmExtractor
+        from ingestion.llm_providers import LLMResponse
+
+        response = LLMResponse(
+            text=WRONG_SHAPE_RESPONSE, input_tokens=1, output_tokens=1, finish_reason="STOP"
+        )
+        with (
+            patch("framework.llm_extractor._create_google_client", return_value=MagicMock()),
+            patch("ingestion.llm_providers.call_llm", return_value=response),
+        ):
+            real = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+            real._cache = None
+            try:
+                rulings = real.extract(text, **kwargs)
+            except ExtractionIncompleteError:
+                self.events[f"harness.call.{role}.wrong_shape_failed"] += 1
+                raise
+        self.events[f"harness.call.{role}.wrong_shape_returned"] += 1
+        return rulings
 
 
 class _RoutedExtractor:
@@ -1119,8 +1187,8 @@ class _RoutedExtractor:
     def extract_from_pdf(self, _pdf: bytes, **_kwargs: Any) -> list[ExtractedRuling]:
         return self._fake.result("multimodal")
 
-    def extract(self, _text: str, **_kwargs: Any) -> list[ExtractedRuling]:
-        return self._fake.result(self.role)
+    def extract(self, text: str, **kwargs: Any) -> list[ExtractedRuling]:
+        return self._fake.result(self.role, text, **kwargs)
 
 
 #: The worker method building an extractor, and the extractor it builds.
@@ -1886,15 +1954,16 @@ class KeyHarness:
             if mode == PARTIAL:
                 # No text fallback after a partial page split (#5000).
                 return "failed"
-            if mode not in FAIL_MODES:
+            if mode not in (*FAIL_MODES, WRONG_SHAPE):
                 return "ok"
         if not self._step_doc(step):
             return "failed"  # no text to fall back on, or to read at all
         needed = "county" if config is not None and config.provider else "framework"
         if all_missing or mode == f"{needed}_missing":
             return "unavailable"
-        # Incomplete input: the text lacks a scanned page (#5010).
-        return "failed" if mode in ("all", PARTIAL, INCOMPLETE_INPUT) else "ok"
+        # Incomplete input: the text lacks a scanned page (#5010).  A
+        # malformed response is a failed chunk, not "no rulings" (#5011).
+        return "failed" if mode in ("all", PARTIAL, INCOMPLETE_INPUT, WRONG_SHAPE) else "ok"
 
     def _unextractable(self, step: Step) -> bool:
         """A text-first county's step with no text: no extractor can run,
@@ -3283,6 +3352,40 @@ def run_incomplete_input(
         ops=("blank_page",),
     )
     return run_steps(dsn, [*steps, blank], run_token, seed=seed, name=name)
+
+
+def run_wrong_shape(
+    dsn: str,
+    seed: int,
+    run_token: str,
+    *,
+    kind: str,
+    whole: bool = False,
+    name: str = "wrong_shape",
+) -> Counter[str]:
+    """A malformed LLM response (:data:`WRONG_SHAPE`, #5011) on *seed*'s key.
+
+    *seed*'s history runs, then a step of *kind* (``reingest`` or ``live``)
+    in a text-first county whose model answers ``{"rulings": null}``, parsed
+    by the real ``LlmExtractor``.  *whole*: the step's document is one
+    chunk whose extraction would be the whole document (the case where the
+    empty answer replaced the key's split before #5011).  The step must
+    leave the key's rows and search docs as they were (``untouched``), and
+    a reingest must report the key (``failed_manifest``).  Returns the
+    run's event counts.
+    """
+    steps = generate(seed, extraction_modes=False)
+    last = steps[-1]
+    wrong = replace(
+        last,
+        kind=kind,
+        fail_mode=WRONG_SHAPE,
+        whole=whole,
+        profile="llm_county",
+        doc=last.doc or _BLANK_PAGE_TEXT_LAYER,
+        ops=("wrong_shape",),
+    )
+    return run_steps(dsn, [*steps, wrong], run_token, seed=seed, name=name)
 
 
 # ---------------------------------------------------------------------------

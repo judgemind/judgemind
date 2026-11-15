@@ -52,6 +52,14 @@ The document-level entry is written only when **every** page is `ok` and the joi
 
 Each PDF extraction logs `llm_extractor.pdf_pages_summary` with `total_pages`, `page_cache_hits`, `llm_pages` and `failed_pages`. Use it to see why a document missed the document-level cache. `llm_extractor.page_parse_retry` and `llm_extractor.page_parse_exhausted` record the JSON retry. `llm_extractor.page_shape_error` (with a `shape` field) records a valid-JSON response of the wrong shape, and `llm_extractor.page_parse_exception` records a parser exception (`source` is `llm` or `cache`).
 
+### Wrong-shape text responses (#5011)
+
+A text chunk's answer (`LlmExtractor.extract`, and `extract_fields_llm`) is valid only when it is a JSON object whose `rulings` is a list of objects (`framework.llm_utils.rulings_array_shape_error`). Anything else is a **failed chunk**, exactly like an unparseable or cut-off one: a top-level array or scalar, a missing or misnamed `rulings` key, `rulings` that is null or not a list, or any item that is not an object. The chunk is retried in halves; if it still fails, the result is never cached and under `strict=True` it raises `ExtractionIncompleteError` (single chunk) or `PartialExtractionError` (some chunks answered), so the worker leaves the key's rows alone and records `reingest_failed`. Before #5011 these shapes parsed as a successful chunk with zero rulings: a multi-chunk document lost that chunk's rulings and was cached as complete, and a single-chunk document passed for a verdict of no rulings, which on reingest replaced the key's split with one whole-document row. Each is logged as `llm_extractor.chunk_shape_error` / `llm_extract.chunk_shape_error` with a `shape` field.
+
+Unlike the page path, a text `rulings` array that mixes objects with junk fails the chunk: a garbled item may be a lost ruling, and a text chunk carries many rulings, so it is retried rather than returned as complete.
+
+An explicit `{"rulings": []}` stays a valid chunk with no rulings, even when the chunk's text looks like it holds rulings. An empty answer is the extractor's verdict (#4940), and no-ruling calendars (continuance lists, "no tentative rulings" notices) print case numbers too, so treating `[]` as suspect would retry them forever.
+
 ## What re-runs on cache hit and what does NOT
 
 Since #2513, cache hits are **not a raw replay** of the stored value. Two helpers re-apply the post-processing filters that operate purely on the final `ExtractedRuling[]` list before returning to the caller:

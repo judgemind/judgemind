@@ -44,6 +44,36 @@ def strip_llm_json_fences(text: str) -> str:
     return cleaned
 
 
+def rulings_array_shape_error(parsed: Any) -> str | None:
+    """Why a parsed text-extraction response has no valid ``rulings`` array,
+    or ``None`` when it has one (#5011).
+
+    Every text-extraction prompt answers ``{"rulings": [ ... ], ...}``.  A
+    response is only a valid answer when ``rulings`` is present and a list of
+    objects.  An explicit empty list ``[]`` is valid: the model read the
+    chunk and found no rulings.  Anything else is a failed chunk, never an
+    empty one: the top level is not an object, ``rulings`` is missing, null
+    or not a list, or an item of it is not an object (a garbled item may be
+    a ruling the model lost, so the chunk is retried instead of returning
+    the rest as complete).  Before #5011 each of these shapes became a
+    successful result with zero rulings, which was cached (a later call
+    returned the same empty answer) and, for a single-chunk document, passed
+    for a verdict that the document holds no rulings.
+
+    The shape names match the page path's ``page_shape_error`` (#4738).
+    """
+    if not isinstance(parsed, dict):
+        return "scalar" if not isinstance(parsed, list) else "top_level_list"
+    if "rulings" not in parsed:
+        return "missing_rulings_key"
+    raw = parsed["rulings"]
+    if not isinstance(raw, list):
+        return f"rulings_{type(raw).__name__}"
+    if any(not isinstance(item, dict) for item in raw):
+        return "non_object_ruling"
+    return None
+
+
 def parse_llm_json(text: str) -> Any:
     """Strip markdown code fences and parse the result as JSON (relaxed mode).
 

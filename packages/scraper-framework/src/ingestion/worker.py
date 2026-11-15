@@ -322,6 +322,14 @@ class NoExtractableTextError(SplitExtractionFailedError):
     """
 
 
+class CcPortalEnvelopeError(SplitExtractionFailedError):
+    """A CC portal envelope event whose envelope could not be unwrapped
+    (#5011): malformed envelope text, an unreadable archived envelope, or an
+    error while unwrapping.  Nothing is written for the event: the envelope
+    JSON is never ruling text.  See ``_unwrap_cc_portal_envelope``.
+    """
+
+
 #: Environment variable naming the worker's extraction mode (#4953).
 EXTRACTION_MODE_ENV = "JUDGEMIND_EXTRACTION"
 #: The default mode, and the one every deployed process (the ECS worker, the
@@ -2544,21 +2552,50 @@ class IngestionWorker:
         the multimodal splitter and store every other case's ruling here.
 
         Returns ``event_data`` unchanged (the same object) for every other
-        event, and when unwrapping raises (malformed envelope), so the event
-        still goes through the normal path instead of being dropped.
+        event.
+
+        An envelope that cannot be unwrapped is a failed extraction, never
+        ruling text (#5011): unwrapping raised, the event text is shaped
+        like an envelope that does not load (truncated, not JSON, missing
+        ``row`` / ``detail_html_b64``), or a PDF-only ruling's archived
+        envelope cannot be read.  Before, the event went on as-is, so a
+        rebuild or reingest extracted the raw envelope JSON (about 1 MB of
+        base64) as if it were the ruling.  Now nothing is written for the
+        event and ``CcPortalEnvelopeError`` is raised: on a split-set
+        replacement (reingest / rebuild) the key's rows are left as they are
+        and recorded ``reingest_failed`` in ``telemetry.ingest_incomplete``
+        (#5008), and the reingest counts the key failed; a live capture is
+        retried, and dead-lettered (recorded ``dead_letter``) if it keeps
+        failing.
         """
         try:
             return self._resolve_cc_portal_envelope(event_data)
         except Exception as exc:
+            reason = f"CC portal envelope unwrap failed: {type(exc).__name__}: {exc}"[:500]
+            replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
+            s3_key = event_data.get("s3_key")
             logger.warning(
-                "CC portal envelope unwrap failed — processing the event as-is",
+                "CC portal envelope unwrap failed — the event is a failed extraction",
                 extra={
                     "document_id": event_data.get("document_id"),
+                    "s3_key": s3_key,
                     "error": f"{type(exc).__name__}: {exc}",
+                    "action": "reported_failed" if replace_set else "retry",
                     "telemetry_event": "cc_portal_envelope_unwrap_failed",
                 },
             )
-            return event_data
+            if replace_set:
+                # The key's rows stay as they were: record it durably so the
+                # raw-key reconciler retries the key (#5008).
+                self._record_incomplete_and_commit(
+                    event_data,
+                    INCOMPLETE_REINGEST_FAILED,
+                    {"error": reason},
+                    rollback_first=True,
+                )
+            raise CcPortalEnvelopeError(
+                f"{s3_key or event_data.get('document_id')}: {reason}"
+            ) from exc
 
     def _resolve_cc_portal_envelope(self, event_data: dict[str, Any]) -> dict[str, Any]:
         """Body of :meth:`_unwrap_cc_portal_envelope` (which adds the error guard)."""
@@ -2574,6 +2611,9 @@ class IngestionWorker:
         updates: dict[str, Any] = {}
 
         envelope = portal.load_envelope(ruling_text) if ruling_text else None
+        if envelope is None and portal.looks_like_envelope(ruling_text):
+            # An envelope that does not load is not ruling text (#5011).
+            raise ValueError("event text is a malformed CC portal envelope")
         if envelope is not None:
             # rebuild / prefix reingest: the event text IS the envelope.
             fields = portal.envelope_fields(envelope)
@@ -2598,14 +2638,16 @@ class IngestionWorker:
             envelope = portal.load_envelope(raw)
             if envelope is None:
                 logger.warning(
-                    "CC portal envelope could not be read — PDF-only ruling left untranscribed",
+                    "CC portal envelope could not be read — PDF-only ruling not transcribed",
                     extra={
                         "document_id": document_id,
                         "s3_key": event_data.get("s3_key"),
                         "telemetry_event": "cc_portal_envelope_unreadable",
                     },
                 )
-                return event_data
+                # The ruling is only in the envelope's PDF: without it the
+                # event has no ruling text, a failed extraction (#5011).
+                raise ValueError("archived CC portal envelope is missing or unreadable")
 
         pdf_texts: list[PdfText] = []
 

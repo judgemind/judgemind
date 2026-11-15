@@ -496,7 +496,8 @@ class TestParseResponse:
         assert result is not None
         assert result.hearing_date is None
 
-    def test_rulings_not_a_list_handled(self) -> None:
+    def test_rulings_not_a_list_is_failed_chunk(self) -> None:
+        """#5011: a wrong-shape `rulings` is a failed chunk, never empty."""
         response_json = json.dumps(
             {
                 "judge_name": None,
@@ -506,9 +507,7 @@ class TestParseResponse:
             }
         )
         result = _parse_response(response_json, None)
-        assert result is not None
-        assert result.rulings == []
-        assert result.case_count == 0
+        assert result is None
 
     def test_long_party_name_discarded(self) -> None:
         """Party names > 200 chars are discarded as garbage."""
