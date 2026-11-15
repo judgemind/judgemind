@@ -3226,6 +3226,125 @@ class TestUnextractableKeyIsNotRetried:
         assert (body.decode() if isinstance(body, bytes) else body) == other + "\n"
 
 
+class TestAllChildrenRejectedKeyIsCounted:
+    """A key whose split rejected every child keeps its rulings (the worker
+    raises ``AllChildrenRejectedError``, #5057): the reingest counts it
+    failed, lists it in the retry manifest, and reports how many keys kept
+    their rulings this way in ``rows_kept_all_rejected``."""
+
+    _CONTENT = b"%PDF-1.4 every child rejected"
+
+    def _key(self) -> str:
+        return f"ca/orange/superior_court/raw/{hashlib.sha256(self._CONTENT).hexdigest()}.pdf"
+
+    def _process(self, *, allow_ruling_removal: bool = False) -> tuple[dict[str, Any], MagicMock]:
+        from ingestion.worker import AllChildrenRejectedError
+
+        worker = MagicMock()
+        worker.process_event.side_effect = AllChildrenRejectedError("every child was rejected")
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = self._CONTENT
+        mock_s3.get_object.return_value = {"Body": body}
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+        try:
+            with (
+                patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+                patch("ingestion.worker.IngestionWorker", return_value=worker),
+                patch("redis.Redis.from_url", return_value=MagicMock()),
+            ):
+                result = reingest._process_prefix_document(
+                    self._key(),
+                    "test-bucket",
+                    "postgresql://test",
+                    "redis://localhost:6379",
+                    "",
+                    False,
+                    allow_ruling_removal,
+                )
+        finally:
+            if hasattr(reingest._process_prefix_document, "_worker"):
+                delattr(reingest._process_prefix_document, "_worker")
+        return result, worker
+
+    def test_all_rejected_key_is_an_error_that_kept_its_rulings(self) -> None:
+        result, worker = self._process()
+        assert result["status"] == "error"
+        assert result["error_class"] == "AllChildrenRejectedError"
+        assert result["rows_kept_all_rejected"] is True
+        (event,) = worker.process_event.call_args.args
+        assert "_allow_ruling_removal" not in event
+
+    def test_allow_ruling_removal_reaches_the_event(self) -> None:
+        _result, worker = self._process(allow_ruling_removal=True)
+        (event,) = worker.process_event.call_args.args
+        assert event["_allow_ruling_removal"] is True
+
+    def test_allow_ruling_removal_flag_parses(self) -> None:
+        parser = reingest._build_parser()
+        assert parser.parse_args(["--allow-ruling-removal"]).allow_ruling_removal is True
+        assert parser.parse_args([]).allow_ruling_removal is False
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_reingest_all_rejected_keeps_count_in_summary(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        result, _ = self._process()
+        failed = {"status": "error", "hash_mismatch": False, "error_class": "ValueError"}
+        other = "ca/orange/superior_court/raw/" + "0" * 64 + ".pdf"
+        mock_list.return_value = [self._key(), other]
+        mock_discover.return_value = []
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+        s3_client = MagicMock()
+        mock_boto3.client.return_value = s3_client
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+        futures = [MagicMock(), MagicMock()]
+        futures[0].result.return_value = result
+        futures[1].result.return_value = failed
+        pool.submit.side_effect = futures
+
+        with patch("reingest_from_s3.as_completed", return_value=futures):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="ca/orange/",
+                concurrency=1,
+                skip_judge_prepass=True,
+                allow_ruling_removal=True,
+                write_failed_manifest="s3://manifest-bucket/failed/keys.txt",
+            )
+
+        assert stats["rows_kept_all_rejected"] == 1
+        assert stats["rows_kept_all_rejected_keys"] == [self._key()]
+        assert stats["errors"] == 2
+        assert sorted(stats["failed_keys"]) == sorted([self._key(), other])
+        # The flag reaches every key's worker call.
+        assert all(c.args[-1] is True for c in pool.submit.call_args_list)
+
+
 class TestPrefixPartialFailureStats:
     """run_reingest_from_prefix surfaces error_ratio / top class / failed_keys
     and writes the failed-keys manifest (#4619)."""
@@ -4183,6 +4302,149 @@ class TestSplitSetChange:
 
         assert "every child was rejected" in caplog.text
         worker._indexer.delete_documents.assert_called_once_with(["stale-1"])
+
+    def _rejected_batch(self, parent_id: str) -> Any:
+        from ingestion.worker import _SplitBatch
+
+        batch = _SplitBatch(parent_document_id=parent_id, replace=True)
+        batch.rejections = [
+            {"document_id": "c0", "reason": "deterministic_validation"},
+            {"document_id": "c1", "reason": "all_null_metadata"},
+        ]
+        return batch
+
+    @pytest.mark.parametrize("replace_set", [True, False])
+    def test_split_set_all_rejected_on_held_key_is_refused(self, replace_set: bool) -> None:
+        """Every child rejected on a key whose rows hold rulings: nothing is
+        written or removed, the key is recorded ``all_children_rejected``,
+        and a split-set replacement raises ``AllChildrenRejectedError``
+        (#5057); a live capture returns."""
+        from contextlib import ExitStack
+
+        from ingestion.worker import AllChildrenRejectedError
+
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = _sc_prefix_event()
+        if not replace_set:
+            event.pop("_replace_split_set", None)
+        delete = MagicMock(return_value=0)
+        record = MagicMock()
+        with ExitStack() as stack:
+            for p in self._split_write_patches(worker, delete):
+                stack.enter_context(p)
+            stack.enter_context(patch("ingestion.worker.split_rulings_held", return_value=3))
+            stack.enter_context(patch.object(worker, "_record_incomplete_and_commit", record))
+            batch = self._rejected_batch(event["document_id"])
+            if replace_set:
+                with pytest.raises(AllChildrenRejectedError, match="kept 3 ruling"):
+                    worker._write_split_batch(event, event["document_id"], batch)
+            else:
+                worker._write_split_batch(event, event["document_id"], batch)
+
+        delete.assert_not_called()
+        worker._indexer.delete_documents.assert_not_called()
+        (call,) = record.call_args_list
+        assert call.args[1] == "all_children_rejected"
+        detail = call.args[2]
+        assert detail["held_rulings"] == 3
+        assert detail["rejection_reasons"] == {
+            "deterministic_validation": 1,
+            "all_null_metadata": 1,
+        }
+
+    def test_split_set_all_rejected_with_allow_ruling_removal_removes(self, caplog: Any) -> None:
+        """``--allow-ruling-removal`` lets the empty split set remove the
+        key's rulings, with a warning (#5057)."""
+        from contextlib import ExitStack
+
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = {**_sc_prefix_event(), "_allow_ruling_removal": True}
+
+        def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+            kwargs["deleted_ids"].extend(["stale-1"])
+            return 1
+
+        record = MagicMock()
+        with ExitStack() as stack, caplog.at_level("WARNING"):
+            for p in self._split_write_patches(worker, _fake_delete):
+                stack.enter_context(p)
+            stack.enter_context(patch("ingestion.worker.split_rulings_held", return_value=1))
+            stack.enter_context(patch.object(worker, "_record_incomplete_and_commit", record))
+            worker._write_split_batch(
+                event, event["document_id"], self._rejected_batch(event["document_id"])
+            )
+
+        record.assert_not_called()
+        worker._indexer.delete_documents.assert_called_once_with(["stale-1"])
+        events = [getattr(r, "telemetry_event", None) for r in caplog.records]
+        assert "split_set.empty_replacement_allowed" in events
+
+    def test_split_set_rejections_that_remove_rows_are_logged(self, caplog: Any) -> None:
+        """The partial case (#5057): a split that writes a child while
+        rejecting others and removes rows is not refused, but logged with
+        the key's rulings before and the rows removed."""
+        from contextlib import ExitStack
+
+        worker = _split_set_change_worker()
+        worker._indexer = MagicMock()
+        event = _sc_prefix_event()
+
+        def _fake_delete(conn: Any, s3_key: str, valid_ids: list[str], **kwargs: Any) -> int:
+            kwargs["deleted_ids"].extend(["stale-1", "stale-2"])
+            return 2
+
+        batch = self._rejected_batch(event["document_id"])
+        batch.children.append(MagicMock(document_id="keep"))
+        with ExitStack() as stack, caplog.at_level("WARNING"):
+            for p in self._split_write_patches(worker, _fake_delete):
+                stack.enter_context(p)
+            stack.enter_context(patch("ingestion.worker.split_rulings_held", return_value=3))
+            worker._write_split_batch(event, event["document_id"], batch)
+
+        (rec,) = [
+            r
+            for r in caplog.records
+            if getattr(r, "telemetry_event", None) == "split_set.rejections_removed_rows"
+        ]
+        assert rec.held_before == 3
+        assert rec.removed == 2
+        assert rec.removed_fraction == round(2 / 3, 3)
+        assert rec.rejection_reasons == ["all_null_metadata", "deterministic_validation"]
+
+    def test_dispatch_split_child_error_is_a_rejection(self) -> None:
+        """A split child that raises (other than an exhausted enrichment)
+        writes nothing: it is noted as a rejection (#5057)."""
+        from ingestion.worker import _SplitBatch
+
+        worker = _split_set_change_worker()
+        batch = _SplitBatch(parent_document_id="p")
+        with (
+            patch.object(worker, "process_event", side_effect=ValueError("bad child")),
+            pytest.raises(ValueError),
+        ):
+            worker._dispatch_split_child(batch, {"document_id": "c0"})
+        assert batch.rejections == [
+            {"document_id": "c0", "reason": "error", "error": "ValueError: bad child"}
+        ]
+
+    def test_note_rejected_child_only_notes_the_open_batch_children(self) -> None:
+        """Only a child of the open split batch is noted (#5057)."""
+        from ingestion.worker import WHOLE_DOCUMENT_KEY, _SplitBatch
+
+        worker = _split_set_change_worker()
+        worker._note_rejected_child({"_split_processed": True}, "x", "llm_validation")
+        batch = _SplitBatch(parent_document_id="p")
+        worker._split_batch = batch
+        worker._note_rejected_child(
+            {"_split_processed": True, "_original_document_id": "other"}, "x", "llm_validation"
+        )
+        worker._note_rejected_child(
+            {"_split_processed": True, "_original_document_id": "p"}, "c1", "llm_validation"
+        )
+        worker._note_rejected_child({WHOLE_DOCUMENT_KEY: True}, "p", "all_null_metadata")
+        assert [r["document_id"] for r in batch.rejections] == ["c1", "p"]
 
     def test_split_set_change_cleanup_failure_rolls_back(self) -> None:
         """A failed cleanup rolls back the whole split write and raises, so

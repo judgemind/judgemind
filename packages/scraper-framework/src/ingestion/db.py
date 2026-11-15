@@ -3653,6 +3653,40 @@ def delete_stale_split_children(
     return deleted
 
 
+def split_rulings_held(
+    conn: psycopg.Connection,
+    s3_key: str,
+    *,
+    parent_document_id: str,
+    owns_key: bool = False,
+) -> int:
+    """How many rulings the rows of *parent_document_id* on *s3_key* hold.
+
+    These are the rulings a split set of this parent can remove: the same
+    rows :func:`delete_stale_split_children` considers (UUIDv5 documents on
+    the key that the parent owns; every v5 row when *owns_key*).  Rows of
+    other parents on the key, such as scraper pre-split siblings, are not
+    counted.  The worker reads it before an empty split set replaces the
+    key's rows (#5057).
+    """
+    if not s3_key:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT d.id FROM documents d
+            JOIN rulings r ON r.document_id = d.id
+            WHERE d.s3_key = %s
+              AND substring(d.id::text, 15, 1) = '5'
+            """,
+            (s3_key,),
+        )
+        ids = [str(row[0]) for row in cur.fetchall()]
+    if not owns_key:
+        ids = _own_split_rows(parent_document_id, ids)
+    return len(ids)
+
+
 def _detach_alerts_from_documents(
     cur: psycopg.Cursor,
     document_ids: list[str],

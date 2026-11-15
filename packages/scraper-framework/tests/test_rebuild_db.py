@@ -13,6 +13,8 @@ import sys
 from typing import Any
 from unittest.mock import MagicMock, mock_open, patch
 
+import pytest
+
 _SCRIPTS_DIR = os.path.join(
     os.path.dirname(__file__),
     "..",
@@ -212,6 +214,43 @@ class TestBuildEvent:
 
 class TestProcessOneDocument:
     """Tests for _process_one_document() return format."""
+
+    @pytest.mark.parametrize("allow", [False, True])
+    def test_all_rejected_key_kept_its_rulings(self, tmp_path: Any, allow: bool) -> None:
+        """A key whose every split child was rejected keeps its rulings
+        (``AllChildrenRejectedError``, #5057): an error result flagged
+        ``rows_kept_all_rejected``.  ``--allow-ruling-removal`` reaches the
+        event."""
+        import hashlib
+
+        from ingestion.worker import AllChildrenRejectedError
+
+        content = b"%PDF-1.4 every child rejected"
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.pdf"
+        key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
+        key_path.mkdir(parents=True)
+        (key_path / f"{content_hash}.pdf").write_bytes(content)
+        mock_worker = MagicMock()
+        mock_worker.process_event.side_effect = AllChildrenRejectedError("rejected")
+        if hasattr(rebuild_db._process_one_document, "_worker"):
+            delattr(rebuild_db._process_one_document, "_worker")
+        try:
+            with (
+                patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+                patch("redis.Redis.from_url", return_value=MagicMock()),
+                patch("framework.s3_cache.make_s3_client", return_value=MagicMock()),
+            ):
+                result = rebuild_db._process_one_document(
+                    key, str(tmp_path), "test-bucket", "postgres://test", "redis://test", "", allow
+                )
+        finally:
+            if hasattr(rebuild_db._process_one_document, "_worker"):
+                delattr(rebuild_db._process_one_document, "_worker")
+        assert result["status"] == "error"
+        assert result["rows_kept_all_rejected"] is True
+        (event,) = mock_worker.process_event.call_args.args
+        assert event.get("_allow_ruling_removal", False) is allow
 
     def test_returns_dict_with_status_ok(self, tmp_path: Any) -> None:
         """Successful processing should return a dict with status='ok'."""

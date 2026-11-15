@@ -34,8 +34,11 @@ import logging
 import os
 import sys
 import uuid
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pytest
@@ -548,6 +551,149 @@ def test_retry_marker_reingest_failed() -> None:
     so the key is retried after the failed manifest expires (#5008)."""
     events = harness.run_partial_extraction(_DSN, 0, _RUN, kind="reingest", name="marker-reingest")
     assert events["harness.marker.reingest_failed"] > 0, dict(events)
+
+
+# ---------------------------------------------------------------------------
+# A split that rejects every child keeps the key's rulings (#5057)
+# ---------------------------------------------------------------------------
+
+
+def _good_specs(tag: str) -> tuple[harness.Spec, ...]:
+    """Three rulings that pass validation, then two that fail it: no case
+    number and no caption (``unknown_and_null_title_fail``)."""
+    good = tuple(
+        harness.Spec(i, harness._case_number(i), harness._title(i), harness._text(tag, i))
+        for i in range(3)
+    )
+    rejected = tuple(harness.Spec(i, None, None, harness._text(tag, i)) for i in range(3, 5))
+    return good + rejected
+
+
+def _run_after_rulings(
+    name: str,
+    second: Callable[[tuple[harness.Spec, ...]], harness.Step],
+    *,
+    allow_removal: bool = False,
+    profile: str = "default",
+    legacy: bool = False,
+) -> tuple[Counter[str], list[str], list[str], tuple[str, int, Any] | None]:
+    """Give a fresh key three rulings, then run *second* on it, with every
+    invariant checked.  Returns the run's events, the key's ruling ids
+    before and after the second step, and the key's incomplete record.
+
+    *legacy* writes the three rulings directly (a ``profile="none"`` key
+    cannot split), as split slots of the key's parent.
+    """
+    from ingestion.split_ids import make_split_document_id
+
+    tag = f"{_RUN}-{name}"
+    specs = _good_specs(tag)
+    h = harness.KeyHarness(_DSN, _RUN, -1, profile=profile)
+    try:
+        key = harness.make_key(f"{tag}-main")
+        if legacy:
+            for i in range(3):
+                h.write_legacy_row(key, make_split_document_id(key.parent, i), specs[i])
+        else:
+            rows = tuple(harness.Row("ruling", i) for i in range(3))
+            h.run_step(key, harness.Step("reingest", rows, specs), "three rulings")
+        before = sorted(r.id for r in harness.read_key(h.checker, key.s3_key) if r.ruling_id)
+        if allow_removal:
+            # ``reingest_from_s3.py --allow-ruling-removal``.
+            h.event_extra = {"_allow_ruling_removal": True}
+        h.run_step(key, second(specs), "second step")
+        after = sorted(r.id for r in harness.read_key(h.checker, key.s3_key) if r.ruling_id)
+        return Counter(h.events), before, after, h._incomplete_marker(key)
+    finally:
+        h.close()
+
+
+def _all_rejected(kind: str) -> Callable[[tuple[harness.Spec, ...]], harness.Step]:
+    return lambda specs: harness.Step(
+        kind, (harness.Row("ruling", 3), harness.Row("ruling", 4)), specs, ("reject_all",)
+    )
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "db", "live"])
+def test_reingest_all_rejected_keeps_rulings(kind: str) -> None:
+    """A step whose every child fails validation leaves the key's three
+    rulings in place and records ``all_children_rejected`` (#5057).  A
+    reingest (prefix or DB-row mode) raises ``AllChildrenRejectedError``, so
+    the run counts the key failed.  Before the fix the split set was
+    replaced by the empty one: the rulings were deleted with only a
+    warning (#5026: 106 federal rulings)."""
+    events, before, after, marker = _run_after_rulings(f"rejected-{kind}", _all_rejected(kind))
+    assert len(before) == 3
+    assert after == before
+    assert marker is not None and marker[0] == "all_children_rejected", marker
+    assert events["harness.refused"] == 1, dict(events)
+    raised = events["harness.raised.AllChildrenRejectedError"]
+    assert raised == (0 if kind == "live" else 1), dict(events)
+
+
+@_needs_pg
+def test_reingest_all_rejected_whole_document_without_verdict_keeps_rulings() -> None:
+    """The #5026 shape: a county no extractor runs on
+    (``ExtractionMethod.NONE``, like CourtListener) writes each document
+    whole; a reingest event missing the fields validation needs rejects it.
+    That is no verdict on the key's rulings, so they are kept (#5057)."""
+    events, before, after, marker = _run_after_rulings(
+        "rejected-whole-none",
+        lambda specs: harness.Step("reingest", (), specs, ("whole",), whole=True, profile="none"),
+        profile="none",
+        legacy=True,
+    )
+    assert len(before) == 3
+    assert after == before
+    assert marker is not None and marker[0] == "all_children_rejected", marker
+    assert events["harness.raised.AllChildrenRejectedError"] == 1, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize(
+    "doc",
+    [
+        pytest.param("", id="no-rulings-no-text-skip"),
+        pytest.param("Page 1 of 1", id="no-rulings-verdict-whole-rejected"),
+    ],
+)
+def test_complete_empty_source_still_empties_the_key(doc: str) -> None:
+    """A legitimate empty source still replaces the key's rulings with none
+    (#4725, #4940 unchanged by #5057): a document with no rulings and no
+    text (a recorded skip), or a complete extraction that found no rulings
+    whose whole document validation then rejects."""
+    events, before, after, marker = _run_after_rulings(
+        f"empty-source-{doc[:4] or 'none'}",
+        lambda specs: harness.Step("reingest", (), specs, ("whole",), doc=doc, whole=True),
+    )
+    assert len(before) == 3
+    assert after == []
+    assert marker is None, marker
+    assert events["harness.refused"] == 0, dict(events)
+
+
+@_needs_pg
+def test_allow_ruling_removal_removes_rejected_rulings() -> None:
+    """``--allow-ruling-removal`` (a rule tightening meant to remove rows)
+    lets a split that rejects every child remove the key's rulings, with a
+    warning (#5057)."""
+    events, before, after, marker = _run_after_rulings(
+        "allow-removal", _all_rejected("reingest"), allow_removal=True
+    )
+    assert len(before) == 3
+    assert after == []
+    assert marker is None, marker
+    assert events["split_set.empty_replacement_allowed"] == 1, dict(events)
+    assert events["harness.refused"] == 0, dict(events)
+
+
+@_needs_pg
+def test_generated_seeds_reach_the_refusal() -> None:
+    """A generated seed reaches the refusal (#5057), so the sweep keeps
+    checking it (``refused``, with its fresh-key oracle)."""
+    events = harness.run_seed(_DSN, 53, _RUN, name="refusal-reach")
+    assert events["harness.refused"] > 0, dict(events)
 
 
 @_needs_pg

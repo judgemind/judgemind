@@ -105,8 +105,18 @@ Options:
                         it they are skipped in both modes and logged as
                         ``deferred_backlog_skipped`` with the blocking issue;
                         a run whose every key is deferred exits 5 (#5043).
-                        Their reingest fails validation today and replaces
-                        each key's rulings with nothing.
+                        Their reingest fails validation today: the worker
+                        keeps each key's rulings and reports the key failed
+                        (``all_children_rejected``, #5057).
+    --allow-ruling-removal
+                        Let a key whose every split child is rejected
+                        (validation, the all-NULL guard) lose its rulings.
+                        Without it the worker refuses that write, keeps the
+                        rows, records the key ``all_children_rejected`` in
+                        ``telemetry.ingest_incomplete`` and the run counts it
+                        failed and in ``rows_kept_all_rejected`` (#5057).
+                        For a rule tightening meant to remove rows; logged
+                        as a warning for the run and for every key.
     --write-crashed-manifest s3://bucket/key
                         Write the keys whose worker process died (the pool
                         broke, e.g. a worker was OOM-killed) to this S3
@@ -707,6 +717,7 @@ def _build_prefix_event(
     bucket: str,
     capture_timestamp: datetime | None = None,
     provenance: dict[str, str] | None = None,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Construct an ingestion event dict from an S3 object for prefix mode.
 
@@ -720,6 +731,10 @@ def _build_prefix_event(
     of the object: the captured ``source_url`` and the live
     ``capture_scraper_id``, which the worker's ``hearing_date_for_raw``
     hooks need to reproduce the live scraper's hearing date (#4774).
+
+    ``allow_ruling_removal`` (``--allow-ruling-removal``) sets
+    ``ingestion.worker.ALLOW_RULING_REMOVAL_KEY``: a split that rejects every
+    child may then remove the key's rulings (#5057).
     """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
@@ -744,6 +759,9 @@ def _build_prefix_event(
         # ``ingestion.worker.REPLACE_SPLIT_SET_KEY``.
         "_replace_split_set": True,
     }
+    if allow_ruling_removal:
+        # ``ingestion.worker.ALLOW_RULING_REMOVAL_KEY`` (#5057).
+        event["_allow_ruling_removal"] = True
     event.update(provenance or {})
 
     # For text-based formats (HTML, TXT), pass content as ruling_text.
@@ -1092,6 +1110,7 @@ def _process_prefix_document(
     redis_url: str,
     os_url: str,
     bust_llm_cache: bool = False,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Process a single S3 object through the ingestion pipeline.
 
@@ -1104,6 +1123,9 @@ def _process_prefix_document(
         When True, the per-process ``IngestionWorker`` is constructed with
         ``bust_llm_cache=True`` so every ``LlmExtractor`` it creates skips
         cache reads (#4049).
+    allow_ruling_removal:
+        ``--allow-ruling-removal``: the event lets a split that rejects every
+        child remove the key's rulings (#5057).
 
     Returns a dict with:
       - ``status``: ``"ok"``, ``"skip"``, ``"error"``, or ``UNEXTRACTABLE``
@@ -1119,6 +1141,9 @@ def _process_prefix_document(
         re-derive any split-children from the raw content.  Mirrors the
         behavior already in ``rebuild_db._process_one_document`` (see #2494,
         #2628).
+      - ``rows_kept_all_rejected``: True on an ``"error"`` result whose
+        split rejected every child of a key that holds rulings, so the
+        worker kept them (``AllChildrenRejectedError``, #5057).
     """
     parsed = _parse_s3_key(key)
     if not parsed:
@@ -1175,6 +1200,7 @@ def _process_prefix_document(
         bucket,
         capture_timestamp=capture_timestamp,
         provenance=provenance,
+        allow_ruling_removal=allow_ruling_removal,
     )
 
     # Lazy per-process worker — cached on the function object.
@@ -1214,8 +1240,19 @@ def _process_prefix_document(
         worker.process_event(event)
         return {"status": "ok", "hash_mismatch": hash_mismatch, "error_class": None}
     except Exception as exc:
-        from ingestion.worker import NoExtractableTextError
+        from ingestion.worker import AllChildrenRejectedError, NoExtractableTextError
 
+        if isinstance(exc, AllChildrenRejectedError):
+            # Every child was rejected: the worker kept the key's rulings
+            # and recorded ``all_children_rejected`` (#5057).  A failure,
+            # counted apart so the run says how many keys it kept.
+            logger.warning("Kept rulings: every child was rejected", s3_key=key, error=str(exc))
+            return {
+                "status": "error",
+                "hash_mismatch": hash_mismatch,
+                "error_class": type(exc).__name__,
+                "rows_kept_all_rejected": True,
+            }
         if isinstance(exc, NoExtractableTextError):
             # No text layer and no page images: a retry reads the same
             # bytes, so the key is reported apart from the retryable
@@ -1296,6 +1333,7 @@ def run_reingest_from_prefix(
     write_failed_manifest: str | None = None,
     include_deferred: bool = False,
     write_crashed_manifest: str | None = None,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Prefix mode: re-ingest the S3 objects under *prefix*.
 
@@ -1339,12 +1377,18 @@ def run_reingest_from_prefix(
     include_deferred:
         Also re-ingest keys of a deferred backlog (#5043), which are
         otherwise skipped (``deferred_skipped`` in the stats).
+    allow_ruling_removal:
+        Let a key whose every split child is rejected lose its rulings
+        (#5057).  Without it such keys keep them and are counted in
+        ``rows_kept_all_rejected``.
 
     Returns
     -------
     dict with keys: ``total_keys``, ``processed``, ``errors``, ``skipped``,
     ``hash_mismatch_warnings``, ``wall_time_seconds``, ``error_ratio``,
-    ``top_error_class``, ``failed_keys``, and (when the judge pre-pass ran)
+    ``top_error_class``, ``failed_keys``, ``rows_kept_all_rejected`` (failed
+    keys whose rulings were kept because every child was rejected, #5057;
+    the keys in ``rows_kept_all_rejected_keys``), and (when the judge pre-pass ran)
     ``judge_prepass_docs_scanned``, ``judge_prepass_judges_seeded``,
     ``judge_prepass_judges_skipped_invalid``.
     """
@@ -1434,6 +1478,7 @@ def run_reingest_from_prefix(
         skip_judge_prepass=skip_judge_prepass,
         write_failed_manifest=write_failed_manifest,
         write_crashed_manifest=write_crashed_manifest,
+        allow_ruling_removal=allow_ruling_removal,
         s3_client=s3_client,
     )
     return _with_deferred_count(stats, split)
@@ -1505,6 +1550,7 @@ def run_reingest(
     write_failed_manifest: str | None = None,
     include_deferred: bool = False,
     write_crashed_manifest: str | None = None,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """DB-row mode: re-ingest the S3 objects behind the matching rows.
 
@@ -1563,6 +1609,7 @@ def run_reingest(
         skip_judge_prepass=skip_judge_prepass,
         write_failed_manifest=write_failed_manifest,
         write_crashed_manifest=write_crashed_manifest,
+        allow_ruling_removal=allow_ruling_removal,
         s3_client=s3_client,
         mode="db",
     )
@@ -1583,6 +1630,7 @@ def _reingest_keys(
     s3_client: object | None = None,
     mode: str = "prefix",
     write_crashed_manifest: str | None = None,
+    allow_ruling_removal: bool = False,
 ) -> dict[str, Any]:
     """Run each S3 object in *keys* through ``IngestionWorker.process_event``.
 
@@ -1680,7 +1728,18 @@ def _reingest_keys(
     crashed_keys: list[str] = []
     # Keys no extractor could read: reported, never retried (#4983).
     unextractable_keys: list[str] = []
+    # Failed keys whose split rejected every child, so the worker kept their
+    # rulings (``AllChildrenRejectedError``, #5057).
+    rows_kept_keys: list[str] = []
     error_classes: Counter[str] = Counter()
+
+    if allow_ruling_removal:
+        logger.warning(
+            "--allow-ruling-removal is set: a key whose every split child is "
+            "rejected loses its rulings in this run (#5057)",
+            mode=mode,
+            total_keys=len(keys),
+        )
 
     logger.info(
         "Processing documents from S3",
@@ -1698,6 +1757,7 @@ def _reingest_keys(
                 redis_url,
                 os_url,
                 bust_llm_cache,
+                allow_ruling_removal,
             ): key
             for key in keys
         }
@@ -1726,6 +1786,8 @@ def _reingest_keys(
                     failed_keys.append(key)
                     if isinstance(result, dict):
                         error_classes[result.get("error_class") or "unknown"] += 1
+                        if result.get("rows_kept_all_rejected"):
+                            rows_kept_keys.append(key)
                     else:
                         error_classes["unknown"] += 1
                 total_done = processed + errors + skipped + len(unextractable_keys)
@@ -1783,6 +1845,8 @@ def _reingest_keys(
         "crashed_keys": crashed_keys,
         "unextractable": len(unextractable_keys),
         "unextractable_keys": unextractable_keys,
+        "rows_kept_all_rejected": len(rows_kept_keys),
+        "rows_kept_all_rejected_keys": rows_kept_keys,
     }
     if prepass_stats is not None:
         stats["judge_prepass_docs_scanned"] = prepass_stats["docs_scanned"]
@@ -1796,7 +1860,13 @@ def _reingest_keys(
     log_stats = {
         k: v
         for k, v in stats.items()
-        if k not in ("failed_keys", "crashed_keys", "unextractable_keys")
+        if k
+        not in (
+            "failed_keys",
+            "crashed_keys",
+            "unextractable_keys",
+            "rows_kept_all_rejected_keys",
+        )
     }
     logger.info(
         "Key reingest complete",
@@ -1812,6 +1882,17 @@ def _reingest_keys(
             "Keys with no extractable text (not retried)",
             unextractable_count=len(unextractable_keys),
             unextractable_keys=unextractable_keys,
+        )
+
+    if rows_kept_keys:
+        # Every child of these keys was rejected; their rulings were kept
+        # and each is recorded ``all_children_rejected`` (#5057).  Check for
+        # a tightened rule or a missing event field before
+        # ``--allow-ruling-removal``.
+        logger.warning(
+            "Keys whose rulings were kept because every child was rejected",
+            rows_kept_all_rejected=len(rows_kept_keys),
+            rows_kept_all_rejected_keys=rows_kept_keys[:50],
         )
 
     if write_failed_manifest and failed_keys:
@@ -2073,7 +2154,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "Also re-ingest keys of a deferred backlog "
             "(validation.deferred_backlogs, e.g. the May-June CourtListener "
             "raws blocked on #3954), which are skipped by default (#5043).  "
-            "Their reingest fails validation today and deletes their rulings."
+            "Their reingest fails validation today; the worker keeps their "
+            "rulings and reports them failed (#5057)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-ruling-removal",
+        action="store_true",
+        dest="allow_ruling_removal",
+        help=(
+            "Let a key whose every split child is rejected (validation, the "
+            "all-NULL guard) lose its rulings.  Without it the worker keeps "
+            "them, records the key all_children_rejected and the run counts "
+            "it failed (#5057).  For a rule tightening meant to remove rows."
         ),
     )
     return parser
@@ -2116,6 +2209,7 @@ def main() -> None:
         "write_failed_manifest": args.write_failed_manifest,
         "write_crashed_manifest": args.write_crashed_manifest,
         "include_deferred": args.include_deferred,
+        "allow_ruling_removal": args.allow_ruling_removal,
     }
     if args.prefix:
         stats = run_reingest_from_prefix(dsn, prefix=args.prefix, **common)
@@ -2141,6 +2235,7 @@ def main() -> None:
         errors=stats["errors"],
         skipped=stats["skipped"],
         deferred_skipped=stats.get("deferred_skipped", 0),
+        rows_kept_all_rejected=stats.get("rows_kept_all_rejected", 0),
         judge_prepass_judges_seeded=stats.get("judge_prepass_judges_seeded"),
     )
     if stats.get("only_deferred") is True:

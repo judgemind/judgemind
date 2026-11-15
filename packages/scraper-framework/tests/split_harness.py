@@ -108,6 +108,16 @@ properties that must hold for any sequence of re-splits:
   writes nothing for another reason (a live capture of a key with rows, an
   unavailable extractor) leaves the record as it was.  Dead-lettering is
   outside the harness (``test_ingest_incomplete.py``).
+- ``refused``: a step whose split rejects every child (validation, the
+  all-NULL guard) on a key that holds rulings, with no verdict that the
+  document holds none, keeps the key's rows (#5057): the worker refuses
+  the empty split set, so the step is checked like one that wrote nothing
+  (``untouched``; ``marker`` expects ``all_children_rejected``), and a
+  ``reingest`` / ``db`` step raises ``AllChildrenRejectedError``.  A
+  refusal is legitimate only after a complete extraction, on a key that
+  held a ruling, and when a fresh ingest of the same bytes (the oracle,
+  on a key with no history) writes no ruling either.  ``converge`` then
+  allows the key to keep its history's rows.
 
 A shared-court scenario also runs ``search_fields`` (a court rename made by
 one key's write re-indexes the other keys' rulings) and ``judge_converge``
@@ -263,6 +273,7 @@ INVARIANTS = (
     "held_printed",
     "explained",
     "marker",
+    "refused",
     "error",
 )
 
@@ -274,6 +285,10 @@ _MARKER_EXHAUSTED_CHILD = "exhausted_child"
 
 #: ``ingestion.worker.SPLIT_EXTRACTION_FAILED_EVENT`` (#4948).
 _EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
+
+#: ``ingestion.worker.EMPTY_SPLIT_SET_REFUSED_EVENT`` (#5057).
+_EMPTY_REFUSED_EVENT = "split_set.empty_replacement_refused"
+_MARKER_ALL_CHILDREN_REJECTED = "all_children_rejected"
 
 
 class InvariantError(AssertionError):
@@ -1427,6 +1442,10 @@ class KeyHarness:
         self.env = env
         #: Providers whose missing key :meth:`_check_refuses_start` checked.
         self._refusal_checked: set[str] = set()
+        #: Whether the last step's empty split set was refused (#5057).
+        self.last_refused = False
+        #: Fresh keys :meth:`_check_refusal_rejects_fresh` has used.
+        self._refusal_oracles = 0
         self._patches: list[Any] = []
         try:
             self._start_extraction_env()
@@ -1655,6 +1674,7 @@ class KeyHarness:
             expected_error = "SplitExtractionFailedError"
         reported_failed = False
         logged_before = self.events[_EXTRACTION_FAILED_EVENT]
+        refused_before = self.events[_EMPTY_REFUSED_EVENT]
         try:
             with _real_enrichment(), self._exhausted_enrichment(outcome == "exhausted"):
                 if step.kind == "db":
@@ -1670,7 +1690,14 @@ class KeyHarness:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced as a violation
             self.events[f"harness.raised.{type(exc).__name__}"] += 1
-            if not (expect_failed and type(exc).__name__ == expected_error):
+            # A split-set replacement whose every child was rejected keeps
+            # the key's rulings and reports the key failed (#5057); whether
+            # the refusal was right is checked below (``refused``).
+            refused_raise = (
+                type(exc).__name__ == "AllChildrenRejectedError"
+                and self.events[_EMPTY_REFUSED_EVENT] > refused_before
+            )
+            if not (expect_failed and type(exc).__name__ == expected_error) and not refused_raise:
                 self._fail("error", f"step raised {type(exc).__name__}: {exc}")
             reported_failed = True
         finally:
@@ -1684,6 +1711,23 @@ class KeyHarness:
             raise self._pending
         after_rows = read_key(self.checker, key.s3_key)
         after = ruling_identities(after_rows)
+        # The worker refused an empty split set over the key's rulings
+        # (#5057): nothing was written, so the step is checked as one that
+        # wrote nothing (``untouched``, ``marker``), not as a complete one.
+        refused = self.events[_EMPTY_REFUSED_EVENT] > refused_before
+        if refused:
+            self.events["harness.refused"] += 1
+            self._guard(
+                "refused",
+                self._check_refused,
+                step,
+                before_rows,
+                outcome,
+                reported_failed,
+            )
+            self._spelling = spelling_before
+            outcome = "rejected"
+            complete = False
         # A live capture of a key with no rows yet writes the document on
         # its own when its extraction fails (``single_document_fallback``,
         # #4948), or the parts that answered when it was partial
@@ -1708,8 +1752,9 @@ class KeyHarness:
                 after_rows,
                 search_before,
                 # An exhausted enrichment is no failed extraction: its raise
-                # (``reported_failed``) shows the step took its branch.
-                not_logged and outcome != "exhausted",
+                # (``reported_failed``) shows the step took its branch.  A
+                # refused empty split set logged its own event (#5057).
+                not_logged and outcome not in ("exhausted", "rejected"),
             )
         if step.kind == "presplit":
             # One event per ruling, each blind to its siblings (see the
@@ -1765,6 +1810,10 @@ class KeyHarness:
         )
         self._judges_seen.update(j for _d, _t, j, _n in judges_before + judges_after)
         self._guard("judge_converge", self._check_votes)
+        if refused:
+            # Last: it runs a step of its own on a fresh key.
+            self._guard("refused", self._check_refusal_rejects_fresh, step)
+        self.last_refused = refused
 
     @contextmanager
     def _incomplete_input(self, key: Key, event: dict[str, Any], on: bool) -> Iterator[None]:
@@ -2136,6 +2185,12 @@ class KeyHarness:
                 f"a whole-document {step.kind} step whose enrichment was exhausted",
             )
             return
+        if outcome == "rejected":
+            expect(
+                (_MARKER_ALL_CHILDREN_REJECTED,),
+                f"a {step.kind} step refused for rejecting every child (#5057)",
+            )
+            return
         if fallback:
             expect(_MARKER_FALLBACK_REASONS, "a live capture of a new key that took the fallback")
             return
@@ -2162,6 +2217,51 @@ class KeyHarness:
                 "marker",
                 f"a {step.kind} step that wrote nothing changed the key's incomplete "
                 f"record: before {before}, after {after}",
+            )
+
+    def _check_refused(
+        self, step: Step, before_rows: list[DocRow], outcome: str, reported_failed: bool
+    ) -> None:
+        """A refused empty split set (#5057) refused a complete extraction
+        over a key that held rulings, and a split-set replacement reported
+        the key failed (``AllChildrenRejectedError``)."""
+        if outcome != "ok":
+            self._fail(
+                "refused",
+                f"the worker refused an empty split set on a step whose extraction "
+                f"was {outcome}, not complete",
+            )
+        if step.kind == "presplit":
+            self._fail("refused", "a pre-split child's write was refused as an empty split set")
+        if not any(r.ruling_id for r in before_rows):
+            self._fail(
+                "refused",
+                "the worker refused an empty split set on a key that held no ruling",
+            )
+        if step.kind != "live" and not reported_failed:
+            self._fail(
+                "refused",
+                f"a refused {step.kind} step raised no AllChildrenRejectedError, so the "
+                "reingest does not count the key failed",
+            )
+
+    def _check_refusal_rejects_fresh(self, step: Step) -> None:
+        """The refusal's oracle (#5057): the same bytes ingested on a fresh
+        key (no history) write no ruling either.  Otherwise the refused
+        step did not reject every child on its merits."""
+        self._refusal_oracles += 1
+        owner = self._key.content_hash[:16] if self._key is not None else ""
+        fresh = make_key(f"{self.run_token}-{self.seed}-{owner}-refusal-{self._refusal_oracles}")
+        oracle = replace(step, kind="reingest", fail_mode="", fail=False)
+        label = self._step_label
+        self.run_step(fresh, oracle, f"refusal oracle {self._refusal_oracles}")
+        self._step_label = label
+        written = [r for r in read_key(self.checker, fresh.s3_key) if r.ruling_id]
+        if written:
+            self._fail(
+                "refused",
+                f"the worker refused an empty split set, but a fresh ingest of the same "
+                f"bytes writes {len(written)} ruling(s)",
             )
 
     @contextmanager
@@ -2859,6 +2959,10 @@ def run_steps(
             # the same bytes.  A failed step left the key as it was.
             settle = replace(final, kind="reingest", ops=("settle",))
             harness.run_step(key, settle, "settle")
+        # The final bytes reject every child, so the key keeps the rulings
+        # its history left (#5057); the refusal's oracle already checked
+        # that a fresh ingest writes none.
+        kept_by_refusal = harness.last_refused
         history = normalized(key, read_key(harness.checker, key.s3_key))
         # Bytes nothing can be extracted from (no text in a text-first
         # county) leave a key as its history left it, in the failed-keys
@@ -2893,8 +2997,10 @@ def run_steps(
         # fuzzy correction moves a number onto a near-miss case the court
         # already holds (#1576), which depends on the court's history.
         near_miss_ok = not doc_is_evidence(final.doc)
-        if extractable == "ok" and not _converged(
-            history, fresh["reingest"], near_miss_ok=near_miss_ok
+        if (
+            extractable == "ok"
+            and not kept_by_refusal
+            and not _converged(history, fresh["reingest"], near_miss_ok=near_miss_ok)
         ):
             raise InvariantError(
                 "converge",

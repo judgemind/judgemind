@@ -37,6 +37,7 @@ import os
 import re
 import socket
 import time
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -108,6 +109,7 @@ from .db import (
     record_judge_votes,
     resolve_judge,
     resolve_judge_from_department,
+    split_rulings_held,
     upsert_case_judge,
     upsert_case_returning_title,
     upsert_court,
@@ -133,6 +135,7 @@ from .extract import (
     strip_trailing_connectors,
 )
 from .ingest_incomplete import (
+    INCOMPLETE_ALL_CHILDREN_REJECTED,
     INCOMPLETE_DEAD_LETTER,
     INCOMPLETE_EXHAUSTED_CHILD,
     INCOMPLETE_PARTIAL_SPLIT,
@@ -248,6 +251,30 @@ def _markdown_to_html(text: str) -> str:
 #: Live scraper events never carry it (#4788).
 REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 
+#: Event key set by ``scripts/reingest_from_s3.py`` and ``scripts/rebuild_db.py``
+#: when run with ``--allow-ruling-removal`` (#5057): a split that rejects
+#: every child may then replace the key's rulings with none.  Without it
+#: the worker refuses that write and records ``all_children_rejected``
+#: (``IngestionWorker._refuse_empty_split_set``).  Live events never carry it.
+ALLOW_RULING_REMOVAL_KEY = "_allow_ruling_removal"
+
+#: ``telemetry_event`` of the warning logged when the worker refuses to
+#: replace a key's rulings with an empty split set (#5057).
+EMPTY_SPLIT_SET_REFUSED_EVENT = "split_set.empty_replacement_refused"
+
+#: ``telemetry_event`` of the warning logged when ``--allow-ruling-removal``
+#: lets an empty split set remove a key's rulings (#5057).
+EMPTY_SPLIT_SET_ALLOWED_EVENT = "split_set.empty_replacement_allowed"
+
+#: ``telemetry_event`` of the warning logged when a split that rejected
+#: some children removed some of the key's rulings but wrote others
+#: (#5057): the partial case, recorded but not refused.
+REJECTIONS_REMOVED_ROWS_EVENT = "split_set.rejections_removed_rows"
+
+#: Rejections listed in an ``all_children_rejected`` record's detail; the
+#: count is always complete.
+_MAX_REJECTIONS_IN_DETAIL = 20
+
 #: Event key on the one child of a whole-document split (#4940): the
 #: extractor found no rulings in the document (a complete result, not a
 #: failed call), so the document is written as one ruling, the key's only
@@ -330,6 +357,21 @@ class NoExtractableTextError(SplitExtractionFailedError):
     a retry cannot succeed: the same bytes come back with the same missing
     text layer.  A reingest reports such keys separately instead of in its
     ``--write-failed-manifest`` retry list (#4983).
+    """
+
+
+class AllChildrenRejectedError(SplitExtractionFailedError):
+    """A split-set replacement (reingest / rebuild) that rejected every
+    child of a key that holds rulings (#5057).
+
+    Every candidate failed validation, the all-NULL guard, or raised, and
+    nothing says the document holds no rulings (no skip verdict, no
+    whole-document verdict).  The write is refused: the key's rows are left
+    as they are and the key is recorded ``all_children_rejected`` in
+    ``telemetry.ingest_incomplete``.  The reingest counts the key failed and
+    reports it in its ``rows_kept_all_rejected`` count.  A rule tightening
+    that should remove the rows is an operator action:
+    ``--allow-ruling-removal``.
     """
 
 
@@ -1851,6 +1893,19 @@ class _SplitBatch:
     #: ``telemetry.ingest_incomplete`` with the write (#5008).
     incomplete_reason: str | None = None
     incomplete_detail: dict[str, Any] = field(default_factory=dict)
+    #: Children dispatched this pass that wrote nothing (#5057): rejected by
+    #: deterministic or LLM validation, dropped by the all-NULL guard, or
+    #: raised.  One dict per child (``document_id``, ``reason`` and its
+    #: detail).  When they are every child and the key holds rulings, the
+    #: split-set write is refused (``_refuse_empty_split_set``).
+    rejections: list[dict[str, Any]] = field(default_factory=list)
+    #: Set with ``whole_document`` when a complete extraction found no
+    #: rulings (#4940): the extractor's verdict that the document holds
+    #: none, so a whole document rejected by validation legitimately leaves
+    #: the key empty (#5057).  Unset for a whole document no extractor ran
+    #: on (``ExtractionMethod.NONE``, e.g. CourtListener): its rejection is
+    #: no verdict on the key's rulings.
+    no_rulings_verdict: bool = False
 
 
 def _incomplete_split_reason(batch: _SplitBatch) -> str | None:
@@ -1883,6 +1938,32 @@ def _empty_split_skip_reason(batch: _SplitBatch) -> str | None:
     if batch.textless_rows:
         return SKIP_NO_RULING_TEXT
     return None
+
+
+def _writes_nothing(batch: _SplitBatch) -> bool:
+    """Whether a worker split writes and keeps no child, and nothing says
+    the document holds no rulings (#5057).
+
+    Such a split set is empty only because every candidate was rejected
+    (validation, the all-NULL guard, a child that raised), including the
+    whole-document child of a document no extractor ran on
+    (``ExtractionMethod.NONE``).  On a key that holds rulings that is no
+    verdict on the document, so ``_write_split_batch`` refuses to remove
+    them (``_refuse_empty_split_set``).
+
+    Two legitimate empty sources still empty the key: a recorded skip
+    verdict (``_empty_split_skip_reason``: a placeholder notice, a PDF with
+    no rulings and no text, rows with no ruling text), and a complete
+    extraction that found no rulings (``no_rulings_verdict``), whose whole
+    document validation then rejected (#4940).
+    """
+    return (
+        batch.pre_split is None
+        and not batch.children
+        and not batch.keep_ids
+        and not batch.no_rulings_verdict
+        and _empty_split_skip_reason(batch) is None
+    )
 
 
 class InfrastructureError(Exception):
@@ -4513,6 +4594,13 @@ class IngestionWorker:
                     "case_number": case_number,
                 },
             )
+            self._note_rejected_child(
+                event_data,
+                document_id,
+                "deterministic_validation",
+                failed_rules=failed_rule_names,
+                case_number=case_number,
+            )
             try:
                 conn = self._get_connection()
                 insert_validation_result(
@@ -4666,6 +4754,13 @@ class IngestionWorker:
                         "case_number": case_number,
                     },
                 )
+                self._note_rejected_child(
+                    event_data,
+                    document_id,
+                    "llm_validation",
+                    validation_reason=(validation_result.reason or "")[:200],
+                    case_number=case_number,
+                )
                 # Still log the validation result to the DB (validation_results
                 # table only — not the ruling itself).
                 try:
@@ -4726,6 +4821,7 @@ class IngestionWorker:
                     "telemetry_event": NON_RULING_PDF_DROPPED_EVENT,
                 },
             )
+            self._note_rejected_child(event_data, document_id, "all_null_metadata")
             # Best-effort telemetry write (savepoint-protected so a transient
             # failure does not abort the caller's transaction).
             try:
@@ -4816,11 +4912,8 @@ class IngestionWorker:
         # A worker split writes all of its children in one transaction, after
         # the last one is extracted (``_write_split_batch``, #4845).  So does
         # a whole-document split, whose one child is the document (#4940).
-        batch = self._split_batch
-        if batch is not None and (
-            (is_split and event_data.get("_original_document_id") == batch.parent_document_id)
-            or (event_data.get(WHOLE_DOCUMENT_KEY) and document_id == batch.parent_document_id)
-        ):
+        batch = self._batch_of(event_data, document_id)
+        if batch is not None:
             batch.children.append(write)
             return
 
@@ -4849,6 +4942,36 @@ class IngestionWorker:
                 self._write_one_ruling(write)
         finally:
             timing.add_ms("db_write_ms", (time.perf_counter() - _db_write_t0) * 1000.0)
+
+    def _batch_of(self, event_data: dict[str, Any], document_id: str) -> _SplitBatch | None:
+        """The worker split batch *event_data* is a child of, or ``None``.
+
+        A worker split's child (``_split_processed`` with the batch's parent
+        as ``_original_document_id``) or its whole-document child
+        (``WHOLE_DOCUMENT_KEY`` on the parent id, #4940).
+        """
+        batch = self._split_batch
+        if batch is None:
+            return None
+        if (
+            event_data.get("_split_processed", False)
+            and event_data.get("_original_document_id") == batch.parent_document_id
+        ) or (event_data.get(WHOLE_DOCUMENT_KEY) and document_id == batch.parent_document_id):
+            return batch
+        return None
+
+    def _note_rejected_child(
+        self, event_data: dict[str, Any], document_id: str, reason: str, **detail: Any
+    ) -> None:
+        """Note on its split batch that a child wrote nothing (#5057).
+
+        A no-op for an event that is not a worker split's child.  The
+        split-set write reads the notes: when every child was rejected and
+        the key holds rulings, it refuses to remove them.
+        """
+        batch = self._batch_of(event_data, document_id)
+        if batch is not None:
+            batch.rejections.append({"document_id": document_id, "reason": reason, **detail})
 
     # ------------------------------------------------------------------
     # Ruling writes (#4845)
@@ -5251,6 +5374,23 @@ class IngestionWorker:
         vacated: list[str] = []
         split_changes = ShownRowChanges()
         conn = self._get_connection()
+        # The rulings this split can remove, read only when children were
+        # rejected or the split writes nothing (#5057).
+        held = None
+        if s3_key and batch.pre_split is None and (batch.rejections or _writes_nothing(batch)):
+            try:
+                held = split_rulings_held(
+                    conn, s3_key, parent_document_id=parent_document_id, owns_key=owns_key
+                )
+            except Exception:
+                conn.rollback()
+                raise
+        if (
+            held
+            and _writes_nothing(batch)
+            and self._refuse_empty_split_set(event_data, parent_document_id, batch, held)
+        ):
+            return
         try:
             # The votes the key's documents cast before this write, read
             # before anything changes: a removed child's row goes with its
@@ -5408,8 +5548,10 @@ class IngestionWorker:
         elif removed and not written and not batch.keep_ids:
             # Every child of this split was rejected (validation, all-NULL
             # guard), the whole document included when the extractor found
-            # no rulings (#4940): the key now holds no rulings.  Worth a
-            # look when it happens to a key that had some.
+            # no rulings (#4940), and the key now holds no rulings: it held
+            # none before (only rows without a ruling went), or the run
+            # allowed the removal (``--allow-ruling-removal``, logged by
+            # ``_refuse_empty_split_set``, #5057).
             logger.warning(
                 "Split set replaced by an empty one: every child was rejected",
                 extra={
@@ -5428,6 +5570,28 @@ class IngestionWorker:
                     "s3_key": s3_key,
                     "new_split_count": len(written),
                     "stale_ids": removed,
+                },
+            )
+        if removed and batch.rejections and (written or batch.keep_ids):
+            # The partial case (#5057): some children were rejected and the
+            # write removed rows while keeping others.  Not refused (the
+            # rejected rulings may be the ones that should go), but recorded
+            # so a run that drops a large share of a key's rulings over
+            # rejections shows up.
+            logger.warning(
+                "Split set write removed rulings while rejecting children",
+                extra={
+                    "telemetry_event": REJECTIONS_REMOVED_ROWS_EVENT,
+                    "document_id": parent_document_id,
+                    "s3_key": s3_key,
+                    "county": event_data.get("county"),
+                    "held_before": held,
+                    "removed": len(removed),
+                    "removed_fraction": round(len(removed) / held, 3) if held else None,
+                    "written": len(written),
+                    "rejected": len(batch.rejections),
+                    "rejection_reasons": sorted({r["reason"] for r in batch.rejections}),
+                    "replace_set": event_data.get(REPLACE_SPLIT_SET_KEY) is True,
                 },
             )
         for document_id in written:
@@ -5840,6 +6004,84 @@ class IngestionWorker:
             rollback_first=True,
         )
 
+    def _refuse_empty_split_set(
+        self,
+        event_data: dict[str, Any],
+        parent_document_id: str,
+        batch: _SplitBatch,
+        held: int,
+    ) -> bool:
+        """Refuse a split set that would remove a key's *held* rulings
+        because every child was rejected (#5057); return True when refused.
+
+        Called by ``_write_split_batch`` for a split that writes nothing
+        (``_writes_nothing``) on a key whose rows of this parent hold
+        rulings.  The rejections (validation, the all-NULL guard, a child
+        that raised) are no verdict that the document holds no rulings: a
+        tightened rule, an event missing a field the live capture had, or a
+        parser regression rejects every child the same way, and replacing
+        the key's rows would delete good rulings with a warning as the only
+        trace (#5026: 106 federal rulings).
+
+        Refused, nothing is written or removed.  The key is recorded
+        ``all_children_rejected`` in ``telemetry.ingest_incomplete`` (with
+        the rejections), so the dashboard shows it and the raw-key
+        reconciler retries it under its attempt cap.  A split-set
+        replacement (reingest / rebuild) then raises
+        ``AllChildrenRejectedError`` so the run counts the key failed; a
+        live capture returns.
+
+        An event carrying ``ALLOW_RULING_REMOVAL_KEY`` (a reingest / rebuild
+        run with ``--allow-ruling-removal``: a rule tightening meant to
+        remove rows) is not refused: the removal is logged as a warning and
+        the write goes ahead.
+        """
+        s3_key = event_data.get("s3_key")
+        replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
+        reasons = Counter(r.get("reason", "unknown") for r in batch.rejections)
+        log_extra = {
+            "document_id": parent_document_id,
+            "s3_key": s3_key,
+            "county": event_data.get("county"),
+            "scraper_id": event_data.get("scraper_id"),
+            "held_rulings": held,
+            "rejected": len(batch.rejections),
+            "rejection_reasons": dict(reasons),
+            "whole_document": batch.whole_document,
+            "replace_set": replace_set,
+        }
+        if event_data.get(ALLOW_RULING_REMOVAL_KEY) is True:
+            logger.warning(
+                "Removing a key's rulings: every child was rejected and "
+                "--allow-ruling-removal is set",
+                extra={"telemetry_event": EMPTY_SPLIT_SET_ALLOWED_EVENT, **log_extra},
+            )
+            return False
+        logger.warning(
+            "Refused to replace a key's rulings with an empty split set: every "
+            "child was rejected; the rows are kept",
+            extra={"telemetry_event": EMPTY_SPLIT_SET_REFUSED_EVENT, **log_extra},
+        )
+        self._record_incomplete_and_commit(
+            {**event_data, "document_id": parent_document_id},
+            INCOMPLETE_ALL_CHILDREN_REJECTED,
+            {
+                "held_rulings": held,
+                "rejected": len(batch.rejections),
+                "rejection_reasons": dict(reasons),
+                "rejections": batch.rejections[:_MAX_REJECTIONS_IN_DETAIL],
+                "whole_document": batch.whole_document,
+                "replace_set": replace_set,
+            },
+        )
+        if replace_set:
+            noted = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "no reason noted"
+            raise AllChildrenRejectedError(
+                f"{s3_key or parent_document_id}: every child was rejected ({noted}); "
+                f"kept {held} ruling(s)"
+            )
+        return True
+
     def _key_has_rows(self, s3_key: str) -> bool:
         """Whether any document row is stored for *s3_key*."""
         conn = self._get_connection()
@@ -5927,6 +6169,17 @@ class IngestionWorker:
                 batch.keep_ids.add(str(split_event["document_id"]))
                 # The split set is incomplete: recorded with the write (#5008).
                 batch.exhausted_ids.add(str(split_event["document_id"]))
+            else:
+                # The child writes nothing: a rejection like a validation
+                # failure, so an all-rejected split keeps the key's rows
+                # (#5057).
+                batch.rejections.append(
+                    {
+                        "document_id": str(split_event["document_id"]),
+                        "reason": "error",
+                        "error": f"{type(exc).__name__}: {exc}"[:200],
+                    }
+                )
             raise
 
     def _split_document(
@@ -6496,6 +6749,10 @@ class IngestionWorker:
                 extraction_method == "multimodal" or (ruling_text or "").strip()
             ):
                 batch.whole_document = True
+                # The extractor's verdict that the document holds no
+                # rulings: a whole document rejected by validation then
+                # empties the key, as a fresh ingest leaves it (#5057).
+                batch.no_rulings_verdict = True
             elif multimodal_error is not None or not self._extraction_required:
                 batch.extraction_failed = multimodal_error
             else:
