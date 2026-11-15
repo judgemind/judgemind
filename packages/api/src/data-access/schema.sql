@@ -984,6 +984,25 @@ CREATE SEQUENCE telemetry.data_quality_metrics_id_seq
 ALTER SEQUENCE telemetry.data_quality_metrics_id_seq OWNED BY telemetry.data_quality_metrics.id;
 
 
+CREATE TABLE telemetry.ingest_incomplete (
+    s3_key text NOT NULL,
+    reason text NOT NULL,
+    county text,
+    scraper_id text,
+    document_id text,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    first_recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    occurrences integer DEFAULT 1 NOT NULL,
+    retry_attempts integer DEFAULT 0 NOT NULL,
+    last_retry_at timestamp with time zone,
+    stuck_at timestamp with time zone
+);
+
+
+COMMENT ON TABLE telemetry.ingest_incomplete IS 'One row per raw S3 key whose stored rows are not a complete split (single_document_fallback, partial_split, exhausted_child, dead_letter, reingest_failed). Deleted by a later complete write of the key. Re-ingested by scripts/reconcile_raw_keys.py up to its attempt cap. Issue #5008.';
+
+
 CREATE TABLE telemetry.ingest_skips (
     s3_key text NOT NULL,
     reason text NOT NULL,
@@ -1010,7 +1029,9 @@ CREATE TABLE telemetry.raw_reconcile_counts (
     pending integer DEFAULT 0 NOT NULL,
     dated_excluded integer DEFAULT 0 NOT NULL,
     skipped_by_reason jsonb DEFAULT '{}'::jsonb NOT NULL,
-    unrepresented_by_day jsonb DEFAULT '{}'::jsonb NOT NULL
+    unrepresented_by_day jsonb DEFAULT '{}'::jsonb NOT NULL,
+    incomplete integer DEFAULT 0 NOT NULL,
+    incomplete_stuck integer DEFAULT 0 NOT NULL
 );
 
 
@@ -1029,7 +1050,9 @@ CREATE TABLE telemetry.raw_reconcile_runs (
     dated_excluded integer DEFAULT 0 NOT NULL,
     action text DEFAULT 'none'::text NOT NULL,
     key_list_uri text,
-    detail jsonb DEFAULT '{}'::jsonb NOT NULL
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    incomplete integer DEFAULT 0 NOT NULL,
+    incomplete_stuck integer DEFAULT 0 NOT NULL
 );
 
 
@@ -1361,6 +1384,10 @@ ALTER TABLE ONLY telemetry.data_quality_metrics
     ADD CONSTRAINT data_quality_metrics_pkey PRIMARY KEY (id);
 
 
+ALTER TABLE ONLY telemetry.ingest_incomplete
+    ADD CONSTRAINT ingest_incomplete_pkey PRIMARY KEY (s3_key);
+
+
 ALTER TABLE ONLY telemetry.ingest_skips
     ADD CONSTRAINT ingest_skips_pkey PRIMARY KEY (s3_key);
 
@@ -1593,6 +1620,9 @@ CREATE INDEX idx_staging_ruled_status ON staging.ruled_items USING btree (valida
 
 
 CREATE INDEX idx_dqm_county_metric_time ON telemetry.data_quality_metrics USING btree (county, metric_name, recorded_at DESC);
+
+
+CREATE INDEX idx_ingest_incomplete_reason ON telemetry.ingest_incomplete USING btree (reason);
 
 
 CREATE INDEX idx_ingest_skips_reason ON telemetry.ingest_skips USING btree (reason);

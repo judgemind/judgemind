@@ -105,6 +105,12 @@ export const RAW_KEY_RECONCILIATION_QUERY = gql`
       unrepresented
       pending
       datedExcluded
+      incomplete
+      incompleteStuck
+      incompleteByReason {
+        reason
+        count
+      }
       action
       scopes {
         scope
@@ -114,6 +120,8 @@ export const RAW_KEY_RECONCILIATION_QUERY = gql`
         unrepresented
         pending
         datedExcluded
+        incomplete
+        incompleteStuck
         skippedByReason {
           reason
           count
@@ -133,6 +141,9 @@ export interface RawKeyReconcileScopeItem {
   unrepresented: number;
   pending: number;
   datedExcluded: number;
+  /** Keys whose rows are not a complete split, under / at the retry cap (#5008). */
+  incomplete: number;
+  incompleteStuck: number;
   skippedByReason: { reason: string; count: number }[];
   oldestUnrepresentedDay: string | null;
   newestUnrepresentedDay: string | null;
@@ -148,6 +159,9 @@ export interface RawKeyReconciliationRun {
   unrepresented: number;
   pending: number;
   datedExcluded: number;
+  incomplete: number;
+  incompleteStuck: number;
+  incompleteByReason: { reason: string; count: number }[];
   action: string;
   scopes: RawKeyReconcileScopeItem[];
 }

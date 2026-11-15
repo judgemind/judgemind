@@ -479,6 +479,52 @@ def test_partial_live_capture_of_a_new_key_writes_the_answered_rows() -> None:
     assert events["harness.partial_new_key_written"] > 0, dict(events)
 
 
+# ---------------------------------------------------------------------------
+# Durable incomplete records (#5008)
+# ---------------------------------------------------------------------------
+
+
+@_needs_pg
+def test_retry_marker_single_document_fallback_then_cleared() -> None:
+    """A live new key whose extraction fails is written whole and recorded
+    ``single_document_fallback``; the complete split that follows clears the
+    record (``marker``, #5008)."""
+    events = harness.run_new_key_fallback(_DSN, 0, _RUN, name="marker-fallback")
+    assert events["harness.marker.single_document_fallback"] > 0, dict(events)
+    assert events["harness.marker.cleared"] > 0, dict(events)
+
+
+@_needs_pg
+def test_retry_marker_partial_split_then_cleared() -> None:
+    """A live new key whose split is partial writes the answered parts and
+    is recorded ``partial_split``; a later complete split clears it (#5008)."""
+    events = harness.run_partial_extraction(_DSN, 0, _RUN, kind="new-live", name="marker-part")
+    assert events["harness.marker.partial_split"] > 0, dict(events)
+    assert events["harness.marker.cleared"] > 0, dict(events)
+
+
+@_needs_pg
+def test_retry_marker_reingest_failed() -> None:
+    """A reingest that refuses a partial split records ``reingest_failed``,
+    so the key is retried after the failed manifest expires (#5008)."""
+    events = harness.run_partial_extraction(_DSN, 0, _RUN, kind="reingest", name="marker-reingest")
+    assert events["harness.marker.reingest_failed"] > 0, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize(
+    "splitter",
+    harness.DETERMINISTIC_SPLITTERS,
+    ids=[s.name for s in harness.DETERMINISTIC_SPLITTERS],
+)
+def test_retry_marker_exhausted_child(splitter: harness.DeterministicSplitter) -> None:
+    """A split whose child's enrichment is exhausted records
+    ``exhausted_child`` (#4878, #5008).  ``test_exhausted_enrichment_keeps_child_ruling``
+    enforces it on every seed; this pins that the branch is reached."""
+    events = harness.run_enrichment_failure(_DSN, splitter, 0, _RUN)
+    assert events["harness.marker.exhausted_child"] > 0, dict(events)
+
+
 #: A default-set seed per partial-extraction branch the generated stream
 #: reaches (#5000), with the events that show it: a multimodal county's
 #: reingest and a text-first county's reingest, each reported failed.

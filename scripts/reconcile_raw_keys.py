@@ -29,6 +29,23 @@ only: no object is read) and sorts each one into a category:
                      ``validation_fail_by_document_id`` (#5023).
 - ``pending``        captured within ``--grace-hours`` (default 6): the
                      worker may not have processed it yet.
+- ``incomplete``     a ``telemetry.ingest_incomplete`` row (#5008): the key's
+                     rows are not a complete split (a live new key written
+                     whole or partially after a failed extraction, an
+                     exhausted split child, a dead-lettered event, a reingest
+                     that refused an incomplete extraction).  Checked first:
+                     a fallback row would otherwise count as represented.
+                     Re-ingested with the unrepresented keys, oldest first,
+                     as many as fit beside them under ``--max-auto-reingest``
+                     (they never make a run ``over_threshold``; the rest
+                     wait for the next run).  A reingest that runs to the
+                     end counts one ``retry_attempts``, and a complete
+                     reingest deletes the row (the worker).
+- ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
+                     (default 3): reported, not retried.  Keys that just
+                     reached the cap set ``issue_needed`` once (``stuck_at``
+                     is stamped); ``--reset-incomplete-attempts`` makes them
+                     retryable again after a fix.
 - ``unrepresented``  none of the above: a capture that never reached the
                      database.  These are the keys to reingest.
 
@@ -168,7 +185,18 @@ INTENTIONAL_SKIP_PREFIXES: dict[str, str] = {
 #: ``ingestion.ruling_guards.NON_RULING_PDF_DROPPED_METRIC`` (all-NULL guard).
 NON_RULING_PDF_DROPPED_METRIC = "non_ruling_pdf_dropped"
 
-CATEGORIES = ("represented", "skipped", "pending", "unrepresented")
+CATEGORIES = (
+    "represented",
+    "skipped",
+    "pending",
+    "incomplete",
+    "incomplete_stuck",
+    "unrepresented",
+)
+
+#: Reingest attempts after which an incomplete key is reported as stuck
+#: rather than retried again (#5008).
+DEFAULT_MAX_INCOMPLETE_ATTEMPTS = 3
 
 #: Where the oneshot task role may read and write key lists (#4803).
 KEY_LIST_DIR = "tmp/keys/"
@@ -213,6 +241,9 @@ class Explained:
     #: document ids of failed validation rows with no ``s3_key`` (written
     #: before #4773 added the column, #5023).
     validation_fail_documents: set[str] = field(default_factory=set)
+    #: s3_key -> (reason, retry_attempts), from ``telemetry.ingest_incomplete``:
+    #: keys whose rows are not a complete split (#5008).
+    incomplete: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -220,8 +251,13 @@ class ScopeReport:
     scope: str
     counts: Counter[str] = field(default_factory=Counter)
     skipped_by_reason: Counter[str] = field(default_factory=Counter)
+    #: Incomplete keys (retryable and stuck) by recorded reason (#5008).
+    incomplete_by_reason: Counter[str] = field(default_factory=Counter)
     dated_excluded: int = 0
     unrepresented: list[RawKey] = field(default_factory=list)
+    #: Incomplete keys under the attempt cap: re-ingested with the
+    #: unrepresented ones (#5008).
+    incomplete: list[RawKey] = field(default_factory=list)
 
     def unrepresented_by_day(self) -> dict[str, int]:
         return dict(sorted(Counter(k.day for k in self.unrepresented).items()))
@@ -231,6 +267,7 @@ class ScopeReport:
         out["raw"] = sum(self.counts.get(c, 0) for c in CATEGORIES)
         out["dated_excluded"] = self.dated_excluded
         out["skipped_by_reason"] = dict(sorted(self.skipped_by_reason.items()))
+        out["incomplete_by_reason"] = dict(sorted(self.incomplete_by_reason.items()))
         out["unrepresented_by_month"] = dict(
             sorted(Counter(k.day[:7] for k in self.unrepresented).items())
         )
@@ -360,10 +397,28 @@ def raw_key_document_id(key: str) -> str | None:
 
 
 def classify(
-    raw: RawKey, explained: Explained, *, now: datetime, grace: timedelta
+    raw: RawKey,
+    explained: Explained,
+    *,
+    now: datetime,
+    grace: timedelta,
+    max_incomplete_attempts: int = DEFAULT_MAX_INCOMPLETE_ATTEMPTS,
 ) -> tuple[str, str | None]:
-    """``(category, skip reason)`` for one raw key."""
+    """``(category, reason)`` for one raw key.
+
+    An incomplete record comes first (#5008): a fallback or partial
+    document row makes the key look represented, and a dead-lettered key
+    is otherwise just unrepresented.  Under the attempt cap it is
+    ``incomplete`` (re-ingested); at the cap, ``incomplete_stuck``
+    (reported, not retried).  The reason is the recorded one.
+    """
     key = raw.key
+    incomplete = explained.incomplete.get(key)
+    if incomplete is not None:
+        reason, attempts = incomplete
+        if attempts >= max_incomplete_attempts:
+            return "incomplete_stuck", reason
+        return "incomplete", reason
     if key in explained.documents:
         return "represented", None
     reason = explained.skips.get(key)
@@ -402,11 +457,18 @@ def reconcile(
     grace: timedelta,
     dated: Counter[str] | None = None,
     placeholder_check: Callable[[RawKey], bool] | None = None,
+    max_incomplete_attempts: int = DEFAULT_MAX_INCOMPLETE_ATTEMPTS,
 ) -> dict[str, ScopeReport]:
     reports: dict[str, ScopeReport] = {}
     for raw in keys:
         rep = reports.setdefault(raw.scope, ScopeReport(raw.scope))
-        category, reason = classify(raw, explained, now=now, grace=grace)
+        category, reason = classify(
+            raw,
+            explained,
+            now=now,
+            grace=grace,
+            max_incomplete_attempts=max_incomplete_attempts,
+        )
         if (
             category == "unrepresented"
             and placeholder_check is not None
@@ -416,14 +478,19 @@ def reconcile(
         ):
             category, reason = "skipped", "santa_clara_placeholder"
         rep.counts[category] += 1
-        if reason:
+        if category in ("incomplete", "incomplete_stuck"):
+            rep.incomplete_by_reason[reason or "unknown"] += 1
+        elif reason:
             rep.skipped_by_reason[reason] += 1
         if category == "unrepresented":
             rep.unrepresented.append(raw)
+        elif category == "incomplete":
+            rep.incomplete.append(raw)
     for scope, n in (dated or {}).items():
         reports.setdefault(scope, ScopeReport(scope)).dated_excluded = n
     for rep in reports.values():
         rep.unrepresented.sort(key=lambda k: (k.utc, k.key))
+        rep.incomplete.sort(key=lambda k: (k.utc, k.key))
     return reports
 
 
@@ -509,7 +576,72 @@ def fetch_explained(conn: Any) -> Explained:
         print(
             f"WARNING telemetry.ingest_skips unreadable ({exc}); no skip records used"
         )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT s3_key, reason, retry_attempts FROM telemetry.ingest_incomplete"
+            )
+            explained.incomplete = {
+                row[0]: (str(row[1]), int(row[2] or 0)) for row in cur.fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 — table not migrated yet
+        conn.rollback()
+        print(
+            f"WARNING telemetry.ingest_incomplete unreadable ({exc}); "
+            "no incomplete records used"
+        )
     return explained
+
+
+def count_incomplete_attempts(conn: Any, keys: Sequence[str]) -> None:
+    """Count one reingest attempt for each incomplete key about to be
+    re-ingested (#5008).  A complete reingest deletes the record (the
+    worker), so the count only survives for a key that stays incomplete."""
+    if not keys:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE telemetry.ingest_incomplete "
+            "SET retry_attempts = retry_attempts + 1, last_retry_at = now() "
+            "WHERE s3_key = ANY(%s)",
+            (list(keys),),
+        )
+    conn.commit()
+
+
+def mark_newly_stuck(conn: Any, keys: Sequence[str]) -> list[str]:
+    """Stamp ``stuck_at`` on the stuck keys not stamped yet; return them.
+
+    The issue is filed or updated once when keys become stuck, not on every
+    run they stay stuck (#5008).
+    """
+    if not keys:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE telemetry.ingest_incomplete SET stuck_at = now() "
+            "WHERE s3_key = ANY(%s) AND stuck_at IS NULL RETURNING s3_key",
+            (list(keys),),
+        )
+        newly = [row[0] for row in cur.fetchall()]
+    conn.commit()
+    return newly
+
+
+def reset_incomplete_attempts(conn: Any, max_attempts: int) -> int:
+    """Make every stuck incomplete key (at *max_attempts*, or stamped
+    ``stuck_at``) retryable again after a fix (e.g. #5007); return how many
+    were reset.  Keys still under the cap keep their count."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE telemetry.ingest_incomplete "
+            "SET retry_attempts = 0, stuck_at = NULL "
+            "WHERE retry_attempts >= %s OR stuck_at IS NOT NULL RETURNING s3_key",
+            (max_attempts,),
+        )
+        n = len(cur.fetchall())
+    conn.commit()
+    return n
 
 
 def fetch_recent_runs(conn: Any, n: int) -> list[tuple[int, str]]:
@@ -541,8 +673,9 @@ def record_run(
             """
             INSERT INTO telemetry.raw_reconcile_runs
                 (started_at, raw_keys, represented, skipped, unrepresented,
-                 pending, dated_excluded, action, key_list_uri, detail)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 pending, dated_excluded, action, key_list_uri, detail,
+                 incomplete, incomplete_stuck)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
             RETURNING run_id
             """,
             (
@@ -556,6 +689,8 @@ def record_run(
                 action,
                 key_list_uri,
                 json.dumps(detail, default=str),
+                total["incomplete"],
+                total["incomplete_stuck"],
             ),
         )
         row = cur.fetchone()
@@ -567,8 +702,9 @@ def record_run(
                 """
                 INSERT INTO telemetry.raw_reconcile_counts
                     (run_id, scope, raw_keys, represented, skipped, unrepresented,
-                     pending, dated_excluded, skipped_by_reason, unrepresented_by_day)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                     pending, dated_excluded, skipped_by_reason, unrepresented_by_day,
+                     incomplete, incomplete_stuck)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
                 """,
                 (
                     run_id,
@@ -581,6 +717,8 @@ def record_run(
                     s["dated_excluded"],
                     json.dumps(s["skipped_by_reason"]),
                     json.dumps(rep.unrepresented_by_day()),
+                    s["incomplete"],
+                    s["incomplete_stuck"],
                 ),
             )
     conn.commit()
@@ -616,17 +754,26 @@ def decide_action(
     persist_runs: int,
     reingest: bool,
     defer: bool,
+    incomplete: int = 0,
 ) -> str:
-    """What to do about *unrepresented* keys, given ``(unrepresented,
-    action)`` of the previous recorded runs, newest first.
+    """What to do about *unrepresented* keys and this run's batch of
+    *incomplete* (retryable) keys, given ``(unrepresented, action)`` of the
+    previous recorded runs, newest first.  Both are re-ingested together
+    (#5008).
+
+    Only the unrepresented keys decide ``over_threshold``: the caller sizes
+    the incomplete batch to the threshold's remaining room
+    (:func:`incomplete_batch`), so a backlog of incomplete keys drains a
+    batch a day and never blocks the unrepresented heal.
 
     ``persistent`` still re-ingests (new losses keep healing), and also
     files the issue: each of the previous ``persist_runs - 1`` runs already
-    re-ingested and the keys are back.  Runs that did not re-ingest
-    (deferred, report-only, over the threshold) do not count as a failed
-    heal.
+    re-ingested and unrepresented keys are back.  Runs that did not
+    re-ingest (deferred, report-only, over the threshold) do not count as a
+    failed heal.  Incomplete keys do not make a run persistent: their
+    attempt cap reports them as stuck instead.
     """
-    if unrepresented == 0:
+    if unrepresented + incomplete == 0:
         return "none"
     if unrepresented > max_auto_reingest:
         return "over_threshold"
@@ -636,7 +783,8 @@ def decide_action(
         return "reingest_deferred"
     earlier = list(previous[: max(0, persist_runs - 1)])
     if (
-        persist_runs > 1
+        unrepresented > 0
+        and persist_runs > 1
         and len(earlier) == persist_runs - 1
         and all(n > 0 and action in REINGEST_ACTIONS for n, action in earlier)
     ):
@@ -644,12 +792,31 @@ def decide_action(
     return "reingest"
 
 
-def reingest_groups(reports: dict[str, ScopeReport]) -> dict[str, list[str]]:
-    """Unrepresented keys grouped by top-level ``<state>/`` prefix."""
+def incomplete_batch(
+    reports: dict[str, ScopeReport], unrepresented: int, max_auto_reingest: int
+) -> list[RawKey]:
+    """The incomplete (retryable) keys this run re-ingests, oldest first:
+    as many as fit beside the unrepresented ones under
+    *max_auto_reingest* (#5008).  The rest wait for the next run."""
+    room = max(0, max_auto_reingest - unrepresented)
+    keys = sorted(
+        (raw for rep in reports.values() for raw in rep.incomplete),
+        key=lambda k: (k.utc, k.key),
+    )
+    return keys[:room]
+
+
+def reingest_groups(
+    reports: dict[str, ScopeReport], incomplete: Sequence[RawKey] = ()
+) -> dict[str, list[str]]:
+    """Unrepresented keys, then the run's *incomplete* batch, grouped by
+    top-level ``<state>/`` prefix."""
     groups: dict[str, list[str]] = {}
     for scope in sorted(reports):
         for raw in reports[scope].unrepresented:
             groups.setdefault(f"{raw.state}/", []).append(raw.key)
+    for raw in incomplete:
+        groups.setdefault(f"{raw.state}/", []).append(raw.key)
     return groups
 
 
@@ -734,7 +901,8 @@ def run(
         f"DB documents={len(explained.documents)} skips={len(explained.skips)} "
         f"validation_fail={len(explained.validation_fail)} "
         f"validation_fail_by_document_id={len(explained.validation_fail_documents)} "
-        f"all_null_guard={len(explained.all_null_guard)}"
+        f"all_null_guard={len(explained.all_null_guard)} "
+        f"incomplete={len(explained.incomplete)}"
     )
 
     placeholder_check = None
@@ -755,6 +923,7 @@ def run(
         grace=timedelta(hours=args.grace_hours),
         dated=dated,
         placeholder_check=placeholder_check,
+        max_incomplete_attempts=args.max_incomplete_attempts,
     )
 
     for scope in sorted(reports):
@@ -764,6 +933,9 @@ def run(
             out(f"UNREPRESENTED_DAYS {scope}: {json.dumps(rep.unrepresented_by_day())}")
         for raw in rep.unrepresented[: args.sample]:
             out(f"UNREPRESENTED {scope} day={raw.day} key={raw.key}")
+        for raw in rep.incomplete[: args.sample]:
+            reason, attempts = explained.incomplete[raw.key]
+            out(f"INCOMPLETE {scope} reason={reason} attempts={attempts} key={raw.key}")
         if args.write_keys and rep.unrepresented:
             chunks = chunked([k.key for k in rep.unrepresented], args.chunk_size)
             for uri, chunk in zip(
@@ -782,6 +954,7 @@ def run(
     previous: list[tuple[int, str]] = []
     if conn is not None:
         previous = fetch_recent_runs(conn, max(0, args.persist_runs - 1))
+    batch = incomplete_batch(reports, total["unrepresented"], args.max_auto_reingest)
     action = decide_action(
         total["unrepresented"],
         previous,
@@ -789,17 +962,35 @@ def run(
         persist_runs=args.persist_runs if conn is not None else 0,
         reingest=args.reingest,
         defer=args.defer_reingest,
+        incomplete=len(batch),
     )
     top = sorted(
         ((rep.scope, rep.counts.get("unrepresented", 0)) for rep in reports.values()),
         key=lambda t: (-t[1], t[0]),
     )
+    incomplete_by_reason: Counter[str] = Counter()
+    for rep in reports.values():
+        incomplete_by_reason.update(rep.incomplete_by_reason)
+    stuck_keys = [
+        raw.key
+        for raw in keys
+        if raw.key in explained.incomplete
+        and explained.incomplete[raw.key][1] >= args.max_incomplete_attempts
+    ]
+    newly_stuck = mark_newly_stuck(conn, stuck_keys) if conn is not None else []
+    for key in newly_stuck[: args.sample]:
+        out(f"INCOMPLETE_STUCK reason={explained.incomplete[key][0]} key={key}")
     detail: dict[str, Any] = {
         "other": dict(sorted(other.items())),
         "previous_unrepresented": [n for n, _ in previous],
         "previous_actions": [a for _, a in previous],
         "top_scopes": [[s, n] for s, n in top if n > 0][:10],
         "max_auto_reingest": args.max_auto_reingest,
+        "max_incomplete_attempts": args.max_incomplete_attempts,
+        "incomplete_by_reason": dict(sorted(incomplete_by_reason.items())),
+        "incomplete_batch": len(batch),
+        "newly_stuck": len(newly_stuck),
+        "newly_stuck_sample": newly_stuck[:10],
     }
 
     script = None
@@ -826,18 +1017,34 @@ def run(
         stamp = started_at.strftime("%Y%m%dT%H%MZ")
         try:
             detail["reingest"] = launch_reingest(
-                args, s3, reingest_groups(reports), script, stamp, out, runner=runner
+                args,
+                s3,
+                reingest_groups(reports, batch),
+                script,
+                stamp,
+                out,
+                runner=runner,
             )
         except Exception as exc:  # noqa: BLE001 — recorded, then reported as failed
             action = "reingest_failed"
             detail["reingest_error"] = f"{type(exc).__name__}: {exc}"
+        if conn is not None and "reingest" in detail:
+            # One attempt per incomplete key whose prefix's reingest ran to
+            # the end (exit 0; per-key failures do not change the exit, so
+            # the worker's record decides).  A reingest that crashed was no
+            # attempt.  Past the cap the key is reported as stuck (#5008).
+            finished = {r["prefix"] for r in detail["reingest"] if r.get("exit") == 0}
+            count_incomplete_attempts(
+                conn, [raw.key for raw in batch if f"{raw.state}/" in finished]
+            )
         if conn is not None and run_id is not None:
             update_run(conn, run_id, action, detail)
 
     result = {
         "run_id": run_id,
         "action": action,
-        "issue_needed": action in ISSUE_ACTIONS,
+        # Keys that just reached the attempt cap are reported once (#5008).
+        "issue_needed": action in ISSUE_ACTIONS or bool(newly_stuck),
         **total,
         **detail,
     }
@@ -901,6 +1108,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--persist-runs", type=int, default=3)
     parser.add_argument("--reingest-concurrency", type=int, default=4)
     parser.add_argument("--reingest-script", default=None)
+    parser.add_argument(
+        "--max-incomplete-attempts",
+        type=int,
+        default=DEFAULT_MAX_INCOMPLETE_ATTEMPTS,
+        help="Reingest attempts after which an incomplete key is reported as stuck.",
+    )
+    parser.add_argument(
+        "--reset-incomplete-attempts",
+        action="store_true",
+        help="Make every stuck incomplete key retryable again (after a fix) before the run.",
+    )
     args = parser.parse_args(argv)
     if args.since and args.until and args.since > args.until:
         parser.error("--since is after --until")
@@ -908,6 +1126,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--prefix must end with /")
     if args.reingest and not args.record:
         parser.error("--reingest needs --record (the threshold reads the run history)")
+    if args.reset_incomplete_attempts and not args.record:
+        parser.error(
+            "--reset-incomplete-attempts needs --record (it writes the database)"
+        )
     if args.record and (args.prefix or args.county or args.since or args.until):
         parser.error(
             "--record is for full runs only (no --prefix/--county/--since/--until)"
@@ -928,6 +1150,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     s3 = boto3.client("s3")
     with psycopg.connect(database_url) as conn:
+        if args.reset_incomplete_attempts:
+            n = reset_incomplete_attempts(conn, args.max_incomplete_attempts)
+            print(f"RESET_INCOMPLETE_ATTEMPTS {n}", flush=True)
         explained = fetch_explained(conn)
         conn.commit()
         outcome = run(

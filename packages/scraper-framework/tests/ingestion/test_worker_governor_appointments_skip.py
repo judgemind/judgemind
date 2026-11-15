@@ -111,12 +111,14 @@ class TestGovernorAppointmentsSkip:
         assert result is None, f"Expected None but got {result!r}"
 
         # (b) No document or ruling write: the only statements are the skip
-        # record's savepoint + upsert (#5015), then a commit.
+        # record's savepoint + upsert (#5015) and, a skip being a verdict,
+        # the incomplete record's clear (#5008), then a commit.
         mock_psycopg.connect.assert_not_called()
         cur = mock_get_conn.return_value.cursor.return_value.__enter__.return_value
         sqls = [c.args[0] for c in cur.execute.call_args_list]
-        assert len(sqls) == 3, sqls
+        assert len(sqls) == 6, sqls
         assert "INSERT INTO telemetry.ingest_skips" in sqls[1]
+        assert "DELETE FROM telemetry.ingest_incomplete" in sqls[4]
         assert not any("documents" in s or "rulings" in s for s in sqls)
         mock_get_conn.return_value.commit.assert_called_once()
 

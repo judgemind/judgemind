@@ -128,6 +128,15 @@ from .extract import (
     strip_trailing_case_number,
     strip_trailing_connectors,
 )
+from .ingest_incomplete import (
+    INCOMPLETE_DEAD_LETTER,
+    INCOMPLETE_EXHAUSTED_CHILD,
+    INCOMPLETE_PARTIAL_SPLIT,
+    INCOMPLETE_REINGEST_FAILED,
+    INCOMPLETE_SINGLE_DOCUMENT_FALLBACK,
+    clear_ingest_incomplete,
+    record_ingest_incomplete,
+)
 from .ingest_skips import (
     SKIP_GOVERNOR_BIO_ROUTE,
     SKIP_NO_EXTRACTABLE_TEXT,
@@ -241,6 +250,12 @@ REPLACE_SPLIT_SET_KEY = "_replace_split_set"
 #: through the split-set write, so the key's earlier split children are
 #: replaced like any re-split's.
 WHOLE_DOCUMENT_KEY = "_whole_document"
+
+#: Event key on a live capture of a new key written whole because its split
+#: extraction failed (``single_document_fallback``, #4948).  The key's
+#: ``telemetry.ingest_incomplete`` record is already written, so the
+#: document's write must not clear it as a complete one (#5008).
+INCOMPLETE_FALLBACK_KEY = "_incomplete_fallback"
 
 #: ``telemetry_event`` of the warning logged when a document's split
 #: extraction failed (#4948): an extractor's API call failed, so the result
@@ -1758,6 +1773,30 @@ class _SplitBatch:
     extraction_failed: str | None = None
     pre_split: SplitSet | None = None
     extractor_unavailable: bool = False
+    #: Children whose per-child enrichment was exhausted this pass (#4878):
+    #: the split set is not complete (#5008).
+    exhausted_ids: set[str] = field(default_factory=set)
+    #: Set when the split writes an incomplete result on purpose (a live
+    #: new key's partial extraction, #5000): the reason recorded in
+    #: ``telemetry.ingest_incomplete`` with the write (#5008).
+    incomplete_reason: str | None = None
+    incomplete_detail: dict[str, Any] = field(default_factory=dict)
+
+
+def _incomplete_split_reason(batch: _SplitBatch) -> str | None:
+    """Why a worker split's write is not a complete split of its key (#5008),
+    or ``None`` when it is.
+
+    Not asked for a scraper's pre-split child (``batch.pre_split``): it is
+    one ruling of a page whose siblings arrive as their own events, so its
+    write says nothing about whether the key is complete, and
+    ``_write_split_batch`` neither records nor clears for it.
+    """
+    if batch.incomplete_reason:
+        return batch.incomplete_reason
+    if batch.exhausted_ids:
+        return INCOMPLETE_EXHAUSTED_CHILD
+    return None
 
 
 def _empty_split_skip_reason(batch: _SplitBatch) -> str | None:
@@ -2152,6 +2191,10 @@ class IngestionWorker:
         # The worker split being extracted, if any: its children are
         # collected here and written together (#4845).
         self._split_batch: _SplitBatch | None = None
+        # Set by ``_leave_key_after_failed_extraction`` when the caller is to
+        # write a live new key's document whole after a failed extraction
+        # (its incomplete record already written, #5008).
+        self._pending_incomplete_fallback = False
 
         # Why each LLM extractor failed to build, by extractor label
         # (#4953).  Named in the error a split raises when one is missing.
@@ -3468,6 +3511,7 @@ class IngestionWorker:
         # and is written below.  A required extractor that cannot be built
         # raises ``ExtractorUnavailableError`` on every event (#4953).
         if not event_data.get("_split_processed") and not event_data.get(WHOLE_DOCUMENT_KEY):
+            self._pending_incomplete_fallback = False
             llm_split = self._llm_split_document(
                 event_data,
                 document_id,
@@ -3479,6 +3523,11 @@ class IngestionWorker:
             if llm_split:
                 # Handled: the split was written, or the key was left alone.
                 return
+            if getattr(self, "_pending_incomplete_fallback", False):
+                # The single-document fallback: its write keeps the key's
+                # incomplete record rather than clearing it (#5008).
+                self._pending_incomplete_fallback = False
+                event_data = {**event_data, INCOMPLETE_FALLBACK_KEY: True}
             # No extractor configured or nothing to extract (``optional``
             # mode), or a live capture of a new key whose extraction failed
             # — continue with single-document processing and per-field
@@ -4933,6 +4982,14 @@ class IngestionWorker:
                 document_ids=[w.document_id],
                 renamed_judge_ids=w.shown_changes.judge_ids,
             )
+            if not w.event_data.get(INCOMPLETE_FALLBACK_KEY) and not w.event_data.get(
+                "_split_processed"
+            ):
+                # A whole document written as the extraction's result is
+                # the key's complete write: an earlier incomplete record
+                # (a dead-letter, say) goes with it (#5008).  The fallback
+                # after a failed extraction keeps its record.
+                clear_ingest_incomplete(conn, w.s3_key)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5113,6 +5170,30 @@ class IngestionWorker:
                     document_id=parent_document_id,
                     detail={"removed_rows": len(removed), "textless_rows": batch.textless_rows},
                 )
+            if s3_key and batch.pre_split is None:
+                # The key's incomplete record follows this write, in its
+                # transaction (#5008): an incomplete split (a partial
+                # extraction, an exhausted child) records why, so the
+                # raw-key reconciler re-splits the key; a complete one
+                # (a verdict of no rulings included) clears an earlier record.
+                incomplete = _incomplete_split_reason(batch)
+                if incomplete:
+                    record_ingest_incomplete(
+                        conn,
+                        s3_key=s3_key,
+                        reason=incomplete,
+                        county=event_data.get("county"),
+                        scraper_id=event_data.get("scraper_id"),
+                        document_id=parent_document_id,
+                        detail={
+                            **batch.incomplete_detail,
+                            "written": len(written),
+                            "exhausted": sorted(batch.exhausted_ids),
+                            "replace_set": event_data.get(REPLACE_SPLIT_SET_KEY) is True,
+                        },
+                    )
+                else:
+                    clear_ingest_incomplete(conn, s3_key)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5420,7 +5501,28 @@ class IngestionWorker:
                 # lost (#5015).  The split wrote nothing, so the commit
                 # only keeps this record and the best-effort telemetry.
                 self._record_skip_and_commit(event_data, SKIP_NO_EXTRACTABLE_TEXT)
+            else:
+                # The key's rows stay as they were, and they may not be a
+                # complete split: record it durably, so the raw-key
+                # reconciler retries the key after the failed manifest
+                # under tmp/keys/ expires (#5008).  On a transaction of its
+                # own: whatever the failed event wrote is rolled back, as
+                # the raise below would have it.
+                self._record_incomplete_and_commit(
+                    event_data,
+                    INCOMPLETE_REINGEST_FAILED,
+                    {"error": reason[:500]},
+                    rollback_first=True,
+                )
             raise error(f"extraction failed for {s3_key or document_id}: {reason[:500]}")
+        if not key_has_rows:
+            # The caller writes the whole document as one ruling: not a
+            # complete split, so record it before that write (#5008).  The
+            # write keeps the record (``INCOMPLETE_FALLBACK_KEY``).
+            self._record_incomplete_and_commit(
+                event_data, INCOMPLETE_SINGLE_DOCUMENT_FALLBACK, {"error": reason[:500]}
+            )
+            self._pending_incomplete_fallback = True
         if key_has_rows:
             # Nothing is written for this event: end the transaction the
             # read opened, keeping the best-effort telemetry rows logged
@@ -5452,12 +5554,55 @@ class IngestionWorker:
                 document_id=event_data.get("document_id"),
                 detail=detail,
             ):
+                # A skip is a verdict on the key: it holds no rulings, which
+                # is complete, so an earlier incomplete record goes (#5008).
+                clear_ingest_incomplete(conn, event_data.get("s3_key"))
                 conn.commit()
         except Exception:  # noqa: BLE001 — the record is best-effort
             logger.warning(
                 "ingest skip record commit failed",
                 exc_info=True,
                 extra={"s3_key": event_data.get("s3_key"), "skip_reason": reason},
+            )
+
+    def _record_incomplete_and_commit(
+        self,
+        event_data: dict[str, Any],
+        reason: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        rollback_first: bool = False,
+    ) -> None:
+        """Record that the event's raw key holds no complete split, and
+        commit (#5008).
+
+        For outcomes that end without a split-set write (a failed reingest,
+        the single-document fallback, a dead-letter).  *rollback_first*
+        drops whatever the failed event left in the transaction (the
+        dead-letter path).  Best-effort: a failure is logged and never fails
+        the event.
+        """
+        if not event_data.get("s3_key"):
+            return
+        try:
+            conn = self._get_connection()
+            if rollback_first:
+                conn.rollback()
+            if record_ingest_incomplete(
+                conn,
+                s3_key=event_data.get("s3_key"),
+                reason=reason,
+                county=event_data.get("county"),
+                scraper_id=event_data.get("scraper_id"),
+                document_id=event_data.get("document_id"),
+                detail=detail,
+            ):
+                conn.commit()
+        except Exception:  # noqa: BLE001 — the record is best-effort
+            logger.warning(
+                "ingest incomplete record commit failed",
+                exc_info=True,
+                extra={"s3_key": event_data.get("s3_key"), "incomplete_reason": reason},
             )
 
     def _key_has_rows(self, s3_key: str) -> bool:
@@ -5474,6 +5619,7 @@ class IngestionWorker:
         county: str,
         reason: str,
         exc: PartialExtractionError,
+        batch: _SplitBatch,
     ) -> list[Any] | None:
         """The rulings to write after a partial extraction (#5000), or None
         to refuse the split as a failed extraction.
@@ -5493,8 +5639,10 @@ class IngestionWorker:
         them with the complete split once every page answers (the per-page
         cache re-sends only the failed pages, #4716); until then the
         reingest refuses its partial result and leaves them.  Logs
-        ``SPLIT_EXTRACTION_FAILED_EVENT`` with ``action=partial_split_written``
-        so the key can be found and retried.
+        ``SPLIT_EXTRACTION_FAILED_EVENT`` with ``action=partial_split_written``,
+        and marks *batch* incomplete so the split-set write records the key
+        in ``telemetry.ingest_incomplete`` and the raw-key reconciler
+        re-splits it (#5008).
         """
         if not exc.rulings or event_data.get(REPLACE_SPLIT_SET_KEY) is True:
             return None
@@ -5515,6 +5663,11 @@ class IngestionWorker:
                 "ruling_count": len(exc.rulings),
             },
         )
+        batch.incomplete_reason = INCOMPLETE_PARTIAL_SPLIT
+        batch.incomplete_detail = {
+            "error": reason[:500],
+            "failed_parts": list(exc.failed_parts or []),
+        }
         return list(exc.rulings)
 
     def _dispatch_split_child(self, batch: _SplitBatch, split_event: dict[str, Any]) -> None:
@@ -5537,6 +5690,8 @@ class IngestionWorker:
 
             if isinstance(exc, LlmEnrichmentExhaustedError):
                 batch.keep_ids.add(str(split_event["document_id"]))
+                # The split set is incomplete: recorded with the write (#5008).
+                batch.exhausted_ids.add(str(split_event["document_id"]))
             raise
 
     def _split_document(
@@ -5890,7 +6045,7 @@ class IngestionWorker:
                     # would swap the page-image split for a text one.
                     reason = f"multimodal: {type(exc).__name__}: {exc}"
                     extracted_rulings = self._partial_rulings_for_new_key(
-                        event_data, document_id, county, reason, exc
+                        event_data, document_id, county, reason, exc, batch
                     )
                     if extracted_rulings is None:
                         batch.extraction_failed = reason
@@ -5980,7 +6135,7 @@ class IngestionWorker:
                 text_error = f"text: {type(exc).__name__}: {exc}"
                 reason = "; ".join(e for e in (multimodal_error, text_error) if e)
                 extracted_rulings = self._partial_rulings_for_new_key(
-                    event_data, document_id, county, reason, exc
+                    event_data, document_id, county, reason, exc, batch
                 )
                 if extracted_rulings is None:
                     batch.extraction_failed = reason
@@ -6720,6 +6875,7 @@ class IngestionWorker:
                         msg_id,
                         exc,
                     )
+                    self._record_dead_letter(event_data, exc, attempts=attempt + 1)
                     self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
                     return
                 attempt += 1
@@ -6739,7 +6895,29 @@ class IngestionWorker:
             self._max_retries,
             last_exc,
         )
+        self._record_dead_letter(event_data, last_exc, attempts=attempt)
         self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+
+    def _record_dead_letter(
+        self, event_data: Any, exc: BaseException | None, *, attempts: int
+    ) -> None:
+        """Record a dead-lettered event's raw key as incomplete (#5008).
+
+        Dead-lettering is only an ``xack``: there is no dead-letter store,
+        so without this record the raw never reaches ``derived.*`` and
+        nothing retries it.  The raw-key reconciler re-ingests the key.
+        """
+        if not isinstance(event_data, dict):
+            return
+        self._record_incomplete_and_commit(
+            event_data,
+            INCOMPLETE_DEAD_LETTER,
+            {
+                "error": f"{type(exc).__name__}: {exc}"[:500] if exc is not None else None,
+                "attempts": attempts,
+            },
+            rollback_first=True,
+        )
 
 
 # ---------------------------------------------------------------------------

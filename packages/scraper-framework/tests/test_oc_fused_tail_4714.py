@@ -504,8 +504,16 @@ def test_worker_failed_extraction_on_live_capture(key_has_rows: bool, written: b
     has_rows.assert_called_once_with(event["s3_key"])
     split_write.assert_not_called()
     assert single_write.called is written
-    # A key left alone ends the read's transaction.
-    assert worker._get_connection().commit.called is not written
+    # A key left alone ends the read's transaction; a new key's fallback
+    # commits its incomplete record before the write (#5008).
+    assert worker._get_connection().commit.called
+    cur = worker._get_connection().cursor.return_value.__enter__.return_value
+    recorded = any(
+        "INSERT INTO telemetry.ingest_incomplete" in c.args[0] for c in cur.execute.call_args_list
+    )
+    assert recorded is written
+    if written:
+        assert single_write.call_args.args[0].event_data["_incomplete_fallback"] is True
 
 
 def test_worker_key_has_rows_reads_the_documents_on_the_key() -> None:

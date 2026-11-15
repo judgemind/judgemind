@@ -89,6 +89,20 @@ properties that must hold for any sequence of re-splits:
 - ``held_printed``: in such a court, no key holds a ruling its last
   extraction did not return (a pre-split capture keeps its earlier
   captures' rulings on other slots).
+- ``explained``: a complete step that leaves its key with no document rows
+  records why (#5015).
+- ``marker``: a step that ends incomplete leaves a durable
+  ``telemetry.ingest_incomplete`` record for its key, and a later complete
+  step clears it (#5008).  A live capture of a new key that takes the
+  fallback (the whole document, or a partial split's answered parts)
+  records ``single_document_fallback`` / ``partial_split``; a split-set
+  replacement that reports the key failed records ``reingest_failed``; a
+  split with an exhausted child records ``exhausted_child``
+  (:func:`run_enrichment_failure`).  A complete step (a verdict of no
+  rulings, or nothing readable, included) leaves no record; a step that
+  writes nothing for another reason (a live capture of a key with rows, an
+  unavailable extractor) leaves the record as it was.  Dead-lettering is
+  outside the harness (``test_ingest_incomplete.py``).
 
 A shared-court scenario also runs ``search_fields`` (a court rename made by
 one key's write re-indexes the other keys' rulings) and ``judge_converge``
@@ -239,8 +253,14 @@ INVARIANTS = (
     "printed_somewhere",
     "held_printed",
     "explained",
+    "marker",
     "error",
 )
+
+#: ``ingestion.ingest_incomplete`` reasons (#5008).
+_MARKER_FALLBACK_REASONS = ("single_document_fallback", "partial_split")
+_MARKER_REINGEST_FAILED = "reingest_failed"
+_MARKER_EXHAUSTED_CHILD = "exhausted_child"
 
 
 #: ``ingestion.worker.SPLIT_EXTRACTION_FAILED_EVENT`` (#4948).
@@ -1281,6 +1301,10 @@ class KeyHarness:
         #: A failing step's extractors cannot be built (#4953), rather than
         #: built and failing every call (#4948).
         self.fail_unavailable = False
+        #: The next steps exhaust a split child's enrichment
+        #: (:func:`run_enrichment_failure`): their split is incomplete, so
+        #: ``marker`` expects an ``exhausted_child`` record (#5008).
+        self.expect_exhausted = False
         #: S3 keys this harness has run a step on.
         self._keys: set[str] = set()
         #: Every judge a ruling on those keys has been on (``_check_votes``).
@@ -1473,6 +1497,7 @@ class KeyHarness:
         spelling_before = dict(self._spelling)
         search_before = self._search_docs(key)
         doc = self._step_doc(step)
+        marker_before = self._incomplete_marker(key)
         outcome = self.expected_outcome(step, has_rows=bool(before_rows))
         self.events[f"harness.outcome.{outcome}"] += 1
         complete = outcome in ("ok", "skipped")
@@ -1578,6 +1603,21 @@ class KeyHarness:
             # A complete step, or one nothing could read, is a verdict on
             # the key; a retryable failure is reported for a retry instead.
             self._guard("explained", self._check_explained, key, after_rows, step_started)
+        if step.kind != "presplit" and outcome != "skipped":
+            # A pre-split child is one ruling of its page, so it says
+            # nothing about the key's completeness; a DB-row reingest of a
+            # key with no rows selects nothing.
+            self._guard(
+                "marker",
+                self._check_marker,
+                key,
+                step,
+                outcome,
+                fallback,
+                reported_failed,
+                marker_before,
+                step_started,
+            )
         if step.kind != "db" and not step.whole and complete:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
@@ -1890,6 +1930,76 @@ class KeyHarness:
                 "(no ingest_skips, validation_results or non_ruling_pdf_dropped row)",
             )
         self.events[f"harness.explained.{found[0]}"] += 1
+
+    def _incomplete_marker(self, key: Key) -> tuple[str, int, datetime] | None:
+        """The key's ``telemetry.ingest_incomplete`` record (#5008):
+        ``(reason, occurrences, last_recorded_at)``, or None."""
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT reason, occurrences, last_recorded_at "
+                "FROM telemetry.ingest_incomplete WHERE s3_key = %s",
+                (key.s3_key,),
+            )
+            row = cur.fetchone()
+        return None if row is None else (row[0], row[1], row[2])
+
+    def _check_marker(
+        self,
+        key: Key,
+        step: Step,
+        outcome: str,
+        fallback: bool,
+        reported_failed: bool,
+        before: tuple[str, int, datetime] | None,
+        since: datetime,
+    ) -> None:
+        """A step that ends incomplete records it durably, and a complete
+        step clears the record (#5008).  Without the record nothing
+        re-splits the key: ``derived.documents`` has no completeness
+        column, and a reingest's failed manifest expires."""
+        after = self._incomplete_marker(key)
+        recorded = after is not None and after[2] >= since
+
+        def expect(reasons: tuple[str, ...], what: str) -> None:
+            if not recorded or after is None or after[0] not in reasons:
+                self._fail(
+                    "marker",
+                    f"{what} left no durable incomplete record for the key "
+                    f"(want {'/'.join(reasons)}, found {after and after[0]!r}"
+                    f"{'' if recorded else ' (not written by this step)'})",
+                )
+            self.events[f"harness.marker.{after[0]}"] += 1
+
+        if self.expect_exhausted:
+            expect((_MARKER_EXHAUSTED_CHILD,), "a split with an exhausted child")
+            return
+        if fallback:
+            expect(_MARKER_FALLBACK_REASONS, "a live capture of a new key that took the fallback")
+            return
+        if outcome == "ok" or (
+            outcome == "failed" and self._unextractable(step) and step.kind != "live"
+        ):
+            # A complete split, or a verdict that nothing is readable.
+            if after is not None:
+                self._fail(
+                    "marker",
+                    f"a complete {step.kind} step left the key's incomplete record "
+                    f"({after[0]!r}), so the reconciler would re-split a complete key",
+                )
+            if before is not None:
+                self.events["harness.marker.cleared"] += 1
+            return
+        if outcome == "failed" and reported_failed:
+            expect((_MARKER_REINGEST_FAILED,), f"a {step.kind} step that reported the key failed")
+            return
+        # Nothing was written for another reason: a live capture of a key
+        # that holds rows, or an extractor that is unavailable.
+        if after != before:
+            self._fail(
+                "marker",
+                f"a {step.kind} step that wrote nothing changed the key's incomplete "
+                f"record: before {before}, after {after}",
+            )
 
     def _check_telemetry(self, key: Key) -> None:
         gone = self._validation_seen - self._validation_ids(key)
@@ -2813,11 +2923,13 @@ def deterministic_split(
 
 def run_enrichment_failure(
     dsn: str, splitter: DeterministicSplitter, seed: int, run_token: str
-) -> None:
+) -> Counter[str]:
     """Ingest a key through *splitter* with enrichment healthy, then re-ingest
     it while enrichment is exhausted for one random child (or, sometimes,
     every child).  Each failed child must keep the document and ruling its
-    slot held (``kept``), and the step must hold the other invariants."""
+    slot held (``kept``), the step must record the key incomplete
+    (``marker``, #5008), and it must hold the other invariants.  Returns the
+    run's event counts."""
     from ingestion.split_ids import split_child_document_id
 
     rng = random.Random(seed)
@@ -2856,7 +2968,11 @@ def run_enrichment_failure(
 
             failing.update(specs[i].text for i in failed)
             second = Step(kinds[1], rows, tuple(specs), (splitter.name, f"fail={failed}"))
-            harness.run_step(key, second, "enrichment exhausted")
+            harness.expect_exhausted = True
+            try:
+                harness.run_step(key, second, "enrichment exhausted")
+            finally:
+                harness.expect_exhausted = False
             after = {r.id: r for r in read_key(harness.checker, key.s3_key)}
             for i, doc_id in zip(failed, child_ids, strict=True):
                 held, now = before[doc_id], after.get(doc_id)
@@ -2870,6 +2986,7 @@ def run_enrichment_failure(
                     )
     finally:
         harness.close()
+    return harness.events
 
 
 # ---------------------------------------------------------------------------
@@ -2924,7 +3041,9 @@ def run_extraction_failure(
         harness.close()
 
 
-def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fallback") -> None:
+def run_new_key_fallback(
+    dsn: str, seed: int, run_token: str, *, name: str = "fallback"
+) -> Counter[str]:
     """A live capture of a new key whose extraction fails, then *seed*'s
     generated sequence (#4970).
 
@@ -2932,11 +3051,12 @@ def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fa
     (``single_document_fallback``, ``_write_one_ruling``).  The sequence
     that follows must hold every invariant and converge: its first split
     replaces the parent row with the split's children.  Raises
-    :class:`InvariantError` on a broken invariant.
+    :class:`InvariantError` on a broken invariant.  Returns the run's event
+    counts.
     """
     steps = generate(seed, extraction_modes=False)
     first = replace(steps[0], kind="live", fail=True, whole=False, ops=("fallback",))
-    run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
+    return run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
 
 
 def run_partial_extraction(

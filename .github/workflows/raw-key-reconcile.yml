@@ -131,14 +131,21 @@ jobs:
           fi
           printf '%s\n' "${line#RECONCILE_RESULT }" > tmp/result.json
           jq . tmp/result.json
+          # Healed: nothing unrepresented and no incomplete key stuck at the
+          # retry cap (#5008). Retryable incomplete keys heal on their own
+          # (live captures add a few every day), so they do not hold the
+          # issue open; a stuck key does, until it is fixed or reset.
+          healed=$(jq -r '((.unrepresented // 0) + (.incomplete_stuck // 0)) == 0' tmp/result.json)
           {
             echo "action=$(jq -r .action tmp/result.json)"
             echo "issue_needed=$(jq -r .issue_needed tmp/result.json)"
             echo "unrepresented=$(jq -r .unrepresented tmp/result.json)"
+            echo "stuck=$(jq -r '.incomplete_stuck // 0' tmp/result.json)"
+            echo "healed=$healed"
           } >> "$GITHUB_OUTPUT"
 
       - name: Write the issue text
-        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.unrepresented == '0'
+        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.stuck != '0' || steps.result.outputs.healed == 'true'
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TASK_ID: ${{ steps.run.outputs.task_id }}
@@ -148,6 +155,10 @@ jobs:
             echo "**Action:** \`$(jq -r .action tmp/result.json)\`"
             echo "**Unrepresented:** $(jq -r .unrepresented tmp/result.json) of $(jq -r .raw tmp/result.json) raw keys"
             echo "(represented $(jq -r .represented tmp/result.json), skipped $(jq -r .skipped tmp/result.json), pending $(jq -r .pending tmp/result.json))"
+            echo "**Incomplete (rows not a complete split, #5008):** $(jq -r '.incomplete // 0' tmp/result.json) retrying, $(jq -r '.incomplete_stuck // 0' tmp/result.json) stuck at $(jq -r '.max_incomplete_attempts // 3' tmp/result.json) attempts ($(jq -r '.newly_stuck // 0' tmp/result.json) newly stuck); by reason $(jq -c '.incomplete_by_reason // {}' tmp/result.json)"
+            if [ "$(jq -r '.newly_stuck // 0' tmp/result.json)" != "0" ]; then
+              echo "Newly stuck (sample): $(jq -r '(.newly_stuck_sample // []) | join(", ")' tmp/result.json)"
+            fi
             echo "**Previous runs (unrepresented, newest first):** $(jq -c .previous_unrepresented tmp/result.json)"
             echo ""
             echo "| Scope | Unrepresented |"
@@ -161,15 +172,23 @@ jobs:
           cat tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: File or update the reconciler issue
-        if: steps.result.outputs.issue_needed == 'true'
+        # issue_needed: file or comment. Stuck incomplete keys with no open
+        # issue: file one, so a lost notification (stuck_at is stamped once)
+        # is recovered on the next run without commenting every day (#5008).
+        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.stuck != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NEEDED: ${{ steps.result.outputs.issue_needed }}
         run: |
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
             --description "Raw-key reconciler: unrepresented archived raws" --force
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label "$ISSUE_LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ] && [ "$ISSUE_NEEDED" != "true" ]; then
+            echo "Stuck incomplete keys are already reported on #$existing."
+            exit 0
+          fi
           if [ -n "$existing" ]; then
             {
               echo "### Still unhealed: $(date -u +%Y-%m-%dT%H:%MZ)"
@@ -187,6 +206,9 @@ jobs:
             echo "reason that the daily auto-reingest cannot heal: more than the auto-reingest"
             echo "threshold (\`over_threshold\`), keys back after several daily reingests"
             echo "(\`persistent\`), or a reingest that could not be launched (\`reingest_failed\`)."
+            echo "It also reports keys whose rows are not a complete split (a fallback, partial"
+            echo "split, exhausted child, dead-letter or failed reingest, \`telemetry.ingest_incomplete\`)"
+            echo "that are still incomplete after the attempt cap (\`incomplete_stuck\`, #5008)."
             echo ""
             cat tmp/summary.md
             echo ""
@@ -195,16 +217,17 @@ jobs:
             echo "1. Write the key lists: \`scripts/ecs-run-task.sh --detach scripts/reconcile_raw_keys.py -- --prefix <state>/ --write-keys s3://judgemind-document-archive-dev/tmp/keys/<name> --chunk-size 1500\`."
             echo "2. Find why they never reached the database (an ingestion outage window, a worker path that writes nothing without recording a skip reason)."
             echo "3. Heal with \`scripts/reingest_from_s3.py --prefix <state>/ --s3-key-list <uri> --concurrency 4\`."
+            echo "4. Stuck incomplete keys: \`SELECT s3_key, reason, detail FROM telemetry.ingest_incomplete WHERE stuck_at IS NOT NULL\` (\`scripts/dev-db-query.sh\`); fix the cause, then run the reconciler once with \`--record --reingest --reset-incomplete-attempts\`."
             echo ""
-            echo "This issue is updated by each daily run while the condition holds and closed"
-            echo "automatically when a run finds nothing unrepresented."
+            echo "This issue is updated by each daily run that needs it and closed automatically"
+            echo "when a run finds nothing unrepresented and no key stuck at the retry cap."
           } > tmp/issue.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" \
             --body-file tmp/issue.md \
             --label "$ISSUE_LABEL,priority/p1,area/ingestion,type/bug,agent/ready"
 
       - name: Close the reconciler issue when healed
-        if: steps.result.outputs.unrepresented == '0'
+        if: steps.result.outputs.healed == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,7 +236,7 @@ jobs:
           for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
               --label "$ISSUE_LABEL" --json number --jq '.[].number'); do
             {
-              echo "The raw-key reconciler found nothing unrepresented. Closing."
+              echo "The raw-key reconciler found nothing unrepresented and no stuck incomplete key. Closing."
               echo ""
               cat tmp/summary.md
             } > tmp/close.md

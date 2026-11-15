@@ -26,6 +26,11 @@ import { SECTION_HEADING } from '@/lib/typography';
  * none), pending (captured in the last few hours) or unrepresented (lost on
  * the way to the database). Two multi-week ingestion losses went unnoticed
  * before this existed.
+ *
+ * Incomplete keys (#5008) have rows that are not a complete split (a live
+ * fallback or partial split, an exhausted child, a dead-lettered event, a
+ * failed reingest): they are re-ingested daily up to a retry cap, then
+ * reported as stuck.
  */
 
 const ACTION_LABELS: Record<string, string> = {
@@ -50,7 +55,21 @@ const REASON_LABELS: Record<string, string> = {
   no_ruling_text: 'no ruling text',
 };
 
+const INCOMPLETE_REASON_LABELS: Record<string, string> = {
+  single_document_fallback: 'whole-document fallback',
+  partial_split: 'partial split',
+  exhausted_child: 'enrichment exhausted',
+  dead_letter: 'dead-lettered',
+  reingest_failed: 'reingest failed',
+};
+
 const fmt = (n: number) => n.toLocaleString('en-US');
+
+export function formatIncompleteReasons(reasons: { reason: string; count: number }[]): string {
+  return reasons
+    .map((r) => `${INCOMPLETE_REASON_LABELS[r.reason] ?? r.reason} ${fmt(r.count)}`)
+    .join(', ');
+}
 
 export function formatActionLabel(action: string): string {
   return ACTION_LABELS[action] ?? action;
@@ -97,6 +116,21 @@ export function RawKeyReconciliationTable({ run }: { run: RawKeyReconciliationRu
           · {fmt(run.represented)} represented · {fmt(run.skipped)} skipped
           {run.pending > 0 && ` · ${fmt(run.pending)} pending`} of {fmt(run.rawKeys)} raw keys
         </span>
+        {(run.incomplete > 0 || run.incompleteStuck > 0) && (
+          <span className="block" data-testid="raw-reconcile-incomplete">
+            <span
+              className={
+                run.incompleteStuck > 0 ? 'font-medium text-red-700 dark:text-red-400' : undefined
+              }
+            >
+              {fmt(run.incomplete)} incomplete retrying
+              {run.incompleteStuck > 0 && `, ${fmt(run.incompleteStuck)} stuck at the retry cap`}
+            </span>
+            {run.incompleteByReason.length > 0 && (
+              <span className="text-xs"> ({formatIncompleteReasons(run.incompleteByReason)})</span>
+            )}
+          </span>
+        )}
         <span className="block text-xs">
           Last run {formatTimestamp(run.finishedAt)} ·{' '}
           <span className={issue ? 'text-red-700 dark:text-red-400' : undefined}>
@@ -114,6 +148,7 @@ export function RawKeyReconciliationTable({ run }: { run: RawKeyReconciliationRu
               <TableHead className="text-right">Represented</TableHead>
               <TableHead className="text-right">Skipped</TableHead>
               <TableHead className="text-right">Unrepresented</TableHead>
+              <TableHead className="text-right">Incomplete</TableHead>
               <TableHead>Skip reasons</TableHead>
             </TableRow>
           </TableHeader>
@@ -147,6 +182,18 @@ export function RawKeyReconciliationTable({ run }: { run: RawKeyReconciliationRu
                       </span>
                     )}
                   </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      scope.incompleteStuck > 0 ? 'font-medium text-red-700 dark:text-red-400' : ''
+                    }`}
+                  >
+                    {fmt(scope.incomplete)}
+                    {scope.incompleteStuck > 0 && (
+                      <span className="block text-xs font-normal">
+                        {fmt(scope.incompleteStuck)} stuck
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell className="max-w-xs text-xs text-muted-foreground">
                     {formatSkipReasons(scope)}
                   </TableCell>
@@ -172,7 +219,8 @@ export function RawKeyReconciliationPanel() {
       </h2>
       <p className="mb-4 mt-1 text-sm text-muted-foreground">
         Every archived raw capture should have a document row or a recorded skip reason. Unrepresented
-        keys never reached the database; small counts are re-ingested automatically each day.
+        keys never reached the database; incomplete keys hold rows that are not a complete split.
+        Small counts of both are re-ingested automatically each day.
       </p>
       {loading ? (
         <div className="h-48 animate-pulse rounded-lg bg-muted motion-reduce:animate-none" />
