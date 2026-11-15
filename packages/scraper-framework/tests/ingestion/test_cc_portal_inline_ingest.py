@@ -51,11 +51,12 @@ def _listing(hearing: datetime) -> str:
 
 
 @respx.mock
-def _capture_event_payload() -> dict[str, Any]:
-    """Run the portal scraper against the inline fixture; return the event."""
-    # A hearing a few days out so deterministic validation's date-range
-    # rule accepts it, as it would for a freshly posted ruling.
-    hearing = (datetime.now(UTC) + timedelta(days=3)).replace(
+def _capture_event_payload(days_from_now: int = 3) -> dict[str, Any]:
+    """Run the portal scraper against the inline fixture; return the event.
+
+    The default is a hearing a few days out, as for a freshly posted ruling.
+    """
+    hearing = (datetime.now(UTC) + timedelta(days=days_from_now)).replace(
         hour=16, minute=0, second=0, microsecond=0
     )
     respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
@@ -137,3 +138,35 @@ def test_worker_writes_inline_portal_ruling_text() -> None:
     assert kwargs["s3_key"] == "ca/contra_costa/superior_court/raw/abc.txt"
     assert "Walnut Creek Presbyterian Church" in kwargs["ruling_text"]
     assert "continued to give plaintiffs additional time" in kwargs["ruling_text"]
+
+
+def test_worker_writes_a_stale_relisted_portal_ruling() -> None:
+    """#5023: the portal keeps listing rulings heard over a year ago (L24-04564,
+    heard 2025-01-29, was re-captured daily June-November 2026).  Before
+    #4793 deterministic validation's ``hearing_date_in_range`` rule failed
+    those captures (>180 days before capture) and wrote no document, so 157
+    Contra Costa raw keys had no ``derived.documents`` row.  The listing
+    date is the scraper's structured date, so the rule now only flags it and
+    the document is written."""
+    payload = _capture_event_payload(days_from_now=-520)
+
+    worker = _worker()
+    with (
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.resolve_judge", return_value=None),
+        patch("ingestion.worker.batch_upsert_parties"),
+        patch("ingestion.worker.insert_validation_result") as mock_val,
+        patch("ingestion.worker.insert_document_and_ruling", return_value=True) as mock_ins,
+    ):
+        mock_psycopg.connect.return_value = _conn()
+        worker.process_event(payload)
+
+    mock_ins.assert_called_once()
+    kwargs = mock_ins.call_args.kwargs
+    assert kwargs["s3_key"] == "ca/contra_costa/superior_court/raw/abc.txt"
+    assert "Walnut Creek Presbyterian Church" in kwargs["ruling_text"]
+    # the out-of-window date was judged, and judged a flag, not a fail
+    results = [c.kwargs["result"] for c in mock_val.call_args_list]
+    assert results, "deterministic validation did not run"
+    assert all(r.result != "fail" for r in results)
+    assert any("hearing_date" in (r.reason or "") for r in results)
