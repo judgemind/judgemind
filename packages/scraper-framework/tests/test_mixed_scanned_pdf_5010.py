@@ -112,7 +112,7 @@ def _ocr(fail_pages: frozenset[int] = frozenset(), text: str = SCANNED_RULING) -
     """``call_llm_with_images``: *text* for each page, ``None`` (a failed
     call) for *fail_pages*."""
 
-    def call(*, system_prompt: str, text_message: str, images: Any, timeout: float) -> Any:
+    def call(*, system_prompt: str, text_message: str, images: Any, **_: Any) -> Any:
         if _page_number(text_message) in fail_pages:
             return None
         return LLMResponse(text=text, input_tokens=10, output_tokens=10)

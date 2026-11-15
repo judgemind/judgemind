@@ -136,6 +136,10 @@ class LLMResponse:
     finish_reason: str | None = None
     block_reason: str | None = None
     safety_ratings: list[str] | None = None
+    # Tokens a thinking model spent reasoning (Gemini ``thoughts_token_count``),
+    # which count against the output budget; ``None`` when it did not think
+    # (#5046).
+    thinking_tokens: int | None = None
 
     @property
     def truncated(self) -> bool:
@@ -161,6 +165,7 @@ class LLMResponse:
             "safety_ratings": self.safety_ratings or [],
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "thinking_tokens": self.thinking_tokens,
             "response_chars": len(self.text),
         }
 
@@ -195,10 +200,13 @@ def _google_response(response: object) -> LLMResponse:
     """
     input_tokens = 0
     output_tokens = 0
+    thinking_tokens: int | None = None
     usage = getattr(response, "usage_metadata", None)
     if usage:
         input_tokens = getattr(usage, "prompt_token_count", 0) or 0
         output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        thoughts = getattr(usage, "thoughts_token_count", None)
+        thinking_tokens = thoughts if isinstance(thoughts, int) else None
 
     finish_reason: str | None = None
     safety: list[str] = []
@@ -235,7 +243,24 @@ def _google_response(response: object) -> LLMResponse:
         finish_reason=finish_reason,
         block_reason=block_reason,
         safety_ratings=safety or None,
+        thinking_tokens=thinking_tokens,
     )
+
+
+def _google_thinking_config(model: str, thinking_budget: int | None) -> object | None:
+    """A ``ThinkingConfig`` capping a Gemini model's thinking, or ``None``.
+
+    Thinking tokens count against ``max_output_tokens``: on a thinking model
+    (gemini-2.5-flash thinks by default) a transcription can stop at
+    ``MAX_TOKENS`` having written almost nothing (#5046).  Only the
+    gemini-2.5-flash family accepts a budget of 0; other models get no
+    config rather than a request they would reject.
+    """
+    if thinking_budget is None or not model.startswith("gemini-2.5-flash"):
+        return None
+    from google.genai import types
+
+    return types.ThinkingConfig(thinking_budget=thinking_budget)
 
 
 def _anthropic_finish_reason(response: object) -> str | None:
@@ -496,6 +521,7 @@ def call_llm_with_images(
     timeout: float | None = None,
     max_tokens: int = 4096,
     json_mode: bool = False,
+    thinking_budget: int | None = None,
 ) -> LLMResponse | None:
     """Call an LLM provider with text and image content (vision API).
 
@@ -519,6 +545,10 @@ def call_llm_with_images(
         json_mode: Ask Google for a JSON response
             (``response_mime_type="application/json"``), which constrains
             the output to valid JSON.  Ignored for Anthropic.
+        thinking_budget: Cap on a Gemini thinking model's reasoning tokens
+            (``0`` turns thinking off; see ``_google_thinking_config``).
+            ``None`` keeps the model's default.  Ignored for Anthropic,
+            which does not think unless asked to.
 
     Returns:
         An ``LLMResponse`` or ``None`` on failure.
@@ -548,6 +578,7 @@ def call_llm_with_images(
             timeout=timeout,
             max_tokens=max_tokens,
             json_mode=json_mode,
+            thinking_budget=thinking_budget,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)
@@ -651,6 +682,7 @@ def _call_google_with_images(
     timeout: float | None = None,
     max_tokens: int = 4096,
     json_mode: bool = False,
+    thinking_budget: int | None = None,
 ) -> LLMResponse | None:
     """Call the Google GenAI API with image content (multimodal)."""
     from google import genai
@@ -683,6 +715,9 @@ def _call_google_with_images(
     }
     if json_mode:
         config_kwargs["response_mime_type"] = "application/json"
+    thinking_config = _google_thinking_config(model, thinking_budget)
+    if thinking_config is not None:
+        config_kwargs["thinking_config"] = thinking_config
     if timeout is not None:
         config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
     config = types.GenerateContentConfig(**config_kwargs)
