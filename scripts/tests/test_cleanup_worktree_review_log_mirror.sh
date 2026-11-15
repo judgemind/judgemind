@@ -15,6 +15,7 @@
 #   1 — One or more tests failed.
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_git-env-scrub.sh"  # unset inherited GIT_DIR etc. (#5058)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLEANUP_SCRIPT="$REPO_ROOT/scripts/cleanup_worktree.sh"

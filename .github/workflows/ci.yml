@@ -154,6 +154,11 @@ jobs:
               # Fargate hook files; the parity tests check their COPY lines.
               - 'Dockerfile.dispatcher-v3'
               - 'Dockerfile.dispatcher-agent-runner'
+              # scripts/check-test-git-env-scrub.sh scans package test
+              # files and conftest.py copies of the git-env-scrub block
+              # (#5058); a PR that only adds a git-writing package test
+              # must still run it.
+              - 'packages/*/tests/**'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
@@ -875,6 +880,14 @@ jobs:
       - name: Check tests use POSIX sed instead of GNU head negative count
         if: matrix.shard == 'python'
         run: scripts/check-no-gnu-head.sh
+      # Issue #5058: a test that runs git writes in a scratch repo must
+      # unset git's repository env vars (the conftest git-env-scrub block,
+      # or scripts/tests/_git-env-scrub.sh for shell tests), or a caller
+      # with GIT_DIR exported (a hook, rebase --exec, bisect run) makes it
+      # write to that repository instead (#5045).
+      - name: Check git-writing tests scrub inherited repository env vars
+        if: matrix.shard == 'python'
+        run: scripts/check-test-git-env-scrub.sh
       - name: Check test files do not redefine the same stub binary
         if: matrix.shard == 'python'
         run: scripts/check-no-duplicate-stubs.sh

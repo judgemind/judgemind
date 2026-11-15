@@ -80,6 +80,7 @@
 # Exits non-zero if any scenario fails.
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_git-env-scrub.sh"  # unset inherited GIT_DIR etc. (#5058)
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HOOK="$REPO_ROOT/.githooks/pre-push"
