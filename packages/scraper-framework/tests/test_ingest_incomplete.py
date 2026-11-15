@@ -112,6 +112,28 @@ def test_retry_marker_write_failure_rolls_back_to_savepoint_and_never_raises() -
     assert clear_ingest_incomplete(conn, S3_KEY) is False
 
 
+def test_retry_marker_clear_failure_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    from ingestion import ingest_incomplete
+
+    conn, cur = _conn()
+
+    def execute(sql: str, *_a: object) -> None:
+        if "DELETE" in sql:
+            raise RuntimeError('relation "telemetry.ingest_incomplete" does not exist')
+
+    cur.execute.side_effect = execute
+    with (
+        patch.object(ingest_incomplete, "_clear_failure_logged", False),
+        caplog.at_level(logging.DEBUG, logger="ingestion.ingest_incomplete"),
+    ):
+        assert clear_ingest_incomplete(conn, S3_KEY) is False
+        assert clear_ingest_incomplete(conn, S3_KEY) is False
+    levels = [r.levelno for r in caplog.records if "record clear failed" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG]
+
+
 def test_retry_marker_cursor_failure_never_raises() -> None:
     conn = MagicMock()
     conn.cursor.side_effect = RuntimeError("connection closed")
@@ -256,12 +278,17 @@ def test_retry_marker_live_key_with_rows_left_alone_records_nothing() -> None:
 
 
 def test_retry_marker_reingest_failed_recorded() -> None:
-    worker, _redis, _conn_, cur = _worker()
+    worker, _redis, conn, cur = _worker()
+    order: list[str] = []
+    conn.rollback.side_effect = lambda: order.append("rollback")
+    conn.commit.side_effect = lambda: order.append("commit")
     with pytest.raises(SplitExtractionFailedError):
         worker._leave_key_after_failed_extraction(
             _event(**{REPLACE_SPLIT_SET_KEY: True}), "doc-1", "Orange", "text: boom"
         )
     assert [w[:2] for w in _incomplete_writes(cur)] == [(S3_KEY, "reingest_failed")]
+    # The failed event's writes are rolled back first, as the raise would.
+    assert order == ["rollback", "commit"]
 
 
 def test_retry_marker_no_extractable_text_is_a_verdict_that_clears() -> None:

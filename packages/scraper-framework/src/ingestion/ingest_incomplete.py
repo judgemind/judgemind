@@ -72,6 +72,11 @@ _UPSERT_SQL = """
 
 _DELETE_SQL = "DELETE FROM telemetry.ingest_incomplete WHERE s3_key = %s"
 
+#: The clear runs on every complete write, so a failure that repeats on
+#: every write (the table not migrated yet) is logged with its traceback
+#: once per process, then at debug level.
+_clear_failure_logged = False
+
 
 def _run_protected(conn: Any, sql: str, params: tuple[Any, ...], what: str, s3_key: str) -> bool:
     try:
@@ -84,10 +89,15 @@ def _run_protected(conn: Any, sql: str, params: tuple[Any, ...], what: str, s3_k
                 cur.execute("ROLLBACK TO SAVEPOINT ingest_incomplete")
                 raise
     except Exception:  # noqa: BLE001 — the record is best-effort
-        logger.warning(
+        global _clear_failure_logged
+        quiet = what == "clear" and _clear_failure_logged
+        if what == "clear":
+            _clear_failure_logged = True
+        logger.log(
+            logging.DEBUG if quiet else logging.WARNING,
             "ingest incomplete record %s failed",
             what,
-            exc_info=True,
+            exc_info=not quiet,
             extra={"s3_key": s3_key},
         )
         return False

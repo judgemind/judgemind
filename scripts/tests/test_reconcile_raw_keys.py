@@ -786,10 +786,13 @@ def test_retry_marker_classify_incomplete_before_represented(
     ) == ("incomplete", "single_document_fallback")
 
 
-def test_retry_marker_decide_action_counts_incomplete_against_the_threshold() -> None:
+def test_retry_marker_decide_action_threshold_is_unrepresented_only() -> None:
     kw = {"max_auto_reingest": 5, "persist_runs": 3, "reingest": True, "defer": False}
     assert rec.decide_action(0, [], incomplete=2, **kw) == "reingest"
-    assert rec.decide_action(4, [], incomplete=2, **kw) == "over_threshold"
+    # The incomplete batch is sized to the room left, so it never trips the
+    # threshold; only unrepresented keys do.
+    assert rec.decide_action(4, [], incomplete=1, **kw) == "reingest"
+    assert rec.decide_action(6, [], incomplete=0, **kw) == "over_threshold"
     assert rec.decide_action(0, [], incomplete=0, **kw) == "none"
     # Retrying incomplete keys alone never makes a run persistent: the cap
     # reports them instead.
@@ -878,22 +881,102 @@ def test_retry_marker_fetch_explained_reads_incomplete_and_tolerates_missing_tab
     assert "ingest_incomplete unreadable" in capsys.readouterr().out
 
 
+def test_retry_marker_incomplete_batch_fills_the_room_oldest_first() -> None:
+    rep = rec.ScopeReport("ca/los_angeles")
+    rep.incomplete = [
+        _raw(f"{LA}{_h('c')}.html", _lm("2026-06-02")),
+        _raw(f"{LA}{_h('b')}.html", _lm("2026-05-13")),
+        _raw(f"{LA}{_h('d')}.html", _lm("2026-06-03")),
+    ]
+    reports = {"ca/los_angeles": rep}
+    assert [k.key for k in rec.incomplete_batch(reports, 3, 5)] == [
+        f"{LA}{_h('b')}.html",
+        f"{LA}{_h('c')}.html",
+    ]
+    assert rec.incomplete_batch(reports, 7, 5) == []
+
+
+def test_retry_marker_incomplete_backlog_never_blocks_the_unrepresented_heal(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """A large incomplete backlog drains a batch per run instead of making
+    the run over_threshold (which would stop the lost-key heal too)."""
+    explained.incomplete = {f"{LA}{_h(c)}.html": ("partial_split", 0) for c in "bcd"}
+    db = FakeDb({"RETURNING run_id": [("run-10",)]})
+    calls: list[list[str]] = []
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "4",
+            "--reingest-script",
+            _stub_script(tmp_path),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: (
+            calls.append(cmd) or types.SimpleNamespace(returncode=0)
+        ),
+    )
+    result = _result(lines)
+    # 3 unrepresented (2 SC + 1 federal) leave room for 1 incomplete key.
+    assert result["unrepresented"] == 3
+    assert result["incomplete"] == 3
+    assert result["incomplete_batch"] == 1
+    assert result["action"] == "reingest"
+    attempts = db.sql("SET retry_attempts = retry_attempts + 1")
+    assert attempts[0][1] == ([f"{LA}{_h('b')}.html"],)
+
+
+def test_retry_marker_crashed_reingest_counts_no_attempt(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    _incomplete_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-11",)]})
+    lines: list[str] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: types.SimpleNamespace(returncode=1),
+    )
+    assert db.sql("retry_attempts + 1") == []
+
+
 def test_retry_marker_reset_and_count_helpers() -> None:
     db = FakeDb({"SET retry_attempts = 0": [("k1",), ("k2",)]})
-    assert rec.reset_incomplete_attempts(db) == 2
+    assert rec.reset_incomplete_attempts(db, 3) == 2
+    reset = db.sql("SET retry_attempts = 0")[0]
+    assert "retry_attempts >= %s OR stuck_at IS NOT NULL" in reset[0]
+    assert reset[1] == (3,)
     rec.count_incomplete_attempts(db, [])
     assert rec.mark_newly_stuck(db, []) == []
     assert not db.sql("retry_attempts + 1")
 
 
+def test_retry_marker_reset_needs_record() -> None:
+    with pytest.raises(SystemExit):
+        rec.parse_args(["--reset-incomplete-attempts"])
+
+
 def test_retry_marker_main_resets_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
-    db = FakeDb({"SET retry_attempts = 0": [("k1",)]})
+    db = FakeDb({"SET retry_attempts = 0": [("k1",)], "RETURNING run_id": [("run-r",)]})
     fake_psycopg = types.SimpleNamespace(connect=lambda _url: db)
     fake_boto3 = types.SimpleNamespace(client=lambda _name: FakeS3({}))
     monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
     monkeypatch.setenv("DATABASE_URL", "postgresql://x")
-    assert rec.main(["--bucket", BUCKET, "--reset-incomplete-attempts"]) == 0
+    assert (
+        rec.main(["--bucket", BUCKET, "--record", "--reset-incomplete-attempts"]) == 0
+    )
     assert db.sql("SET retry_attempts = 0")
 
 

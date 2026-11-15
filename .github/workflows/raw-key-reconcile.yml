@@ -131,19 +131,21 @@ jobs:
           fi
           printf '%s\n' "${line#RECONCILE_RESULT }" > tmp/result.json
           jq . tmp/result.json
-          # Healed: nothing unrepresented and no incomplete key, retryable
-          # or stuck (#5008). A stuck key keeps the issue open until it is
-          # fixed or reset (--reset-incomplete-attempts).
-          healed=$(jq -r '((.unrepresented // 0) + (.incomplete // 0) + (.incomplete_stuck // 0)) == 0' tmp/result.json)
+          # Healed: nothing unrepresented and no incomplete key stuck at the
+          # retry cap (#5008). Retryable incomplete keys heal on their own
+          # (live captures add a few every day), so they do not hold the
+          # issue open; a stuck key does, until it is fixed or reset.
+          healed=$(jq -r '((.unrepresented // 0) + (.incomplete_stuck // 0)) == 0' tmp/result.json)
           {
             echo "action=$(jq -r .action tmp/result.json)"
             echo "issue_needed=$(jq -r .issue_needed tmp/result.json)"
             echo "unrepresented=$(jq -r .unrepresented tmp/result.json)"
+            echo "stuck=$(jq -r '.incomplete_stuck // 0' tmp/result.json)"
             echo "healed=$healed"
           } >> "$GITHUB_OUTPUT"
 
       - name: Write the issue text
-        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.healed == 'true'
+        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.stuck != '0' || steps.result.outputs.healed == 'true'
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TASK_ID: ${{ steps.run.outputs.task_id }}
@@ -170,15 +172,23 @@ jobs:
           cat tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: File or update the reconciler issue
-        if: steps.result.outputs.issue_needed == 'true'
+        # issue_needed: file or comment. Stuck incomplete keys with no open
+        # issue: file one, so a lost notification (stuck_at is stamped once)
+        # is recovered on the next run without commenting every day (#5008).
+        if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.stuck != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NEEDED: ${{ steps.result.outputs.issue_needed }}
         run: |
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
             --description "Raw-key reconciler: unrepresented archived raws" --force
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label "$ISSUE_LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ] && [ "$ISSUE_NEEDED" != "true" ]; then
+            echo "Stuck incomplete keys are already reported on #$existing."
+            exit 0
+          fi
           if [ -n "$existing" ]; then
             {
               echo "### Still unhealed: $(date -u +%Y-%m-%dT%H:%MZ)"
@@ -210,7 +220,7 @@ jobs:
             echo "4. Stuck incomplete keys: \`SELECT s3_key, reason, detail FROM telemetry.ingest_incomplete WHERE stuck_at IS NOT NULL\` (\`scripts/dev-db-query.sh\`); fix the cause, then run the reconciler once with \`--record --reingest --reset-incomplete-attempts\`."
             echo ""
             echo "This issue is updated by each daily run that needs it and closed automatically"
-            echo "when a run finds nothing unrepresented and no incomplete key."
+            echo "when a run finds nothing unrepresented and no key stuck at the retry cap."
           } > tmp/issue.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" \
             --body-file tmp/issue.md \
@@ -226,7 +236,7 @@ jobs:
           for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
               --label "$ISSUE_LABEL" --json number --jq '.[].number'); do
             {
-              echo "The raw-key reconciler found nothing unrepresented and no incomplete key. Closing."
+              echo "The raw-key reconciler found nothing unrepresented and no stuck incomplete key. Closing."
               echo ""
               cat tmp/summary.md
             } > tmp/close.md

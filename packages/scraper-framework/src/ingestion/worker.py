@@ -5495,9 +5495,14 @@ class IngestionWorker:
                 # The key's rows stay as they were, and they may not be a
                 # complete split: record it durably, so the raw-key
                 # reconciler retries the key after the failed manifest
-                # under tmp/keys/ expires (#5008).
+                # under tmp/keys/ expires (#5008).  On a transaction of its
+                # own: whatever the failed event wrote is rolled back, as
+                # the raise below would have it.
                 self._record_incomplete_and_commit(
-                    event_data, INCOMPLETE_REINGEST_FAILED, {"error": reason[:500]}
+                    event_data,
+                    INCOMPLETE_REINGEST_FAILED,
+                    {"error": reason[:500]},
+                    rollback_first=True,
                 )
             raise error(f"extraction failed for {s3_key or document_id}: {reason[:500]}")
         if not key_has_rows:
