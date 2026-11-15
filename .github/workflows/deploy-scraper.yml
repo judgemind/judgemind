@@ -40,6 +40,17 @@ on:
       - "scripts/check-scraper-zero-record-runner.py"
       - "scripts/check-scraper-zero-record-streak.py"
       - "scripts/notify-telegram.sh"
+      # Everything else packages/scraper-framework/Dockerfile COPYs (#5060):
+      # the judgemind-config package it pip-installs, the baked
+      # data-quality baselines, and the reingest/rebuild CLIs the raw-key
+      # reconciler runs from /app/scripts/ (#4288). Without these an edit
+      # merges without rebuilding the image that runs it.
+      # scripts/check-image-path-filters.sh fails CI when a COPY'd file is
+      # missing here.
+      - "packages/judgemind-config/**"
+      - "data-quality-baselines.json"
+      - "scripts/reingest_from_s3.py"
+      - "scripts/rebuild_db.py"
   workflow_dispatch:
     inputs:
       image_tag:
