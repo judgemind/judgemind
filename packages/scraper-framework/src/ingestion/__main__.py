@@ -17,6 +17,10 @@ Optional:
                              GOOGLE_API_KEY must build LLM extractors, or the
                              worker exits at startup; ``optional``: run
                              without them, regex-only (#4953)
+    SHUTDOWN_GRACE_S       — Seconds an in-flight message may run after
+                             SIGTERM before it is released unacked and
+                             uncharged (default: 105; keep below the task
+                             definition's stopTimeout, 120) (#5069)
 
 OpenSearch auth: SigV4-signed requests (from the ambient AWS credential chain)
 are the preferred, deployed path; ``OPENSEARCH_USERNAME``/``OPENSEARCH_PASSWORD``
@@ -98,6 +102,10 @@ def main() -> None:
             archive_bucket=archive_bucket,
             max_retries=max_retries,
         )
+
+        # ECS stops tasks with SIGTERM; without a handler PID 1 ignores it
+        # and every deploy ends in SIGKILL (exit 137) (#5069).
+        worker.install_shutdown_handler()
 
         logger.info("Starting ingestion worker", archive_bucket=archive_bucket)
         worker.run()
