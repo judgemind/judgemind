@@ -38,7 +38,11 @@ only: no object is read) and sorts each one into a category:
                      Re-ingested with the unrepresented keys, oldest first,
                      as many as fit beside them under ``--max-auto-reingest``
                      (they never make a run ``over_threshold``; the rest
-                     wait for the next run).  A reingest that runs to the
+                     wait for the next run).  On an ``over_threshold`` run
+                     the unrepresented keys wait for a human, but up to
+                     ``--max-auto-reingest`` incomplete keys still
+                     re-ingest on their own (``reingest_scope``
+                     ``incomplete_only``).  A reingest that runs to the
                      end counts one ``retry_attempts``, and a complete
                      reingest deletes the row (the worker).
 - ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
@@ -795,10 +799,17 @@ def decide_action(
 def incomplete_batch(
     reports: dict[str, ScopeReport], unrepresented: int, max_auto_reingest: int
 ) -> list[RawKey]:
-    """The incomplete (retryable) keys this run re-ingests, oldest first:
-    as many as fit beside the unrepresented ones under
-    *max_auto_reingest* (#5008).  The rest wait for the next run."""
-    room = max(0, max_auto_reingest - unrepresented)
+    """The incomplete (retryable) keys this run re-ingests, oldest first
+    (#5008): as many as fit beside the unrepresented ones under
+    *max_auto_reingest*, or, when the unrepresented keys are over it (they
+    are not re-ingested then), up to *max_auto_reingest* on their own.  An
+    incomplete key is a known key with a recorded reason and an attempt
+    cap, so it keeps draining while a lost-key backlog waits for a human.
+    The rest wait for the next run."""
+    if unrepresented > max_auto_reingest:
+        room = max_auto_reingest
+    else:
+        room = max(0, max_auto_reingest - unrepresented)
     keys = sorted(
         (raw for rep in reports.values() for raw in rep.incomplete),
         key=lambda k: (k.utc, k.key),
@@ -994,12 +1005,24 @@ def run(
     }
 
     script = None
-    if action in REINGEST_ACTIONS:
+    # Over the threshold the unrepresented keys wait for a human (the issue),
+    # but the incomplete batch still re-ingests on its own (#5008).
+    incomplete_only = (
+        action == "over_threshold"
+        and bool(batch)
+        and args.reingest
+        and not args.defer_reingest
+        and conn is not None
+    )
+    if action in REINGEST_ACTIONS or incomplete_only:
         try:
             script = find_reingest_script(args.reingest_script)
         except FileNotFoundError as exc:
-            action = "reingest_failed"
+            if not incomplete_only:
+                action = "reingest_failed"
             detail["reingest_error"] = str(exc)
+    if incomplete_only:
+        detail["reingest_scope"] = "incomplete_only"
 
     run_id = None
     if conn is not None:
@@ -1019,14 +1042,15 @@ def run(
             detail["reingest"] = launch_reingest(
                 args,
                 s3,
-                reingest_groups(reports, batch),
+                reingest_groups({} if incomplete_only else reports, batch),
                 script,
                 stamp,
                 out,
                 runner=runner,
             )
         except Exception as exc:  # noqa: BLE001 — recorded, then reported as failed
-            action = "reingest_failed"
+            if not incomplete_only:
+                action = "reingest_failed"
             detail["reingest_error"] = f"{type(exc).__name__}: {exc}"
         if conn is not None and "reingest" in detail:
             # One attempt per incomplete key whose prefix's reingest ran to

@@ -893,7 +893,114 @@ def test_retry_marker_incomplete_batch_fills_the_room_oldest_first() -> None:
         f"{LA}{_h('b')}.html",
         f"{LA}{_h('c')}.html",
     ]
-    assert rec.incomplete_batch(reports, 7, 5) == []
+    # No room beside the unrepresented keys, which still fit the threshold.
+    assert rec.incomplete_batch(reports, 5, 5) == []
+    # Over the threshold the unrepresented keys are not re-ingested, so the
+    # incomplete keys get the whole threshold.
+    assert [k.key for k in rec.incomplete_batch(reports, 7, 2)] == [
+        f"{LA}{_h('b')}.html",
+        f"{LA}{_h('c')}.html",
+    ]
+
+
+def test_retry_marker_over_threshold_still_drains_incomplete_keys(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """A lost-key backlog over the threshold files the issue and leaves the
+    unrepresented keys alone, but the incomplete batch still re-ingests."""
+    _incomplete_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-12",)]})
+    calls: list[list[str]] = []
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "2",
+            "--reingest-script",
+            _stub_script(tmp_path),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: (
+            calls.append(cmd) or types.SimpleNamespace(returncode=0)
+        ),
+    )
+    result = _result(lines)
+    assert result["action"] == "over_threshold"
+    assert result["issue_needed"] is True
+    assert result["reingest_scope"] == "incomplete_only"
+    assert result["incomplete_batch"] == 1
+    assert [c[c.index("--prefix") + 1] for c in calls] == ["ca/"]
+    uri = calls[0][calls[0].index("--s3-key-list") + 1]
+    assert s3.puts[uri].decode().splitlines() == [f"{LA}{_h('b')}.html"]
+    attempts = db.sql("SET retry_attempts = retry_attempts + 1")
+    assert attempts[0][1] == ([f"{LA}{_h('b')}.html"],)
+    # The run keeps its over_threshold action after the incomplete reingest.
+    assert db.sql("UPDATE telemetry.raw_reconcile_runs")[0][1][0] == "over_threshold"
+
+
+def test_retry_marker_over_threshold_incomplete_only_tolerates_missing_script(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    _incomplete_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-13",)]})
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "2",
+            "--reingest-script",
+            str(tmp_path / "nope.py"),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: pytest.fail("no reingest without a script"),
+    )
+    result = _result(lines)
+    assert result["action"] == "over_threshold"
+    assert "reingest_error" in result
+
+
+def test_retry_marker_over_threshold_incomplete_only_launch_error_keeps_action(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    _incomplete_explained(explained)
+    db = FakeDb({"RETURNING run_id": [("run-14",)]})
+    lines: list[str] = []
+
+    def runner(cmd: list[str], check: bool) -> Any:
+        raise OSError("exec format error")
+
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "2",
+            "--reingest-script",
+            _stub_script(tmp_path),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=runner,
+    )
+    result = _result(lines)
+    assert result["action"] == "over_threshold"
+    assert "exec format error" in result["reingest_error"]
+    assert db.sql("retry_attempts + 1") == []
 
 
 def test_retry_marker_incomplete_backlog_never_blocks_the_unrepresented_heal(
