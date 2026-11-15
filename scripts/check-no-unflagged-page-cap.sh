@@ -62,9 +62,11 @@ SLICE='(pages|doc)\)?\[[^]]*:'
 COUNTED='islice\(|range\([[:space:]]*(min\([[:space:]]*)?[0-9]+[[:space:]]*[,)]'
 MARKER='page-cap:[[:space:]]*[^[:space:]]'
 
-# The dispatcher pages GitHub issue lists, not documents.
-exclude_args=(--exclude-dir=tests --exclude-dir=archive --exclude-dir=dispatcher
-    --exclude-dir=dispatcher_v3 --exclude='test_*' --include='*.py')
+# The dispatcher pages GitHub issue lists, not documents.  --include comes
+# first: GNU grep includes a file no option matches unless the first
+# include/exclude option is --include (BSD grep does not care).
+exclude_args=(--include='*.py' --exclude='test_*' --exclude-dir=tests --exclude-dir=archive
+    --exclude-dir=dispatcher --exclude-dir=dispatcher_v3)
 for dir in "${REPO_WALK_EXCLUSIONS[@]}"; do
     exclude_args+=("--exclude-dir=$dir")
 done
