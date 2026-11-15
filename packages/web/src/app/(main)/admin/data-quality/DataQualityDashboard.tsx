@@ -8,6 +8,7 @@ import { OverviewGrid } from './OverviewGrid';
 import { MetricsChart } from './MetricsChart';
 import { CountyDetail } from './CountyDetail';
 import { RosterHealthPanel } from './RosterHealthPanel';
+import { RawKeyReconciliationPanel } from './RawKeyReconciliationPanel';
 import {
   DATA_QUALITY_OVERVIEW_QUERY,
   DATA_QUALITY_METRICS_QUERY,
@@ -135,6 +136,9 @@ export function DataQualityDashboard() {
 
       {/* Per-court judge roster fetch health (#4872) */}
       <RosterHealthPanel />
+
+      {/* Archived raw keys vs derived.documents (#5015) */}
+      <RawKeyReconciliationPanel />
 
       {/* Truncation warning */}
       {!metricsLoading && metricsTruncated && (

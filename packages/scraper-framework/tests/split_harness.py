@@ -238,6 +238,7 @@ INVARIANTS = (
     "refuse_start",
     "printed_somewhere",
     "held_printed",
+    "explained",
     "error",
 )
 
@@ -1461,6 +1462,7 @@ class KeyHarness:
         """Run one step on *key*; raise :class:`InvariantError` on a
         broken invariant."""
         self._key = key
+        step_started = self._db_now()
         self._keys.add(key.s3_key)
         self._step_label = f"seed={self.seed} {label} {step.describe()}"
         self._attach_alerts(key)
@@ -1570,6 +1572,12 @@ class KeyHarness:
         self._guard("search", self._check_search, key, after_rows)
         self._guard("search_fields", self._check_search_fields)
         self._guard("telemetry", self._check_telemetry, key)
+        if step.kind != "presplit" and (
+            outcome == "ok" or (outcome == "failed" and self._unextractable(step))
+        ):
+            # A complete step, or one nothing could read, is a verdict on
+            # the key; a retryable failure is reported for a retry instead.
+            self._guard("explained", self._check_explained, key, after_rows, step_started)
         if step.kind != "db" and not step.whole and complete:
             # A DB-row reingest only rewrites rows it selects, so it can
             # leave a slot untouched; the worker writes every ruling row.
@@ -1842,7 +1850,46 @@ class KeyHarness:
             )
             return {row[0] for row in cur.fetchall()}
 
+    def _db_now(self) -> datetime:
+        with self.checker.cursor() as cur:
+            cur.execute("SELECT clock_timestamp()")
+            row = cur.fetchone()
+        assert row is not None
+        return row[0]
+
     # -- invariants -----------------------------------------------------
+
+    def _check_explained(self, key: Key, after_rows: list[DocRow], since: datetime) -> None:
+        """A step that leaves its key with no document rows records why
+        (#5015): an ``ingest_skips`` row, a ``validation_results`` row, or the
+        all-NULL guard's ``data_quality_metrics`` row for the key, written by
+        this step.  Without one the raw-key reconciler cannot tell the
+        deliberate non-write from a lost event."""
+        if after_rows:
+            return
+        params = {"k": key.s3_key, "t": since}
+        found = None
+        with self.checker.cursor() as cur:
+            for sql in (
+                "SELECT 'ingest_skips:' || reason FROM telemetry.ingest_skips "
+                "WHERE s3_key = %(k)s AND last_recorded_at >= %(t)s",
+                "SELECT 'validation_results' FROM validation_results "
+                "WHERE s3_key = %(k)s AND created_at >= %(t)s",
+                "SELECT 'data_quality_metrics' FROM data_quality_metrics "
+                "WHERE metric_name = 'non_ruling_pdf_dropped' "
+                "AND metadata->>'s3_key' = %(k)s AND recorded_at >= %(t)s",
+            ):
+                cur.execute(sql + " LIMIT 1", params)
+                found = cur.fetchone()
+                if found is not None:
+                    break
+        if found is None:
+            self._fail(
+                "explained",
+                "the step left the key with no document rows and recorded no reason "
+                "(no ingest_skips, validation_results or non_ruling_pdf_dropped row)",
+            )
+        self.events[f"harness.explained.{found[0]}"] += 1
 
     def _check_telemetry(self, key: Key) -> None:
         gone = self._validation_seen - self._validation_ids(key)

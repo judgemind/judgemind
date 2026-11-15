@@ -93,6 +93,69 @@ export interface RosterFreshnessData {
   rosterFreshness: RosterFreshnessItem[];
 }
 
+export const RAW_KEY_RECONCILIATION_QUERY = gql`
+  query RawKeyReconciliation {
+    rawKeyReconciliation {
+      runId
+      startedAt
+      finishedAt
+      rawKeys
+      represented
+      skipped
+      unrepresented
+      pending
+      datedExcluded
+      action
+      scopes {
+        scope
+        rawKeys
+        represented
+        skipped
+        unrepresented
+        pending
+        datedExcluded
+        skippedByReason {
+          reason
+          count
+        }
+        oldestUnrepresentedDay
+        newestUnrepresentedDay
+      }
+    }
+  }
+`;
+
+export interface RawKeyReconcileScopeItem {
+  scope: string;
+  rawKeys: number;
+  represented: number;
+  skipped: number;
+  unrepresented: number;
+  pending: number;
+  datedExcluded: number;
+  skippedByReason: { reason: string; count: number }[];
+  oldestUnrepresentedDay: string | null;
+  newestUnrepresentedDay: string | null;
+}
+
+export interface RawKeyReconciliationRun {
+  runId: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  rawKeys: number;
+  represented: number;
+  skipped: number;
+  unrepresented: number;
+  pending: number;
+  datedExcluded: number;
+  action: string;
+  scopes: RawKeyReconcileScopeItem[];
+}
+
+export interface RawKeyReconciliationData {
+  rawKeyReconciliation: RawKeyReconciliationRun | null;
+}
+
 export interface DataQualityOverviewItem {
   county: string;
   healthStatus: 'green' | 'yellow' | 'red';

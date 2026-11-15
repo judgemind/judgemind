@@ -8,7 +8,8 @@ or LLM call occurs for governor-appointment events.
 
 Verifies:
   (a) process_event returns None early for ca-governor-appointments events.
-  (b) No DB upsert was attempted (_get_connection is never called).
+  (b) No document/ruling upsert was attempted; the only DB write is the
+      ``telemetry.ingest_skips`` record explaining the missing document (#5015).
   (c) No LLM split or LLM extractor call was made.
   (d) The bypass info log line was emitted.
 """
@@ -92,7 +93,7 @@ class TestGovernorAppointmentsSkip:
 
         Assertions:
           (a) Return value is None (early return).
-          (b) No DB connection is obtained — _get_connection was never called.
+          (b) The only DB statements are the ingest_skips record (#5015).
           (c) No LLM split or extractor call was attempted.
           (d) The bypass info log line was emitted with the expected telemetry_event.
         """
@@ -109,9 +110,15 @@ class TestGovernorAppointmentsSkip:
         # (a) Early return — result is None.
         assert result is None, f"Expected None but got {result!r}"
 
-        # (b) No DB connection was obtained.
-        mock_get_conn.assert_not_called()
+        # (b) No document or ruling write: the only statements are the skip
+        # record's savepoint + upsert (#5015), then a commit.
         mock_psycopg.connect.assert_not_called()
+        cur = mock_get_conn.return_value.cursor.return_value.__enter__.return_value
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert len(sqls) == 3, sqls
+        assert "INSERT INTO telemetry.ingest_skips" in sqls[1]
+        assert not any("documents" in s or "rulings" in s for s in sqls)
+        mock_get_conn.return_value.commit.assert_called_once()
 
         # (c) No LLM split or extractor was invoked.
         # worker._get_framework_extractor is already a no-op lambda; confirm it
@@ -139,6 +146,30 @@ class TestGovernorAppointmentsSkip:
                 f"Expected telemetry_event={expected_telemetry!r} in log extra, "
                 f"got: {record.__dict__}"
             )
+
+    def test_skip_reason_governor_bio_route_is_recorded(self) -> None:
+        """The governor route records a durable skip reason keyed by s3_key (#5015)."""
+        worker = _make_worker()
+        with patch.object(worker, "_get_connection") as mock_get_conn:
+            worker.process_event(_make_governor_event())
+        cur = mock_get_conn.return_value.cursor.return_value.__enter__.return_value
+        upsert = cur.execute.call_args_list[1]
+        params = upsert.args[1]
+        assert params[0] == "ca/statewide/governor/raw/press123.html"
+        assert params[1] == "governor_bio_route"
+        assert params[3] == "ca-governor-appointments"
+
+    def test_skip_reason_record_failure_does_not_fail_the_event(self) -> None:
+        """A failing skip-record write (e.g. table missing) is swallowed."""
+        worker = _make_worker()
+        with patch.object(worker, "_get_connection", side_effect=RuntimeError("db down")):
+            assert worker.process_event(_make_governor_event()) is None
+
+    def test_skip_reason_not_recorded_without_s3_key(self) -> None:
+        worker = _make_worker()
+        with patch.object(worker, "_get_connection") as mock_get_conn:
+            worker.process_event(_make_governor_event(s3_key=None))
+        mock_get_conn.assert_not_called()
 
     def test_non_governor_scraper_id_is_not_skipped(self) -> None:
         """Sanity-check: a non-governor scraper_id does NOT early-return before DB access.

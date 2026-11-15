@@ -65,6 +65,9 @@ vi.mock('recharts', () => ({
 vi.mock('../src/app/(main)/admin/data-quality/RosterHealthPanel', () => ({
   RosterHealthPanel: () => <div data-testid="roster-health-panel" />,
 }));
+vi.mock('../src/app/(main)/admin/data-quality/RawKeyReconciliationPanel', () => ({
+  RawKeyReconciliationPanel: () => <div data-testid="raw-reconcile-panel" />,
+}));
 
 import { DataQualityDashboard } from '../src/app/(main)/admin/data-quality/DataQualityDashboard';
 
@@ -194,6 +197,7 @@ describe('DataQualityDashboard', () => {
     };
     render(<DataQualityDashboard />);
     expect(screen.getByTestId('roster-health-panel')).toBeInTheDocument();
+    expect(screen.getByTestId('raw-reconcile-panel')).toBeInTheDocument();
   });
 
   it('renders system health score', () => {

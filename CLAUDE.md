@@ -172,7 +172,7 @@ Every human-facing alert MUST pass all three tests. An alert that fails any of t
 
 **Default to the dashboard.** New monitoring starts dashboard-only or issue-only. Promote it to a human alert only after it has demonstrated it meets all three tests — not on the assumption that it will.
 
-**Currently disabled pending retrofit (2026-09-18).** These sent non-actionable Telegram alerts, three of them hourly: `Data Quality Check`, `Short-Unsubstantive Ruling Check`, `API Error Check`, `S3 Orphan-Rate Regression Guard`, `CC Dual-Run Diff`. **Do not re-enable them as part of an unrelated recovery** — their Telegram steps must be brought in line with the three tests first (or dropped in favour of the dashboard). `Scraper Zero-Record Streak Check` stays enabled: capture failure is irrecoverable, so it has a real CTA and fires at most daily.
+**Currently disabled pending retrofit (2026-09-18).** These sent non-actionable Telegram alerts, three of them hourly: `Data Quality Check`, `Short-Unsubstantive Ruling Check`, `API Error Check`, `CC Dual-Run Diff`. (`S3 Orphan-Rate Regression Guard` was retired: the daily `Raw-Key Reconciler` replaces it, dashboard and issue only, #5015.) **Do not re-enable them as part of an unrelated recovery** — their Telegram steps must be brought in line with the three tests first (or dropped in favour of the dashboard). `Scraper Zero-Record Streak Check` stays enabled: capture failure is irrecoverable, so it has a real CTA and fires at most daily.
 
 ## PR Workflow
 

@@ -152,6 +152,13 @@ export function createApolloClient(): ApolloClient<unknown> {
         RosterFreshness: {
           keyFields: ['courtId'],
         },
+        // Raw-key reconciliation on /admin/data-quality (#5015): one run,
+        // its scopes and their skip reasons stay embedded in the run.
+        RawKeyReconciliation: {
+          keyFields: ['runId'],
+        },
+        RawKeyReconcileScope: { keyFields: false },
+        ReasonCount: { keyFields: false },
         OutcomeCount: {
           keyFields: ['outcome'],
         },

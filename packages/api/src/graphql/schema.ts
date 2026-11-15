@@ -363,6 +363,53 @@ const coreTypeDefs = `#graphql
     staleThresholdHours: Float!
   }
 
+  """A skip reason and how many keys it explains."""
+  type ReasonCount {
+    reason: String!
+    count: Int!
+  }
+
+  """Raw-key reconciliation counts for one <state>/<county> archive scope. Issue #5015."""
+  type RawKeyReconcileScope {
+    """Archive scope, e.g. ca/los_angeles or federal/federal."""
+    scope: String!
+    """Content-addressed raw keys in the scope."""
+    rawKeys: Int!
+    """Keys with a derived.documents row."""
+    represented: Int!
+    """Keys with no document row but a recorded skip reason."""
+    skipped: Int!
+    """Keys with neither: captures that never reached the database."""
+    unrepresented: Int!
+    """Keys captured inside the grace window, not yet expected in the database."""
+    pending: Int!
+    """Legacy dated-layout keys, not reconciled (#4988)."""
+    datedExcluded: Int!
+    """Skipped keys per reason, largest first."""
+    skippedByReason: [ReasonCount!]!
+    """Earliest capture day (YYYY-MM-DD, UTC) of an unrepresented key."""
+    oldestUnrepresentedDay: String
+    """Latest capture day (YYYY-MM-DD, UTC) of an unrepresented key."""
+    newestUnrepresentedDay: String
+  }
+
+  """The latest scripts/reconcile_raw_keys.py run. Issue #5015."""
+  type RawKeyReconciliation {
+    runId: String!
+    startedAt: String
+    finishedAt: String
+    rawKeys: Int!
+    represented: Int!
+    skipped: Int!
+    unrepresented: Int!
+    pending: Int!
+    datedExcluded: Int!
+    """none, reingest, persistent, reingest_failed, reingest_deferred, report_only or over_threshold."""
+    action: String!
+    """Per-scope counts, most unrepresented first."""
+    scopes: [RawKeyReconcileScope!]!
+  }
+
   type DataQualityMetricEdge {
     node: DataQualityMetric!
     cursor: String!
@@ -523,6 +570,10 @@ const coreTypeDefs = `#graphql
 
     """Per-court judge-roster fetch freshness. Admin only. Issue #4872."""
     rosterFreshness: [RosterFreshness!]!
+
+    """Latest raw-key reconciliation: archived raws vs derived.documents, per
+    scope. Null before the first recorded run. Admin only. Issue #5015."""
+    rawKeyReconciliation: RawKeyReconciliation
   }
 
   # ---------------------------------------------------------------------------

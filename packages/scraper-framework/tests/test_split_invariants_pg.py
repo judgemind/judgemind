@@ -189,6 +189,25 @@ def test_generated_extraction_paths(path: str, entry: tuple[int, tuple[str, ...]
     assert all(events[e] > 0 for e in needed), (needed, dict(events))
 
 
+#: A default-set seed per non-write path, with the durable record the
+#: ``explained`` invariant found for it (#5015): a step that leaves its key
+#: with no document rows records why, keyed by the S3 key.
+_SKIP_REASON_SEEDS = {
+    "zero_rulings_no_text": (5, "harness.explained.ingest_skips:zero_rulings_no_text"),
+    "no_extractable_text": (1, "harness.explained.ingest_skips:no_extractable_text"),
+    "no_ruling_text": (55, "harness.explained.ingest_skips:no_ruling_text"),
+    "validation_fail": (0, "harness.explained.validation_results"),
+}
+
+
+@_needs_pg
+@pytest.mark.parametrize(("path", "entry"), sorted(_SKIP_REASON_SEEDS.items()))
+def test_skip_reason_recorded_for_non_write_path(path: str, entry: tuple[int, str]) -> None:
+    seed, needed = entry
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"skip-{path}")
+    assert events[needed] > 0, (needed, dict(events))
+
+
 @_needs_pg
 def test_generated_scraper_extracted_county_runs_no_extractor() -> None:
     """A seed whose county's scraper extracts every field
