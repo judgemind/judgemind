@@ -4360,102 +4360,60 @@ class LlmExtractor:
         json_mode: bool = False,
         max_tokens: int | None = None,
     ) -> LLMResponse | None:
-        """Call the multimodal LLM for one page with API-level retries.
+        """Call the multimodal LLM for one page.
 
-        Returns the provider response (text plus ``finish_reason`` and token
-        counts), or ``None`` when every attempt failed.
+        Transient provider errors are retried inside ``call_llm_with_images``
+        (``ingestion.llm_retry``, #5056), up to ``max_retries - 1`` retries:
+        the same number of attempts as before, but only for errors worth
+        retrying (a 400 is not re-sent) and without a second retry loop
+        here multiplying the first.  Returns the provider response (text plus
+        ``finish_reason`` and token counts), or ``None`` when every attempt
+        failed.
         """
         from ingestion.llm_providers import call_llm_with_images
 
-        delay = self._base_delay
+        try:
+            response = call_llm_with_images(
+                system_prompt=PDF_PER_PAGE_PROMPT,
+                text_message=text_message,
+                images=[(img_bytes, media_type)],
+                provider=self._provider,
+                model=self._model,
+                client=self._client,
+                max_retries=max(0, self._max_retries - 1),
+                max_tokens=max_tokens or self._max_output_tokens,
+                timeout=20.0,
+                json_mode=json_mode,
+            )
+        except Exception:  # noqa: BLE001 — a provider bug must not kill the doc
+            logger.error(
+                "llm_extractor.page_extract_exhausted",
+                page_index=page_index,
+                exc_info=True,
+            )
+            return None
 
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                response = call_llm_with_images(
-                    system_prompt=PDF_PER_PAGE_PROMPT,
-                    text_message=text_message,
-                    images=[(img_bytes, media_type)],
-                    provider=self._provider,
-                    model=self._model,
-                    client=self._client,
-                    max_retries=0,  # We handle retries ourselves.
-                    max_tokens=max_tokens or self._max_output_tokens,
-                    timeout=20.0,
-                    json_mode=json_mode,
-                )
+        if response is None:
+            # Self-diagnosing page-failure payload (#4253): the image's
+            # SHA-256 and byte length, so log queries can group failures by
+            # content.  The retries already happened inside the provider.
+            logger.error(
+                "llm_extractor.page_api_exhausted",
+                page_index=page_index,
+                document_id=document_id,
+                provider=self._provider,
+                model=self._model,
+                chunk_content_sha256=hashlib.sha256(img_bytes).hexdigest(),
+                chunk_preview="",
+                chunk_len=len(img_bytes),
+                chunk_kind="image",
+            )
+            return None
 
-                if response is None:
-                    # Self-diagnosing page-failure payload (#4253).
-                    # ``call_llm_with_images`` was invoked with
-                    # ``max_retries=0`` so this loop is the only retry
-                    # layer for the multimodal path; every failure here
-                    # already represents the exhausted internal retries
-                    # for one attempt.  Emit the rich payload (image
-                    # SHA-256 + byte length) on every failure so future
-                    # log queries can group by content without waiting
-                    # for a counter threshold.
-                    image_sha256 = hashlib.sha256(img_bytes).hexdigest()
-                    image_len = len(img_bytes)
-                    if attempt < self._max_retries:
-                        wait = min(delay, self._max_delay)
-                        logger.warning(
-                            "llm_extractor.page_api_failure",
-                            attempt=attempt,
-                            max_retries=self._max_retries,
-                            retry_in=wait,
-                            page_index=page_index,
-                            document_id=document_id,
-                            provider=self._provider,
-                            model=self._model,
-                            chunk_content_sha256=image_sha256,
-                            chunk_preview="",
-                            chunk_len=image_len,
-                            chunk_kind="image",
-                        )
-                        time.sleep(wait)
-                        delay *= 2
-                        continue
-                    logger.error(
-                        "llm_extractor.page_api_exhausted",
-                        page_index=page_index,
-                        document_id=document_id,
-                        provider=self._provider,
-                        model=self._model,
-                        chunk_content_sha256=image_sha256,
-                        chunk_preview="",
-                        chunk_len=image_len,
-                        chunk_kind="image",
-                    )
-                    return None
-
-                usage.input_tokens += response.input_tokens
-                usage.output_tokens += response.output_tokens
-                usage.api_calls += 1
-
-                return response
-
-            except Exception:  # noqa: BLE001
-                if attempt < self._max_retries:
-                    wait = min(delay, self._max_delay)
-                    logger.warning(
-                        "llm_extractor.page_extract_error",
-                        attempt=attempt,
-                        max_retries=self._max_retries,
-                        retry_in=wait,
-                        page_index=page_index,
-                        exc_info=True,
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                    continue
-                logger.error(
-                    "llm_extractor.page_extract_exhausted",
-                    page_index=page_index,
-                    exc_info=True,
-                )
-                return None
-
-        return None  # pragma: no cover — defensive
+        usage.input_tokens += response.input_tokens
+        usage.output_tokens += response.output_tokens
+        usage.api_calls += 1
+        return response
 
     # ------------------------------------------------------------------
     # Internal: message building

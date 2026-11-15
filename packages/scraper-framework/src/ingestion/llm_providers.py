@@ -21,36 +21,9 @@ import anthropic
 import structlog
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
+from .llm_retry import KIND_TIMEOUT, call_with_retries, classify_error
+
 logger = structlog.get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Retryable Google API error helpers
-# ---------------------------------------------------------------------------
-
-_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
-    "ResourceExhausted",  # 429 — rate limit
-    "ServiceUnavailable",  # 503 — capacity issues
-    "Unavailable",  # gRPC UNAVAILABLE status
-)
-
-
-def _is_retryable_google_error(exc: Exception) -> bool:
-    """Check if a Google API exception is transient and retryable.
-
-    Uses substring matching on the exception class name because
-    ``google.api_core.exceptions`` class names may vary across SDK
-    versions (e.g. ``ResourceExhausted`` vs ``ResourceExhaustedError``).
-    """
-    exc_name = type(exc).__name__
-    return any(sub in exc_name for sub in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS)
-
-
-def _google_retry_log_event(exc: Exception) -> str:
-    """Return the appropriate structlog event name for a retryable error."""
-    exc_name = type(exc).__name__
-    if "ResourceExhausted" in exc_name:
-        return "llm_providers.google_rate_limit"
-    return "llm_providers.google_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +333,7 @@ def _call_google(
     max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
     """Call the Google GenAI API.
 
@@ -370,16 +344,18 @@ def _call_google(
         client: Optional pre-created ``google.genai.Client`` instance for
             connection reuse.  If ``None``, creates one from the
             ``GOOGLE_API_KEY`` env var.
-        max_retries: Number of retries on transient errors (rate limit,
-            503 unavailable).  Uses exponential backoff (1s, 2s, 4s, ...).
-        timeout: Per-call timeout in seconds.  If ``None``, no timeout
-            is applied.  On timeout, returns ``None``.
+        max_retries: Number of retries on transient errors (429, 5xx,
+            timeouts, dropped connections; see ``ingestion.llm_retry``),
+            with exponential backoff and jitter.
+        timeout: Per-attempt timeout in seconds.  If ``None``, no timeout
+            is applied.
+        deadline: ``time.monotonic()`` value no attempt or retry may run
+            past.  If ``None``, only *max_retries* bounds the retries.
 
     Returns:
         An ``LLMResponse`` or ``None`` on unrecoverable failure.
     """
     from google import genai
-    from google.genai import types
 
     if client is None:
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -406,38 +382,71 @@ def _call_google(
         "max_output_tokens": max_tokens,
         "response_mime_type": "application/json",
     }
-    if timeout is not None:
-        config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
-    config = types.GenerateContentConfig(**config_kwargs)
+    return _google_generate(
+        client,
+        model,
+        user_message,
+        config_kwargs,
+        max_retries=max_retries,
+        timeout=timeout,
+        deadline=deadline,
+        event_prefix="llm_providers.google_",
+    )
 
-    for attempt in range(1 + max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=user_message,
-                config=config,
-            )
-            return _google_response(response)
-        except Exception as exc:  # noqa: BLE001
-            # google-genai raises google.api_core.exceptions for rate limits
-            # and other API errors.  Catch broadly and check for retryable.
-            exc_name = type(exc).__name__
-            # Timeout errors — return immediately without retrying.
-            if "DeadlineExceeded" in exc_name or "Timeout" in exc_name:
-                logger.warning(
-                    "llm_providers.google_timeout",
-                    timeout=timeout,
-                    error=str(exc),
-                )
-                return None
-            if _is_retryable_google_error(exc) and attempt < max_retries:
-                log_event = _google_retry_log_event(exc)
-                logger.warning(log_event, attempt=attempt + 1)
-                time.sleep(2**attempt)
-                continue
-            logger.warning("llm_providers.google_api_error", error=str(exc))
-            return None
-    return None  # pragma: no cover — defensive unreachable
+
+def _google_generate(
+    client: object,
+    model: str,
+    contents: object,
+    config_kwargs: dict,
+    *,
+    max_retries: int,
+    timeout: float | None,
+    deadline: float | None,
+    event_prefix: str,
+) -> LLMResponse | None:
+    """One ``generate_content`` call with the shared retry policy (#5056).
+
+    Transient errors (429 / 5xx / timeouts / dropped connections) are
+    retried by ``llm_retry.call_with_retries``, within *deadline*; each
+    attempt's HTTP timeout is *timeout* shortened to the time left.  The
+    SDK's own retry stays off (no ``retry_options``), so nothing retries
+    twice.  On final failure, logs ``<event_prefix>timeout`` or
+    ``<event_prefix>api_error`` and returns ``None``.
+    """
+    from google.genai import types
+
+    def attempt(attempt_timeout: float | None) -> LLMResponse:
+        kwargs = dict(config_kwargs)
+        if attempt_timeout is not None:
+            kwargs["http_options"] = types.HttpOptions(timeout=max(1, int(attempt_timeout * 1000)))
+        response = client.models.generate_content(  # type: ignore[attr-defined]
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(**kwargs),
+        )
+        return _google_response(response)
+
+    try:
+        return call_with_retries(
+            attempt,
+            max_retries=max_retries,
+            timeout=timeout,
+            deadline=deadline,
+            event_prefix=event_prefix,
+        )
+    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+        decision = classify_error(exc)
+        event = "timeout" if decision.kind == KIND_TIMEOUT else "api_error"
+        logger.warning(
+            f"{event_prefix}{event}",
+            timeout=timeout,
+            status=decision.status,
+            kind=decision.kind,
+            retryable=decision.retryable,
+            error=str(exc),
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +464,7 @@ def call_llm(
     max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
     """Call an LLM provider and return the response.
 
@@ -471,11 +481,14 @@ def call_llm(
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
         max_retries: Number of retries on transient errors.  For Google,
-            this includes rate limits (429) and service unavailable (503).
-            For Anthropic, retries are limited to rate-limit errors.
-        timeout: Per-call timeout in seconds.  If ``None``, no timeout
-            is applied.  On timeout, returns ``None`` so the caller can
-            fall back to the next extraction tier (e.g. regex).
+            ``ingestion.llm_retry`` decides: 429, 500, 502, 503, 504,
+            timeouts and dropped connections.  For Anthropic, retries are
+            limited to rate-limit errors.
+        timeout: Per-attempt timeout in seconds.  If ``None``, no timeout
+            is applied.  When every attempt fails, returns ``None`` so the
+            caller can fall back to the next extraction tier (e.g. regex).
+        deadline: Google only: ``time.monotonic()`` value no attempt or
+            retry may run past.
 
     Returns:
         An ``LLMResponse`` with the text and token counts, or ``None``
@@ -503,6 +516,7 @@ def call_llm(
             max_retries=max_retries,
             timeout=timeout,
             max_tokens=max_tokens,
+            deadline=deadline,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)
@@ -522,6 +536,7 @@ def call_llm_with_images(
     max_tokens: int = 4096,
     json_mode: bool = False,
     thinking_budget: int | None = None,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
     """Call an LLM provider with text and image content (vision API).
 
@@ -538,9 +553,12 @@ def call_llm_with_images(
         model: Model ID.
         client: Optional pre-created provider client.
         max_retries: Number of retries on transient errors.  For Google,
-            this includes rate limits (429) and service unavailable (503).
-            For Anthropic, retries are limited to rate-limit errors.
-        timeout: Per-call timeout in seconds.
+            ``ingestion.llm_retry`` decides: 429, 500, 502, 503, 504,
+            timeouts and dropped connections.  For Anthropic, retries are
+            limited to rate-limit errors.
+        timeout: Per-attempt timeout in seconds.
+        deadline: Google only: ``time.monotonic()`` value no attempt or
+            retry may run past (the OCR run budget, #4986).
         max_tokens: Maximum output tokens.
         json_mode: Ask Google for a JSON response
             (``response_mime_type="application/json"``), which constrains
@@ -579,6 +597,7 @@ def call_llm_with_images(
             max_tokens=max_tokens,
             json_mode=json_mode,
             thinking_budget=thinking_budget,
+            deadline=deadline,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)
@@ -683,8 +702,12 @@ def _call_google_with_images(
     max_tokens: int = 4096,
     json_mode: bool = False,
     thinking_budget: int | None = None,
+    deadline: float | None = None,
 ) -> LLMResponse | None:
-    """Call the Google GenAI API with image content (multimodal)."""
+    """Call the Google GenAI API with image content (multimodal).
+
+    Retries and *deadline* work as in :func:`_call_google`.
+    """
     from google import genai
     from google.genai import types
 
@@ -718,43 +741,16 @@ def _call_google_with_images(
     thinking_config = _google_thinking_config(model, thinking_budget)
     if thinking_config is not None:
         config_kwargs["thinking_config"] = thinking_config
-    if timeout is not None:
-        config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
-    config = types.GenerateContentConfig(**config_kwargs)
-
-    for attempt in range(1 + max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=parts,
-                config=config,
-            )
-            return _google_response(response)
-        except Exception as exc:  # noqa: BLE001
-            exc_name = type(exc).__name__
-            if "DeadlineExceeded" in exc_name or "Timeout" in exc_name:
-                logger.warning(
-                    "llm_providers.google_vision_timeout",
-                    timeout=timeout,
-                    error=str(exc),
-                )
-                return None
-            if _is_retryable_google_error(exc) and attempt < max_retries:
-                log_event = _google_retry_log_event(exc)
-                # Use vision-specific log event prefix
-                vision_event = log_event.replace(
-                    "llm_providers.google_",
-                    "llm_providers.google_vision_",
-                )
-                logger.warning(
-                    vision_event,
-                    attempt=attempt + 1,
-                )
-                time.sleep(2**attempt)
-                continue
-            logger.warning("llm_providers.google_vision_api_error", error=str(exc))
-            return None
-    return None  # pragma: no cover — defensive unreachable
+    return _google_generate(
+        client,
+        model,
+        parts,
+        config_kwargs,
+        max_retries=max_retries,
+        timeout=timeout,
+        deadline=deadline,
+        event_prefix="llm_providers.google_vision_",
+    )
 
 
 def _try_create(provider: str) -> object | None:
