@@ -37,14 +37,22 @@ Real versions are never deleted or overwritten (``framework.raw_delete_guard``).
 ``--write-keys URI`` writes the restored keys, one per line, for
 ``reingest_from_s3.py --s3-key-list``.
 
-Usage (run on ECS, the oneshot role can list versions and get)::
+Usage (classify and --thaw run on ECS under the read-only raw-audit role,
+``judgemind-s3-raw-audit-dev``: ListBucketVersions under ``ca/``, plus
+GetObject / GetObjectVersion / RestoreObject on ``ca/*/*/raw/*``; #4993)::
 
-    scripts/ecs-run-task.sh --detach scripts/audit_raw_delete_markers.py
+    scripts/ecs-run-task.sh --detach --role judgemind-s3-raw-audit-dev \\
+        scripts/audit_raw_delete_markers.py
     scripts/ecs-wait-task.sh
 
-    # --thaw needs s3:RestoreObject; --restore needs s3:DeleteObjectVersion
-    # and s3:PutObject on raw keys, which no ECS oneshot role grants: run
-    # those with operator credentials for the dev account.
+    # Request thawed copies of GLACIER / DEEP_ARCHIVE versions:
+    scripts/ecs-run-task.sh --detach --role judgemind-s3-raw-audit-dev \\
+        scripts/audit_raw_delete_markers.py -- --thaw Standard
+
+    # --restore needs s3:DeleteObjectVersion (to remove a delete marker)
+    # and s3:PutObject on raw keys. No ECS role is granted those: IAM cannot
+    # tell a delete marker from a data version, and deleting a data version
+    # is permanent. Run --restore with operator credentials for dev.
     packages/scraper-framework/.venv/bin/python \\
         scripts/audit_raw_delete_markers.py --restore \\
         --write-keys s3://judgemind-document-archive-dev/tmp/keys/restored-4991.txt

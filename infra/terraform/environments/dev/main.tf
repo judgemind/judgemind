@@ -70,12 +70,13 @@ module "iam_agent" {
   scraper_role_arn            = module.iam_scraper.role_arn
 }
 
-# Narrow IAM role for one-off raw-prefix S3 cleanup scripts (#4440).
-# Used via `scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev` for
-# scripts/cleanup_mislabeled_s3_2661.py (#2661) and similar future
-# `ca/{county}/{court}/raw/*` cleanup classes. Dev-only by design.
-module "iam_s3_cleanup" {
-  source = "../../modules/iam_s3_cleanup"
+# Read-only IAM role for raw-archive audits (#4993, formerly the #4440
+# s3-cleanup role). Used via
+# `scripts/ecs-run-task.sh --role judgemind-s3-raw-audit-dev` for
+# scripts/audit_raw_delete_markers.py: lists versions under ca/, reads and
+# thaws versions of ca/*/*/raw/*. No delete, no write. Dev-only by design.
+module "iam_s3_raw_audit" {
+  source = "../../modules/iam_s3_raw_audit"
 
   environment                 = "dev"
   document_archive_bucket_arn = module.document_archive.bucket_arn
@@ -784,9 +785,9 @@ output "agent_role_arn" {
   value       = module.iam_agent.role_arn
 }
 
-output "s3_cleanup_role_arn" {
-  description = "Dev s3-cleanup IAM role ARN -- pass to scripts/ecs-run-task.sh --role judgemind-s3-cleanup-dev for raw-prefix cleanup scripts (#4440)"
-  value       = module.iam_s3_cleanup.role_arn
+output "s3_raw_audit_role_arn" {
+  description = "Dev read-only raw-audit IAM role ARN -- pass scripts/ecs-run-task.sh --role judgemind-s3-raw-audit-dev for scripts/audit_raw_delete_markers.py (#4993)"
+  value       = module.iam_s3_raw_audit.role_arn
 }
 
 output "scraper_instance_profile_arn" {
