@@ -31,8 +31,7 @@
 # scope-driven:
 #
 #   - ``scripts/archive/`` houses deprecated one-offs kept for
-#     posterity. The pre-extraction migration (``migrate_s3_keys.py``)
-#     lives there and is intentionally kept independent.
+#     posterity.
 #   - ``scripts/tests/`` legitimately imports from the framework but
 #     also defines names locally as fixtures / inside
 #     ``mock_sys_modules`` blocks — out of scope for this guard.
@@ -198,8 +197,7 @@ if (( violations > 0 )); then
     echo "    +    parse_flat_hash_key,"
     echo "    +)"
     echo ""
-    echo "  Reference implementations:"
-    echo "    - scripts/archive/cleanup_mislabeled_s3_2661.py (post-#4447, archived #4565)"
+    echo "  Reference implementation:"
     echo "    - scripts/archive/repoint_mislabeled_documents_4439.py (post-#4447, archived #4565)"
     echo ""
     echo "  If your script genuinely cannot import from framework.s3_keys"

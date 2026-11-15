@@ -56,9 +56,7 @@ What is NOT flagged
 -------------------
 
   - Files under ``scripts/archive/`` (deprecated one-offs kept for
-    posterity — the migration that originally produced the helpers
-    lives there as ``scripts/archive/migrate_s3_keys.py`` and it is
-    intentionally kept independent).
+    posterity).
   - Files under ``scripts/tests/`` (tests legitimately import from
     the framework but may also redefine names locally as fixtures or
     inside ``mock_sys_modules`` blocks — out of scope for this guard).

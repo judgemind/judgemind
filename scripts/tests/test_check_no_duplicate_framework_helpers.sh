@@ -366,10 +366,6 @@ if ! echo "$out" | grep -q '^  Fix:'; then
     echo "FAIL: Fix block label not emitted"
     fail=1
 fi
-if ! echo "$out" | grep -q 'cleanup_mislabeled_s3_2661.py'; then
-    echo "FAIL: Fix block missing reference to cleanup_mislabeled_s3_2661.py"
-    fail=1
-fi
 if ! echo "$out" | grep -q 'repoint_mislabeled_documents_4439.py'; then
     echo "FAIL: Fix block missing reference to repoint_mislabeled_documents_4439.py"
     fail=1

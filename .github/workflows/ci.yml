@@ -85,6 +85,7 @@ jobs:
               # packages/scraper-framework/tests/**.py by
               # scripts/check-test-script-imports-mapped.sh.  See #4452.
               - 'scripts/audit_oc_ruling_integrity.py'
+              - 'scripts/audit_raw_delete_markers.py'
               - 'scripts/backfill_llm_enrichment.py'
               - 'scripts/check-scraper-registry.py'
               - 'scripts/check_tests_use_reingest_helper.py'
@@ -806,6 +807,11 @@ jobs:
       - name: Check docs describe the actual rebuild_db.py CLI
         if: matrix.shard == 'python'
         run: scripts/check-no-rebuild-db-skip-reset.sh
+      # Issue #4991: no raw may be deleted unless a live byte-identical copy
+      # exists; only framework.raw_delete_guard may delete from the archive.
+      - name: Check S3 deletes go through the raw-archive guard
+        if: matrix.shard == 'python'
+        run: scripts/check-no-unguarded-s3-delete.sh
       # Issue #4417: forbid spelling out the CI rollup-classifier
       # vocabulary (frozenset({"FAILURE","TIMED_OUT",...}) or jq
       # `$x == "FAILURE" or $x == "TIMED_OUT"`) outside the canonical
