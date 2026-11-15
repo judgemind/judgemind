@@ -706,77 +706,88 @@ def _ocr_pages_counted(
     ``_OCR_TOTAL_TIMEOUT``); pages not answered by then are abandoned.
     """
     import time as time_mod
-    from concurrent.futures import FIRST_COMPLETED, wait
+    from concurrent.futures import FIRST_COMPLETED, Future, wait
+
+    import pymupdf
 
     start_time = time_mod.monotonic()
-    page_images, total_pages = _render_pdf_pages_counted(pdf_bytes, max_pages, indexes)
-    wanted = total_pages if indexes is None else len(indexes)
-
-    problems: list[str] = []
-    if wanted > len(page_images):
-        logger.warning(
-            "ocr_pdf_text.page_limit_reached",
-            max_pages=max_pages,
-            total_pages=total_pages,
-            pages_to_read=wanted,
-        )
-        problems.append(f"page cap {max_pages} of {wanted} pages")
-
-    if not page_images:
-        logger.warning("ocr_pdf_text.no_pages_rendered", total_pages=total_pages)
-        return {}, problems, total_pages
-
-    budget = (
-        _ocr_total_timeout(len(page_images), page_timeout, concurrency)
-        if total_timeout is None
-        else total_timeout
-    )
-    logger.info(
-        "ocr_pdf_text.starting",
-        page_count=len(page_images),
-        total_pages=total_pages,
-        max_pages=max_pages,
-        concurrency=concurrency,
-        total_timeout=budget,
-    )
-
     texts: dict[int, str | None] = {}
-    pool = ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="ocr")
-    try:
-        futures = {}
-        deadline = start_time + budget
-        if budget > 0:
-            futures = {
-                pool.submit(
-                    _ocr_single_page,
-                    image_bytes,
-                    media_type,
-                    page_index=index,
-                    timeout=min(page_timeout, budget),
-                ): index
-                for index, (image_bytes, media_type) in page_images
-            }
-        pending = set(futures)
-        while pending:
-            remaining = deadline - time_mod.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            for future in done:
-                texts[futures[future]] = future.result()
-        for future in pending:
-            future.cancel()
-    finally:
-        # Abandoned calls finish in the background; their results are
-        # dropped.
-        pool.shutdown(wait=False, cancel_futures=True)
+    problems: list[str] = []
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total_pages = len(doc)
+        wanted = list(range(total_pages)) if indexes is None else list(indexes)
+        # page-cap: past it the result is incomplete (#4986).
+        to_read = wanted[:max_pages]
+        if len(wanted) > len(to_read):
+            logger.warning(
+                "ocr_pdf_text.page_limit_reached",
+                max_pages=max_pages,
+                total_pages=total_pages,
+                pages_to_read=len(wanted),
+            )
+            problems.append(f"page cap {max_pages} of {len(wanted)} pages")
 
-    unanswered = len(page_images) - len(texts)
+        if not to_read:
+            logger.warning("ocr_pdf_text.no_pages_rendered", total_pages=total_pages)
+            return {}, problems, total_pages
+
+        budget = (
+            _ocr_total_timeout(len(to_read), page_timeout, concurrency)
+            if total_timeout is None
+            else total_timeout
+        )
+        logger.info(
+            "ocr_pdf_text.starting",
+            page_count=len(to_read),
+            total_pages=total_pages,
+            max_pages=max_pages,
+            concurrency=concurrency,
+            total_timeout=budget,
+        )
+
+        # Pages are rendered one at a time, only when a worker is free, so
+        # at most *concurrency* page images are alive at once: rendering a
+        # whole scan up front OOM-killed the 512 MB live worker (#5010).
+        workers = max(1, concurrency)
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr")
+        try:
+            deadline = start_time + budget
+            queue = iter(to_read)
+            pending: dict[Future[str | None], int] = {}
+            exhausted = budget <= 0
+            while True:
+                while not exhausted and len(pending) < workers:
+                    index = next(queue, None)
+                    if index is None or time_mod.monotonic() >= deadline:
+                        exhausted = True
+                        break
+                    future = pool.submit(
+                        _ocr_single_page,
+                        _render_page(doc, index),
+                        "image/png",
+                        page_index=index,
+                        timeout=min(page_timeout, budget),
+                    )
+                    pending[future] = index
+                remaining = deadline - time_mod.monotonic()
+                if not pending or remaining <= 0:
+                    break
+                done, _ = wait(set(pending), timeout=remaining, return_when=FIRST_COMPLETED)
+                for future in done:
+                    texts[pending.pop(future)] = future.result()
+            for future in pending:
+                future.cancel()
+        finally:
+            # Abandoned calls finish in the background; their results are
+            # dropped.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    unanswered = len(to_read) - len(texts)
     if unanswered:
         logger.warning(
             "ocr_pdf_text.total_timeout",
             pages_completed=len(texts),
-            total_pages=len(page_images),
+            total_pages=len(to_read),
             elapsed_seconds=round(time_mod.monotonic() - start_time, 1),
         )
         problems.append(f"{unanswered} page(s) unanswered after {budget:g}s")
@@ -791,6 +802,22 @@ def _ocr_pages_counted(
             reason="; ".join(problems),
         )
     return texts, problems, total_pages
+
+
+def _render_page(doc: object, index: int) -> bytes:
+    """Page *index* of an open pymupdf document as a PNG, at
+    ``_OCR_RESOLUTION`` DPI."""
+    import pymupdf
+
+    zoom = _OCR_RESOLUTION / 72.0
+    pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))  # type: ignore[index]
+    png = pix.tobytes("png")
+    del pix
+    # MuPDF keeps decoded page images in its store (up to 256 MB by
+    # default): a scan's full-resolution images, one per page.  Empty it,
+    # so a long scan costs one page's memory, not the whole document's.
+    pymupdf.TOOLS.store_shrink(100)
+    return png
 
 
 def _render_pdf_pages(

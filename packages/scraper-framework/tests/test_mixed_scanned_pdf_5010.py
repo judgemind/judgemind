@@ -194,7 +194,7 @@ def test_mixed_scanned_pdf_ocr_page_cap_is_incomplete() -> None:
 
 
 def test_mixed_scanned_pdf_render_failure_is_incomplete(mixed: bytes) -> None:
-    with patch.object(llm_extract, "_render_pdf_pages_counted", side_effect=RuntimeError("x")):
+    with patch.object(llm_extract, "_render_page", side_effect=RuntimeError("x")):
         result = extract_pdf_text(mixed)
     assert result is not None
     assert result.incomplete == "OCR of page(s) [4] failed"
@@ -455,18 +455,21 @@ def _s3_returning(body: bytes | None) -> MagicMock:
 
 @pytest.fixture()
 def live_reread(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The live re-read, off in production until OCR streams pages in
-    bounded memory (the 512 MB live worker OOM'd on a 25-page scan)."""
+    """The live re-read on, whatever the production default
+    (``LIVE_SCANNED_PAGE_REREAD``)."""
     from ingestion import worker as worker_mod
 
     monkeypatch.setattr(worker_mod, "LIVE_SCANNED_PAGE_REREAD", True)
 
 
 def test_live_capture_scanned_pages_deferred_without_reading_the_archive(
-    mixed: bytes,
+    mixed: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Off (the default): no S3 read, no OCR in the live worker; the event
-    is marked incomplete so no split is built on its partial text."""
+    """Off: no S3 read, no OCR in the live worker; the event is marked
+    incomplete so no split is built on its partial text."""
+    from ingestion import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "LIVE_SCANNED_PAGE_REREAD", False)
     worker, _ = _sc_worker()
     worker._s3_client = _s3_returning(mixed)
     extra: dict[str, Any] = {}

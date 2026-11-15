@@ -291,14 +291,15 @@ OCR_INCOMPLETE_KEY = "_ocr_incomplete"
 OCR_INCOMPLETE = "incomplete OCR of a PDF's scanned pages"
 
 #: Whether the live worker reads a live capture's scanned pages again from
-#: the archive and OCRs them (#5010).  Off: OCR renders every scanned page
-#: to an image at once, and a 25-page San Bernardino scan OOM-killed the
-#: 512 MB live worker on every redelivery.  Until OCR streams pages in
-#: bounded memory, such an event is marked incomplete instead: the split
-#: is refused (a new key takes the single-document fallback and its
-#: ``ingest_incomplete`` record), and the reconciler's reingest, which
-#: runs in a larger one-off task, OCRs the pages.
-LIVE_SCANNED_PAGE_REREAD = False
+#: the archive and OCRs them (#5010).  It was off for a day: OCR rendered
+#: every scanned page at once and kept MuPDF's image store full, and a
+#: 25-page San Bernardino scan OOM-killed the 512 MB live worker on every
+#: redelivery.  OCR now renders one page at a time and empties the store
+#: (``llm_extract._render_page``; that scan peaks about 100 MB over the
+#: worker's baseline instead of 300 MB), and a message that still kills the
+#: worker is dead-lettered after ``MAX_MESSAGE_DELIVERIES``.  Off, such an
+#: event is marked incomplete and left to the reconciler's reingest.
+LIVE_SCANNED_PAGE_REREAD = True
 
 #: Pages OCR'd for a multimodal county's scanned PDF (#4986).  Its split
 #: reads the page images itself (every page); the OCR text is only the
@@ -1948,6 +1949,15 @@ STALE_CONSUMER_IDLE_MS = 3_600_000
 # abandoned by a crashed consumer.  30 seconds is long enough that a healthy
 # consumer processing a slow message won't lose it.
 PENDING_RECLAIM_MIN_IDLE_MS = 30_000
+
+#: Deliveries after which a reclaimed message is dead-lettered unprocessed
+#: (#5010).  A message is only redelivered without an ack when the worker
+#: died processing it (an OOM kill, a crash): ``_process_message`` acks or
+#: dead-letters every error it sees.  Processing such a message again kills
+#: the worker again, so live ingestion stalls behind it forever.  Past this
+#: count it is recorded ``dead_letter`` (#5008), so the raw-key reconciler
+#: re-ingests its key in a one-off task, under its attempt cap.
+MAX_MESSAGE_DELIVERIES = 3
 
 # How often (in empty-poll cycles) to attempt PEL reclamation during the
 # main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
@@ -7024,10 +7034,62 @@ class IngestionWorker:
                 logger.debug("Acknowledging deleted PEL entry %s", msg_id)
                 self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
                 continue
+            deliveries = self._delivery_count(msg_id)
+            if deliveries is not None and deliveries > MAX_MESSAGE_DELIVERIES:
+                self._dead_letter_poison_message(msg_id, data, deliveries)
+                continue
             self._process_message(msg_id, data)
             processed += 1
 
         return processed
+
+    def _delivery_count(self, msg_id: bytes) -> int | None:
+        """How many times *msg_id* has been delivered (``XPENDING``'s
+        ``times_delivered``, the claim that returned it included), or
+        ``None`` when Redis cannot say."""
+        try:
+            rows = self._redis.xpending_range(
+                STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, min=msg_id, max=msg_id, count=1
+            )
+        except Exception as exc:
+            logger.warning("XPENDING failed for %s: %s", msg_id, exc)
+            return None
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return None
+        count = rows[0].get("times_delivered")
+        return count if isinstance(count, int) else None
+
+    def _dead_letter_poison_message(
+        self, msg_id: bytes, data: dict[bytes, bytes], deliveries: int
+    ) -> None:
+        """Dead-letter a message the worker died on *deliveries* times,
+        without processing it again (``MAX_MESSAGE_DELIVERIES``)."""
+        raw = data.get(b"data", data.get("data", "{}"))  # type: ignore[call-overload]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        try:
+            event_data = json.loads(raw)
+        except json.JSONDecodeError:
+            event_data = None
+        event = event_data if isinstance(event_data, dict) else {}
+        logger.critical(
+            "Dead-lettering message %s unprocessed: delivered %d times without an "
+            "ack, so it killed the worker each time",
+            msg_id,
+            deliveries,
+            extra={
+                "telemetry_event": "poison_message_dead_lettered",
+                "document_id": event.get("document_id"),
+                "s3_key": event.get("s3_key"),
+                "deliveries": deliveries,
+            },
+        )
+        self._record_dead_letter(
+            event_data,
+            RuntimeError(f"worker died on this message {deliveries} times (OOM or crash)"),
+            attempts=deliveries,
+        )
+        self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
 
     def _process_batch(self, batch_size: int, block_ms: int) -> None:
         messages = self._redis.xreadgroup(
