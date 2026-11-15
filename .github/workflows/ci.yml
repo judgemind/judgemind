@@ -888,6 +888,13 @@ jobs:
       - name: Check git-writing tests scrub inherited repository env vars
         if: matrix.shard == 'python'
         run: scripts/check-test-git-env-scrub.sh
+      # Issue #5071: every test root must cut tests off from real GitHub (the
+      # conftest gh-isolate block, or scripts/tests/_gh-isolate.sh for shell
+      # tests). A test that reaches the real gh with a developer's login acts
+      # on real GitHub; in #5071 one closed an open issue.
+      - name: Check tests cannot reach real GitHub
+        if: matrix.shard == 'python'
+        run: scripts/check-test-gh-isolate.sh
       - name: Check test files do not redefine the same stub binary
         if: matrix.shard == 'python'
         run: scripts/check-no-duplicate-stubs.sh

@@ -421,6 +421,24 @@ When filing a hygiene-check issue:
 - **File both halves at the same time.** Either as one issue (when the work is small enough to land together) or as a pair of linked issues with `Parent: #<root>` and a cross-reference in each body. Do not assume the test-side guard will follow naturally — it usually doesn't.
 - **Reference the symmetric pair in both bodies.** Future readers should be able to see the loop closed without having to re-derive it from the audit history.
 
+## PR descriptions and commit messages: closing words only for the PR's own issue
+
+GitHub closes an issue when a closing word sits directly before its number: `close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`, optionally followed by a colon, then `#N`, `owner/repo#N` or an issue URL. In a PR description the issue closes when the PR merges; in a commit message, when the commit lands on `main` (this repo squash-merges with the branch's commit messages as the squash body). It does not matter that the sentence is describing an incident: PR #5072's description told the story of a test run that had wrongly closed an open issue, wrote the verb right before the issue number, and merging it closed that issue again (#5071).
+
+Rules for PR bodies and commit messages:
+
+- **Close only the PR's own issue, on its own line.** End the body with `Closes #N` for the issue the PR is meant to close (the `/task` template already does). Do not put a closing word before any other issue number anywhere in the body or the commits.
+- **Describe other issues without the pattern.** Drop the `#`, or put a word between the verb and the number: write "the run auto-closed issue 4673", "the fix for issue 4673 landed in PR 5070", or "see #4673", not the verb followed directly by `#4673`.
+- **Issue bodies and comments are safe.** Closing words there do nothing; the rule is for PR descriptions and commit messages.
+
+`scripts/check-pr-closing-refs.py` enforces this. The `closing-refs` job in `.github/workflows/pr-title-check.yml` runs it on every PR (and on every body edit): it reads the PR's `closingIssuesReferences`, the body and the commit messages, and fails, with a `Fix:` block, when any of them would close an issue that is not in the branch name, the PR title, or an explicit `Closes #N` line. Check a draft before opening the PR:
+
+```
+scripts/check-pr-closing-refs.py --title "<title>" --body-file tmp/pr_body.txt --git-range origin/main..HEAD
+```
+
+If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh, passing run, but the failed run stays on the same head commit and `scripts/wait-for-ci.sh` keeps reporting it. Re-run it once: `gh run rerun <failed-run-id> --failed --repo judgemind/judgemind` (the check reads the live PR, so the re-run passes).
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:

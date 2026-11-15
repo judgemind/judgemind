@@ -60,6 +60,7 @@
 # Exits non-zero if any scenario fails.
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 UMBRELLA_REAL="$REPO_ROOT/scripts/run-ci-guards.sh"

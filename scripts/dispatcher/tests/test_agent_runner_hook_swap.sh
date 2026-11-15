@@ -31,6 +31,7 @@
 
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../tests/_git-env-scrub.sh"  # unset inherited GIT_DIR etc. (#5058)
+. "$(dirname "${BASH_SOURCE[0]}")/../../tests/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HELPER="$SCRIPT_DIR/dispatcher/agent_runner_install_fargate_hook.sh"

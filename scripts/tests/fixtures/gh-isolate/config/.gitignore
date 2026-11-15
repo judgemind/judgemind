@@ -1,0 +1,5 @@
+# GH_CONFIG_DIR for shell tests (scripts/tests/_gh-isolate.sh, #5071).
+# Must stay empty of gh state: no hosts.yml means no login. Ignore anything
+# a gh binary might write here so it never reaches a commit.
+*
+!.gitignore

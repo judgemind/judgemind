@@ -781,6 +781,14 @@ Immediately open a PR after the first push — never push without creating one. 
 
 The PR body must include `Closes #N` so the unblock workflow fires on merge.
 
+**Closing words only for this PR's issue (#5071).** GitHub closes any issue whose number follows a closing word (`close`/`closes`/`closed`, `fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved`) in the PR body or in a commit message, even mid-sentence: PR #5072 described an incident with the verb right before an issue number and its merge re-closed that open issue. Keep `Closes #N` for this PR's issue on its own line at the end of the body, and when the body or a commit message mentions any other issue, drop the `#` or put a word between ("the run auto-closed issue 4673", "see #4673"). Before creating the PR, check the draft body and the branch's commits:
+
+```
+{worktree}/scripts/check-pr-closing-refs.py --title "<title>" --body-file {worktree}/tmp/pr_body.txt --git-range origin/main..HEAD
+```
+
+Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. If it fails on the open PR and you fix the body with `gh pr edit`, also re-run the failed run (`gh run rerun <run-id> --failed --repo judgemind/judgemind`): the stale failure stays on the head commit and keeps `wait-for-ci.sh` red. See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
+
 **PR body template — use this structure for all PRs:**
 
 Write the PR body to `{worktree}/tmp/pr_body.txt` using this template:

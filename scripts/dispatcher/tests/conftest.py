@@ -91,6 +91,68 @@ def _git_env_scrub(tmp_path_factory: pytest.TempPathFactory) -> object:
 # --- END git-env-scrub (#5058) ---
 
 
+# --- BEGIN gh-isolate (#5071) ---
+# Edit scripts/tests/conftest.py, then copy this block verbatim into every
+# other conftest.py that has it. scripts/check-test-gh-isolate.sh fails when
+# the copies differ or when a test root has no copy.
+#
+# A test that reaches the real `gh` acts on real GitHub with the developer's
+# login: in #5071 a dispatcher test ran the real sweep-completed-parents.sh,
+# which closed an open issue and posted comments. This session fixture cuts
+# every test off from real GitHub:
+#   * GH_CONFIG_DIR points at an empty directory (no stored login);
+#   * GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN and GITHUB_ENTERPRISE_TOKEN
+#     are removed;
+#   * a `gh` shim goes first on PATH. It never touches the network: it prints
+#     "real gh called from a test" to stderr, appends the call to
+#     $GH_ISOLATE_LOG, and exits 4 (gh's "not authenticated" code).
+# A test that needs gh installs its own stub (a fake `gh` prepended to PATH,
+# or a mocked subprocess call); that stub wins over the shim. Everything is
+# restored after the session.
+_GH_ISOLATE_TOKEN_VARS = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
+_GH_ISOLATE_SHIM = """\
+#!/bin/sh
+# gh shim from the gh-isolate test fixture (#5071). Never calls GitHub.
+echo "FAIL: real gh called from a test (#5071): gh $*" >&2
+echo "Fix: stub gh in this test (put a fake gh first on PATH, or mock the call)." >&2
+if [ -n "${GH_ISOLATE_LOG:-}" ]; then
+    printf '%s\\tgh %s\\n' "${PYTEST_CURRENT_TEST:-${GH_ISOLATE_TEST:-?}}" "$*" >>"$GH_ISOLATE_LOG"
+fi
+exit 4
+"""
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _gh_isolate(tmp_path_factory: pytest.TempPathFactory) -> object:
+    """Cut the test session off from real GitHub (#5071)."""
+    root = tmp_path_factory.mktemp("gh-isolate")
+    bin_dir = root / "bin"
+    config_dir = root / "config"
+    bin_dir.mkdir()
+    config_dir.mkdir()
+    shim = bin_dir / "gh"
+    shim.write_text(_GH_ISOLATE_SHIM)
+    shim.chmod(0o755)
+    log = os.environ.get("GH_ISOLATE_LOG") or str(root / "calls.log")
+    with pytest.MonkeyPatch.context() as mp:
+        for name in _GH_ISOLATE_TOKEN_VARS:
+            mp.delenv(name, raising=False)
+        mp.setenv("GH_CONFIG_DIR", str(config_dir))
+        mp.setenv("GH_ISOLATE_LOG", log)
+        mp.setenv("GH_NO_UPDATE_NOTIFIER", "1")
+        mp.setenv("GH_PROMPT_DISABLED", "1")
+        mp.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+        yield
+
+
+# --- END gh-isolate (#5071) ---
+
+
 class _UniqueViolation(Exception):
     """Test sentinel — real Exception subclass so daemon's except clauses work."""
 
@@ -145,6 +207,53 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "integration: tests exercising real subprocess/filesystem/git — excluded from default CI run",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_gh_healers: run DispatcherDaemon's real gh-calling housekeeping "
+        "healers instead of the conftest stubs (#5071)",
+    )
+
+
+# DispatcherDaemon housekeeping healers that shell out to scripts which call
+# `gh` and change GitHub state (close issues / PRs, post comments). In #5071
+# a `_housekeeping_tick()` test ran the real sweep-completed-parents.sh with
+# the developer's gh login and closed an open issue. The gh-isolate fixture
+# above already makes any such call fail; these stubs also keep the tick
+# tests from spawning the scripts at all (they made the suite take >10 min).
+_GH_HEALER_STUBS: dict[str, dict[str, object]] = {
+    "_housekeeping_sweep_completed_parents": {"exit_code": 0, "summary_tail": ""},
+    "_housekeeping_close_orphan_prs": {
+        "closed": 0,
+        "scanned": 0,
+        "skipped_non_agent": 0,
+        "skipped_no_target": 0,
+        "skipped_open_target": 0,
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def _stub_gh_housekeeping_healers(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replace the gh-calling housekeeping healers with no-op stubs (#5071).
+
+    A test that exercises a healer itself opts out with
+    ``@pytest.mark.real_gh_healers`` (and must point it at a fake script).
+    A test's own ``monkeypatch.setattr(d, "<healer>", ...)`` on the instance
+    still wins over these class-level stubs.
+    """
+    if request.node.get_closest_marker("real_gh_healers"):
+        return
+    for module_name in ("dispatcher.daemon", "scripts.dispatcher.daemon"):
+        module = sys.modules.get(module_name)
+        cls = getattr(module, "DispatcherDaemon", None)
+        if cls is None:
+            continue
+        for name, result in _GH_HEALER_STUBS.items():
+            monkeypatch.setattr(
+                cls, name, lambda self, _r=result: dict(_r), raising=True
+            )
 
 
 @pytest.fixture(autouse=True, scope="session")

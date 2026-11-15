@@ -30,6 +30,18 @@ block in `conftest.py` (the canonical copy, mirrored in every other
 Python test root). `scripts/check-test-git-env-scrub.sh` enforces both.
 See `docs/agent/code-standards.md` §Tests that write to git.
 
+### Tests never reach real GitHub
+
+Every shell test sources `_gh-isolate.sh` right after `set -euo pipefail`
+(after the `_git-env-scrub.sh` line, if any). It empties `GH_CONFIG_DIR`,
+unsets the GitHub token variables and puts the `gh` shim from
+`fixtures/gh-isolate/bin/` first on `PATH`; the shim exits 4 with "real gh
+called from a test" and never touches the network (#5071). A test that needs
+`gh` prepends its own fake `gh` to `PATH` afterwards. pytest tests get the
+same protection from the `gh-isolate` block in `conftest.py`.
+`scripts/check-test-gh-isolate.sh` enforces both. See
+`docs/agent/code-standards.md` §Tests never reach real GitHub.
+
 ### Deferred tests (dedicated CI jobs)
 
 A small set of tests are intentionally **skipped** by the scripts-tests

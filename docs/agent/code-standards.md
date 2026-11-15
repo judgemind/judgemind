@@ -230,6 +230,17 @@ A git hook, `git rebase --exec`, `git bisect run` or a `!` alias runs its comman
 - **shell tests:** source `scripts/tests/_git-env-scrub.sh` right after `set -euo pipefail`.
 - **guard:** `scripts/check-test-git-env-scrub.sh` (CI and the pre-push guard umbrella) fails when a git-writing test has neither, or when a copy of the block drifts. Its `Fix:` block prints the line or file to add.
 
+### Tests never reach real GitHub (gh isolation)
+
+A test that runs the real `gh`, directly or through a script such as `scripts/sweep-completed-parents.sh`, acts on real GitHub with the developer's login. In CI `gh` is not logged in, so the call fails quietly; on a laptop it does not. In #5071 a dispatcher test closed an open issue and posted comments that way. Tests are cut off from GitHub at the source (#5071):
+
+- **pytest:** every Python test root's `conftest.py` (`scripts/tests`, `scripts/dispatcher/tests`, `scripts/dispatcher_v3/tests`, `packages/{scraper-framework,nlp-pipeline,judgemind-config}/tests`, and the repo-root `tests/`) has the `gh-isolate` block. It is a session fixture that points `GH_CONFIG_DIR` at an empty directory, removes `GH_TOKEN` / `GITHUB_TOKEN` / `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN`, and puts a `gh` shim first on `PATH`. The shim never touches the network: it prints `FAIL: real gh called from a test (#5071)`, appends the call to `$GH_ISOLATE_LOG`, and exits 4. The canonical copy is `scripts/tests/conftest.py`; the other copies must be identical.
+- **shell tests:** source `scripts/tests/_gh-isolate.sh` right after `set -euo pipefail` (after the `_git-env-scrub.sh` line, if any). It uses the checked-in shim in `scripts/tests/fixtures/gh-isolate/`.
+- **tests that need gh:** write a fake `gh` and prepend its directory to `PATH` (or mock the subprocess call). That stub wins over the shim. Never let a test fall through to the shim on purpose: the call fails, so the test is not testing what it claims.
+- **dispatcher housekeeping:** `scripts/dispatcher/tests/conftest.py` also stubs `DispatcherDaemon._housekeeping_sweep_completed_parents` and `_housekeeping_close_orphan_prs` for every test, so `_housekeeping_tick()` tests never spawn the sweep or `gh pr close`. A test that exercises one of those healers itself opts out with `@pytest.mark.real_gh_healers` and stubs `_subprocess_with_retry`.
+- **audit:** `GH_ISOLATE_LOG=<file> pytest ...` writes one line per shim hit (`<test id>\tgh <args>`), so you can see which tests still call `gh` without a stub.
+- **guard:** `scripts/check-test-gh-isolate.sh` (CI and the pre-push guard umbrella) fails when a test root has no copy of the block, a copy drifts, or a shell test does not source the helper. Its `Fix:` block prints the line or file to add.
+
 ### CI guard umbrella (`scripts/run-ci-guards.sh`)
 
 The pre-push hook also runs `scripts/run-ci-guards.sh`, an auto-discovery umbrella that mirrors the dozen+ `scripts/check-*` jobs in `.github/workflows/ci.yml`. Self-maintaining: dropping a new `scripts/check-foo.sh` into the tree makes it pick up automatically — no umbrella-script edit required.

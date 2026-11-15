@@ -12,6 +12,7 @@
 # Exits 0 if all tests pass, 1 if any test fails.
 
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$SCRIPT_DIR/install-dispatcher-venv.sh"

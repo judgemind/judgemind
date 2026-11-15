@@ -15,6 +15,7 @@
 # Usage: scripts/tests/test_check_dependency_upper_bounds.sh
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECK="$SCRIPT_DIR/check-dependency-upper-bounds.py"
