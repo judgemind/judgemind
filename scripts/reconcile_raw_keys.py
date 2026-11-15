@@ -298,6 +298,26 @@ DEFAULT_REINGEST_SCRIPTS = (
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "reingest_from_s3.py"),
 )
 
+#: Every flag :meth:`Reingester.launch` passes to ``reingest_from_s3.py``.
+#: This script is uploaded fresh per run, but the reingest CLI it runs is
+#: the copy baked into the scraper image, so the two can be different
+#: versions (#5060).  A flag the baked copy does not know makes argparse
+#: exit 2 on every launch, which would read as a crash and charge every
+#: incomplete key an attempt toward stuck.  :func:`check_reingest_cli`
+#: refuses up front instead.
+REINGEST_CLI_FLAGS = (
+    "--prefix",
+    "--s3-key-list",
+    "--concurrency",
+    "--write-failed-manifest",
+    "--write-crashed-manifest",
+    "--no-fail-on-errors",
+)
+
+
+class ReingestCliMismatch(RuntimeError):
+    """The reingest CLI on disk predates a flag this reconciler passes."""
+
 
 @dataclass(frozen=True)
 class RawKey:
@@ -1188,6 +1208,25 @@ def find_reingest_script(explicit: str | None) -> str:
     raise FileNotFoundError(f"reingest_from_s3.py not found (tried {candidates})")
 
 
+def check_reingest_cli(script: str) -> None:
+    """Raise :class:`ReingestCliMismatch` when *script* does not declare
+    every flag in :data:`REINGEST_CLI_FLAGS` (#5060).
+
+    Reads the source instead of running ``--help``: no subprocess, no
+    import cost, and each flag is declared as a string literal in its
+    ``add_argument`` call.
+    """
+    with open(script, encoding="utf-8") as fh:
+        text = fh.read()
+    missing = [f for f in REINGEST_CLI_FLAGS if f'"{f}"' not in text]
+    if missing:
+        raise ReingestCliMismatch(
+            f"{script} does not accept {', '.join(missing)}: the scraper image's "
+            "reingest CLI is older than this reconciler. Rebuild the image "
+            "(run deploy-scraper.yml), then re-run the reconciler."
+        )
+
+
 def split_isolated(
     batch: Sequence[RawKey], explained: Explained
 ) -> tuple[list[RawKey], list[RawKey]]:
@@ -1544,7 +1583,9 @@ def run(
     if action in REINGEST_ACTIONS or incomplete_only:
         try:
             script = find_reingest_script(args.reingest_script)
-        except FileNotFoundError as exc:
+            check_reingest_cli(script)
+        except (FileNotFoundError, ReingestCliMismatch) as exc:
+            script = None
             if not incomplete_only:
                 action = "reingest_failed"
                 mark_scopes_failed(scope_actions, healing)

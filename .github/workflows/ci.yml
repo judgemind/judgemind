@@ -1363,6 +1363,22 @@ jobs:
         run: scripts/check-deploy-workflow-rollout.sh
 
   # ---------------------------------------------------------------
+  # Image path-filter guard (#5060): every file a Dockerfile COPYs
+  # must be in the on.push.paths filter of the workflow that builds
+  # that image, so an image input cannot merge without a rebuild.
+  # deploy-scraper.yml missed scripts/reingest_from_s3.py and
+  # scripts/rebuild_db.py, which the raw-key reconciler runs from the
+  # image. Unfiltered on purpose: a Dockerfile, a workflow or a newly
+  # COPY'd file can each open the gap, and the check takes a second.
+  # ---------------------------------------------------------------
+  image-path-filter-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify every file baked into an image triggers its build workflow
+        run: scripts/check-image-path-filters.sh
+
+  # ---------------------------------------------------------------
   # parse_document reingest-safety marker guard: every Live-only
   # parse_document under packages/scraper-framework/src/courts/ must
   # carry a docstring marker that names the reingest hazard.  Closes
@@ -2439,6 +2455,7 @@ jobs:
       - split-ruling-propagation-check
       - cleanup-step-continue-on-error-check
       - deploy-workflow-rollout-check
+      - image-path-filter-check
       - parse-document-reingest-safety-check
       - tests-use-reingest-helper-check
       - test-script-imports-mapped-check

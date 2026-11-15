@@ -722,10 +722,74 @@ def test_record_run_writes_run_and_scope_rows(
     assert "RECORDED run_id=run-1" in lines
 
 
-def _stub_script(tmp_path: Any) -> str:
+def _stub_script(tmp_path: Any, flags: Any = None) -> str:
+    """A stand-in reingest CLI that declares *flags* (default: all of
+    :data:`rec.REINGEST_CLI_FLAGS`) the way argparse source does."""
     script = tmp_path / "reingest_from_s3.py"
-    script.write_text("# stub\n")
+    declared = rec.REINGEST_CLI_FLAGS if flags is None else flags
+    script.write_text(
+        "# stub\n" + "".join(f'parser.add_argument("{f}")\n' for f in declared)
+    )
     return str(script)
+
+
+def test_reingest_cli_flags_cover_every_launch_flag(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """REINGEST_CLI_FLAGS is the contract check_reingest_cli enforces, so it
+    must list every flag a launch actually passes (#5060)."""
+    calls: list[list[str]] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
+        s3,
+        explained,
+        out=lambda _line: None,
+        now=NOW,
+        conn=FakeDb({"RETURNING run_id": [("run-9",)]}),
+        runner=lambda cmd, check, **kw: (
+            calls.append(cmd) or types.SimpleNamespace(returncode=0)
+        ),
+    )
+    assert calls
+    passed = {tok for cmd in calls for tok in cmd if tok.startswith("--")}
+    assert passed == set(rec.REINGEST_CLI_FLAGS)
+
+
+def test_real_reingest_cli_declares_every_flag() -> None:
+    """The repo's reingest_from_s3.py satisfies the contract, so the check
+    only refuses a stale baked copy, never the current one."""
+    rec.check_reingest_cli(rec.DEFAULT_REINGEST_SCRIPTS[-1])
+
+
+def test_stale_reingest_cli_refuses_before_anything_runs(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """A baked reingest CLI that predates a flag (#5060) is refused up front:
+    no launch, no attempt charged, a clear error naming the flag and the
+    fix."""
+    stale = _stub_script(
+        tmp_path,
+        [f for f in rec.REINGEST_CLI_FLAGS if f != "--write-crashed-manifest"],
+    )
+    db = FakeDb({"RETURNING run_id": [("run-8",)]})
+    lines: list[str] = []
+    calls: list[Any] = []
+    rec.run(
+        _args("--record", "--reingest", "--reingest-script", stale),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check, **kw: calls.append(cmd),
+    )
+    result = _result(lines)
+    assert result["action"] == "reingest_failed"
+    assert "--write-crashed-manifest" in result["reingest_error"]
+    assert "deploy-scraper.yml" in result["reingest_error"]
+    assert calls == []
+    assert s3.puts == {}
+    assert db.sql("ingest_incomplete") == []
 
 
 def test_persistent_still_reingests_and_files_an_issue(
