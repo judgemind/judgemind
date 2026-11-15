@@ -83,7 +83,7 @@ fi
 #
 # A future edit that wires the launcher into S3 (e.g. for session-log
 # streaming) is a spec departure — the launcher is scheduler-only. The
-# agent task role has `s3:*`; the launcher must not.
+# launcher must hold no S3 wildcard (and no role here may, see Check 7).
 launcher_s3_section=$(awk '
     /aws_iam_role_policy "launcher_/ {capture=1}
     capture {print}
@@ -135,6 +135,35 @@ if [ "$ecs_cluster_condition_count" -lt 1 ]; then
     check "main.tf has at least one ecs:cluster ArnEquals condition" 1
 else
     check "main.tf has at least one ecs:cluster ArnEquals condition" 0
+fi
+
+# ── Check 7: the agent task role's S3 grant is scoped (#5013) ──────────────
+#
+# Raw objects are the irreplaceable source of truth. The agent task role
+# used to hold `s3:*` on `*`, which covers DeleteObject /
+# DeleteObjectVersion on raws and PutLifecycleConfiguration (a lifecycle
+# expiration deletes without a DeleteObject call). No S3 wildcard action,
+# no version delete, no bucket-configuration write, and the delete
+# prefixes must not include a raw-bearing or kept prefix.
+for pat in '"s3:\*"' '"s3:[A-Za-z]*\*"' '"s3:DeleteObjectVersion"' '"s3:PutLifecycleConfiguration"' '"s3:PutBucket' '"s3:DeleteBucket'; do
+    if grep -E "$pat" "$main_tf" >/dev/null; then
+        check "no policy grants an action matching '${pat}'" 1
+    else
+        check "no policy grants an action matching '${pat}'" 0
+    fi
+done
+
+delete_prefixes=$(awk '
+    /archive_delete_prefixes = \[/ {capture=1; next}
+    capture && /\]/ {capture=0}
+    capture {print}
+' "$main_tf")
+if [ -z "$delete_prefixes" ]; then
+    check "archive_delete_prefixes is declared" 1
+elif echo "$delete_prefixes" | grep -E '"(raw|ca|directories|llm-cache|keylists|\*)"' >/dev/null; then
+    check "archive_delete_prefixes holds only throwaway prefixes" 1
+else
+    check "archive_delete_prefixes holds only throwaway prefixes" 0
 fi
 
 if [ "$failures" -eq 0 ]; then

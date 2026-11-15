@@ -51,7 +51,8 @@ assert_passes() {
 }
 
 reset_tmpdir() {
-    rm -rf "${TMPDIR_TEST:?}"/*
+    # find, not a glob: fixtures under .github/ are dot-directories.
+    find "${TMPDIR_TEST:?}" -mindepth 1 -delete
 }
 
 create_test_file "cleanup.py" 's3.delete_objects(Bucket=b, Delete={"Objects": objs})'
@@ -100,6 +101,123 @@ reset_tmpdir
 create_test_file "audit.py" 'from framework.raw_delete_guard import remove_delete_marker
 remove_delete_marker(s3, bucket, key, marker_version_id)'
 assert_passes "a caller of the guard module passes"
+reset_tmpdir
+
+# ── #5013: forms the original pattern missed ───────────────────────────────
+
+create_test_file "move.sh" 'aws s3 mv "s3://bucket/ca/x/y/raw/a.pdf" "s3://bucket/old/a.pdf"'
+assert_fails "aws s3 mv (copy then delete) is detected"
+reset_tmpdir
+
+create_test_file "drop.sh" 'aws s3 rb s3://bucket --force'
+assert_fails "aws s3 rb is detected"
+reset_tmpdir
+
+create_test_file "mirror.sh" 'aws s3 sync ./local "s3://bucket/ca/" --delete --quiet'
+assert_fails "aws s3 sync --delete is detected"
+reset_tmpdir
+
+create_test_file "mirror_ok.sh" 'aws s3 sync "s3://bucket/ca/" ./local --quiet'
+assert_passes "aws s3 sync without --delete passes"
+reset_tmpdir
+
+create_test_file "res1.py" 'boto3.resource("s3").Object(bucket, key).delete()'
+assert_fails "boto3 resource Object(...).delete() is detected"
+reset_tmpdir
+
+create_test_file "res2.py" 'bucket.objects.filter(Prefix="ca/").delete()'
+assert_fails "boto3 resource objects.filter(...).delete() is detected"
+reset_tmpdir
+
+create_test_file "res3.py" 'bucket.objects.all().delete()'
+assert_fails "boto3 resource objects.all().delete() is detected"
+reset_tmpdir
+
+create_test_file "res4.py" 'bucket.object_versions.delete()'
+assert_fails "boto3 resource object_versions.delete() is detected"
+reset_tmpdir
+
+create_test_file "res5.py" 's3 = session.resource("s3")
+obj = s3.Object(bucket, key)
+obj.delete()'
+assert_fails "a .delete() in a file that builds an S3 resource is detected"
+reset_tmpdir
+
+create_test_file "orm.py" 'session.delete(row)
+cache.delete("k")'
+assert_passes "an unrelated .delete( call in a file without an S3 resource passes"
+reset_tmpdir
+
+create_test_file "lifecycle.py" 's3.put_bucket_lifecycle_configuration(Bucket=b, LifecycleConfiguration=c)'
+assert_fails "a boto3 lifecycle write is detected"
+reset_tmpdir
+
+create_test_file "lifecycle.sh" 'aws s3api put-bucket-lifecycle-configuration --bucket b --lifecycle-configuration file://c.json'
+assert_fails "an AWS CLI lifecycle write is detected"
+reset_tmpdir
+
+create_test_file ".github/workflows/cleanup.yml" '      - run: aws s3 rm "s3://bucket/ca/" --recursive'
+assert_fails "a delete in a .github/ workflow is detected"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/x/main.tf" '    command = "aws s3 mv s3://b/ca/a s3://b/tmp/a"'
+assert_fails "a delete in a terraform local-exec is detected"
+reset_tmpdir
+
+# Default scan roots include .github/ and infra/ (and not docs/).
+FIXTURE_ROOT="$TMPDIR_TEST/root"
+mkdir -p "$FIXTURE_ROOT/.github/workflows" "$FIXTURE_ROOT/infra" "$FIXTURE_ROOT/docs"
+printf '%s\n' '      - run: aws s3 rm s3://bucket/ca/ --recursive' > "$FIXTURE_ROOT/.github/workflows/w.yml"
+TESTS=$((TESTS + 1))
+if S3_DELETE_CHECK_REPO_ROOT="$FIXTURE_ROOT" "$CHECK_SCRIPT" > /dev/null 2>&1; then
+    echo "FAIL: default scan roots include .github/ (expected failure, got success)"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: default scan roots include .github/"
+fi
+rm -f "$FIXTURE_ROOT/.github/workflows/w.yml"
+printf '%s\n' 'command = "aws s3 rm s3://bucket/ca/x"' > "$FIXTURE_ROOT/infra/main.tf"
+TESTS=$((TESTS + 1))
+if S3_DELETE_CHECK_REPO_ROOT="$FIXTURE_ROOT" "$CHECK_SCRIPT" > /dev/null 2>&1; then
+    echo "FAIL: default scan roots include infra/ (expected failure, got success)"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "PASS: default scan roots include infra/"
+fi
+rm -f "$FIXTURE_ROOT/infra/main.tf"
+printf '%s\n' 'aws s3 rm s3://bucket/ca/x' > "$FIXTURE_ROOT/docs/notes.sh"
+TESTS=$((TESTS + 1))
+if S3_DELETE_CHECK_REPO_ROOT="$FIXTURE_ROOT" "$CHECK_SCRIPT" > /dev/null 2>&1; then
+    echo "PASS: docs/ is not a default scan root"
+else
+    echo "FAIL: docs/ is not a default scan root (expected success, got failure)"
+    FAILURES=$((FAILURES + 1))
+fi
+reset_tmpdir
+
+# ── #5013: the marker covers the call below it, not the whole file ─────────
+
+create_test_file "two_calls.py" '# s3-delete-not-raw: removes only tmp/ uploads
+s3.delete_object(Bucket=b, Key="tmp/upload.txt")
+
+
+def other():
+    x = 1
+    s3.delete_object(Bucket=b, Key=raw_key)'
+assert_fails "a marker does not cover a second, unmarked call in the same file"
+reset_tmpdir
+
+create_test_file "far_marker.py" '# s3-delete-not-raw: removes only tmp/ uploads
+a = 1
+b = 2
+c = 3
+d = 4
+s3.delete_object(Bucket=b, Key=k)'
+assert_fails "a marker more than 3 lines above the call does not count"
+reset_tmpdir
+
+create_test_file "same_line.sh" 'aws s3 rm "s3://assets/oneshot-scripts/x.py"  # s3-delete-not-raw: staged oneshot script'
+assert_passes "a marker on the same line passes"
 reset_tmpdir
 
 # The real repository must be clean.
