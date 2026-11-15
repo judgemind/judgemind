@@ -37,6 +37,8 @@ import anthropic
 import structlog
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
+from ingestion.llm_providers import FINISH_MAX_TOKENS, LLMResponse, response_diagnostics
+
 from .llm_schema import (
     EXTRACTION_SYSTEM_PROMPT,
     ConfidenceLevel,
@@ -355,6 +357,9 @@ class _PageExtraction(NamedTuple):
     status: PageStatus
     rows: list[dict]
     raw_text: str | None = None
+    # Why the provider stopped on the last failed attempt (#5007), e.g.
+    # ``"RECITATION"`` or ``"MAX_TOKENS"``; ``None`` for an ``"ok"`` page.
+    finish_reason: str | None = None
 
 
 # Appended to the per-page user message when a page's first response did not
@@ -367,6 +372,25 @@ PAGE_JSON_RETRY_NUDGE = (
     'markdown. If the page has no rulings, return {"page_header": null, '
     '"rulings": []}.'
 )
+
+# Also appended to the recovery request (#5007).  A page of quoted statute or
+# case law can be withheld as a recitation; headings inside a ruling (for
+# example "III. Treble Damages") must stay in that ruling's text.
+PAGE_RECOVERY_NOTE = (
+    "Transcribe the judge's text as it appears on this page. Section headings "
+    "inside a ruling (for example 'III. Discussion') are part of that "
+    "ruling's ruling_text, not new entries."
+)
+
+# Introduces the page's embedded text layer in the recovery request (#5007).
+PAGE_TEXT_LAYER_HEADER = (
+    "The page's embedded text layer follows, for reference. Use the image "
+    "for the layout and this text for the exact wording:"
+)
+
+# Output budget ceiling for a page retried after a ``MAX_TOKENS`` cut-off
+# (gemini-2.5-flash-lite's maximum output, #5007).
+_MAX_PAGE_OUTPUT_TOKENS = 65536
 
 
 # ---------------------------------------------------------------------------
@@ -3690,7 +3714,14 @@ class LlmExtractor:
         # document with one persistently failing page only re-sends that page.
         all_rows: list[dict] = []
         failed_pages: list[int] = []
+        # Why each failed page's provider stopped (#5007), for the logs and
+        # the error that lands in the reingest's failed manifest.
+        failure_reasons: dict[int, str | None] = {}
         page_cache_hits = 0
+        # Each page's embedded text layer, for a page's recovery request
+        # (#5007); read at most once, when the first page goes to the LLM
+        # (a fully cached document never reads it).
+        text_layers: list[str] | None = None
         for page_idx, (img_bytes, media_type) in enumerate(page_images):
             page_key = _content_hash_for_cache(img_bytes)
             legacy_page_key = _content_hash_for_cache(img_bytes, metadata) if metadata else None
@@ -3702,12 +3733,15 @@ class LlmExtractor:
             if page is not None:
                 page_cache_hits += 1
             else:
+                if text_layers is None:
+                    text_layers = _pdf_page_text_layers(pdf_bytes, len(page_images))
                 page = self._extract_single_page(
                     img_bytes,
                     media_type,
                     usage=usage,
                     page_index=page_idx,
                     document_id=document_id,
+                    page_text=text_layers[page_idx] if page_idx < len(text_layers) else None,
                 )
                 if page.status == "ok" and page.raw_text is not None and self._cache is not None:
                     self._cache.put_page(PDF_PER_PAGE_PROMPT, page_key, page.raw_text)
@@ -3722,11 +3756,13 @@ class LlmExtractor:
                 # NOT an empty page: the result is partial and must not be
                 # cached at document level (#3517).
                 failed_pages.append(page_idx)
+                failure_reasons[page_idx] = page.finish_reason
                 logger.warning(
                     "llm_extractor.page_partial_failure",
                     page_index=page_idx,
                     total_pages=len(page_images),
                     status=page.status,
+                    finish_reason=page.finish_reason,
                     document_id=document_id,
                 )
 
@@ -3739,13 +3775,15 @@ class LlmExtractor:
             page_cache_hits=page_cache_hits,
             llm_pages=len(page_images) - page_cache_hits,
             failed_pages=failed_pages,
+            failure_reasons=failure_reasons or None,
         )
+        reasons_suffix = _finish_reasons_suffix(failure_reasons)
 
         if not all_rows:
             logger.warning("llm_extractor.no_rows_extracted", page_count=len(page_images))
             if strict and failed_pages:
                 # The failed pages may hold the rows: not a verdict (#4940).
-                raise ExtractionIncompleteError(f"PDF pages {failed_pages} failed")
+                raise ExtractionIncompleteError(f"PDF pages {failed_pages} failed{reasons_suffix}")
             return []
 
         # Join rows into cases and convert to ExtractedRuling objects.  The
@@ -3761,12 +3799,13 @@ class LlmExtractor:
                 "llm_extractor.pdf_partial_result",
                 document_id=document_id,
                 failed_pages=failed_pages,
+                failure_reasons=failure_reasons,
                 total_pages=len(page_images),
                 ruling_count=len(rulings),
             )
             if strict:
                 raise PartialExtractionError(
-                    f"PDF pages {failed_pages} of {len(page_images)} failed",
+                    f"PDF pages {failed_pages} of {len(page_images)} failed{reasons_suffix}",
                     rulings=_apply_pdf_metadata_overrides(rulings, metadata),
                     failed_parts=failed_pages,
                 )
@@ -3863,6 +3902,17 @@ class LlmExtractor:
                 usage.output_tokens += response.usage.output_tokens
                 usage.api_calls += 1
 
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    # Cut off at the output budget: never a complete chunk,
+                    # even if the text parses (#5007).
+                    logger.warning(
+                        "llm_extractor.chunk_response_failed",
+                        chunk_index=chunk_index,
+                        document_id=document_id,
+                        finish_reason=FINISH_MAX_TOKENS,
+                        output_tokens=response.usage.output_tokens,
+                    )
+                    return None
                 raw_text = response.content[0].text.strip()
                 return self._parse_response(raw_text, metadata)
 
@@ -4006,7 +4056,21 @@ class LlmExtractor:
         usage.output_tokens += response.output_tokens
         usage.api_calls += 1
 
-        return self._parse_response(response.text, metadata)
+        # A cut-off or withheld answer is a failed chunk even when its text
+        # happens to parse (#5007): ``_extract_chunk_with_retry`` then
+        # retries it in halves, and it is never cached.
+        result = None
+        if getattr(response, "incomplete", False) is not True:
+            result = self._parse_response(response.text, metadata)
+        if result is None:
+            logger.warning(
+                "llm_extractor.chunk_response_failed",
+                chunk_index=chunk_index,
+                document_id=document_id,
+                chunk_len=len(chunk_text) if chunk_text is not None else None,
+                **response_diagnostics(response),
+            )
+        return result
 
     def _extract_chunk_with_retry(
         self,
@@ -4145,6 +4209,7 @@ class LlmExtractor:
         usage: TokenUsage,
         page_index: int = 0,
         document_id: str | None = None,
+        page_text: str | None = None,
     ) -> _PageExtraction:
         """Send a single page image to the LLM and return its extraction outcome.
 
@@ -4157,47 +4222,89 @@ class LlmExtractor:
         Returns a :class:`_PageExtraction` whose ``status`` separates a
         complete result (``"ok"``, possibly with zero rows) from a failure
         (``"api_error"`` / ``"parse_error"``) so the caller can decide what
-        is cacheable (#4716).  A response that does not parse as JSON, parses
-        to the wrong shape, or makes the parser raise (#4738) is retried once
-        with :data:`PAGE_JSON_RETRY_NUDGE` appended to the user message before
-        the page is reported as ``"parse_error"``.  Parse problems never
-        propagate as exceptions: they stay local to the page.
+        is cacheable (#4716).  A response that is empty, cut off, withheld
+        (``finish_reason`` other than ``STOP``, #5007), does not parse as
+        JSON, parses to the wrong shape, or makes the parser raise (#4738)
+        is retried once with a recovery request before the page is reported
+        as ``"parse_error"``: :data:`PAGE_JSON_RETRY_NUDGE` and
+        :data:`PAGE_RECOVERY_NOTE` appended, JSON mode on, and *page_text*
+        (the page's embedded text layer, when it has one) attached.  Parse
+        problems never propagate as exceptions: they stay local to the page.
         """
         text_message = self._build_user_message_for_page()
         raw_text: str | None = None
+        finish_reason: str | None = None
+        max_tokens = self._max_output_tokens
         for parse_attempt in range(1 + self._max_page_parse_retries):
             message = text_message
+            json_mode = False
             if parse_attempt > 0:
-                message = f"{text_message}\n\n{PAGE_JSON_RETRY_NUDGE}"
+                # The recovery request (#5007): JSON mode, so the answer is
+                # well-formed, plus the page's own text layer.  Gemini
+                # withholds a transcription that recites a source verbatim
+                # (finish_reason RECITATION, e.g. a quoted statute), and
+                # does so on every identical retry; given the text layer,
+                # it transcribes the same page.  A truncated answer is
+                # retried with twice the output budget.
+                json_mode = True
+                message = f"{text_message}\n\n{PAGE_JSON_RETRY_NUDGE}\n\n{PAGE_RECOVERY_NOTE}"
+                if page_text:
+                    message = f"{message}\n\n{PAGE_TEXT_LAYER_HEADER}\n\n{page_text}"
+                if finish_reason == FINISH_MAX_TOKENS:
+                    max_tokens = min(max_tokens * 2, _MAX_PAGE_OUTPUT_TOKENS)
                 logger.warning(
                     "llm_extractor.page_parse_retry",
                     page_index=page_index,
                     document_id=document_id,
                     parse_attempt=parse_attempt,
+                    previous_finish_reason=finish_reason,
+                    with_text_layer=bool(page_text),
+                    max_tokens=max_tokens,
                 )
-            raw_text = self._call_page_llm(
+            response = self._call_page_llm(
                 img_bytes,
                 media_type,
                 message,
                 usage=usage,
                 page_index=page_index,
                 document_id=document_id,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
             )
-            if raw_text is None:
-                return _PageExtraction(status="api_error", rows=[])
-            ok, rows = _parse_page_rows_guarded(
-                raw_text, page_index, document_id=document_id, source="llm"
-            )
+            if response is None:
+                return _PageExtraction(status="api_error", rows=[], finish_reason=finish_reason)
+            raw_text = response.text
+            finish_reason = getattr(response, "finish_reason", None)
+            incomplete = getattr(response, "incomplete", False) is True
+            ok = False
+            rows: list[dict] = []
+            if not incomplete:
+                ok, rows = _parse_page_rows_guarded(
+                    raw_text, page_index, document_id=document_id, source="llm"
+                )
             if ok:
                 return _PageExtraction(status="ok", rows=rows, raw_text=raw_text)
+            # Self-diagnosing failure record (#5007): why the provider
+            # stopped, and what it spent, for every empty, cut-off, or
+            # unparseable page response.
+            logger.warning(
+                "llm_extractor.page_response_failed",
+                page_index=page_index,
+                document_id=document_id,
+                parse_attempt=parse_attempt,
+                **response_diagnostics(response),
+            )
 
         logger.error(
             "llm_extractor.page_parse_exhausted",
             page_index=page_index,
             document_id=document_id,
+            finish_reason=finish_reason,
             raw_preview=(raw_text or "")[:200],
         )
-        return _PageExtraction(status="parse_error", rows=[], raw_text=raw_text)
+        return _PageExtraction(
+            status="parse_error", rows=[], raw_text=raw_text, finish_reason=finish_reason
+        )
 
     def _cached_page(
         self,
@@ -4250,10 +4357,13 @@ class LlmExtractor:
         usage: TokenUsage,
         page_index: int,
         document_id: str | None,
-    ) -> str | None:
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> LLMResponse | None:
         """Call the multimodal LLM for one page with API-level retries.
 
-        Returns the raw response text, or ``None`` when every attempt failed.
+        Returns the provider response (text plus ``finish_reason`` and token
+        counts), or ``None`` when every attempt failed.
         """
         from ingestion.llm_providers import call_llm_with_images
 
@@ -4269,8 +4379,9 @@ class LlmExtractor:
                     model=self._model,
                     client=self._client,
                     max_retries=0,  # We handle retries ourselves.
-                    max_tokens=self._max_output_tokens,
+                    max_tokens=max_tokens or self._max_output_tokens,
                     timeout=20.0,
+                    json_mode=json_mode,
                 )
 
                 if response is None:
@@ -4321,7 +4432,7 @@ class LlmExtractor:
                 usage.output_tokens += response.output_tokens
                 usage.api_calls += 1
 
-                return response.text
+                return response
 
             except Exception:  # noqa: BLE001
                 if attempt < self._max_retries:
@@ -5681,6 +5792,44 @@ def _render_pdf_pages(
             results.append((png_bytes, "image/png"))
 
     return results
+
+
+def _pdf_page_text_layers(pdf_bytes: bytes, max_pages: int) -> list[str]:
+    """Return each page's embedded text layer, reflowed, for at most *max_pages*.
+
+    Used only by a page's recovery request (#5007).  Each text block becomes
+    one paragraph with its line wraps joined, so the model does not copy the
+    PDF's visual line breaks into ``ruling_text``.  A scanned page has no
+    text layer and gets ``""``.  Never raises: a PDF that cannot be read
+    gives ``[]``, and the recovery request goes without text.
+    """
+    try:
+        import pymupdf
+
+        layers: list[str] = []
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for i, page in enumerate(doc):
+                # Text past the rendered pages is never sent to the LLM.
+                # page-cap: max_pages = pages already rendered; cannot drop rulings.
+                if i >= max_pages:
+                    break
+                blocks = page.get_text("blocks", sort=True)
+                paragraphs = [
+                    " ".join(str(block[4]).split())
+                    for block in blocks
+                    if len(block) > 4 and str(block[4]).strip()
+                ]
+                layers.append("\n\n".join(paragraphs))
+        return layers
+    except Exception:  # noqa: BLE001 — the text layer is optional
+        logger.warning("llm_extractor.text_layer_unreadable", exc_info=True)
+        return []
+
+
+def _finish_reasons_suffix(failure_reasons: dict[int, str | None]) -> str:
+    """`` (finish_reason: 48=RECITATION)`` for the known reasons, else ``""``."""
+    known = [f"{idx}={reason}" for idx, reason in failure_reasons.items() if reason]
+    return f" (finish_reason: {', '.join(known)})" if known else ""
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,10 @@ import json
 import re
 from typing import Any
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 
 def strip_llm_json_fences(text: str) -> str:
     """Strip markdown code fences and surrounding whitespace from LLM output.
@@ -68,4 +72,72 @@ def parse_llm_json(text: str) -> Any:
             invalid — those are tolerated by design.
     """
     cleaned = strip_llm_json_fences(text)
-    return json.loads(cleaned, strict=False)
+    try:
+        return json.loads(cleaned, strict=False)
+    except json.JSONDecodeError as exc:
+        repaired, fixes = _repair_unescaped_quotes(cleaned, exc)
+        if repaired is None:
+            raise
+        logger.info("llm_utils.json_repaired", fixes=fixes, error=str(exc))
+        return repaired
+
+
+# Errors the decoder raises right after a string ended at a stray quote:
+# the text that follows the quote is not a delimiter.
+_STRAY_QUOTE_ERRORS = (
+    "Expecting ',' delimiter",
+    "Expecting ':' delimiter",
+    "Expecting property name enclosed in double quotes",
+)
+
+# Upper bound on repairs in one response; each one fixes one stray character.
+_MAX_JSON_REPAIRS = 50
+
+
+def _repair_unescaped_quotes(text: str, error: json.JSONDecodeError) -> tuple[Any, int]:
+    """Parse *text* after escaping the stray characters that break it (#5007).
+
+    Gemini copies source text into JSON strings verbatim.  When that text
+    holds a straight double quote (``(“ . . . thusly:")``) or a lone
+    backslash, the model sometimes leaves it unescaped, and the same input
+    gives the same broken answer on every retry.  Re-asking, even in
+    halves, never helps.  This repairs exactly those two faults:
+
+    * A stray ``"`` ends the string early, so the decoder fails just after
+      it, on prose where it expected a delimiter.  The quote is escaped.
+      The failure must land on a non-quote character: a missing comma
+      between two fields (``"a" "b"``) is not repaired.
+    * An invalid escape (``\\s``) has its backslash doubled.
+
+    Each fix must move the first decode error forward, and at most
+    ``_MAX_JSON_REPAIRS`` are made.  Returns ``(value, fixes)``, or
+    ``(None, 0)`` when the text cannot be repaired this way.  The callers
+    still check the parsed value's shape.
+    """
+    fixes = 0
+    current = text
+    exc = error
+    while fixes < _MAX_JSON_REPAIRS:
+        pos = exc.pos
+        if exc.msg.startswith("Invalid \\escape") and current[pos : pos + 1] == "\\":
+            current = current[:pos] + "\\" + current[pos:]
+        elif exc.msg in _STRAY_QUOTE_ERRORS and current[pos : pos + 1] not in ('"', ""):
+            quote = current.rfind('"', 0, pos)
+            # Only a quote with nothing but whitespace or a comma after it
+            # can have ended the string the decoder failed after.
+            between = current[quote + 1 : pos] if quote >= 0 else ""
+            if quote <= 0 or current[quote - 1] == "\\" or between.strip(" \t\r\n,"):
+                return None, 0
+            current = current[:quote] + "\\" + current[quote:]
+        else:
+            return None, 0
+        fixes += 1
+        try:
+            return json.loads(current, strict=False), fixes
+        except json.JSONDecodeError as next_exc:
+            # The next fault must lie beyond this fix, or the repair is
+            # going in circles.
+            if next_exc.pos <= pos:
+                return None, 0
+            exc = next_exc
+    return None, 0
