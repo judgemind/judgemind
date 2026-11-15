@@ -1,0 +1,13 @@
+# Global git config for shell tests (#5058). scripts/tests/_git-env-scrub.sh
+# exports GIT_CONFIG_GLOBAL pointing here, so a test never reads or writes the
+# user's ~/.gitconfig. If this file shows up as modified, a test ran
+# `git config --global`: make that test write its scratch repo's config.
+[user]
+	name = Judgemind Test
+	email = test@example.com
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false
+[safe]
+	directory = *

@@ -222,6 +222,14 @@ Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (u
 
 `scripts/tests/` runs in CI with only `scripts/tests/requirements-ci.txt` installed: no psycopg, no structlog, no scraper-framework dependencies. When a push touches `scripts/**/*.py` or `scripts/tests/`, `.githooks/pre-push` runs `pytest scripts/tests/` in a cached per-checkout venv built from that same file (`scripts/ensure-scripts-tests-venv.sh`), so a script that imports e.g. `ingestion` (whose `__init__` loads psycopg) fails pre-push with a `Fix:` block instead of in CI (#5045). Do not run scripts/tests in a package venv to check it: that venv has packages CI lacks. Reproduce CI with `VENV=$(scripts/ensure-scripts-tests-venv.sh)` and `PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/tests/`. See `scripts/tests/README.md` §CI Environment.
 
+### Tests that write to git (GIT_DIR from hooks)
+
+A git hook, `git rebase --exec`, `git bisect run` or a `!` alias runs its command with `GIT_DIR` (and in a linked worktree more `GIT_*` vars) exported. A test that runs `git init` / `commit` / `config` / `update-ref` in a scratch directory then writes to that repository instead: in #5045 a push set `core.bare=true` in the shared `.git` and moved `main`. Tests are protected at the source, whoever runs them (#5058):
+
+- **pytest:** every Python test root's `conftest.py` (`scripts/tests`, `scripts/dispatcher/tests`, `scripts/dispatcher_v3/tests`, `packages/{scraper-framework,nlp-pipeline,judgemind-config}/tests`) has the `git-env-scrub` block. It is a session fixture that removes every variable `git rev-parse --local-env-vars` lists, and points `GIT_CONFIG_GLOBAL` at a throwaway file, so a test cannot write `~/.gitconfig` either. The canonical copy is `scripts/tests/conftest.py`; the other copies must be identical.
+- **shell tests:** source `scripts/tests/_git-env-scrub.sh` right after `set -euo pipefail`.
+- **guard:** `scripts/check-test-git-env-scrub.sh` (CI and the pre-push guard umbrella) fails when a git-writing test has neither, or when a copy of the block drifts. Its `Fix:` block prints the line or file to add.
+
 ### CI guard umbrella (`scripts/run-ci-guards.sh`)
 
 The pre-push hook also runs `scripts/run-ci-guards.sh`, an auto-discovery umbrella that mirrors the dozen+ `scripts/check-*` jobs in `.github/workflows/ci.yml`. Self-maintaining: dropping a new `scripts/check-foo.sh` into the tree makes it pick up automatically — no umbrella-script edit required.

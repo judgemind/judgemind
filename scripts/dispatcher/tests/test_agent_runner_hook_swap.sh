@@ -30,6 +30,7 @@
 #   1 — one or more assertions failed (regression).
 
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../tests/_git-env-scrub.sh"  # unset inherited GIT_DIR etc. (#5058)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HELPER="$SCRIPT_DIR/dispatcher/agent_runner_install_fargate_hook.sh"

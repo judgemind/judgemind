@@ -19,6 +19,17 @@ Use this naming convention for any sourced library file under
 `scripts/tests/`. See `scripts/run-scripts-tests.sh` and the unit test
 `test_scripts_tests_runner.sh` for the enforced behavior (#2559).
 
+### Tests that write to git
+
+A shell test that runs `git init` / `commit` / `config` / `update-ref`
+must source `_git-env-scrub.sh` right after `set -euo pipefail`, so a
+`GIT_DIR` exported by a git hook (or `git rebase --exec`, `git bisect
+run`) cannot redirect its writes into the real repository (#5045,
+#5058). pytest tests get the same protection from the `git-env-scrub`
+block in `conftest.py` (the canonical copy, mirrored in every other
+Python test root). `scripts/check-test-git-env-scrub.sh` enforces both.
+See `docs/agent/code-standards.md` §Tests that write to git.
+
 ### Deferred tests (dedicated CI jobs)
 
 A small set of tests are intentionally **skipped** by the scripts-tests
