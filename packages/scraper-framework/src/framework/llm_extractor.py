@@ -59,15 +59,48 @@ logger = structlog.get_logger(__name__)
 
 
 class ExtractionIncompleteError(RuntimeError):
-    """An extraction returned no rulings because part of it failed.
+    """An extraction did not read the whole document because part of it failed.
 
     Raised by ``LlmExtractor.extract`` / ``extract_from_pdf`` only when the
-    caller passes ``strict=True``.  Without it they return ``[]``, which a
-    caller cannot tell apart from a document that holds no rulings.  The
-    ingestion worker replaces a key's split set with the whole document
-    only on a complete empty result (#4940): a failed LLM call is not a
-    verdict on the document.
+    caller passes ``strict=True``.  Without it they return what the parts
+    that worked produced (``[]`` when none did), which a caller cannot tell
+    apart from a complete result.  The ingestion worker replaces a key's
+    split set only with a complete result (#4940, #5000): a failed LLM call
+    is not a verdict on the document.
     """
+
+
+class PartialExtractionError(ExtractionIncompleteError):
+    """Some pages (multimodal) or chunks (text) failed while others answered
+    (#5000).
+
+    Raised under ``strict=True`` when at least one page or chunk failed (an
+    API failure after retries, a response that never parsed, a timeout) and
+    at least one other answered.  The rulings of the failed part are
+    missing, so the result is not a complete split.  ``rulings`` holds what
+    the parts that answered produced (post-processed, as the method would
+    have returned it), and ``failed_parts`` the failed page or chunk
+    indexes.  The ingestion worker refuses the split: a split-set
+    replacement leaves the key's rows alone and reports the key, and only
+    a live capture of a key that holds no rows yet writes ``rulings``, so
+    the rows the other parts yielded are stored until a retry replaces
+    them with the complete split.
+
+    The document-level cache never stores such a result; the per-page cache
+    holds only the pages that answered, so a retry re-sends only the failed
+    ones (#4716).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rulings: list[ExtractedRuling],
+        failed_parts: list[int],
+    ) -> None:
+        super().__init__(message)
+        self.rulings = rulings
+        self.failed_parts = failed_parts
 
 
 class PageCapExceededError(ExtractionIncompleteError):
@@ -3376,7 +3409,11 @@ class LlmExtractor:
             strict: When ``True``, raise :class:`ExtractionIncompleteError`
                 instead of returning an empty list when a chunk's API call
                 failed, so an empty result always means the document holds
-                no rulings (#4940).
+                no rulings (#4940), and :class:`PartialExtractionError`
+                when a chunk (or half of a retried chunk) failed while
+                others answered, so a returned result always covers the
+                whole text (#5000).  A result with a failed chunk is never
+                cached.
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -3417,6 +3454,9 @@ class LlmExtractor:
                 )
         usage = TokenUsage()
         failed_chunks: list[int] = []
+        # Sub-chunks that failed inside a chunk's retry-by-halves: one
+        # failed half loses its rulings even when the other answered (#5000).
+        failed_halves: list[int] = []
 
         if len(chunks) == 1:
             results = self._extract_chunk_with_retry(
@@ -3425,12 +3465,15 @@ class LlmExtractor:
                 usage=usage,
                 system_prompt=system_prompt,
                 document_id=document_id,
+                failed_parts=failed_halves,
             )
             self._log_usage(usage)
             if not results:
                 if strict:
                     raise ExtractionIncompleteError("text extraction failed")
                 return []
+            if failed_halves:
+                failed_chunks.append(0)
             merged = self._merge_results(results)
             rulings = self._propagate_document_fields(merged)
         else:
@@ -3442,6 +3485,7 @@ class LlmExtractor:
             )
             all_results: list[ExtractionResult] = []
             for i, chunk in enumerate(chunks):
+                halves_before = len(failed_halves)
                 results = self._extract_chunk_with_retry(
                     chunk,
                     metadata=metadata,
@@ -3449,8 +3493,9 @@ class LlmExtractor:
                     chunk_index=i,
                     system_prompt=system_prompt,
                     document_id=document_id,
+                    failed_parts=failed_halves,
                 )
-                if not results:
+                if not results or len(failed_halves) > halves_before:
                     failed_chunks.append(i)
                 all_results.extend(results)
 
@@ -3487,12 +3532,26 @@ class LlmExtractor:
         # No-op on non-SB documents (scoped to CIVSB/CIVRS case numbers).
         rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
 
-        if strict and failed_chunks and not rulings:
-            # The failed chunks may hold the rulings the others did not.
-            raise ExtractionIncompleteError(f"text extraction failed on chunks {failed_chunks}")
+        if failed_chunks:
+            # The failed chunks' rulings are missing: the result is partial,
+            # whether or not the other chunks found rulings (#5000).
+            logger.warning(
+                "llm_extractor.text_partial_failure",
+                document_id=document_id,
+                failed_chunks=failed_chunks,
+                total_chunks=len(chunks),
+                ruling_count=len(rulings),
+            )
+            if strict:
+                raise PartialExtractionError(
+                    f"text extraction failed on chunks {failed_chunks} of {len(chunks)}",
+                    rulings=rulings,
+                    failed_parts=failed_chunks,
+                )
 
-        # Write to cache
-        if self._cache is not None and rulings and not truncated:
+        # Write to cache.  A partial result never is: it would serve the
+        # missing chunks' absence on every later call (#5000).
+        if self._cache is not None and rulings and not truncated and not failed_chunks:
             self._cache.put(
                 effective_prompt,
                 content_key,
@@ -3552,7 +3611,10 @@ class LlmExtractor:
             strict: When ``True``, raise :class:`ExtractionIncompleteError`
                 instead of returning an empty list when rendering failed or
                 a page's API call failed, so an empty result always means
-                every page parsed and none holds a ruling (#4940).
+                every page parsed and none holds a ruling (#4940), and
+                :class:`PartialExtractionError` when a page failed while
+                others returned rows, so a returned result always covers
+                every page (#5000).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -3690,6 +3752,24 @@ class LlmExtractor:
         # join is metadata-free so the cached entry is the same for every
         # caller (#4815); the caller's metadata is applied on return.
         rulings = _join_page_rows(all_rows)
+
+        if failed_pages:
+            # Other pages answered, but the failed pages' rulings are
+            # missing: the result is not a complete split (#5000).  Before,
+            # it was returned under ``strict`` too, and the worker wrote it.
+            logger.warning(
+                "llm_extractor.pdf_partial_result",
+                document_id=document_id,
+                failed_pages=failed_pages,
+                total_pages=len(page_images),
+                ruling_count=len(rulings),
+            )
+            if strict:
+                raise PartialExtractionError(
+                    f"PDF pages {failed_pages} of {len(page_images)} failed",
+                    rulings=_apply_pdf_metadata_overrides(rulings, metadata),
+                    failed_parts=failed_pages,
+                )
 
         # Write the document-level entry ONLY if every page ended "ok".  A
         # page that failed (API error, or JSON that did not parse even after
@@ -3938,6 +4018,7 @@ class LlmExtractor:
         system_prompt: str | None = None,
         _depth: int = 0,
         document_id: str | None = None,
+        failed_parts: list[int] | None = None,
     ) -> list[ExtractionResult]:
         """Extract a chunk, retrying with smaller sub-chunks on parse failure.
 
@@ -3954,7 +4035,10 @@ class LlmExtractor:
 
         Returns a list of ``ExtractionResult`` (one per successful
         sub-chunk, or one for the original chunk if it succeeds).  The
-        caller merges all results.
+        caller merges all results.  Every (sub-)chunk that failed for good
+        is appended to *failed_parts* (#5000): when one half fails and the
+        other answers, the returned list is not empty, yet the failed
+        half's rulings are missing.
         """
         result = self._extract_chunk(
             text,
@@ -3977,6 +4061,8 @@ class LlmExtractor:
                 chunk_len=len(text),
                 depth=_depth,
             )
+            if failed_parts is not None:
+                failed_parts.append(chunk_index)
             return []
 
         logger.info(
@@ -3998,6 +4084,7 @@ class LlmExtractor:
                     system_prompt=system_prompt,
                     _depth=_depth + 1,
                     document_id=document_id,
+                    failed_parts=failed_parts,
                 )
             )
         return sub_results

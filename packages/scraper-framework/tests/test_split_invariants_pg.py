@@ -14,7 +14,9 @@ invariants after every commit (see its docstring for the list).
   still reach the case-number gate's branches (#4929).
 - ``test_generated_fail_mode_reaches_its_branch`` and
   ``test_generated_extraction_paths`` check the generated seeds reach every
-  extraction fail mode and county strategy (#4968).
+  extraction fail mode and county strategy (#4968), and
+  ``test_generated_partial_extraction_reaches_its_branch`` the partial
+  extractions (#5000).
 - ``test_shared_court_invariants_hold`` sweeps ``SPLIT_HARNESS_SHARED_SEEDS``
   (default 100) scenarios where several keys share one court (#4969);
   ``_OPEN_SHARED_BUGS`` pins their open bugs as strict xfails.
@@ -32,6 +34,7 @@ import logging
 import os
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import psycopg
@@ -420,6 +423,83 @@ def test_new_key_live_fallback_converges(seed: int) -> None:
     document on its own (``single_document_fallback``); the generated
     sequence after it holds every invariant and converges (#4970)."""
     harness.run_new_key_fallback(_DSN, seed, _RUN)
+
+
+@_needs_pg
+@pytest.mark.parametrize("kind", ["reingest", "db", "live"])
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_partial_extraction_leaves_the_key_untouched(seed: int, kind: str) -> None:
+    """A re-ingest whose split is partial (a page or chunk failed while
+    others answered, #5000) after a generated history leaves the key's rows
+    and search docs as they were (``untouched``); a split-set replacement
+    reports the key (``failed_manifest``).  Before the fix the partial
+    split was written as complete, dropping the failed page's rulings."""
+    events = harness.run_partial_extraction(_DSN, seed, _RUN, kind=kind, name=f"part-{kind}")
+    assert (
+        events["harness.fail_mode.partial.failed"] + events["harness.fail_mode.partial.skipped"] > 0
+    ), dict(events)
+    if kind != "live" and events["harness.fail_mode.partial.failed"]:
+        assert events["harness.raised.SplitExtractionFailedError"] > 0, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize("seed", _extraction_failure_seeds())
+def test_partial_live_capture_of_a_new_key_converges(seed: int) -> None:
+    """A live capture of a new key whose split is partial writes the parts
+    that answered (``partial_split_written``, #5000); the generated
+    sequence after it holds every invariant and converges."""
+    events = harness.run_partial_extraction(_DSN, seed, _RUN, kind="new-live", name="part-new")
+    assert events["llm_split.extraction_failed"] > 0, dict(events)
+
+
+@_needs_pg
+def test_partial_live_capture_of_a_new_key_writes_the_answered_rows() -> None:
+    """Seed 0's first capture has rulings left after the failed part: they
+    are written, not the whole document as one ruling (#5000)."""
+    events = harness.run_partial_extraction(_DSN, 0, _RUN, kind="new-live", name="part-new-0")
+    assert events["harness.partial_new_key_written"] > 0, dict(events)
+
+
+#: A default-set seed per partial-extraction branch the generated stream
+#: reaches (#5000), with the events that show it: a multimodal county's
+#: reingest and a text-first county's reingest, each reported failed.
+_PARTIAL_SEEDS = {
+    "multimodal": (
+        14,
+        ("harness.call.multimodal.partial", "harness.raised.SplitExtractionFailedError"),
+    ),
+    "text_county": (
+        10,
+        ("harness.call.framework.partial", "harness.raised.SplitExtractionFailedError"),
+    ),
+}
+
+
+@_needs_pg
+@pytest.mark.parametrize(("path", "entry"), sorted(_PARTIAL_SEEDS.items()))
+def test_generated_partial_extraction_reaches_its_branch(
+    path: str, entry: tuple[int, tuple[str, ...]]
+) -> None:
+    seed, needed = entry
+    assert any(s.fail_mode == harness.PARTIAL for s in harness.generate(seed))
+    events = harness.run_seed(_DSN, seed, _RUN, name=f"partial-{path}")
+    reached = ["harness.fail_mode.partial.failed", *needed]
+    assert all(events[e] > 0 for e in reached), (reached, dict(events))
+
+
+def test_partial_steps_keep_the_seed_s_other_draws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The partial steps come from their own random stream (#5000): with
+    them off, a seed's steps are the same apart from those steps' fail
+    mode, so the seeds pinned against the other fail modes keep theirs."""
+    on = {seed: harness.generate(seed) for seed in range(200)}
+    monkeypatch.setattr(harness, "PARTIAL_STEPS", False)
+    for seed, steps in on.items():
+        off = harness.generate(seed)
+        restored = [
+            replace(s, fail_mode="") if s.fail_mode == harness.PARTIAL else s for s in steps
+        ]
+        assert restored == off
+    assert any(s.fail_mode == harness.PARTIAL for steps in on.values() for s in steps)
 
 
 @_needs_pg

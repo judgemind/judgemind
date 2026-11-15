@@ -63,8 +63,9 @@ properties that must hold for any sequence of re-splits:
   search docs exactly as they were: no whole-document ruling next to the
   key's split children, no deletions (#4948).  The same holds when the
   worker, in ``required`` extraction mode, finds an extractor it needs
-  could not be built (#4953), and when no extractor could run at all (no
-  text to read and no page images, #4968).  Checked on every generated
+  could not be built (#4953), when no extractor could run at all (no
+  text to read and no page images, #4968), and when a page or chunk failed
+  while others answered (``PartialExtractionError``, #5000).  Checked on every generated
   step whose extraction is incomplete, and by :func:`run_extraction_failure`.
 - ``failed_manifest``: a step whose extraction did not produce a complete
   result reports the key as failed.  A split-set replacement (``reingest`` /
@@ -157,6 +158,11 @@ Extraction modes (#4968), from a fourth random stream (:func:`_with_extraction_m
 - a step has a ``fail_mode`` (:data:`FAIL_MODES`): every call fails, the
   multimodal call fails and the text fallback succeeds, or the multimodal
   call fails and the framework or county extractor cannot be built;
+- a step with rulings can instead be partial (:data:`PARTIAL`, #5000, from
+  a fifth stream): the split's extractor answers for every part but one
+  (``PartialExtractionError``).  That is no complete split, so it is
+  checked like a failed one (``untouched``, ``failed_manifest``), except
+  that a live capture of a new key writes the parts that answered;
 - a whole-document step can have no text at all, so a multimodal county
   reaches ``zero_rulings_no_text`` and a text-first one has nothing to read.
 
@@ -505,6 +511,19 @@ _ENV_VARS: dict[str, dict[str, str]] = {
 #: extractor's init error), so a county that needs it has none (#4957).
 FAIL_MODES = ("all", "multimodal_only", "framework_missing", "county_missing")
 
+#: A partial extraction (#5000): the split's extractor (multimodal, or the
+#: text-first county's) answers for every part but one, and raises
+#: ``PartialExtractionError`` carrying the other parts' rulings.  Not a
+#: complete split: a split-set replacement reports the key and leaves its
+#: rows alone, a live capture of a key with rows writes nothing, and only a
+#: live capture of a new key writes the carried rulings.  Drawn from its own
+#: random stream (:func:`_with_partial_failures`), so the seeds pinned
+#: against :data:`FAIL_MODES` keep their draws.
+PARTIAL = "partial"
+
+#: Whether generated seeds include :data:`PARTIAL` steps (#5000).
+PARTIAL_STEPS = True
+
 
 def profile_config(profile: str) -> Any:
     """The ``CountyExtractionConfig`` a key of *profile* has, or None
@@ -557,6 +576,31 @@ def _with_extraction_modes(seed: int, steps: list[Step]) -> list[Step]:
         out.append(
             replace(step, profile=profile, env=env, whole=whole, fail_mode=fail_mode, doc=doc)
         )
+    if PARTIAL_STEPS:
+        out = _with_partial_failures(seed, out)
+    return out
+
+
+def _with_partial_failures(seed: int, steps: list[Step]) -> list[Step]:
+    """Make some of *steps*' healthy extractions partial (:data:`PARTIAL`).
+
+    A fifth random stream, one draw per step whatever the step, so a seed's
+    other streams (and its :data:`FAIL_MODES` draws) are unchanged.  Only a
+    step with rulings to lose gets it: not a pre-split step (no
+    extraction), not a whole document, not an ``ExtractionMethod.NONE``
+    county's step.
+    """
+    rng = random.Random(f"{seed}:partial")
+    out = []
+    for step in steps:
+        draw = rng.random()
+        eligible = (
+            step.kind != "presplit"
+            and not step.fail_mode
+            and not step.whole
+            and step.profile != "none"
+        )
+        out.append(replace(step, fail_mode=PARTIAL) if eligible and draw < 0.12 else step)
     return out
 
 
@@ -984,6 +1028,17 @@ class FakeExtractor:
         self.events: Counter[str] = events if events is not None else Counter()
 
     def result(self, role: str) -> list[ExtractedRuling]:
+        if self.fail_mode == PARTIAL and not self.failing:
+            # Every part but the last answered (#5000).
+            from framework.llm_extractor import PartialExtractionError
+
+            self.events[f"harness.call.{role}.partial"] += 1
+            kept = [r.model_copy() for r in self.rulings[:-1]]
+            raise PartialExtractionError(
+                f"harness: one {role} part failed",
+                rulings=kept,
+                failed_parts=[len(self.rulings) - 1],
+            )
         fails = self.failing or self.fail_mode == "all"
         if role == "multimodal" and self.fail_mode in FAIL_MODES:
             fails = True
@@ -1478,12 +1533,17 @@ class KeyHarness:
         after = ruling_identities(after_rows)
         # A live capture of a key with no rows yet writes the document on
         # its own when its extraction fails (``single_document_fallback``,
-        # #4948): the one failed step that is not ``untouched``.  The
-        # following steps must converge from it (#4970).
+        # #4948), or the parts that answered when it was partial
+        # (``partial_split_written``, #5000): the one failed step that is
+        # not ``untouched``.  The following steps must converge from it
+        # (#4970).
         fallback = outcome == "failed" and step.kind == "live" and not before_rows
         not_logged = self.events[_EXTRACTION_FAILED_EVENT] == logged_before
         if fallback and not_logged:
             self._fail("error", "a failed live capture of a new key did not take the fallback")
+        if fallback and fail_mode == PARTIAL and after_rows:
+            # The parts that answered were written as the key's split (#5000).
+            self.events["harness.partial_new_key_written"] += 1
         if expect_failed and not reported_failed:
             self._guard("failed_manifest", self._check_reported, step, outcome)
         if not complete and not fallback:
@@ -1688,6 +1748,9 @@ class KeyHarness:
             # The worker reads the page images (the harness's PDF bytes).
             if all_missing:
                 return "unavailable"
+            if mode == PARTIAL:
+                # No text fallback after a partial page split (#5000).
+                return "failed"
             if mode not in FAIL_MODES:
                 return "ok"
         if not self._step_doc(step):
@@ -1695,7 +1758,7 @@ class KeyHarness:
         needed = "county" if config is not None and config.provider else "framework"
         if all_missing or mode == f"{needed}_missing":
             return "unavailable"
-        return "failed" if mode == "all" else "ok"
+        return "failed" if mode in ("all", PARTIAL) else "ok"
 
     def _unextractable(self, step: Step) -> bool:
         """A text-first county's step with no text: no extractor can run,
@@ -2827,6 +2890,28 @@ def run_new_key_fallback(dsn: str, seed: int, run_token: str, *, name: str = "fa
     steps = generate(seed, extraction_modes=False)
     first = replace(steps[0], kind="live", fail=True, whole=False, ops=("fallback",))
     run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
+
+
+def run_partial_extraction(
+    dsn: str, seed: int, run_token: str, *, kind: str, name: str = "partial"
+) -> Counter[str]:
+    """A partial extraction (:data:`PARTIAL`, #5000) on *seed*'s key.
+
+    *kind* ``new-live``: a live capture of a new key is partial, so it
+    writes the parts that answered; *seed*'s sequence follows and must hold
+    every invariant and converge from those rows.  Otherwise *seed*'s
+    history runs, then a partial step of *kind* (``reingest``, ``db`` or
+    ``live``): it must leave the key's rows and search docs as they were
+    (``untouched``), and a split-set replacement must report the key
+    (``failed_manifest``).  The convergence checks then re-ingest the same
+    bytes healthily.  Returns the run's event counts.
+    """
+    steps = generate(seed, extraction_modes=False)
+    if kind == "new-live":
+        first = replace(steps[0], kind="live", fail_mode=PARTIAL, whole=False, ops=("partial",))
+        return run_steps(dsn, [first, *steps], run_token, seed=seed, name=name)
+    partial = replace(steps[-1], kind=kind, fail_mode=PARTIAL, whole=False, ops=("partial",))
+    return run_steps(dsn, [*steps, partial], run_token, seed=seed, name=name)
 
 
 # ---------------------------------------------------------------------------
