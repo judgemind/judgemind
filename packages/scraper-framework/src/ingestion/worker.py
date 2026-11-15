@@ -290,6 +290,16 @@ OCR_INCOMPLETE_KEY = "_ocr_incomplete"
 #: Prefix of the failure reason of a text split refused over incomplete OCR.
 OCR_INCOMPLETE = "incomplete OCR of a PDF's scanned pages"
 
+#: Whether the live worker reads a live capture's scanned pages again from
+#: the archive and OCRs them (#5010).  Off: OCR renders every scanned page
+#: to an image at once, and a 25-page San Bernardino scan OOM-killed the
+#: 512 MB live worker on every redelivery.  Until OCR streams pages in
+#: bounded memory, such an event is marked incomplete instead: the split
+#: is refused (a new key takes the single-document fallback and its
+#: ``ingest_incomplete`` record), and the reconciler's reingest, which
+#: runs in a larger one-off task, OCRs the pages.
+LIVE_SCANNED_PAGE_REREAD = False
+
 #: Pages OCR'd for a multimodal county's scanned PDF (#4986).  Its split
 #: reads the page images itself (every page); the OCR text is only the
 #: fallback when that fails, and a fallback built on a capped OCR is
@@ -2723,6 +2733,21 @@ class IngestionWorker:
         ):
             return event_data, ruling_text
         document_id = str(event_data.get("document_id"))
+        if not LIVE_SCANNED_PAGE_REREAD:
+            logger.warning(
+                "Live PDF capture has scanned pages; left for a reingest to OCR",
+                extra={
+                    "document_id": document_id,
+                    "s3_key": event_data.get("s3_key"),
+                    "scanned_pages": scanned,
+                    "telemetry_event": "pdf_scanned_pages_deferred",
+                },
+            )
+            reason = (
+                f"page(s) {scanned} are scanned and a live capture is not OCR'd "
+                "(a reingest of the key OCRs them)"
+            )
+            return {**event_data, OCR_INCOMPLETE_KEY: reason}, ruling_text
         raw = self._fetch_archived_bytes(
             event_data.get("s3_key"), event_data.get("s3_bucket"), document_id
         )
