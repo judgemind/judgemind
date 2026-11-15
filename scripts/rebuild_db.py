@@ -123,6 +123,12 @@ KEY_PATTERN = re.compile(
     r"^(?P<state>[^/]+)/(?P<county>[^/]+)/(?P<court>[^/]+)/raw/(?P<content_hash>[0-9a-f]+)\.(?P<ext>\w+)$"
 )
 
+# Pre-#2193 dated raws (``.../raw/YYYY/MM/DD/<uuid>.<ext>``).  Never listed:
+# the ones holding bytes no content-addressed key had were copied to their
+# content-addressed key by ``scripts/audit_dated_raw_keys.py --migrate``
+# (#4988); the dated originals are kept, so they show up in the skip count.
+LEGACY_DATED_RAW_RE = re.compile(r"/raw/\d{4}/\d{2}/\d{2}/")
+
 EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
 
 # Best-effort courthouse name extraction from HTML body text (#4014).
@@ -306,14 +312,32 @@ def reindex_renamed_courts(
 
 
 def list_s3_keys(s3_client: Any, bucket: str, prefix: str = "ca/") -> list[str]:
-    """List all content-addressed keys from S3 (or local cache)."""
+    """List all content-addressed keys from S3 (or local cache).
+
+    Keys that don't match ``KEY_PATTERN`` are skipped, and the count is
+    logged (``s3_keys_skipped_non_matching``) so a key-layout drift is
+    visible instead of silent: legacy dated ``raw/YYYY/MM/DD/`` raws sat
+    unlisted for months (#4988).
+    """
     paginator = s3_client.get_paginator("list_objects_v2")
     keys: list[str] = []
+    skipped: list[str] = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if KEY_PATTERN.match(key):
                 keys.append(key)
+            else:
+                skipped.append(key)
+    if skipped:
+        logger.warning(
+            "s3_keys_skipped_non_matching",
+            prefix=prefix,
+            matched=len(keys),
+            skipped=len(skipped),
+            legacy_dated=sum(1 for k in skipped if LEGACY_DATED_RAW_RE.search(k)),
+            sample=skipped[:5],
+        )
     return keys
 
 

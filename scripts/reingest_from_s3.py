@@ -437,6 +437,11 @@ _S3_KEY_PATTERN = re.compile(
     r"(?P<content_hash>[0-9a-f]+)\.(?P<ext>\w+)$"
 )
 
+# Pre-#2193 dated raws (``.../raw/YYYY/MM/DD/<uuid>.<ext>``), kept after
+# ``scripts/audit_dated_raw_keys.py --migrate`` copied the unique ones to
+# content-addressed keys (#4988).  Counted separately in the skip warning.
+_LEGACY_DATED_RAW_RE = re.compile(r"/raw/\d{4}/\d{2}/\d{2}/")
+
 _EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
 
 # Timezone lookup by state (expand as states are added)
@@ -468,14 +473,31 @@ def _parse_s3_key(key: str) -> dict[str, str] | None:
 
 
 def _list_s3_keys(s3_client: object, bucket: str, prefix: str) -> list[str]:
-    """List all content-addressed S3 keys under *prefix*."""
+    """List all content-addressed S3 keys under *prefix*.
+
+    Non-matching keys are skipped and counted in one
+    ``s3_keys_skipped_non_matching`` warning, so a key-layout drift is
+    visible instead of silent (#4988).
+    """
     paginator = s3_client.get_paginator("list_objects_v2")  # type: ignore[union-attr]
     keys: list[str] = []
+    skipped: list[str] = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if _S3_KEY_PATTERN.match(key):
                 keys.append(key)
+            else:
+                skipped.append(key)
+    if skipped:
+        logger.warning(
+            "s3_keys_skipped_non_matching",
+            prefix=prefix,
+            matched=len(keys),
+            skipped=len(skipped),
+            legacy_dated=sum(1 for k in skipped if _LEGACY_DATED_RAW_RE.search(k)),
+            sample=skipped[:5],
+        )
     return keys
 
 
