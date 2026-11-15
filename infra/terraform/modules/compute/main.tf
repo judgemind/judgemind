@@ -549,6 +549,15 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       command   = ["ingestion"]
       essential = true
 
+      # Time between ECS's SIGTERM and its SIGKILL (default 30 s; 120 s is
+      # the Fargate maximum). On SIGTERM the worker claims no new message
+      # and finishes the one in flight, or after SHUTDOWN_GRACE_S (105 s)
+      # releases it unacked with its crash charge taken back, then exits 0
+      # (#5069). Sized from dev message durations, 2026-11-01..15: LLM-
+      # bearing messages (reingest_doc_timing total_ms > 1 s, n=5866) ran
+      # p95 52 s, p99 86 s, and 0.14% ran past 110 s.
+      stopTimeout = 120
+
       # Secrets injected from Secrets Manager so they are never visible in
       # plaintext in the task definition.
       secrets = concat(

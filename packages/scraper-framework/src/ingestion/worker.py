@@ -172,6 +172,7 @@ from .ruling_guards import (
     is_all_null_metadata,
 )
 from .ruling_summarizer import summarize_ruling
+from .shutdown import ShutdownCoordinator, WorkerShutdown, shutdown_grace_from_env
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -2047,9 +2048,11 @@ PENDING_RECLAIM_MIN_IDLE_MS = 30_000
 #: ``_process_message`` adds one just before it processes a message and takes
 #: it back whenever processing ends in Python: an ack, a dead-letter, or an
 #: exception that exits the worker (an ``InfrastructureError``, Ctrl-C).
-#: Only a death that runs no Python (the OOM killer's SIGKILL, a segfault,
-#: and ECS's stop signal, which the worker does not handle) leaves the count
-#: raised, and only on the one message in flight.
+#: Only a death that runs no Python (the OOM killer's SIGKILL, a segfault)
+#: leaves the count raised, and only on the one message in flight.  ECS's
+#: stop signal is handled (#5069, ``ingestion.shutdown``): the worker
+#: finishes the message, or past the grace period releases it with the
+#: charge taken back.
 MAX_MESSAGE_CRASHES = 3
 
 #: Redis key prefix of a message's crash count (``MAX_MESSAGE_CRASHES``).
@@ -2258,6 +2261,10 @@ class IngestionWorker:
         heartbeat_level_env = os.environ.get("HEARTBEAT_LOG_LEVEL", "INFO").upper()
         self._heartbeat_log_level: int = getattr(logging, heartbeat_level_env, logging.INFO)
         self._empty_polls: int = 0
+        # SIGTERM handling (#5069).  Inert until install_shutdown_handler().
+        self._shutdown = ShutdownCoordinator(
+            self._release_in_flight, grace_s=shutdown_grace_from_env()
+        )
         self._last_event_time: float = time.monotonic()
         # Monotonic time of the last consumed-entry trim; None = never (#4474).
         self._last_trim_time: float | None = None
@@ -3492,7 +3499,8 @@ class IngestionWorker:
     ) -> None:
         """Block indefinitely, processing events from the Redis stream.
 
-        Call this from the process entrypoint. Returns only on KeyboardInterrupt.
+        Call this from the process entrypoint. Returns on KeyboardInterrupt
+        and, once ``install_shutdown_handler`` has run, on SIGTERM (#5069).
         Raises InfrastructureError if the database is unavailable or the schema
         is missing — this causes a non-zero exit so ECS can restart the task.
         """
@@ -3501,46 +3509,90 @@ class IngestionWorker:
         self._ensure_consumer_group()
         self._cleanup_stale_consumers()
 
-        # Reclaim any messages left pending by crashed consumers before
-        # starting the main loop.  This is critical: after an infrastructure
-        # error (e.g. missing DB column) is fixed, the messages that caused
-        # crash-loops are stuck in the PEL because XREADGROUP '>' only
-        # delivers new messages.  See #1044.
-        reclaimed = self._reclaim_pending_messages()
-        if reclaimed:
-            logger.info("Startup PEL reclamation processed %d message(s)", reclaimed)
+        try:
+            # Reclaim any messages left pending by crashed consumers before
+            # starting the main loop.  This is critical: after an infrastructure
+            # error (e.g. missing DB column) is fixed, the messages that caused
+            # crash-loops are stuck in the PEL because XREADGROUP '>' only
+            # delivers new messages.  See #1044.
+            reclaimed = self._reclaim_pending_messages()
+            if reclaimed:
+                logger.info("Startup PEL reclamation processed %d message(s)", reclaimed)
 
+            logger.info(
+                "Ingestion worker started",
+                extra={
+                    "stream": STREAM_DOCUMENT_CAPTURED,
+                    "group": CONSUMER_GROUP,
+                    "consumer": CONSUMER_NAME,
+                },
+            )
+            self._consume(batch_size=batch_size, block_ms=block_ms)
+            if self._shutdown.requested:
+                self._log_shutdown("finished in-flight work")
+        except WorkerShutdown:
+            self._log_shutdown("idle")
+        finally:
+            self.close()
+            self._shutdown.stopped()
+
+    def install_shutdown_handler(self) -> None:
+        """Handle SIGTERM: stop claiming messages, finish the one in flight,
+        and return from ``run()`` (#5069).  Call from the main thread."""
+        self._shutdown.install()
         logger.info(
-            "Ingestion worker started",
+            "SIGTERM handler installed (grace %.0fs)",
+            self._shutdown.grace_s,
+            extra={"shutdown_grace_s": self._shutdown.grace_s},
+        )
+
+    def request_shutdown(self) -> None:
+        """Ask ``run()`` to stop after the message in flight, from any
+        thread.  An idle worker stops when its blocking read returns."""
+        self._shutdown.request()
+
+    def _log_shutdown(self, state: str) -> None:
+        logger.info(
+            "Ingestion worker stopped on SIGTERM (%s)",
+            state,
             extra={
-                "stream": STREAM_DOCUMENT_CAPTURED,
-                "group": CONSUMER_GROUP,
-                "consumer": CONSUMER_NAME,
+                "telemetry_event": "worker_shutdown_clean",
+                "shutdown_state": state,
+                "seconds_since_sigterm": self._shutdown.seconds_since_request(),
             },
         )
 
+    def _release_in_flight(self, msg_id: bytes) -> None:
+        """Hand *msg_id* back unacked, taking back its crash charge, when the
+        shutdown grace period ends mid-message (#5069).  Called by the
+        shutdown watchdog under the shutdown lock."""
         try:
-            while True:
-                try:
-                    self._process_batch(batch_size=batch_size, block_ms=block_ms)
+            self._redis.decr(_crashes_key(msg_id))
+        except Exception as exc:
+            logger.warning("Could not take back the crash charge of %s: %s", msg_id, exc)
 
-                    # Periodically check for pending messages that may have
-                    # been abandoned by other consumers that crashed.
-                    if self._empty_polls > 0 and self._empty_polls % PENDING_RECLAIM_INTERVAL == 0:
-                        self._reclaim_pending_messages()
+    def _consume(self, batch_size: int, block_ms: int) -> None:
+        """The consumer loop; returns on KeyboardInterrupt or a shutdown
+        request, raises ``InfrastructureError`` / ``WorkerShutdown``."""
+        while not self._shutdown.requested:
+            try:
+                self._process_batch(batch_size=batch_size, block_ms=block_ms)
 
-                    self._maybe_trim_consumed_entries()
-                except KeyboardInterrupt:
-                    logger.info("Ingestion worker stopped")
-                    break
-                except InfrastructureError:
-                    # Propagate infra errors to exit the process for ECS restart.
-                    # Messages stay unacknowledged in the stream.
-                    raise
-                except Exception as exc:
-                    logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
-        finally:
-            self.close()
+                # Periodically check for pending messages that may have
+                # been abandoned by other consumers that crashed.
+                if self._empty_polls > 0 and self._empty_polls % PENDING_RECLAIM_INTERVAL == 0:
+                    self._reclaim_pending_messages()
+
+                self._maybe_trim_consumed_entries()
+            except KeyboardInterrupt:
+                logger.info("Ingestion worker stopped")
+                break
+            except InfrastructureError:
+                # Propagate infra errors to exit the process for ECS restart.
+                # Messages stay unacknowledged in the stream.
+                raise
+            except Exception as exc:
+                logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
 
     def _warn_if_socket_timeout_below_block(self, block_ms: int) -> None:
         """Warn once at startup if idle XREADGROUP polls would time out client-side.
@@ -7312,6 +7364,10 @@ class IngestionWorker:
         )
 
         for msg_id, data in claimed_messages:
+            if self._shutdown.requested:
+                # Claim no new message after SIGTERM (#5069); the rest stay
+                # pending, uncharged, for another consumer's XAUTOCLAIM.
+                break
             if data is None:
                 # Message was deleted from the stream but still in PEL.
                 # Acknowledge it to clear the PEL entry.
@@ -7324,12 +7380,21 @@ class IngestionWorker:
         return processed
 
     def _ack(self, msg_id: bytes) -> None:
-        """Acknowledge *msg_id* and drop its crash count (#5055)."""
-        self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
-        try:
-            self._redis.delete(_crashes_key(msg_id))
-        except Exception as exc:
-            logger.warning("Could not clear the crash count of %s: %s", msg_id, exc)
+        """Acknowledge *msg_id* and drop its crash count (#5055).
+
+        A no-op for a message the shutdown watchdog already handed back
+        (#5069): another consumer owns it now."""
+        shutdown = self._shutdown
+        with shutdown.lock:
+            if shutdown.released == msg_id:
+                return
+            self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+            if shutdown.in_flight == msg_id:
+                shutdown.in_flight = None
+            try:
+                self._redis.delete(_crashes_key(msg_id))
+            except Exception as exc:
+                logger.warning("Could not clear the crash count of %s: %s", msg_id, exc)
 
     def _begin_processing(self, msg_id: bytes) -> int | None:
         """Charge *msg_id* one crash before processing it, and return how many
@@ -7352,10 +7417,16 @@ class IngestionWorker:
         an exception that exits the worker: the worker did not die on the
         message, so a crash loop over a broken database or schema (#1044)
         never dead-letters anything."""
-        try:
-            self._redis.decr(_crashes_key(msg_id))
-        except Exception as exc:
-            logger.warning("Could not clear the processing mark of %s: %s", msg_id, exc)
+        shutdown = self._shutdown
+        with shutdown.lock:
+            if shutdown.released == msg_id:
+                return  # the shutdown watchdog already took it back (#5069)
+            if shutdown.in_flight == msg_id:
+                shutdown.in_flight = None
+            try:
+                self._redis.decr(_crashes_key(msg_id))
+            except Exception as exc:
+                logger.warning("Could not clear the processing mark of %s: %s", msg_id, exc)
 
     def _dead_letter_poison_message(self, msg_id: bytes, event_data: Any, crashes: int) -> None:
         """Dead-letter a message the worker died processing *crashes* times,
@@ -7380,13 +7451,24 @@ class IngestionWorker:
         self._ack(msg_id)
 
     def _process_batch(self, batch_size: int, block_ms: int) -> None:
-        messages = self._redis.xreadgroup(
-            CONSUMER_GROUP,
-            CONSUMER_NAME,
-            {STREAM_DOCUMENT_CAPTURED: ">"},
-            count=batch_size,
-            block=block_ms,
-        )
+        shutdown = self._shutdown
+        if shutdown.requested:
+            return
+        # While idle the SIGTERM handler raises WorkerShutdown out of the
+        # blocking read, so an idle worker stops at once (#5069).
+        shutdown.idle = True
+        try:
+            if shutdown.requested:
+                return
+            messages = self._redis.xreadgroup(
+                CONSUMER_GROUP,
+                CONSUMER_NAME,
+                {STREAM_DOCUMENT_CAPTURED: ">"},
+                count=batch_size,
+                block=block_ms,
+            )
+        finally:
+            shutdown.idle = False
         if not messages:
             self._empty_polls += 1
             if self._heartbeat_interval > 0 and self._empty_polls % self._heartbeat_interval == 0:
@@ -7408,6 +7490,9 @@ class IngestionWorker:
         self._last_event_time = time.monotonic()
         for _stream_name, entries in messages:
             for msg_id, data in entries:
+                if shutdown.requested:
+                    # The rest stay pending, uncharged, for XAUTOCLAIM (#5069).
+                    return
                 self._process_message(msg_id, data)
 
     def _process_message(self, msg_id: bytes, data: dict[bytes, bytes]) -> bool:
@@ -7424,23 +7509,34 @@ class IngestionWorker:
             self._ack(msg_id)
             return False
 
-        crashes = self._begin_processing(msg_id)
-        if crashes is not None and crashes >= MAX_MESSAGE_CRASHES:
-            self._dead_letter_poison_message(msg_id, event_data, crashes)
-            return False
-        if crashes:
-            logger.warning(
-                "Processing message %s again: the worker died processing it %d time(s)",
-                msg_id,
-                crashes,
-                extra={"telemetry_event": "message_crash_retry", "crashes": crashes},
-            )
+        shutdown = self._shutdown
+        # Charge and mark in flight under the shutdown lock, so the shutdown
+        # watchdog releases exactly the charge taken here (#5069).  No charge
+        # (Redis failed) means nothing to release.
+        with shutdown.lock:
+            crashes = self._begin_processing(msg_id)
+            shutdown.in_flight = msg_id if crashes is not None else None
         try:
-            self._process_event_data(msg_id, event_data)
-        except BaseException:
-            self._end_processing(msg_id)
-            raise
-        return True
+            if crashes is not None and crashes >= MAX_MESSAGE_CRASHES:
+                self._dead_letter_poison_message(msg_id, event_data, crashes)
+                return False
+            if crashes:
+                logger.warning(
+                    "Processing message %s again: the worker died processing it %d time(s)",
+                    msg_id,
+                    crashes,
+                    extra={"telemetry_event": "message_crash_retry", "crashes": crashes},
+                )
+            try:
+                self._process_event_data(msg_id, event_data)
+            except BaseException:
+                self._end_processing(msg_id)
+                raise
+            return True
+        finally:
+            with shutdown.lock:
+                if shutdown.in_flight == msg_id:
+                    shutdown.in_flight = None
 
     def _process_event_data(self, msg_id: bytes, event_data: Any) -> None:
         """Run ``process_event`` with retries, then ack or dead-letter."""
