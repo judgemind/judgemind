@@ -27,6 +27,8 @@ GOV = "ca/statewide/governor/raw/"
 FED = "federal/federal/courtlistener/raw/"
 NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 OLD = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+#: The shipped deferral list, captured before the autouse fixture empties it.
+REAL_DEFERRALS = rec.DEFERRED_BACKLOGS
 
 
 def _h(c: str) -> str:
@@ -89,6 +91,13 @@ class FakeS3:
 
     def put_object(self, Bucket: str, Key: str, Body: bytes) -> None:
         self.puts[f"s3://{Bucket}/{Key}"] = Body
+
+
+@pytest.fixture(autouse=True)
+def _no_default_deferrals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fixture's federal key is a plain loss unless a test defers it
+    (#5036); the real deferral list is tested on its own."""
+    monkeypatch.setattr(rec, "DEFERRED_BACKLOGS", ())
 
 
 @pytest.fixture
@@ -374,31 +383,30 @@ def test_is_sc_placeholder_pdf_uses_worker_predicate(
 @pytest.mark.parametrize(
     ("unrep", "previous", "reingest", "defer", "expected"),
     [
-        (0, [(5, "reingest"), (5, "reingest")], True, False, "none"),
         (501, [], True, False, "over_threshold"),
         (500, [], True, False, "reingest"),
-        # two earlier runs re-ingested and the keys came back
-        (10, [(3, "reingest"), (7, "persistent")], True, False, "persistent"),
-        (10, [(0, "none"), (7, "reingest")], True, False, "reingest"),
-        (10, [(7, "reingest")], True, False, "reingest"),  # not enough history yet
-        # runs that never re-ingested are not a failed heal
-        (10, [(3, "reingest_deferred"), (7, "reingest")], True, False, "reingest"),
-        (10, [(3, "reingest"), (900, "over_threshold")], True, False, "reingest"),
-        (10, [(3, "report_only"), (7, "report_only")], True, False, "reingest"),
-        (10, [(3, "reingest"), (7, "reingest")], False, False, "report_only"),
-        (10, [(3, "reingest"), (7, "reingest")], True, True, "reingest_deferred"),
-        (501, [(3, "reingest"), (7, "reingest")], True, True, "over_threshold"),
+        # the scope was re-ingested in both earlier runs and its keys are back
+        (10, ["reingest", "persistent"], True, False, "persistent"),
+        (10, [None, "reingest"], True, False, "reingest"),  # healed in between
+        (10, ["reingest"], True, False, "reingest"),  # not enough history yet
+        # runs that never re-ingested the scope are not a failed heal
+        (10, ["reingest_deferred", "reingest"], True, False, "reingest"),
+        (10, ["reingest", "over_threshold"], True, False, "reingest"),
+        (10, ["report_only", "report_only"], True, False, "reingest"),
+        (10, ["reingest", "reingest"], False, False, "report_only"),
+        (10, ["reingest", "reingest"], True, True, "reingest_deferred"),
+        (501, ["reingest", "reingest"], True, True, "over_threshold"),
     ],
 )
-def test_decide_action(
+def test_decide_scope_action(
     unrep: int,
-    previous: list[tuple[int, str]],
+    previous: list[str | None],
     reingest: bool,
     defer: bool,
     expected: str,
 ) -> None:
     assert (
-        rec.decide_action(
+        rec.decide_scope_action(
             unrep,
             previous,
             max_auto_reingest=500,
@@ -410,11 +418,11 @@ def test_decide_action(
     )
 
 
-def test_decide_action_without_history_never_persistent() -> None:
+def test_decide_scope_action_without_history_never_persistent() -> None:
     assert (
-        rec.decide_action(
+        rec.decide_scope_action(
             5,
-            [(9, "reingest"), (9, "reingest")],
+            ["reingest", "reingest"],
             max_auto_reingest=500,
             persist_runs=0,
             reingest=True,
@@ -422,6 +430,134 @@ def test_decide_action_without_history_never_persistent() -> None:
         )
         == "reingest"
     )
+
+
+def test_per_scope_threshold_heals_small_scopes_beside_a_big_one() -> None:
+    """#5036: one scope over the threshold no longer stops another scope's
+    heal; persistence is tracked per scope."""
+    big = [_raw(f"{FED}{_h(c)}.txt") for c in "789"]
+    small = [_raw(f"{LA}{_h('b')}.html")]
+    other = [_raw(f"{SD}{_h('1')}.pdf")]
+    actions = rec.decide_scope_actions(
+        {"federal/federal": big, "ca/los_angeles": small, "ca/san_diego": other},
+        # LA was re-ingested in both earlier runs; SD only in the last one.
+        [
+            {"ca/los_angeles": "reingest", "ca/san_diego": "reingest"},
+            {"ca/los_angeles": "reingest"},
+        ],
+        max_auto_reingest=2,
+        persist_runs=3,
+        reingest=True,
+        defer=False,
+    )
+    assert actions == {
+        "ca/los_angeles": "persistent",
+        "ca/san_diego": "reingest",
+        "federal/federal": "over_threshold",
+    }
+
+
+@pytest.mark.parametrize(
+    ("scope_actions", "incomplete", "reingest", "defer", "expected"),
+    [
+        ({}, 0, True, False, "none"),
+        ({}, 2, True, False, "reingest"),  # the incomplete batch alone
+        ({}, 2, False, False, "report_only"),
+        ({}, 2, True, True, "reingest_deferred"),
+        ({"a/x": "reingest", "b/y": "over_threshold"}, 0, True, False, "reingest"),
+        ({"a/x": "persistent", "b/y": "reingest"}, 0, True, False, "persistent"),
+        ({"b/y": "over_threshold"}, 3, True, False, "over_threshold"),
+        (
+            {"b/y": "over_threshold", "a/x": "report_only"},
+            0,
+            False,
+            False,
+            "over_threshold",
+        ),
+        ({"a/x": "report_only"}, 0, False, False, "report_only"),
+        ({"a/x": "reingest_deferred"}, 0, True, True, "reingest_deferred"),
+    ],
+)
+def test_overall_action(
+    scope_actions: dict[str, str],
+    incomplete: int,
+    reingest: bool,
+    defer: bool,
+    expected: str,
+) -> None:
+    assert (
+        rec.overall_action(
+            scope_actions, incomplete=incomplete, reingest=reingest, defer=defer
+        )
+        == expected
+    )
+
+
+# -- deferred backlogs (#5036) ----------------------------------------------
+
+
+CL_BACKLOG = rec.DeferredBacklog(
+    name="cl",
+    issue=3954,
+    scopes=("federal/*", "unknown/*", "*/statewide"),
+    exclude=("ca/*",),
+    captured_before=date(2026, 6, 21),
+)
+
+
+def test_deferred_backlog_matches_scope_patterns_exclusions_and_cutoff() -> None:
+    assert CL_BACKLOG.matches(_raw(f"{FED}{_h('7')}.txt"))
+    assert CL_BACKLOG.matches(
+        _raw(f"south carolina/statewide/courtlistener/raw/{_h('7')}.txt")
+    )
+    assert CL_BACKLOG.matches(_raw(f"unknown/unknown/courtlistener/raw/{_h('7')}.txt"))
+    # The ca/ capture prefix is never deferred, ca/statewide included.
+    assert not CL_BACKLOG.matches(_raw(f"{GOV}{_h('5')}.html"))
+    assert not CL_BACKLOG.matches(_raw(f"{LA}{_h('b')}.html"))
+    # A loss after the cutoff heals as usual.
+    assert not CL_BACKLOG.matches(_raw(f"{FED}{_h('7')}.txt", _lm("2026-06-21")))
+    assert CL_BACKLOG.matches(_raw(f"{FED}{_h('7')}.txt", _lm("2026-06-20", 23)))
+    assert rec.DeferredBacklog("x", 1, ("federal/*",)).matches(
+        _raw(f"{FED}{_h('7')}.txt", _lm("2030-01-01"))
+    )
+    assert CL_BACKLOG.label == "deferred (blocked on #3954)"
+
+
+def test_default_deferral_is_the_courtlistener_backlog_on_3954() -> None:
+    assert [b.issue for b in REAL_DEFERRALS] == [3954]
+    (cl,) = REAL_DEFERRALS
+    assert cl.matches(_raw(f"{FED}{_h('7')}.txt", _lm("2026-06-18")))
+    assert cl.matches(_raw(f"california/statewide/courtlistener/raw/{_h('7')}.txt"))
+    assert not cl.matches(_raw(f"{LA}{_h('b')}.html", _lm("2026-06-18")))
+    assert not cl.matches(_raw(f"{GOV}{_h('5')}.html"))
+
+
+def test_split_deferred_and_report() -> None:
+    fed = [_raw(f"{FED}{_h(c)}.txt") for c in "78"]
+    late = _raw(f"{FED}{_h('9')}.txt", _lm("2026-07-01"))
+    la = _raw(f"{LA}{_h('b')}.html")
+    reports = {
+        "federal/federal": rec.ScopeReport(
+            "federal/federal", unrepresented=[*fed, late]
+        ),
+        "ca/los_angeles": rec.ScopeReport("ca/los_angeles", unrepresented=[la]),
+    }
+    actionable, deferred = rec.split_deferred(reports, (CL_BACKLOG,))
+    assert actionable == {"ca/los_angeles": [la], "federal/federal": [late]}
+    assert deferred == {"cl": {"federal/federal": 2}}
+    assert rec.deferred_report((CL_BACKLOG,), deferred) == [
+        {
+            "name": "cl",
+            "issue": 3954,
+            "label": "deferred (blocked on #3954)",
+            "keys": 2,
+            "scope_count": 1,
+            "top_scopes": [["federal/federal", 2]],
+        }
+    ]
+    assert rec.deferred_report((CL_BACKLOG,), {}) == []
+    # No backlogs: everything is actionable.
+    assert rec.split_deferred(reports, ())[1] == {}
 
 
 # -- database ---------------------------------------------------------------
@@ -579,6 +715,12 @@ def test_persistent_still_reingests_and_files_an_issue(
         {
             "RETURNING run_id": [("run-2",)],
             "ORDER BY finished_at": [(4, "reingest"), (9, "persistent")],
+            # jsonb comes back as a dict (psycopg) or a string; an old run
+            # recorded no scope actions.
+            "scope_actions": [
+                ({"ca/los_angeles": "reingest", "ca/santa_clara": "reingest"},),
+                ('{"ca/los_angeles": "persistent"}',),
+            ],
         }
     )
     calls: list[list[str]] = []
@@ -597,9 +739,17 @@ def test_persistent_still_reingests_and_files_an_issue(
     result = _result(lines)
     assert result["action"] == "persistent"
     assert result["issue_needed"] is True
+    # Only LA was re-ingested in both earlier runs.
+    assert result["scope_actions"] == {
+        "ca/los_angeles": "persistent",
+        "ca/santa_clara": "reingest",
+        "federal/federal": "reingest",
+    }
+    assert "SCOPE_ACTION ca/los_angeles action=persistent unrepresented=3" in lines
     assert result["previous_unrepresented"] == [4, 9]
     assert result["previous_actions"] == ["reingest", "persistent"]
     assert db.sql("ORDER BY finished_at")[0][1] == (2,)
+    assert db.sql("scope_actions")[0][1] == (2,)
     # new losses keep healing while the issue is open
     assert len(calls) == 2
 
@@ -628,6 +778,8 @@ def test_reingest_launch_failure_is_recorded_and_reported(
     assert "exec format error" in result["reingest_error"]
     update = db.sql("UPDATE telemetry.raw_reconcile_runs")[0][1]
     assert update[0] == "reingest_failed"
+    # Not re-ingested, so no later run counts this as a heal attempt.
+    assert set(json.loads(update[1])["scope_actions"].values()) == {"reingest_failed"}
 
 
 def test_missing_reingest_script_is_recorded_before_anything_runs(
@@ -649,6 +801,7 @@ def test_missing_reingest_script_is_recorded_before_anything_runs(
     assert result["action"] == "reingest_failed"
     run_insert = db.sql("INSERT INTO telemetry.raw_reconcile_runs")[0][1]
     assert run_insert[7] == "reingest_failed"
+    assert set(result["scope_actions"].values()) == {"reingest_failed"}
     assert calls == []
     assert s3.puts == {}
 
@@ -660,19 +813,156 @@ def test_over_threshold_files_an_issue_and_does_not_reingest(
     calls: list[list[str]] = []
     lines: list[str] = []
     rec.run(
-        _args("--record", "--reingest", "--max-auto-reingest", "5"),
+        _args("--record", "--reingest", "--max-auto-reingest", "1"),
         s3,
         explained,
         out=lines.append,
         now=NOW,
         conn=db,
         runner=lambda cmd, check: calls.append(cmd),
+        # federal is deferred, so every remaining scope is over 1
+        deferrals=(CL_BACKLOG,),
     )
     result = _result(lines)
     assert result["action"] == "over_threshold"
+    assert result["scope_actions"] == {
+        "ca/los_angeles": "over_threshold",
+        "ca/santa_clara": "over_threshold",
+    }
     assert result["issue_needed"] is True
     assert calls == []
     assert s3.puts == {}
+
+
+def test_per_scope_threshold_heals_a_county_beside_a_scope_over_it(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """#5036: LA (3 keys) is over a threshold of 2, but Santa Clara (2) and
+    federal (1) still heal, and the issue is filed for LA."""
+    db = FakeDb({"RETURNING run_id": [("run-15",)]})
+    calls: list[list[str]] = []
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "2",
+            "--reingest-script",
+            _stub_script(tmp_path),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: (
+            calls.append(cmd) or types.SimpleNamespace(returncode=0)
+        ),
+    )
+    result = _result(lines)
+    assert result["action"] == "reingest"
+    assert result["scope_actions"] == {
+        "ca/los_angeles": "over_threshold",
+        "ca/santa_clara": "reingest",
+        "federal/federal": "reingest",
+    }
+    assert result["issue_needed"] is True
+    assert result["actionable_unrepresented"] == 6
+    assert result["deferred"] == 0
+    assert [c[c.index("--prefix") + 1] for c in calls] == ["ca/", "federal/"]
+    ca_list = s3.puts[calls[0][calls[0].index("--s3-key-list") + 1]]
+    assert ca_list.decode().splitlines() == [f"{SC}{_h('3')}.pdf", f"{SC}{_h('4')}.pdf"]
+    assert "SCOPE_ACTION ca/los_angeles action=over_threshold unrepresented=3" in lines
+
+
+def test_deferred_backlog_is_reported_and_never_reingested_or_over_threshold(
+    s3: FakeS3, explained: rec.Explained, tmp_path: Any
+) -> None:
+    """#5036: a deferred scope far over the threshold neither blocks the
+    California heal nor files the issue; it is reported separately."""
+    for c in "89fe":
+        s3.objects[f"{FED}{_h(c)}.txt"] = (_lm("2026-06-02"), b"")
+    db = FakeDb({"RETURNING run_id": [("run-16",)]})
+    calls: list[list[str]] = []
+    lines: list[str] = []
+    rec.run(
+        _args(
+            "--record",
+            "--reingest",
+            "--max-auto-reingest",
+            "3",
+            "--reingest-script",
+            _stub_script(tmp_path),
+        ),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: (
+            calls.append(cmd) or types.SimpleNamespace(returncode=0)
+        ),
+        deferrals=(CL_BACKLOG,),
+    )
+    result = _result(lines)
+    assert result["action"] == "reingest"
+    assert result["scope_actions"] == {
+        "ca/los_angeles": "reingest",
+        "ca/santa_clara": "reingest",
+    }
+    assert result["issue_needed"] is False
+    # Deferred keys stay unrepresented in the counts (and the dashboard).
+    assert result["unrepresented"] == 10
+    assert result["actionable_unrepresented"] == 5
+    assert result["deferred"] == 5
+    assert result["deferred_backlogs"] == [
+        {
+            "name": "cl",
+            "issue": 3954,
+            "label": "deferred (blocked on #3954)",
+            "keys": 5,
+            "scope_count": 1,
+            "top_scopes": [["federal/federal", 5]],
+        }
+    ]
+    assert result["top_scopes"] == [["ca/los_angeles", 3], ["ca/santa_clara", 2]]
+    assert [c[c.index("--prefix") + 1] for c in calls] == ["ca/"]
+    assert not any("federal" in uri for uri in s3.puts)
+    assert "DEFERRED cl deferred (blocked on #3954) keys=5 scopes=1" in lines
+    run_insert = db.sql("INSERT INTO telemetry.raw_reconcile_runs")[0][1]
+    assert run_insert[4] == 10  # the run row still counts every unrepresented key
+    detail = json.loads(db.sql("UPDATE telemetry.raw_reconcile_runs")[0][1][1])
+    assert detail["scope_actions"] == result["scope_actions"]
+
+
+def test_only_deferred_keys_left_means_nothing_to_do(
+    s3: FakeS3, explained: rec.Explained
+) -> None:
+    """With every non-deferred key healed the run is ``none`` and the
+    workflow's healed check (``actionable_unrepresented``) can close the
+    issue while the deferred backlog waits."""
+    explained.documents.update(f"{LA}{_h(c)}.html" for c in "bcd")
+    explained.documents.update(f"{SC}{_h(c)}.pdf" for c in "34")
+    db = FakeDb({"RETURNING run_id": [("run-17",)]})
+    lines: list[str] = []
+    rec.run(
+        _args("--record", "--reingest"),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        conn=db,
+        runner=lambda cmd, check: pytest.fail("nothing to re-ingest"),
+        deferrals=(CL_BACKLOG,),
+    )
+    result = _result(lines)
+    assert result["action"] == "none"
+    assert result["issue_needed"] is False
+    assert result["unrepresented"] == 1
+    assert result["actionable_unrepresented"] == 0
+    assert result["deferred"] == 1
+    assert result["scope_actions"] == {}
 
 
 def test_reingest_writes_key_lists_and_runs_per_state(
@@ -792,6 +1082,15 @@ def _incomplete_explained(
     return explained
 
 
+def _every_scope_over_one(explained: rec.Explained) -> rec.Explained:
+    """:func:`_incomplete_explained` with the federal key represented: LA
+    (c, d) and Santa Clara (3, 4) both have 2 unrepresented keys, so every
+    scope is over a threshold of 1 (#5036)."""
+    _incomplete_explained(explained)
+    explained.documents.add(f"{FED}{_h('7')}.txt")
+    return explained
+
+
 def test_retry_marker_classify_incomplete_before_represented(
     explained: rec.Explained,
 ) -> None:
@@ -811,18 +1110,25 @@ def test_retry_marker_classify_incomplete_before_represented(
     ) == ("incomplete", "single_document_fallback")
 
 
-def test_retry_marker_decide_action_threshold_is_unrepresented_only() -> None:
-    kw = {"max_auto_reingest": 5, "persist_runs": 3, "reingest": True, "defer": False}
-    assert rec.decide_action(0, [], incomplete=2, **kw) == "reingest"
+def test_retry_marker_threshold_is_unrepresented_only() -> None:
+    kw = {"reingest": True, "defer": False}
+    assert rec.overall_action({}, incomplete=2, **kw) == "reingest"
     # The incomplete batch is sized to the room left, so it never trips the
     # threshold; only unrepresented keys do.
-    assert rec.decide_action(4, [], incomplete=1, **kw) == "reingest"
-    assert rec.decide_action(6, [], incomplete=0, **kw) == "over_threshold"
-    assert rec.decide_action(0, [], incomplete=0, **kw) == "none"
+    assert rec.overall_action({"a/x": "reingest"}, incomplete=1, **kw) == "reingest"
+    assert rec.overall_action({}, incomplete=0, **kw) == "none"
     # Retrying incomplete keys alone never makes a run persistent: the cap
-    # reports them instead.
-    history = [(0, "reingest"), (0, "reingest")]
-    assert rec.decide_action(0, history, incomplete=2, **kw) == "reingest"
+    # reports them instead (scopes with no unrepresented keys get no action).
+    assert (
+        rec.decide_scope_actions(
+            {},
+            [{"a/x": "reingest"}, {"a/x": "reingest"}],
+            max_auto_reingest=5,
+            persist_runs=3,
+            **kw,
+        )
+        == {}
+    )
 
 
 def test_retry_marker_run_reingests_incomplete_keys_and_counts_attempts(
@@ -933,7 +1239,7 @@ def test_retry_marker_over_threshold_still_drains_incomplete_keys(
 ) -> None:
     """A lost-key backlog over the threshold files the issue and leaves the
     unrepresented keys alone, but the incomplete batch still re-ingests."""
-    _incomplete_explained(explained)
+    _every_scope_over_one(explained)
     db = FakeDb({"RETURNING run_id": [("run-12",)]})
     calls: list[list[str]] = []
     lines: list[str] = []
@@ -942,7 +1248,7 @@ def test_retry_marker_over_threshold_still_drains_incomplete_keys(
             "--record",
             "--reingest",
             "--max-auto-reingest",
-            "2",
+            "1",
             "--reingest-script",
             _stub_script(tmp_path),
         ),
@@ -972,7 +1278,7 @@ def test_retry_marker_over_threshold_still_drains_incomplete_keys(
 def test_retry_marker_over_threshold_incomplete_only_tolerates_missing_script(
     s3: FakeS3, explained: rec.Explained, tmp_path: Any
 ) -> None:
-    _incomplete_explained(explained)
+    _every_scope_over_one(explained)
     db = FakeDb({"RETURNING run_id": [("run-13",)]})
     lines: list[str] = []
     rec.run(
@@ -980,7 +1286,7 @@ def test_retry_marker_over_threshold_incomplete_only_tolerates_missing_script(
             "--record",
             "--reingest",
             "--max-auto-reingest",
-            "2",
+            "1",
             "--reingest-script",
             str(tmp_path / "nope.py"),
         ),
@@ -999,7 +1305,7 @@ def test_retry_marker_over_threshold_incomplete_only_tolerates_missing_script(
 def test_retry_marker_over_threshold_incomplete_only_launch_error_keeps_action(
     s3: FakeS3, explained: rec.Explained, tmp_path: Any
 ) -> None:
-    _incomplete_explained(explained)
+    _every_scope_over_one(explained)
     db = FakeDb({"RETURNING run_id": [("run-14",)]})
     lines: list[str] = []
 
@@ -1011,7 +1317,7 @@ def test_retry_marker_over_threshold_incomplete_only_launch_error_keeps_action(
             "--record",
             "--reingest",
             "--max-auto-reingest",
-            "2",
+            "1",
             "--reingest-script",
             _stub_script(tmp_path),
         ),
@@ -1197,3 +1503,82 @@ def test_main_exits_1_when_the_reingest_cannot_launch(
         str(tmp_path / "missing.py"),
     ]
     assert rec.main(argv) == 1
+
+
+# -- issue text and scope history (#5036) ------------------------------------
+
+
+def _deferred_run_result(s3: FakeS3, explained: rec.Explained) -> dict[str, Any]:
+    for c in "89":
+        s3.objects[f"{FED}{_h(c)}.txt"] = (_lm("2026-06-02"), b"")
+    lines: list[str] = []
+    rec.run(
+        _args("--max-auto-reingest", "2"),
+        s3,
+        explained,
+        out=lines.append,
+        now=NOW,
+        deferrals=(CL_BACKLOG,),
+    )
+    return _result(lines)
+
+
+def test_issue_summary_lists_actions_per_scope_and_deferred_backlogs(
+    s3: FakeS3, explained: rec.Explained
+) -> None:
+    text = rec.issue_summary(_deferred_run_result(s3, explained))
+    assert "**Action:** `over_threshold`" in text
+    assert (
+        "**Unrepresented:** 5 to act on, of 14 raw keys (8 including deferred"
+    ) in text
+    assert (
+        "**Deferred (blocked on #3954):** 3 keys in 1 scopes, not re-ingested and "
+        "not counted toward the threshold (largest: federal/federal 3)"
+    ) in text
+    assert "Threshold: 2 keys per scope." in text
+    assert "| Scope | Unrepresented | Action |" in text
+    # Largest scope first; deferred scopes are not in the action table.
+    assert text.index("| ca/los_angeles | 3 | `over_threshold` |") < text.index(
+        "| ca/santa_clara | 2 | `report_only` |"
+    )
+    assert "| federal/federal |" not in text
+    assert "Newly stuck" not in text
+
+
+def test_issue_summary_with_nothing_to_act_on_and_newly_stuck_keys() -> None:
+    text = rec.issue_summary(
+        {
+            "action": "none",
+            "unrepresented": 0,
+            "raw": 9,
+            "newly_stuck": 1,
+            "newly_stuck_sample": ["k1"],
+            "max_auto_reingest": 500,
+        }
+    )
+    assert "**Unrepresented:** 0 to act on, of 9 raw keys" in text
+    assert "Newly stuck (sample): k1" in text
+    assert "No scope has unrepresented keys to act on." in text
+    assert "Deferred" not in text
+
+
+def test_main_issue_summary_needs_no_database(
+    s3: FakeS3,
+    explained: rec.Explained,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(_deferred_run_result(s3, explained)))
+    capsys.readouterr()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert rec.main(["--issue-summary", str(path)]) == 0
+    assert "Deferred (blocked on #3954)" in capsys.readouterr().out
+
+
+def test_fetch_recent_scope_actions_shapes() -> None:
+    assert rec.fetch_recent_scope_actions(FakeDb(), 0) == []
+    db = FakeDb({"scope_actions": [({"ca/x": "reingest"},), (None,), ("[]",)]})
+    assert rec.fetch_recent_scope_actions(db, 3) == [{"ca/x": "reingest"}, {}, {}]
+    assert db.sql("scope_actions")[0][1] == (3,)
