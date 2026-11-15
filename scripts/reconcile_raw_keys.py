@@ -279,7 +279,7 @@ STALE_VALIDATION = "stale_validation"
 
 #: Incomplete reasons whose keys re-ingest one key per subprocess, after the
 #: batched launches (#5054).  A ``dead_letter`` key killed the live worker
-#: ``MAX_MESSAGE_DELIVERIES`` times (#5010), so it is the likeliest to kill a
+#: ``MAX_MESSAGE_CRASHES`` times (#5010, #5055), so it is the likeliest to kill a
 #: reingest too.
 ISOLATED_REASONS = frozenset({"dead_letter"})
 
