@@ -481,7 +481,13 @@ if [[ -s "$TSV_PATH" ]]; then
     echo "Sections recorded: $SECTION_COUNT"
     echo "Top $TOP_N longest sections:"
     # Sort by first column (elapsed_seconds) numerically, descending.
-    sort -t '	' -k1,1 -n -r "$TSV_PATH" | head -n "$TOP_N"
+    # Truncate with awk, NOT head (#4817). head exits once it has TOP_N
+    # lines; if sort still has output to write (the TSV is bigger than one
+    # pipe/stdio buffer), sort dies of SIGPIPE / EPIPE and, under
+    # `set -o pipefail` + `set -e`, the profiler exits 141 (or 2) instead
+    # of the wrapped test's rc. awk reads all of its input, so sort always
+    # finishes cleanly and the exit code stays tied to the wrapped test.
+    sort -t '	' -k1,1 -n -r "$TSV_PATH" | awk -v n="$TOP_N" 'NR <= n'
 else
     echo "Sections recorded: 0 (no sections matched pattern: $SECTION_PATTERN)"
 fi
