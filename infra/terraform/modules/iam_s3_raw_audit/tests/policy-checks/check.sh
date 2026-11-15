@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Policy-shape regression test for the iam_s3_cleanup module (#4440).
+# Policy-shape regression test for the iam_s3_raw_audit module
+# (#4440, repurposed read-only by #4993).
 #
-# Asserts the invariants from #4440's scope exclusions that are easy to
-# break with a stray string-replace and hard to spot in code review:
+# Asserts invariants that are easy to break with a stray string-replace
+# and hard to spot in code review:
 #
 #   1. The module is dev-only — `environment` variable validation must
 #      reject any value other than "dev".
@@ -13,10 +14,16 @@ set -euo pipefail
 #   3. The S3 resource ARNs must reference only `ca/*/*/raw/*` — never
 #      the bucket root, `derived/`, `processed/`, `transcripts/`,
 #      `staging/`, or `spotcheck/`.
-#   4. `s3:PutObject` must NOT appear — cleanup scripts should never
-#      write to the raw prefix.
-#   5. `s3:ListBucket` must be guarded by an `s3:prefix` condition that
-#      restricts list visibility to `ca/*/*/raw/*` subtrees.
+#   4. The role is read-only: no `s3:Delete*` (in particular
+#      `s3:DeleteObject` and `s3:DeleteObjectVersion`, #4993), no
+#      `s3:Put*`, no wildcard action. No raw is deleted without a live
+#      byte-identical copy (architecture-spec §3.3.3), and only
+#      `framework.raw_delete_guard` may delete.
+#   5. The audit's version actions are present (`s3:ListBucketVersions`,
+#      `s3:GetObjectVersion`), so `scripts/audit_raw_delete_markers.py`
+#      can run on ECS.
+#   6. `s3:ListBucket` / `s3:ListBucketVersions` must be guarded by an
+#      `s3:prefix` condition that restricts listing to the `ca/` subtree.
 #
 # This script runs against the rendered HCL — no AWS credentials are
 # needed, no actual roles are created. Mirror of
@@ -123,27 +130,55 @@ else
     check "Resource ARN includes ca/*/*/raw/* prefix" 1
 fi
 
-# ── Check 4: s3:PutObject must NOT appear ──────────────────────────────────
+# ── Check 4: the role is read-only ─────────────────────────────────────────
 #
-# Cleanup scripts should never write to the raw prefix. PutObject is
-# explicitly excluded per #4440 implementation notes.
-if grep -q '"s3:PutObject"' "$main_tf"; then
-    check "policy does NOT grant s3:PutObject" 1
-else
-    check "policy does NOT grant s3:PutObject" 0
-fi
+# No delete, no write, no wildcard. `s3:DeleteObjectVersion` destroys a
+# data version permanently and `s3:DeleteObject` hides a raw behind a
+# delete marker; neither may be held by an ECS role (#4993). The patterns
+# match quoted action strings in the policy JSON, so prose comments that
+# name the actions in backticks do not trip them.
+forbidden_actions=(
+    '"s3:DeleteObject"'
+    '"s3:DeleteObjectVersion"'
+    '"s3:Delete'
+    '"s3:Put'
+    '"s3:Abort'
+    '"s3:Replicate'
+    '"s3:Bypass'
+    '"s3:\*"'
+    '"s3:[A-Za-z]*\*"'
+    '"\*"'
+)
+for pat in "${forbidden_actions[@]}"; do
+    if grep -qE "$pat" "$main_tf"; then
+        check "policy grants no action matching '${pat}'" 1
+    else
+        check "policy grants no action matching '${pat}'" 0
+    fi
+done
 
-# ── Check 5: ListBucket is prefix-conditioned ──────────────────────────────
+# ── Check 5: the audit's version actions are granted ───────────────────────
 #
-# `s3:ListBucket` against the bucket ARN without an `s3:prefix` condition
-# would let the role enumerate every key in the bucket. The condition
-# must restrict prefix so the role can only list under the `ca/` subtree.
-# This is widened from `ca/*/*/raw/*` to `ca/*` because the cleanup
-# script paginates from `ca/` and filters keys client-side (the
-# narrower form rejected `Prefix='ca/'` at apply time, see #2661).
-# DeleteObject remains narrowly scoped to `ca/*/*/raw/*` so the
-# destructive blast radius is unchanged.
-if grep -q '"s3:ListBucket"' "$main_tf"; then
+# Without these, scripts/audit_raw_delete_markers.py cannot run on ECS and
+# falls back to operator credentials (#4993).
+for action in '"s3:ListBucketVersions"' '"s3:GetObjectVersion"'; do
+    if grep -q "$action" "$main_tf"; then
+        check "policy grants ${action}" 0
+    else
+        check "policy grants ${action}" 1
+    fi
+done
+
+# ── Check 6: listing is prefix-conditioned ─────────────────────────────────
+#
+# `s3:ListBucket` / `s3:ListBucketVersions` against the bucket ARN
+# without an `s3:prefix` condition would let the role enumerate every key
+# in the bucket. The condition must restrict prefix so the role can only
+# list under the `ca/` subtree. This is widened from `ca/*/*/raw/*` to
+# `ca/*` because the audit lists from `ca/` and filters keys client-side
+# (the narrower form rejected `Prefix='ca/'` at apply time, see #2661).
+# Object reads stay scoped to `ca/*/*/raw/*`.
+if grep -qE '"s3:ListBucket(Versions)?"' "$main_tf"; then
     if grep -q '"s3:prefix"' "$main_tf"; then
         check "s3:ListBucket is gated by s3:prefix condition" 0
     else
@@ -182,9 +217,9 @@ fi
 # ── Summary ────────────────────────────────────────────────────────────────
 if [ "$failures" -gt 0 ]; then
     echo ""
-    echo "FAIL: ${failures} policy-shape regression check(s) failed for iam_s3_cleanup" >&2
+    echo "FAIL: ${failures} policy-shape regression check(s) failed for iam_s3_raw_audit" >&2
     exit 1
 fi
 
 echo ""
-echo "PASS: all iam_s3_cleanup policy-shape regression checks"
+echo "PASS: all iam_s3_raw_audit policy-shape regression checks"
