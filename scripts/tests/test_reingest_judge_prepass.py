@@ -906,3 +906,36 @@ class TestCliForwardsPrePassFlags:
         assert kwargs["prefix"] == "ca/"
         assert kwargs["skip_judge_prepass"] is True
         assert kwargs["parse_timeout"] == 12.0
+
+
+class TestListS3KeysSkipCount:
+    """Prefix listing logs how many non-matching keys it skipped (#4988)."""
+
+    def _s3(self, keys: list[str]) -> MagicMock:
+        s3 = MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": k} for k in keys]}
+        ]
+        return s3
+
+    def test_logs_skipped_count_with_legacy_dated_breakdown(self) -> None:
+        good = _la_key("ab" * 32)
+        dated = f"{_LA_RAW}2026/03/04/0b1eeb4b.html"
+        other = f"{_LA_RAW}notes.txt"
+        s3 = self._s3([good, dated, other])
+        with patch.object(reingest, "logger") as log:
+            keys = reingest._list_s3_keys(s3, _PREFIX_BUCKET, "ca/")
+        assert keys == [good]
+        log.warning.assert_called_once()
+        args, kwargs = log.warning.call_args
+        assert args == ("s3_keys_skipped_non_matching",)
+        assert kwargs["skipped"] == 2
+        assert kwargs["legacy_dated"] == 1
+        assert kwargs["matched"] == 1
+        assert kwargs["sample"] == [dated, other]
+
+    def test_no_warning_when_every_key_matches(self) -> None:
+        s3 = self._s3([_la_key("cd" * 32)])
+        with patch.object(reingest, "logger") as log:
+            reingest._list_s3_keys(s3, _PREFIX_BUCKET, "ca/")
+        log.warning.assert_not_called()

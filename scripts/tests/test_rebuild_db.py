@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 # Add scripts/ to path so we can import rebuild_db as a module.
@@ -240,6 +241,40 @@ class TestDefaultMaxRetryRatio(unittest.TestCase):
         self.assertEqual(
             _default_max_retry_ratio({"REBUILD_MAX_RETRY_RATIO": "0"}), 0.0
         )
+
+
+@unittest.skipUnless(REBUILD_DB_IMPORTABLE, "rebuild_db not importable")
+class TestListS3KeysSkipCount(unittest.TestCase):
+    """list_s3_keys logs how many non-matching keys it skipped (#4988)."""
+
+    RAW = "ca/orange/superior_court/raw/"
+
+    def _s3(self, keys: list[str]) -> unittest.mock.MagicMock:
+        s3 = unittest.mock.MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": k} for k in keys]}
+        ]
+        return s3
+
+    def test_logs_skipped_count_with_legacy_dated_breakdown(self) -> None:
+        good = f"{self.RAW}{'ab' * 32}.pdf"
+        dated = f"{self.RAW}2026/03/04/0b1eeb4b.pdf"
+        other = f"{self.RAW}notes.txt"
+        with unittest.mock.patch.object(rebuild_db, "logger") as log:
+            keys = rebuild_db.list_s3_keys(self._s3([good, dated, other]), "b")
+        self.assertEqual(keys, [good])
+        log.warning.assert_called_once()
+        args, kwargs = log.warning.call_args
+        self.assertEqual(args, ("s3_keys_skipped_non_matching",))
+        self.assertEqual(kwargs["skipped"], 2)
+        self.assertEqual(kwargs["legacy_dated"], 1)
+        self.assertEqual(kwargs["matched"], 1)
+        self.assertEqual(kwargs["sample"], [dated, other])
+
+    def test_no_warning_when_every_key_matches(self) -> None:
+        with unittest.mock.patch.object(rebuild_db, "logger") as log:
+            rebuild_db.list_s3_keys(self._s3([f"{self.RAW}{'cd' * 32}.pdf"]), "b")
+        log.warning.assert_not_called()
 
 
 if __name__ == "__main__":
