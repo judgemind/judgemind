@@ -12,8 +12,7 @@ Covers:
 
 The script imports boto3, psycopg, structlog, and framework.logging at module
 level; we mock them before importing to support the CI scripts-tests (python)
-environment which only installs ``pytest pytest-xdist boto3 -e
-packages/judgemind-config``. Mirrors the post-#4368 pattern used in
+environment which only installs ``scripts/tests/requirements-ci.txt``. Mirrors the post-#4368 pattern used in
 ``test_drain_splitter_carry_forward_clusters.py`` /
 ``test_backfill_split_supersede.py``. Migrated as part of #4373.
 """

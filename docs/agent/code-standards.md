@@ -218,6 +218,10 @@ If lint fails: `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff for
 
 Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (unused imports, remove them), **UP017** (use `datetime.now(datetime.UTC)`). Format and lint are **separate commands** — run BOTH.
 
+### scripts/tests (CI's minimal environment)
+
+`scripts/tests/` runs in CI with only `scripts/tests/requirements-ci.txt` installed: no psycopg, no structlog, no scraper-framework dependencies. When a push touches `scripts/**/*.py` or `scripts/tests/`, `.githooks/pre-push` runs `pytest scripts/tests/` in a cached per-checkout venv built from that same file (`scripts/ensure-scripts-tests-venv.sh`), so a script that imports e.g. `ingestion` (whose `__init__` loads psycopg) fails pre-push with a `Fix:` block instead of in CI (#5045). Do not run scripts/tests in a package venv to check it: that venv has packages CI lacks. Reproduce CI with `VENV=$(scripts/ensure-scripts-tests-venv.sh)` and `PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/tests/`. See `scripts/tests/README.md` §CI Environment.
+
 ### CI guard umbrella (`scripts/run-ci-guards.sh`)
 
 The pre-push hook also runs `scripts/run-ci-guards.sh`, an auto-discovery umbrella that mirrors the dozen+ `scripts/check-*` jobs in `.github/workflows/ci.yml`. Self-maintaining: dropping a new `scripts/check-foo.sh` into the tree makes it pick up automatically — no umbrella-script edit required.

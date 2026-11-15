@@ -1,0 +1,22 @@
+# The minimal Python environment scripts/tests runs in (#5045).
+#
+# The one definition of it, read by both:
+#   - the `scripts-tests` CI job (.github/workflows/ci.yml,
+#     step "Install test dependencies": pip install -r this file), and
+#   - the pre-push hook, through scripts/ensure-scripts-tests-venv.sh,
+#     which builds a cached per-checkout venv from this file.
+# So a test that passes pre-push passes CI's import boundary too.
+#
+# Keep it minimal on purpose: no psycopg, no structlog, no
+# scraper-framework dependencies. A script under test that imports one
+# of those at module load must mock it (scripts/tests/_mock_helpers.py)
+# or import it lazily. See scripts/tests/README.md §CI Environment.
+#
+# Paths are relative to the repository root: both callers run pip there.
+pytest
+pytest-xdist
+boto3
+# diff-cover: scripts/tests/test_diff_cover_range_notation.py runs the
+# real binary against a scratch repo (#4764).
+diff-cover
+-e packages/judgemind-config

@@ -56,6 +56,10 @@
 #                         out the files they import, with a WARNING (#4950).
 #   TEST_DATABASE_URL     when exported, used as is for the real-Postgres
 #                         tests instead of the per-checkout database.
+#   PREPUSH_SCRIPTS_TESTS=0  do not run scripts/tests in CI's minimal
+#                         environment (WARNING; CI still runs it) (#5045).
+#   PREPUSH_SCRIPTS_TESTS_WORKERS  xdist workers for that run (default
+#                         auto; 0 runs it serially, as CI does).
 #
 # Real-Postgres tests (#4950)
 # ───────────────────────────
@@ -621,7 +625,8 @@ python_pkg_checks() {
         local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
         local pytest_log="$PREPUSH_LOG_DIR/prepush-${pkg//\//_}-pytest.log"
         # $pg_assign is unquoted on purpose: empty, it expands to nothing.
-        run_check "$pkg" "pytest" run_capped "$max_secs" env $pg_assign \
+        run_check "$pkg" "pytest" run_capped "$max_secs" \
+            env ${PREPUSH_GIT_ENV_UNSET[@]+"${PREPUSH_GIT_ENV_UNSET[@]}"} $pg_assign \
             bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line" \
             || pytest_rc=$?
         if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
@@ -817,6 +822,121 @@ ci_guard_umbrella() {
         echo "  Bypass: SKIP_CI_GUARDS=1 git push (CI still runs every guard)." >&2
         failures=$((failures + 1))
     fi
+}
+
+# -------------------------------------------------------------------
+# Git's repository env vars, as `env -u` arguments (#5045).
+#
+# `git push` runs this hook with GIT_DIR (and in a linked worktree more
+# GIT_* vars) exported. A test that runs `git init` / `git commit` /
+# `git config` in a scratch directory inherits them and acts on THIS
+# repository instead: the first #5045 push set core.bare=true and
+# user.name=Test in the shared .git/config and moved refs/heads/main to
+# test commits. Test runs get these unset, so git finds the scratch repo.
+# -------------------------------------------------------------------
+PREPUSH_GIT_ENV_UNSET=()
+for prepush_git_var in $(git rev-parse --local-env-vars 2>/dev/null); do
+    PREPUSH_GIT_ENV_UNSET+=(-u "$prepush_git_var")
+done
+
+# -------------------------------------------------------------------
+# scripts_tests_checks — pytest scripts/tests/ in CI's minimal env (#5045)
+#
+# CI's `scripts-tests` job runs scripts/tests in a bare Python with only
+# scripts/tests/requirements-ci.txt installed: no psycopg, no
+# scraper-framework dependencies. A script that imports a package whose
+# __init__ needs one of those (#5043: `ingestion`, whose __init__ loads
+# the worker and psycopg) passes in a full package venv and fails CI at
+# collection. scripts/ensure-scripts-tests-venv.sh builds a cached
+# per-checkout venv from the same requirements file CI installs, and the
+# suite runs there with PYTHONPATH=scripts as CI sets it, and with the
+# venv first on PATH so `python3` subprocesses see the same packages.
+#
+# Knobs: PREPUSH_SCRIPTS_TESTS=0 skips it (WARNING; CI still runs it).
+# PREPUSH_SCRIPTS_TESTS_WORKERS: xdist workers (default auto; 0 = serial,
+# exactly as CI runs it). The suite is xdist-safe today and takes ~5s
+# under xdist against ~30s serial.
+# -------------------------------------------------------------------
+scripts_tests_checks() {
+    local helper="scripts/ensure-scripts-tests-venv.sh"
+    if [ "${#PREPUSH_GIT_ENV_UNSET[@]}" -eq 0 ]; then
+        # Without it, tests that run git in a scratch dir act on this repo.
+        echo "  FAILED: could not list git's repository env vars (git rev-parse --local-env-vars);" >&2
+        echo "  scripts/tests did not run (#5045)." >&2
+        echo "  Fix:" >&2
+        echo "    git rev-parse --local-env-vars     # must print GIT_DIR etc.; check that git works here" >&2
+        failures=$((failures + 1))
+        return 0
+    fi
+    if [ ! -x "$helper" ]; then
+        echo "  WARNING: $helper not found or not executable — skipping scripts/tests (#5045)" >&2
+        return 0
+    fi
+    local log="$PREPUSH_LOG_DIR/prepush-_-ensure-scripts-tests-venv.log"
+    local out rc=0 start end venv
+    start=$(date +%s)
+    out="$("$helper" 2>"$log")" || rc=$?
+    end=$(date +%s)
+    printf '%s\t%s\t%s\t%s\n' "$((end - start))" "_" "ensure-scripts-tests-venv" "$rc" >> "$PREPUSH_TIMINGS"
+    case "$rc" in
+        0)
+            venv="$(printf '%s\n' "$out" | tail -n 1)"
+            ;;
+        3)
+            echo "  WARNING: no venv for scripts/tests, so it did not run; CI still runs it (#5045)" >&2
+            sed 's/^/  /' "$log" >&2
+            return 0
+            ;;
+        *)
+            echo "" >&2
+            echo "  FAILED: could not prepare the scripts/tests venv (#5045)" >&2
+            sed 's/^/  /' "$log" >&2
+            failures=$((failures + 1))
+            return 0
+            ;;
+    esac
+
+    local xdist_flag=""
+    case "${PREPUSH_SCRIPTS_TESTS_WORKERS:-auto}" in
+        0|"") ;;
+        *) xdist_flag="-n ${PREPUSH_SCRIPTS_TESTS_WORKERS:-auto}" ;;
+    esac
+    local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
+    local pytest_log="$PREPUSH_LOG_DIR/prepush-_-scripts_tests-pytest.log"
+    # shellcheck disable=SC2086  # xdist_flag is intentionally word-split
+    run_check "_" "scripts/tests pytest" run_capped "$max_secs" \
+        env "${PREPUSH_GIT_ENV_UNSET[@]}" \
+        PATH="$venv/bin:$PATH" VIRTUAL_ENV="$venv" PYTHONPATH=scripts \
+        "$venv/bin/pytest" scripts/tests/ $xdist_flag -q --tb=short -p no:cacheprovider \
+        || pytest_rc=$?
+    [ "$pytest_rc" -eq 0 ] && return 0
+
+    failures=$((failures + 1))
+    if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
+        echo "  scripts/tests did not finish within ${max_secs}s awake (PREPUSH_PYTEST_MAX_SECS) and was killed." >&2
+    fi
+    local import_errors
+    import_errors="$(grep -E "^E +(ModuleNotFoundError|ImportError)|^ERROR .* - (ModuleNotFoundError|ImportError)" \
+        "$pytest_log" 2>/dev/null | sort -u | head -n 10)"
+    echo "  scripts/tests runs in the minimal environment of CI's scripts-tests job:" >&2
+    echo "  only scripts/tests/requirements-ci.txt is installed (no psycopg, no" >&2
+    echo "  scraper-framework dependencies). This run used the same packages." >&2
+    if [ -n "$import_errors" ]; then
+        echo "  Import errors (a module these tests load needs a package CI does not have):" >&2
+        printf '%s\n' "$import_errors" | sed 's/^/    /' >&2
+    fi
+    echo "  Fix:" >&2
+    if [ -n "$import_errors" ]; then
+        echo "    # Import the leaf module, not a package whose __init__ pulls in heavy" >&2
+        echo "    # deps (e.g. not 'ingestion'), import the dependency lazily inside the" >&2
+        echo "    # function that needs it, or mock it in the test with" >&2
+        echo "    # scripts/tests/_mock_helpers.py:mock_sys_modules." >&2
+        echo "    # Only if scripts/tests genuinely needs it: add it to" >&2
+        echo "    # scripts/tests/requirements-ci.txt (CI installs the same file)." >&2
+    fi
+    echo "    # Reproduce exactly what CI runs:" >&2
+    echo "    PATH=$venv/bin:\$PATH PYTHONPATH=scripts $venv/bin/pytest scripts/tests/ --tb=short" >&2
+    return 0
 }
 
 # -------------------------------------------------------------------
@@ -1082,6 +1202,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
 
 done
+
+# -------------------------------------------------------------------
+# scripts/tests in CI's minimal environment (#5045) — run whenever a
+# scripts/**/*.py file, anything under scripts/tests/, the venv helper or
+# judgemind-config (installed into that environment) changes. A background
+# job, so it overlaps the CI guard umbrella. See scripts_tests_checks.
+# -------------------------------------------------------------------
+changed_scripts_tests_inputs=$(echo "$changed_files" \
+    | grep -E '^(scripts/.*\.py|scripts/tests/.*|scripts/ensure-scripts-tests-venv\.sh|packages/judgemind-config/.*)$' || true)
+if [ -n "$changed_scripts_tests_inputs" ]; then
+    if [ "${PREPUSH_SCRIPTS_TESTS:-1}" = "0" ]; then
+        echo "pre-push: WARNING: PREPUSH_SCRIPTS_TESTS=0, so scripts/tests did not run; CI still runs it (#5045)" >&2
+    else
+        echo "pre-push: running scripts/tests in CI's minimal environment (scripts/tests/requirements-ci.txt)..." >&2
+        start_job "scripts-tests" scripts_tests_checks
+    fi
+fi
 
 # -------------------------------------------------------------------
 # ci-passed coverage check — run whenever .github/workflows/ci.yml changes

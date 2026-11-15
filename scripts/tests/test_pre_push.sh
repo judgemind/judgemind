@@ -64,6 +64,15 @@
 #  47. a hook run from elsewhere (the main checkout's copy, as linked
 #      worktrees do) re-execs the checkout's own .githooks/pre-push (#4950)
 #  48. a hook run through a symlink still finds its lib/ helpers (#4950)
+#  49. a scripts/*.py change runs scripts/tests in the venv from
+#      scripts/ensure-scripts-tests-venv.sh, PYTHONPATH=scripts (#5045)
+#  50. an import CI's minimal env cannot satisfy fails with a Fix: block (#5045)
+#  51. no Python 3.12 for that venv: WARNING, push not blocked (#5045)
+#  52. a venv that cannot be built fails the push (#5045)
+#  53. a docs-only push does not run scripts/tests (#5045)
+#  54. PREPUSH_SCRIPTS_TESTS=0 / PREPUSH_SCRIPTS_TESTS_WORKERS=0 knobs (#5045)
+#  55. ci.yml and the hook's helper share scripts/tests/requirements-ci.txt (#5045)
+#  56. under a real `git push`, the tests run without git's GIT_DIR (#5045)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2075,6 +2084,234 @@ elif ! echo "$hook_out" | grep -q "FAILED: testpkg's venv is missing packages"; 
     report_fail "expected 'FAILED: testpkg's venv is missing packages' via the symlink (#4950)" "$hook_out"
 else
     report_pass "symlinked hook finds lib/ (#4950)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 49-55 (#5045): scripts/tests runs in CI's minimal environment.
+# scripts/ensure-scripts-tests-venv.sh is a stub printing a stub venv
+# (outside the repo) whose pytest records its argv, PYTHONPATH and which
+# python3 is first on PATH, prints the given output and exits with the
+# given code. The stub helper counts its calls in st-calls.txt.
+# ───────────────────────────────────────────────────────────────────────
+ST_VENV="$TMPDIR/st-venv"
+
+# commit_scripts_change <branch> <path>: a one-line scripts file, committed.
+commit_scripts_change() {
+    git -C "$WORK" checkout --quiet -b "$1"
+    mkdir -p "$WORK/$(dirname "$2")"
+    printf '"""A scripts module for #5045 scenarios."""\n' > "$WORK/$2"
+    git -C "$WORK" add "$2"
+    git -C "$WORK" commit --quiet -m "feat: $2"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+# seed_st_stubs <helper_rc> <pytest_rc> [pytest output]
+seed_st_stubs() {
+    local helper_rc="$1" pytest_rc="$2" pytest_output="${3-stub scripts/tests passed}"
+    rm -rf "$ST_VENV" "$TMPDIR/st-calls.txt" "$TMPDIR/st-pytest.txt"
+    mkdir -p "$ST_VENV/bin" "$WORK/scripts"
+    printf '#!/usr/bin/env bash\necho stub-venv-python3\n' > "$ST_VENV/bin/python3"
+    printf '%s\n' "$pytest_output" > "$TMPDIR/st-pytest-output.txt"
+    cat > "$ST_VENV/bin/pytest" <<SH
+#!/usr/bin/env bash
+{
+    echo "args=\$*"
+    echo "pythonpath=\${PYTHONPATH:-}"
+    echo "python3=\$(python3)"
+    echo "cwd=\$PWD"
+    echo "gitdir=\${GIT_DIR:-unset}"
+} > "$TMPDIR/st-pytest.txt"
+cat "$TMPDIR/st-pytest-output.txt"
+exit $pytest_rc
+SH
+    chmod +x "$ST_VENV/bin/python3" "$ST_VENV/bin/pytest"
+    cat > "$WORK/scripts/ensure-scripts-tests-venv.sh" <<SH
+#!/usr/bin/env bash
+echo call >> "$TMPDIR/st-calls.txt"
+case $helper_rc in
+    0) echo "ensure-scripts-tests-venv: reusing $ST_VENV" >&2
+       echo "$ST_VENV" ;;
+    3) echo "WARNING: no Python 3.12+ interpreter for the scripts/tests venv (#5045)" >&2
+       echo "Fix:" >&2
+       echo "  brew install python@3.12" >&2 ;;
+    *) echo "FAILED: could not build the scripts/tests venv at stub" >&2 ;;
+esac
+exit $helper_rc
+SH
+    chmod +x "$WORK/scripts/ensure-scripts-tests-venv.sh"
+}
+
+echo "[scenario 49] a scripts/*.py change runs scripts/tests in the helper's venv, CI-style (#5045)"
+init_workspace
+commit_scripts_change feature-st-pass scripts/thing.py
+seed_st_stubs 0 0
+run_hook "refs/heads/feature-st-pass $feat_sha refs/heads/feature-st-pass $ZERO_SHA"
+st_seen="$(cat "$TMPDIR/st-pytest.txt" 2>/dev/null || true)"
+work_abs="$(cd "$WORK" && pwd)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a passing scripts/tests run to pass the push (#5045)" "$hook_out"
+elif ! echo "$st_seen" | grep -q "^args=scripts/tests/ "; then
+    report_fail "expected the helper venv's pytest to run scripts/tests/; saw: $st_seen" "$hook_out"
+elif ! echo "$st_seen" | grep -q "^args=.*-n auto"; then
+    report_fail "expected xdist (-n auto) by default; saw: $st_seen" "$hook_out"
+elif ! echo "$st_seen" | grep -q "^pythonpath=scripts$"; then
+    report_fail "expected PYTHONPATH=scripts, as the CI job sets it; saw: $st_seen" "$hook_out"
+elif ! echo "$st_seen" | grep -q "^python3=stub-venv-python3$"; then
+    report_fail "expected the venv's python3 first on PATH; saw: $st_seen" "$hook_out"
+elif ! echo "$st_seen" | grep -q "^cwd=$work_abs$"; then
+    report_fail "expected pytest to run from the repo root; saw: $st_seen" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/tests pytest"; then
+    report_fail "expected the run in the timing summary (#5045)" "$hook_out"
+else
+    report_pass "scripts/tests runs in the minimal venv with CI's PYTHONPATH (#5045)"
+fi
+
+echo "[scenario 50] an import CI's minimal env cannot satisfy fails the push with a Fix: block (#5045)"
+init_workspace
+commit_scripts_change feature-st-import scripts/tests/test_thing.py
+seed_st_stubs 0 2 "ERROR scripts/tests/test_thing.py - ModuleNotFoundError: No module named 'psycopg'
+E   ModuleNotFoundError: No module named 'psycopg'
+1 error in 0.10s"
+run_hook "refs/heads/feature-st-import $feat_sha refs/heads/feature-st-import $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a scripts/tests collection error to fail the push (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: scripts/tests pytest"; then
+    report_fail "expected 'FAILED: scripts/tests pytest' (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "Import errors (a module these tests load needs a package CI does not have)"; then
+    report_fail "expected the import-error explanation (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "    E   ModuleNotFoundError: No module named 'psycopg'"; then
+    report_fail "expected the ModuleNotFoundError line quoted (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a Fix: block (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/tests/requirements-ci.txt (CI installs the same file)"; then
+    report_fail "expected the Fix: block to name scripts/tests/requirements-ci.txt (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "PYTHONPATH=scripts $ST_VENV/bin/pytest scripts/tests/"; then
+    report_fail "expected a copy-pasteable reproduce command (#5045)" "$hook_out"
+else
+    report_pass "a CI-only import error fails pre-push with a Fix: block (#5045)"
+fi
+
+echo "[scenario 51] no Python 3.12 for the venv: WARNING, push not blocked (#5045)"
+init_workspace
+commit_scripts_change feature-st-nopython scripts/thing.py
+seed_st_stubs 3 0
+run_hook "refs/heads/feature-st-nopython $feat_sha refs/heads/feature-st-nopython $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass when no venv can be built (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "WARNING: no venv for scripts/tests, so it did not run"; then
+    report_fail "expected the skip WARNING (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "brew install python@3.12"; then
+    report_fail "expected the helper's Fix: block in the output (#5045)" "$hook_out"
+elif [ -f "$TMPDIR/st-pytest.txt" ]; then
+    report_fail "pytest must not run without a venv (#5045)" "$hook_out"
+else
+    report_pass "no interpreter: WARNING with Fix:, push passes (#5045)"
+fi
+
+echo "[scenario 52] a venv that cannot be built fails the push (#5045)"
+init_workspace
+commit_scripts_change feature-st-pipfail scripts/thing.py
+seed_st_stubs 1 0
+run_hook "refs/heads/feature-st-pipfail $feat_sha refs/heads/feature-st-pipfail $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a failed venv build to fail the push (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: could not prepare the scripts/tests venv"; then
+    report_fail "expected 'FAILED: could not prepare the scripts/tests venv' (#5045)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "could not build the scripts/tests venv at stub"; then
+    report_fail "expected the helper's own message in the output (#5045)" "$hook_out"
+else
+    report_pass "an unbuildable venv fails the push (#5045)"
+fi
+
+echo "[scenario 53] a docs-only push does not run scripts/tests (#5045)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-st-docs
+echo "# docs" > "$WORK/NOTES.md"
+git -C "$WORK" add NOTES.md
+git -C "$WORK" commit --quiet -m "docs: notes"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+seed_st_stubs 0 0
+run_hook "refs/heads/feature-st-docs $feat_sha refs/heads/feature-st-docs $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a docs-only push to pass (#5045)" "$hook_out"
+elif [ -f "$TMPDIR/st-calls.txt" ]; then
+    report_fail "the venv helper must not run for a docs-only push (#5045)" "$hook_out"
+else
+    report_pass "docs-only push: no scripts/tests run (#5045)"
+fi
+
+echo "[scenario 54] PREPUSH_SCRIPTS_TESTS=0 skips it with a WARNING; WORKERS=0 runs serially (#5045)"
+init_workspace
+commit_scripts_change feature-st-knobs scripts/thing.py
+seed_st_stubs 0 1
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-st-knobs $feat_sha refs/heads/feature-st-knobs $ZERO_SHA" \
+    | PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+hook_out_skip="$hook_out"
+hook_rc_skip="$hook_rc"
+calls_after_skip="$(cat "$TMPDIR/st-calls.txt" 2>/dev/null || true)"
+seed_st_stubs 0 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-st-knobs $feat_sha refs/heads/feature-st-knobs $ZERO_SHA" \
+    | PREPUSH_SCRIPTS_TESTS_WORKERS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+st_seen="$(cat "$TMPDIR/st-pytest.txt" 2>/dev/null || true)"
+if [ "$hook_rc_skip" -ne 0 ]; then
+    report_fail "expected PREPUSH_SCRIPTS_TESTS=0 to skip the (failing) run (#5045)" "$hook_out_skip"
+elif ! echo "$hook_out_skip" | grep -q "WARNING: PREPUSH_SCRIPTS_TESTS=0"; then
+    report_fail "expected the bypass WARNING (#5045)" "$hook_out_skip"
+elif [ -n "$calls_after_skip" ]; then
+    report_fail "the venv helper must not run under PREPUSH_SCRIPTS_TESTS=0 (#5045)" "$hook_out_skip"
+elif [ "$hook_rc" -ne 0 ] || echo "$st_seen" | grep -q -- "-n "; then
+    report_fail "expected a serial run (no -n) under PREPUSH_SCRIPTS_TESTS_WORKERS=0; saw: $st_seen" "$hook_out"
+else
+    report_pass "bypass and serial knobs work (#5045)"
+fi
+
+echo "[scenario 55] CI and the hook share one scripts/tests install list (#5045)"
+ci_yml="$REPO_ROOT/.github/workflows/ci.yml"
+req_file="$REPO_ROOT/scripts/tests/requirements-ci.txt"
+st_helper="$REPO_ROOT/scripts/ensure-scripts-tests-venv.sh"
+inline_lists="$(grep -nE "pip install .*pytest-xdist" "$ci_yml" "$HOOK" "$REPO_ROOT"/scripts/*.sh 2>/dev/null || true)"
+if [ ! -f "$req_file" ]; then
+    report_fail "expected $req_file (#5045)"
+elif ! grep -qE "^ *run: pip install -r scripts/tests/requirements-ci\.txt$" "$ci_yml"; then
+    report_fail "expected the scripts-tests job to install from scripts/tests/requirements-ci.txt (#5045)"
+elif ! grep -q 'REQUIREMENTS="$REPO_ROOT/scripts/tests/requirements-ci.txt"' "$st_helper"; then
+    report_fail "expected scripts/ensure-scripts-tests-venv.sh to build from the same file (#5045)"
+elif [ -n "$inline_lists" ]; then
+    report_fail "found an inline copy of the install list; use the requirements file (#5045): $inline_lists"
+else
+    report_pass "one install list, used by CI and the hook (#5045)"
+fi
+
+echo "[scenario 56] a real 'git push' runs the tests without git's GIT_DIR (#5045)"
+# git exports GIT_DIR to the hook. Tests that run git in a scratch dir
+# must not inherit it, or they act on the pushing repo: the first #5045
+# push set core.bare=true in the shared .git/config this way.
+# Git exports GIT_DIR to hooks when pushing from a linked worktree (every
+# agent worktree), so push from one.
+init_workspace
+commit_scripts_change feature-st-gitdir scripts/thing.py
+git -C "$WORK" checkout --quiet main
+LINKED="$TMPDIR/linked"
+rm -rf "$LINKED"
+git -C "$WORK" worktree add --quiet "$LINKED" feature-st-gitdir
+saved_work="$WORK"
+WORK="$LINKED"
+seed_st_stubs 0 0
+WORK="$saved_work"
+mkdir -p "$TMPDIR/push-hooks"
+ln -sf "$HOOK" "$TMPDIR/push-hooks/pre-push"
+git -C "$WORK" config core.hooksPath "$TMPDIR/push-hooks"
+push_out="$(git -C "$LINKED" push origin feature-st-gitdir 2>&1)" && push_rc=0 || push_rc=$?
+git -C "$WORK" worktree remove --force "$LINKED" 2>/dev/null || true
+st_seen="$(cat "$TMPDIR/st-pytest.txt" 2>/dev/null || true)"
+if [ "$push_rc" -ne 0 ]; then
+    report_fail "expected the push to succeed (#5045)" "$push_out"
+elif [ -z "$st_seen" ]; then
+    report_fail "expected the hook to run scripts/tests during the push (#5045)" "$push_out"
+elif ! echo "$st_seen" | grep -q "^gitdir=unset$"; then
+    report_fail "expected GIT_DIR unset for the test run; saw: $st_seen" "$push_out"
+else
+    report_pass "test runs do not inherit git's GIT_DIR (#5045)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

@@ -40,12 +40,25 @@ changes will no longer run the test in any job.
 
 ## CI Environment
 
-The `scripts-tests` CI job runs in a **minimal environment** with only these
-packages installed:
+The `scripts-tests` CI job runs in a **minimal environment**: the Python
+stdlib plus only the packages in
+[`requirements-ci.txt`](requirements-ci.txt) (pytest, pytest-xdist, boto3,
+diff-cover, and `judgemind-config`). That file is the one definition. CI
+installs it with `pip install -r`, and `.githooks/pre-push` runs
+`pytest scripts/tests/` in a cached per-checkout venv built from the same
+file (`scripts/ensure-scripts-tests-venv.sh`, at
+`tmp/scripts-tests-venv/`) whenever a push touches `scripts/**/*.py` or
+`scripts/tests/` (#5045). So an import the minimal environment cannot
+satisfy fails pre-push with a `Fix:` block, not one CI round trip later.
+To reproduce by hand:
 
-- **pytest** (test runner)
-- **boto3** (AWS SDK — used by some scripts)
-- **Python stdlib**
+```
+VENV=$(scripts/ensure-scripts-tests-venv.sh)
+PATH=$VENV/bin:$PATH PYTHONPATH=scripts $VENV/bin/pytest scripts/tests/ --tb=short
+```
+
+Add a dependency to `requirements-ci.txt` only when scripts/tests genuinely
+needs it; CI and the hook both pick it up.
 
 Notably, these packages are **not available** in CI:
 

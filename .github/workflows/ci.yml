@@ -203,6 +203,9 @@ jobs:
               - 'scripts/apply_migrations.sh'
               - 'scripts/tests/test_ensure_test_db.sh'
               - 'scripts/tests/test_apply_migrations.sh'
+              # The hook's scripts/tests venv (#5045).
+              - 'scripts/ensure-scripts-tests-venv.sh'
+              - 'scripts/tests/requirements-ci.txt'
               - '.github/workflows/ci.yml'
             dispatcher-terminals:
               - 'scripts/dispatcher/daemon.py'
@@ -756,10 +759,12 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      # diff-cover: scripts/tests/test_diff_cover_range_notation.py runs
-      # the real binary against a scratch repo (#4764).
+      # The package list lives in scripts/tests/requirements-ci.txt, the
+      # one definition shared with the pre-push hook's cached venv
+      # (scripts/ensure-scripts-tests-venv.sh), so the two cannot drift
+      # (#5045). Add a dependency there, not here.
       - name: Install test dependencies
-        run: pip install pytest pytest-xdist boto3 diff-cover -e packages/judgemind-config
+        run: pip install -r scripts/tests/requirements-ci.txt
       - name: Install Node.js test dependencies
         run: npm install --no-save graphql@^16.8
       - name: Test
