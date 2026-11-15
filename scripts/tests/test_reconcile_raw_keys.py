@@ -171,6 +171,40 @@ def test_skip_record_beats_validation_fail() -> None:
     )
 
 
+CC = "ca/contra_costa/superior_court/raw/"
+
+
+def test_raw_key_document_id_matches_the_scraper_and_reingest_scheme() -> None:
+    import uuid
+
+    sha = _h("f")
+    assert rec.raw_key_document_id(f"{CC}{sha}.txt") == str(
+        uuid.uuid5(uuid.NAMESPACE_URL, sha)
+    )
+    assert rec.raw_key_document_id(f"{CC}2026/03/04/u.pdf") is None
+
+
+def test_pre_s3_key_validation_fail_is_matched_by_document_id() -> None:
+    """#5023: a CC portal re-capture of a 2025 ruling failed
+    ``hearing_date_in_range`` before #4793 made it a flag, and its
+    validation row was written before #4773 added ``s3_key``.  The key is
+    explained by the row's document id, not lost."""
+    key = f"{CC}{_h('c')}.txt"
+    other = f"{CC}{_h('d')}.txt"
+    doc_id = rec.raw_key_document_id(key)
+    assert doc_id
+    ex = rec.Explained(validation_fail_documents={doc_id})
+    g = timedelta(0)
+    assert rec.classify(_raw(key), ex, now=NOW, grace=g) == (
+        "skipped",
+        "validation_fail_by_document_id",
+    )
+    assert rec.classify(_raw(other), ex, now=NOW, grace=g) == ("unrepresented", None)
+    # a document row still wins
+    ex.documents = {key}
+    assert rec.classify(_raw(key), ex, now=NOW, grace=g) == ("represented", None)
+
+
 def test_partition_keys_window_layouts_and_dated_scopes(s3: FakeS3) -> None:
     keys, other, dated = rec.partition_keys(
         rec.list_raw_objects(s3, BUCKET, "ca/"),
@@ -452,14 +486,19 @@ def test_fetch_explained_reads_all_four_sources() -> None:
     db = FakeDb(
         {
             "derived.documents": [("k1",), (None,)],
+            "s3_key IS NULL": [("doc-5",)],
             "validation_results": [("k2",)],
             "data_quality_metrics": [("k3",)],
             "ingest_skips": [("k4", "governor_bio_route")],
         }
     )
     ex = rec.fetch_explained(db)
-    assert ex == rec.Explained({"k1"}, {"k4": "governor_bio_route"}, {"k2"}, {"k3"})
+    assert ex == rec.Explained(
+        {"k1"}, {"k4": "governor_bio_route"}, {"k2"}, {"k3"}, {"doc-5"}
+    )
     assert "result = 'fail'" in db.sql("validation_results")[0][0]
+    unkeyed = db.sql("s3_key IS NULL")
+    assert len(unkeyed) == 1 and "result = 'fail'" in unkeyed[0][0]
     assert "non_ruling_pdf_dropped" in db.sql("data_quality_metrics")[0][0]
 
 

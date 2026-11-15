@@ -22,6 +22,11 @@ only: no object is read) and sorts each one into a category:
                      guard's ``non_ruling_pdf_dropped`` metric.  Keys under
                      ``ca/statewide/governor/`` count as skipped too (they
                      were routed away before skip records existed, #5016).
+                     A failed validation row written before the table had
+                     an ``s3_key`` column (#4773, 2026-09-25) is matched by
+                     the key's document id, ``uuid5(NAMESPACE_URL,
+                     <sha256>)``, and counted as
+                     ``validation_fail_by_document_id`` (#5023).
 - ``pending``        captured within ``--grace-hours`` (default 6): the
                      worker may not have processed it yet.
 - ``unrepresented``  none of the above: a capture that never reached the
@@ -105,6 +110,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -204,6 +210,9 @@ class Explained:
     skips: dict[str, str] = field(default_factory=dict)
     validation_fail: set[str] = field(default_factory=set)
     all_null_guard: set[str] = field(default_factory=set)
+    #: document ids of failed validation rows with no ``s3_key`` (written
+    #: before #4773 added the column, #5023).
+    validation_fail_documents: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -335,6 +344,21 @@ def partition_keys(
     return keys, other, dated
 
 
+def raw_key_document_id(key: str) -> str | None:
+    """The document id the worker gives a content-addressed raw key:
+    ``uuid5(NAMESPACE_URL, <sha256>)``, as the live scraper
+    (``framework.base``) and a prefix reingest (``reingest_from_s3``)
+    derive it.  ``None`` for any other key layout.
+
+    A split child has its own id (``split_child_document_id``), so a
+    pre-#4773 validation row for a child is not matched; only the parent's.
+    """
+    m = CONTENT_KEY_RE.match(key)
+    if not m:
+        return None
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, m["hash"]))
+
+
 def classify(
     raw: RawKey, explained: Explained, *, now: datetime, grace: timedelta
 ) -> tuple[str, str | None]:
@@ -347,6 +371,11 @@ def classify(
         return "skipped", reason
     if key in explained.validation_fail:
         return "skipped", "validation_fail"
+    if (
+        explained.validation_fail_documents
+        and raw_key_document_id(key) in explained.validation_fail_documents
+    ):
+        return "skipped", "validation_fail_by_document_id"
     if key in explained.all_null_guard:
         return "skipped", "all_null_guard"
     for prefix, prefix_reason in INTENTIONAL_SKIP_PREFIXES.items():
@@ -459,6 +488,11 @@ def fetch_explained(conn: Any) -> Explained:
             cur,
             "SELECT DISTINCT s3_key FROM telemetry.validation_results "
             "WHERE result = 'fail' AND s3_key IS NOT NULL",
+        )
+        explained.validation_fail_documents = _fetch_set(
+            cur,
+            "SELECT DISTINCT document_id::text FROM telemetry.validation_results "
+            "WHERE result = 'fail' AND s3_key IS NULL AND document_id IS NOT NULL",
         )
         explained.all_null_guard = _fetch_set(
             cur,
@@ -699,6 +733,7 @@ def run(
     out(
         f"DB documents={len(explained.documents)} skips={len(explained.skips)} "
         f"validation_fail={len(explained.validation_fail)} "
+        f"validation_fail_by_document_id={len(explained.validation_fail_documents)} "
         f"all_null_guard={len(explained.all_null_guard)}"
     )
 
