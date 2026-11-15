@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import anthropic
 import pytest
+import structlog
+from helpers.anthropic_errors import connection_error, status_error, timeout_error
 
 from framework.llm_extractor import (
     _MAX_RETRY_DEPTH,
@@ -221,105 +224,118 @@ class TestExtractBasic:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def no_sleep() -> Iterator[MagicMock]:
+    """The shared retry policy's backoff, without waiting."""
+    with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
+        yield mock_sleep
+
+
 class TestRetryBehavior:
-    """Tests for retry on transient API errors."""
+    """Retry on transient API errors, through ``ingestion.llm_retry`` (#5066).
 
-    def test_retry_on_rate_limit(self, extractor: LlmExtractor, mock_client: MagicMock) -> None:
-        """Should retry on 429 and succeed on second attempt."""
-        rate_limit_response = MagicMock()
-        rate_limit_response.status_code = 429
-        rate_limit_response.headers = {}
+    Every error is the real anthropic SDK exception for its status code.
+    """
 
-        mock_client.messages.create.side_effect = [
-            anthropic.RateLimitError(
-                message="rate limited",
-                response=rate_limit_response,
-                body=None,
-            ),
-            _make_response(SINGLE_RULING_JSON),
-        ]
-        extractor._base_delay = 0.01  # Speed up test
+    @pytest.mark.parametrize(
+        ("error", "expected_type"),
+        [
+            (status_error(429), anthropic.RateLimitError),
+            (status_error(500), anthropic.InternalServerError),
+            (status_error(503), anthropic.InternalServerError),
+            (status_error(529), anthropic.OverloadedError),
+            (timeout_error(), anthropic.APITimeoutError),
+            (connection_error(), anthropic.APIConnectionError),
+        ],
+    )
+    def test_transient_error_retried_then_succeeds(
+        self,
+        extractor: LlmExtractor,
+        mock_client: MagicMock,
+        no_sleep: MagicMock,
+        error: Exception,
+        expected_type: type,
+    ) -> None:
+        assert type(error) is expected_type
+        mock_client.messages.create.side_effect = [error, _make_response(SINGLE_RULING_JSON)]
 
         rulings = extractor.extract("Some text")
+
         assert len(rulings) == 1
         assert mock_client.messages.create.call_count == 2
-
-    def test_retry_on_server_error(self, extractor: LlmExtractor, mock_client: MagicMock) -> None:
-        """Should retry on 500 and succeed on second attempt."""
-        server_error_response = MagicMock()
-        server_error_response.status_code = 500
-        server_error_response.headers = {}
-
-        mock_client.messages.create.side_effect = [
-            anthropic.InternalServerError(
-                message="server error",
-                response=server_error_response,
-                body=None,
-            ),
-            _make_response(SINGLE_RULING_JSON),
-        ]
-        extractor._base_delay = 0.01
-
-        rulings = extractor.extract("Some text")
-        assert len(rulings) == 1
-        assert mock_client.messages.create.call_count == 2
-
-    def test_retry_on_529_overloaded(self, extractor: LlmExtractor, mock_client: MagicMock) -> None:
-        """Should retry on 529 (Anthropic overloaded)."""
-        overloaded_response = MagicMock()
-        overloaded_response.status_code = 529
-        overloaded_response.headers = {}
-
-        mock_client.messages.create.side_effect = [
-            anthropic.APIStatusError(
-                message="overloaded",
-                response=overloaded_response,
-                body=None,
-            ),
-            _make_response(SINGLE_RULING_JSON),
-        ]
-        extractor._base_delay = 0.01
-
-        rulings = extractor.extract("Some text")
-        assert len(rulings) == 1
+        assert no_sleep.call_count == 1
 
     def test_exhausts_retries_returns_empty(
-        self, extractor: LlmExtractor, mock_client: MagicMock
+        self, extractor: LlmExtractor, mock_client: MagicMock, no_sleep: MagicMock
     ) -> None:
-        """Should return empty list after exhausting all retries."""
-        rate_limit_response = MagicMock()
-        rate_limit_response.status_code = 429
-        rate_limit_response.headers = {}
-
-        mock_client.messages.create.side_effect = anthropic.RateLimitError(
-            message="rate limited",
-            response=rate_limit_response,
-            body=None,
-        )
-        extractor._base_delay = 0.01
+        """``max_retries`` counts attempts: 2 means one retry, then give up."""
+        mock_client.messages.create.side_effect = status_error(529)
         extractor._max_retries = 2
 
-        rulings = extractor.extract("Some text")
+        with structlog.testing.capture_logs() as logs:
+            rulings = extractor.extract("Some text")
+
         assert rulings == []
+        # A text this short is not split for a second try, so: 2 attempts.
         assert mock_client.messages.create.call_count == 2
+        failures = [e for e in logs if e["event"] == "llm_extractor.api_error"]
+        assert failures[0]["status_code"] == 529
+        assert failures[0]["retryable"] is True
 
-    def test_non_retryable_error_no_retry(
-        self, extractor: LlmExtractor, mock_client: MagicMock
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_client_errors_not_retried(
+        self,
+        extractor: LlmExtractor,
+        mock_client: MagicMock,
+        no_sleep: MagicMock,
+        status: int,
     ) -> None:
-        """Non-retryable status codes should not be retried."""
-        bad_request_response = MagicMock()
-        bad_request_response.status_code = 400
-        bad_request_response.headers = {}
-
-        mock_client.messages.create.side_effect = anthropic.APIStatusError(
-            message="bad request",
-            response=bad_request_response,
-            body=None,
-        )
+        mock_client.messages.create.side_effect = status_error(status)
 
         rulings = extractor.extract("Some text")
+
         assert rulings == []
         assert mock_client.messages.create.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_retry_after_ms_header_honoured(
+        self, extractor: LlmExtractor, mock_client: MagicMock, no_sleep: MagicMock
+    ) -> None:
+        mock_client.messages.create.side_effect = [
+            status_error(429, headers={"retry-after-ms": "7000"}),
+            _make_response(SINGLE_RULING_JSON),
+        ]
+
+        extractor.extract("Some text")
+
+        no_sleep.assert_called_once_with(7.0)
+
+    def test_programming_error_propagates(
+        self, extractor: LlmExtractor, mock_client: MagicMock, no_sleep: MagicMock
+    ) -> None:
+        """Only SDK errors mean "no answer"; a bug is not swallowed or retried."""
+        mock_client.messages.create.side_effect = TypeError("unexpected keyword")
+
+        with pytest.raises(TypeError):
+            extractor._extract_chunk("Some text", usage=TokenUsage())
+
+        assert mock_client.messages.create.call_count == 1
+
+
+class TestSdkRetryOff:
+    """The SDK's own retry is off, so nothing retries twice (#5066)."""
+
+    def test_client_built_with_max_retries_0(self) -> None:
+        ext = LlmExtractor(api_key="test-key")
+
+        assert isinstance(ext._client, anthropic.Anthropic)
+        assert ext._client.max_retries == 0
+
+    def test_constructor_passes_max_retries_0(self) -> None:
+        with patch.object(anthropic, "Anthropic") as mock_cls:
+            LlmExtractor(api_key="test-key")
+
+        mock_cls.assert_called_once_with(max_retries=0, api_key="test-key")
 
 
 # ---------------------------------------------------------------------------

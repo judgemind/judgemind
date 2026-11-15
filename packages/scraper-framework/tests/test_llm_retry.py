@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import anthropic
 import httpx
 import pytest
 from google.genai import errors as genai_errors
+from helpers.anthropic_errors import connection_error, status_error, timeout_error
 
 from ingestion import llm_retry
 from ingestion.llm_retry import (
@@ -140,6 +142,126 @@ class TestClassifyError:
         decision = classify_error(exc)
         assert decision.retryable
         assert decision.retry_after is None
+
+
+class TestClassifyAnthropicError:
+    """The real anthropic SDK exceptions, built by the SDK's own
+    ``_make_status_error`` (#5066)."""
+
+    @pytest.mark.parametrize(
+        ("code", "expected_type"),
+        [
+            (500, anthropic.InternalServerError),
+            (502, anthropic.InternalServerError),
+            (503, anthropic.InternalServerError),
+            (504, anthropic.InternalServerError),
+            (529, anthropic.OverloadedError),
+        ],
+    )
+    def test_anthropic_server_errors_retryable(self, code: int, expected_type: type) -> None:
+        exc = status_error(code)
+        assert type(exc) is expected_type
+        decision = classify_error(exc)
+        assert decision.retryable
+        assert decision.kind == KIND_SERVER_ERROR
+        assert decision.status == code
+
+    def test_anthropic_429_retryable_rate_limit(self) -> None:
+        exc = status_error(429)
+        assert type(exc) is anthropic.RateLimitError
+        decision = classify_error(exc)
+        assert decision.retryable
+        assert decision.kind == KIND_RATE_LIMIT
+        assert decision.status == 429
+
+    @pytest.mark.parametrize(
+        ("code", "expected_type"),
+        [
+            (400, anthropic.BadRequestError),
+            (401, anthropic.AuthenticationError),
+            (403, anthropic.PermissionDeniedError),
+            (404, anthropic.NotFoundError),
+            (413, anthropic.RequestTooLargeError),
+        ],
+    )
+    def test_anthropic_client_errors_not_retryable(self, code: int, expected_type: type) -> None:
+        exc = status_error(code)
+        assert type(exc) is expected_type
+        decision = classify_error(exc)
+        assert not decision.retryable
+        assert decision.kind == KIND_CLIENT_ERROR
+        assert decision.status == code
+
+    def test_anthropic_timeout_retryable(self) -> None:
+        decision = classify_error(timeout_error())
+        assert decision.retryable
+        assert decision.kind == KIND_TIMEOUT
+
+    def test_anthropic_connection_error_retryable(self) -> None:
+        decision = classify_error(connection_error())
+        assert decision.retryable
+        assert decision.kind == KIND_CONNECTION
+
+    def test_anthropic_retry_after_header(self) -> None:
+        assert classify_error(status_error(429, headers={"retry-after": "4"})).retry_after == 4.0
+
+    def test_anthropic_retry_after_ms_header_wins(self) -> None:
+        exc = status_error(529, headers={"retry-after-ms": "1500", "retry-after": "9"})
+        assert classify_error(exc).retry_after == 1.5
+
+    def test_anthropic_no_retry_after(self) -> None:
+        assert classify_error(status_error(529)).retry_after is None
+
+    def test_anthropic_base_api_error_not_retryable(self) -> None:
+        """A bare ``APIError`` (no HTTP status, not a transport failure)."""
+        exc = anthropic.APIError("m", request=timeout_error().request, body=None)
+        assert not classify_error(exc).retryable
+
+    def test_anthropic_529_retried_through_call_with_retries(self) -> None:
+        clock = FakeClock()
+        calls: list[float | None] = []
+
+        def fn(attempt_timeout: float | None) -> str:
+            calls.append(attempt_timeout)
+            if len(calls) < 3:
+                raise status_error(529 if len(calls) == 1 else 429)
+            return "ok"
+
+        result = call_with_retries(
+            fn, max_retries=2, event_prefix="t_", sleep=clock.sleep, clock=clock
+        )
+
+        assert result == "ok"
+        assert len(calls) == 3
+        assert len(clock.sleeps) == 2
+
+    def test_anthropic_400_not_retried_through_call_with_retries(self) -> None:
+        clock = FakeClock()
+        fn = MagicMock(side_effect=status_error(400))
+
+        with pytest.raises(anthropic.BadRequestError):
+            call_with_retries(fn, max_retries=3, event_prefix="t_", sleep=clock.sleep, clock=clock)
+
+        assert fn.call_count == 1
+        assert clock.sleeps == []
+
+    def test_anthropic_deadline_respected(self) -> None:
+        """A 529 retry that would end past the deadline is not made."""
+        clock = FakeClock(now=100.0)
+        fn = MagicMock(side_effect=status_error(529))
+
+        with pytest.raises(anthropic.OverloadedError):
+            call_with_retries(
+                fn,
+                max_retries=5,
+                deadline=101.2,
+                event_prefix="t_",
+                sleep=clock.sleep,
+                clock=clock,
+            )
+
+        assert fn.call_count == 1
+        assert clock.sleeps == []
 
 
 class TestBackoffDelay:

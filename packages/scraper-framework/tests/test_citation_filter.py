@@ -506,8 +506,6 @@ class TestExtractUsesCitationFilter:
         extractor._model = "stub"
         extractor._client = None
         extractor._max_retries = 0
-        extractor._base_delay = 0.0
-        extractor._max_delay = 0.0
         extractor._max_output_tokens = 4096
         extractor._max_chars_per_chunk = 80_000
         extractor._cache = None

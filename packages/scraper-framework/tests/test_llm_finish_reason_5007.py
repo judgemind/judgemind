@@ -86,7 +86,6 @@ def _recitation() -> LLMResponse:
 def _make_extractor(cache: object | None = None) -> LlmExtractor:
     with patch.object(anthropic, "Anthropic"):
         ext = LlmExtractor(api_key="test-key")
-    ext._base_delay = 0.0
     ext._max_retries = 1
     ext._cache = cache
     return ext

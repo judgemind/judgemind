@@ -19,17 +19,21 @@ import respx
 import structlog
 from google import genai
 from google.genai import errors as genai_errors
+from helpers.anthropic_errors import connection_error, status_error, timeout_error
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from ingestion.llm_providers import (
     LLMResponse,
     _call_anthropic,
+    _call_anthropic_with_images,
     _call_google,
     _call_google_with_images,
     _try_create,
     call_llm,
     call_llm_with_images,
     create_client,
+    new_anthropic_client,
+    without_sdk_retries,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,16 +89,13 @@ class TestCallAnthropic:
         mock_response.content = [mock_block]
         mock_response.usage = mock_usage
 
-        rate_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
+        rate_error = status_error(429)
+        assert type(rate_error) is anthropic.RateLimitError
 
         client = MagicMock()
         client.messages.create.side_effect = [rate_error, mock_response]
 
-        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+        with patch("ingestion.llm_retry.time.sleep") as mock_sleep:
             result = _call_anthropic(
                 system_prompt="sys",
                 user_message="user",
@@ -105,23 +106,20 @@ class TestCallAnthropic:
 
         assert result is not None
         assert result.text == "ok"
-        mock_sleep.assert_called_once_with(1)
+        mock_sleep.assert_called_once()
         assert client.messages.create.call_count == 2
 
     def test_rate_limit_exhausted_returns_none(self) -> None:
         """On double rate limit, returns None."""
         import anthropic
 
-        rate_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
+        rate_error = status_error(429)
+        assert type(rate_error) is anthropic.RateLimitError
 
         client = MagicMock()
         client.messages.create.side_effect = rate_error
 
-        with patch("ingestion.llm_providers.time.sleep"):
+        with patch("ingestion.llm_retry.time.sleep"):
             result = _call_anthropic(
                 system_prompt="sys",
                 user_message="user",
@@ -651,7 +649,7 @@ class TestAnthropicTimeout:
     """Tests for timeout behavior in the Anthropic adapter."""
 
     def test_timeout_returns_none(self) -> None:
-        """APITimeoutError returns None immediately."""
+        """APITimeoutError on the last attempt returns None."""
         import anthropic
 
         client = MagicMock()
@@ -1191,3 +1189,414 @@ class TestGenaiErrorsRealTransport:
         assert result is not None
         assert result.text == "ok"
         assert result.finish_reason == "STOP"
+
+
+# ---------------------------------------------------------------------------
+# Anthropic: the shared retry policy (#5066)
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_ok(text: str = "ok") -> MagicMock:
+    """A ``messages.create`` result with one text block."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    response = MagicMock()
+    response.content = [block]
+    response.usage.input_tokens = 10
+    response.usage.output_tokens = 5
+    response.stop_reason = "end_turn"
+    return response
+
+
+class TestAnthropicRetryPolicy:
+    """``_call_anthropic`` / ``_call_anthropic_with_images`` retry through
+    ``llm_retry`` on the real anthropic SDK exceptions."""
+
+    @pytest.mark.parametrize(
+        ("status", "expected_type"),
+        [
+            (429, anthropic.RateLimitError),
+            (500, anthropic.InternalServerError),
+            (502, anthropic.InternalServerError),
+            (503, anthropic.InternalServerError),
+            (504, anthropic.InternalServerError),
+            (529, anthropic.OverloadedError),
+        ],
+    )
+    def test_anthropic_transient_status_retried_then_succeeds(
+        self, status: int, expected_type: type, no_sleep: MagicMock
+    ) -> None:
+        error = status_error(status)
+        assert type(error) is expected_type
+        client = MagicMock()
+        client.messages.create.side_effect = [error, _anthropic_ok()]
+
+        result = _call_anthropic("sys", "user", "test-model", client=client, max_retries=2)
+
+        assert result is not None
+        assert result.text == "ok"
+        assert result.finish_reason == "STOP"
+        assert client.messages.create.call_count == 2
+        assert no_sleep.call_count == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_anthropic_client_errors_not_retried(self, status: int, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(status)
+
+        result = _call_anthropic("sys", "user", "test-model", client=client, max_retries=3)
+
+        assert result is None
+        assert client.messages.create.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_anthropic_timeouts_and_dropped_connections_retried(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = [
+            timeout_error(),
+            connection_error(),
+            _anthropic_ok(),
+        ]
+
+        result = _call_anthropic("sys", "user", "test-model", client=client, max_retries=2)
+
+        assert result is not None
+        assert client.messages.create.call_count == 3
+
+    def test_anthropic_exhausted_returns_none_and_logs(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(529)
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_anthropic("sys", "user", "test-model", client=client, max_retries=2)
+
+        assert result is None
+        assert client.messages.create.call_count == 3  # 1 + 2 retries
+        events = [(e["event"], e.get("status")) for e in logs]
+        assert events.count(("llm_providers.anthropic_unavailable", 529)) == 2
+        assert events[-1] == ("llm_providers.anthropic_api_error", 529)
+
+    def test_anthropic_rate_limit_log_event(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = [status_error(429), _anthropic_ok()]
+
+        with structlog.testing.capture_logs() as logs:
+            _call_anthropic("sys", "user", "test-model", client=client, max_retries=1)
+
+        assert [e["event"] for e in logs] == ["llm_providers.anthropic_rate_limit"]
+
+    def test_anthropic_final_timeout_logs_timeout_event(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = timeout_error()
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_anthropic(
+                "sys", "user", "test-model", client=client, max_retries=0, timeout=5.0
+            )
+
+        assert result is None
+        assert logs[-1]["event"] == "llm_providers.anthropic_timeout"
+
+    @pytest.mark.parametrize(
+        ("headers", "expected"),
+        [({"retry-after": "7"}, 7.0), ({"retry-after-ms": "2500"}, 2.5)],
+    )
+    def test_anthropic_retry_after_honoured(
+        self, headers: dict[str, str], expected: float, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = [status_error(429, headers=headers), _anthropic_ok()]
+
+        _call_anthropic("sys", "user", "test-model", client=client, max_retries=1)
+
+        no_sleep.assert_called_once_with(expected)
+
+    def test_anthropic_vision_529_then_success(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = [
+            status_error(529),
+            status_error(503),
+            _anthropic_ok("page text"),
+        ]
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_anthropic_with_images(
+                "sys", "user", [(b"img", "image/png")], "test-model", client=client, max_retries=2
+            )
+
+        assert result is not None
+        assert result.text == "page text"
+        assert client.messages.create.call_count == 3
+        assert {e["event"] for e in logs} == {"llm_providers.anthropic_vision_unavailable"}
+
+    def test_anthropic_vision_400_not_retried(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(400)
+
+        result = _call_anthropic_with_images(
+            "sys", "user", [(b"img", "image/png")], "test-model", client=client, max_retries=2
+        )
+
+        assert result is None
+        assert client.messages.create.call_count == 1
+
+    def test_anthropic_default_max_retries_is_2(self) -> None:
+        import inspect
+
+        for fn in (_call_anthropic, _call_anthropic_with_images):
+            assert inspect.signature(fn).parameters["max_retries"].default == 2
+
+
+class TestAnthropicDeadline:
+    """The caller's deadline bounds Anthropic attempts and retries."""
+
+    def test_anthropic_deadline_stops_retries(self, no_sleep: MagicMock) -> None:
+        """A retry that would not finish before the deadline is not made."""
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(529)
+
+        result = _call_anthropic_with_images(
+            "sys",
+            "user",
+            [(b"img", "image/png")],
+            "test-model",
+            client=client,
+            max_retries=5,
+            timeout=30.0,
+            deadline=time.monotonic() + 1.2,
+        )
+
+        assert result is None
+        assert client.messages.create.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_anthropic_past_deadline_makes_no_call(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+
+        result = _call_anthropic(
+            "sys", "user", "test-model", client=client, deadline=time.monotonic() - 1
+        )
+
+        assert result is None
+        client.messages.create.assert_not_called()
+
+    def test_anthropic_attempt_timeout_shortened_to_deadline(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.return_value = _anthropic_ok()
+
+        _call_anthropic(
+            "sys",
+            "user",
+            "test-model",
+            client=client,
+            timeout=30.0,
+            deadline=time.monotonic() + 5.0,
+        )
+
+        assert 1.0 <= client.messages.create.call_args.kwargs["timeout"] <= 5.0
+
+    def test_anthropic_call_llm_with_images_honours_deadline(self, no_sleep: MagicMock) -> None:
+        """``call_llm_with_images(..., deadline=...)`` reaches the Anthropic path."""
+        client = MagicMock()
+
+        result = call_llm_with_images(
+            "sys",
+            "user",
+            [(b"img", "image/png")],
+            provider="anthropic",
+            model="test-model",
+            client=client,
+            deadline=time.monotonic() - 1,
+        )
+
+        assert result is None
+        client.messages.create.assert_not_called()
+
+    def test_anthropic_call_llm_with_images_deadline_shortens_timeout(
+        self, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.messages.create.return_value = _anthropic_ok("page")
+
+        result = call_llm_with_images(
+            "sys",
+            "user",
+            [(b"img", "image/png")],
+            provider="anthropic",
+            model="test-model",
+            client=client,
+            timeout=20.0,
+            deadline=time.monotonic() + 3.0,
+        )
+
+        assert result is not None
+        assert client.messages.create.call_args.kwargs["timeout"] <= 3.0
+
+    def test_anthropic_call_llm_honours_deadline(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+
+        result = call_llm(
+            "sys",
+            "user",
+            provider="anthropic",
+            model="test-model",
+            client=client,
+            deadline=time.monotonic() - 1,
+        )
+
+        assert result is None
+        client.messages.create.assert_not_called()
+
+
+class TestAnthropicSdkRetryOff:
+    """Every Anthropic client we build or use has the SDK's retry off."""
+
+    def test_anthropic_try_create_max_retries_0(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            client = _try_create("anthropic")
+
+        assert isinstance(client, anthropic.Anthropic)
+        assert client.max_retries == 0
+
+    def test_anthropic_create_client_max_retries_0(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+            client = create_client(provider="anthropic")
+
+        assert isinstance(client, anthropic.Anthropic)
+        assert client.max_retries == 0
+
+    def test_anthropic_new_client_max_retries_0(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            assert new_anthropic_client().max_retries == 0
+
+    def test_anthropic_default_client_is_built_without_sdk_retries(self) -> None:
+        with patch("anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value.messages.create.return_value = _anthropic_ok()
+            _call_anthropic("sys", "user", "test-model", client=None)
+
+        mock_cls.assert_called_once_with(max_retries=0)
+
+    def test_anthropic_caller_client_gets_sdk_retries_off(self) -> None:
+        caller = anthropic.Anthropic(api_key="test-key")  # SDK default: 2 retries
+        assert caller.max_retries == 2
+
+        used = without_sdk_retries(caller)
+
+        assert isinstance(used, anthropic.Anthropic)
+        assert used.max_retries == 0
+        assert without_sdk_retries(used) is used
+
+    def test_anthropic_test_double_unchanged(self) -> None:
+        double = MagicMock()
+        assert without_sdk_retries(double) is double
+
+
+_MESSAGE_BODY = {
+    "id": "msg_test",
+    "type": "message",
+    "role": "assistant",
+    "model": "test-model",
+    "content": [{"type": "text", "text": "ok"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 3, "output_tokens": 1},
+}
+
+
+class TestAnthropicRealTransport:
+    """A real ``anthropic.Anthropic`` over a stubbed HTTP transport.
+
+    No request leaves the process: ``httpx2.MockTransport`` answers.  The
+    SDK turns each HTTP status into its own exception class, so these
+    tests cover the real classification path end to end.  The request
+    omits ``temperature``, which anthropic 1.17 rejects (issue 4960).
+    """
+
+    @staticmethod
+    def _transport(statuses: list[int]) -> tuple[object, list[int]]:
+        import httpx2
+
+        seen: list[int] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            status = statuses[min(len(seen), len(statuses) - 1)]
+            seen.append(status)
+            if status == 200:
+                return httpx2.Response(200, json=_MESSAGE_BODY)
+            body = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+            return httpx2.Response(status, json=body)
+
+        return httpx2.Client(transport=httpx2.MockTransport(handler)), seen
+
+    @staticmethod
+    def _request() -> dict:
+        return {
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+    def test_anthropic_real_client_529_503_then_200(self, no_sleep: MagicMock) -> None:
+        from ingestion.llm_providers import anthropic_messages_create
+
+        http_client, seen = self._transport([529, 503, 200])
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            client = _try_create("anthropic")
+        assert client is not None
+        client = client.with_options(http_client=http_client)
+        assert client.max_retries == 0
+
+        response = anthropic_messages_create(
+            client,
+            self._request(),
+            max_retries=2,
+            timeout=10.0,
+            deadline=None,
+            event_prefix="test_",
+        )
+
+        assert seen == [529, 503, 200]
+        assert response.content[0].text == "ok"
+        # Our two backoffs only: the SDK slept and retried nothing itself.
+        assert no_sleep.call_count == 2
+
+    def test_anthropic_real_client_one_request_per_attempt(self, no_sleep: MagicMock) -> None:
+        """A caller's client with the SDK default (2 retries) still sends
+        exactly one request per attempt of ours."""
+        from ingestion.llm_providers import anthropic_messages_create
+
+        http_client, seen = self._transport([529])
+        caller = anthropic.Anthropic(api_key="test-key", http_client=http_client)
+        assert caller.max_retries == 2
+
+        with pytest.raises(anthropic.OverloadedError):
+            anthropic_messages_create(
+                caller,
+                self._request(),
+                max_retries=0,
+                timeout=10.0,
+                deadline=None,
+                event_prefix="test_",
+            )
+
+        assert seen == [529]
+        no_sleep.assert_not_called()
+
+    def test_anthropic_real_client_400_not_retried(self, no_sleep: MagicMock) -> None:
+        from ingestion.llm_providers import anthropic_messages_create
+
+        http_client, seen = self._transport([400])
+        client = new_anthropic_client(api_key="test-key", http_client=http_client)
+
+        with pytest.raises(anthropic.BadRequestError):
+            anthropic_messages_create(
+                client,
+                self._request(),
+                max_retries=3,
+                timeout=10.0,
+                deadline=None,
+                event_prefix="test_",
+            )
+
+        assert seen == [400]

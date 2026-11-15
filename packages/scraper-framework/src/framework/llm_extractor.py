@@ -27,7 +27,6 @@ import hashlib
 import json
 import os
 import re
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,7 +36,13 @@ import anthropic
 import structlog
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
-from ingestion.llm_providers import FINISH_MAX_TOKENS, LLMResponse, response_diagnostics
+from ingestion.llm_providers import (
+    FINISH_MAX_TOKENS,
+    LLMResponse,
+    anthropic_messages_create,
+    response_diagnostics,
+)
+from ingestion.llm_retry import classify_error
 
 from .llm_schema import (
     EXTRACTION_SYSTEM_PROMPT,
@@ -135,13 +140,9 @@ class TokenUsage:
 # Retry configuration
 # ---------------------------------------------------------------------------
 
-# HTTP status codes that are considered transient and should be retried.
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 529})
-
-# Default retry parameters.
+# Attempts per API call (first try plus retries).  Which errors are retried
+# and how long to wait is ``ingestion.llm_retry``'s policy (#5056, #5066).
 _DEFAULT_MAX_RETRIES = 3
-_DEFAULT_BASE_DELAY = 2.0
-_DEFAULT_MAX_DELAY = 60.0
 
 # ---------------------------------------------------------------------------
 # Chunking constants
@@ -3293,9 +3294,10 @@ class LlmExtractor:
         api_key: Provider API key.  For Anthropic, if ``None`` the
             ``ANTHROPIC_API_KEY`` env var is used.  For Google, the
             ``GOOGLE_API_KEY`` env var is used.
-        max_retries: Number of retries on transient API failures (429, 500, 529).
-        base_delay: Initial backoff delay in seconds.
-        max_delay: Maximum backoff delay in seconds.
+        max_retries: Attempts per API call; transient failures (429, 5xx,
+            529, timeouts, dropped connections) get up to
+            ``max_retries - 1`` retries with the ``ingestion.llm_retry``
+            backoff.
         max_output_tokens: Maximum tokens in the model response.
         max_chars_per_chunk: Per-chunk character limit for large documents.
 
@@ -3322,8 +3324,6 @@ class LlmExtractor:
         model: str | None = None,
         api_key: str | None = None,
         max_retries: int = _DEFAULT_MAX_RETRIES,
-        base_delay: float = _DEFAULT_BASE_DELAY,
-        max_delay: float = _DEFAULT_MAX_DELAY,
         max_output_tokens: int = 4096,
         max_chars_per_chunk: int = _DEFAULT_MAX_CHARS,
         bust_cache: bool = False,
@@ -3333,8 +3333,6 @@ class LlmExtractor:
         self._max_retries = max_retries
         # Extra calls per PDF page when the response is not valid JSON (#4716).
         self._max_page_parse_retries = 1
-        self._base_delay = base_delay
-        self._max_delay = max_delay
         self._max_output_tokens = max_output_tokens
         self._max_chars_per_chunk = max_chars_per_chunk
         # Instance-level default for cache-bust mode (#2424).  When True,
@@ -3363,7 +3361,9 @@ class LlmExtractor:
                 raise ValueError(msg)
             if api_key is not None:
                 client_kwargs["api_key"] = api_key
-            self._client = anthropic.Anthropic(**client_kwargs)
+            # The SDK's own retry is off: ``ingestion.llm_retry`` is the one
+            # retry layer, so nothing retries twice (#5066).
+            self._client = anthropic.Anthropic(max_retries=0, **client_kwargs)
 
         # LLM result cache — stored in S3, served locally via CachedS3Client.
         cache_bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
@@ -3873,11 +3873,12 @@ class LlmExtractor:
         is ``"google"``, delegates to ``call_llm`` from
         ``ingestion.llm_providers`` which handles the Google GenAI SDK.
 
-        Retries on transient errors (429, 500, 529) with exponential backoff.
+        Transient errors (429 / 5xx / 529 / timeouts / dropped connections)
+        are retried by ``ingestion.llm_retry`` (#5066), up to
+        ``max_retries - 1`` retries; the client's own SDK retry is off.
         """
         effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
         user_message = self._build_user_message(text, metadata)
-        delay = self._base_delay
 
         # Google provider: delegate to the provider-agnostic call_llm helper
         # which handles the Google GenAI SDK and retry logic.
@@ -3892,116 +3893,53 @@ class LlmExtractor:
                 chunk_text=text,
             )
 
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                response = self._client.messages.create(
-                    model=self._model,
-                    max_tokens=self._max_output_tokens,
-                    temperature=0,
-                    system=effective_prompt,
-                    messages=[{"role": "user", "content": user_message}],
-                )
+        try:
+            response = anthropic_messages_create(
+                self._client,
+                {
+                    "model": self._model,
+                    "max_tokens": self._max_output_tokens,
+                    "temperature": 0,
+                    "system": effective_prompt,
+                    "messages": [{"role": "user", "content": user_message}],
+                },
+                max_retries=max(0, self._max_retries - 1),
+                timeout=None,
+                deadline=None,
+                event_prefix="llm_extractor.anthropic_",
+            )
+        except anthropic.APIError as exc:
+            # Retries are used up or the error is not worth one.  A
+            # programming error (not an ``APIError``) still propagates.
+            decision = classify_error(exc)
+            logger.error(
+                "llm_extractor.api_error",
+                status_code=decision.status,
+                kind=decision.kind,
+                retryable=decision.retryable,
+                error=str(exc),
+                chunk_index=chunk_index,
+                document_id=document_id,
+            )
+            return None
 
-                usage.input_tokens += response.usage.input_tokens
-                usage.output_tokens += response.usage.output_tokens
-                usage.api_calls += 1
+        usage.input_tokens += response.usage.input_tokens
+        usage.output_tokens += response.usage.output_tokens
+        usage.api_calls += 1
 
-                if getattr(response, "stop_reason", None) == "max_tokens":
-                    # Cut off at the output budget: never a complete chunk,
-                    # even if the text parses (#5007).
-                    logger.warning(
-                        "llm_extractor.chunk_response_failed",
-                        chunk_index=chunk_index,
-                        document_id=document_id,
-                        finish_reason=FINISH_MAX_TOKENS,
-                        output_tokens=response.usage.output_tokens,
-                    )
-                    return None
-                raw_text = response.content[0].text.strip()
-                return self._parse_response(raw_text, metadata)
-
-            except anthropic.RateLimitError:
-                if attempt < self._max_retries:
-                    wait = min(delay, self._max_delay)
-                    logger.warning(
-                        "llm_extractor.rate_limit",
-                        attempt=attempt,
-                        max_retries=self._max_retries,
-                        retry_in=wait,
-                        chunk_index=chunk_index,
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                    continue
-                logger.error(
-                    "llm_extractor.rate_limit_exhausted",
-                    chunk_index=chunk_index,
-                )
-                return None
-
-            except anthropic.InternalServerError:
-                if attempt < self._max_retries:
-                    wait = min(delay, self._max_delay)
-                    logger.warning(
-                        "llm_extractor.server_error",
-                        attempt=attempt,
-                        max_retries=self._max_retries,
-                        retry_in=wait,
-                        chunk_index=chunk_index,
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                    continue
-                logger.error(
-                    "llm_extractor.server_error_exhausted",
-                    chunk_index=chunk_index,
-                )
-                return None
-
-            except anthropic.APIStatusError as exc:
-                # 529 is Anthropic's "overloaded" status code.
-                if exc.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries:
-                    wait = min(delay, self._max_delay)
-                    logger.warning(
-                        "llm_extractor.retryable_error",
-                        status_code=exc.status_code,
-                        attempt=attempt,
-                        max_retries=self._max_retries,
-                        retry_in=wait,
-                        chunk_index=chunk_index,
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                    continue
-                logger.error(
-                    "llm_extractor.api_error",
-                    status_code=exc.status_code,
-                    error=str(exc),
-                    chunk_index=chunk_index,
-                )
-                return None
-
-            except anthropic.APIConnectionError as exc:
-                if attempt < self._max_retries:
-                    wait = min(delay, self._max_delay)
-                    logger.warning(
-                        "llm_extractor.connection_error",
-                        attempt=attempt,
-                        max_retries=self._max_retries,
-                        retry_in=wait,
-                        chunk_index=chunk_index,
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                    continue
-                logger.error(
-                    "llm_extractor.connection_error_exhausted",
-                    error=str(exc),
-                    chunk_index=chunk_index,
-                )
-                return None
-
-        return None  # pragma: no cover — defensive
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            # Cut off at the output budget: never a complete chunk,
+            # even if the text parses (#5007).
+            logger.warning(
+                "llm_extractor.chunk_response_failed",
+                chunk_index=chunk_index,
+                document_id=document_id,
+                finish_reason=FINISH_MAX_TOKENS,
+                output_tokens=response.usage.output_tokens,
+            )
+            return None
+        raw_text = response.content[0].text.strip()
+        return self._parse_response(raw_text, metadata)
 
     def _extract_chunk_google(
         self,

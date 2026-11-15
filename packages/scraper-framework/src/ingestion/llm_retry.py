@@ -1,16 +1,23 @@
-"""Retry policy for transient LLM-provider errors (#5056).
+"""Retry policy for transient LLM-provider errors (#5056, #5066).
 
-Every Gemini call in the pipeline goes through :func:`call_with_retries`
-(via ``ingestion.llm_providers``), so this module is the one place that
-decides which errors are worth another attempt and how long to wait.
+Every Gemini and Anthropic call in the pipeline goes through
+:func:`call_with_retries` (via ``ingestion.llm_providers`` and
+``framework.llm_extractor``), so this module is the one place that decides
+which errors are worth another attempt and how long to wait.
 
 Retryable:
 
 - ``google.genai.errors.APIError`` (``ClientError`` / ``ServerError``)
   whose HTTP ``code`` is 429, 500, 502, 503 or 504;
-- transport timeouts (``httpx.TimeoutException``, ``TimeoutError``);
+- ``anthropic.APIStatusError`` (``RateLimitError``,
+  ``InternalServerError``, ``OverloadedError``, ...) whose
+  ``status_code`` is 429, 500, 502, 503, 504 or 529 (Anthropic's
+  "overloaded");
+- transport timeouts (``httpx.TimeoutException``, ``TimeoutError``,
+  ``anthropic.APITimeoutError``);
 - dropped connections (``httpx.NetworkError``,
-  ``httpx.RemoteProtocolError``, ``ConnectionError``).
+  ``httpx.RemoteProtocolError``, ``ConnectionError``,
+  ``anthropic.APIConnectionError``).
 
 Everything else (400, 401, 403, 404, programming errors) fails on the
 first attempt.  Content-level outcomes (a ``RECITATION`` / ``SAFETY``
@@ -19,18 +26,20 @@ come back as an ``LLMResponse`` and are handled by the callers (#5007,
 #5046), never retried here.
 
 The waits are exponential with jitter, raised to the server's
-``Retry-After`` header or ``RetryInfo.retryDelay`` when it gives one.  A
-retry is never started when the wait would run past the caller's
-*deadline* (a ``time.monotonic()`` value, e.g. the OCR run budget), and
-each attempt's HTTP timeout is shortened to the time left, so the deadline
-holds.
+``Retry-After`` / ``retry-after-ms`` header or ``RetryInfo.retryDelay``
+when it gives one.  A retry is never started when the wait would run past
+the caller's *deadline* (a ``time.monotonic()`` value, e.g. the OCR run
+budget), and each attempt's HTTP timeout is shortened to the time left, so
+the deadline holds.
 
-The SDK's own retry (``HttpOptions.retry_options``) is deliberately left
-off (the SDK default): it knows nothing about our deadlines or
-``Retry-After`` and would multiply with this loop.  Before #5056 the check
-matched ``google.api_core`` class names (``ResourceExhausted``,
-``ServiceUnavailable``) that google-genai never raises, so no Gemini error
-was ever retried.
+The SDKs' own retries are deliberately off: google-genai's
+``HttpOptions.retry_options`` is left unset (its default), and every
+Anthropic client is built with ``max_retries=0`` (the SDK default is 2).
+They know nothing about our deadlines and would multiply with this loop.
+Before #5056 the Gemini check matched ``google.api_core`` class names
+(``ResourceExhausted``, ``ServiceUnavailable``) that google-genai never
+raises, so no Gemini error was ever retried; before #5066 one Anthropic 529
+could cost 3 SDK attempts times 3 of our own.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import anthropic
 import httpx
 import structlog
 from google.genai import errors as genai_errors
@@ -48,8 +58,9 @@ from google.genai import errors as genai_errors
 logger = structlog.get_logger(__name__)
 
 # HTTP status codes worth another attempt: rate limit and server-side
-# failures (504 is Gemini's DEADLINE_EXCEEDED, "please try again").
-RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+# failures (504 is Gemini's DEADLINE_EXCEEDED, "please try again"; 529 is
+# Anthropic's "overloaded").
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 
 # First backoff step (seconds); attempt n waits about BASE * 2**n.
 BASE_DELAY = 1.0
@@ -84,16 +95,33 @@ def classify_error(exc: BaseException) -> RetryDecision:
     """Classify *exc* by its real type and HTTP status code."""
     if isinstance(exc, genai_errors.APIError):
         code = exc.code if isinstance(exc.code, int) else None
-        if code in RETRYABLE_STATUS_CODES:
-            kind = KIND_RATE_LIMIT if code == 429 else KIND_SERVER_ERROR
-            return RetryDecision(True, kind, code, _retry_after(exc))
-        kind = KIND_CLIENT_ERROR if code is not None and 400 <= code < 500 else KIND_OTHER
-        return RetryDecision(False, kind, code)
-    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return _status_decision(code, exc)
+    if isinstance(exc, anthropic.APIStatusError):
+        code = exc.status_code if isinstance(exc.status_code, int) else None
+        return _status_decision(code, exc)
+    # APITimeoutError subclasses APIConnectionError, so it is checked first.
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError, anthropic.APITimeoutError)):
         return RetryDecision(True, KIND_TIMEOUT)
-    if isinstance(exc, (httpx.NetworkError, httpx.RemoteProtocolError, ConnectionError)):
+    if isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            ConnectionError,
+            anthropic.APIConnectionError,
+        ),
+    ):
         return RetryDecision(True, KIND_CONNECTION)
     return RetryDecision(False, KIND_OTHER)
+
+
+def _status_decision(code: int | None, exc: BaseException) -> RetryDecision:
+    """Decide on an HTTP-status error from either SDK."""
+    if code in RETRYABLE_STATUS_CODES:
+        kind = KIND_RATE_LIMIT if code == 429 else KIND_SERVER_ERROR
+        return RetryDecision(True, kind, code, _retry_after(exc))
+    kind = KIND_CLIENT_ERROR if code is not None and 400 <= code < 500 else KIND_OTHER
+    return RetryDecision(False, kind, code)
 
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*s?\s*$")
@@ -107,18 +135,20 @@ def _seconds(value: object) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _retry_after(exc: genai_errors.APIError) -> float | None:
-    """The server's requested pause: ``Retry-After`` header, else the
-    ``google.rpc.RetryInfo`` ``retryDelay`` in the error body."""
+def _retry_after(exc: BaseException) -> float | None:
+    """The server's requested pause: a ``retry-after-ms`` (Anthropic) or
+    ``Retry-After`` header, else the ``google.rpc.RetryInfo``
+    ``retryDelay`` in a google-genai error body."""
     headers = getattr(getattr(exc, "response", None), "headers", None)
     if headers is not None:
         try:
-            seconds = _seconds(headers.get("retry-after"))
+            millis = _seconds(headers.get("retry-after-ms"))
+            seconds = millis / 1000 if millis is not None else _seconds(headers.get("retry-after"))
         except Exception:  # noqa: BLE001 — a header object we do not know
             seconds = None
         if seconds is not None:
             return seconds
-    details = exc.details
+    details = getattr(exc, "details", None)
     if isinstance(details, dict):
         details = details.get("error", details)
     items = details.get("details") if isinstance(details, dict) else None
