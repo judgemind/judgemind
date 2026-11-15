@@ -2655,11 +2655,21 @@ class IngestionWorker:
                     kwargs["max_output_tokens"] = max_output_tokens
                 if max_chars_per_chunk:
                     kwargs["max_chars_per_chunk"] = max_chars_per_chunk
+                # ``--bust-llm-cache`` reaches the county extractors too, as it
+                # does the framework and multimodal ones (#4049).  Without it a
+                # bad cached county split (Santa Clara ``9242bb73``) was
+                # replayed on every busted reingest (#4994).
+                if self._bust_llm_cache:
+                    kwargs["bust_cache"] = True
                 extractor = LlmExtractor(**kwargs)
                 self._county_extractors[cache_key] = extractor
                 logger.info(
                     "Initialized county-specific LlmExtractor",
-                    extra={"provider": provider, "model": model},
+                    extra={
+                        "provider": provider,
+                        "model": model,
+                        "bust_cache": self._bust_llm_cache,
+                    },
                 )
             except Exception as exc:
                 self._extractor_init_errors["county"] = f"{type(exc).__name__}: {exc}"
