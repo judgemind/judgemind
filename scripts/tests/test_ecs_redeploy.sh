@@ -81,6 +81,16 @@ case "$1 $2" in
         fi
         n=$(cat "$state/describe.count" 2>/dev/null || echo 0)
         n=$((n + 1)); echo "$n" > "$state/describe.count"
+        if [[ "${MOCK_SUPERSEDE:-}" == "draining" ]]; then
+            # A newer deployment (same image) replaced ours; ours drains.
+            printf '{"services":[{"serviceName":"svc","desiredCount":1,"runningCount":0,"pendingCount":0,"events":[],"deployments":[{"id":"ecs-svc/new-deploy-2","taskDefinition":"arn:td:2","status":"PRIMARY","rolloutState":"IN_PROGRESS","desiredCount":1,"runningCount":0,"pendingCount":0},{"id":"ecs-svc/new-deploy-1","taskDefinition":"arn:td:1","status":"DRAINING","rolloutState":"IN_PROGRESS","desiredCount":0,"runningCount":1,"pendingCount":0}]}]}\n'
+            exit 0
+        fi
+        if [[ "${MOCK_SUPERSEDE:-}" == "gone" ]]; then
+            # ECS dropped ours; only the newer deployment is listed.
+            printf '{"services":[{"serviceName":"svc","desiredCount":1,"runningCount":1,"pendingCount":0,"events":[],"deployments":[{"id":"ecs-svc/new-deploy-2","taskDefinition":"arn:td:2","status":"PRIMARY","rolloutState":"COMPLETED","desiredCount":1,"runningCount":1,"pendingCount":0}]}]}\n'
+            exit 0
+        fi
         if [[ "$n" -gt "${MOCK_COMPLETE_AFTER:-0}" ]]; then
             state_name="COMPLETED"; running=1
         else
@@ -88,6 +98,10 @@ case "$1 $2" in
         fi
         printf '{"services":[{"serviceName":"svc","desiredCount":1,"runningCount":%s,"pendingCount":0,"events":[],"deployments":[{"id":"ecs-svc/new-deploy-1","taskDefinition":"arn:td:1","rolloutState":"%s","desiredCount":1,"runningCount":%s,"pendingCount":0}]}]}\n' \
             "$running" "$state_name" "$running"
+        ;;
+    "ecs describe-task-definition")
+        # Both revisions run the same image.
+        echo '{"taskDefinition":{"containerDefinitions":[{"name":"app","image":"repo/app:abc1234"}]}}'
         ;;
     "ecs list-tasks")
         echo ""
@@ -186,6 +200,51 @@ test_describe_failure_exits_125() {
     fi
 }
 
+# ── Test 3b: followed a same-image supersede → resume names it (#5097) ─────
+#
+# The first call follows deployment new-deploy-2 (same image) and runs out
+# of time.  By the re-run, ECS has dropped new-deploy-1.  Resuming on the
+# original id would exit 3 ("replaced before this call saw it"); the printed
+# command must name new-deploy-2, and resuming on it exits 0.
+
+test_resume_after_follow_names_followed_deployment() {
+    local root
+    root=$(make_sandbox)
+
+    MOCK_SUPERSEDE=draining ROLLOUT_TIMEOUT_SECS=0 run_redeploy "$root" my-svc my-cluster
+    if [[ "$RUN_EC" -eq 124 ]]; then
+        pass "following a same-image supersede that is still rolling out exits 124"
+    else
+        fail "following a same-image supersede that is still rolling out exits 124" "exit=$RUN_EC output=$RUN_OUTPUT"
+    fi
+    if echo "$RUN_OUTPUT" | grep -qF "scripts/ecs-redeploy.sh my-svc my-cluster --deployment-id ecs-svc/new-deploy-2"; then
+        pass "resume command names the followed deployment"
+    else
+        fail "resume command names the followed deployment" "output=$RUN_OUTPUT"
+    fi
+    if echo "$RUN_OUTPUT" | grep -qF -- "--deployment-id ecs-svc/new-deploy-1"; then
+        fail "resume command does not name the replaced original deployment" "output=$RUN_OUTPUT"
+    else
+        pass "resume command does not name the replaced original deployment"
+    fi
+
+    MOCK_SUPERSEDE=gone ROLLOUT_TIMEOUT_SECS=60 \
+        run_redeploy "$root" my-svc my-cluster --deployment-id ecs-svc/new-deploy-2
+    if [[ "$RUN_EC" -eq 0 ]]; then
+        pass "resuming on the followed deployment after the original is gone exits 0"
+    else
+        fail "resuming on the followed deployment after the original is gone exits 0" "exit=$RUN_EC output=$RUN_OUTPUT"
+    fi
+
+    local deploys
+    deploys=$(grep -c "^ecs update-service" "$root/state/calls.log" || true)
+    if [[ "$deploys" == "1" ]]; then
+        pass "follow + resume forced only one deployment"
+    else
+        fail "follow + resume forced only one deployment" "update-service calls: $deploys"
+    fi
+}
+
 # ── Test 4: usage errors ───────────────────────────────────────────────────
 
 test_usage_errors() {
@@ -208,6 +267,7 @@ test_usage_errors() {
 test_default_wait_under_tool_cap
 test_still_rolling_out_then_reattach
 test_describe_failure_exits_125
+test_resume_after_follow_names_followed_deployment
 test_usage_errors
 
 echo ""

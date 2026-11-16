@@ -48,6 +48,10 @@
 #                            may be missing, while another PRIMARY exists,
 #                            before we call it superseded (default: 3). Only
 #                            used when we have no stronger signal (see below).
+#   ROLLOUT_FOLLOWED_ID_FILE — when set, the ID of a superseding deployment
+#                            this call follows is written to this file, so a
+#                            caller can resume on it after exit 124/125
+#                            (#5097). Left untouched when nothing is followed.
 #
 # Superseded deployments (#5073):
 #   Another actor can replace our deployment before it finishes. The common
@@ -73,7 +77,14 @@
 #     - Different image: exit 3 with the reason. The service is not running
 #       this run's image.
 #   Re-running after exit 124 repeats the same detection, so the wait stays
-#   resumable.
+#   resumable, with one exception (#5097): in deployment-id mode the script
+#   learns our task-def only by seeing our deployment. ECS soon drops a
+#   replaced deployment from deployments[], so a re-run with the ORIGINAL
+#   NEW_DEPLOYMENT_ID cannot compare images and would exit 3 for a rollout
+#   that is succeeding. So when this call follows a superseding deployment,
+#   its resume hint names the FOLLOWED deployment ID, and it writes that ID
+#   to ROLLOUT_FOLLOWED_ID_FILE (when set) so scripts/ecs-redeploy.sh prints
+#   a `--deployment-id <followed>` resume command.
 #
 # Exit codes:
 #   0 — Target deployment reached rolloutState=COMPLETED with runningCount==
@@ -390,6 +401,9 @@ while true; do
           match)
             echo "[${ELAPSED}s] The superseding deployment carries this run's image ($IMAGE_DETAIL). Waiting on it instead."
             FOLLOWED_DESC="$PRIMARY_ID ($PRIMARY_TD)"
+            if [ -n "${ROLLOUT_FOLLOWED_ID_FILE:-}" ]; then
+              printf '%s\n' "$PRIMARY_ID" > "$ROLLOUT_FOLLOWED_ID_FILE"
+            fi
             SELECTOR_DESC="deployment $PRIMARY_ID (superseded $ORIGINAL_SELECTOR_DESC)"
             JQ_SELECT_FILTER="$JQ_SELECT_BY_ID"
             JQ_SELECT_ARG="$PRIMARY_ID"
@@ -484,9 +498,15 @@ while true; do
     echo "Last observed state: ${LAST_STATE:-<none>} (${LAST_COUNTS:-<no counts>})"
     echo "Full service JSON snapshot:"
     echo "$SERVICE_JSON" | jq '.services[0] | {serviceName, desiredCount, runningCount, pendingCount, deployments, events: (.events[:5])}'
-    echo "Re-run with the same env vars to keep waiting on the same deployment (nothing is redeployed)."
-    if [ -n "$FOLLOWED_DESC" ]; then
-      echo "This call was following superseding deployment $FOLLOWED_DESC; the re-run detects the supersession again, or wait on it directly with NEW_DEPLOYMENT_ID=$JQ_SELECT_ARG."
+    if [ -z "$FOLLOWED_DESC" ]; then
+      echo "Re-run with the same env vars to keep waiting on the same deployment (nothing is redeployed)."
+    elif [ -n "$NEW_DEPLOYMENT_ID" ]; then
+      # Deployment-id mode: a re-run with the original ID cannot compare
+      # images once ECS drops the original deployment (#5097).
+      echo "This call was following superseding deployment $FOLLOWED_DESC, which carries this run's image."
+      echo "Re-run with NEW_DEPLOYMENT_ID=$JQ_SELECT_ARG to keep waiting on it (nothing is redeployed). Do not re-run with the original NEW_DEPLOYMENT_ID=$NEW_DEPLOYMENT_ID: ECS drops replaced deployments, and then the image can no longer be compared."
+    else
+      echo "This call was following superseding deployment $FOLLOWED_DESC; re-running with the same env vars detects the supersession again (nothing is redeployed), or wait on it directly with NEW_DEPLOYMENT_ID=$JQ_SELECT_ARG."
     fi
     exit 124
   fi
