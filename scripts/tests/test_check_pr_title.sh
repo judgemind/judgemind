@@ -97,6 +97,86 @@ assert_passes "WIP mid-string (not at start) with non-empty body is accepted" \
     "add WIP detection helper" \
     "Implements the detection logic described in #3994"
 
+# ─── --pr mode: reads the live title/body over REST (#5133) ───────────
+# A fake gh serves the PR. MOCK_TITLE / MOCK_BODY set the text;
+# MOCK_FAIL=1 makes the read fail. Calls are logged to $TMPDIR_TEST/calls.
+MOCK_BIN="$TMPDIR_TEST/bin"
+mkdir -p "$MOCK_BIN"
+cat > "$MOCK_BIN/gh" << 'MOCKEOF'
+#!/usr/bin/env bash
+echo "$*" >> "$MOCK_CALLS"
+if [[ "${MOCK_FAIL:-0}" == "1" ]]; then
+    echo "HTTP 502: Bad Gateway" >&2
+    exit 1
+fi
+if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/pulls/[0-9]+$ && "$3" == "--jq" ]]; then
+    jq -cn --arg t "${MOCK_TITLE:-}" --arg b "${MOCK_BODY:-}" '{title: $t, body: $b}' | jq -r "$4"
+    exit 0
+fi
+echo "mock gh: unhandled: $*" >&2
+exit 127
+MOCKEOF
+chmod +x "$MOCK_BIN/gh"
+export MOCK_CALLS="$TMPDIR_TEST/calls"
+
+run_pr_mode() {
+    PATH="$MOCK_BIN:$PATH" PR_TITLE="" PR_BODY="" "$CHECK_SCRIPT" "$@" > /dev/null 2>&1
+}
+
+TESTS=$((TESTS + 1))
+: > "$MOCK_CALLS"
+rc=0
+MOCK_TITLE="WIP: stub" MOCK_BODY="body" run_pr_mode --pr 990001 --repo o/r || rc=$?
+if [[ "$rc" -eq 1 ]] && grep -q "^api /repos/o/r/pulls/990001 --jq" "$MOCK_CALLS"; then
+    echo "PASS: --pr mode rejects a placeholder live title"
+else
+    echo "FAIL: --pr mode rejects a placeholder live title (rc=$rc calls: $(cat "$MOCK_CALLS"))"
+    FAILURES=$((FAILURES + 1))
+fi
+
+TESTS=$((TESTS + 1))
+rc=0
+MOCK_TITLE="feat(x): y" MOCK_BODY="" run_pr_mode --pr 990001 || rc=$?
+if [[ "$rc" -eq 1 ]]; then
+    echo "PASS: --pr mode rejects an empty live body"
+else
+    echo "FAIL: --pr mode rejects an empty live body (rc=$rc)"
+    FAILURES=$((FAILURES + 1))
+fi
+
+TESTS=$((TESTS + 1))
+rc=0
+MOCK_TITLE="feat(x): y" MOCK_BODY="real body" run_pr_mode --pr 990001 || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    echo "PASS: --pr mode accepts a good live title and body"
+else
+    echo "FAIL: --pr mode accepts a good live title and body (rc=$rc)"
+    FAILURES=$((FAILURES + 1))
+fi
+
+TESTS=$((TESTS + 1))
+rc=0
+MOCK_FAIL=1 run_pr_mode --pr 990001 || rc=$?
+if [[ "$rc" -eq 2 ]]; then
+    echo "PASS: --pr mode exits 2 when the PR cannot be read"
+else
+    echo "FAIL: --pr mode exits 2 when the PR cannot be read (rc=$rc)"
+    FAILURES=$((FAILURES + 1))
+fi
+
+for bad_args in "--pr abc" "--pr" "--bogus"; do
+    TESTS=$((TESTS + 1))
+    rc=0
+    # shellcheck disable=SC2086  # split the arg list on purpose
+    run_pr_mode $bad_args || rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        echo "PASS: usage error exits 2 ($bad_args)"
+    else
+        echo "FAIL: usage error exits 2 ($bad_args) (rc=$rc)"
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"

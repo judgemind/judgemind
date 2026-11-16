@@ -276,8 +276,58 @@ query($owner: String!, $name: String!, $number: Int!) {
 """
 
 
+_GRAPHQL_RATE_LIMIT_MARKER = "API rate limit"
+# GraphQL reads commits(first: 250); the REST fallback reads up to 300.
+# page-cap: same bound as the GraphQL path; squash PRs here have a handful of commits
+_REST_COMMIT_PAGES = 3
+
+
+def fetch_pr_rest(pr: int, repo: str) -> dict[str, object]:
+    """The same fields as ``fetch_pr``, read over REST (#5133).
+
+    Used when the GraphQL quota is exhausted, so the merge-time gate in
+    ``gh-pr-with-retry.sh merge`` still checks the live text. REST has no
+    ``closingIssuesReferences``, so issues linked only in the Development
+    sidebar are not seen on this path; the body and commits are.
+    """
+    node = _gh_json(["api", f"/repos/{repo}/pulls/{pr}"])
+    commits: list[str] = []
+    # page-cap: bounded by _REST_COMMIT_PAGES above (same bound as GraphQL)
+    for page in range(1, _REST_COMMIT_PAGES + 1):
+        batch = _gh_json(
+            ["api", f"/repos/{repo}/pulls/{pr}/commits?per_page=100&page={page}"]
+        )
+        commits += [c["commit"]["message"] for c in batch]  # type: ignore[union-attr,index]
+        if len(batch) < 100:  # type: ignore[arg-type]
+            break
+    return {
+        "title": node["title"] or "",  # type: ignore[index]
+        "body": node["body"] or "",  # type: ignore[index]
+        "branch": node["head"]["ref"] or "",  # type: ignore[index]
+        "linked": [],
+        "commits": commits,
+    }
+
+
 def fetch_pr(pr: int, repo: str) -> dict[str, object]:
-    """Title, body, branch, linked closing refs and commit messages of a PR."""
+    """Title, body, branch, linked closing refs and commit messages of a PR.
+
+    Falls back to REST when GraphQL reports its rate limit exhausted (#5133).
+    """
+    try:
+        return _fetch_pr_graphql(pr, repo)
+    except RuntimeError as exc:
+        if _GRAPHQL_RATE_LIMIT_MARKER not in str(exc):
+            raise
+        print(
+            "check-pr-closing-refs: GraphQL rate limit exhausted; reading the PR "
+            "over REST (sidebar-linked issues are not visible on this path).",
+            file=sys.stderr,
+        )
+        return fetch_pr_rest(pr, repo)
+
+
+def _fetch_pr_graphql(pr: int, repo: str) -> dict[str, object]:
     owner, name = repo.split("/", 1)
     data = _gh_json(
         [

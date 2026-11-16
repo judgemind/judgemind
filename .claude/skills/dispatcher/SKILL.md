@@ -605,10 +605,12 @@ The dispatcher proactively merges PRs when all conditions are met:
 2. **No merge conflicts** — `mergeable` is not `CONFLICTING`
 3. **The PR was created by a `/task` agent in this session** (or by any agent if the PR has passed ralph review)
 
-Merge command:
+Merge command (after `scripts/wait-for-ci.sh <N>` exits 0):
 ```
-gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch
+scripts/gh-pr-with-retry.sh merge <N> --squash --delete-branch
 ```
+
+Always merge through the wrapper, never with bare `gh pr merge`. Immediately before the merge call it runs `scripts/check-pr-closing-refs.py` and `scripts/check-pr-title.sh` on the PR's live title, body and commits, and refuses (exit 1, `Fix:` block) when either fails or cannot read the PR (#5133). Those checks also run in CI, but they are not required status checks, so this is the gate that stops a stray closing keyword from closing an unrelated issue on merge. The wrapper also handles the GraphQL-quota REST fallback and a 5xx that merged anyway (see `.claude/skills/task/SKILL.md` §A.7).
 
 After merging:
 - **Immediately sync to latest main** (see "Post-merge sync" in Rules below) — this must happen before spawning any new agents

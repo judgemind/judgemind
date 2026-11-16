@@ -341,7 +341,11 @@ if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/pulls/[0-9]+$ ]]; then
         --arg ref "${MOCK_HEAD_REF:-feature-branch}" \
         --argjson merged "${MOCK_MERGED:-false}" \
         --arg state "${MOCK_PR_STATE:-open}" \
-        '{mergeable_state: $st, merged: $merged, state: $state, head: {sha: $sha, ref: $ref}}')
+        --arg title "${MOCK_PR_TITLE:-feat(dx): mock PR (#990001)}" \
+        --arg body "${MOCK_PR_BODY:-Mock body.
+
+Closes #990001}" \
+        '{mergeable_state: $st, merged: $merged, state: $state, title: $title, body: $body, head: {sha: $sha, ref: $ref}}')
     jq_expr=""
     for ((i=1; i<=$#; i++)); do
         if [[ "${!i}" == "--jq" ]]; then
@@ -358,11 +362,65 @@ if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/pulls/[0-9]+$ ]]; then
     exit 0
 fi
 
+# ── gh api /repos/.../pulls/<N>/commits?... (closing-refs REST fallback) ──
+if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/pulls/[0-9]+/commits ]]; then
+    jq -cn --arg msg "${MOCK_COMMIT_MSG:-feat(dx): mock commit (#990001)}" \
+        '[{commit: {message: $msg}}]'
+    exit 0
+fi
+
+# ── gh api graphql (check-pr-closing-refs.py --pr, #5133) ─────────────────
+# MOCK_GRAPHQL_MODE: "success" (default) builds the PR node from
+# MOCK_PR_TITLE / MOCK_PR_BODY / MOCK_HEAD_REF / MOCK_COMMIT_MSG;
+# "rate_limit" fails with GitHub's GraphQL quota message.
+if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
+    if [[ "${MOCK_GRAPHQL_MODE:-success}" == "rate_limit" ]]; then
+        echo "GraphQL: API rate limit already exceeded for user ID 3708633." >&2
+        exit 1
+    fi
+    jq -cn \
+        --arg title "${MOCK_PR_TITLE:-feat(dx): mock PR (#990001)}" \
+        --arg body "${MOCK_PR_BODY:-Mock body.
+
+Closes #990001}" \
+        --arg ref "${MOCK_HEAD_REF:-feature-branch}" \
+        --arg msg "${MOCK_COMMIT_MSG:-feat(dx): mock commit (#990001)}" \
+        '{data: {repository: {pullRequest: {title: $title, body: $body, headRefName: $ref,
+          closingIssuesReferences: {nodes: []}, commits: {nodes: [{commit: {message: $msg}}]}}}}}'
+    exit 0
+fi
+
 # Unknown command — fail loudly so the test surfaces it.
 echo "mock gh: unhandled command: $*" >&2
 exit 127
 MOCKEOF
 chmod +x "$MOCK_BIN_DIR/gh"
+
+# ── Stub PR-text checkers for the merge gate (#5133) ──────────────────────
+#
+# `merge` runs check-pr-closing-refs.py and check-pr-title.sh on the live PR
+# before merging. Most tests stub both (exit 0) so they exercise the merge
+# paths only; the G.* tests set them to fail, or point the wrapper at the
+# real checkers backed by the mock gh above. Each stub records its argv to
+# MOCK_CHECK_INVOCATIONS and, so the ordering against `pr merge` can be
+# asserted, to MOCK_INVOCATIONS too.
+# Exit codes: MOCK_CLOSING_REFS_EXIT / MOCK_TITLE_CHECK_EXIT (default 0).
+for _check in closing-refs:MOCK_CLOSING_REFS_EXIT title:MOCK_TITLE_CHECK_EXIT; do
+    _name="${_check%%:*}"
+    _exit_var="${_check#*:}"
+    cat > "$MOCK_BIN_DIR/stub-check-$_name" << STUBEOF
+#!/usr/bin/env bash
+if [[ -n "\${MOCK_CHECK_INVOCATIONS:-}" ]]; then echo "$_name \$*" >> "\$MOCK_CHECK_INVOCATIONS"; fi
+if [[ -n "\${MOCK_INVOCATIONS:-}" ]]; then echo "check-$_name \$*" >> "\$MOCK_INVOCATIONS"; fi
+echo "stub $_name check: exit \${$_exit_var:-0}" >&2
+exit "\${$_exit_var:-0}"
+STUBEOF
+    chmod +x "$MOCK_BIN_DIR/stub-check-$_name"
+done
+export GH_PR_CLOSING_REFS_CHECK="$MOCK_BIN_DIR/stub-check-closing-refs"
+export GH_PR_TITLE_CHECK="$MOCK_BIN_DIR/stub-check-title"
+REAL_CLOSING_REFS_CHECK="$SCRIPT_DIR/check-pr-closing-refs.py"
+REAL_TITLE_CHECK="$SCRIPT_DIR/check-pr-title.sh"
 
 # ── Test E — Usage / argument validation paths ─────────────────────────────
 
@@ -1331,6 +1389,206 @@ if [[ "$exit_code" -eq 4 ]] && [[ "$api_calls" == "0" ]]; then
 else
     fail "S.6: non-5xx merge failure skips the merged-anyway check" \
         "exit=$exit_code invocations: $(cat "$INVOCATIONS_S6")"
+fi
+
+# ── Test G — PR-text gate at merge time (#5133) ────────────────────────────
+#
+# Issue numbers here (99000x) are fake: nothing reaches real GitHub (the
+# gh-isolate shim plus the mock gh), and no real issue could be closed.
+
+# G.1 — closing-refs check fails: refuse, exit non-zero, never call the
+# `gh pr merge` stub or any write.
+INVOCATIONS_G1="$MOCK_BIN_DIR/invocations_g1.txt"
+: > "$INVOCATIONS_G1"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_G1" \
+    MOCK_CLOSING_REFS_EXIT=1 \
+    "$WRAPPER" merge 500 --squash --delete-branch 2>&1 >/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G1")
+write_calls=$(awk '/^api -X / {n++} END {print n+0}' "$INVOCATIONS_G1")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]] && [[ "$write_calls" == "0" ]] \
+        && [[ "$err_output" == *"refusing to merge PR #500"* ]] \
+        && [[ "$err_output" == *"closing-refs check"* ]] \
+        && [[ "$err_output" == *"Fix:"* ]]; then
+    pass "G.1: failing closing-refs check refuses the merge (exit 1, no gh pr merge)"
+else
+    fail "G.1: failing closing-refs check refuses the merge (exit 1, no gh pr merge)" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_G1")"
+fi
+
+# G.2 — title/body check fails: refuse the same way.
+INVOCATIONS_G2="$MOCK_BIN_DIR/invocations_g2.txt"
+: > "$INVOCATIONS_G2"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_G2" \
+    MOCK_TITLE_CHECK_EXIT=1 \
+    "$WRAPPER" merge 501 --squash 2>&1 >/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G2")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]] \
+        && [[ "$err_output" == *"title/body check"* ]]; then
+    pass "G.2: failing title/body check refuses the merge"
+else
+    fail "G.2: failing title/body check refuses the merge" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_G2")"
+fi
+
+# G.3 — a checker that cannot read the PR (exit 2) also refuses.
+INVOCATIONS_G3="$MOCK_BIN_DIR/invocations_g3.txt"
+: > "$INVOCATIONS_G3"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_G3" \
+    MOCK_CLOSING_REFS_EXIT=2 \
+    "$WRAPPER" merge 502 --squash > /dev/null 2>&1 || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G3")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]]; then
+    pass "G.3: an unreadable PR (checker exit 2) refuses the merge"
+else
+    fail "G.3: an unreadable PR (checker exit 2) refuses the merge" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_G3")"
+fi
+
+# G.4 — both checks run, with --pr/--repo, BEFORE the merge call.
+INVOCATIONS_G4="$MOCK_BIN_DIR/invocations_g4.txt"
+CHECKS_G4="$MOCK_BIN_DIR/checks_g4.txt"
+: > "$INVOCATIONS_G4"
+: > "$CHECKS_G4"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_G4" \
+    MOCK_CHECK_INVOCATIONS="$CHECKS_G4" \
+    "$WRAPPER" merge 503 --squash --delete-branch > /dev/null 2>&1 || exit_code=$?
+first_merge_line=$(grep -nE "^pr merge " "$INVOCATIONS_G4" | head -1 | cut -d: -f1)
+last_check_line=$(grep -nE "^check-" "$INVOCATIONS_G4" | tail -1 | cut -d: -f1)
+if [[ "$exit_code" -eq 0 ]] \
+        && grep -qx "closing-refs --pr 503 --repo judgemind/judgemind" "$CHECKS_G4" \
+        && grep -qx "title --pr 503 --repo judgemind/judgemind" "$CHECKS_G4" \
+        && [[ -n "$first_merge_line" && -n "$last_check_line" ]] \
+        && [[ "$last_check_line" -lt "$first_merge_line" ]]; then
+    pass "G.4: both PR-text checks run on the live PR before gh pr merge"
+else
+    fail "G.4: both PR-text checks run on the live PR before gh pr merge" \
+        "exit=$exit_code checks: $(cat "$CHECKS_G4") invocations: $(cat "$INVOCATIONS_G4")"
+fi
+
+# G.5 — the gate also guards the GraphQL-rate-limit REST path: a failing
+# check means no gh pr merge and no REST PUT.
+INVOCATIONS_G5="$MOCK_BIN_DIR/invocations_g5.txt"
+: > "$INVOCATIONS_G5"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_G5" \
+    MOCK_CLOSING_REFS_EXIT=1 \
+    MOCK_PR_MERGE_MODE=graphql_rate_limit \
+    MOCK_REST_MERGE_MODE=success \
+    "$WRAPPER" merge 504 --squash > /dev/null 2>&1 || exit_code=$?
+merge_calls=$(awk '/^pr merge |^api -X PUT / {n++} END {print n+0}' "$INVOCATIONS_G5")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]]; then
+    pass "G.5: a failing check blocks the REST merge fallback too"
+else
+    fail "G.5: a failing check blocks the REST merge fallback too" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_G5")"
+fi
+
+# G.6 — real check-pr-title.sh on a placeholder live title (WIP: ...).
+INVOCATIONS_G6="$MOCK_BIN_DIR/invocations_g6.txt"
+: > "$INVOCATIONS_G6"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_G6" \
+    GH_PR_TITLE_CHECK="$REAL_TITLE_CHECK" \
+    MOCK_PR_TITLE="WIP: ralph output" \
+    "$WRAPPER" merge 505 --squash --delete-branch 2>&1 >/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G6")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]] \
+        && [[ "$err_output" == *"PR title looks like a placeholder"* ]] \
+        && grep -qE "^api /repos/judgemind/judgemind/pulls/505 --jq " "$INVOCATIONS_G6"; then
+    pass "G.6: real title check on a live 'WIP:' title refuses the merge"
+else
+    fail "G.6: real title check on a live 'WIP:' title refuses the merge" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_G6")"
+fi
+
+# G.7 — real check-pr-title.sh on an empty live body refuses.
+exit_code=0
+err_output=$(
+    GH_PR_TITLE_CHECK="$REAL_TITLE_CHECK" \
+    MOCK_PR_BODY="   " \
+    "$WRAPPER" merge 506 --squash 2>&1 >/dev/null
+) || exit_code=$?
+if [[ "$exit_code" -eq 1 ]] && [[ "$err_output" == *"PR body is empty"* ]]; then
+    pass "G.7: real title check on an empty live body refuses the merge"
+else
+    fail "G.7: real title check on an empty live body refuses the merge" \
+        "exit=$exit_code err=$err_output"
+fi
+
+# G.8 — real check-pr-closing-refs.py on a live body with a stray closing
+# keyword before another (fake) issue number refuses.
+INVOCATIONS_G8="$MOCK_BIN_DIR/invocations_g8.txt"
+: > "$INVOCATIONS_G8"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_G8" \
+    GH_PR_CLOSING_REFS_CHECK="$REAL_CLOSING_REFS_CHECK" \
+    GH_PR_TITLE_CHECK="$REAL_TITLE_CHECK" \
+    MOCK_PR_TITLE="fix(dx): gate (#990001)" \
+    MOCK_PR_BODY="My local run closed #990002 while testing.
+
+Closes #990001" \
+    "$WRAPPER" merge 507 --squash --delete-branch 2>&1 >/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G8")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]] \
+        && [[ "$err_output" == *"#990002 via PR body"* ]] \
+        && grep -qE "^api graphql " "$INVOCATIONS_G8"; then
+    pass "G.8: real closing-refs check on a stray closing keyword refuses the merge"
+else
+    fail "G.8: real closing-refs check on a stray closing keyword refuses the merge" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_G8")"
+fi
+
+# G.9 — real checkers on clean live text: the merge goes ahead.
+INVOCATIONS_G9="$MOCK_BIN_DIR/invocations_g9.txt"
+: > "$INVOCATIONS_G9"
+exit_code=0
+GH_PR_CLOSING_REFS_CHECK="$REAL_CLOSING_REFS_CHECK" \
+    GH_PR_TITLE_CHECK="$REAL_TITLE_CHECK" \
+    MOCK_INVOCATIONS="$INVOCATIONS_G9" \
+    "$WRAPPER" merge 508 --squash --delete-branch > /dev/null 2>&1 || exit_code=$?
+merge_calls=$(awk '/^pr merge 508 / {n++} END {print n+0}' "$INVOCATIONS_G9")
+if [[ "$exit_code" -eq 0 ]] && [[ "$merge_calls" == "1" ]]; then
+    pass "G.9: real checkers on clean live text let the merge through"
+else
+    fail "G.9: real checkers on clean live text let the merge through" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_G9")"
+fi
+
+# G.10 — GraphQL exhausted: the real closing-refs check reads the PR over
+# REST and still catches a stray closing keyword in a commit message.
+INVOCATIONS_G10="$MOCK_BIN_DIR/invocations_g10.txt"
+: > "$INVOCATIONS_G10"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_G10" \
+    GH_PR_CLOSING_REFS_CHECK="$REAL_CLOSING_REFS_CHECK" \
+    MOCK_GRAPHQL_MODE=rate_limit \
+    MOCK_COMMIT_MSG="fix(dx): gate (#990001)
+
+this also fixes #990003" \
+    "$WRAPPER" merge 509 --squash 2>&1 >/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_G10")
+if [[ "$exit_code" -eq 1 ]] && [[ "$merge_calls" == "0" ]] \
+        && [[ "$err_output" == *"reading the PR over REST"* ]] \
+        && [[ "$err_output" == *"#990003 via commit message"* ]] \
+        && grep -qE "^api /repos/judgemind/judgemind/pulls/509/commits" "$INVOCATIONS_G10"; then
+    pass "G.10: closing-refs falls back to REST when GraphQL is exhausted"
+else
+    fail "G.10: closing-refs falls back to REST when GraphQL is exhausted" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_G10")"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

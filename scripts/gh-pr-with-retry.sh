@@ -44,6 +44,14 @@
 # merged, or the read fails, the original failure passes through. This
 # path only reads and deletes a ref; it never merges.
 #
+# PR-text gate at merge time (#5133): before any merge call, `merge` runs
+# scripts/check-pr-closing-refs.py --pr N and scripts/check-pr-title.sh
+# --pr N against the PR's live title, body and commits, and refuses (exit 1,
+# with a Fix: block, no merge call) unless both pass. Those two checks also
+# run in CI (pr-title-check.yml) but are not required status checks, so this
+# gate is what stops a stray closing keyword or a placeholder title from
+# merging. It runs on every path: plain, REST fallback and 5xx recovery.
+#
 # create/edit have no 5xx recovery: they are not idempotent the same way
 # (a blind retry of create can open a duplicate PR). A
 # `base branch policy prohibits the merge` refusal is passed through
@@ -148,6 +156,9 @@ Subcommands:
            --title or --body-file is required.
   merge    Squash-merge a PR. --squash is required (only mode supported);
            pass --delete-branch to delete the head ref after merging.
+           First runs the PR-text checks (check-pr-closing-refs.py and
+           check-pr-title.sh) on the live PR and refuses (exit 1) unless
+           both pass (#5133).
            On a 5xx from gh pr merge, reads the PR: if it merged anyway,
            deletes the head ref (with --delete-branch) and exits 0.
 
@@ -694,7 +705,62 @@ recover_merge_after_server_error() {
     exit 0
 }
 
+# PR-text gate (#5133). `closing-refs` and `validate-pr` are not required
+# status checks, and `ci-passed` does not re-run on a body edit, so GitHub
+# will merge a PR whose text those checks would reject. wait-for-ci.sh only
+# narrows the timing windows (#5078, #5090, #5128); an edit made after it
+# exits, or a check run GitHub creates late, is never seen. So run both
+# checkers against the PR's LIVE title, body and commits right before the
+# merge call, and refuse on anything but a clean pass. Each checker reads the
+# PR itself (closing-refs over GraphQL with a REST fallback, the title check
+# over REST). A checker that cannot read the PR (exit 2) also refuses: an
+# unchecked body is exactly what this gate exists to stop.
+#
+# GH_PR_CLOSING_REFS_CHECK / GH_PR_TITLE_CHECK override the checker paths
+# (tests only).
+run_pr_text_gate() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local closing_check="${GH_PR_CLOSING_REFS_CHECK:-$script_dir/check-pr-closing-refs.py}"
+    local title_check="${GH_PR_TITLE_CHECK:-$script_dir/check-pr-title.sh}"
+    local failed=0 rc
+
+    set +e
+    "$closing_check" --pr "$PR_NUMBER" --repo "$REPO" >&2
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        failed=1
+        echo "gh-pr-with-retry: closing-refs check on PR #$PR_NUMBER's live text failed (exit $rc)." >&2
+    fi
+
+    set +e
+    "$title_check" --pr "$PR_NUMBER" --repo "$REPO" >&2
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        failed=1
+        echo "gh-pr-with-retry: title/body check on PR #$PR_NUMBER's live text failed (exit $rc)." >&2
+    fi
+
+    if [[ "$failed" -ne 0 ]]; then
+        cat >&2 << EOF
+ERROR: refusing to merge PR #$PR_NUMBER: its live title/body/commits fail the PR-text checks (#5133).
+Fix:
+  Reword the PR as the check output above says, then re-run the merge:
+    scripts/gh-pr-with-retry.sh edit $PR_NUMBER --body-file <reworded-body-file>   # or --title "..."
+    scripts/gh-pr-with-retry.sh merge $PR_NUMBER --squash --delete-branch
+  A closing word in a commit message needs an amended commit and a push instead.
+  If a checker could not read the PR (exit 2), wait for the API to recover and retry;
+  never merge around this gate with plain 'gh pr merge' or the REST merge endpoint.
+EOF
+        exit 1
+    fi
+}
+
 run_merge() {
+    run_pr_text_gate
+
     # Build the gh pr merge args. SQUASH is the only supported mode.
     local -a gh_args=("pr" "merge" "$PR_NUMBER" "--repo" "$REPO" "--squash")
     if [[ "$DELETE_BRANCH" -eq 1 ]]; then

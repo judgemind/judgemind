@@ -137,19 +137,16 @@ Record the PR number from the output (e.g. `#1234`).
 
 ---
 
-## Step 5 — Auto-merge
+## Step 5 — Merge once CI is green
 
-Enable auto-merge so the PR merges as soon as CI passes:
+The repo does not allow auto-merge, so wait for CI, then merge through the wrapper. It checks the PR's live title, body and commits (`scripts/check-pr-closing-refs.py`, `scripts/check-pr-title.sh`) right before merging and refuses on a failure (#5133):
 
 ```
-gh pr merge PR_NUMBER \
-    --repo judgemind/judgemind \
-    --auto \
-    --squash \
-    --delete-branch
+scripts/wait-for-ci.sh PR_NUMBER
+scripts/gh-pr-with-retry.sh merge PR_NUMBER --squash --delete-branch
 ```
 
-Replace `PR_NUMBER` with the number captured from Step 4.
+Re-run `scripts/wait-for-ci.sh` while it exits 124 (still running); merge only after it exits 0. Replace `PR_NUMBER` with the number captured from Step 4.
 
 ---
 

@@ -353,6 +353,67 @@ def test_main_pr_mode_gh_failure_exits_2(
     assert "HTTP 401" in capsys.readouterr().err
 
 
+def test_main_pr_mode_falls_back_to_rest_on_graphql_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#5133: the merge-time gate must still read the PR with GraphQL exhausted."""
+    seen: list[list[str]] = []
+    rest_pr = {
+        "title": "fix(dx): gate (#990001)",
+        "body": "Closes #990001\n",
+        "head": {"ref": "worktree-agent-x"},
+    }
+    commits_page1 = [{"commit": {"message": f"wip {i}"}} for i in range(99)] + [
+        {"commit": {"message": "fix(dx): gate\n\nalso fixes #990002"}}
+    ]
+    commits_page2 = [{"commit": {"message": "last"}}]
+
+    def fake_run(cmd: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "GraphQL: API rate limit already exceeded for user ID 1."
+            )
+        path = cmd[2]
+        if path.endswith("page=1"):
+            payload: object = commits_page1
+        elif path.endswith("page=2"):
+            payload = commits_page2
+        else:
+            payload = rest_pr
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.main(["--pr", "990001"]) == 1
+    err = capsys.readouterr().err
+    assert "reading the PR over REST" in err
+    assert "#990002 via commit message" in err
+    paths = [c[2] for c in seen[1:]]
+    assert paths == [
+        "/repos/judgemind/judgemind/pulls/990001",
+        "/repos/judgemind/judgemind/pulls/990001/commits?per_page=100&page=1",
+        "/repos/judgemind/judgemind/pulls/990001/commits?per_page=100&page=2",
+    ]
+
+
+def test_main_pr_mode_rest_fallback_passes_clean_pr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_run(cmd: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "API rate limit exceeded")
+        if "/commits" in cmd[2]:
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps([{"commit": {"message": "x (#990001)"}}]), ""
+            )
+        pr = {"title": "x (#990001)", "body": "Closes #990001", "head": {"ref": "b"}}
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(pr), "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.main(["--pr", "990001"]) == 0
+    assert "OK: PR #990001 closes #990001" in capsys.readouterr().out
+
+
 def test_main_cli_runs_as_script(tmp_path: Path) -> None:
     body = tmp_path / "body.md"
     body.write_text("Closes #3\n")

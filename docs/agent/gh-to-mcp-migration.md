@@ -25,7 +25,7 @@
 | `gh pr view <N> --json reviewDecision,reviews` | `mcp__github__get_pull_request_reviews` | **Available** | |
 | `gh pr create --body-file ... --base main` | `mcp__github__create_pull_request` | **Available (write — currently blocked)** | Body as native string. |
 | `gh pr edit <N> --body-file ...` | *(no direct MCP equivalent for PR body edit)* | **Gap** | MCP has no `update_pull_request`. Keep `gh pr edit`. |
-| `gh pr merge <N> --squash --delete-branch` | `mcp__github__merge_pull_request` | **Partial (write — currently blocked)** | MCP supports `merge_method` but has **no flag for `--delete-branch`**. Keep `gh pr merge --squash --delete-branch` for the typical merge-and-cleanup flow. |
+| `gh pr merge <N> --squash --delete-branch` | `mcp__github__merge_pull_request` | **Partial (write — currently blocked)** | MCP supports `merge_method` but has **no flag for `--delete-branch`**. Merge with `scripts/gh-pr-with-retry.sh merge <N> --squash --delete-branch`, which wraps `gh pr merge` and runs the PR-text checks on the live PR first (#5133). |
 | `gh pr diff <N>` | *(no direct MCP equivalent)* | **Gap** | Use `get_pull_request_files` to list changes; for raw unified diff, keep `gh pr diff`. |
 | `gh pr review <N> --approve` / `--request-changes` / `--comment` | `mcp__github__create_pull_request_review` | **Available (write — currently blocked)** | |
 | `gh run list --workflow X.yml --branch main --limit 1` | *(no MCP equivalent)* | **Gap — stays on `gh`** | MCP has no workflow-runs API exposure. |
