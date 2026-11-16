@@ -367,7 +367,7 @@ def call_anthropic_page(
     response = client.messages.create(
         model=model_id,
         max_tokens=4096,
-        temperature=0,
+        extra_body={"temperature": 0},  # SDK 1.x dropped the kwarg (#4960)
         system=PER_PAGE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
     )

@@ -438,7 +438,7 @@ def call_anthropic(
     message = client.messages.create(
         model=MODEL_ID,
         max_tokens=2048,
-        temperature=0.0,
+        extra_body={"temperature": 0},  # SDK 1.x dropped the kwarg (#4960)
         messages=[{"role": "user", "content": user_msg}],
     )
     latency = (time.monotonic() - start) * 1000

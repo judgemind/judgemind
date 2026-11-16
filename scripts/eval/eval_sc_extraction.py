@@ -423,7 +423,7 @@ def call_anthropic(
     with client.messages.stream(
         model=model_id,
         max_tokens=32768,
-        temperature=0,
+        extra_body={"temperature": 0},  # SDK 1.x dropped the kwarg (#4960)
         system=SC_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": text}],
     ) as stream:

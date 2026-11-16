@@ -60,6 +60,9 @@ MODELS = {
     "opus": "claude-opus-4-7",
 }
 
+# Models above that still accept sampling params (closed legacy set, #4960).
+_SAMPLING_MODELS = frozenset({MODELS["haiku"], MODELS["sonnet"]})
+
 # Fields we want to extract
 TARGET_FIELDS = [
     "judge_name",
@@ -310,10 +313,16 @@ def call_anthropic(
 ) -> tuple[dict, int, int, float]:
     """Call Anthropic API and return (parsed_result, input_tokens, output_tokens, latency_ms)."""
     start = time.monotonic()
+    # SDK 1.x dropped the temperature kwarg.  Only the legacy models in
+    # _SAMPLING_MODELS still honour it (via extra_body); Opus 4.7 and every
+    # later model reject any sampling param, so they get none (#4960).
+    sampling = (
+        {"extra_body": {"temperature": 0}} if model_id in _SAMPLING_MODELS else {}
+    )
     message = client.messages.create(
         model=model_id,
         max_tokens=1024,
-        temperature=0.0,
+        **sampling,
         messages=[
             {
                 "role": "user",

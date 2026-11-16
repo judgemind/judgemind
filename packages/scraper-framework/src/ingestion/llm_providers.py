@@ -14,6 +14,7 @@ Configuration is via environment variables:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 import anthropic
@@ -276,6 +277,51 @@ def without_sdk_retries(client: object) -> object:
     return client
 
 
+# Anthropic models that still honour sampling parameters (``temperature``).
+# Opus 4.7 and every later model reject them with a 400 (Claude Sonnet 5
+# rejects non-default values), so this set is closed: no new model joins
+# it and the allowlist cannot rot.  Tolerates Bedrock / Vertex prefixes
+# (``anthropic.``, ``us.anthropic.``) and ``-YYYYMMDD`` / ``@date`` /
+# ``-v1:0`` suffixes.
+_ANTHROPIC_SAMPLING_MODEL_RE = re.compile(
+    r"^(?:[a-z]+\.)*claude-(?:"
+    r"3(?:$|[-.@])"
+    r"|(?:haiku|sonnet|opus)-4(?:-[0-6])?(?=$|[@:]|-\d{8}|-v\d|-latest)"
+    r")"
+)
+
+
+def anthropic_sampling_params(model: str) -> dict:
+    """Extra ``messages.create`` kwargs that pin greedy decoding for *model*.
+
+    anthropic SDK 1.x removed ``temperature`` from the ``Messages.create``
+    signature (passing it raises ``TypeError``), but the API still accepts
+    it for the legacy models in :data:`_ANTHROPIC_SAMPLING_MODEL_RE`, so
+    extraction keeps ``temperature=0`` there via ``extra_body`` (merged
+    into the request JSON as-is).  Later models reject any sampling
+    parameter, so they get nothing (#4960).
+    """
+    if _ANTHROPIC_SAMPLING_MODEL_RE.match(model):
+        return {"extra_body": {"temperature": 0}}
+    return {}
+
+
+def _with_sampling_params(request: dict) -> dict:
+    """A copy of *request* with :func:`anthropic_sampling_params` merged in.
+
+    A caller-supplied ``extra_body`` wins key by key; *request* is not
+    mutated.
+    """
+    kwargs = dict(request)
+    model = kwargs.get("model")
+    if not isinstance(model, str):
+        return kwargs
+    sampling = anthropic_sampling_params(model).get("extra_body")
+    if sampling:
+        kwargs["extra_body"] = {**sampling, **(kwargs.get("extra_body") or {})}
+    return kwargs
+
+
 def anthropic_messages_create(
     client: object,
     request: dict,
@@ -291,13 +337,17 @@ def anthropic_messages_create(
     are retried by ``llm_retry.call_with_retries``, within *deadline*;
     each attempt's HTTP timeout is *timeout* shortened to the time left
     (no ``timeout`` keyword is sent when neither is set).  The SDK's own
-    retry is off (:func:`without_sdk_retries`).  Returns the SDK
-    ``Message``; the last exception propagates when every attempt failed.
+    retry is off (:func:`without_sdk_retries`).  ``temperature=0`` is
+    added through ``extra_body`` for models that accept it
+    (:func:`anthropic_sampling_params`, #4960); callers never pass
+    ``temperature`` themselves.  Returns the SDK ``Message``; the last
+    exception propagates when every attempt failed.
     """
     sdk_client = without_sdk_retries(client)
+    base_kwargs = _with_sampling_params(request)
 
     def attempt(attempt_timeout: float | None) -> object:
-        kwargs = dict(request)
+        kwargs = dict(base_kwargs)
         if attempt_timeout is not None:
             kwargs["timeout"] = attempt_timeout
         return sdk_client.messages.create(**kwargs)  # type: ignore[attr-defined]
@@ -365,7 +415,6 @@ def _call_anthropic(
             {
                 "model": model,
                 "max_tokens": max_tokens,
-                "temperature": 0,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_message}],
             },
@@ -698,7 +747,6 @@ def _call_anthropic_with_images(
             {
                 "model": model,
                 "max_tokens": max_tokens,
-                "temperature": 0,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": content}],
             },
