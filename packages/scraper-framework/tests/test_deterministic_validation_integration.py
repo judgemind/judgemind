@@ -32,6 +32,10 @@ def _split_set_write() -> Iterator[None]:
     with (
         patch("ingestion.worker.write_split_rulings", return_value={}),
         patch("ingestion.worker.record_judge_votes"),
+        # A live whole-document write looks up the ruling's current case
+        # (#5006), which would consume a scripted ``fetchone``; covered in
+        # ``test_unsupported_case_move.py``.
+        patch("ingestion.worker._should_move_off_unsupported_case", return_value=False),
     ):
         yield
 

@@ -3120,7 +3120,7 @@ class SplitChildRuling:
     summary_generated_at: datetime | None = None
     hearing_date_source: str | None = None
     #: The source evidence a case number on this child's slot must appear
-    #: in to be kept when this child found none (#4915, #4927): the
+    #: in for the slot to keep it (#4915, #4927, #5006): the
     #: document's extracted text, never LLM output.  Empty when the
     #: document's text cannot settle it (no text layer, or a split path
     #: whose case numbers can come from outside the text).
@@ -3211,12 +3211,15 @@ def write_split_rulings(
     case is:
 
     - the child's case when they agree;
+    - the child's case when the child gives ``case_number_evidence`` that
+      refutes the row's real number (``case_number_refuted``): the number
+      is not in the document, so an LLM invented or misread it.  This holds
+      on a live write as on a relink (#4915, #5006): preserve-first exists
+      for a number a flaky re-extraction missed, not one the document's own
+      text refutes.  The rules below apply only when it does not;
     - the row's real case when the child found no case number
       (``UNKNOWN-*``): a re-extraction that misses the case number must not
-      drop the one found before (#4788).  The exception is a *relink* whose
-      child gives ``case_number_evidence`` that does not carry the row's number:
-      the number is not in the document, so an LLM invented or misread it,
-      and the row moves to the child's placeholder case (#4915);
+      drop the one found before (#4788);
     - the child's case when the row's case is a placeholder;
     - for two different real case numbers, the child's case when *relink*
       (a split-set replacement: reingest / rebuild, #4700) and the row's
@@ -3310,24 +3313,27 @@ def write_split_rulings(
         if h is None or h.case_id == c.case_id:
             final_case[i] = c.case_id
             continue
-        child_placeholder = _is_placeholder_case_number(child_case_numbers.get(c.case_id))
-        if child_placeholder and not h.placeholder:
-            if relink and _held_case_number_unsupported(h, c):
-                # The row's number is not in the document at all, so the
-                # row was filed under a case an LLM invented or misread:
-                # it moves to the child's placeholder case (#4915).
-                logger.info(
-                    "write_split_rulings: ruling leaves a case number absent from its document",
-                    extra={
-                        "document_id": c.document_id,
-                        "ruling_id": h.ruling_id,
-                        "unsupported_case_number": h.case_number,
-                        "telemetry_event": "split_ruling_left_unsupported_case",
-                    },
-                )
-                final_case[i] = c.case_id
-            else:
-                final_case[i] = h.case_id
+        if not h.placeholder and _held_case_number_unsupported(h, c):
+            # The row's number is not in the document at all, so the row
+            # was filed under a case an LLM invented or misread: it moves
+            # to the child's case, on a live write too (#4915, #5006).
+            # Preserve-first guards a number a flaky re-extraction missed,
+            # not one the document's own text refutes.
+            logger.info(
+                "write_split_rulings: ruling leaves a case number absent from its document",
+                extra={
+                    "document_id": c.document_id,
+                    "ruling_id": h.ruling_id,
+                    "unsupported_case_number": h.case_number,
+                    "relink": relink,
+                    "telemetry_event": "split_ruling_left_unsupported_case",
+                },
+            )
+            final_case[i] = c.case_id
+        elif _is_placeholder_case_number(child_case_numbers.get(c.case_id)):
+            # The child found no number: keep the row's (#4788), or move
+            # it between two placeholder cases.
+            final_case[i] = c.case_id if h.placeholder else h.case_id
         elif h.placeholder or relink:
             final_case[i] = c.case_id
         else:

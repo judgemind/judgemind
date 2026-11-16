@@ -721,7 +721,7 @@ def _log_refuted_case_numbers(
 
 
 def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) -> bool:
-    """Decide whether a reingest moves this document's ruling to *case_id*
+    """Decide whether a write moves this document's ruling to *case_id*
     because its current case number is absent from the document (#4915).
 
     Only for a whole document written on its own (a split child's text is
@@ -730,17 +730,13 @@ def _should_move_off_unsupported_case(conn: Any, w: _RulingWrite, case_id: str) 
     rulings).  A failed extraction writes nothing on a reingest (#4948), and
     in ``required`` mode neither does a document no extractor could run on
     (#4968), so this covers a document written on its own in ``optional``
-    mode (no extractor configured: regex-only extraction).  Only on a
-    reingest / rebuild (``REPLACE_SPLIT_SET_KEY``), only when the document
-    text can settle it, and only off a real case number the evidence
-    refutes (``case_number_refuted``).  A number the document prints keeps
-    preserve-first semantics (#2475, #4788).
+    mode (no extractor configured: regex-only extraction).  On a live write
+    as on a reingest / rebuild (#5006), only when the document text can
+    settle it, and only off a real case number the evidence refutes
+    (``case_number_refuted``).  A number the document prints, or one no
+    evidence can settle, keeps preserve-first semantics (#2475, #4788).
     """
-    if (
-        w.event_data.get("_split_processed")
-        or w.event_data.get(REPLACE_SPLIT_SET_KEY) is not True
-        or not w.case_number_evidence
-    ):
+    if w.event_data.get("_split_processed") or not w.case_number_evidence:
         return False
     with conn.cursor() as cur:
         cur.execute(
@@ -5942,7 +5938,7 @@ class IngestionWorker:
                 ],
                 # A split-set replacement (reingest / rebuild) re-derives the
                 # case of a reused slot; a live write keeps an established
-                # link (#4700, #4788).
+                # link (#4700, #4788) unless the evidence refutes it (#5006).
                 relink=event_data.get(REPLACE_SPLIT_SET_KEY) is True,
                 protected_ids=frozenset(batch.keep_ids),
                 retire_ids=frozenset(written) if batch.pre_split is not None else None,
@@ -7553,8 +7549,8 @@ class IngestionWorker:
         # can repeat its misread (#4915, ``2024-0139388`` for a printed
         # ``30-2024-01399388``).  The case-number gate in ``process_event``
         # checks the child's number, from the LLM, the regex fallback or the
-        # parent, against it.  A reingest also moves a ruling off a number
-        # it does not carry when the child found none (#4915).  A scanned
+        # parent, against it.  A write, live or reingest, also moves a
+        # ruling off a number it does not carry (#4915, #5006).  A scanned
         # PDF gives no evidence (``document_evidence``), nor does its OCR
         # text, however long (#4986).
         extra = event_data.get("extra")

@@ -10,6 +10,7 @@ All external dependencies (Postgres, Redis, OpenSearch, S3) are mocked.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,17 @@ import pytest
 
 from framework.enrichment import CaseMatch, EnrichmentResult, JudgeResolution
 from ingestion.worker import IngestionWorker
+
+
+@pytest.fixture(autouse=True)
+def _no_unsupported_case_lookup() -> Iterator[None]:
+    """These tests script the cursor's ``fetchone`` results for the write.
+    A live whole-document write also looks up the ruling's current case
+    (``_should_move_off_unsupported_case``, #5006), which would consume one;
+    ``test_unsupported_case_move.py`` covers that lookup."""
+    with patch("ingestion.worker._should_move_off_unsupported_case", return_value=False):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_ingestion.py patterns)

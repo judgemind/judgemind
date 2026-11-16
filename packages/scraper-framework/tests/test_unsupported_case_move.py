@@ -40,14 +40,34 @@ _REINGEST = {REPLACE_SPLIT_SET_KEY: True}
         # No ruling on another case, or a placeholder one: nothing to move.
         (_REINGEST, (_TEXT,), None, False),
         (_REINGEST, (_TEXT,), "UNKNOWN-doc-1", False),
-        # A live write, a split child, or no checkable text: never.
-        ({}, (_TEXT,), "CVRI2401073", False),
+        # A split child, or no checkable text: never.
         ({**_REINGEST, "_split_processed": True}, (_TEXT,), "CVRI2401073", False),
         (_REINGEST, (), "CVRI2401073", False),
     ],
 )
 def test_should_move_off_unsupported_case(
     event: dict[str, Any], texts: tuple[str, ...], current: str | None, expected: bool
+) -> None:
+    assert _should_move_off_unsupported_case(_conn(current), _write(event, texts), "case-new") is (
+        expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("event", "texts", "current", "expected"),
+    [
+        # The document refutes the held number: a live write moves too (#5006).
+        ({}, (_TEXT,), "CVRI2401073", True),
+        # The document prints it, or cannot settle it: preserve-first (#4788).
+        ({}, (_TEXT,), "CVRI2401570", False),
+        ({}, (), "CVRI2401073", False),
+        # A live split child is written by ``write_split_rulings``.
+        ({"_split_processed": True}, (_TEXT,), "CVRI2401073", False),
+    ],
+    ids=["refuted", "supported", "no-evidence", "split-child"],
+)
+def test_live_write_moves_off_refuted_case(
+    event: dict[str, Any], texts: tuple[str, ...], current: str, expected: bool
 ) -> None:
     assert _should_move_off_unsupported_case(_conn(current), _write(event, texts), "case-new") is (
         expected
