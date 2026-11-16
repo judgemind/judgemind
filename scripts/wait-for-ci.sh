@@ -79,7 +79,8 @@
 #       run has a hard-failure conclusion (failure, timed_out,
 #       action_required), no re-run of an earlier failed check is still
 #       going (#5078), no PR-text check (`closing-refs`, `validate-pr`)
-#       is still running (#5090), and mergeStateStatus is CLEAN, UNSTABLE or
+#       is still running (#5090) or, within 60s of a PR update, not yet
+#       created by GitHub (#5128), and mergeStateStatus is CLEAN, UNSTABLE or
 #       HAS_HOOKS (BLOCKED keeps waiting: GitHub's branch protection is not satisfied yet, so
 #       `gh pr merge` would refuse). Pending entries from other, non-required
 #       check names (Vercel, smoke tests) and `cancelled` checks do not
@@ -179,6 +180,13 @@ AUTO_RERUN=1
 # Non-required checks that judge the PR title/body (.github/workflows/
 # pr-title-check.yml). A pending run of one blocks success (#5090).
 PR_TEXT_CHECKS="closing-refs validate-pr"
+# After a PR edit, GitHub takes a few seconds to create the new PR-text
+# check runs (measured ~4s on PR 5129, #5128); until then neither the REST
+# check-runs list nor the GraphQL rollup shows them. While the PR was
+# updated less than this many seconds ago and no PR-text run has started
+# since, success waits. An update that starts no run (a comment, a label)
+# only delays success by at most this long.
+PR_TEXT_EDIT_GRACE_SECS=60
 
 # Path to this script's directory — used to locate the sibling
 # `classify-ci-flake.sh` helper without depending on PATH.
@@ -284,6 +292,7 @@ fi
 #                       |                    |                   | false→CONFLICTING,
 #                       |                    |                   | null→UNKNOWN
 #     mergeStateStatus  | CLEAN / DIRTY/...  | mergeable_state   | uppercase
+#     updatedAt         | "<ISO-8601 UTC>"   | updated_at        | none (verbatim)
 #
 # Per AC #3 of #4507, only one `info: GraphQL rate-limited, falling back to
 # REST` line is emitted to stderr per script invocation — additional
@@ -358,6 +367,11 @@ gh_pr_view_with_rest_fallback() {
             # match the GraphQL enum.
             rest_field="mergeable_state"
             rest_jq='(.mergeable_state // "unknown") | ascii_upcase'
+            ;;
+        updatedAt)
+            # Same ISO-8601 UTC string in both APIs (#5128).
+            rest_field="updated_at"
+            rest_jq='.updated_at // ""'
             ;;
         *)
             echo "ERROR: gh_pr_view_with_rest_fallback: unsupported field '$field'." >&2
@@ -756,9 +770,7 @@ EOF
     # a `gh pr edit` re-runs them on the same head SHA. A merge while one is
     # still running could ship a body that closes an unrelated issue (the
     # check never gets to fail). So a pending newest run of one of them
-    # blocks success, exactly like a pending `ci-passed`. Limit: a run GitHub
-    # has not created yet (the first seconds after the edit) is invisible
-    # here; only a required status check closes that window.
+    # blocks success, exactly like a pending `ci-passed`.
     PR_TEXT_PENDING_NAMES=$(printf '%s' "$CHECK_RUNS_JSON" | jq -r --arg names "$PR_TEXT_CHECKS" '
         ($names | split(" ") | map(select(length > 0))) as $gate
         | [.[] | select(.status != "completed" and ((.name // "") as $n | any($gate[]; . == $n))) | .name]
@@ -769,6 +781,36 @@ EOF
             CI_PASSED_CONCLUSION="success (waiting for PR-text check(s): ${PR_TEXT_PENDING_NAMES})"
         fi
         CI_PASSED_SUCCESS=false
+    fi
+
+    # PR-text runs not created yet (#5128). GitHub creates the runs for a
+    # `gh pr edit` about 4s after the edit; in that window neither the REST
+    # check-runs list nor the GraphQL rollup shows them (both captured side
+    # by side on PR 5129), so the check above sees nothing pending. The PR's
+    # updatedAt moves at the edit, so: if the PR was updated within
+    # PR_TEXT_EDIT_GRACE_SECS and no PR-text run on this SHA started at or
+    # after that moment, the edit's runs may still be coming; keep waiting.
+    # Only read when everything else is green, to spare API calls.
+    if [ "$CI_PASSED_SUCCESS" = "true" ]; then
+        PR_UPDATED_AT=$(gh_pr_view_with_rest_fallback updatedAt || echo "")
+        PR_TEXT_LAST_STARTED=$(printf '%s' "$CHECK_RUNS_ALL_JSON" | jq -r --arg names "$PR_TEXT_CHECKS" '
+            ($names | split(" ") | map(select(length > 0))) as $gate
+            | [.[] | select((.name // "") as $n | any($gate[]; . == $n)) | (.started_at // "")]
+            | max // ""')
+        if [ -n "$PR_UPDATED_AT" ] && { [ -z "$PR_TEXT_LAST_STARTED" ] || [[ "$PR_TEXT_LAST_STARTED" < "$PR_UPDATED_AT" ]]; }; then
+            PR_UPDATED_EPOCH=$(jq -rn --arg t "$PR_UPDATED_AT" '$t | fromdateiso8601' 2>/dev/null || echo "")
+            # Test hook: WAIT_FOR_CI_EPOCH_FILE holds a fake "now" (epoch secs).
+            if [ -n "${WAIT_FOR_CI_EPOCH_FILE:-}" ]; then
+                read -r NOW_EPOCH < "$WAIT_FOR_CI_EPOCH_FILE"
+            else
+                NOW_EPOCH=$(date -u +%s)
+            fi
+            if [ -n "$PR_UPDATED_EPOCH" ] && [ $((NOW_EPOCH - PR_UPDATED_EPOCH)) -lt "$PR_TEXT_EDIT_GRACE_SECS" ]; then
+                echo "  PR updated at ${PR_UPDATED_AT} and no PR-text check run has started since (newest: ${PR_TEXT_LAST_STARTED:-none}); waiting up to ${PR_TEXT_EDIT_GRACE_SECS}s for GitHub to create the edit's runs"
+                CI_PASSED_CONCLUSION="success (waiting for PR-text runs after the ${PR_UPDATED_AT} PR update)"
+                CI_PASSED_SUCCESS=false
+            fi
+        fi
     fi
 
     # ── Rebase-required fast-path (#4412) ────────────────────────────────────
