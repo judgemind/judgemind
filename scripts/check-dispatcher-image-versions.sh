@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: Dockerfile.dispatcher
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-dispatcher-image-versions.sh — Verify dispatcher image Python ≥ 3.12 and Node ≥ 20.
 #
 # Builds (or accepts) a dispatcher Docker image and asserts that both

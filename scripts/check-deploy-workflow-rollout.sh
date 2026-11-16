@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: .github/workflows/deploy-*.yml
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # permanent: true
 # check-deploy-workflow-rollout.sh — Verify every deploy workflow that pushes
 # an image to ECR also rolls the running ECS service / scheduler.

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/scraper-framework/src/courts/ packages/scraper-framework/src/framework/runner.py
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-scraper-registry.sh — Verify all scraper modules are registered in runner.py.
 #
 # Every Python module under courts/ that exports a default_config function

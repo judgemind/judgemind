@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/api/migrations/
+# (#5088: diff-driven, so the trigger is a PR that changes a migration; check-guard-path-filters.sh checks its CI job runs then.)
 # check-graphql-nullability-drift.sh — Thin wrapper for
 # check-graphql-nullability-drift.py.
 #

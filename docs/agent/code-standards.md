@@ -352,7 +352,7 @@ Even with unique issue-number markers, a 3-way git merge can silently discard on
 - `WATCH_FILES` — hardcoded list of 'appended-list' files to check. Initial entry: `scripts/tests/test_agent_runner_entrypoint.sh`. Add new files here when a new appended-list file is identified.
 - `MARKER_PATTERN` — ERE passed to `grep -E`. Default: `^# Test T(_issue)?[0-9]+`. Override via environment variable if a different file uses a different marker scheme.
 
-**Wiring:** the guard runs in the pre-push hook whenever `scripts/tests/test_agent_runner_entrypoint.sh` is in the pushed diff. It also runs as an explicit CI step (`Check rebase does not silently drop appended-list markers`) in the `scripts-tests` job (python shard). The CI checkout uses `fetch-depth: 0` so `origin/main` is always reachable. On shallow clones (or repos with no `origin/main`), the guard exits 0 gracefully.
+**Wiring:** the guard runs in the pre-push hook whenever `scripts/tests/test_agent_runner_entrypoint.sh` is in the pushed diff. It also runs as an explicit CI step (`Check rebase does not silently drop appended-list markers`) in the unfiltered `repo-guards` job. The CI checkout uses `fetch-depth: 0` so `origin/main` is always reachable. On shallow clones (or repos with no `origin/main`), the guard exits 0 gracefully.
 
 **Fix when the guard fires:** rebase interactively (`git rebase -i origin/main`) and ensure both sides' marker blocks appear in the final result. If the merge heuristics keep collapsing them, add a unique sentinel comment line (e.g. `# --- T_issue<N> end ---`) after each block to give git distinct context to anchor the merge hunks.
 
@@ -551,13 +551,13 @@ See the helper's docstring in the entrypoint for a worked example.
 
 Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the OS bash at 3.2 since 2007 for GPLv3 licensing reasons). Shell scripts in this repo — especially `scripts/check-*.sh` hygiene guards and `scripts/tests/*.sh` unit tests — are run both from CI (ubuntu-latest, bash 5+) and from operator shells. A script that uses a bash 4+ feature passes CI but fails locally with a cryptic message such as `mapfile: command not found` (exit 127) or `bad substitution`.
 
-**`scripts/check-bash-compat.sh` enforces this**, scanning every `scripts/**/*.sh` file for the forbidden constructs below and exiting non-zero on a match. It is wired into the `scripts-tests` CI job (same path filter as the other hygiene checks). Comment lines are exempted, so prose referencing a forbidden token (e.g., "we avoid `mapfile` because...") is fine.
+**`scripts/check-bash-compat.sh` enforces this**, scanning every `scripts/**/*.sh` file for the forbidden constructs below and exiting non-zero on a match. It is wired into the unfiltered `repo-guards` CI job, so it runs on every PR (#5088). Comment lines are exempted, so prose referencing a forbidden token (e.g., "we avoid `mapfile` because...") is fine.
 
 #### `scripts-tests` matrix shards
 
 The `scripts-tests` CI job runs two parallel matrix shards to keep wall-clock time under 600 s (issue #3307):
 
-- **`python` shard** — both `pytest` suites (`scripts/tests/` and `scripts/dispatcher/tests/`) plus all 11 inline shell hygiene guards (`check-aws-bool-flags.sh`, `check-bash-compat.sh`, etc.). The dispatcher daemon suite uses `pytest-xdist` (`-n auto`) because all tests are `monkeypatch`/`tmp_path`-based and contain no `os.chdir` calls. Estimated wall-clock ~200 s.
+- **`python` shard** — both `pytest` suites (`scripts/tests/` and `scripts/dispatcher/tests/`) and `check-no-test-leaked-worktrees.sh`, which inspects what those suites left behind. The repo-scanning hygiene guards (`check-aws-bool-flags.sh`, `check-bash-compat.sh`, etc.) moved to the unfiltered `repo-guards` job (#5088). The dispatcher daemon suite uses `pytest-xdist` (`-n auto`) because all tests are `monkeypatch`/`tmp_path`-based and contain no `os.chdir` calls. Estimated wall-clock ~200 s.
 - **`shell` shard** — `scripts/run-scripts-tests.sh` only (60 shell tests auto-discovered under `scripts/tests/*.sh`). Dominated by `test_agent_runner_entrypoint.sh` (~275 s) and `test_check_dispatcher_image_versions.sh` (~58 s). Estimated wall-clock ~395 s.
 
 Both shards inherit the same `needs: detect-changes` / `scripts == 'true'` path filter. GH Actions aggregates the two matrix expansions under the single `scripts-tests` name, so the `ci-passed` `needs:` list does not need updating.
@@ -592,6 +592,16 @@ The peer guard tests under `scripts/tests/test_check_*.sh` include a self-match 
 **Canonical repo-walk exclusion list (#4308).** Any new `scripts/check-*.sh` that runs `grep -rEn` over the repo must consume `REPO_WALK_EXCLUSIONS` from `scripts/preflight.sh` rather than hand-rolling its own `--exclude-dir=` list. The canonical baseline (`.git`, `.venv`, `.venv-scripts`, `node_modules`, `__pycache__`, `.next`, `.claude`, `.vite`, `tmp`, `dist`, `build`) is repo-wide policy — duplicating it across 10+ scripts is what caused #4300 (a missed `.claude` exclusion took main CI red for ~30 minutes). Per-check augmentations stay local to the script via `EXTRA_EXCLUDE_DIRS=(...)` appended to the canonical iteration. The hygiene gate `scripts/check-repo-walk-exclusions-canonical.sh` enforces the contract — see the `REPO_WALK_EXCLUSIONS` docstring in `scripts/preflight.sh` for the consumer pattern.
 
 **Canonical shape for `ci-passed.needs:` (#4444).** The `ci-passed` aggregator job in `.github/workflows/ci.yml` lists every CI job as a YAML block list (one job per line) — NOT the inline flow form `needs: [a, b, c]`. The block-list shape is the canonical form because parallel guard-adding PRs always edit two co-located fields (the new job block + the new `needs:` entry); the inline form forced both PRs to rewrite the same ~3-KB line, producing a guaranteed merge conflict on the second PR. The block-list shape lets non-adjacent insertions auto-merge, and reduces same-spot conflicts (both PRs append at the end) to a trivially-resolvable 1-line-vs-1-line shape (~12 lines including the adjacent job-block insertion). When appending a new entry, add it at the end of the list (or grouped near related entries) — alphabetical ordering is intentionally not enforced. The parser in `scripts/check-ci-passed-coverage.py` accepts both forms so any future workflow that stays on the inline shape still passes the guard.
+
+#### Where a guard runs: `repo-guards` or a declared `# scans:` (#5088)
+
+A guard only protects the PRs whose CI run includes it. Wire a new `scripts/check-*` guard into the unfiltered `repo-guards` job in `.github/workflows/ci.yml` (no `if:` on `detect-changes` outputs; stdlib only, no venv). Put it in a path-filtered job only when it reads nothing outside that job's filter, and then declare what it reads near the top of the script:
+
+```bash
+# scans: packages/api/src/ scripts/dispatcher/daemon.py
+```
+
+A path ending in `/` means everything below it; `*` and `**` work. `scripts/check-guard-path-filters.sh` (last step of `repo-guards`, and in pre-push via `run-ci-guards.sh`) fails when a guard runs only in path-filtered jobs (detect-changes `if:` gates or a workflow's `on.pull_request.paths`) and either has no `# scans:` line or declares a path no filter covers. The bug it prevents: the S3-delete and page-cap guards scan `packages/*/src` but ran only inside `scripts-tests`, so a PR touching only `packages/*/src` skipped both.
 
 #### Hygiene-check guards: Fix-block contract
 

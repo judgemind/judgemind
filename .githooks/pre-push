@@ -1236,13 +1236,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done
 
 # -------------------------------------------------------------------
-# scripts/tests in CI's minimal environment (#5045) — run whenever a
-# scripts/**/*.py file, anything under scripts/tests/, the venv helper or
-# judgemind-config (installed into that environment) changes. A background
-# job, so it overlaps the CI guard umbrella. See scripts_tests_checks.
+# scripts/tests in CI's minimal environment (#5045) — run whenever a path
+# in CI's `scripts` paths-filter changes (the filter that gates CI's
+# scripts-tests job: scripts/**, .claude/skills/**, the preflight hooks,
+# the dispatcher Dockerfiles, package tests, the ecs-deploy action), or
+# judgemind-config (installed into that environment). A narrower trigger
+# let an edit to only scripts/*.sh or .claude/skills/** pass pre-push and
+# go red in CI (#5088); scripts/tests/test_pre_push_scripts_tests_trigger.py
+# keeps this regex in step with the CI filter. A background job, so it
+# overlaps the CI guard umbrella. See scripts_tests_checks.
 # -------------------------------------------------------------------
 changed_scripts_tests_inputs=$(echo "$changed_files" \
-    | grep -E '^(scripts/.*\.py|scripts/tests/.*|scripts/ensure-scripts-tests-venv\.sh|packages/judgemind-config/.*)$' || true)
+    | grep -E '^(scripts/.*|\.claude/skills/.*|\.claude/hooks/preflight.*|Dockerfile\.dispatcher.*|packages/[^/]+/tests/.*|\.github/actions/ecs-deploy/.*|packages/judgemind-config/.*)$' || true)
 if [ -n "$changed_scripts_tests_inputs" ]; then
     if [ "${PREPUSH_SCRIPTS_TESTS:-1}" = "0" ]; then
         echo "pre-push: WARNING: PREPUSH_SCRIPTS_TESTS=0, so scripts/tests did not run; CI still runs it (#5045)" >&2

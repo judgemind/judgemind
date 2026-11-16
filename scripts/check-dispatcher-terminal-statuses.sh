@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/dispatcher/daemon.py packages/api/src/graphql/dispatcher/ packages/web/src/app/(main)/admin/dispatcher/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-dispatcher-terminal-statuses.sh — Assert that the terminal-status
 # lists in Python and TypeScript stay in sync.
 #

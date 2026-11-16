@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/tests/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-manual-sys-modules-mock.sh — Forbid the manual
 # ``sys.modules["<name>"] = <mock>`` mocking anti-pattern at module
 # level in scripts/tests/test_*.py (#4434).

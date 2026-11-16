@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/api/src/ packages/api/tests/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-test-statuscode-assertions.sh — Forbid HTTP-status-naming test titles
 # that lack a corresponding `statusCode` assertion in the test body.
 #

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/api/src/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-api-github-fetch.sh — Forbid GitHub API calls from the API container.
 #
 # The API container (packages/api/src/) must not call GitHub's REST API

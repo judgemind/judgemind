@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/*.py packages/scraper-framework/src/framework/s3_keys.py
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-duplicate-framework-helpers.sh — Forbid scripts/*.py from
 # re-defining names exported by ``framework.s3_keys``.
 #

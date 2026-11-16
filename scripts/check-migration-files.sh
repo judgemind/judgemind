@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/api/migrations/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-migration-files.sh — Validate migration file naming and sequencing.
 #
 # Checks:
