@@ -201,6 +201,8 @@ class TestGovernorAppointmentsSkip:
 
             event = _make_governor_event(
                 scraper_id="ca-la-tentatives-civil",
+                # The governor key prefix alone routes to the bio path (#5016).
+                s3_key="ca/los_angeles/superior_court/raw/la123.html",
                 county="Los Angeles",
                 court="Superior Court",
                 case_number="24STCV00001",

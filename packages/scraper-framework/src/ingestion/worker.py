@@ -2300,6 +2300,31 @@ def _counts_toward_error_cap(cause: BaseException) -> bool:
     return not isinstance(cause, (*_INFRA_PG_ERRORS, ExtractorUnavailableError))
 
 
+#: Live scraper id of the governor press-release scraper (#3688).
+GOVERNOR_APPOINTMENTS_SCRAPER_ID = "ca-governor-appointments"
+#: Raw-key prefix that scraper archives under (state ``CA``, county
+#: ``Statewide``, court ``Governor``, sluggified by ``S3Archiver``).
+GOVERNOR_APPOINTMENTS_KEY_PREFIX = "ca/statewide/governor/"
+
+
+def is_governor_appointment_event(event_data: dict[str, Any]) -> bool:
+    """Whether *event_data* is a governor press release, not a ruling (#5016).
+
+    The answer must not depend on which entry point built the event.  A
+    live event carries the scraper id as ``scraper_id``; ``rebuild_db`` and
+    ``reingest_from_s3`` set ``scraper_id`` to ``rebuild-…`` / ``reingest-…``
+    and carry the live id only as ``capture_scraper_id`` (from the raw
+    object's metadata), and a local-cache rebuild has no metadata at all.
+    The raw key's prefix covers that last case.
+    """
+    if GOVERNOR_APPOINTMENTS_SCRAPER_ID in (
+        event_data.get("scraper_id"),
+        event_data.get("capture_scraper_id"),
+    ):
+        return True
+    return str(event_data.get("s3_key") or "").startswith(GOVERNOR_APPOINTMENTS_KEY_PREFIX)
+
+
 def _client_socket_timeout(redis_client: Any) -> float | None | object:
     """Best-effort read of a redis-py client's configured socket_timeout.
 
@@ -4048,13 +4073,17 @@ class IngestionWorker:
         # pollutes derived.rulings (178 rows as of 2026-04-28). Raw HTML is
         # preserved in S3 + staging.captures so #2144 can recover appointee
         # data via courts.ca.governor_appointments.parse_appointees().
+        # Rebuild and reingest events carry a rebuild-/reingest- scraper_id,
+        # so the check also reads capture_scraper_id and the key (#5016).
         scraper_id: str = event_data.get("scraper_id", "")
-        if scraper_id == "ca-governor-appointments":
+        if is_governor_appointment_event(event_data):
             logger.info(
                 "Routing governor-appointment document to bio path (skipping ruling extraction)",
                 extra={
                     "document_id": event_data["document_id"],
                     "scraper_id": scraper_id,
+                    "capture_scraper_id": event_data.get("capture_scraper_id"),
+                    "s3_key": event_data.get("s3_key"),
                     "telemetry_event": "governor_appointment_routed_to_bio_path",
                 },
             )
