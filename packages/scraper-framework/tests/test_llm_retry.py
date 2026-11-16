@@ -8,6 +8,7 @@ class-name check pass its tests while retrying nothing in production.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import anthropic
@@ -25,6 +26,8 @@ from ingestion.llm_retry import (
     KIND_SERVER_ERROR,
     KIND_TIMEOUT,
     MAX_DELAY,
+    MAX_RETRY_AFTER,
+    MAX_TOTAL_WAIT,
     backoff_delay,
     call_with_retries,
     classify_error,
@@ -265,13 +268,26 @@ class TestClassifyAnthropicError:
 
 
 class TestBackoffDelay:
+    def test_base_delay_is_two_seconds(self) -> None:
+        assert llm_retry.BASE_DELAY == 2.0
+
     def test_exponential_with_jitter_bounds(self) -> None:
-        for attempt, step in [(0, 1.0), (1, 2.0), (2, 4.0)]:
+        base = llm_retry.BASE_DELAY
+        for attempt in (0, 1, 2):
+            step = base * 2**attempt
             assert backoff_delay(attempt, rand=lambda: 0.0) == step / 2
             assert backoff_delay(attempt, rand=lambda: 1.0) == step
 
     def test_retry_after_raises_the_wait(self) -> None:
         assert backoff_delay(0, 9.0, rand=lambda: 0.0) == 9.0
+
+    def test_retry_after_above_max_delay_honoured(self) -> None:
+        """MAX_DELAY caps only the computed backoff, not a server retry-after."""
+        assert MAX_DELAY < 45.0 < MAX_RETRY_AFTER
+        assert backoff_delay(0, 45.0, rand=lambda: 0.0) == 45.0
+
+    def test_retry_after_clamped_to_max_retry_after(self) -> None:
+        assert backoff_delay(0, MAX_RETRY_AFTER + 100, rand=lambda: 0.0) == MAX_RETRY_AFTER
 
     def test_capped(self) -> None:
         assert backoff_delay(20, rand=lambda: 1.0) == MAX_DELAY
@@ -303,11 +319,134 @@ class TestCallWithRetries:
         assert clock.sleeps == []
 
     def test_exhausted_reraises_last(self) -> None:
+        """503 is a congestion status: at least CONGESTION_MIN_RETRIES retries."""
         clock = FakeClock()
         fn = MagicMock(side_effect=_genai_error(503))
         with pytest.raises(genai_errors.ServerError):
             call_with_retries(fn, max_retries=2, event_prefix="t.", sleep=clock.sleep, clock=clock)
+        assert fn.call_count == llm_retry.CONGESTION_MIN_RETRIES + 1
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [lambda: _genai_error(500), lambda: status_error(502), lambda: httpx.ReadTimeout("t")],
+    )
+    def test_non_congestion_error_keeps_caller_max_retries(
+        self, make_exc: Callable[[], Exception]
+    ) -> None:
+        clock = FakeClock()
+        fn = MagicMock(side_effect=make_exc())
+        with pytest.raises(Exception):  # noqa: B017 — type varies by case
+            call_with_retries(fn, max_retries=2, event_prefix="t.", sleep=clock.sleep, clock=clock)
         assert fn.call_count == 3
+        assert len(clock.sleeps) == 2
+
+    def test_max_retries_zero_opts_out_for_congestion(self) -> None:
+        clock = FakeClock()
+        fn = MagicMock(side_effect=status_error(529))
+        with pytest.raises(anthropic.OverloadedError):
+            call_with_retries(fn, max_retries=0, event_prefix="t.", sleep=clock.sleep, clock=clock)
+        assert fn.call_count == 1
+        assert clock.sleeps == []
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [
+            lambda: _genai_error(
+                429,
+                details=[
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "45s"}
+                ],
+            ),
+            lambda: status_error(429, headers={"retry-after": "45"}),
+        ],
+        ids=["gemini_retry_info", "anthropic_header"],
+    )
+    def test_429_retry_after_45s_within_deadline_is_retried(
+        self, make_exc: Callable[[], Exception]
+    ) -> None:
+        """AC1 (#5096): a 45 s retry-after that fits before the deadline is honoured."""
+        clock = FakeClock(now=100.0)
+        calls: list[float | None] = []
+
+        def fn(attempt_timeout: float | None) -> str:
+            calls.append(attempt_timeout)
+            if len(calls) == 1:
+                raise make_exc()
+            return "ok"
+
+        result = call_with_retries(
+            fn,
+            max_retries=2,
+            deadline=clock.now + 120.0,
+            event_prefix="t.",
+            sleep=clock.sleep,
+            clock=clock,
+        )
+        assert result == "ok"
+        assert clock.sleeps == [45.0]
+        assert len(calls) == 2
+
+    def test_retry_after_45s_past_deadline_not_waited(self) -> None:
+        clock = FakeClock(now=100.0)
+        fn = MagicMock(side_effect=status_error(429, headers={"retry-after": "45"}))
+        with pytest.raises(anthropic.RateLimitError):
+            call_with_retries(
+                fn,
+                max_retries=2,
+                deadline=clock.now + 30.0,
+                event_prefix="t.",
+                sleep=clock.sleep,
+                clock=clock,
+            )
+        assert fn.call_count == 1
+        assert clock.sleeps == []
+
+    def test_total_wait_capped_without_deadline(self) -> None:
+        """Repeated 45 s retry-afters: the second wait would pass MAX_TOTAL_WAIT."""
+        assert 45.0 < MAX_TOTAL_WAIT < 90.0
+        clock = FakeClock()
+        fn = MagicMock(side_effect=status_error(429, headers={"retry-after": "45"}))
+        with pytest.raises(anthropic.RateLimitError):
+            call_with_retries(fn, max_retries=2, event_prefix="t.", sleep=clock.sleep, clock=clock)
+        assert clock.sleeps == [45.0]
+        assert fn.call_count == 2
+
+    @pytest.mark.parametrize("jitter", [0.0, 1.0])
+    @pytest.mark.parametrize(
+        "make_exc",
+        [lambda: status_error(529), lambda: _genai_error(503)],
+        ids=["anthropic_529", "gemini_503"],
+    )
+    def test_congestion_storm_of_8s_ridden_out(
+        self, make_exc: Callable[[], Exception], jitter: float
+    ) -> None:
+        """AC2 (#5096): an 8 s overload storm does not fail the call at max_retries=2."""
+        clock = FakeClock(now=100.0)
+        start = clock.now
+
+        def fn(attempt_timeout: float | None) -> str:
+            if clock.now - start < 8.0:
+                raise make_exc()
+            return "ok"
+
+        result = call_with_retries(
+            fn,
+            max_retries=2,
+            event_prefix="t.",
+            sleep=clock.sleep,
+            clock=clock,
+            rand=lambda: jitter,
+        )
+        assert result == "ok"
+        assert sum(clock.sleeps) <= MAX_TOTAL_WAIT
+
+    def test_effective_limit_logged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        logger = MagicMock()
+        monkeypatch.setattr(llm_retry, "logger", logger)
+        clock = FakeClock()
+        fn = MagicMock(side_effect=[status_error(529), "ok"])
+        call_with_retries(fn, max_retries=2, event_prefix="p.", sleep=clock.sleep, clock=clock)
+        assert logger.warning.call_args.kwargs["max_retries"] == llm_retry.CONGESTION_MIN_RETRIES
 
     def test_deadline_bounds_total_time(self) -> None:
         """Retries stop once the next wait plus an attempt would pass the deadline."""
@@ -346,14 +485,16 @@ class TestCallWithRetries:
             call_with_retries(fn, max_retries=2, deadline=10.5, event_prefix="t.", clock=clock)
         fn.assert_not_called()
 
-    def test_long_retry_after_not_waited(self) -> None:
-        """A server asking for more than MAX_DELAY is a quota window: fail now."""
+    def test_retry_after_beyond_max_retry_after_not_waited(self) -> None:
+        """A server asking for more than MAX_RETRY_AFTER (e.g. a daily quota
+        window) is not waited for: fail now, zero retries."""
         clock = FakeClock()
-        exc = _genai_error(429, headers={"Retry-After": str(int(MAX_DELAY) + 30)})
+        exc = _genai_error(429, headers={"Retry-After": str(int(MAX_RETRY_AFTER) + 25)})
         fn = MagicMock(side_effect=exc)
         with pytest.raises(genai_errors.ClientError):
             call_with_retries(fn, max_retries=3, event_prefix="t.", sleep=clock.sleep, clock=clock)
         assert fn.call_count == 1
+        assert clock.sleeps == []
 
     def test_retry_log_events(self, monkeypatch: pytest.MonkeyPatch) -> None:
         logger = MagicMock()

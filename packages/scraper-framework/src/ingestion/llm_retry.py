@@ -37,12 +37,17 @@ finish reason, a ``MAX_TOKENS`` cut-off) are not exceptions at all: they
 come back as an ``LLMResponse`` and are handled by the callers (#5007,
 #5046), never retried here.
 
-The waits are exponential with jitter, raised to the server's
-``Retry-After`` / ``retry-after-ms`` header or ``RetryInfo.retryDelay``
-when it gives one.  A retry is never started when the wait would run past
-the caller's *deadline* (a ``time.monotonic()`` value, e.g. the OCR run
-budget), and each attempt's HTTP timeout is shortened to the time left, so
-the deadline holds.
+The waits are exponential with jitter (base 2 s, capped at 30 s), raised
+to the server's ``Retry-After`` / ``retry-after-ms`` header or
+``RetryInfo.retryDelay`` when it gives one.  A server retry-after is
+honoured up to 65 s (Gemini per-minute quota windows); a longer one (a
+daily quota) fails the call at once.  Congestion statuses (429, 503, 529)
+get at least 4 retries when the caller allows any (#5096).  The total
+slept in one call is capped at 75 s, deadline or not, so callers without a
+deadline stay bounded.  A retry is never started when the wait would run
+past the caller's *deadline* (a ``time.monotonic()`` value, e.g. the OCR
+run budget), and each attempt's HTTP timeout is shortened to the time left,
+so the deadline holds.
 
 The SDKs' own retries are deliberately off: google-genai's
 ``HttpOptions.retry_options`` is left unset (its default), and every
@@ -74,12 +79,37 @@ logger = structlog.get_logger(__name__)
 # Anthropic's "overloaded").
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 
-# First backoff step (seconds); attempt n waits about BASE * 2**n.
-BASE_DELAY = 1.0
+# First backoff step (seconds); attempt n waits BASE * 2**n with equal
+# jitter: 1-2 s, 2-4 s, 4-8 s, 8-16 s (#5096: at 1 s a 529 episode got
+# only ~3 s of retries).
+BASE_DELAY = 2.0
 
-# No single wait is longer than this.  A server asking for a longer pause
-# (a quota window, not a blip) is not waited for: the call fails now.
+# Cap on the computed exponential backoff only.  A server retry-after is
+# bounded by MAX_RETRY_AFTER instead.
 MAX_DELAY = 30.0
+
+# A server retry-after up to this is honoured: Gemini per-minute quota
+# windows reset within 60 s (5 s margin).  A longer retry-after (e.g. a
+# daily quota window) is not waited for: the call fails now, zero retries.
+MAX_RETRY_AFTER = 65.0
+
+# Congestion statuses (rate limit 429, Gemini's "model is overloaded" 503
+# UNAVAILABLE, Anthropic's "overloaded" 529) get at least this many retries
+# whenever the caller allows any (max_retries > 0).  Other retryable errors
+# keep the caller's max_retries.
+CONGESTION_STATUS_CODES: frozenset[int] = frozenset({429, 503, 529})
+CONGESTION_MIN_RETRIES = 4
+
+# Cumulative seconds one call_with_retries call may sleep, deadline or not.
+# Callers without a deadline (llm_extractor chunk calls) are otherwise
+# bounded only by retries x waits (4 x 65 s).  75 s fits one full 65 s
+# quota wait plus a few backoffs, and stays under the worker's 105 s SIGTERM
+# grace (shutdown.SHUTDOWN_GRACE_S), so a call that is waiting when the stop
+# arrives can usually still finish.  The message lease is renewed by a
+# separate heartbeat thread (worker.py), so sleeping here never loses it;
+# the cap is about not wasting the grace window and not stalling a message
+# for minutes.
+MAX_TOTAL_WAIT = 75.0
 
 # An attempt with less time than this left before the deadline is not
 # started: it could not finish.
@@ -202,13 +232,22 @@ def backoff_delay(
     """Wait before retry number *attempt* + 1 (*attempt* counts from 0).
 
     Exponential (``BASE_DELAY * 2**attempt``) with equal jitter (half the
-    step fixed, half random), at least *retry_after*, at most ``MAX_DELAY``.
+    step fixed, half random), capped at ``MAX_DELAY``; then raised to
+    *retry_after* (itself capped at ``MAX_RETRY_AFTER``) when one is given.
     """
     step = BASE_DELAY * (2**attempt)
-    delay = step / 2 + rand() * step / 2
+    delay = min(step / 2 + rand() * step / 2, MAX_DELAY)
     if retry_after is not None:
-        delay = max(delay, retry_after)
-    return min(delay, MAX_DELAY)
+        delay = max(delay, min(retry_after, MAX_RETRY_AFTER))
+    return delay
+
+
+def _retry_limit(max_retries: int, decision: RetryDecision) -> int:
+    """Retries allowed for this error: congestion statuses get at least
+    ``CONGESTION_MIN_RETRIES`` unless the caller opted out (``0``)."""
+    if max_retries > 0 and decision.status in CONGESTION_STATUS_CODES:
+        return max(max_retries, CONGESTION_MIN_RETRIES)
+    return max_retries
 
 
 def call_with_retries[T](
@@ -220,21 +259,31 @@ def call_with_retries[T](
     event_prefix: str,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    rand: Callable[[], float] | None = None,
 ) -> T:
     """``fn(attempt_timeout)``, retried on transient errors.
 
     *fn* gets the HTTP timeout for this attempt: *timeout*, shortened to
     the time left before *deadline* (``None`` when neither is set).  At most
-    *max_retries* retries follow the first attempt.  Each retry logs
-    ``<event_prefix>rate_limit`` (429) or ``<event_prefix>unavailable``
-    (5xx, timeouts, dropped connections).  The last exception is re-raised
-    when the error is not retryable, the retries are used up, or the next
+    *max_retries* retries follow the first attempt, except that a 429, 503
+    or 529 gets at least ``CONGESTION_MIN_RETRIES`` when *max_retries* > 0
+    (``0`` still means no retries).  Waits are :func:`backoff_delay` (base
+    2 s, capped at 30 s, raised to a server retry-after up to 65 s); the
+    total slept in one call never exceeds ``MAX_TOTAL_WAIT``.  Each retry
+    logs ``<event_prefix>rate_limit`` (429) or ``<event_prefix>unavailable``
+    (5xx, timeouts, dropped connections) with the effective limit as
+    ``max_retries``.  The last exception is re-raised when the error is not
+    retryable, the retries are used up, the server's retry-after exceeds
+    ``MAX_RETRY_AFTER``, the wait would pass ``MAX_TOTAL_WAIT``, or the next
     attempt would not fit before *deadline*; a :class:`TimeoutError` is
-    raised when no attempt fits at all.
+    raised when no attempt fits at all.  *rand* (default
+    :func:`random.random`) is the jitter source, injectable for tests.
     """
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
+    rand = rand or random.random
     attempt = 0
+    waited = 0.0
     while True:
         attempt_timeout = timeout
         if deadline is not None:
@@ -246,22 +295,28 @@ def call_with_retries[T](
             return fn(attempt_timeout)
         except Exception as exc:
             decision = classify_error(exc)
-            if not decision.retryable or attempt >= max_retries:
+            if not decision.retryable:
                 raise
-            if decision.retry_after is not None and decision.retry_after > MAX_DELAY:
+            limit = _retry_limit(max_retries, decision)
+            if attempt >= limit:
                 raise
-            wait = backoff_delay(attempt, decision.retry_after)
+            if decision.retry_after is not None and decision.retry_after > MAX_RETRY_AFTER:
+                raise
+            wait = backoff_delay(attempt, decision.retry_after, rand=rand)
+            if waited + wait > MAX_TOTAL_WAIT:
+                raise
             if deadline is not None and clock() + wait + MIN_ATTEMPT_SECONDS > deadline:
                 raise
             event = "rate_limit" if decision.kind == KIND_RATE_LIMIT else "unavailable"
             logger.warning(
                 f"{event_prefix}{event}",
                 attempt=attempt + 1,
-                max_retries=max_retries,
+                max_retries=limit,
                 retry_in=round(wait, 2),
                 status=decision.status,
                 kind=decision.kind,
                 error=str(exc)[:300],
             )
             sleep(wait)
+            waited += wait
             attempt += 1

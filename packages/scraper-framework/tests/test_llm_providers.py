@@ -35,6 +35,7 @@ from ingestion.llm_providers import (
     new_anthropic_client,
     without_sdk_retries,
 )
+from ingestion.llm_retry import CONGESTION_MIN_RETRIES
 
 # ---------------------------------------------------------------------------
 # Anthropic adapter tests
@@ -1011,7 +1012,8 @@ class TestGenaiErrorsRetry:
         result = _call_google("sys", "user", "test-model", client=client, max_retries=2)
 
         assert result is None
-        assert client.models.generate_content.call_count == 3  # 1 + 2 retries
+        # 503 is a congestion status: at least CONGESTION_MIN_RETRIES retries (#5096).
+        assert client.models.generate_content.call_count == 1 + CONGESTION_MIN_RETRIES
 
     def test_genai_errors_timeouts_and_resets_are_retried(self, no_sleep: MagicMock) -> None:
         client = MagicMock()
@@ -1292,9 +1294,10 @@ class TestAnthropicRetryPolicy:
             result = _call_anthropic("sys", "user", "test-model", client=client, max_retries=2)
 
         assert result is None
-        assert client.messages.create.call_count == 3  # 1 + 2 retries
+        # 529 is a congestion status: at least CONGESTION_MIN_RETRIES retries (#5096).
+        assert client.messages.create.call_count == 1 + CONGESTION_MIN_RETRIES
         events = [(e["event"], e.get("status")) for e in logs]
-        assert events.count(("llm_providers.anthropic_unavailable", 529)) == 2
+        assert events.count(("llm_providers.anthropic_unavailable", 529)) == CONGESTION_MIN_RETRIES
         assert events[-1] == ("llm_providers.anthropic_api_error", 529)
 
     def test_anthropic_rate_limit_log_event(self, no_sleep: MagicMock) -> None:
@@ -1728,7 +1731,8 @@ class TestProviderErrorsStillReturnNone:
         result = _call_anthropic_with_images("sys", "u", _IMAGES, "m", client=client, max_retries=1)
 
         assert result is None
-        assert client.messages.create.call_count == 2
+        # 529 is a congestion status: at least CONGESTION_MIN_RETRIES retries (#5096).
+        assert client.messages.create.call_count == 1 + CONGESTION_MIN_RETRIES
 
     def test_google_vision_transport_errors_exhausted_return_none(
         self, no_sleep: MagicMock
