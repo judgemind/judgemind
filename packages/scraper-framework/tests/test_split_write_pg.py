@@ -244,6 +244,75 @@ def test_new_real_case_relinks_only_on_replacement(conn: object) -> None:
     assert key.rulings()[key.slot(0)][2] == "30-E-9"  # replacement: relink
 
 
+#: A document text that prints the second ruling's number but not the
+#: first's (``CIVSB2600093`` is an example number from a county prompt that
+#: an LLM filed a ruling under before the case-number gate, #5006).
+_INVENTED = "CIVSB2600093"
+_DOC_TEXT = (
+    "SUPERIOR COURT OF CALIFORNIA, COUNTY OF SAN BERNARDINO. Tentative rulings. "
+    "1. Smith v. Jones, motion to compel. 2. Case 30-G-2, Doe v. Roe, demurrer. "
+    + "The court has read and considered the papers filed. "
+    * 4
+)
+
+
+@pytest.mark.parametrize(
+    ("evidence", "kept"),
+    [
+        # The document's text refutes the held number: the ruling moves to
+        # the child's placeholder case on a live write too (#5006).
+        ((_DOC_TEXT,), False),
+        # The text prints the held number: preserve-first keeps it (#4788).
+        ((_DOC_TEXT + f" Case {_INVENTED}.",), True),
+        # No evidence (a scanned PDF, a deterministic child): keep (#4788).
+        ((), True),
+    ],
+    ids=["refuted", "supported", "no-evidence"],
+)
+def test_live_write_moves_off_a_refuted_case_number(
+    conn: object, evidence: tuple[str, ...], kept: bool
+) -> None:
+    """#5006: a live (non-relink) split write whose child evidence refutes
+    the held real case number moves the ruling to the child's case.  The
+    row moves in place, so its alert keeps its ``ruling_id``.  A held number
+    the evidence supports, or one with no evidence, keeps preserve-first."""
+    key = Key(conn)
+    key.write([(_INVENTED, _text(1)), ("30-G-2", _text(2))])
+    ruling_id = key.rulings()[key.slot(0)][0]
+    alert = _alert(conn, ruling_id, key.slot(0))
+
+    key.write(
+        [(None, _text(1), {"case_number_evidence": evidence}), ("30-G-2", _text(2))],
+        relink=False,
+    )
+    rid, _text_now, number, _status = key.rulings()[key.slot(0)]
+    assert rid == ruling_id
+    if kept:
+        assert number == _INVENTED
+    else:
+        assert number == f"UNKNOWN-{key.slot(0)}"
+    assert _alert_target(conn, alert) == (ruling_id, key.slot(0))
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [((_DOC_TEXT,), "30-G-2"), ((_DOC_TEXT + f" Case {_INVENTED}.",), _INVENTED), ((), _INVENTED)],
+    ids=["refuted", "supported", "no-evidence"],
+)
+def test_live_write_moves_off_a_refuted_case_number_to_a_real_one(
+    conn: object, evidence: tuple[str, ...], expected: str
+) -> None:
+    """#5006: when the child found a different real number, a live write
+    keeps the held one (#2475) only while the evidence does not refute it."""
+    key = Key(conn)
+    key.write([(_INVENTED, _text(1)), ("30-G-2", _text(2))])
+    key.write(
+        [("30-G-2", _text(1), {"case_number_evidence": evidence}), ("30-G-2", _text(2))],
+        relink=False,
+    )
+    assert key.rulings()[key.slot(0)][2] == expected
+
+
 def test_dropped_ruling_is_removed_and_its_alert_detached(conn: object) -> None:
     key = Key(conn)
     key.write([("30-F-1", _text(1)), ("30-F-2", _text(2))])

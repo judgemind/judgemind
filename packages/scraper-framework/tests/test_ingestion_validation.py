@@ -7,7 +7,10 @@ between enrichment and DB write, handles all validation outcomes
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from ingestion.worker import IngestionWorker
 from validation.gate import ValidationResult
@@ -15,6 +18,16 @@ from validation.gate import ValidationResult
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_unsupported_case_lookup() -> Iterator[None]:
+    """These tests script the cursor's ``fetchone`` results for the write.
+    A live whole-document write also looks up the ruling's current case
+    (``_should_move_off_unsupported_case``, #5006), which would consume one;
+    ``test_unsupported_case_move.py`` covers that lookup."""
+    with patch("ingestion.worker._should_move_off_unsupported_case", return_value=False):
+        yield
 
 
 def _make_event(**overrides: object) -> dict:

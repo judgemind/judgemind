@@ -41,9 +41,10 @@ properties that must hold for any sequence of re-splits:
 - ``evidence``: after a step whose document text can settle a case number
   (``MIN_DOCUMENT_TEXT_CHARS`` or more), every ruling on the key is filed
   under a number that text prints, or under its ``UNKNOWN-`` case (#4907,
-  #4915, #4927).  A live step keeps an established case link
-  (preserve-first, #2475), so on a live step a ruling that kept its row and
-  its case is exempt.  An LLM's misread or invented number, whichever
+  #4915, #4927), on a live step as on a reingest (#5006).  A scraper's
+  pre-split child keeps an established case link (preserve-first, #2475),
+  so on a ``presplit`` step a ruling that kept its row and its case is
+  exempt.  An LLM's misread or invented number, whichever
   extractor (the LLM split, the regex fallback over the LLM's
   transcription, the fuzzy correction) produced it, breaks it.
 - ``judge_converge``: a court's rulings of one roster judge, whatever
@@ -2566,9 +2567,10 @@ class KeyHarness:
         """Every ruling is filed under a number the document prints, or under
         its ``UNKNOWN-`` case, once the document's text can settle it.
 
-        A live step keeps an established case link (preserve-first, #2475,
-        #4788): a ruling that kept its row and its case on a live step is
-        exempt.  A reingest moves it off a number its document lacks (#4915).
+        A reingest and a live step both move a ruling off a number its
+        document lacks (#4915, #5006).  A scraper's pre-split child keeps an
+        established case link (preserve-first, #2475, #4788): a ruling that
+        kept its row and its case on a ``presplit`` step is exempt.
         """
         if not doc_is_evidence(doc):
             return
@@ -2577,7 +2579,7 @@ class KeyHarness:
             number = r.case_number
             if not r.ruling_id or not number or number.startswith("UNKNOWN-"):
                 continue
-            if step.kind in ("live", "presplit") and (r.ruling_id, number) in held:
+            if step.kind == "presplit" and (r.ruling_id, number) in held:
                 continue
             if not case_number_supported_by_text(number, doc):
                 self._fail(

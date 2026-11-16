@@ -1093,13 +1093,15 @@ def _rulings_with_alerts(h: harness.KeyHarness, key: harness.Key) -> list[tuple]
         return cur.fetchall()
 
 
-def _run_misread_then_reingest(stored: str, *, tag: str, text: str | None = None) -> list[tuple]:
+def _run_misread_then_reingest(
+    stored: str, *, tag: str, text: str | None = None, kind: str = "reingest"
+) -> list[tuple]:
     """Store a ruling under *stored* the way a run before #4907 did (no
-    usable document text, so no check), then reingest the key with the
-    document text printing ``_PRINTED`` while the LLM reads ``_MISREAD``
-    again.  *text* is the child's ruling text (the LLM's transcription).
-    Returns ``(ruling id, case number, alert ruling id)`` before and after,
-    concatenated."""
+    usable document text, so no check), then re-process the key (a *kind*
+    step: ``reingest`` or ``live``) with the document text printing
+    ``_PRINTED`` while the LLM reads ``_MISREAD`` again.  *text* is the
+    child's ruling text (the LLM's transcription).  Returns ``(ruling id,
+    case number, alert ruling id)`` before and after, concatenated."""
     h = harness.KeyHarness(_DSN, _RUN, -1)
     try:
         key = harness.make_key(f"{_RUN}-{tag}")
@@ -1111,10 +1113,36 @@ def _run_misread_then_reingest(stored: str, *, tag: str, text: str | None = None
 
         h.event_extra = {"ruling_text": _calendar_text(_PRINTED)}
         misread = harness.Spec(0, _MISREAD, harness._title(0), text)
-        h.run_step(key, harness.Step("reingest", (harness.Row("ruling", 0),), (misread,)), "fix")
+        h.run_step(key, harness.Step(kind, (harness.Row("ruling", 0),), (misread,)), "fix")
         return before + _rulings_with_alerts(h, key)
     finally:
         h.close()
+
+
+@_needs_pg
+def test_live_refuted_case_relinks_to_placeholder() -> None:
+    """#5006: a live re-delivery of the key moves a ruling off a number its
+    document does not print, as a reingest does (#4915).  Observed on San
+    Bernardino: a row filed before the #4927 gate under a prompt's example
+    number kept it through every live event until a reingest.  The ruling
+    keeps its row and its alert."""
+    (old_id, old_case, old_alert), (new_id, new_case, new_alert) = _run_misread_then_reingest(
+        _MISREAD, tag="b5006", kind="live"
+    )
+    assert old_case == _MISREAD and old_alert == old_id
+    assert new_case.startswith("UNKNOWN-")
+    assert new_id == old_id and new_alert == old_id
+
+
+@_needs_pg
+def test_live_supported_case_is_not_refuted() -> None:
+    """Control for #5006: a live write keeps a number the document prints
+    when the child finds none (preserve-first, #4788)."""
+    (old_id, old_case, _), (new_id, new_case, new_alert) = _run_misread_then_reingest(
+        _PRINTED, tag="b5006ok", kind="live"
+    )
+    assert old_case == _PRINTED
+    assert (new_id, new_case, new_alert) == (old_id, _PRINTED, old_id)
 
 
 @_needs_pg
