@@ -372,3 +372,45 @@ class TestCallWithRetries:
         fn = MagicMock(side_effect=[_genai_error(500), "ok"])
         assert call_with_retries(fn, max_retries=1, event_prefix="t.") == "ok"
         assert len(sleeps) == 1
+
+
+class TestProviderErrors:
+    """``PROVIDER_ERRORS`` / ``is_provider_error``: SDK and transport failures
+    only; programming errors are not provider errors (#5125)."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            _genai_error(503),
+            _genai_error(400),
+            status_error(529),
+            status_error(401),
+            timeout_error(),
+            connection_error(),
+            anthropic.APIError(message="m", request=MagicMock(), body=None),
+            httpx.ReadTimeout("t"),
+            httpx.ConnectError("refused"),
+            httpx.RemoteProtocolError("dropped"),
+            TimeoutError("deadline"),
+            ConnectionResetError(104, "reset"),
+        ],
+    )
+    def test_sdk_and_transport_errors_are_provider_errors(self, exc: BaseException) -> None:
+        assert llm_retry.is_provider_error(exc)
+        assert isinstance(exc, llm_retry.PROVIDER_ERRORS)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            TypeError("unexpected keyword argument 'temperature'"),
+            AttributeError("x"),
+            KeyError("x"),
+            IndexError("x"),
+            ValueError("x"),
+            RuntimeError("x"),
+            anthropic.AnthropicError("no api key"),
+        ],
+    )
+    def test_programming_errors_are_not_provider_errors(self, exc: BaseException) -> None:
+        assert not llm_retry.is_provider_error(exc)
+        assert not isinstance(exc, llm_retry.PROVIDER_ERRORS)

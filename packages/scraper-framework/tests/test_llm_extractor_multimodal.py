@@ -3241,8 +3241,9 @@ class TestExtractSinglePageRetry:
 
         assert rulings == []
 
-    def test_exception_fails_page_without_crashing(self, sample_pdf_bytes: bytes) -> None:
-        """An unexpected exception from the provider fails the page, not the doc."""
+    def test_programming_error_propagates(self, sample_pdf_bytes: bytes) -> None:
+        """Provider failures come back as ``None``; a raised exception is a
+        bug in our code and must not be logged away as a failed page (#5125)."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
@@ -3253,12 +3254,12 @@ class TestExtractSinglePageRetry:
             ),
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
-                side_effect=RuntimeError("bug"),
+                side_effect=TypeError("bug"),
             ) as mock_call,
+            pytest.raises(TypeError),
         ):
-            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+            ext.extract_from_pdf(sample_pdf_bytes)
 
-        assert rulings == []
         assert mock_call.call_count == 1
 
     def test_partial_page_failure(self, sample_pdf_bytes: bytes) -> None:

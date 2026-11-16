@@ -20,7 +20,19 @@ Retryable:
   ``anthropic.APIConnectionError``).
 
 Everything else (400, 401, 403, 404, programming errors) fails on the
-first attempt.  Content-level outcomes (a ``RECITATION`` / ``SAFETY``
+first attempt.
+
+:data:`PROVIDER_ERRORS` (:func:`is_provider_error`) is the one definition
+of "the provider or the network failed": every ``genai_errors.APIError``
+and ``anthropic.APIError`` (retryable or not), ``httpx`` timeouts and
+transport errors, ``TimeoutError`` (also what :func:`call_with_retries`
+raises when the deadline leaves no room) and ``ConnectionError``.  Only
+these mean "no answer" to the provider helpers.  Anything else
+(``TypeError``, ``AttributeError``, ``KeyError``, ...) is a bug in our code
+or config and must propagate (#5125): before that, a ``TypeError`` from a
+rejected keyword read as an outage for 631 calls (#4960).
+
+Content-level outcomes (a ``RECITATION`` / ``SAFETY``
 finish reason, a ``MAX_TOKENS`` cut-off) are not exceptions at all: they
 come back as an ``LLMResponse`` and are handled by the callers (#5007,
 #5046), never retried here.
@@ -79,6 +91,27 @@ KIND_TIMEOUT = "timeout"
 KIND_CONNECTION = "connection"
 KIND_CLIENT_ERROR = "client_error"
 KIND_OTHER = "other"
+
+# SDK API errors and transport failures: the provider or the network did
+# not answer.  ``anthropic.APIError`` covers ``APIStatusError``,
+# ``APIConnectionError``, ``APITimeoutError`` and
+# ``APIResponseValidationError``; it does not cover ``AnthropicError``
+# itself (e.g. a missing API key), which is a config error.  Everything
+# outside this tuple is a bug and must propagate (#5125).
+PROVIDER_ERRORS: tuple[type[BaseException], ...] = (
+    genai_errors.APIError,
+    anthropic.APIError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    TimeoutError,
+    ConnectionError,
+)
+
+
+def is_provider_error(exc: BaseException) -> bool:
+    """True when *exc* is a provider / network failure (:data:`PROVIDER_ERRORS`)."""
+    return isinstance(exc, PROVIDER_ERRORS)
 
 
 @dataclass(frozen=True)

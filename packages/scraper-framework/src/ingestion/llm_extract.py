@@ -1040,7 +1040,9 @@ def _ocr_call(
     *splittable* is true for an answer the provider did not finish
     (``RECITATION``, ``MAX_TOKENS``, ...), and *reason* names why: reading
     a smaller region can succeed where the whole failed.  A call that got
-    no answer (an outage, a timeout) is ``(None, "", False)``.  With
+    no answer (an outage, a timeout) is ``(None, "", False)``.  A raised
+    exception is a bug in our code or config, not a failed page, and
+    propagates (#5125).  With
     *words*, the model separates the words with bars
     (``_OCR_WORDS_SYSTEM_PROMPT``) and they are joined back with spaces.
     """
@@ -1050,18 +1052,14 @@ def _ocr_call(
             f"Extract all text from this part of a court document page "
             f"(page {page_index + 1}). It may start or end mid-sentence."
         )
-    try:
-        response = call_llm_with_images(
-            system_prompt=_OCR_WORDS_SYSTEM_PROMPT if words else _OCR_SYSTEM_PROMPT,
-            text_message=message,
-            images=[(image_bytes, media_type)],
-            timeout=timeout,
-            thinking_budget=_OCR_THINKING_BUDGET,
-            deadline=deadline,
-        )
-    except Exception:
-        logger.warning("ocr_pdf_text.page_error", page_index=page_index, exc_info=True)
-        return None, "", False
+    response = call_llm_with_images(
+        system_prompt=_OCR_WORDS_SYSTEM_PROMPT if words else _OCR_SYSTEM_PROMPT,
+        text_message=message,
+        images=[(image_bytes, media_type)],
+        timeout=timeout,
+        thinking_budget=_OCR_THINKING_BUDGET,
+        deadline=deadline,
+    )
     if response is None:
         logger.warning("ocr_pdf_text.page_failed", page_index=page_index, tile_depth=depth)
         return None, "", False

@@ -5629,33 +5629,27 @@ def test_llm_enrich_fields_retries_on_transient_then_succeeds(
 
 @patch("framework.llm_enrichment.time.sleep")
 @patch("framework.llm_enrichment.enrich_ruling")
-def test_llm_enrich_fields_retries_on_exception_then_succeeds(
+def test_llm_enrich_fields_exception_propagates_without_retry(
     mock_enrich_ruling: MagicMock,
     mock_sleep: MagicMock,
 ) -> None:
-    """_llm_enrich_fields retries on exceptions and succeeds on 4th call."""
-    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    """A raised exception is a bug, not a provider failure: no retry (#5125).
 
-    populated = LlmEnrichmentResult(
-        case_title="Garcia v. State Farm",
-        motion_type="motion_to_compel",
-        outcome="granted_in_part",
-        parties=EnrichmentParties(plaintiffs=["Garcia"], defendants=["State Farm"]),
-    )
-    err = RuntimeError("ServiceUnavailable")
-    mock_enrich_ruling.side_effect = [err, err, err, populated]
+    Provider failures reach ``enrich_ruling_with_retry`` as ``None``
+    (covered by the retry-on-None test above); before #5125 a ``TypeError``
+    was retried five times and folded into ``LlmEnrichmentExhaustedError``.
+    """
+    mock_enrich_ruling.side_effect = TypeError("unexpected keyword argument 'temperature'")
 
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result, status = worker._llm_enrich_fields("The motion to compel is GRANTED IN PART.", "doc-2")
+    with pytest.raises(TypeError, match="temperature"):
+        worker._llm_enrich_fields("The motion to compel is GRANTED IN PART.", "doc-2")
 
-    assert result is not None
-    assert result.motion_type == "motion_to_compel"
-    assert status == "ok"
-    assert mock_enrich_ruling.call_count == 4
-    assert mock_sleep.call_count == 3
+    assert mock_enrich_ruling.call_count == 1
+    mock_sleep.assert_not_called()
 
 
 @patch("framework.llm_enrichment.time.sleep")

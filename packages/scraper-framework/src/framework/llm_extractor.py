@@ -4320,30 +4320,23 @@ class LlmExtractor:
         retrying (a 400 is not re-sent) and without a second retry loop
         here multiplying the first.  Returns the provider response (text plus
         ``finish_reason`` and token counts), or ``None`` when every attempt
-        failed.
+        failed.  A raised exception is a bug in our code or config, not a
+        provider failure, and propagates (#5125).
         """
         from ingestion.llm_providers import call_llm_with_images
 
-        try:
-            response = call_llm_with_images(
-                system_prompt=PDF_PER_PAGE_PROMPT,
-                text_message=text_message,
-                images=[(img_bytes, media_type)],
-                provider=self._provider,
-                model=self._model,
-                client=self._client,
-                max_retries=max(0, self._max_retries - 1),
-                max_tokens=max_tokens or self._max_output_tokens,
-                timeout=20.0,
-                json_mode=json_mode,
-            )
-        except Exception:  # noqa: BLE001 — a provider bug must not kill the doc
-            logger.error(
-                "llm_extractor.page_extract_exhausted",
-                page_index=page_index,
-                exc_info=True,
-            )
-            return None
+        response = call_llm_with_images(
+            system_prompt=PDF_PER_PAGE_PROMPT,
+            text_message=text_message,
+            images=[(img_bytes, media_type)],
+            provider=self._provider,
+            model=self._model,
+            client=self._client,
+            max_retries=max(0, self._max_retries - 1),
+            max_tokens=max_tokens or self._max_output_tokens,
+            timeout=20.0,
+            json_mode=json_mode,
+        )
 
         if response is None:
             # Self-diagnosing page-failure payload (#4253): the image's

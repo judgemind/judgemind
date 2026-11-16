@@ -20,12 +20,14 @@ from framework.llm_enrichment import (
     VALID_MOTION_TYPES,
     VALID_OUTCOMES,
     EnrichmentParties,
+    LlmEnrichmentExhaustedError,
     LlmEnrichmentResult,
     MotionType,
     OutcomeType,
     _parse_response,
     enrich_ruling,
     enrich_ruling_strict_retry,
+    enrich_ruling_with_retry,
 )
 
 # ---------------------------------------------------------------------------
@@ -353,6 +355,47 @@ class TestParseResponse:
 # ---------------------------------------------------------------------------
 # enrich_ruling (integration with mocked LLM)
 # ---------------------------------------------------------------------------
+
+
+class TestEnrichRulingWithRetry:
+    """``enrich_ruling_with_retry``: ``None`` is retried, a raised bug is not (#5125)."""
+
+    @patch("framework.llm_enrichment.time.sleep")
+    @patch("framework.llm_enrichment.call_llm")
+    def test_programming_error_propagates_without_retry(
+        self, mock_call_llm: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        mock_call_llm.side_effect = TypeError("unexpected keyword argument 'temperature'")
+
+        with pytest.raises(TypeError, match="temperature"):
+            enrich_ruling_with_retry("The motion is GRANTED.", max_attempts=5)
+
+        assert mock_call_llm.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("framework.llm_enrichment.time.sleep")
+    @patch("framework.llm_enrichment.call_llm")
+    def test_none_is_retried_then_exhausted(
+        self, mock_call_llm: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        mock_call_llm.return_value = None
+
+        with pytest.raises(LlmEnrichmentExhaustedError, match="API returned None"):
+            enrich_ruling_with_retry("The motion is GRANTED.", max_attempts=3)
+
+        assert mock_call_llm.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch("framework.llm_enrichment.time.sleep")
+    @patch("framework.llm_enrichment.call_llm")
+    def test_none_then_success(self, mock_call_llm: MagicMock, mock_sleep: MagicMock) -> None:
+        mock_call_llm.side_effect = [None, _make_llm_response(_valid_json_response())]
+
+        result = enrich_ruling_with_retry("The motion is GRANTED.", max_attempts=3)
+
+        assert result is not None
+        assert result.case_title == "Smith v. Jones"
+        assert mock_sleep.call_count == 1
 
 
 class TestEnrichRuling:
