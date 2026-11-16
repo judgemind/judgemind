@@ -38,9 +38,15 @@ SKIP_NO_EXTRACTABLE_TEXT = "no_extractable_text"
 #: Every row the multimodal split found had no ruling text (calendar rows
 #: with an empty tentative cell, fused tail rows; #4714).
 SKIP_NO_RULING_TEXT = "no_ruling_text"
+#: Written by ``scripts/reconcile_raw_keys.py``, never the worker (#5093): a
+#: ``telemetry.ingest_incomplete`` key whose raw object is gone from the
+#: archive, closed out so it is reported once and never retried.  The
+#: detail keeps the incomplete reason, detail and attempts.
+SKIP_RAW_MISSING = "raw_missing"
 
 SKIP_REASONS = frozenset(
     {
+        SKIP_RAW_MISSING,
         SKIP_GOVERNOR_BIO_ROUTE,
         SKIP_SANTA_CLARA_PLACEHOLDER,
         SKIP_ZERO_RULINGS_NO_TEXT,

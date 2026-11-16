@@ -91,6 +91,7 @@ def test_skip_reasons_match_the_migration_comment() -> None:
         "zero_rulings_no_text",
         "no_extractable_text",
         "no_ruling_text",
+        "raw_missing",
     }
 
 

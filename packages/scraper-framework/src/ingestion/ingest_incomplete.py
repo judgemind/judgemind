@@ -34,6 +34,17 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   rule since relaxed (``validation.rule_versions``), so the key is
   re-ingested for the current rules to judge.  A reingest that writes the
   key, or fails it again under the current rules, resolves it.
+- ``orphaned_superseded``: written by the raw-key reconciler, not the
+  worker (#5093).  Every document row of the key is superseded, none holds
+  a ruling, and the ruling it lost content-hash dedup to is gone (the
+  #4982 path deletes the dedup winner and nulls the loser's link), so the
+  key's ruling exists nowhere.  The key is re-ingested; once one of its
+  rows holds a ruling again, or its dedup ruling exists, the reconciler
+  deletes the record.
+
+A record whose raw object is gone from the archive can never heal: the
+reconciler moves it to ``telemetry.ingest_skips`` with reason
+``raw_missing`` (``ingestion.ingest_skips``, #5093).
 
 Each upserts one ``telemetry.ingest_incomplete`` row per key, keyed by
 ``s3_key`` (the latest reason wins, ``occurrences`` counts them).  A later
@@ -69,9 +80,12 @@ INCOMPLETE_ALL_CHILDREN_REJECTED = "all_children_rejected"
 INCOMPLETE_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
 #: Recorded by ``scripts/reconcile_raw_keys.py`` (#5027), never the worker.
 INCOMPLETE_STALE_VALIDATION = "stale_validation"
+#: Recorded by ``scripts/reconcile_raw_keys.py`` (#5093), never the worker.
+INCOMPLETE_ORPHANED_SUPERSEDED = "orphaned_superseded"
 
 INCOMPLETE_REASONS = frozenset(
     {
+        INCOMPLETE_ORPHANED_SUPERSEDED,
         INCOMPLETE_SINGLE_DOCUMENT_FALLBACK,
         INCOMPLETE_PARTIAL_SPLIT,
         INCOMPLETE_EXHAUSTED_CHILD,

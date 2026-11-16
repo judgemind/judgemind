@@ -61,6 +61,11 @@ const INCOMPLETE_REASON_LABELS: Record<string, string> = {
   exhausted_child: 'enrichment exhausted',
   dead_letter: 'dead-lettered',
   reingest_failed: 'reingest failed',
+  all_children_rejected: 'all children rejected',
+  evidence_unavailable: 'page unreadable',
+  stale_validation: 'stale validation',
+  // Every row superseded and the dedup ruling gone (#5093).
+  orphaned_superseded: 'superseded, ruling lost',
 };
 
 const fmt = (n: number) => n.toLocaleString('en-US');

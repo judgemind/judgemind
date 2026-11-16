@@ -10,10 +10,14 @@ May-June and October 2026 ElastiCache windows, #4470 / #4474), and neither
 loss was caught automatically.  This script lists the raw keys (S3 listing
 only: no object is read) and sorts each one into a category:
 
-- ``represented``    a ``derived.documents`` row (active or superseded) has
-                     this ``s3_key``.  ``s3_key`` is authoritative for
-                     content-addressed keys; ``content_hash`` is not (split
-                     children carry other hashes, #4988).
+- ``represented``    a ``derived.documents`` row has this ``s3_key`` and
+                     its ruling is reachable (#5093): a row on the key is
+                     ``active`` or holds a ruling, or a superseded row lost
+                     content-hash dedup to a ruling that still exists (see
+                     ``orphaned_superseded`` below).  ``s3_key`` is
+                     authoritative for content-addressed keys;
+                     ``content_hash`` is not (split children carry other
+                     hashes, #4988).
 - ``skipped``        no document row, but a durable reason is recorded:
                      a ``telemetry.ingest_skips`` row (governor bio route,
                      Santa Clara placeholder, zero rulings with no text, no
@@ -57,6 +61,23 @@ only: no object is read) and sorts each one into a category:
                      its row, reason ``stale_validation``, and deletes it
                      once the key is represented or the current rules
                      failed it again.
+                     A key whose document rows are all superseded, hold no
+                     ruling, and whose dedup ruling is gone is incomplete
+                     too, reason ``orphaned_superseded`` (#5093; the #4982
+                     path deletes the dedup winner and nulls the loser's
+                     link).  A superseded-only key is covered, so still
+                     ``represented``, when one of its rows lost dedup to a
+                     ruling that still exists: a ruling with the
+                     ``content_hash_dedup_supersede`` metric's
+                     ``(case_id, ruling_text_hash)``, or with that hash on
+                     the row's ``previous_version_id`` winner (the winner's
+                     case can be re-keyed); with no metric row, any ruling
+                     on the winner.  A ruling with the same hash in another
+                     case does not count (short boilerplate repeats across
+                     cases).  A recorded skip or validation failure still
+                     explains the key.  With ``--record`` this script
+                     writes the row (deferred backlogs excepted) and
+                     deletes it once the key is covered again.
 - ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
                      (default 3): reported, not retried.  Keys that just
                      reached the cap set ``issue_needed`` once (``stuck_at``
@@ -64,6 +85,14 @@ only: no object is read) and sorts each one into a category:
                      retryable again after a fix.
 - ``unrepresented``  none of the above: a capture that never reached the
                      database.  These are the keys to reingest.
+
+A ``telemetry.ingest_incomplete`` row whose raw key is gone from the
+archive (not in the listing, and a ``HEAD`` answers 404) can never be
+re-ingested.  It is reported as ``orphan_incomplete`` (#5093) and, with
+``--record``, closed out: the row moves to ``telemetry.ingest_skips`` with
+reason ``raw_missing`` (its incomplete reason, detail and attempts kept in
+the skip's detail), so it is reported once, files the issue once, and is
+never retried.  Only keys inside the run's listing scope are checked.
 
 Keys under ``raw/`` in the legacy dated layout (``raw/YYYY/MM/DD/``) are
 counted as ``dated_excluded`` and not reconciled: #4988 copied every dated
@@ -277,6 +306,21 @@ DEFAULT_MAX_INCOMPLETE_ATTEMPTS = 3
 #: was judged by a since-relaxed rule version (#5027).
 STALE_VALIDATION = "stale_validation"
 
+#: ``ingestion.ingest_incomplete.INCOMPLETE_ORPHANED_SUPERSEDED``: the
+#: incomplete reason this script records for a key whose rows are all
+#: superseded and whose dedup ruling is gone (#5093).
+ORPHANED_SUPERSEDED = "orphaned_superseded"
+
+#: Incomplete reasons this script records (and resolves) itself.
+RECONCILER_REASONS = frozenset({STALE_VALIDATION, ORPHANED_SUPERSEDED})
+
+#: ``ingestion.ingest_skips.SKIP_RAW_MISSING``: the skip reason an
+#: incomplete key is closed out with once its raw object is gone (#5093).
+RAW_MISSING = "raw_missing"
+
+#: ``HEAD`` error codes that mean the object does not exist.
+_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
 #: Incomplete reasons whose keys re-ingest one key per subprocess, after the
 #: batched launches (#5054).  A ``dead_letter`` key killed the live worker
 #: ``MAX_MESSAGE_CRASHES`` times (#5010, #5055), so it is the likeliest to kill a
@@ -361,6 +405,9 @@ class Explained:
     #: that judged them (#5027).
     validation_rows: dict[str, list[FailRow]] = field(default_factory=dict)
     validation_rows_by_document: dict[str, list[FailRow]] = field(default_factory=dict)
+    #: Keys in ``documents`` whose rows are all superseded, hold no ruling,
+    #: and whose dedup ruling is gone (#5093): not represented.
+    orphaned_superseded: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -381,6 +428,11 @@ class ScopeReport:
     #: Keys whose ``stale_validation`` record is resolved: the key is now
     #: represented, or the current rules failed it again (#5027).
     resolved_stale: list[RawKey] = field(default_factory=list)
+    #: Orphaned superseded keys found this run with no incomplete record
+    #: yet, and keys whose ``orphaned_superseded`` record is resolved (the
+    #: key is covered again, #5093).
+    new_orphaned: list[RawKey] = field(default_factory=list)
+    resolved_orphaned: list[RawKey] = field(default_factory=list)
 
     def unrepresented_by_day(self) -> dict[str, int]:
         return dict(sorted(Counter(k.day for k in self.unrepresented).items()))
@@ -533,13 +585,26 @@ def _intentional_skip(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in INTENTIONAL_SKIP_PREFIXES)
 
 
-def _stale_record_resolved(raw: RawKey, explained: Explained) -> bool:
-    """A ``stale_validation`` record whose re-validation is done: the key
-    is represented, or its failures stand under the current rules."""
+def is_represented(key: str, explained: Explained) -> bool:
+    """*key* has document rows and its ruling is reachable (#5093)."""
+    return key in explained.documents and key not in explained.orphaned_superseded
+
+
+def _reconciler_record_resolved(raw: RawKey, explained: Explained) -> bool:
+    """A record this script wrote whose cause is gone.
+
+    ``stale_validation`` (#5027): the key is represented, or its failures
+    stand under the current rules.  ``orphaned_superseded`` (#5093): the key
+    is no longer orphaned (revived, covered by its dedup ruling, or its
+    rows are gone, which makes it unrepresented instead)."""
     record = explained.incomplete.get(raw.key)
-    if record is None or record[0] != STALE_VALIDATION:
+    if record is None:
         return False
-    return raw.key in explained.documents or not key_stale_rules(raw, explained)
+    if record[0] == STALE_VALIDATION:
+        return is_represented(raw.key, explained) or not key_stale_rules(raw, explained)
+    if record[0] == ORPHANED_SUPERSEDED:
+        return raw.key not in explained.orphaned_superseded
+    return False
 
 
 def classify(
@@ -564,15 +629,20 @@ def classify(
     to judge.  Its record is resolved, and the key classified as usual,
     once the key is represented or no failure is stale any more (the
     current rules failed it again).
+
+    A key whose rows are all superseded with no reachable ruling
+    (:attr:`Explained.orphaned_superseded`, #5093) is not represented: it
+    is ``incomplete`` with reason ``orphaned_superseded`` unless a skip
+    record or validation failure explains it.
     """
     key = raw.key
     incomplete = explained.incomplete.get(key)
-    if incomplete is not None and not _stale_record_resolved(raw, explained):
+    if incomplete is not None and not _reconciler_record_resolved(raw, explained):
         reason, attempts = incomplete
         if attempts >= max_incomplete_attempts:
             return "incomplete_stuck", reason
         return "incomplete", reason
-    if key in explained.documents:
+    if is_represented(key, explained):
         return "represented", None
     reason = explained.skips.get(key)
     if reason:
@@ -594,6 +664,8 @@ def classify(
     for prefix, prefix_reason in INTENTIONAL_SKIP_PREFIXES.items():
         if key.startswith(prefix):
             return "skipped", prefix_reason
+    if key in explained.orphaned_superseded:
+        return "incomplete", ORPHANED_SUPERSEDED
     if now - raw.utc < grace:
         return "pending", None
     return "unrepresented", None
@@ -636,11 +708,16 @@ def reconcile(
         ):
             category, reason = "skipped", "santa_clara_placeholder"
         record = explained.incomplete.get(raw.key)
-        if record is not None and record[0] == STALE_VALIDATION:
-            if category not in ("incomplete", "incomplete_stuck"):
+        if record is not None and _reconciler_record_resolved(raw, explained):
+            if record[0] == STALE_VALIDATION:
                 rep.resolved_stale.append(raw)
-        elif record is None and reason == STALE_VALIDATION:
+            else:
+                rep.resolved_orphaned.append(raw)
+            record = None
+        if record is None and reason == STALE_VALIDATION:
             rep.new_stale.append((raw, key_stale_rules(raw, explained)))
+        elif record is None and reason == ORPHANED_SUPERSEDED:
+            rep.new_orphaned.append(raw)
         rep.counts[category] += 1
         if category in ("incomplete", "incomplete_stuck"):
             rep.incomplete_by_reason[reason or "unknown"] += 1
@@ -768,21 +845,184 @@ def record_stale_validation(
     conn.commit()
 
 
-def clear_stale_validation(conn: Any, keys: Sequence[str]) -> None:
-    """Delete the resolved ``stale_validation`` records (#5027)."""
+def clear_stale_validation(
+    conn: Any, keys: Sequence[str], reason: str = STALE_VALIDATION
+) -> None:
+    """Delete the resolved records of *reason* (``stale_validation``,
+    #5027; ``orphaned_superseded``, #5093) for *keys*."""
     if not keys:
         return
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM telemetry.ingest_incomplete "
             "WHERE s3_key = ANY(%s) AND reason = %s",
-            (list(keys), STALE_VALIDATION),
+            (list(keys), reason),
+        )
+    conn.commit()
+
+
+def record_orphaned_superseded(conn: Any, keys: Sequence[RawKey]) -> None:
+    """Record orphaned superseded keys in ``telemetry.ingest_incomplete``
+    (reason ``orphaned_superseded``, #5093), so their reingest goes through
+    the #5008 attempt count and cap.  A record already there is left
+    alone."""
+    if not keys:
+        return
+    with conn.cursor() as cur:
+        for raw in keys:
+            cur.execute(
+                "INSERT INTO telemetry.ingest_incomplete "
+                "(s3_key, reason, county, document_id, detail) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) ON CONFLICT (s3_key) DO NOTHING",
+                (
+                    raw.key,
+                    ORPHANED_SUPERSEDED,
+                    raw.county,
+                    raw_key_document_id(raw.key),
+                    json.dumps({"scope": raw.scope}),
+                ),
+            )
+    conn.commit()
+
+
+#: Keys whose document rows are all superseded, hold no ruling, and whose
+#: dedup ruling is gone (#5093).  A superseded row is covered when the
+#: ruling it lost content-hash dedup to still exists: a ruling with the
+#: ``content_hash_dedup_supersede`` metric's (case_id, ruling_text_hash), or
+#: with that hash on the row's ``previous_version_id`` winner (a rebuild can
+#: re-key the winner's case); with no metric row for the loser, any ruling
+#: on the winner.  The same hash in another case does not count: short
+#: boilerplate rulings repeat across cases.
+ORPHANED_SUPERSEDED_SQL = """
+WITH inactive AS (
+    SELECT s3_key FROM derived.documents
+    WHERE s3_key IS NOT NULL
+    GROUP BY s3_key
+    HAVING NOT bool_or(status = 'active')
+), dedup AS (
+    SELECT metadata->>'loser_document_id' AS loser_id,
+           CASE WHEN metadata->>'case_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                THEN (metadata->>'case_id')::uuid END AS case_id,
+           metadata->>'ruling_text_hash' AS text_hash
+    FROM telemetry.data_quality_metrics
+    WHERE metric_name = 'content_hash_dedup_supersede'
+      AND metadata->>'loser_document_id' IS NOT NULL
+)
+SELECT d.s3_key
+FROM derived.documents d
+JOIN inactive USING (s3_key)
+GROUP BY d.s3_key
+HAVING NOT bool_or(
+    EXISTS (SELECT 1 FROM derived.rulings r WHERE r.document_id = d.id)
+    OR EXISTS (
+        SELECT 1 FROM dedup m
+        JOIN derived.rulings r
+          ON r.case_id = m.case_id AND r.ruling_text_hash = m.text_hash
+        WHERE m.loser_id = d.id::text
+    )
+    OR EXISTS (
+        SELECT 1 FROM dedup m
+        JOIN derived.rulings r
+          ON r.document_id = d.previous_version_id
+         AND r.ruling_text_hash = m.text_hash
+        WHERE m.loser_id = d.id::text
+    )
+    OR (
+        NOT EXISTS (SELECT 1 FROM dedup m WHERE m.loser_id = d.id::text)
+        AND EXISTS (
+            SELECT 1 FROM derived.rulings r
+            WHERE r.document_id = d.previous_version_id
+        )
+    )
+)
+"""
+
+
+def fetch_orphaned_superseded(conn: Any) -> set[str]:
+    """:data:`ORPHANED_SUPERSEDED_SQL`; empty (with a warning) when it
+    cannot run, so the reconciler still reports everything else."""
+    try:
+        with conn.cursor() as cur:
+            return _fetch_set(cur, ORPHANED_SUPERSEDED_SQL)
+    except Exception as exc:  # noqa: BLE001 — degrade to the pre-#5093 view
+        conn.rollback()
+        print(f"WARNING orphaned superseded keys unreadable ({exc}); none used")
+        return set()
+
+
+def raw_missing(s3: Any, bucket: str, key: str) -> bool:
+    """``True`` only when a ``HEAD`` of *key* says the object does not
+    exist; any other error (throttling, access) is not proof (#5093)."""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001 — classified by its error code
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        return code in _MISSING_CODES
+    return False
+
+
+def in_listing_scope(
+    key: str,
+    *,
+    prefix: str,
+    exclude: Sequence[str],
+    counties: set[str] | None,
+) -> bool:
+    """Whether *key* is inside what this run listed (``--prefix``,
+    ``--exclude-prefix``, ``--county``)."""
+    if prefix:
+        if not key.startswith(prefix):
+            return False
+    elif any(key.startswith(e) for e in exclude):
+        return False
+    if counties:
+        m = RAW_SEGMENT_RE.match(key)
+        parts = key.split("/")
+        if not m or parts[1] not in counties:
+            return False
+    return True
+
+
+def close_out_raw_missing(conn: Any, keys: Sequence[str]) -> None:
+    """Move the incomplete records of *keys*, whose raw objects are gone, to
+    ``telemetry.ingest_skips`` with reason ``raw_missing`` (#5093): the
+    incomplete reason, detail and attempts go in the skip's detail.  Never
+    retried again, and reported once."""
+    if not keys:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO telemetry.ingest_skips
+                (s3_key, reason, county, scraper_id, document_id, detail)
+            SELECT s3_key, %s, county, scraper_id, document_id,
+                   jsonb_build_object(
+                       'incomplete_reason', reason,
+                       'incomplete_detail', detail,
+                       'retry_attempts', retry_attempts,
+                       'first_recorded_at', first_recorded_at,
+                       'closed_by', 'reconcile_raw_keys'
+                   )
+            FROM telemetry.ingest_incomplete
+            WHERE s3_key = ANY(%s)
+            ON CONFLICT (s3_key) DO UPDATE SET
+                reason = EXCLUDED.reason,
+                detail = EXCLUDED.detail,
+                last_recorded_at = now(),
+                occurrences = telemetry.ingest_skips.occurrences + 1
+            """,
+            (RAW_MISSING, list(keys)),
+        )
+        cur.execute(
+            "DELETE FROM telemetry.ingest_incomplete WHERE s3_key = ANY(%s)",
+            (list(keys),),
         )
     conn.commit()
 
 
 def fetch_explained(conn: Any) -> Explained:
-    """Every s3_key the database accounts for, from all four sources."""
+    """Every s3_key the database accounts for, from all four sources, and
+    the keys whose rows hold no reachable ruling (#5093)."""
     explained = Explained()
     with conn.cursor() as cur:
         explained.documents = _fetch_set(
@@ -795,6 +1035,7 @@ def fetch_explained(conn: Any) -> Explained:
             f"WHERE metric_name = '{NON_RULING_PDF_DROPPED_METRIC}' "
             "AND metadata->>'s3_key' IS NOT NULL",
         )
+    explained.orphaned_superseded = fetch_orphaned_superseded(conn)
     _fetch_validation_fails(conn, explained)
     try:
         with conn.cursor() as cur:
@@ -1454,17 +1695,54 @@ def run(
     # Keys pending re-validation under a relaxed rule (#5027) join the
     # incomplete keys: recorded (with --record) so the reingest counts its
     # attempts against the cap.  Resolved records go.
+    # Orphaned superseded keys (#5093) are recorded the same way, except
+    # deferred backlog keys: they are never re-ingested, so no record.
+    backlogs = DEFERRED_BACKLOGS if deferrals is None else tuple(deferrals)
     new_stale = [item for rep in reports.values() for item in rep.new_stale]
     resolved_stale = [raw.key for rep in reports.values() for raw in rep.resolved_stale]
+    new_orphaned = [raw for rep in reports.values() for raw in rep.new_orphaned]
+    resolved_orphaned = [
+        raw.key for rep in reports.values() for raw in rep.resolved_orphaned
+    ]
+    for key in (*resolved_stale, *resolved_orphaned):
+        explained.incomplete.pop(key, None)
     for raw, _rules in new_stale:
         explained.incomplete[raw.key] = (STALE_VALIDATION, 0)
-    for key in resolved_stale:
-        explained.incomplete.pop(key, None)
+    for raw in new_orphaned:
+        explained.incomplete[raw.key] = (ORPHANED_SUPERSEDED, 0)
     if conn is not None:
-        record_stale_validation(conn, new_stale)
         clear_stale_validation(conn, resolved_stale)
+        clear_stale_validation(conn, resolved_orphaned, ORPHANED_SUPERSEDED)
+        record_stale_validation(conn, new_stale)
+        record_orphaned_superseded(
+            conn,
+            [raw for raw in new_orphaned if not any(b.matches(raw) for b in backlogs)],
+        )
     for raw, rules in new_stale[: args.sample]:
         out(f"STALE_VALIDATION {raw.scope} rules={','.join(rules)} key={raw.key}")
+    for raw in new_orphaned[: args.sample]:
+        out(f"ORPHANED_SUPERSEDED {raw.scope} day={raw.day} key={raw.key}")
+
+    # Incomplete records whose raw object is gone can never heal (#5093):
+    # reported, and closed out with --record.
+    listed = {key for key, _lm in objects}
+    counties = set(args.county) or None
+    candidates = sorted(
+        key
+        for key in explained.incomplete
+        if key not in listed
+        and in_listing_scope(
+            key, prefix=args.prefix, exclude=args.exclude_prefix, counties=counties
+        )
+    )
+    orphan_incomplete = [k for k in candidates if raw_missing(s3, args.bucket, k)]
+    orphan_by_reason = Counter(explained.incomplete[k][0] for k in orphan_incomplete)
+    for key in orphan_incomplete[: args.sample]:
+        out(f"ORPHAN_INCOMPLETE reason={explained.incomplete[key][0]} key={key}")
+    if conn is not None:
+        close_out_raw_missing(conn, orphan_incomplete)
+    for key in orphan_incomplete:
+        explained.incomplete.pop(key, None)
 
     for scope in sorted(reports):
         rep = reports[scope]
@@ -1498,7 +1776,6 @@ def run(
         previous_scopes = fetch_recent_scope_actions(
             conn, max(0, args.persist_runs - 1)
         )
-    backlogs = DEFERRED_BACKLOGS if deferrals is None else tuple(deferrals)
     actionable, deferred = split_deferred(reports, backlogs)
     scope_actions = decide_scope_actions(
         actionable,
@@ -1568,6 +1845,17 @@ def run(
         "newly_stuck_sample": newly_stuck[:10],
         "stale_validation_new": len(new_stale),
         "stale_validation_resolved": len(resolved_stale),
+        # Superseded-only keys with no reachable ruling (#5093).
+        "orphaned_superseded": sum(
+            1 for raw in keys if raw.key in explained.orphaned_superseded
+        ),
+        "orphaned_superseded_new": len(new_orphaned),
+        "orphaned_superseded_resolved": len(resolved_orphaned),
+        # Incomplete records whose raw object is gone (#5093).
+        "orphan_incomplete": len(orphan_incomplete),
+        "orphan_incomplete_by_reason": dict(sorted(orphan_by_reason.items())),
+        "orphan_incomplete_sample": orphan_incomplete[:10],
+        "orphan_incomplete_closed": len(orphan_incomplete) if conn is not None else 0,
     }
 
     script = None
@@ -1661,7 +1949,9 @@ def run(
         # other scopes heal (#5036).
         "issue_needed": action in ISSUE_ACTIONS
         or bool(set(scope_actions.values()) & ISSUE_ACTIONS)
-        or bool(newly_stuck),
+        or bool(newly_stuck)
+        # A lost raw object is irrecoverable; closed out, so reported once.
+        or bool(orphan_incomplete),
         **total,
         **detail,
     }
@@ -1697,6 +1987,21 @@ def issue_summary(result: dict[str, Any]) -> str:
     if g("newly_stuck"):
         lines.append(
             f"Newly stuck (sample): {', '.join(g('newly_stuck_sample') or [])}"
+        )
+    if g("orphaned_superseded"):
+        lines.append(
+            f"**Superseded with no reachable ruling (#5093):** "
+            f"{g('orphaned_superseded')} keys ({g('orphaned_superseded_new', 0)} new, "
+            f"{g('orphaned_superseded_resolved', 0)} healed since the last run); "
+            "retried as incomplete `orphaned_superseded`"
+        )
+    if g("orphan_incomplete"):
+        by_reason = json.dumps(g("orphan_incomplete_by_reason") or {}, sort_keys=True)
+        lines.append(
+            f"**Raw object missing (#5093):** {g('orphan_incomplete')} incomplete "
+            f"keys whose raw is gone from the archive, by reason {by_reason}; "
+            f"{g('orphan_incomplete_closed', 0)} closed out as skip `raw_missing` "
+            f"(sample: {', '.join(g('orphan_incomplete_sample') or [])})"
         )
     lines.append(
         "**Previous runs (unrepresented, newest first):** "

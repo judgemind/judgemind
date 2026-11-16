@@ -642,6 +642,9 @@ def test_fetch_explained_reads_all_four_sources() -> None:
     versions = {"hearing_date_in_range": 2}
     db = FakeDb(
         {
+            # The orphaned-superseded query (#5093) also names
+            # derived.documents: matched first.
+            "content_hash_dedup_supersede": [("k1",)],
             "derived.documents": [("k1",), (None,)],
             "validation_results": [
                 ("k2", "doc-2", OLD, "r2", ["hearing_date_in_range"], versions),
@@ -662,6 +665,7 @@ def test_fetch_explained_reads_all_four_sources() -> None:
             "k2": [rec.FailRow(OLD, "r2", ("hearing_date_in_range",), versions)]
         },
         validation_rows_by_document={"doc-5": [rec.FailRow(OLD, "r5")]},
+        orphaned_superseded={"k1"},
     )
     sql = db.sql("validation_results")
     assert len(sql) == 1
