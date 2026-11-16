@@ -134,10 +134,14 @@ class TestConfigureStructlog:
         assert "test error" in record["exception"]
 
     def test_cache_logger_on_first_use(self) -> None:
-        """cache_logger_on_first_use should be True."""
-        configure_structlog(json=True)
-        config = structlog.get_config()
-        assert config["cache_logger_on_first_use"] is True
+        """configure_structlog asks structlog for cache_logger_on_first_use=True.
+
+        The call is checked rather than ``structlog.get_config()``: the test
+        conftest forces caching off for the whole session (#5113).
+        """
+        with patch("structlog.configure") as configure:
+            configure_structlog(json=True)
+        assert configure.call_args.kwargs["cache_logger_on_first_use"] is True
 
     def test_context_class_is_dict(self) -> None:
         """context_class should be dict."""

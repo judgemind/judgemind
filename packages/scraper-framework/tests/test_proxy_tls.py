@@ -189,9 +189,8 @@ class TestChromiumLaunchKwargs:
             )
         assert len(runner.calls) == 2
 
-    # The module logger is patched (rather than using structlog's capture_logs)
-    # because other tests configure structlog with cache_logger_on_first_use,
-    # which makes capture_logs order-dependent in a serial run.
+    # The module logger is patched here. structlog's capture_logs also works
+    # now that tests/conftest.py forces cache_logger_on_first_use off (#5113).
     def test_missing_certutil_logs_and_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         log = MagicMock()
         monkeypatch.setattr(proxy_tls, "logger", log)
