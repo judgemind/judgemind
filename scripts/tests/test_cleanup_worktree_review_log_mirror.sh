@@ -238,6 +238,155 @@ PYEOF
     fi
 }
 
+# Write a finished-agent session log under a fresh stub HOME; echo the HOME.
+make_finished_home() {
+    local stub_home
+    stub_home=$(make_temp_dir)
+    mkdir -p "$stub_home/.claude/projects"
+    printf '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}\n' \
+        > "$stub_home/.claude/projects/agent-${AGENT_ID}-session.jsonl"
+    echo "$stub_home"
+}
+
+# Build a bin dir holding only the commands cleanup_worktree.sh needs, so
+# PATH=<dir> has no timeout/gtimeout (the macOS-without-coreutils case, #5116).
+make_bin_without_timeout() {
+    local bin cmd path
+    bin=$(make_temp_dir)
+    for cmd in bash git jq python3 sed find tail head date basename dirname rm realpath mkdir cat env; do
+        path="$(command -v "$cmd" 2>/dev/null)" || continue
+        ln -s "$path" "$bin/$cmd"
+    done
+    echo "$bin"
+}
+
+# Test 6 (#5116): with no timeout(1) on PATH the uploader still runs, and the
+# script reports success rather than "command not found".
+test_upload_runs_without_timeout_on_path() {
+    setup_git_repo
+
+    local ralph_dir="$WORKTREE/tmp/ralph"
+    mkdir -p "$ralph_dir"
+    echo '{"type": "summary"}' > "$ralph_dir/review-log.jsonl"
+    echo "# Issue #5116 — bare timeout" > "$ralph_dir/task.md"
+
+    local marker
+    marker="$(make_temp_dir)/uploader-called"
+    cat > "$REPO/scripts/telemetry_upload.py" <<PYEOF
+import sys
+with open("$marker", "w") as fh:
+    fh.write(" ".join(sys.argv[1:]))
+print("ok: uploaded " + sys.argv[1])
+PYEOF
+
+    local stub_home bin
+    stub_home=$(make_finished_home)
+    bin=$(make_bin_without_timeout)
+
+    if PATH="$bin" command -v timeout >/dev/null 2>&1 || PATH="$bin" command -v gtimeout >/dev/null 2>&1; then
+        fail "no timeout on restricted PATH" "timeout still resolvable in $bin"
+        return
+    fi
+
+    local output exit_code=0
+    output=$(HOME="$stub_home" PATH="$bin" bash "$REPO/scripts/cleanup_worktree.sh" \
+        ".claude/worktrees/agent-${AGENT_ID}" 2>&1) || exit_code=$?
+
+    if [[ -f "$marker" ]] && grep -q "review-log.jsonl ralph-reviews/.*/agent-${AGENT_ID}-5116.jsonl" "$marker"; then
+        pass "uploader called with timeout absent from PATH"
+    else
+        fail "uploader called with timeout absent from PATH" \
+            "marker=$(cat "$marker" 2>/dev/null) output=$output (exit=$exit_code)"
+    fi
+    if echo "$output" | grep -q "command not found"; then
+        fail "no 'command not found' in cleanup output" "$output"
+    else
+        pass "no 'command not found' in cleanup output"
+    fi
+    if echo "$output" | grep -q "Review log mirrored to s3://.../ralph-reviews/"; then
+        pass "success outcome reported"
+    else
+        fail "success outcome reported" "$output"
+    fi
+    if [[ "$exit_code" -eq 0 && ! -d "$WORKTREE" ]]; then
+        pass "cleanup completes with timeout absent"
+    else
+        fail "cleanup completes with timeout absent" "exit=$exit_code worktree_exists=$([[ -d $WORKTREE ]] && echo yes || echo no)"
+    fi
+}
+
+# Test 7 (#5116): a failed upload is reported with its reason, and cleanup
+# still succeeds.
+test_failed_upload_reports_reason() {
+    setup_git_repo
+
+    local ralph_dir="$WORKTREE/tmp/ralph"
+    mkdir -p "$ralph_dir"
+    echo '{"type": "summary"}' > "$ralph_dir/review-log.jsonl"
+
+    cat > "$REPO/scripts/telemetry_upload.py" <<'PYEOF'
+import sys
+print("failed: S3 upload failed: NoCredentialsError: Unable to locate credentials")
+sys.exit(1)
+PYEOF
+
+    local stub_home
+    stub_home=$(make_finished_home)
+
+    local output exit_code=0
+    output=$(HOME="$stub_home" bash "$REPO/scripts/cleanup_worktree.sh" \
+        ".claude/worktrees/agent-${AGENT_ID}" 2>&1) || exit_code=$?
+
+    if echo "$output" | grep -q "\[telemetry\] failed: .*NoCredentialsError" \
+        && echo "$output" | grep -q "Review log NOT mirrored .*upload exit 1"; then
+        pass "failed upload reports reason"
+    else
+        fail "failed upload reports reason" "$output"
+    fi
+    if echo "$output" | grep -q "Review log mirrored to"; then
+        fail "failed upload not reported as success" "$output"
+    else
+        pass "failed upload not reported as success"
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "cleanup exits 0 after failed upload"
+    else
+        fail "cleanup exits 0 after failed upload" "exit=$exit_code"
+    fi
+}
+
+# Test 8 (#5116): sourced under the caller's set -e, a failed upload neither
+# aborts the caller nor skips the cd to repo root.
+test_sourced_failed_upload_keeps_contract() {
+    setup_git_repo
+
+    local ralph_dir="$WORKTREE/tmp/ralph"
+    mkdir -p "$ralph_dir"
+    echo '{"type": "summary"}' > "$ralph_dir/review-log.jsonl"
+    cat > "$REPO/scripts/telemetry_upload.py" <<'PYEOF'
+import sys
+print("failed: boom")
+sys.exit(1)
+PYEOF
+
+    local stub_home
+    stub_home=$(make_finished_home)
+
+    local output exit_code=0
+    output=$(cd "$WORKTREE" && HOME="$stub_home" bash -c \
+        'set -e; . "$1/scripts/cleanup_worktree.sh" ".claude/worktrees/agent-$2"; echo "AFTER rc=$? pwd=$(pwd -P)"' \
+        _ "$REPO" "$AGENT_ID" 2>&1) || exit_code=$?
+
+    local repo_phys
+    repo_phys="$(cd "$REPO" && pwd -P)"
+    if [[ "$exit_code" -eq 0 ]] && echo "$output" | grep -q "AFTER rc=0 pwd=${repo_phys}$"; then
+        pass "sourced cleanup survives failed upload and cds to repo root"
+    else
+        fail "sourced cleanup survives failed upload and cds to repo root" \
+            "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_mirror_uploads_when_review_log_exists
@@ -245,6 +394,9 @@ test_mirror_key_includes_issue_number
 test_no_upload_when_no_review_log
 test_no_upload_when_review_log_empty
 test_cleanup_succeeds_even_if_upload_fails
+test_upload_runs_without_timeout_on_path
+test_failed_upload_reports_reason
+test_sourced_failed_upload_keeps_contract
 
 echo ""
 echo "────────────────────────────────────────────"

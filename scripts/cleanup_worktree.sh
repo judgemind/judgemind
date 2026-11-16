@@ -48,7 +48,10 @@ find_repo_root() {
     # "gitdir: …".  This prevents stopping at a worktree root when the
     # dispatcher's cwd has drifted into one.
     local dir
-    dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # pwd -P: physical path, so it matches the realpath-resolved worktree
+    # path in the safety check below even when the repo sits under a
+    # symlink (e.g. macOS /var -> /private/var).
+    dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
     while [[ "$dir" != "/" ]]; do
         if [[ -f "$dir/CLAUDE.md" && -d "$dir/.git" ]]; then
             echo "$dir"
@@ -129,8 +132,8 @@ agent_is_finished() {
 # --- Mirror review-log.jsonl to S3 before teardown (best-effort) ---
 # Derives agent_id from the worktree basename and issue_number from the
 # first line of {worktree}/tmp/ralph/task.md, then calls telemetry_upload.py.
-# Non-zero exit from the upload is silently ignored — telemetry must never
-# abort a cleanup.
+# The upload's real outcome is reported on stderr, but a failure never
+# changes the return code — telemetry must never abort a cleanup.
 _mirror_review_log_best_effort() {
     local worktree_path="$1"
     local repo_root="$2"
@@ -174,9 +177,29 @@ _mirror_review_log_best_effort() {
         return 0
     fi
 
-    echo "Mirroring review log to s3://.../${s3_key}" >&2
-    # 10-second timeout; ignore non-zero exit — telemetry must never abort cleanup
-    timeout 10 python3 "$upload_script" "$review_log" "$s3_key" 2>&1 | sed 's/^/[telemetry] /' >&2 || true
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Review log NOT mirrored to s3://.../${s3_key}: python3 not on PATH" >&2
+        return 0
+    fi
+
+    # No timeout(1) here: macOS has none (#5116). telemetry_upload.py bounds
+    # itself (boto3 connect/read timeouts plus an overall deadline) and prints
+    # one "ok: ..." or "failed: <reason>" line, which we relay. Any failure is
+    # reported and ignored — telemetry must never abort cleanup.
+    local upload_out upload_rc=0
+    if upload_out="$(python3 "$upload_script" "$review_log" "$s3_key" 2>&1)"; then
+        upload_rc=0
+    else
+        upload_rc=$?
+    fi
+    if [[ -n "$upload_out" ]]; then
+        printf '%s\n' "$upload_out" | sed 's/^/[telemetry] /' >&2 || true
+    fi
+    if [[ "$upload_rc" -eq 0 ]]; then
+        echo "Review log mirrored to s3://.../${s3_key}" >&2
+    else
+        echo "Review log NOT mirrored to s3://.../${s3_key} (upload exit ${upload_rc}; reason above)" >&2
+    fi
     return 0
 }
 
@@ -286,7 +309,7 @@ main() {
     fi
 
     # Best-effort: mirror review-log.jsonl to S3 before tearing down the worktree.
-    # The upload runs with a 10s timeout and never aborts cleanup on failure.
+    # The upload bounds its own run time and never aborts cleanup on failure.
     _mirror_review_log_best_effort "$worktree_path" "$repo_root"
 
     # Remove the worktree (this also cd's to repo root)

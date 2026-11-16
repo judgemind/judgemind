@@ -16,8 +16,10 @@ boto3/botocore availability by manipulating sys.modules before each call.
 from __future__ import annotations
 
 import sys
+import threading
+import time
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,7 +27,7 @@ import pytest
 # Add scripts directory to path so we can import the module
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import telemetry_upload  # noqa: E402
+import telemetry_upload
 
 
 def _make_botocore_exceptions(
@@ -45,7 +47,8 @@ def _make_botocore_exceptions(
 def _restore_boto3_modules() -> Generator[None, None, None]:
     """Ensure boto3/botocore are restored in sys.modules after each test."""
     saved = {
-        k: sys.modules.get(k) for k in ("boto3", "botocore", "botocore.exceptions")
+        k: sys.modules.get(k)
+        for k in ("boto3", "botocore", "botocore.exceptions", "botocore.config")
     }
     yield
     for k, v in saved.items():
@@ -71,6 +74,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         result = telemetry_upload.mirror_to_s3(
             local_file,
@@ -98,6 +102,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         result = telemetry_upload.mirror_to_s3(
             local_file,
@@ -126,6 +131,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         result = telemetry_upload.mirror_to_s3(
             local_file,
@@ -165,6 +171,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         telemetry_upload.mirror_to_s3(
             local_file,
@@ -193,6 +200,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         telemetry_upload.mirror_to_s3(
             local_file,
@@ -218,6 +226,7 @@ class TestMirrorToS3:
         sys.modules["boto3"] = mock_boto3
         sys.modules["botocore"] = MagicMock()
         sys.modules["botocore.exceptions"] = mock_botocore_exc
+        sys.modules["botocore.config"] = MagicMock()
 
         telemetry_upload.mirror_to_s3(
             local_file,
@@ -226,3 +235,135 @@ class TestMirrorToS3:
 
         call_kwargs = mock_s3_client.put_object.call_args[1]
         assert call_kwargs["Bucket"] == "judgemind-document-archive-dev"
+
+    def test_client_gets_bounded_timeouts(self, tmp_path: Path) -> None:
+        """The boto3 client is built with connect/read timeouts and retries (#5116)."""
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"x\n")
+        mock_boto3 = _install_fake_boto3()
+        mock_config_mod = sys.modules["botocore.config"]
+
+        assert telemetry_upload.mirror_to_s3(local_file, "k", bucket="b") is True
+
+        config_kwargs = mock_config_mod.Config.call_args[1]  # type: ignore[union-attr]
+        assert (
+            config_kwargs["connect_timeout"] == telemetry_upload._CONNECT_TIMEOUT_SECS
+        )
+        assert config_kwargs["read_timeout"] == telemetry_upload._READ_TIMEOUT_SECS
+        assert (
+            config_kwargs["retries"]["max_attempts"] == telemetry_upload._MAX_ATTEMPTS
+        )
+        assert mock_boto3.client.call_args[1]["config"] is (
+            mock_config_mod.Config.return_value  # type: ignore[union-attr]
+        )
+
+    def test_unexpected_exception_returns_false(self, tmp_path: Path) -> None:
+        """A botocore timeout (not a ClientError) is swallowed, not raised (#5116)."""
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"x\n")
+        mock_boto3 = _install_fake_boto3()
+        mock_boto3.client.return_value.put_object.side_effect = TimeoutError("read")
+
+        assert telemetry_upload.mirror_to_s3(local_file, "k", bucket="b") is False
+
+
+def _install_fake_boto3() -> MagicMock:
+    """Install mock boto3/botocore modules; return the boto3 mock."""
+    mock_boto3 = MagicMock()
+    sys.modules["boto3"] = mock_boto3
+    sys.modules["botocore"] = MagicMock()
+    sys.modules["botocore.exceptions"] = _make_botocore_exceptions()
+    sys.modules["botocore.config"] = MagicMock()
+    return mock_boto3
+
+
+class TestMirrorWithDeadline:
+    """Overall deadline and CLI outcome reporting (#5116)."""
+
+    def test_hung_upload_fails_at_deadline(self, tmp_path: Path) -> None:
+        """A put_object that never returns is cut off at the deadline."""
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"x\n")
+        release = threading.Event()
+        mock_boto3 = _install_fake_boto3()
+        mock_boto3.client.return_value.put_object.side_effect = lambda **_: (
+            release.wait(30)
+        )
+
+        start = time.monotonic()
+        ok, message = telemetry_upload.mirror_with_deadline(
+            local_file, "k", 0.2, bucket="b"
+        )
+        elapsed = time.monotonic() - start
+        release.set()
+
+        assert ok is False
+        assert "did not finish within 0.2s" in message
+        assert elapsed < 5
+
+    def test_success_within_deadline(self, tmp_path: Path) -> None:
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"abc")
+        _install_fake_boto3()
+
+        ok, message = telemetry_upload.mirror_with_deadline(
+            local_file, "ralph-reviews/x.jsonl", 5, bucket="b"
+        )
+
+        assert ok is True
+        assert message == (
+            f"uploaded {local_file} to s3://b/ralph-reviews/x.jsonl (3 bytes)"
+        )
+
+    def test_main_prints_ok_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"abc")
+        _install_fake_boto3()
+
+        code = telemetry_upload.main([str(local_file), "k"])
+
+        assert code == 0
+        assert capsys.readouterr().out.startswith("ok: uploaded ")
+
+    def test_main_prints_failure_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        local_file = tmp_path / "review-log.jsonl"
+        local_file.write_bytes(b"abc")
+        sys.modules["boto3"] = None  # type: ignore[assignment]
+
+        code = telemetry_upload.main([str(local_file), "k"])
+
+        assert code == 1
+        assert capsys.readouterr().out.startswith("failed: boto3 not available")
+
+    def test_main_reports_unreadable_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _install_fake_boto3()
+
+        code = telemetry_upload.main([str(tmp_path / "missing.jsonl"), "k"])
+
+        assert code == 1
+        assert "failed: cannot read" in capsys.readouterr().out
+
+    def test_main_usage_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert telemetry_upload.main(["only-one"]) == 2
+        assert "Usage:" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("", telemetry_upload._DEFAULT_DEADLINE_SECS),
+            ("abc", telemetry_upload._DEFAULT_DEADLINE_SECS),
+            ("0", telemetry_upload._DEFAULT_DEADLINE_SECS),
+            ("3.5", 3.5),
+        ],
+    )
+    def test_deadline_from_env(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: float
+    ) -> None:
+        monkeypatch.setenv("JUDGEMIND_TELEMETRY_DEADLINE_SECS", raw)
+        assert telemetry_upload._deadline_from_env() == expected
