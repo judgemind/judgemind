@@ -26,14 +26,13 @@ from unittest.mock import MagicMock, patch
 import psycopg
 import pymupdf
 import pytest
+from helpers.message_charges import ChargesFake, crash_field
 
 from ingestion import llm_extract
 from ingestion import worker as worker_mod
 from ingestion.llm_providers import LLMResponse
 from ingestion.worker import (
     MAX_MESSAGE_CRASHES,
-    PROCESSING_CRASHES_KEY_PREFIX,
-    PROCESSING_CRASHES_TTL_S,
     InfrastructureError,
     IngestionWorker,
 )
@@ -110,7 +109,7 @@ class _Killed(BaseException):
     """Stands in for the OOM killer's SIGKILL: the process stops mid-call."""
 
 
-class _FakeRedis:
+class _FakeRedis(ChargesFake):
     """The stream calls the poison handling makes, against one consumer group
     whose pending list holds *events* (left by a consumer that died).
 
@@ -125,7 +124,6 @@ class _FakeRedis:
         }
         self.pending = list(self.entries)
         self.kv: dict[str, int] = {}
-        self.ttls: dict[str, int] = {}
         self.alive = True
 
     def kill(self) -> None:
@@ -144,27 +142,9 @@ class _FakeRedis:
         self.pending.remove(msg_id)
         return 1
 
-    def incr(self, key: str) -> int | None:
-        if not self.alive:
-            return None
-        self.kv[key] = self.kv.get(key, 0) + 1
-        return self.kv[key]
-
-    def decr(self, key: str) -> int | None:
-        if not self.alive:
-            return None
-        self.kv[key] = self.kv.get(key, 0) - 1
-        return self.kv[key]
-
-    def expire(self, key: str, seconds: int) -> bool:
-        if self.alive:
-            self.ttls[key] = seconds
-        return self.alive
-
-    def delete(self, key: str) -> int:
-        if not self.alive:
-            return 0
-        return 1 if self.kv.pop(key, None) is not None else 0
+    def xpending_range(self, stream: str, group: str, *, min: str, max: str, count: int) -> Any:
+        ids = [m for m in self.pending if min <= m.decode() <= max]
+        return [{"message_id": m} for m in ids[:count]]
 
 
 def _worker(redis_client: Any = None) -> IngestionWorker:
@@ -185,7 +165,7 @@ def _events(n: int) -> list[dict[str, Any]]:
 
 
 def _key(msg_id: str) -> str:
-    return f"{PROCESSING_CRASHES_KEY_PREFIX}{msg_id}"
+    return crash_field(msg_id)
 
 
 def _killer(redis: _FakeRedis, document_id: str, processed: list[str]) -> Any:
@@ -264,7 +244,7 @@ def test_infrastructure_error_restarts_never_dead_letter() -> None:
         worker.process_event.side_effect = psycopg.OperationalError("connection refused")
         with pytest.raises(InfrastructureError):
             worker._reclaim_pending_messages()
-        assert redis.kv == {_key("1-0"): 0}
+        assert redis.kv == {}  # charge taken back, and no error charged
 
     worker = _worker(redis)
     assert worker._reclaim_pending_messages() == 5
@@ -297,7 +277,6 @@ def test_normal_processing_clears_the_marker() -> None:
     worker = _worker(redis)
     assert worker._process_message(b"1-0", redis.entries[b"1-0"]) is True
     worker.process_event.assert_called_once()
-    assert redis.ttls == {_key("1-0"): PROCESSING_CRASHES_TTL_S}
     assert redis.kv == {}
     assert redis.pending == []
 
@@ -320,7 +299,7 @@ def test_keyboard_interrupt_mid_message_takes_the_charge_back() -> None:
     worker.process_event.side_effect = KeyboardInterrupt
     with pytest.raises(KeyboardInterrupt):
         worker._process_message(b"1-0", redis.entries[b"1-0"])
-    assert redis.kv == {_key("1-0"): 0}
+    assert redis.kv == {}
     assert redis.pending == [b"1-0"]
 
 
@@ -329,12 +308,14 @@ def test_death_between_mark_and_start_counts_once() -> None:
     message once, not twice."""
     redis = _FakeRedis(_events(1))
     worker = _worker(redis)
+    charge = redis.hincrby
 
-    def die_on_expire(key: str, seconds: int) -> bool:
+    def charge_then_die(name: str, field: str, amount: int = 1) -> int | None:
+        charge(name, field, amount)
         redis.kill()
         raise _Killed
 
-    with patch.object(redis, "expire", side_effect=die_on_expire):
+    with patch.object(redis, "hincrby", side_effect=charge_then_die):
         with pytest.raises(_Killed):
             worker._reclaim_pending_messages()
     worker.process_event.assert_not_called()
@@ -381,7 +362,7 @@ def test_xautoclaim_delivery_count_is_ignored() -> None:
         [],
     )
     worker._redis.xpending_range.return_value = [{"times_delivered": 99}]
-    worker._redis.incr.return_value = 1
+    worker._redis.hincrby.return_value = 1
     assert worker._reclaim_pending_messages() == 1
     worker.process_event.assert_called_once()
     worker._redis.xpending_range.assert_not_called()
@@ -390,7 +371,7 @@ def test_xautoclaim_delivery_count_is_ignored() -> None:
 def test_unknown_crash_count_is_processed() -> None:
     """A Redis failure on the mark, or a reply that is not a count, never
     dead-letters: the message is processed."""
-    for incr in (RuntimeError("redis down"), None, b"x"):
+    for incr in (RuntimeError("redis down"), None, b"x", True):
         worker = _worker()
         worker._redis.xautoclaim.return_value = (
             b"0-0",
@@ -398,24 +379,24 @@ def test_unknown_crash_count_is_processed() -> None:
             [],
         )
         if isinstance(incr, Exception):
-            worker._redis.incr.side_effect = incr
+            worker._redis.hincrby.side_effect = incr
         else:
-            worker._redis.incr.return_value = incr
+            worker._redis.hincrby.return_value = incr
         assert worker._reclaim_pending_messages() == 1
         worker.process_event.assert_called_once()
 
 
 def test_redis_failure_clearing_the_marker_is_logged_not_raised() -> None:
     worker = _worker()
-    worker._redis.incr.return_value = 1
-    worker._redis.delete.side_effect = RuntimeError("redis down")
+    worker._redis.hincrby.return_value = 1
+    worker._redis.hdel.side_effect = RuntimeError("redis down")
     data = {b"data": json.dumps(_events(1)[0]).encode()}
     assert worker._process_message(b"7-0", data) is True
     worker._redis.xack.assert_called_once()
 
     worker = _worker()
-    worker._redis.incr.return_value = 1
-    worker._redis.decr.side_effect = RuntimeError("redis down")
+    worker._redis.hincrby.return_value = 1
+    worker._redis.eval.side_effect = RuntimeError("redis down")
     worker.process_event.side_effect = psycopg.OperationalError("db down")
     with pytest.raises(InfrastructureError):
         worker._process_message(b"7-0", data)
@@ -430,3 +411,320 @@ def test_malformed_message_is_acked_without_a_mark() -> None:
     assert redis.pending == []
     assert redis.kv == {}
     worker._record_dead_letter.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #5092: the cap can't be evicted, driven negative, or looped around
+# ---------------------------------------------------------------------------
+
+
+def _healthy(worker: IngestionWorker) -> IngestionWorker:
+    """The database answers: ``_infrastructure_healthy`` is True."""
+    worker._get_connection = MagicMock()  # type: ignore[method-assign]
+    worker.health_check = MagicMock()  # type: ignore[method-assign]
+    return worker
+
+
+def _db_down(worker: IngestionWorker) -> IngestionWorker:
+    worker._get_connection = MagicMock()  # type: ignore[method-assign]
+    worker.health_check = MagicMock(  # type: ignore[method-assign]
+        side_effect=InfrastructureError(psycopg.OperationalError("db down"))
+    )
+    return worker
+
+
+def test_crash_count_survives_volatile_lru_eviction() -> None:
+    """Memory pressure between deaths evicts every TTL'd key; the crash count
+    has no TTL, so the killer is still dead-lettered on the 4th restart."""
+    redis = _FakeRedis(_events(2))
+    processed: list[str] = []
+    for _ in range(MAX_MESSAGE_CRASHES):
+        worker = _worker(redis)
+        worker.process_event.side_effect = _killer(redis, "doc-1", processed)
+        with pytest.raises(_Killed):
+            worker._reclaim_pending_messages()
+        redis.restart()
+        redis.evict_volatile()
+    assert redis.kv == {_key("1-0"): MAX_MESSAGE_CRASHES}
+
+    worker = _worker(redis)
+    worker.process_event.side_effect = _killer(redis, "doc-1", processed)
+    assert worker._reclaim_pending_messages() == 1
+    assert processed == ["doc-2"]
+    assert worker._record_dead_letter.call_args.kwargs["cause"] == "repeated_crash"
+
+
+def test_charge_and_refund_never_set_a_ttl() -> None:
+    redis = MagicMock(wraps=_FakeRedis(_events(1)))
+    worker = _worker(redis)
+    worker.process_event.side_effect = KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        worker._process_message(b"1-0", {b"data": b"{}"})
+    worker.process_event.side_effect = None
+    worker._process_message(b"1-0", {b"data": b"{}"})
+    assert {c[0] for c in redis.mock_calls} == {"hincrby", "eval", "xack", "hdel"}
+
+
+def test_refund_without_a_charge_never_goes_negative() -> None:
+    """The charge failed (a Redis blip): the exit that follows takes nothing
+    back, so the count still records both earlier deaths and never -1."""
+    redis = _FakeRedis(_events(1))
+    redis.kv[_key("1-0")] = 2
+    worker = _worker(redis)
+    charge = redis.hincrby
+
+    def blip_on_crash_charge(name: str, field: str, amount: int = 1) -> int | None:
+        if field == _key("1-0"):
+            raise ConnectionError("blip")
+        return charge(name, field, amount)
+
+    with patch.object(redis, "hincrby", side_effect=blip_on_crash_charge):
+        worker.process_event.side_effect = psycopg.OperationalError("db down")
+        with pytest.raises(InfrastructureError):
+            worker._process_message(b"1-0", redis.entries[b"1-0"])
+        worker.process_event.side_effect = KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            worker._process_message(b"1-0", redis.entries[b"1-0"])
+    assert redis.kv == {_key("1-0"): 2}
+
+
+def test_refund_of_a_missing_count_leaves_no_negative_field() -> None:
+    """The count vanished between the charge and the refund (swept, or a
+    restarted Redis): the refund deletes nothing below 0 into existence."""
+    redis = _FakeRedis(_events(1))
+    worker = _worker(redis)
+
+    def vanish(event: dict[str, Any]) -> None:
+        redis.kv.clear()
+        raise KeyboardInterrupt
+
+    worker.process_event.side_effect = vanish
+    with pytest.raises(KeyboardInterrupt):
+        worker._process_message(b"1-0", redis.entries[b"1-0"])
+    assert redis.kv == {}
+
+    worker._refund_crash(b"1-0")
+    assert redis.kv == {}
+
+
+def test_shutdown_release_never_goes_negative() -> None:
+    redis = _FakeRedis(_events(1))
+    worker = _worker(redis)
+    worker._release_in_flight(b"1-0")
+    assert redis.kv == {}
+
+
+def _restart_with(redis: _FakeRedis, exc: Exception, *, healthy: bool = True) -> IngestionWorker:
+    worker = _worker(redis)
+    (_healthy if healthy else _db_down)(worker)
+    worker.process_event.side_effect = exc
+    return worker
+
+
+def test_repeated_oserror_is_dead_lettered_after_the_cap() -> None:
+    """A message that raises PIL's ``UnidentifiedImageError`` (an ``OSError``,
+    so an infrastructure exit) on every attempt is dead-lettered with cause
+    ``repeated_error:UnidentifiedImageError`` on its 5th exit, and the
+    messages behind it are processed."""
+    from PIL import UnidentifiedImageError
+
+    redis = _FakeRedis(_events(3))
+    corrupt = UnidentifiedImageError("cannot identify image file")
+
+    def fail_doc_1(event: dict[str, Any]) -> None:
+        if event["document_id"] == "doc-1":
+            raise corrupt
+
+    for exits in range(1, worker_mod.MAX_MESSAGE_HANDLED_ERRORS):
+        worker = _restart_with(redis, corrupt)
+        worker.process_event.side_effect = fail_doc_1
+        with pytest.raises(InfrastructureError):
+            worker._reclaim_pending_messages()
+        worker._record_dead_letter.assert_not_called()
+        assert redis.kv == {worker_mod._error_field("1-0"): exits}
+
+    worker = _restart_with(redis, corrupt)
+    worker.process_event.side_effect = fail_doc_1
+    assert worker._reclaim_pending_messages() == 2
+
+    worker._record_dead_letter.assert_called_once()
+    args, kwargs = worker._record_dead_letter.call_args
+    assert args[0]["document_id"] == "doc-1"
+    assert args[1] is corrupt
+    assert kwargs["attempts"] == worker_mod.MAX_MESSAGE_HANDLED_ERRORS
+    assert kwargs["cause"] == "repeated_error:UnidentifiedImageError"
+    assert redis.pending == []
+    assert redis.kv == {}
+
+
+def test_repeated_error_dead_letter_records_its_cause() -> None:
+    worker = IngestionWorker(
+        redis_client=MagicMock(),
+        pg_dsn="postgresql://localhost/test",
+        opensearch_client=MagicMock(),
+        s3_client=MagicMock(),
+        archive_bucket="test-bucket",
+    )
+    worker._record_incomplete_and_commit = MagicMock()  # type: ignore[method-assign]
+    event = _events(1)[0]
+    worker._record_dead_letter(event, OSError("bad"), attempts=5, cause="repeated_error:OSError")
+    args, kwargs = worker._record_incomplete_and_commit.call_args
+    assert args[1] == worker_mod.INCOMPLETE_DEAD_LETTER
+    assert args[2] == {"error": "OSError: bad", "attempts": 5, "cause": "repeated_error:OSError"}
+    assert kwargs == {"rollback_first": True}
+
+    worker._record_dead_letter(event, ValueError("x"), attempts=3)
+    assert "cause" not in worker._record_incomplete_and_commit.call_args.args[2]
+
+
+def test_db_down_restart_loop_dead_letters_nothing() -> None:
+    """An outage: every exit, OSError included, comes while the database is
+    down, so nothing is charged however often the worker restarts (#1044)."""
+    redis = _FakeRedis(_events(3))
+    for _ in range(worker_mod.MAX_MESSAGE_HANDLED_ERRORS * 3):
+        worker = _restart_with(redis, OSError("network unreachable"), healthy=False)
+        with pytest.raises(InfrastructureError):
+            worker._reclaim_pending_messages()
+        worker._record_dead_letter.assert_not_called()
+    assert redis.kv == {}
+
+    worker = _worker(redis)
+    assert worker._reclaim_pending_messages() == 3
+    worker._record_dead_letter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        psycopg.errors.UndefinedColumn("column x does not exist"),
+        psycopg.OperationalError("server closed the connection"),
+        worker_mod.ExtractorUnavailableError("no API key"),
+    ],
+)
+def test_deploy_wide_failures_never_charge_the_message(exc: Exception) -> None:
+    """A schema not migrated or a missing extractor fails every message even
+    while the database answers: never charged, never dead-lettered (#1044)."""
+    redis = _FakeRedis(_events(2))
+    for _ in range(worker_mod.MAX_MESSAGE_HANDLED_ERRORS * 2):
+        worker = _restart_with(redis, exc)
+        with pytest.raises(InfrastructureError):
+            worker._reclaim_pending_messages()
+        worker.health_check.assert_not_called()
+    assert redis.kv == {}
+    worker._record_dead_letter.assert_not_called()
+
+
+def test_other_exiting_exceptions_count_toward_the_cap() -> None:
+    """Any exception escaping processing (here the ack after a success) is
+    charged too, so it can't loop forever either."""
+    redis = _FakeRedis(_events(1))
+    worker = _healthy(_worker(redis))
+    with patch.object(redis, "xack", side_effect=RuntimeError("ack refused")):
+        with pytest.raises(RuntimeError):
+            worker._process_message(b"1-0", redis.entries[b"1-0"])
+    assert redis.kv == {worker_mod._error_field("1-0"): 1}
+
+
+def test_released_message_is_never_charged_or_dead_lettered() -> None:
+    """The shutdown watchdog handed the message back (#5069) before its
+    processing raised: another consumer owns it, so this worker charges no
+    error and dead-letters nothing, even at the cap."""
+    redis = _FakeRedis(_events(1))
+    redis.kv[worker_mod._error_field("1-0")] = worker_mod.MAX_MESSAGE_HANDLED_ERRORS - 1
+    worker = _restart_with(redis, OSError("bad"))
+
+    def released_then_fail(event: dict[str, Any]) -> None:
+        worker._release_in_flight(b"1-0")
+        worker._shutdown.released = b"1-0"
+        raise OSError("bad")
+
+    worker.process_event.side_effect = released_then_fail
+    with pytest.raises(InfrastructureError):
+        worker._process_message(b"1-0", redis.entries[b"1-0"])
+    worker._record_dead_letter.assert_not_called()
+    worker.health_check.assert_not_called()
+    assert redis.kv == {worker_mod._error_field("1-0"): worker_mod.MAX_MESSAGE_HANDLED_ERRORS - 1}
+    assert redis.pending == [b"1-0"]
+
+
+def test_error_charge_failure_dead_letters_nothing() -> None:
+    redis = _FakeRedis(_events(1))
+    redis.kv[worker_mod._error_field("1-0")] = worker_mod.MAX_MESSAGE_HANDLED_ERRORS
+    for reply in (ConnectionError("redis down"), None):
+        worker = _restart_with(redis, OSError("bad"))
+        charge = redis.hincrby
+
+        def error_charge(name: str, field: str, amount: int = 1, reply: Any = reply) -> Any:
+            if field.startswith(worker_mod.ERROR_FIELD_PREFIX):
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+            return charge(name, field, amount)
+
+        with patch.object(redis, "hincrby", side_effect=error_charge):
+            with pytest.raises(InfrastructureError):
+                worker._process_message(b"1-0", redis.entries[b"1-0"])
+        worker._record_dead_letter.assert_not_called()
+
+
+def test_health_probe_rolls_back_first_and_survives_a_broken_connection() -> None:
+    worker = _worker()
+    conn = MagicMock()
+    worker._get_connection = MagicMock(return_value=conn)  # type: ignore[method-assign]
+    worker.health_check = MagicMock()  # type: ignore[method-assign]
+    assert worker._infrastructure_healthy() is True
+    conn.rollback.assert_called_once()
+
+    conn.rollback.side_effect = psycopg.InterfaceError("connection already closed")
+    assert worker._infrastructure_healthy() is True
+    conn.close.assert_called_once()
+
+    worker.health_check.side_effect = InfrastructureError(OSError("db down"))
+    assert worker._infrastructure_healthy() is False
+
+
+def test_sweep_drops_only_counts_of_messages_no_longer_pending() -> None:
+    redis = _FakeRedis(_events(2))
+    redis.kv = {
+        _key("1-0"): 1,
+        worker_mod._error_field("1-0"): 2,
+        _key("9-0"): 1,  # acked by a path that could not delete it
+        worker_mod._error_field("8-0"): 4,
+        "unrelated": 1,
+    }
+    worker = _worker(redis)
+    assert worker._sweep_message_charges() == 2
+    assert redis.kv == {_key("1-0"): 1, worker_mod._error_field("1-0"): 2, "unrelated": 1}
+
+
+def test_sweep_inspects_at_most_the_field_limit() -> None:
+    redis = _FakeRedis([])
+    redis.kv = {_key(f"{i}-0"): 1 for i in range(1, 6)}
+    worker = _worker(redis)
+    with patch.object(worker_mod, "MESSAGE_CHARGES_SWEEP_MAX_FIELDS", 2):
+        assert worker._sweep_message_charges() == 2
+    assert len(redis.kv) == 3
+
+
+def test_sweep_failure_is_logged_not_raised() -> None:
+    worker = _worker()
+    worker._redis.hscan_iter.side_effect = ConnectionError("down")
+    assert worker._sweep_message_charges() == 0
+
+
+def test_trim_pass_sweeps_charges_hourly() -> None:
+    worker = _worker()
+    worker._sweep_message_charges = MagicMock(return_value=0)  # type: ignore[method-assign]
+    clock = [1000.0]
+    with (
+        patch.object(worker_mod, "trim_consumed_entries", return_value=(0, None)),
+        patch.object(worker_mod.time, "monotonic", side_effect=lambda: clock[0]),
+    ):
+        worker._maybe_trim_consumed_entries()
+        assert worker._sweep_message_charges.call_count == 1
+        clock[0] += worker_mod.STREAM_TRIM_INTERVAL_S
+        worker._maybe_trim_consumed_entries()
+        assert worker._sweep_message_charges.call_count == 1
+        clock[0] += worker_mod.MESSAGE_CHARGES_SWEEP_INTERVAL_S
+        worker._maybe_trim_consumed_entries()
+        assert worker._sweep_message_charges.call_count == 2
