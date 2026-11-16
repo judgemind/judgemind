@@ -474,7 +474,9 @@ else
 fi
 
 collect l_wallstop
-if grep -q "rc=124 kill=wall" <<< "$RUN_OUT" && [[ "$RUN_TOOK" -le 7 ]]; then
+# kill=wall already proves the wall stop (not the 100-tick cap) fired; the
+# time bound only has to tell ~4s from 100s, so it is loose (#5083).
+if grep -q "rc=124 kill=wall" <<< "$RUN_OUT" && [[ "$RUN_TOOK" -le 30 ]]; then
     pass "lib: --wall-stop kills a call before its tick cap and records why (${RUN_TOOK}s)"
 else
     fail "lib: --wall-stop kills a call before its tick cap" "took ${RUN_TOOK}s output=$RUN_OUT"

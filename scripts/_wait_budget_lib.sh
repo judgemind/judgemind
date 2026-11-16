@@ -84,6 +84,15 @@
 #   WAIT_SLOW_CALL_SECS   log calls at least this slow (default 30)
 #   WAIT_SLEEP_SLICE_SECS longest single sleep inside wait_budget_sleep
 #                         (default 2)
+#
+# Test hook (never set in production):
+#   WAIT_BUDGET_CLOCK_FILE  when set, the budget reads "now" (integer seconds)
+#                           from this file instead of $SECONDS. Tests advance
+#                           it from a stub command to check the budget and
+#                           slow-call arithmetic without real sleeps (#5083).
+#                           The watchdog's ticks and --wall-stop check still
+#                           use real time, so start a fake clock well above
+#                           the real $SECONDS (e.g. 100000).
 
 _WAIT_BUDGET_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_ecs_exec_lib.sh
@@ -104,6 +113,18 @@ WAIT_BUDGET_DEADLINE=""   # empty = no budget (unlimited wait)
 # `2>&1`; writing the notes to fd 9 keeps them out of that captured text.
 _WAIT_BUDGET_LOG_FD_OPEN=false
 
+# _wait_budget_now — sets _WAIT_BUDGET_NOW to the current time in seconds:
+# $SECONDS, or the WAIT_BUDGET_CLOCK_FILE value under test. Sets a variable
+# rather than printing so production reads cost no fork.
+_WAIT_BUDGET_NOW=0
+_wait_budget_now() {
+    if [ -n "${WAIT_BUDGET_CLOCK_FILE:-}" ]; then
+        read -r _WAIT_BUDGET_NOW < "$WAIT_BUDGET_CLOCK_FILE"
+    else
+        _WAIT_BUDGET_NOW=$SECONDS
+    fi
+}
+
 # wait_budget_init <timeout-secs> [start-secs]
 #
 # Starts the budget. <timeout-secs> of "" or "unlimited" means no budget:
@@ -112,7 +133,8 @@ _WAIT_BUDGET_LOG_FD_OPEN=false
 # whose budget started before the wait loop (e.g. at script start).
 wait_budget_init() {
     local timeout="${1:-}"
-    WAIT_BUDGET_START="${2:-$SECONDS}"
+    _wait_budget_now
+    WAIT_BUDGET_START="${2:-$_WAIT_BUDGET_NOW}"
     if [ -z "$timeout" ] || [ "$timeout" = "unlimited" ]; then
         WAIT_BUDGET_DEADLINE=""
     else
@@ -154,7 +176,8 @@ wait_budget_remaining() {
     if [ -z "$WAIT_BUDGET_DEADLINE" ]; then
         echo 999999
     else
-        echo $((WAIT_BUDGET_DEADLINE - SECONDS))
+        _wait_budget_now
+        echo $((WAIT_BUDGET_DEADLINE - _WAIT_BUDGET_NOW))
     fi
 }
 
@@ -170,7 +193,8 @@ wait_budget_exhausted() {
     if [ "$quarter" -lt "$margin" ]; then
         margin="$quarter"
     fi
-    [ $((WAIT_BUDGET_DEADLINE - SECONDS)) -lt "$margin" ]
+    _wait_budget_now
+    [ $((WAIT_BUDGET_DEADLINE - _WAIT_BUDGET_NOW)) -lt "$margin" ]
 }
 
 # wait_budget_sleep <secs> — sleep <secs>, but never past the budget.
@@ -185,7 +209,8 @@ wait_budget_sleep() {
     local slice left t0 took
     while [ "$secs" -gt 0 ]; do
         if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
-            left=$((WAIT_BUDGET_DEADLINE - SECONDS))
+            _wait_budget_now
+            left=$((WAIT_BUDGET_DEADLINE - _WAIT_BUDGET_NOW))
             if [ "$left" -le 0 ]; then
                 return 0
             fi
@@ -197,9 +222,11 @@ wait_budget_sleep() {
         if [ "$secs" -lt "$slice" ]; then
             slice="$secs"
         fi
-        t0=$SECONDS
+        _wait_budget_now
+        t0=$_WAIT_BUDGET_NOW
         sleep "$slice"
-        took=$((SECONDS - t0))
+        _wait_budget_now
+        took=$((_WAIT_BUDGET_NOW - t0))
         if [ "$took" -gt $((slice + 10)) ]; then
             _wait_budget_note "host asleep: a ${slice}s sleep took ${took}s on the wall clock; that time counts against this call's budget (#4975)."
         fi
@@ -238,7 +265,8 @@ wait_budget_call() {
 
     local cap="$max"
     if [ -n "$WAIT_BUDGET_DEADLINE" ]; then
-        local left=$((WAIT_BUDGET_DEADLINE - SECONDS))
+        _wait_budget_now
+        local left=$((WAIT_BUDGET_DEADLINE - _WAIT_BUDGET_NOW))
         if [ "$left" -lt "$cap" ]; then
             cap="$left"
         fi
@@ -251,7 +279,8 @@ wait_budget_call() {
     out_file=$(mktemp)
     err_file=$(mktemp)
     local rc=0
-    local t0=$SECONDS
+    _wait_budget_now
+    local t0=$_WAIT_BUDGET_NOW
     # Wall-clock stop (#4975): the budget deadline, or t0 + cap when the call
     # got the WAIT_CALL_MIN_SECS floor past the deadline. Awake, the tick cap
     # always fires first; it only matters after the host slept mid-call.
@@ -265,7 +294,8 @@ wait_budget_call() {
     fi
     ecs_exec_run_with_timeout ${wall_args[@]+"${wall_args[@]}"} "$cap" "$@" \
         </dev/null >"$out_file" 2>"$err_file" 9>&- || rc=$?
-    local took=$((SECONDS - t0))
+    _wait_budget_now
+    local took=$((_WAIT_BUDGET_NOW - t0))
 
     cat "$out_file"
     cat "$err_file" >&2
