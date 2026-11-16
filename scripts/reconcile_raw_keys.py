@@ -2314,6 +2314,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "scheduled workflow.",
     )
     parser.add_argument(
+        "--simulate-failure",
+        action="store_true",
+        help="Manual verification only (#5095): exit 3 before doing anything, "
+        "with no RECONCILE_RESULT line, so the workflow's failure issue can be "
+        "exercised.  Only a workflow_dispatch run can pass it.",
+    )
+    parser.add_argument(
         "--issue-summary",
         metavar="RESULT_JSON",
         help="Print the issue Markdown for a saved RECONCILE_RESULT JSON and exit "
@@ -2346,12 +2353,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
+#: Exit code of ``--simulate-failure`` (#5095).
+SIMULATED_FAILURE_EXIT = 3
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.issue_summary:
         with open(args.issue_summary) as fh:
             print(issue_summary(json.load(fh)), end="")
         return 0
+    if args.simulate_failure:
+        print("SIMULATED_FAILURE --simulate-failure set (#5095); exiting 3", flush=True)
+        return SIMULATED_FAILURE_EXIT
 
     import boto3
     import psycopg

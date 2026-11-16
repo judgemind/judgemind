@@ -112,6 +112,9 @@ export const RAW_KEY_RECONCILIATION_QUERY = gql`
         count
       }
       action
+      ageHours
+      staleThresholdHours
+      isStale
       scopes {
         scope
         rawKeys
@@ -163,6 +166,11 @@ export interface RawKeyReconciliationRun {
   incompleteStuck: number;
   incompleteByReason: { reason: string; count: number }[];
   action: string;
+  /** Hours since the last completed run; null when unknown (#5095). */
+  ageHours: number | null;
+  staleThresholdHours: number;
+  /** The last completed run is older than staleThresholdHours (#5095). */
+  isStale: boolean;
   scopes: RawKeyReconcileScopeItem[];
 }
 

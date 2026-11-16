@@ -2041,3 +2041,15 @@ def test_fetch_recent_scope_actions_shapes() -> None:
     db = FakeDb({"scope_actions": [({"ca/x": "reingest"},), (None,), ("[]",)]})
     assert rec.fetch_recent_scope_actions(db, 3) == [{"ca/x": "reingest"}, {}, {}]
     assert db.sql("scope_actions")[0][1] == (3,)
+
+
+def test_main_simulate_failure_exits_without_a_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """#5095: the workflow failure issue is exercised by a run that exits
+    non-zero before doing anything (no database, no RECONCILE_RESULT)."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert rec.main(["--simulate-failure", "--record", "--reingest"]) == 3
+    out = capsys.readouterr().out
+    assert "SIMULATED_FAILURE" in out
+    assert "RECONCILE_RESULT" not in out

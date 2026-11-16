@@ -785,6 +785,7 @@ describe('rawKeyReconciliation', () => {
     rawKeyReconciliation {
       runId finishedAt rawKeys represented skipped unrepresented pending datedExcluded action
       incomplete incompleteStuck incompleteByReason { reason count }
+      ageHours staleThresholdHours isStale
       scopes {
         scope rawKeys represented skipped unrepresented pending datedExcluded
         incomplete incompleteStuck
@@ -856,6 +857,11 @@ describe('rawKeyReconciliation', () => {
     expect(run.unrepresented).toBe(13);
     expect(run.pending).toBe(1);
     expect(run.datedExcluded).toBe(40);
+    // Staleness of the last completed run (#5095): finished in 2099, so the
+    // age clamps to zero and the run is fresh.
+    expect(run.ageHours).toBe(0);
+    expect(run.staleThresholdHours).toBe(36);
+    expect(run.isStale).toBe(false);
     // Keys whose rows are not a complete split (#5008).
     expect(run.incomplete).toBe(3);
     expect(run.incompleteStuck).toBe(1);

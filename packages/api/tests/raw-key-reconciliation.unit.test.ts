@@ -5,7 +5,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { Pool } from 'pg';
 import {
+  computeReconcileStaleness,
   dataQualityResolvers,
+  RAW_RECONCILE_STALE_THRESHOLD_HOURS,
   queryRawKeyReconciliation,
   RAW_RECONCILE_LATEST_RUN_SQL,
   RAW_RECONCILE_SCOPES_SQL,
@@ -62,6 +64,38 @@ describe('toReconcileScope', () => {
     ]);
     expect(toReconcileScope({ scope: 'x', skipped_by_reason: 'null' }).skippedByReason).toEqual([]);
     expect(toReconcileScope({ scope: 'x', skipped_by_reason: 7 }).skippedByReason).toEqual([]);
+  });
+});
+
+describe('computeReconcileStaleness', () => {
+  const now = new Date('2026-11-16T12:00:00Z');
+
+  it('is fresh at the threshold and stale just past it', () => {
+    expect(computeReconcileStaleness('2026-11-15T00:00:00Z', now)).toEqual({
+      ageHours: 36,
+      staleThresholdHours: RAW_RECONCILE_STALE_THRESHOLD_HOURS,
+      isStale: false,
+    });
+    expect(computeReconcileStaleness('2026-11-14T23:00:00Z', now).isStale).toBe(true);
+  });
+
+  it('clamps a finish time in the future to zero hours', () => {
+    expect(computeReconcileStaleness('2026-11-16T13:00:00Z', now)).toMatchObject({
+      ageHours: 0,
+      isStale: false,
+    });
+  });
+
+  it('is stale when the finish time is unknown', () => {
+    expect(computeReconcileStaleness(null, now)).toEqual({
+      ageHours: null,
+      staleThresholdHours: 36,
+      isStale: true,
+    });
+  });
+
+  it('honours a custom threshold', () => {
+    expect(computeReconcileStaleness('2026-11-16T10:00:00Z', now, 1).isStale).toBe(true);
   });
 });
 
@@ -132,6 +166,34 @@ describe('queryRawKeyReconciliation', () => {
     expect(run?.incomplete).toBe(0);
     expect(run?.incompleteStuck).toBe(0);
     expect(run?.incompleteByReason).toEqual([]);
+  });
+
+  it('reports the age and staleness of the last completed run (#5095)', async () => {
+    const rows = (finished_at: string) =>
+      vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ run_id: 'r', finished_at }] })
+        .mockResolvedValueOnce({ rows: [] });
+    const now = new Date('2026-11-16T13:31:02Z');
+    const fresh = await queryRawKeyReconciliation(
+      { query: rows('2026-11-16T13:01:02Z') } as unknown as Pool,
+      now,
+    );
+    expect(fresh).toMatchObject({ ageHours: 0.5, staleThresholdHours: 36, isStale: false });
+    const stale = await queryRawKeyReconciliation(
+      { query: rows('2026-11-15T00:31:02Z') } as unknown as Pool,
+      now,
+    );
+    expect(stale).toMatchObject({ ageHours: 37, staleThresholdHours: 36, isStale: true });
+  });
+
+  it('treats a run with no finish time as stale', async () => {
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: [{ run_id: 'r' }] })
+      .mockResolvedValueOnce({ rows: [] });
+    const run = await queryRawKeyReconciliation({ query } as unknown as Pool);
+    expect(run).toMatchObject({ finishedAt: null, ageHours: null, isStale: true });
   });
 
   it('reads the incomplete counts and orders scopes by what needs work', () => {
