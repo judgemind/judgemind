@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from collections import Counter
 from collections.abc import Iterator
@@ -2111,11 +2112,46 @@ DEFAULT_HEARTBEAT_INTERVAL = 60
 # are considered stale and eligible for cleanup.  1 hour = 3,600,000 ms.
 STALE_CONSUMER_IDLE_MS = 3_600_000
 
-# Minimum idle time (milliseconds) for a pending message to be eligible for
-# reclamation via XAUTOCLAIM.  Messages stuck longer than this are assumed
-# abandoned by a crashed consumer.  30 seconds is long enough that a healthy
-# consumer processing a slow message won't lose it.
-PENDING_RECLAIM_MIN_IDLE_MS = 30_000
+#: Seconds between renewals of the lease on every message the worker holds
+#: (#5091).  A message's lease is its pending-entry idle time: XAUTOCLAIM
+#: measures idle from the last delivery or claim, and processing does not
+#: touch it, so a live worker 31 s into a 52 s message looked abandoned and a
+#: second consumer (the new task of a rolling deploy) took it over, charging
+#: a false crash.  A heartbeat thread re-claims each held message to its own
+#: consumer (``XCLAIM ... JUSTID``, which resets idle to 0 without counting a
+#: delivery) every interval, through ``_RENEW_LEASES_LUA``, which skips any
+#: message another consumer already owns.
+LEASE_RENEW_INTERVAL_S = 10.0
+
+#: Renewals a holder may miss before its messages count as abandoned.
+LEASE_MISSED_RENEWALS = 6
+
+#: Minimum idle time (milliseconds) for a pending message to be eligible for
+#: reclamation via XAUTOCLAIM.  Derived from the lease renewal interval, not
+#: from how long a message takes: a live holder renews every
+#: ``LEASE_RENEW_INTERVAL_S``, so idle past ``LEASE_MISSED_RENEWALS`` renewals
+#: means the holder is dead (SIGKILL, OOM) or stopped renewing.  Message
+#: duration is unbounded (dev p99 86 s, some past 110 s), so no fixed idle
+#: based on it can tell a slow message from a dead worker (#5091).
+PENDING_RECLAIM_MIN_IDLE_MS = int(LEASE_RENEW_INTERVAL_S * LEASE_MISSED_RENEWALS * 1000)
+
+#: Renews the leases of the messages in ARGV[3..] that consumer ARGV[2] of
+#: group ARGV[1] on stream KEYS[1] still owns, atomically per message: a
+#: message another consumer reclaimed (or that was acked) is never claimed
+#: back.  Returns the ids the consumer no longer owns.
+_RENEW_LEASES_LUA = """
+local lost = {}
+for i = 3, #ARGV do
+  local id = ARGV[i]
+  local entry = redis.call('XPENDING', KEYS[1], ARGV[1], id, id, 1)
+  if entry[1] and entry[1][2] == ARGV[2] then
+    redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, id, 'JUSTID')
+  else
+    lost[#lost + 1] = id
+  end
+end
+return lost
+"""
 
 #: Times the worker may die while processing one message before the message
 #: is dead-lettered unprocessed (#5010).  Processing a message that OOM-kills
@@ -2302,8 +2338,16 @@ class IngestionWorker:
         llm_model: str | None = None,
         llm_timeout: float | None = 60.0,
         bust_llm_cache: bool = False,
+        consumer_name: str = CONSUMER_NAME,
     ) -> None:
         self._redis = redis_client
+        self._consumer_name = consumer_name
+        # Messages delivered to this consumer and not yet settled (acked or
+        # handed back): the heartbeat renews their leases (#5091).
+        self._held: set[bytes] = set()
+        self._held_lock = threading.Lock()
+        self._lease_stop = threading.Event()
+        self._lease_thread: threading.Thread | None = None
         self._pg_dsn = pg_dsn
         self._max_retries = max_retries
         self._conn: psycopg.Connection | None = None
@@ -3701,6 +3745,7 @@ class IngestionWorker:
         self._warn_if_socket_timeout_below_block(block_ms)
         self._ensure_consumer_group()
         self._cleanup_stale_consumers()
+        self._start_lease_heartbeat()
 
         try:
             # Reclaim any messages left pending by crashed consumers before
@@ -3717,7 +3762,7 @@ class IngestionWorker:
                 extra={
                     "stream": STREAM_DOCUMENT_CAPTURED,
                     "group": CONSUMER_GROUP,
-                    "consumer": CONSUMER_NAME,
+                    "consumer": self._consumer_name,
                 },
             )
             self._consume(batch_size=batch_size, block_ms=block_ms)
@@ -3726,8 +3771,94 @@ class IngestionWorker:
         except WorkerShutdown:
             self._log_shutdown("idle")
         finally:
+            self._stop_lease_heartbeat()
             self.close()
             self._shutdown.stopped()
+
+    # -- message leases (#5091) ----------------------------------------------
+
+    def _hold(self, msg_ids: Any) -> None:
+        """Start renewing the leases of *msg_ids*, just delivered to us."""
+        with self._held_lock:
+            self._held.update(msg_ids)
+
+    def _unhold(self, msg_id: bytes) -> None:
+        """Stop renewing *msg_id*'s lease: it is settled or handed back."""
+        with self._held_lock:
+            self._held.discard(msg_id)
+
+    def _unhold_all(self, msg_ids: list[bytes]) -> None:
+        with self._held_lock:
+            self._held.difference_update(msg_ids)
+
+    def _holds(self, msg_id: bytes) -> bool:
+        with self._held_lock:
+            return msg_id in self._held
+
+    def _renew_leases(self) -> int:
+        """Renew the lease of every message this worker holds; returns how
+        many were renewed.
+
+        After SIGTERM only the message in flight is renewed: the rest of
+        its batch will not be started here, so their leases lapse and
+        another consumer reclaims them.  A message another consumer now
+        owns is dropped from the held set and will not be started."""
+        with self._held_lock:
+            held = set(self._held)
+        if self._shutdown.requested:
+            held &= {self._shutdown.in_flight}
+        if not held:
+            return 0
+        ids = sorted(held)
+        try:
+            lost = self._redis.eval(
+                _RENEW_LEASES_LUA,
+                1,
+                STREAM_DOCUMENT_CAPTURED,
+                CONSUMER_GROUP,
+                self._consumer_name,
+                *ids,
+            )
+        except Exception as exc:
+            logger.warning("Could not renew message leases: %s", exc)
+            return 0
+        lost_ids = {
+            m if isinstance(m, bytes) else str(m).encode()
+            for m in (lost if isinstance(lost, list | tuple) else [])
+        }
+        lost_ids &= held
+        for msg_id in lost_ids:
+            with self._held_lock:
+                was_held = msg_id in self._held
+                self._held.discard(msg_id)
+            if was_held:
+                logger.warning(
+                    "Lost the lease on message %s: another consumer owns it now",
+                    msg_id,
+                    extra={
+                        "telemetry_event": "message_lease_lost",
+                        "consumer": self._consumer_name,
+                        "in_flight": msg_id == self._shutdown.in_flight,
+                    },
+                )
+        return len(held) - len(lost_ids)
+
+    def _lease_heartbeat(self) -> None:
+        while not self._lease_stop.wait(LEASE_RENEW_INTERVAL_S):
+            self._renew_leases()
+
+    def _start_lease_heartbeat(self) -> None:
+        self._lease_stop.clear()
+        self._lease_thread = threading.Thread(
+            target=self._lease_heartbeat, name="message-lease-heartbeat", daemon=True
+        )
+        self._lease_thread.start()
+
+    def _stop_lease_heartbeat(self) -> None:
+        self._lease_stop.set()
+        thread, self._lease_thread = self._lease_thread, None
+        if thread is not None:
+            thread.join(timeout=LEASE_RENEW_INTERVAL_S)
 
     def install_shutdown_handler(self) -> None:
         """Handle SIGTERM: stop claiming messages, finish the one in flight,
@@ -3759,6 +3890,7 @@ class IngestionWorker:
         """Hand *msg_id* back unacked, taking back its crash charge, when the
         shutdown grace period ends mid-message (#5069).  Called by the
         shutdown watchdog under the shutdown lock."""
+        self._unhold(msg_id)
         try:
             self._redis.decr(_crashes_key(msg_id))
         except Exception as exc:
@@ -7492,7 +7624,7 @@ class IngestionWorker:
             idle: int = int(consumer.get("idle", 0))
             pending: int = int(consumer.get("pending", 0))
 
-            if name == CONSUMER_NAME:
+            if name == self._consumer_name:
                 continue
 
             if idle >= STALE_CONSUMER_IDLE_MS and pending == 0:
@@ -7557,6 +7689,12 @@ class IngestionWorker:
         pending (unacknowledged) for longer than ``PENDING_RECLAIM_MIN_IDLE_MS``
         to this consumer.  The reclaimed messages are then processed normally.
 
+        A live consumer renews the lease (pending idle time) of every message
+        it holds every ``LEASE_RENEW_INTERVAL_S`` (#5091), so this claims only
+        messages whose holder stopped renewing: it died, or it was stopped
+        and handed them back.  During a rolling deploy the new task's startup
+        reclaim therefore leaves the old task's in-flight message alone.
+
         This handles the case where a consumer crash-looped on an infrastructure
         error (e.g. missing DB column), left messages unacknowledged in the PEL,
         and then the infrastructure was fixed.  Without reclamation, those
@@ -7577,7 +7715,7 @@ class IngestionWorker:
             result = self._redis.xautoclaim(
                 STREAM_DOCUMENT_CAPTURED,
                 CONSUMER_GROUP,
-                CONSUMER_NAME,
+                self._consumer_name,
                 min_idle_time=PENDING_RECLAIM_MIN_IDLE_MS,
                 start_id=start_id,
                 count=batch_size,
@@ -7600,20 +7738,29 @@ class IngestionWorker:
             "Reclaimed %d pending message(s) from PEL",
             len(claimed_messages),
         )
-
-        for msg_id, data in claimed_messages:
-            if self._shutdown.requested:
-                # Claim no new message after SIGTERM (#5069); the rest stay
-                # pending, uncharged, for another consumer's XAUTOCLAIM.
-                break
-            if data is None:
-                # Message was deleted from the stream but still in PEL.
-                # Acknowledge it to clear the PEL entry.
-                logger.debug("Acknowledging deleted PEL entry %s", msg_id)
-                self._ack(msg_id)
-                continue
-            if self._process_message(msg_id, data):
-                processed += 1
+        claimed_ids = [msg_id for msg_id, _data in claimed_messages]
+        self._hold(claimed_ids)
+        try:
+            for msg_id, data in claimed_messages:
+                if self._shutdown.requested:
+                    # Claim no new message after SIGTERM (#5069); the rest stay
+                    # pending, uncharged, for another consumer's XAUTOCLAIM.
+                    break
+                if not self._holds(msg_id):
+                    continue  # its lease lapsed and another consumer took it (#5091)
+                if data is None:
+                    # Message was deleted from the stream but still in PEL.
+                    # Acknowledge it to clear the PEL entry.
+                    logger.debug("Acknowledging deleted PEL entry %s", msg_id)
+                    self._ack(msg_id)
+                    continue
+                if self._process_message(msg_id, data):
+                    processed += 1
+        finally:
+            # Whatever this loop leaves unsettled (a SIGTERM break, an
+            # exception) stops renewing, so its lease lapses and a reclaim
+            # picks it up uncharged (#5091).
+            self._unhold_all(claimed_ids)
 
         return processed
 
@@ -7625,8 +7772,10 @@ class IngestionWorker:
         shutdown = self._shutdown
         with shutdown.lock:
             if shutdown.released == msg_id:
+                self._unhold(msg_id)
                 return
             self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+            self._unhold(msg_id)
             if shutdown.in_flight == msg_id:
                 shutdown.in_flight = None
             try:
@@ -7655,6 +7804,7 @@ class IngestionWorker:
         an exception that exits the worker: the worker did not die on the
         message, so a crash loop over a broken database or schema (#1044)
         never dead-letters anything."""
+        self._unhold(msg_id)
         shutdown = self._shutdown
         with shutdown.lock:
             if shutdown.released == msg_id:
@@ -7700,7 +7850,7 @@ class IngestionWorker:
                 return
             messages = self._redis.xreadgroup(
                 CONSUMER_GROUP,
-                CONSUMER_NAME,
+                self._consumer_name,
                 {STREAM_DOCUMENT_CAPTURED: ">"},
                 count=batch_size,
                 block=block_ms,
@@ -7717,7 +7867,7 @@ class IngestionWorker:
                     idle_seconds,
                     self._empty_polls,
                     extra={
-                        "consumer": CONSUMER_NAME,
+                        "consumer": self._consumer_name,
                         "idle_seconds": idle_seconds,
                         "empty_polls": self._empty_polls,
                     },
@@ -7726,12 +7876,21 @@ class IngestionWorker:
 
         self._empty_polls = 0
         self._last_event_time = time.monotonic()
-        for _stream_name, entries in messages:
-            for msg_id, data in entries:
-                if shutdown.requested:
-                    # The rest stay pending, uncharged, for XAUTOCLAIM (#5069).
-                    return
-                self._process_message(msg_id, data)
+        batch_ids = [msg_id for _stream_name, entries in messages for msg_id, _data in entries]
+        self._hold(batch_ids)
+        try:
+            for _stream_name, entries in messages:
+                for msg_id, data in entries:
+                    if shutdown.requested:
+                        # The rest stay pending, uncharged, for XAUTOCLAIM (#5069).
+                        return
+                    if not self._holds(msg_id):
+                        continue  # its lease lapsed and another consumer took it (#5091)
+                    self._process_message(msg_id, data)
+        finally:
+            # Unsettled leftovers (a SIGTERM return, an exception) stop
+            # renewing, so a reclaim picks them up uncharged (#5091).
+            self._unhold_all(batch_ids)
 
     def _process_message(self, msg_id: bytes, data: dict[bytes, bytes]) -> bool:
         """Process one stream message; ``False`` when it was dropped
