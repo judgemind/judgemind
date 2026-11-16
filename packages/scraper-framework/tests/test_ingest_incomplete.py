@@ -158,6 +158,7 @@ def test_retry_marker_reasons_match_the_migration_comment() -> None:
         "all_children_rejected",
         "evidence_unavailable",
         "stale_validation",
+        "orphaned_superseded",
     }
 
 

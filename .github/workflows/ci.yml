@@ -91,6 +91,7 @@ jobs:
               - 'scripts/check_tests_use_reingest_helper.py'
               - 'scripts/dq_trend_storage.py'
               - 'scripts/rebuild_db.py'
+              - 'scripts/reconcile_raw_keys.py'
               - 'scripts/reingest_from_s3.py'
               # The job migrates its test database with this script.
               - 'scripts/apply_migrations.sh'

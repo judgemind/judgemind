@@ -213,6 +213,10 @@ describe('formatters', () => {
         { reason: 'brand_new', count: 2 },
       ]),
     ).toBe('whole-document fallback 1,000, brand_new 2');
+    // #5093: superseded-only keys whose dedup ruling is gone.
+    expect(formatIncompleteReasons([{ reason: 'orphaned_superseded', count: 92 }])).toBe(
+      'superseded, ruling lost 92',
+    );
   });
 
   it('formats day ranges', () => {
