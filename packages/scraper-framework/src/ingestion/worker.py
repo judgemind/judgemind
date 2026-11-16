@@ -2160,8 +2160,8 @@ return lost
 #: (#5008), so the raw-key reconciler re-ingests its key in a one-off task,
 #: under its attempt cap.
 #:
-#: The count is the worker's own, kept in Redis under
-#: ``PROCESSING_CRASHES_KEY_PREFIX`` + message id, not XPENDING's
+#: The count is the worker's own, kept in the Redis hash
+#: ``MESSAGE_CHARGES_KEY`` (field ``crashes:<message id>``), not XPENDING's
 #: ``times_delivered`` (#5055).  XAUTOCLAIM raises ``times_delivered`` for
 #: every message it claims, so after a few restarts the messages queued
 #: behind a poison message, and the whole pending list after an
@@ -2176,13 +2176,53 @@ return lost
 #: charge taken back.
 MAX_MESSAGE_CRASHES = 3
 
-#: Redis key prefix of a message's crash count (``MAX_MESSAGE_CRASHES``).
-PROCESSING_CRASHES_KEY_PREFIX = "ingestion:processing-crashes:"
+#: Times processing one message may end in an exception that exits the
+#: worker (an ``InfrastructureError`` such as a bare ``OSError``, or any other
+#: exception that escapes ``_process_event_data``) before the message is
+#: dead-lettered with cause ``repeated_error:<class>`` (#5092).  Those exits
+#: take the crash charge back (they are not deaths), so a message that raises,
+#: say, PIL's ``UnidentifiedImageError`` (an ``OSError``) on every attempt
+#: would otherwise loop forever.  Only failures seen while the database is
+#: healthy count, and never database errors (``_INFRA_PG_ERRORS``) or a
+#: missing extractor: those are outages or deploy-wide schema problems that
+#: fail every message alike, and must never dead-letter anything (#1044).
+MAX_MESSAGE_HANDLED_ERRORS = 5
 
-#: Lifetime of a crash-count key (seconds), renewed whenever the count is
-#: raised.  An acked message's key is deleted; this only bounds the keys of
-#: messages trimmed or deleted from the stream while still pending.
-PROCESSING_CRASHES_TTL_S = 7 * 24 * 3600
+#: Redis hash of every per-message charge: ``crashes:<id>``
+#: (``MAX_MESSAGE_CRASHES``) and ``errors:<id>``
+#: (``MAX_MESSAGE_HANDLED_ERRORS``).  The hash has no TTL on purpose (#5092):
+#: ElastiCache runs ``volatile-lru``, which evicts only keys with a TTL, and
+#: evicts them exactly when a stalled stream fills memory, so a TTL'd count
+#: was lost when it mattered most.  Growth stays bounded without one: an ack
+#: or dead-letter deletes the message's fields, a charge taken back to 0
+#: deletes its field, and ``_sweep_message_charges`` drops fields of messages
+#: no longer pending (#4474: no unbounded growth).
+MESSAGE_CHARGES_KEY = "ingestion:message-charges"
+
+CRASH_FIELD_PREFIX = "crashes:"
+ERROR_FIELD_PREFIX = "errors:"
+
+#: Seconds between sweeps of ``MESSAGE_CHARGES_KEY`` for fields whose message
+#: is no longer pending (acked by a path that could not delete them).
+MESSAGE_CHARGES_SWEEP_INTERVAL_S = 3600.0
+
+#: Most fields one sweep inspects (each costs one XPENDING), so a sweep stays
+#: cheap however large the hash is; the hash normally holds a handful.
+MESSAGE_CHARGES_SWEEP_MAX_FIELDS = 1000
+
+#: Takes back one charge on field ARGV[1] of hash KEYS[1], never below 0: a
+#: count of 1 or less (or a missing field) is deleted (#5092).  A refund
+#: with no matching charge (the charge failed, or the field was swept) is a
+#: no-op instead of leaving -1, which would hand a worker killer an extra
+#: life.  Returns the count left.
+_REFUND_CHARGE_LUA = """
+local v = tonumber(redis.call('HGET', KEYS[1], ARGV[1]))
+if v == nil or v <= 1 then
+  redis.call('HDEL', KEYS[1], ARGV[1])
+  return 0
+end
+return redis.call('HINCRBY', KEYS[1], ARGV[1], -1)
+"""
 
 # How often (in empty-poll cycles) to attempt PEL reclamation during the
 # main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
@@ -2207,11 +2247,26 @@ def redis_socket_timeout_for_block(block_ms: int) -> float:
 _UNKNOWN = object()
 
 
-def _crashes_key(msg_id: bytes | str) -> str:
-    """Redis key of *msg_id*'s crash count (``MAX_MESSAGE_CRASHES``)."""
-    if isinstance(msg_id, bytes):
-        msg_id = msg_id.decode()
-    return f"{PROCESSING_CRASHES_KEY_PREFIX}{msg_id}"
+def _decode_id(msg_id: bytes | str) -> str:
+    return msg_id.decode() if isinstance(msg_id, bytes) else msg_id
+
+
+def _crash_field(msg_id: bytes | str) -> str:
+    """``MESSAGE_CHARGES_KEY`` field of *msg_id*'s crash count."""
+    return f"{CRASH_FIELD_PREFIX}{_decode_id(msg_id)}"
+
+
+def _error_field(msg_id: bytes | str) -> str:
+    """``MESSAGE_CHARGES_KEY`` field of *msg_id*'s handled-error count."""
+    return f"{ERROR_FIELD_PREFIX}{_decode_id(msg_id)}"
+
+
+def _counts_toward_error_cap(cause: BaseException) -> bool:
+    """Whether a worker-exiting failure may be charged to the message
+    (``MAX_MESSAGE_HANDLED_ERRORS``).  Database errors and a missing
+    extractor fail every message alike (an outage, a schema not migrated,
+    #1044), so they never count."""
+    return not isinstance(cause, (*_INFRA_PG_ERRORS, ExtractorUnavailableError))
 
 
 def _client_socket_timeout(redis_client: Any) -> float | None | object:
@@ -2397,6 +2452,7 @@ class IngestionWorker:
         self._last_event_time: float = time.monotonic()
         # Monotonic time of the last consumed-entry trim; None = never (#4474).
         self._last_trim_time: float | None = None
+        self._last_charges_sweep: float | None = None
 
         # Ruling formatting — uses a dedicated client (provider resolved
         # from LLM_PROVIDER env var), separate from the field extraction
@@ -3891,10 +3947,7 @@ class IngestionWorker:
         shutdown grace period ends mid-message (#5069).  Called by the
         shutdown watchdog under the shutdown lock."""
         self._unhold(msg_id)
-        try:
-            self._redis.decr(_crashes_key(msg_id))
-        except Exception as exc:
-            logger.warning("Could not take back the crash charge of %s: %s", msg_id, exc)
+        self._refund_crash(msg_id)
 
     def _consume(self, batch_size: int, block_ms: int) -> None:
         """The consumer loop; returns on KeyboardInterrupt or a shutdown
@@ -7661,6 +7714,12 @@ class IngestionWorker:
         if self._last_trim_time is not None and now - self._last_trim_time < STREAM_TRIM_INTERVAL_S:
             return 0
         self._last_trim_time = now
+        if (
+            self._last_charges_sweep is None
+            or now - self._last_charges_sweep >= MESSAGE_CHARGES_SWEEP_INTERVAL_S
+        ):
+            self._last_charges_sweep = now
+            self._sweep_message_charges()
         try:
             trimmed, floor = trim_consumed_entries(self._redis, STREAM_DOCUMENT_CAPTURED)
             length = self._redis.xlen(STREAM_DOCUMENT_CAPTURED)
@@ -7765,7 +7824,7 @@ class IngestionWorker:
         return processed
 
     def _ack(self, msg_id: bytes) -> None:
-        """Acknowledge *msg_id* and drop its crash count (#5055).
+        """Acknowledge *msg_id* and drop its charges (#5055, #5092).
 
         A no-op for a message the shutdown watchdog already handed back
         (#5069): another consumer owns it now."""
@@ -7779,9 +7838,9 @@ class IngestionWorker:
             if shutdown.in_flight == msg_id:
                 shutdown.in_flight = None
             try:
-                self._redis.delete(_crashes_key(msg_id))
+                self._redis.hdel(MESSAGE_CHARGES_KEY, _crash_field(msg_id), _error_field(msg_id))
             except Exception as exc:
-                logger.warning("Could not clear the crash count of %s: %s", msg_id, exc)
+                logger.warning("Could not clear the charges of %s: %s", msg_id, exc)
 
     def _begin_processing(self, msg_id: bytes) -> int | None:
         """Charge *msg_id* one crash before processing it, and return how many
@@ -7789,32 +7848,174 @@ class IngestionWorker:
 
         The charge stays only if the worker dies without running Python;
         every other end takes it back (``_ack``, ``_end_processing``).
-        ``None`` when Redis cannot say, so the message is processed."""
-        key = _crashes_key(msg_id)
+        ``None`` when Redis cannot say, so the message is processed; ``None``
+        also means no charge was taken, so none is ever taken back (#5092).
+        One ``HINCRBY`` on a hash with no TTL: nothing to evict, and no
+        second command that can fail after the charge."""
         try:
-            count = self._redis.incr(key)
-            self._redis.expire(key, PROCESSING_CRASHES_TTL_S)
+            count = self._redis.hincrby(MESSAGE_CHARGES_KEY, _crash_field(msg_id), 1)
         except Exception as exc:
             logger.warning("Could not record processing of %s: %s", msg_id, exc)
             return None
-        return max(count - 1, 0) if isinstance(count, int) else None
+        if isinstance(count, bool) or not isinstance(count, int):
+            return None
+        return max(count - 1, 0)
 
-    def _end_processing(self, msg_id: bytes) -> None:
+    def _refund_crash(self, msg_id: bytes) -> None:
+        """Take back one crash charge on *msg_id*, never below 0 (#5092)."""
+        try:
+            self._redis.eval(_REFUND_CHARGE_LUA, 1, MESSAGE_CHARGES_KEY, _crash_field(msg_id))
+        except Exception as exc:
+            logger.warning("Could not take back the crash charge of %s: %s", msg_id, exc)
+
+    def _end_processing(self, msg_id: bytes, *, charged: bool) -> bool:
         """Take back ``_begin_processing``'s charge when processing ends in
         an exception that exits the worker: the worker did not die on the
         message, so a crash loop over a broken database or schema (#1044)
-        never dead-letters anything."""
+        never dead-letters anything.  Nothing is taken back unless this
+        worker's charge succeeded (*charged*): a refund without a charge
+        would drive the count below the deaths it records (#5092).
+
+        ``False`` when the shutdown watchdog already handed the message back
+        (another consumer owns it now, so it must not be charged or
+        dead-lettered here)."""
         self._unhold(msg_id)
         shutdown = self._shutdown
         with shutdown.lock:
             if shutdown.released == msg_id:
-                return  # the shutdown watchdog already took it back (#5069)
+                return False  # the shutdown watchdog already took it back (#5069)
             if shutdown.in_flight == msg_id:
                 shutdown.in_flight = None
+            if charged:
+                self._refund_crash(msg_id)
+        return True
+
+    def _infrastructure_healthy(self) -> bool:
+        """Whether the database answers ``health_check``; ``False`` on any
+        failure, so an outage never charges a message (#5092).  The failed
+        event may have left the transaction aborted, so it is rolled back
+        first (a connection that cannot even roll back is closed, and
+        ``health_check`` reconnects)."""
+        try:
+            conn = self._get_connection()
             try:
-                self._redis.decr(_crashes_key(msg_id))
-            except Exception as exc:
-                logger.warning("Could not clear the processing mark of %s: %s", msg_id, exc)
+                conn.rollback()
+            except Exception:
+                conn.close()
+            self.health_check()
+        except Exception:
+            return False
+        return True
+
+    def _charge_error(self, msg_id: bytes) -> int | None:
+        """Add one to *msg_id*'s handled-error count; ``None`` when Redis
+        cannot say (then nothing is dead-lettered)."""
+        try:
+            count = self._redis.hincrby(MESSAGE_CHARGES_KEY, _error_field(msg_id), 1)
+        except Exception as exc:
+            logger.warning("Could not record the failure of %s: %s", msg_id, exc)
+            return None
+        if isinstance(count, bool) or not isinstance(count, int):
+            return None
+        return count
+
+    def _dead_letter_repeated_error(
+        self, msg_id: bytes, event_data: Any, exc: BaseException
+    ) -> bool:
+        """Charge a worker-exiting failure to *msg_id*, and dead-letter the
+        message once it has failed ``MAX_MESSAGE_HANDLED_ERRORS`` times
+        (#5092).  ``True`` when it was dead-lettered (and acked), so the
+        worker carries on instead of exiting.
+
+        Not charged: database errors and a missing extractor
+        (``_counts_toward_error_cap``), and any failure while the database
+        is down: an outage fails every message, and a message must never be
+        dead-lettered for it (#1044, #5055)."""
+        cause = exc.__cause__ if isinstance(exc, InfrastructureError) else exc
+        if cause is None:
+            cause = exc
+        if not _counts_toward_error_cap(cause):
+            return False
+        if not self._infrastructure_healthy():
+            return False
+        errors = self._charge_error(msg_id)
+        if errors is None:
+            return False
+        cause_name = f"repeated_error:{type(cause).__name__}"
+        event = event_data if isinstance(event_data, dict) else {}
+        if errors < MAX_MESSAGE_HANDLED_ERRORS:
+            logger.warning(
+                "Message %s failed with %s (%d/%d) while the database is healthy",
+                msg_id,
+                type(cause).__name__,
+                errors,
+                MAX_MESSAGE_HANDLED_ERRORS,
+                extra={
+                    "telemetry_event": "message_error_charged",
+                    "document_id": event.get("document_id"),
+                    "errors": errors,
+                    "error_class": type(cause).__name__,
+                },
+            )
+            return False
+        logger.critical(
+            "Dead-lettering message %s: it failed with %s %d times (%s)",
+            msg_id,
+            type(cause).__name__,
+            errors,
+            cause_name,
+            extra={
+                "telemetry_event": "repeated_error_dead_lettered",
+                "document_id": event.get("document_id"),
+                "s3_key": event.get("s3_key"),
+                "errors": errors,
+                "cause": cause_name,
+            },
+        )
+        self._record_dead_letter(event_data, cause, attempts=errors, cause=cause_name)
+        self._ack(msg_id)
+        return True
+
+    def _sweep_message_charges(self) -> int:
+        """Drop ``MESSAGE_CHARGES_KEY`` fields whose message is no longer
+        pending in the consumer group; returns how many messages were
+        dropped.  A charged message is always pending (it was delivered
+        before it was charged), so this never drops a live count; it bounds
+        the hash when an ack could not delete its fields (#5092, #4474).
+        Best-effort: a failure is logged."""
+        try:
+            fields = []
+            for field, _value in self._redis.hscan_iter(MESSAGE_CHARGES_KEY):
+                fields.append(_decode_id(field))
+                if len(fields) >= MESSAGE_CHARGES_SWEEP_MAX_FIELDS:
+                    break
+            ids = {
+                field.split(":", 1)[1]
+                for field in fields
+                if field.startswith((CRASH_FIELD_PREFIX, ERROR_FIELD_PREFIX))
+            }
+            dropped = 0
+            for msg_id in sorted(ids):
+                entry = self._redis.xpending_range(
+                    STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, min=msg_id, max=msg_id, count=1
+                )
+                if not entry:
+                    self._redis.hdel(
+                        MESSAGE_CHARGES_KEY, _crash_field(msg_id), _error_field(msg_id)
+                    )
+                    dropped += 1
+        except Exception as exc:
+            logger.warning("Message charge sweep failed: %s", exc)
+            return 0
+        logger.info(
+            "Message charge sweep",
+            extra={
+                "telemetry_event": "message_charges_swept",
+                "fields": len(fields),
+                "dropped": dropped,
+            },
+        )
+        return dropped
 
     def _dead_letter_poison_message(self, msg_id: bytes, event_data: Any, crashes: int) -> None:
         """Dead-letter a message the worker died processing *crashes* times,
@@ -7835,6 +8036,7 @@ class IngestionWorker:
             event_data,
             RuntimeError(f"worker died processing this message {crashes} times (OOM or crash)"),
             attempts=crashes,
+            cause="repeated_crash",
         )
         self._ack(msg_id)
 
@@ -7926,8 +8128,14 @@ class IngestionWorker:
                 )
             try:
                 self._process_event_data(msg_id, event_data)
+            except Exception as exc:
+                owned = self._end_processing(msg_id, charged=crashes is not None)
+                if owned and self._dead_letter_repeated_error(msg_id, event_data, exc):
+                    return False
+                raise
             except BaseException:
-                self._end_processing(msg_id)
+                # Ctrl-C, SIGTERM: the worker stops, nothing is the message's fault.
+                self._end_processing(msg_id, charged=crashes is not None)
                 raise
             return True
         finally:
@@ -8002,24 +8210,31 @@ class IngestionWorker:
         self._ack(msg_id)
 
     def _record_dead_letter(
-        self, event_data: Any, exc: BaseException | None, *, attempts: int
+        self,
+        event_data: Any,
+        exc: BaseException | None,
+        *,
+        attempts: int,
+        cause: str | None = None,
     ) -> None:
         """Record a dead-lettered event's raw key as incomplete (#5008).
 
         Dead-lettering is only an ``xack``: there is no dead-letter store,
         so without this record the raw never reaches ``derived.*`` and
         nothing retries it.  The raw-key reconciler re-ingests the key.
+        *cause* names why the worker gave up when it is not the retries of
+        one processing (``repeated_crash``, ``repeated_error:<class>``).
         """
         if not isinstance(event_data, dict):
             return
+        detail: dict[str, Any] = {
+            "error": f"{type(exc).__name__}: {exc}"[:500] if exc is not None else None,
+            "attempts": attempts,
+        }
+        if cause is not None:
+            detail["cause"] = cause
         self._record_incomplete_and_commit(
-            event_data,
-            INCOMPLETE_DEAD_LETTER,
-            {
-                "error": f"{type(exc).__name__}: {exc}"[:500] if exc is not None else None,
-                "attempts": attempts,
-            },
-            rollback_first=True,
+            event_data, INCOMPLETE_DEAD_LETTER, detail, rollback_first=True
         )
 
 

@@ -31,6 +31,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from helpers.message_charges import ChargesFake, crash_field
 
 from ingestion import worker as worker_mod
 from ingestion.shutdown import ShutdownCoordinator
@@ -38,7 +39,6 @@ from ingestion.worker import (
     LEASE_MISSED_RENEWALS,
     LEASE_RENEW_INTERVAL_S,
     PENDING_RECLAIM_MIN_IDLE_MS,
-    PROCESSING_CRASHES_KEY_PREFIX,
     IngestionWorker,
 )
 
@@ -47,7 +47,7 @@ class _Killed(BaseException):
     """Stands in for SIGKILL: the process stops mid-call."""
 
 
-class _StreamRedis:
+class _StreamRedis(ChargesFake):
     """One stream + consumer group with a pending entries list (PEL) and a
     fake clock, shared by several workers (consumers).
 
@@ -104,8 +104,11 @@ class _StreamRedis:
             self.pel[msg_id] = [consumer, self.now_ms, self.pel[msg_id][2] + 1]
         return (b"0-0", [(i, self.entries[i]) for i in claimed], [])
 
-    def eval(self, script: str, numkeys: int, *args: Any) -> list[bytes]:
-        """Emulates ``_RENEW_LEASES_LUA`` (run for real in ``TestRealRedis``)."""
+    def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        """Emulates ``_RENEW_LEASES_LUA`` (run for real in ``TestRealRedis``)
+        and ``_REFUND_CHARGE_LUA``."""
+        if script is worker_mod._REFUND_CHARGE_LUA:
+            return self.eval_charge(script, numkeys, *args)
         assert script is worker_mod._RENEW_LEASES_LUA
         assert numkeys == 1
         _stream, _group, consumer, *ids = args
@@ -124,31 +127,9 @@ class _StreamRedis:
             return 0
         return 1 if self.pel.pop(msg_id, None) is not None else 0
 
-    # -- crash counter ---------------------------------------------------------
-
-    def incr(self, key: str) -> int | None:
-        if not self.alive:
-            return None
-        self.kv[key] = self.kv.get(key, 0) + 1
-        return self.kv[key]
-
-    def decr(self, key: str) -> int | None:
-        if not self.alive:
-            return None
-        self.kv[key] = self.kv.get(key, 0) - 1
-        return self.kv[key]
-
-    def expire(self, key: str, seconds: int) -> bool:
-        return self.alive
-
-    def delete(self, key: str) -> int:
-        if not self.alive:
-            return 0
-        return 1 if self.kv.pop(key, None) is not None else 0
-
 
 def _key(msg_id: str) -> str:
-    return f"{PROCESSING_CRASHES_KEY_PREFIX}{msg_id}"
+    return crash_field(msg_id)
 
 
 def _worker(redis: Any, name: str) -> IngestionWorker:
@@ -292,6 +273,46 @@ def test_sigkill_charges_accumulate_to_dead_letter_only_for_real_deaths() -> Non
     survivor.process_event.assert_not_called()
     survivor._record_dead_letter.assert_called_once()
     assert redis.pel == {}
+
+
+def test_repeated_unidentified_image_error_dead_letters_after_the_cap() -> None:
+    """#5092: a corrupt image raises PIL's ``UnidentifiedImageError`` (an
+    ``OSError``, so an exiting infrastructure error) on every attempt.  Each
+    exit takes the crash charge back, but the handled-error cap still
+    dead-letters it, through restarts and lease reclaims, instead of looping
+    forever; its batch-mate is processed."""
+    from PIL import UnidentifiedImageError
+
+    redis = _StreamRedis(2)
+
+    def corrupt_doc_1(event: dict[str, Any]) -> None:
+        if event["document_id"] == "doc-1":
+            raise UnidentifiedImageError("cannot identify image file")
+
+    def restart(n: int) -> IngestionWorker:
+        worker = _worker(redis, f"task-{n}")
+        worker._get_connection = MagicMock()  # type: ignore[method-assign]
+        worker.health_check = MagicMock()  # type: ignore[method-assign]  # DB is up
+        worker.process_event.side_effect = corrupt_doc_1
+        return worker
+
+    with pytest.raises(worker_mod.InfrastructureError):
+        restart(1)._process_batch(batch_size=10, block_ms=0)
+    for n in range(2, worker_mod.MAX_MESSAGE_HANDLED_ERRORS + 1):
+        redis.advance(PENDING_RECLAIM_MIN_IDLE_MS / 1000)  # the dead task's lease lapses
+        worker = restart(n)
+        if n < worker_mod.MAX_MESSAGE_HANDLED_ERRORS:
+            with pytest.raises(worker_mod.InfrastructureError):
+                worker._reclaim_pending_messages()
+            worker._record_dead_letter.assert_not_called()
+        else:
+            assert worker._reclaim_pending_messages() == 1  # doc-2
+    worker._record_dead_letter.assert_called_once()
+    assert worker._record_dead_letter.call_args.kwargs["cause"] == (
+        "repeated_error:UnidentifiedImageError"
+    )
+    assert redis.pel == {}
+    assert redis.kv == {}
 
 
 def test_after_sigterm_only_the_in_flight_message_keeps_its_lease() -> None:
@@ -474,7 +495,7 @@ def test_released_message_stops_renewing() -> None:
     worker._hold([b"1-0"])
     redis.kv[_key("1-0")] = 1
     worker._release_in_flight(b"1-0")
-    assert redis.kv == {_key("1-0"): 0}  # charge refunded (#5069)
+    assert redis.kv == {}  # charge refunded (#5069), never below 0
     assert not worker._holds(b"1-0")
 
 
@@ -485,7 +506,7 @@ def test_exiting_exception_stops_renewing() -> None:
     with pytest.raises(KeyboardInterrupt):
         worker._process_batch(batch_size=10, block_ms=0)
     assert worker._held == set()
-    assert redis.kv == {_key("1-0"): 0}  # #5055: not a crash
+    assert redis.kv == {}  # #5055: not a crash
 
 
 # ---------------------------------------------------------------------------
@@ -595,3 +616,34 @@ class TestRealRedis:
 
         assert holder._renew_leases() == 0
         assert client.xpending(stream, group)["pending"] == 0
+
+    def test_charges_have_no_ttl_and_refunds_never_go_negative(self, real_redis: Any) -> None:
+        """#5092: the charge hash is never evictable under volatile-lru (no
+        TTL), and ``_REFUND_CHARGE_LUA`` clamps at 0 and deletes the field."""
+        client, stream, group = real_redis
+        key = f"{stream}-charges"
+        with patch.object(worker_mod, "MESSAGE_CHARGES_KEY", key):
+            try:
+                msg_id = client.xadd(stream, {b"data": b"{}"})
+                client.xreadgroup(group, "w", {stream: ">"}, count=1)
+                worker = _worker(client, "w")
+                assert worker._begin_processing(msg_id) == 0
+                assert worker._begin_processing(msg_id) == 1
+                assert client.ttl(key) == -1  # no TTL
+                worker._refund_crash(msg_id)
+                assert client.hget(key, crash_field(msg_id.decode())) == b"1"
+                worker._refund_crash(msg_id)
+                assert client.hexists(key, crash_field(msg_id.decode())) == 0
+                worker._refund_crash(msg_id)  # no charge left: no -1
+                assert client.hexists(key, crash_field(msg_id.decode())) == 0
+
+                # The sweep keeps a pending message's count, drops an acked one's.
+                worker._begin_processing(msg_id)
+                client.hset(key, "crashes:1-1", 2)
+                assert worker._sweep_message_charges() == 1
+                assert client.hkeys(key) == [crash_field(msg_id.decode()).encode()]
+                client.xack(stream, group, msg_id)
+                assert worker._sweep_message_charges() == 1
+                assert client.exists(key) == 0
+            finally:
+                client.delete(key)

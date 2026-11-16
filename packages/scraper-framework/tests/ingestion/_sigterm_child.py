@@ -53,23 +53,25 @@ class FileRedis:
         self._save()
         return 1
 
-    def incr(self, key: str) -> int:
-        self.kv[key] = self.kv.get(key, 0) + 1
+    def hincrby(self, name: str, field: str, amount: int = 1) -> int:
+        self.kv[field] = self.kv.get(field, 0) + amount
         self._save()
-        return self.kv[key]
+        return self.kv[field]
 
-    def decr(self, key: str) -> int:
-        self.kv[key] = self.kv.get(key, 0) - 1
+    def hdel(self, name: str, *fields: str) -> int:
+        n = sum(1 for f in fields if self.kv.pop(f, None) is not None)
         self._save()
-        return self.kv[key]
+        return n
 
-    def expire(self, key: str, seconds: int) -> bool:
-        return True
-
-    def delete(self, key: str) -> int:
-        found = self.kv.pop(key, None) is not None
+    def eval(self, script: str, numkeys: int, name: str, field: str) -> int:
+        """Emulates ``_REFUND_CHARGE_LUA``: never below 0."""
+        value = self.kv.get(field, 0)
+        if value <= 1:
+            self.kv.pop(field, None)
+        else:
+            self.kv[field] = value - 1
         self._save()
-        return int(found)
+        return max(value - 1, 0)
 
 
 def ready() -> None:
