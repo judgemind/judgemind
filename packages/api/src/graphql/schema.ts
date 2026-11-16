@@ -418,6 +418,12 @@ const coreTypeDefs = `#graphql
     action: String!
     """Per-scope counts, most unrepresented or incomplete first."""
     scopes: [RawKeyReconcileScope!]!
+    """Hours since finishedAt. A failed run records nothing, so this is the age of the last completed run. Issue #5095."""
+    ageHours: Float
+    """Age in hours beyond which the last completed run counts as stale (36: a missed daily run). Issue #5095."""
+    staleThresholdHours: Float!
+    """True when the last completed run is older than staleThresholdHours (the reconciler has stopped running). Issue #5095."""
+    isStale: Boolean!
   }
 
   type DataQualityMetricEdge {

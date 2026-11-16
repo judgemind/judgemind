@@ -821,6 +821,37 @@ export interface RawKeyReconciliation {
   incompleteByReason: ReasonCount[];
   action: string;
   scopes: RawKeyReconcileScope[];
+  /** Hours since finishedAt (the last completed run), one decimal; null when unknown (#5095). */
+  ageHours: number | null;
+  /** Age beyond which the run counts as stale (#5095). */
+  staleThresholdHours: number;
+  /** True when the last completed run is older than the threshold or its time is unknown (#5095). */
+  isStale: boolean;
+}
+
+/**
+ * The reconciler runs daily (13:30 UTC). A failed run records nothing, so the
+ * latest recorded run is the last completed one; older than 36h means at
+ * least one daily run has been missed or failed and the next is overdue
+ * (#5095).
+ */
+export const RAW_RECONCILE_STALE_THRESHOLD_HOURS = 36;
+
+/** Staleness of the last completed reconciler run, from its finishedAt. */
+export function computeReconcileStaleness(
+  finishedAt: string | null,
+  now: Date,
+  staleThresholdHours: number = RAW_RECONCILE_STALE_THRESHOLD_HOURS,
+): { ageHours: number | null; staleThresholdHours: number; isStale: boolean } {
+  const ageHours =
+    finishedAt !== null
+      ? Math.max(0, (now.getTime() - new Date(finishedAt).getTime()) / 3_600_000)
+      : null;
+  return {
+    ageHours: ageHours !== null ? Math.round(ageHours * 10) / 10 : null,
+    staleThresholdHours,
+    isStale: ageHours === null || ageHours > staleThresholdHours,
+  };
 }
 
 function toReasonCounts(value: unknown): ReasonCount[] {
@@ -889,15 +920,20 @@ export const RAW_RECONCILE_SCOPES_SQL = `
  * The latest raw-key reconciliation run with its per-scope counts, or null
  * when no run has been recorded yet.
  */
-async function queryRawKeyReconciliation(pool: Pool): Promise<RawKeyReconciliation | null> {
+async function queryRawKeyReconciliation(
+  pool: Pool,
+  now: Date = new Date(),
+): Promise<RawKeyReconciliation | null> {
   const { rows } = await pool.query<Row>(RAW_RECONCILE_LATEST_RUN_SQL);
   if (rows.length === 0) return null;
   const run = rows[0];
   const scopes = await pool.query<Row>(RAW_RECONCILE_SCOPES_SQL, [run.run_id]);
+  const finishedAt = toIso(run.finished_at);
   return {
     runId: String(run.run_id),
     startedAt: toIso(run.started_at),
-    finishedAt: toIso(run.finished_at),
+    finishedAt,
+    ...computeReconcileStaleness(finishedAt, now),
     rawKeys: toInt(run.raw_keys),
     represented: toInt(run.represented),
     skipped: toInt(run.skipped),

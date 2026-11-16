@@ -8,6 +8,10 @@ name: Raw-Key Reconciler
 # same ECS task). This workflow only launches it, defers the reingest while
 # another reingest or rebuild runs, and files or updates one GitHub issue when
 # the count is too large to auto-heal or does not heal over repeated runs.
+# A run that fails before recording a result (crash, ECS failure, no result
+# line) files or updates one separate `raw-reconcile-failure` issue, closed by
+# the next successful run (#5095); /admin/data-quality flags a last run older
+# than 36h as stale.
 #
 # Dashboard + issue only, never a human alert (CLAUDE.md "Human Alerts").
 # Replaces the retired S3 orphan-rate check.
@@ -29,6 +33,11 @@ on:
         required: false
         type: string
         default: "500"
+      simulate_failure:
+        description: "Verification only (#5095): make the reconciler exit non-zero to exercise the failure issue"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: raw-key-reconcile
@@ -43,6 +52,10 @@ env:
   CLUSTER: judgemind-dev
   ISSUE_LABEL: raw-reconcile-alert
   ISSUE_TITLE: "Raw-key reconciler: archived raws missing from derived.documents"
+  # A run that fails before recording a result (#5095): its own label, so the
+  # data-gap issue's close-when-healed step never touches it.
+  FAILURE_LABEL: raw-reconcile-failure
+  FAILURE_TITLE: "Raw-key reconciler failed to run"
 
 jobs:
   reconcile:
@@ -91,10 +104,16 @@ jobs:
           REINGEST: ${{ github.event_name == 'schedule' || inputs.reingest }}
           MAX_AUTO: ${{ inputs.max_auto_reingest || '500' }}
           BUSY: ${{ steps.busy.outputs.busy }}
+          # Only a manual run can ask for a deliberate failure (#5095); the
+          # schedule has no inputs and the event check keeps it that way.
+          SIMULATE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_failure == true }}
         run: |
           set -euo pipefail
           mkdir -p tmp
           args=(--record --max-auto-reingest "$MAX_AUTO")
+          if [ "$SIMULATE_FAILURE" = "true" ]; then
+            args+=(--simulate-failure)
+          fi
           if [ "$REINGEST" = "true" ]; then
             args+=(--reingest)
             if [ "$BUSY" = "true" ]; then
@@ -147,6 +166,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Write the issue text
+        id: summary
         if: steps.result.outputs.issue_needed == 'true' || steps.result.outputs.stuck != '0' || steps.result.outputs.healed == 'true'
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -165,6 +185,7 @@ jobs:
           cat tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: File or update the reconciler issue
+        id: file_issue
         # issue_needed: file or comment. Stuck incomplete keys with no open
         # issue: file one, so a lost notification (stuck_at is stamped once)
         # is recovered on the next run without commenting every day (#5008).
@@ -242,9 +263,70 @@ jobs:
           done
 
       - name: Fail when the reconciler task failed
+        id: task_exit
         if: steps.run.outputs.exit_code != '0'
         env:
           EXIT_CODE: ${{ steps.run.outputs.exit_code }}
         run: |
           echo "::error::Reconciler task exited ${EXIT_CODE} (action $(jq -r .action tmp/result.json))."
           exit 1
+
+      # A successful run closes the "failed to run" issue (#5095).
+      - name: Close the failed-to-run issue
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --label "$FAILURE_LABEL" --json number --jq '.[].number'); do
+            echo "The raw-key reconciler ran successfully again: ${RUN_URL}. Closing." > tmp/failure_close.md
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body-file tmp/failure_close.md
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed
+          done
+
+      # Any failure (no result line, a crashed or unlaunched ECS task, a broken
+      # step) files or updates ONE open issue (#5095), deduplicated on the
+      # label. A reingest_failed run is not blind (its counts were recorded)
+      # and is already reported on the data-gap issue, so it is skipped here.
+      # Issue and dashboard only, never a human alert (CLAUDE.md "Human Alerts").
+      - name: File or update the failed-to-run issue
+        if: failure() && steps.result.outputs.action != 'reingest_failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TASK_ID: ${{ steps.run.outputs.task_id }}
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          printf '%s\n' "$STEPS_JSON" > tmp/failure_steps.json
+          echo '[]' > tmp/failure_log.json
+          if [ -n "$TASK_ID" ]; then
+            aws logs get-log-events \
+              --log-group-name /ecs/judgemind-ingestion-worker-dev \
+              --log-stream-name "oneshot/oneshot/${TASK_ID}" \
+              --limit 40 --no-start-from-head \
+              --query 'events[].message' --output json > tmp/failure_log.json \
+              || echo '[]' > tmp/failure_log.json
+          fi
+          common=(--run-url "$RUN_URL" --event "$GITHUB_EVENT_NAME"
+            --task-id "$TASK_ID" --exit-code "$EXIT_CODE"
+            --steps-json tmp/failure_steps.json --log-events-json tmp/failure_log.json)
+          gh label create "$FAILURE_LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Raw-key reconciler run failed: reconciler is blind until fixed" --force
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label "$FAILURE_LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            python3 scripts/reconcile_failure_issue.py --mode comment \
+              --when "$(date -u +%Y-%m-%dT%H:%MZ)" "${common[@]}" > tmp/failure_comment.md
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file tmp/failure_comment.md
+          else
+            python3 scripts/reconcile_failure_issue.py --mode issue "${common[@]}" > tmp/failure_issue.md
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$FAILURE_TITLE" \
+              --body-file tmp/failure_issue.md \
+              --label "$FAILURE_LABEL,priority/p1,area/ingestion,type/bug"
+          fi

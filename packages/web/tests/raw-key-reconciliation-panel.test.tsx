@@ -26,7 +26,11 @@ import {
   formatActionLabel,
   formatDayRange,
   formatIncompleteReasons,
+  formatReason,
+  formatRunAge,
   formatSkipReasons,
+  isReconcileStale,
+  REASON_LABELS,
 } from '../src/app/(main)/admin/data-quality/RawKeyReconciliationPanel';
 
 function makeScope(overrides: Partial<RawKeyReconcileScopeItem>): RawKeyReconcileScopeItem {
@@ -74,6 +78,9 @@ function makeRun(overrides: Partial<RawKeyReconciliationRun> = {}): RawKeyReconc
     incompleteStuck: 0,
     incompleteByReason: [],
     action: 'over_threshold',
+    ageHours: 1,
+    staleThresholdHours: 36,
+    isStale: false,
     scopes: [la, makeScope({})],
     ...overrides,
   };
@@ -154,6 +161,60 @@ describe('RawKeyReconciliationTable', () => {
     render(<RawKeyReconciliationTable run={null} />);
     expect(screen.getByText(/No reconciliation run recorded yet/)).toBeInTheDocument();
   });
+
+  // #5095: a reconciler that stopped running must not look healthy.
+  describe('staleness', () => {
+    const NOW = new Date('2026-11-16T14:01:00Z');
+
+    it('shows the last successful run and its age, with no stale badge when fresh', () => {
+      render(<RawKeyReconciliationTable run={makeRun()} now={NOW} />);
+      const last = screen.getByTestId('raw-reconcile-last-run');
+      expect(last).toHaveTextContent('Last successful run 2026-11-15 13:01Z (25h ago)');
+      expect(last).not.toHaveClass('text-red-700');
+      expect(screen.queryByTestId('raw-reconcile-stale')).toBeNull();
+    });
+
+    it('flags a last run that finished 37h ago as stale', () => {
+      // The API's isStale is false (its cached result predates the threshold);
+      // the panel still flags it from finishedAt.
+      render(
+        <RawKeyReconciliationTable
+          run={makeRun({ finishedAt: '2026-11-15T01:01:00Z', isStale: false })}
+          now={NOW}
+        />,
+      );
+      const banner = screen.getByTestId('raw-reconcile-stale');
+      expect(banner).toHaveTextContent('Stale');
+      expect(banner).toHaveTextContent('finished 37h ago, more than 36h ago');
+      expect(banner).toHaveTextContent('raw-reconcile-failure');
+      expect(screen.getByTestId('raw-reconcile-last-run')).toHaveClass('text-red-700');
+    });
+
+    it('trusts the API stale flag', () => {
+      render(<RawKeyReconciliationTable run={makeRun({ isStale: true })} now={NOW} />);
+      expect(screen.getByTestId('raw-reconcile-stale')).toBeInTheDocument();
+    });
+
+    it('is stale when the run has no finish time', () => {
+      render(
+        <RawKeyReconciliationTable run={makeRun({ finishedAt: null, ageHours: null })} now={NOW} />,
+      );
+      expect(screen.getByTestId('raw-reconcile-stale')).toHaveTextContent('has no finish time');
+      expect(screen.getByTestId('raw-reconcile-last-run')).toHaveTextContent(
+        'Last successful run unknown',
+      );
+    });
+
+    it('uses the threshold the API reports', () => {
+      render(
+        <RawKeyReconciliationTable
+          run={makeRun({ finishedAt: '2026-11-16T10:01:00Z', staleThresholdHours: 2 })}
+          now={NOW}
+        />,
+      );
+      expect(screen.getByTestId('raw-reconcile-stale')).toHaveTextContent('more than 2h ago');
+    });
+  });
 });
 
 describe('RawKeyReconciliationPanel', () => {
@@ -217,6 +278,52 @@ describe('formatters', () => {
     expect(formatIncompleteReasons([{ reason: 'orphaned_superseded', count: 92 }])).toBe(
       'superseded, ruling lost 92',
     );
+  });
+
+  // #5057 / #5093 / #5094: every reason the reconciler or worker records
+  // has a friendly name in both the skip and the incomplete lists.
+  it.each([
+    ['all_children_rejected', 'all children rejected'],
+    ['empty_extraction', 'nothing extracted'],
+    ['stale_skip', 'stale skip verdict'],
+    ['evidence_unavailable', 'page unreadable'],
+    ['orphaned_superseded', 'superseded, ruling lost'],
+    ['raw_missing', 'raw object missing'],
+  ])('labels the %s reason', (reason, label) => {
+    expect(formatReason(reason)).toBe(label);
+    expect(formatIncompleteReasons([{ reason, count: 3 }])).toBe(`${label} 3`);
+    expect(formatSkipReasons(makeScope({ skippedByReason: [{ reason, count: 3 }] }))).toBe(
+      `${label} 3`,
+    );
+  });
+
+  it('labels every reason identifier, not just a sample', () => {
+    for (const [reason, label] of Object.entries(REASON_LABELS)) {
+      expect(label).not.toBe(reason);
+      expect(label).not.toMatch(/_/);
+    }
+  });
+
+  it('isReconcileStale handles bad and custom inputs', () => {
+    const now = new Date('2026-11-16T14:01:00Z');
+    expect(isReconcileStale(makeRun({ finishedAt: 'garbage' }), now)).toBe(true);
+    expect(isReconcileStale(makeRun({ finishedAt: '2026-11-15T02:01:00Z' }), now)).toBe(false);
+    expect(isReconcileStale(makeRun({ finishedAt: '2026-11-15T02:00:00Z' }), now)).toBe(true);
+    const legacy = { ...makeRun({ finishedAt: '2026-11-15T01:00:00Z' }) } as Partial<
+      ReturnType<typeof makeRun>
+    >;
+    delete legacy.staleThresholdHours;
+    expect(isReconcileStale(legacy as ReturnType<typeof makeRun>, now)).toBe(true);
+  });
+
+  it('formats run ages', () => {
+    const now = new Date('2026-11-16T14:01:00Z');
+    expect(formatRunAge(null, now)).toBeNull();
+    expect(formatRunAge('garbage', now)).toBeNull();
+    expect(formatRunAge('2026-11-16T13:51:00Z', now)).toBe('10m ago');
+    expect(formatRunAge('2026-11-16T14:05:00Z', now)).toBe('1m ago');
+    expect(formatRunAge('2026-11-14T14:01:00Z', now)).toBe('48h ago');
+    expect(formatRunAge('2026-11-11T14:01:00Z', now)).toBe('5d ago');
   });
 
   it('formats day ranges', () => {
