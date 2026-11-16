@@ -882,13 +882,15 @@ _OCR_INK_LEVEL = 160
 # A run of fewer inked pixel rows than this is a speck, not a line of text.
 _OCR_MIN_LINE_PX = 4
 
-# The cut is placed at the emptiest pixel line within this fraction of the
-# region's middle, so it falls between text lines rather than through one
-# (wide enough to reach a gap in a region of three lines).
+# The cut is placed at a blank pixel line within this fraction of the
+# region's middle (wide enough to reach a gap in a region of three lines),
+# else at a blank line further out; never through ink (``_blank_cut``,
+# #5098).
 _OCR_CUT_WINDOW = 0.25
 
 # A pixel row whose average darkness (0 white, 255 black, on the black and
-# white copy) is above this holds text: over 2% of its pixels inked.  A
+# white copy) is above this holds text: over 2% of its pixels inked.  At
+# or below it, the row (or column) is blank and may be cut.  A
 # thin vertical rule (a form's box border, a table's grid) inks every row
 # of a region a little and must not merge its lines into one.
 _OCR_LINE_INK = 5
@@ -897,6 +899,23 @@ _OCR_LINE_INK = 5
 # tall: about two lines at 150 DPI.  A taller region is never one line,
 # whatever ``_text_line_count`` makes of touching or ruled lines.
 _OCR_SINGLE_LINE_MAX_PX = 60
+
+# A taller region that ``_text_line_count`` reads as one line and has no
+# blank row is cut left/right only up to this height: one line of large
+# type (a heading, a stamp; 72 pt is 150 px at 150 DPI), never a page.
+_OCR_TALL_LINE_MAX_PX = 3 * _OCR_SINGLE_LINE_MAX_PX
+
+# Rules: pixel columns (rows) inked in at least 95% of the region's rows
+# (columns), i.e. average darkness at least this on the black and white
+# copy.  A table's grid, a form's box border or a scanner's dark edge inks
+# every row; text never does, as its lines have gaps.  A run of rule lines
+# at most ``_OCR_RULE_MAX_PX`` wide, or one along the region's edge at most
+# ``_OCR_EDGE_RULE_FRACTION`` of it, is left out of the blank-line test
+# (``_erase_rules``): cutting across it cuts no glyph.  A wider run (a
+# shaded box, a solid band of text) is not a rule.
+_OCR_RULE_INK = 243
+_OCR_RULE_MAX_PX = 8
+_OCR_EDGE_RULE_FRACTION = 0.1
 
 # OCR is transcription: a thinking model's reasoning only uses up the output
 # budget (``_google_thinking_config``, #5046).
@@ -971,8 +990,10 @@ def _ocr_region(
                 words=True,
                 deadline=deadline,
             )
-            if text is not None:
+            if text:
                 return text, ""
+            # Nothing back for a region the model just withheld is not a
+            # blank region: the page stays unread (#5098).
             reason = word_reason or reason
         return None, reason
     halves, joiner = split
@@ -1088,13 +1109,19 @@ def _split_image(image_bytes: bytes) -> tuple[list[bytes], str] | None:
     """The image cut in two PNGs, plus the separator to join their texts.
 
     Reading order decides the cut (#5046).  A region of several lines is
-    cut top/bottom at the emptiest row near the middle, between lines: a
-    left/right cut through several lines would join the left half of every
-    line to the right half of every line.  A region holding one line of
-    text is cut left/right at the emptiest column near the middle (a space
-    between words), and the halves' texts are joined with a space.
+    cut top/bottom at a blank row, between lines: a left/right cut through
+    several lines would join the left half of every line to the right half
+    of every line.  A region holding one line of text is cut left/right at
+    a blank column (a space between words), and the halves' texts are
+    joined with a space.
 
-    ``None`` when the image cannot be decoded or is too small to cut.
+    A cut never goes through ink (#5098): each half would hold half-glyphs,
+    which the model reads as nothing, and an empty tile passes for a blank
+    region.  Rules (a table's grid, a box border, a scanner's dark edge)
+    are not text, and a line crossing only them still counts as blank
+    (``_erase_rules``).  ``None`` when the image cannot be decoded, is too
+    small to cut, or has no blank line to cut at: the region is
+    unsplittable.
     """
     from PIL import Image
 
@@ -1106,13 +1133,24 @@ def _split_image(image_bytes: bytes) -> tuple[list[bytes], str] | None:
     width, height = image.size
     # Black and white, so a line's darkness counts its inked pixels.
     ink = image.point(lambda level: 0 if level < _OCR_INK_LEVEL else 255)
-    horizontal, joiner = True, "\n"
-    one_line = height <= _OCR_SINGLE_LINE_MAX_PX and _text_line_count(ink) <= 1
-    if one_line and width >= 2 * _OCR_TILE_MIN_PX:
-        horizontal, joiner = False, " "
-    elif height < 2 * _OCR_TILE_MIN_PX:
+    # Rows are measured without the vertical rules, columns without the
+    # horizontal ones.
+    rows = _erase_rules(ink, horizontal=False)
+    one_line = _text_line_count(rows) <= 1
+    if one_line and height <= _OCR_SINGLE_LINE_MAX_PX:
+        horizontal = False
+        cut = _blank_cut(_erase_rules(ink, horizontal=True), horizontal=False)
+    else:
+        horizontal = True
+        cut = _blank_cut(rows, horizontal=True)
+        if cut is None and one_line and height <= _OCR_TALL_LINE_MAX_PX:
+            # One line taller than body text (a heading, a stamp) with no
+            # blank row: cut it between words instead.
+            horizontal = False
+            cut = _blank_cut(_erase_rules(ink, horizontal=True), horizontal=False)
+    if cut is None:
         return None
-    cut = _emptiest_line(ink, horizontal=horizontal)[0]
+    joiner = "\n" if horizontal else " "
     boxes = (
         [(0, 0, width, cut), (0, cut, width, height)]
         if horizontal
@@ -1144,28 +1182,68 @@ def _text_line_count(image: object) -> int:
     return lines + (run >= _OCR_MIN_LINE_PX)
 
 
-def _emptiest_line(image: object, *, horizontal: bool) -> tuple[int, int]:
-    """``(position, ink)`` of the brightest pixel row (*horizontal*) or
-    column within ``_OCR_CUT_WINDOW`` of the middle of a greyscale image.
+def _erase_rules(image: object, *, horizontal: bool) -> object:
+    """A copy of a black-and-white image with its rules painted white:
+    horizontal rules (*horizontal*) or vertical ones (``_OCR_RULE_INK``)."""
+    from PIL import Image, ImageDraw
 
-    *ink* is how dark that line is on average (0 white, 255 black).  Among
-    equally bright lines, the one nearest the middle wins.
+    assert isinstance(image, Image.Image)
+    width, height = image.size
+    length = height if horizontal else width
+    size = (1, height) if horizontal else (width, 1)
+    profile = image.resize(size, Image.Resampling.BOX).tobytes()
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for i in range(length + 1):
+        if i < length and 255 - profile[i] >= _OCR_RULE_INK:
+            if start is None:
+                start = i
+            continue
+        if start is not None:
+            run = i - start
+            at_edge = start == 0 or i == length
+            if run <= _OCR_RULE_MAX_PX or (at_edge and run <= length * _OCR_EDGE_RULE_FRACTION):
+                runs.append((start, i))
+            start = None
+    if not runs:
+        return image
+    erased = image.copy()
+    draw = ImageDraw.Draw(erased)
+    for lo, hi in runs:
+        box = (0, lo, width - 1, hi - 1) if horizontal else (lo, 0, hi - 1, height - 1)
+        draw.rectangle(box, fill=255)
+    return erased
+
+
+def _blank_cut(image: object, *, horizontal: bool) -> int | None:
+    """Where to cut a black-and-white image: a blank pixel row
+    (*horizontal*) or column, or ``None`` when there is none (#5098).
+
+    A line is blank when its average darkness (0 white, 255 black) is at
+    most ``_OCR_LINE_INK``, so a thin rule crossing it does not count as
+    text.  The brightest blank line within ``_OCR_CUT_WINDOW`` of the
+    middle wins, the one nearest the middle among equals.  When the window
+    holds none (a large-font line or tightly spaced lines across it), the
+    brightest blank line nearest the middle anywhere else.  Both halves
+    keep at least ``_OCR_TILE_MIN_PX``: a region too small for that is
+    not cut.
     """
     from PIL import Image
 
     assert isinstance(image, Image.Image)
     width, height = image.size
     length = height if horizontal else width
-    lo = int(length * (0.5 - _OCR_CUT_WINDOW))
-    hi = max(lo + 1, int(length * (0.5 + _OCR_CUT_WINDOW)))
-    if horizontal:
-        band = image.crop((0, lo, width, hi)).resize((1, hi - lo), Image.Resampling.BOX)
-    else:
-        band = image.crop((lo, 0, hi, height)).resize((hi - lo, 1), Image.Resampling.BOX)
-    profile = list(band.tobytes())  # one 8-bit grey level per line
-    middle = (hi - lo) / 2
-    best = max(range(len(profile)), key=lambda i: (profile[i], -abs(i - middle)))
-    return lo + best, 255 - profile[best]
+    lo, hi = _OCR_TILE_MIN_PX, length - _OCR_TILE_MIN_PX
+    size = (1, height) if horizontal else (width, 1)
+    profile = image.resize(size, Image.Resampling.BOX).tobytes()  # one grey level per line
+    blank = [i for i in range(lo, hi + 1) if 255 - profile[i] <= _OCR_LINE_INK]
+    if not blank:
+        return None
+    window_lo = int(length * (0.5 - _OCR_CUT_WINDOW))
+    window_hi = max(window_lo + 1, int(length * (0.5 + _OCR_CUT_WINDOW)))
+    in_window = [i for i in blank if window_lo <= i < window_hi]
+    middle = length / 2
+    return max(in_window or blank, key=lambda i: (profile[i], -abs(i - middle)))
 
 
 # ---------------------------------------------------------------------------
