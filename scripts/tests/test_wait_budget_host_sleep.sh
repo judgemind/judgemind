@@ -327,6 +327,11 @@ hang_case h_ecs_redeploy aws \
     env ROLLOUT_TIMEOUT_SECS="$BUDGET" ROLLOUT_POLL_INTERVAL=1 \
     "$SCRIPT_DIR/ecs-redeploy.sh" my-svc my-cluster --deployment-id ecs-svc/123
 HANG_IDS+=("h_ecs_redeploy:ecs-redeploy.sh")
+hang_case h_post_deploy_healthcheck aws \
+    env ECS_CLUSTER=c INGESTION_SERVICE=s LOG_GROUP=/ecs/s \
+    HEALTHCHECK_TIMEOUT_SECS="$BUDGET" HEALTHCHECK_POLL_INTERVAL=1 \
+    "$SCRIPT_DIR/ecs-post-deploy-healthcheck.sh"
+HANG_IDS+=("h_post_deploy_healthcheck:ecs-post-deploy-healthcheck.sh")
 hang_case h_ecs_logs aws \
     env ECS_LOGS_FOLLOW_MAX_SECS="$BUDGET" ECS_LOGS_POLL_INTERVAL=1 \
     "$SCRIPT_DIR/ecs-logs.sh" /ecs/judgemind-ingestion-worker-dev --task abc123 --follow
