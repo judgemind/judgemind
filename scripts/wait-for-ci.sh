@@ -75,7 +75,8 @@
 #       in progress, the newest `ci-passed` run is success, no check's newest
 #       run has a hard-failure conclusion (failure, timed_out,
 #       action_required), no re-run of an earlier failed check is still
-#       going (#5078), and mergeStateStatus is CLEAN, UNSTABLE or
+#       going (#5078), no PR-text check (`closing-refs`, `validate-pr`)
+#       is still running (#5090), and mergeStateStatus is CLEAN, UNSTABLE or
 #       HAS_HOOKS (BLOCKED keeps waiting: GitHub's branch protection is not satisfied yet, so
 #       `gh pr merge` would refuse). Pending entries from other, non-required
 #       check names (Vercel, smoke tests) and `cancelled` checks do not
@@ -172,6 +173,9 @@ POLL_INTERVAL=30
 REPO="judgemind/judgemind"
 PR_NUMBER=""
 AUTO_RERUN=1
+# Non-required checks that judge the PR title/body (.github/workflows/
+# pr-title-check.yml). A pending run of one blocks success (#5090).
+PR_TEXT_CHECKS="closing-refs validate-pr"
 
 # Path to this script's directory — used to locate the sibling
 # `classify-ci-flake.sh` helper without depending on PATH.
@@ -733,6 +737,26 @@ EOF
         CI_PASSED_SUCCESS=false
     fi
 
+    # PR-text checks (#5090): `closing-refs` and `validate-pr` are not
+    # required by branch protection, but they judge the PR's title/body, and
+    # a `gh pr edit` re-runs them on the same head SHA. A merge while one is
+    # still running could ship a body that closes an unrelated issue (the
+    # check never gets to fail). So a pending newest run of one of them
+    # blocks success, exactly like a pending `ci-passed`. Limit: a run GitHub
+    # has not created yet (the first seconds after the edit) is invisible
+    # here; only a required status check closes that window.
+    PR_TEXT_PENDING_NAMES=$(printf '%s' "$CHECK_RUNS_JSON" | jq -r --arg names "$PR_TEXT_CHECKS" '
+        ($names | split(" ") | map(select(length > 0))) as $gate
+        | [.[] | select(.status != "completed" and ((.name // "") as $n | any($gate[]; . == $n))) | .name]
+        | unique | join(", ")')
+    if [ -n "$PR_TEXT_PENDING_NAMES" ]; then
+        echo "  waiting for PR-text check(s) still running: ${PR_TEXT_PENDING_NAMES}"
+        if [ "$CI_PASSED_SUCCESS" = "true" ]; then
+            CI_PASSED_CONCLUSION="success (waiting for PR-text check(s): ${PR_TEXT_PENDING_NAMES})"
+        fi
+        CI_PASSED_SUCCESS=false
+    fi
+
     # ── Rebase-required fast-path (#4412) ────────────────────────────────────
     # When CI is green (ci-passed=success, no latest failures) but
     # mergeStateStatus is DIRTY, a concurrent merge landed on origin/main that
@@ -773,7 +797,8 @@ EOF
     #      yet satisfied, so `gh pr merge` would refuse; keep waiting (#4965).
     # Pending entries from OTHER check names (Vercel, smoke tests) and
     # `cancelled` non-required checks (#4407) do not block — they are not
-    # required by branch protection.
+    # required by branch protection. The PR-text checks are the exception
+    # (#5090, see above): a pending one already cleared CI_PASSED_SUCCESS.
     #
     # Two success messages, kept for callers that grep them:
     #   - `canonical merge gate green` when mergeable=MERGEABLE too;

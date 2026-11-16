@@ -32,7 +32,10 @@ Each one must be an issue the PR is meant to close:
 * a ``#N`` in the PR title (``fix(x): ... (#5071)``);
 * a ``#N`` on an explicit closing line in the body: a line made only of
   closing statements, such as the ``Closes #N`` line /task writes at the
-  end of every PR body.
+  end of every PR body. The line must start with close/closes, fix/fixes
+  or resolve/resolves (any case, optional colon). A list or quote prefix
+  (``- Fixed #N``, ``> closes #N``) or the past tense (``Fixed #N``) reads
+  as history, so it does not count as intent (#5090).
 
 Anything else fails with a Fix: block telling the author how to reword.
 Only refs to this repository count (``#N``, ``owner/repo#N`` or an issue
@@ -80,12 +83,16 @@ _REF = (
 # keyword must not be glued to a preceding word ("autoclosed #5" does not
 # close; "auto-closed #5" does, since GitHub splits on the hyphen).
 CLOSING_RE = re.compile(
-    rf"(?<![A-Za-z0-9_]){_KEYWORD}:?\s+{_REF}(?![A-Za-z0-9_])", re.IGNORECASE
+    rf"(?<![A-Za-z0-9_])(?P<kw>{_KEYWORD}):?\s+{_REF}(?![A-Za-z0-9_])", re.IGNORECASE
 )
 # Separators allowed between closing statements on an explicit closing line.
-_CLOSING_LINE_FILLER_RE = re.compile(
-    r"^[\s,.;:*>+-]*(?:and[\s,.;:*>+-]*)*$", re.IGNORECASE
-)
+# No list or quote markers (- * + >): "- Fixed #N" is an incident-history
+# bullet, not a statement of intent (#5090).
+_CLOSING_LINE_FILLER_RE = re.compile(r"^[\s,.;:]*(?:and[\s,.;:]*)*$", re.IGNORECASE)
+# Keywords that state intent on an explicit closing line. The past tense
+# (closed, fixed, resolved) reads as history, so it never makes a line
+# explicit (#5090).
+_INTENT_KEYWORDS = frozenset({"close", "closes", "fix", "fixes", "resolve", "resolves"})
 _TITLE_REF_RE = re.compile(r"#(\d+)\b")
 _BRANCH_NUM_RE = re.compile(r"(?<![A-Za-z0-9])(\d+)(?![A-Za-z0-9])")
 
@@ -129,12 +136,20 @@ def closing_refs(text: str, repo: str = DEFAULT_REPO) -> list[tuple[int, str]]:
 
 
 def explicit_closing_numbers(body: str, repo: str = DEFAULT_REPO) -> set[int]:
-    """Numbers on body lines made only of closing statements ("Closes #N")."""
+    """Numbers on body lines made only of closing statements ("Closes #N").
+
+    The line must start with the keyword (no list or quote prefix) and every
+    keyword on it must be close/closes, fix/fixes or resolve/resolves (#5090).
+    """
     numbers: set[int] = set()
     for line in body.splitlines():
         matches = list(CLOSING_RE.finditer(line))
         if not matches:
             continue
+        if matches[0].start() != len(line) - len(line.lstrip()):
+            continue  # something before the first keyword: bullet, quote, prose
+        if any(m.group("kw").lower() not in _INTENT_KEYWORDS for m in matches):
+            continue  # past tense: history, not intent
         if not _CLOSING_LINE_FILLER_RE.match(CLOSING_RE.sub("", line)):
             continue  # prose around the keyword: not an explicit closing line
         for m in matches:
@@ -227,7 +242,10 @@ def format_failure(verdict: Verdict, label: str) -> str:
         lines.append("  Linked issue: unlink it in the PR's Development sidebar.")
     lines.append(
         "  If the PR really is meant to close one of them, add a line 'Closes #N' "
-        "at the end of the body."
+        "at the end of the body"
+    )
+    lines.append(
+        "    (no '-', '*' or '>' prefix: a bulleted 'Fixed #N' reads as history, #5090)."
     )
     return "\n".join(lines)
 
