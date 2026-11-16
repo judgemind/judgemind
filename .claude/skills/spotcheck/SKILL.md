@@ -265,7 +265,7 @@ Process:
 3. Commit with a conventional message (`fix(area): description`) and push.
 4. Open a PR with `gh pr create --base main --body-file <file>`. PR body must describe the root cause (not just the symptom), the fix shape, and how it prevents the class of regression. Include `Found by: /spotcheck` in the body so the merge log shows provenance.
 5. Watch CI to green via `scripts/wait-for-ci.sh <PR>` (re-run while it exits 124).
-6. Merge once CI passes: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+6. Merge once CI passes: `scripts/gh-pr-with-retry.sh merge <N> --squash --delete-branch`. The wrapper checks the PR's live title, body and commits right before merging and refuses on a failure (#5133).
 
 Examples of "fix inline" scope:
 

@@ -186,6 +186,10 @@ PR_TEXT_CHECKS="closing-refs validate-pr"
 # updated less than this many seconds ago and no PR-text run has started
 # since, success waits. An update that starts no run (a comment, a label)
 # only delays success by at most this long.
+# This wait is an early warning, not the correctness gate: a run created
+# after the grace window, or an edit after this script exits, is not seen
+# here. scripts/gh-pr-with-retry.sh merge re-runs both PR-text checks on the
+# live PR right before merging and refuses on a failure (#5133).
 PR_TEXT_EDIT_GRACE_SECS=60
 
 # Path to this script's directory — used to locate the sibling

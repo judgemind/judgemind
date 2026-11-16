@@ -27,7 +27,7 @@ The `github` MCP server exposes the REST API directly as structured tool calls â
 | Posting an issue comment or creating an issue/PR with a multi-line body | **`gh` (today) / MCP (once auth lands)** | See the write-path note below. Once the MCP server has a token, `add_issue_comment` and friends eliminate the tmp-file preamble. |
 | Adding/removing a single label | **`gh issue edit --add-label` / `--remove-label`** | MCP only supports full label replacement (`update_issue` with the full `labels` array). For an incremental add, `gh` is one call, MCP is two (read, then replace). |
 | Closing an issue with `state_reason` (completed / not_planned / duplicate) | **`gh issue close --reason`** | MCP does not expose `state_reason`. |
-| Merging a PR with `--delete-branch` | **`gh pr merge --squash --delete-branch`** | MCP has `merge_pull_request` but no branch-delete flag. |
+| Merging a PR with `--delete-branch` | **`scripts/gh-pr-with-retry.sh merge <N> --squash --delete-branch`** | Wraps `gh pr merge`; runs the PR-text checks on the live PR first and refuses on a failure (#5133). MCP has `merge_pull_request` but no branch-delete flag. |
 | Editing an existing PR's body after CI or pre-merge checklist updates | **`gh pr edit --body-file`** | MCP has no `update_pull_request` body edit. |
 | Watching a workflow run / CI / deploy | **`scripts/wait-for-run.sh <run-id>`** (PR CI: `scripts/wait-for-ci.sh <PR>`) | MCP has no long-poll watcher. Both helpers wait at most 480s per call and exit 124 when still running: re-run them (#4835). |
 | Listing workflow runs or viewing job detail | **`gh run list` / `gh run view`** | MCP has no `actions` API exposure. |

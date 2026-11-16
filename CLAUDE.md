@@ -17,7 +17,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Never use `run_in_background` in any subagent (`/task`, `/ralph`, or Agent-spawned workers). All commands inside subagents run synchronously.
 - Never use the `Monitor` tool. Use synchronous polling instead — `scripts/wait-for-ci.sh` for PR CI gates, `scripts/wait-for-run.sh <run-id>` for workflow runs. Monitor's change-detection fires a wake-up event on every state-string change, including innocuous flickers like `mergeable=UNKNOWN ↔ MERGEABLE` while CI is still running, which bombards the agent with no-progress turns until it yields. Verified failure mode in PR #3927 / #3922 / #3909 transcripts.
 - Never commit directly to `main` during autonomous task work.
-- **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+- **You MAY merge your own PRs** after `/ralph` and CI are green: `scripts/gh-pr-with-retry.sh merge <N> --squash --delete-branch`. Never bare `gh pr merge`: the wrapper re-checks the PR's live title, body and commits for stray closing keywords and placeholder text right before merging (#5133).
 - Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
 - Never deploy to production. Production deploys are human-only.
 - Never skip pre-PR checks. Run lint, format, AND tests locally before pushing.
@@ -201,7 +201,7 @@ Every human-facing alert MUST pass all three tests. An alert that fails any of t
 - **Don't re-Read a file you already Read in full.**
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
 - **GitHub reads: MCP for single objects, `gh --json` for lists and wide rollups.** See `docs/agent/github-api-access.md`.
-- **GitHub writes: `gh` CLI** (`gh issue create`, `gh pr create`, `gh pr merge --squash --delete-branch`, etc.). See `docs/agent/gh-to-mcp-migration.md`.
+- **GitHub writes: `gh` CLI** (`gh issue create`, `scripts/gh-pr-with-retry.sh create` / `merge`, etc.). See `docs/agent/gh-to-mcp-migration.md`.
 - **AWS reads: MCP-first for ECS + CloudWatch.** See `docs/agent/aws-api-access.md`. `scripts/ecs-*.sh` wrappers stay for launch-and-stream-logs. `aws` CLI for writes, S3, and interactive Exec. Never call `aws secretsmanager get-secret-value` directly — use `scripts/with-secret.sh`.
 - **Deferred tools require schema loading.** GitHub MCP, AWS MCP, `TodoWrite`, `Monitor`, `EnterWorktree`/`ExitWorktree`, `WebFetch`/`WebSearch`, and `Cron*` appear by name only in `<system-reminder>` messages — call them directly and you'll hit `InputValidationError`. Load with `ToolSearch query="select:Name1,Name2"` before first invocation.
 - **Parallelize independent Bash calls** to reduce wall-clock time.

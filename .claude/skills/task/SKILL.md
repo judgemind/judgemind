@@ -289,7 +289,7 @@ mcp__github__get_pull_request_status owner=judgemind repo=judgemind pull_number=
 
 Evaluate:
 
-- **`state: OPEN`, `mergeable: MERGEABLE` / `mergeable_state: clean`, `statusCheckRollup` all SUCCESS/SKIPPED, and an AC-mapping process-summary comment already exists on the issue:** the prior agent got us to the merge line and stopped. **Adopt-to-merge.** Skip A.1 (no code changes needed), skip A.2 (ralph), skip A.2b (summary already posted). Jump to A.7 (`gh pr merge --squash --delete-branch`), then A.8 (deploy verification + evidence), then A.9 (retro). Release the `status/in-progress` label as usual.
+- **`state: OPEN`, `mergeable: MERGEABLE` / `mergeable_state: clean`, `statusCheckRollup` all SUCCESS/SKIPPED, and an AC-mapping process-summary comment already exists on the issue:** the prior agent got us to the merge line and stopped. **Adopt-to-merge.** Skip A.1 (no code changes needed), skip A.2 (ralph), skip A.2b (summary already posted). Jump to A.7 (`scripts/gh-pr-with-retry.sh merge <PR-N> --squash --delete-branch`), then A.8 (deploy verification + evidence), then A.9 (retro). Release the `status/in-progress` label as usual.
 - **`state: OPEN`, CI red or `mergeable_state: dirty`/`unstable`, or the PR body shows an obviously incomplete implementation (missing ACs, unchecked Automated-checks boxes, reviewer REVISE):** the prior agent stalled mid-flight. **Adopt-to-iterate.** Check out the existing PR's branch into this worktree, continue from the step that makes sense (A.4 for merge conflicts, A.5 for CI failures, or A.2 to finish ralph on top of the existing diff), and drive it through to merge. To re-bind the worktree to the existing branch:
   ```
   git -C {worktree} fetch origin pull/<existing-PR>/head:adopt-<existing-PR>
@@ -787,7 +787,7 @@ The PR body must include `Closes #N` so the unblock workflow fires on merge.
 {worktree}/scripts/check-pr-closing-refs.py --title "<title>" --body-file {worktree}/tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
-Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit. If it fails on the open PR, fix the body with `gh pr edit`: the edit starts a fresh run on the same head commit, and `wait-for-ci.sh` judges each check by its newest run, so no manual rerun is needed (#5078). See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
+Exit 1 prints the offending lines and a `Fix:` block; reword and re-run until it exits 0. CI runs the same check on the open PR (the `closing-refs` job in `pr-title-check.yml`), on every push and body edit, and `gh-pr-with-retry.sh merge` runs it again on the live PR right before merging (A.7, #5133). If it fails on the open PR, fix the body with `gh pr edit`: the edit starts a fresh run on the same head commit, and `wait-for-ci.sh` judges each check by its newest run, so no manual rerun is needed (#5078). See `docs/agent/issue-authoring.md` §PR descriptions and commit messages.
 
 **PR body template — use this structure for all PRs:**
 
@@ -904,7 +904,7 @@ Check off the **Automated checks** items that passed in CI. Do NOT check off **P
 Write status: `phase: merging`, `summary: Squash merging PR #<N>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} merging`
 
-**Cockpit milestone:** immediately before running `gh pr merge`, emit the `merge` milestone so the cockpit shows the agent has crossed the merge gate:
+**Cockpit milestone:** immediately before running the merge, emit the `merge` milestone so the cockpit shows the agent has crossed the merge gate:
 
 ```
 scripts/dispatcher/progress.sh "$AGENT_ID" merge "PR #<PR-N>" || true
@@ -928,6 +928,10 @@ Once the gate is green, merge via the `gh-pr-with-retry.sh` wrapper (#4527). It 
 ```
 {worktree}/scripts/gh-pr-with-retry.sh merge <PR-N> --squash --delete-branch
 ```
+
+Never merge with bare `gh pr merge`: the wrapper is the merge gate for the PR text.
+
+**The PR-text gate runs at merge time (#5133).** Before any merge call, the wrapper runs `scripts/check-pr-closing-refs.py --pr <PR-N>` and `scripts/check-pr-title.sh --pr <PR-N>` on the PR's **live** title, body and commits. If either fails, or cannot read the PR, it prints the check output and a `Fix:` block, exits 1, and does not merge. The same two checks (`closing-refs`, `validate-pr`) run in CI, but they are not required status checks and `ci-passed` does not re-run on a body edit, so `wait-for-ci.sh` can only narrow the timing windows (#5078, #5090, #5128). An edit after `wait-for-ci.sh` exits, or a check run GitHub creates late, is caught here. On a refusal, reword the PR as the output says (`gh-pr-with-retry.sh edit <PR-N> --body-file <file>`), then re-run the merge. A closing word in a commit message needs an amended commit and a push. When GraphQL is exhausted, `check-pr-closing-refs.py` reads the PR over REST; that path cannot see issues linked only in the Development sidebar.
 
 **If `gh pr merge` refuses with `base branch policy prohibits the merge`, do NOT bypass it.** That message means GitHub's branch protection is not satisfied: the required `ci-passed` has not passed on the head SHA yet. Go back to A.5, re-run `scripts/wait-for-ci.sh <PR-N>` until it exits 0, then retry the merge. Never merge by hand with `gh api .../pulls/<N>/merge -X PUT` and never pass `--admin`: the token belongs to a repo admin and `enforce_admins=false`, so the REST merge endpoint **skips** required checks rather than re-evaluating them. `gh pr merge --auto` is not available either ("Auto merge is not allowed for this repository").
 
