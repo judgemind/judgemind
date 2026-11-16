@@ -209,6 +209,9 @@ jobs:
               - 'scripts/apply_migrations.sh'
               - 'scripts/tests/test_ensure_test_db.sh'
               - 'scripts/tests/test_apply_migrations.sh'
+              # The hook's local Redis for the real-Redis tests (#5106).
+              - 'scripts/ensure-test-redis.sh'
+              - 'scripts/tests/test_ensure_test_redis.sh'
               # The hook's scripts/tests venv (#5045).
               - 'scripts/ensure-scripts-tests-venv.sh'
               - 'scripts/tests/requirements-ci.txt'
@@ -262,6 +265,13 @@ jobs:
     # invariant harness) run here against a migrated database.
     # REQUIRE_PG_TESTS=1 turns their "TEST_DATABASE_URL not set" skip into a
     # failure, so they cannot silently stop running.
+    # The real-Redis tests (the real_redis_client fixture in tests/conftest.py,
+    # e.g. TestRealRedis in tests/ingestion/test_message_lease_5091.py) run
+    # against the redis service. REQUIRE_REDIS_TESTS=1 turns a missing or
+    # unreachable Redis into a failure, not a skip (#5106). The image matches
+    # dev ElastiCache (engine 7.1 on the default.redis7 parameter group,
+    # infra/terraform/modules/cache), and a step below sets the same
+    # maxmemory-policy.
     services:
       postgres:
         image: postgres:16
@@ -276,9 +286,20 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7.0-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
       REQUIRE_PG_TESTS: "1"
+      JUDGEMIND_TEST_REDIS_URL: redis://localhost:6379/0
+      REQUIRE_REDIS_TESTS: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -311,6 +332,15 @@ jobs:
       - name: Apply migrations to the test database
         working-directory: .
         run: scripts/apply_migrations.sh "$TEST_DATABASE_URL"
+      # default.redis7 (dev ElastiCache) uses volatile-lru; the redis image
+      # defaults to noeviction. Service containers take no command args, so
+      # set it on the running server.
+      - name: Match the dev ElastiCache eviction policy on the test Redis
+        env:
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          docker exec "$REDIS_CONTAINER" redis-cli config set maxmemory-policy volatile-lru
+          docker exec "$REDIS_CONTAINER" redis-cli info server | grep redis_version
       - name: Test
         run: >-
           .venv/bin/pytest tests/ -n auto --dist worksteal -v --tb=short --durations=30
@@ -838,7 +868,7 @@ jobs:
         env:
           # Whitespace-separated list of test paths to defer to their own
           # dedicated CI jobs. See the comment above this step for why.
-          SKIP_TESTS: "scripts/tests/test_pre_push.sh scripts/tests/test_ensure_test_db.sh scripts/tests/test_apply_migrations.sh"
+          SKIP_TESTS: "scripts/tests/test_pre_push.sh scripts/tests/test_ensure_test_db.sh scripts/tests/test_apply_migrations.sh scripts/tests/test_ensure_test_redis.sh"
           SHARD_FILTER: ${{ matrix.shard-filter }}
         run: scripts/run-scripts-tests.sh
       # The dispatcher tests directory has only fast tests today, so it
@@ -2208,7 +2238,8 @@ jobs:
     runs-on: ubuntu-latest
     # The hook's Postgres test database helpers (#4950) are tested against
     # a real server here. REQUIRE_PG_TESTS=1 makes a missing server a
-    # failure rather than a skip.
+    # failure rather than a skip. The hook's local-Redis helper (#5106) is
+    # tested against the redis service the same way (REQUIRE_REDIS_TESTS=1).
     services:
       postgres:
         image: postgres:16
@@ -2223,6 +2254,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7.0-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       ENSURE_TEST_DB_ADMIN_URL: postgresql://judgemind:localdev@localhost:5432/postgres
       REQUIRE_PG_TESTS: "1"
@@ -2234,6 +2274,10 @@ jobs:
         run: |
           scripts/tests/test_ensure_test_db.sh
           scripts/tests/test_apply_migrations.sh
+      - name: Run local-Redis helper tests
+        env:
+          REQUIRE_REDIS_TESTS: "1"
+        run: scripts/tests/test_ensure_test_redis.sh
 
   # ---------------------------------------------------------------
   # Dispatcher terminal-status consistency guard: verifies the five

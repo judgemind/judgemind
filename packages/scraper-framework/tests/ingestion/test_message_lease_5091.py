@@ -16,14 +16,15 @@ a fake clock:
 * a long message (well past 30 s) is never stolen;
 * after SIGTERM, only the in-flight message keeps its lease.
 
-``TestRealRedis`` runs the renewal Lua script against a real Redis when
-``JUDGEMIND_TEST_REDIS_URL`` is set.
+``TestRealRedis`` runs the renewal Lua script against a real Redis through
+the ``real_redis_client`` fixture (tests/conftest.py): it needs
+``JUDGEMIND_TEST_REDIS_URL``, and CI sets ``REQUIRE_REDIS_TESTS=1`` so a
+missing Redis fails there instead of skipping (#5106).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from collections.abc import Iterator
@@ -557,13 +558,8 @@ def test_stop_heartbeat_without_start_is_a_no_op() -> None:
 
 
 @pytest.fixture
-def real_redis() -> Iterator[Any]:
-    url = os.environ.get("JUDGEMIND_TEST_REDIS_URL")
-    if not url:
-        pytest.skip("JUDGEMIND_TEST_REDIS_URL not set")
-    import redis as redis_lib
-
-    client = redis_lib.Redis.from_url(url, decode_responses=False)
+def real_redis(real_redis_client: Any) -> Iterator[Any]:
+    client = real_redis_client
     stream = f"test-5091-{uuid.uuid4().hex}"
     group = "test-5091"
     client.xgroup_create(stream, group, id="0", mkstream=True)

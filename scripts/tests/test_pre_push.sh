@@ -82,6 +82,11 @@
 #  62. PREPUSH_SCRIPTS_TESTS=0 skips the dispatcher suites (#5052)
 #  63. a real `git push`: dispatcher run sees no GIT_DIR / gh login, and
 #      both dispatcher conftests carry the isolation blocks (#5052)
+#  64. a package with real-Redis tests gets scripts/ensure-test-redis.sh's
+#      URL as JUDGEMIND_TEST_REDIS_URL for its pytest (#5106)
+#  65. no local Redis: loud WARNING + Fix: block, push not blocked (#5106)
+#  66. an exported JUDGEMIND_TEST_REDIS_URL is used as is, helper not run (#5106)
+#  67. a package without Redis tests does not look for Redis (#5106)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2100,6 +2105,136 @@ elif [ "$pg_url" != "unset" ]; then
     report_fail "expected no TEST_DATABASE_URL for a package without Postgres tests; saw '$pg_url' (#4950)" "$hook_out"
 else
     report_pass "no Postgres tests, no database (#4950)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 64-67 (#5106): real-Redis tests get the local Redis.
+# testpkg gains a test that reads JUDGEMIND_TEST_REDIS_URL;
+# scripts/ensure-test-redis.sh is a stub whose exit code picks the path
+# (0 ready, 3 Redis unavailable). The pytest stub records the
+# JUDGEMIND_TEST_REDIS_URL it saw.
+# ───────────────────────────────────────────────────────────────────────
+
+# commit_redis_testpkg <branch>: testpkg plus a Redis test, committed.
+commit_redis_testpkg() {
+    git -C "$WORK" checkout --quiet -b "$1"
+    seed_testpkg
+    cat > "$WORK/packages/testpkg/tests/test_thing_redis.py" <<'PY'
+"""A real-Redis test (reads JUDGEMIND_TEST_REDIS_URL)."""
+
+import os
+
+from good import greet
+
+_URL = os.environ.get("JUDGEMIND_TEST_REDIS_URL", "")
+
+
+def test_greet() -> None:
+    assert greet() == "hello"
+PY
+    printf '.venv/\npytest-args.txt\ncoverage.xml\nredis-url.txt\n' > "$WORK/packages/testpkg/.gitignore"
+    git -C "$WORK" add packages/testpkg
+    git -C "$WORK" commit --quiet -m "feat: testpkg with a redis test"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+# seed_redis_stubs <ensure_rc>: stub venv + stub scripts/ensure-test-redis.sh.
+# The ensure stub counts its calls in redis-calls.txt (outside the repo).
+seed_redis_stubs() {
+    local ensure_rc="$1" bin="$WORK/packages/testpkg/.venv/bin"
+    seed_stub_venv 0 0
+    printf '#!/usr/bin/env bash\necho "${JUDGEMIND_TEST_REDIS_URL:-unset}" > redis-url.txt\necho "<coverage/>" > coverage.xml\nexit 0\n' > "$bin/pytest"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/diff-cover"
+    chmod +x "$bin/pytest" "$bin/diff-cover"
+    mkdir -p "$WORK/scripts"
+    cat > "$WORK/scripts/ensure-test-redis.sh" <<SH
+#!/usr/bin/env bash
+echo call >> "$TMPDIR/redis-calls.txt"
+case $ensure_rc in
+    0) echo "ensure-test-redis: using Redis at localhost:6379 (database 15)" >&2
+       echo "redis://localhost:6379/15" ;;
+    *) echo "WARNING: no local Redis for the real-Redis tests: stub" >&2
+       echo "Fix:" >&2
+       echo "  docker compose up -d redis" >&2 ;;
+esac
+exit $ensure_rc
+SH
+    chmod +x "$WORK/scripts/ensure-test-redis.sh"
+    rm -f "$TMPDIR/redis-calls.txt" "$WORK/packages/testpkg/redis-url.txt"
+}
+
+echo "[scenario 64] Redis tests get the local Redis (#5106)"
+init_workspace
+commit_redis_testpkg feature-redis-ready
+seed_redis_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-redis-ready $feat_sha refs/heads/feature-redis-ready $ZERO_SHA" \
+    | env -u JUDGEMIND_TEST_REDIS_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+redis_url="$(cat "$WORK/packages/testpkg/redis-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass with a local Redis (#5106)" "$hook_out"
+elif [ "$redis_url" != "redis://localhost:6379/15" ]; then
+    report_fail "expected pytest to see the ensure-test-redis URL; saw '$redis_url' (#5106)" "$hook_out"
+elif echo "$hook_out" | grep -q "real-Redis tests (tests that"; then
+    report_fail "expected no skip WARNING with a local Redis (#5106)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "ensure-test-redis: using Redis at localhost:6379"; then
+    report_fail "expected the ensure-test-redis message in the output (#5106)" "$hook_out"
+else
+    report_pass "Redis tests run against the local Redis (#5106)"
+fi
+
+echo "[scenario 65] no local Redis: WARNING + Fix:, push not blocked (#5106)"
+init_workspace
+commit_redis_testpkg feature-redis-unavailable
+seed_redis_stubs 3
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-redis-unavailable $feat_sha refs/heads/feature-redis-unavailable $ZERO_SHA" \
+    | env -u JUDGEMIND_TEST_REDIS_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+redis_url="$(cat "$WORK/packages/testpkg/redis-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a degraded push to pass when the rest is green (#5106)" "$hook_out"
+elif [ "$redis_url" != "unset" ]; then
+    report_fail "expected pytest to run without JUDGEMIND_TEST_REDIS_URL; saw '$redis_url' (#5106)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "WARNING: no local Redis, so testpkg's real-Redis tests"; then
+    report_fail "expected the loud skip WARNING (#5106)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "^ *Fix:"; then
+    report_fail "expected a Fix: block (#5106)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "docker compose up -d redis"; then
+    report_fail "expected 'docker compose up -d redis' in the Fix block (#5106)" "$hook_out"
+else
+    report_pass "no local Redis: loud WARNING and Fix: block (#5106)"
+fi
+
+echo "[scenario 66] an exported JUDGEMIND_TEST_REDIS_URL is used as is (#5106)"
+init_workspace
+commit_redis_testpkg feature-redis-env
+seed_redis_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-redis-env $feat_sha refs/heads/feature-redis-env $ZERO_SHA" \
+    | JUDGEMIND_TEST_REDIS_URL=redis://localhost:6400/3 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+redis_url="$(cat "$WORK/packages/testpkg/redis-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#5106)" "$hook_out"
+elif [ "$redis_url" != "redis://localhost:6400/3" ]; then
+    report_fail "expected pytest to see the exported URL; saw '$redis_url' (#5106)" "$hook_out"
+elif [ -f "$TMPDIR/redis-calls.txt" ]; then
+    report_fail "ensure-test-redis.sh must not run when JUDGEMIND_TEST_REDIS_URL is exported (#5106)" "$hook_out"
+else
+    report_pass "an exported JUDGEMIND_TEST_REDIS_URL is used as is (#5106)"
+fi
+
+echo "[scenario 67] a package without Redis tests does not look for Redis (#5106)"
+init_workspace
+commit_testpkg_code feature-redis-none
+seed_redis_stubs 0
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-redis-none $feat_sha refs/heads/feature-redis-none $ZERO_SHA" \
+    | env -u JUDGEMIND_TEST_REDIS_URL "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+redis_url="$(cat "$WORK/packages/testpkg/redis-url.txt" 2>/dev/null || true)"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the push to pass (#5106)" "$hook_out"
+elif [ -f "$TMPDIR/redis-calls.txt" ]; then
+    report_fail "ensure-test-redis.sh must not run for a package without Redis tests (#5106)" "$hook_out"
+elif [ "$redis_url" != "unset" ]; then
+    report_fail "expected no JUDGEMIND_TEST_REDIS_URL for a package without Redis tests; saw '$redis_url' (#5106)" "$hook_out"
+else
+    report_pass "no Redis tests, no Redis lookup (#5106)"
 fi
 
 echo "[scenario 47] a hook run from elsewhere re-execs the checkout's own .githooks/pre-push (#4950)"
