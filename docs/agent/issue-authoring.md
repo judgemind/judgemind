@@ -437,7 +437,7 @@ Rules for PR bodies and commit messages:
 scripts/check-pr-closing-refs.py --title "<title>" --body-file tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
-If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh run on the same head commit. No manual rerun is needed: `scripts/wait-for-ci.sh` judges each check by its newest run, so the replaced failure stops counting once the fresh run passes, and the script waits while that run is still going (#5078). It also waits while any `closing-refs` or `validate-pr` run is still going (#5090). It cannot see a run GitHub has not created yet, so for a few seconds right after `gh pr edit` it may still judge the old run: re-run `wait-for-ci.sh` after the edit rather than merging on an earlier exit 0. Making `closing-refs` a required status check closes that window too.
+If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh run on the same head commit. No manual rerun is needed: `scripts/wait-for-ci.sh` judges each check by its newest run, so the replaced failure stops counting once the fresh run passes, and the script waits while that run is still going (#5078). It also waits while any `closing-refs` or `validate-pr` run is still going (#5090). GitHub creates the edit's new runs about 4 seconds after `gh pr edit`, and until then no API lists them, so the script also waits while the PR was updated less than 60 seconds ago and no PR-text run has started since (#5128). Making `closing-refs` a required status check remains the belt-and-braces fix: branch protection then refuses the merge itself.
 
 ## Investigation Tasks
 

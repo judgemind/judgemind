@@ -88,6 +88,8 @@ CALL_COUNTER_FILE="${CALL_COUNTER_FILE:?CALL_COUNTER_FILE required}"
 SHA_RESPONSE="${SHA_RESPONSE:-deadbeefdeadbeef}"
 MERGE_STATE_RESPONSE="${MERGE_STATE_RESPONSE:-CLEAN}"
 MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}"
+# PR updatedAt (#5128). Empty = unreadable, which skips the edit grace check.
+UPDATED_AT_RESPONSE="${UPDATED_AT_RESPONSE:-}"
 LOG_FAILED_FILE="${LOG_FAILED_FILE:-}"
 RERUN_LOG_FILE="${RERUN_LOG_FILE:-}"
 
@@ -121,6 +123,10 @@ case "$ARGS" in
         case "$ARGS" in
             *"headRefOid"*)
                 printf '%s\n' "$SHA_RESPONSE"
+                exit 0
+                ;;
+            *"updatedAt"*)
+                printf '%s\n' "$UPDATED_AT_RESPONSE"
                 exit 0
                 ;;
             *"mergeStateStatus"*)
@@ -158,7 +164,7 @@ case "$ARGS" in
         esac
         rest_mergeable_state=$(printf '%s' "$MERGE_STATE_RESPONSE" | tr '[:upper:]' '[:lower:]')
 
-        rest_json="{\"head\":{\"sha\":\"$SHA_RESPONSE\"},\"mergeable\":$rest_mergeable,\"mergeable_state\":\"$rest_mergeable_state\"}"
+        rest_json="{\"head\":{\"sha\":\"$SHA_RESPONSE\"},\"mergeable\":$rest_mergeable,\"mergeable_state\":\"$rest_mergeable_state\",\"updated_at\":\"$UPDATED_AT_RESPONSE\"}"
 
         # Find the --jq argument the wrapper passed, run jq with it.
         jq_expr=""
@@ -209,6 +215,13 @@ case "$ARGS" in
         exit 0
         ;;
     *"check-runs"*)
+        # Advance the fake epoch clock that the PR-edit grace window reads
+        # by EPOCH_STEP per poll (#5128), so a test passes time without
+        # real sleeps.
+        if [ -n "${WAIT_FOR_CI_EPOCH_FILE:-}" ] && [ -f "$WAIT_FOR_CI_EPOCH_FILE" ]; then
+            read -r e < "$WAIT_FOR_CI_EPOCH_FILE"
+            printf '%s\n' "$((e + ${EPOCH_STEP:-0}))" > "$WAIT_FOR_CI_EPOCH_FILE"
+        fi
         # Fall through to response-file dispatch below.
         ;;
     *)
@@ -257,6 +270,9 @@ run_script() {
     SHA_RESPONSE="${SHA_RESPONSE:-deadbeefdeadbeef}" \
     MERGE_STATE_RESPONSE="${MERGE_STATE_RESPONSE:-CLEAN}" \
     MERGEABLE_RESPONSE="${MERGEABLE_RESPONSE:-MERGEABLE}" \
+    UPDATED_AT_RESPONSE="${UPDATED_AT_RESPONSE:-}" \
+    WAIT_FOR_CI_EPOCH_FILE="${WAIT_FOR_CI_EPOCH_FILE:-}" \
+    EPOCH_STEP="${EPOCH_STEP:-0}" \
     LOG_FAILED_FILE="${LOG_FAILED_FILE:-}" \
     RERUN_LOG_FILE="${RERUN_LOG_FILE:-}" \
     PR_VIEW_GRAPHQL_RATE_LIMIT="${PR_VIEW_GRAPHQL_RATE_LIMIT:-0}" \
@@ -1975,6 +1991,184 @@ test_pending_closing_refs_then_failure_exits_1() {
     fi
 }
 
+# ── PR-text runs not created yet right after a PR edit (#5128) ─────────────
+#
+# Captured live on PR 5129: `gh pr edit` returned at 12:35:49, the PR's
+# updatedAt became 12:35:48, and the edit's new closing-refs / validate-pr
+# runs first appeared at 12:35:52 in BOTH the REST check-runs list and the
+# GraphQL rollup. For those ~4s every PR-text run listed is the old,
+# completed one, so nothing looks pending. The script must not exit 0 then.
+
+EDIT_UPDATED_AT="2026-11-16T12:35:48Z"
+
+# Args: <file> <variant>: before | new-pending | new-success | new-failure
+write_edit_lag_response() {
+    local file="$1"
+    local variant="$2"
+    local new_runs=""
+    case "$variant" in
+        new-pending)
+            new_runs='{"id": 501, "name": "closing-refs", "app": {"id": 15368}, "status": "in_progress", "conclusion": null, "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/501"},
+    {"id": 502, "name": "validate-pr", "app": {"id": 15368}, "status": "queued", "conclusion": null, "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/502"},'
+            ;;
+        new-success)
+            new_runs='{"id": 501, "name": "closing-refs", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/501"},
+    {"id": 502, "name": "validate-pr", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/502"},'
+            ;;
+        new-failure)
+            new_runs='{"id": 501, "name": "closing-refs", "app": {"id": 15368}, "status": "completed", "conclusion": "failure", "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/501"},
+    {"id": 502, "name": "validate-pr", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:35:52Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/502"},'
+            ;;
+    esac
+    cat > "$file" << JSON
+{
+  "check_runs": [
+    $new_runs
+    {"id": 401, "name": "closing-refs", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:33:54Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3001/job/401"},
+    {"id": 402, "name": "validate-pr",  "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:33:54Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3001/job/402"},
+    {"id": 100, "name": "ci-passed",    "app": {"id": 15368}, "status": "completed", "conclusion": "success", "started_at": "2026-11-16T12:20:00Z", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/100"}
+  ]
+}
+JSON
+}
+
+# Args: <tmpdir> <seconds after EDIT_UPDATED_AT> — writes the fake epoch clock.
+set_epoch_after_edit() {
+    local base
+    base=$(jq -rn --arg t "$EDIT_UPDATED_AT" '$t | fromdateiso8601')
+    printf '%s\n' "$((base + $2))" > "$1/epoch"
+}
+
+test_edit_lag_nothing_pending_blocks_success() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    set_epoch_after_edit "$tmpdir" 2
+
+    local output exit_code
+    exit_code=0
+    # --timeout-secs 0: one poll, then exit 124, no sleep.
+    output=$(UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 0 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        pass "edit_lag: REST shows no PR-text run pending 2s after an edit; exit is non-zero (exit=$exit_code)"
+    else
+        fail "edit_lag: REST shows no PR-text run pending 2s after an edit; exit must be non-zero" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        fail "edit_lag: must not report success" "output=$output"
+    else
+        pass "edit_lag: does not report success"
+    fi
+    if echo "$output" | grep -q "no PR-text check run has started since"; then
+        pass "edit_lag: says it is waiting for the edit's PR-text runs"
+    else
+        fail "edit_lag: says it is waiting for the edit's PR-text runs" "output=$output"
+    fi
+}
+
+test_edit_lag_then_new_run_fails_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    write_edit_lag_response "$tmpdir/responses/02.json" new-pending
+    write_edit_lag_response "$tmpdir/responses/03.json" new-failure
+    set_epoch_after_edit "$tmpdir" 0
+
+    local output exit_code
+    exit_code=0
+    output=$(UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" EPOCH_STEP=2 \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ] && echo "$output" | grep -q "closing-refs: conclusion=failure"; then
+        pass "edit_lag_then_failure: waits through the creation gap and exits 1 on the edit's failed closing-refs run"
+    else
+        fail "edit_lag_then_failure: waits through the creation gap and exits 1 on the edit's failed closing-refs run" "exit=$exit_code output=$output"
+    fi
+}
+
+test_edit_lag_then_new_run_passes_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    write_edit_lag_response "$tmpdir/responses/02.json" new-pending
+    write_edit_lag_response "$tmpdir/responses/03.json" new-success
+    set_epoch_after_edit "$tmpdir" 0
+
+    local output exit_code calls
+    exit_code=0
+    output=$(UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" EPOCH_STEP=2 \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+    calls=$(cat "$tmpdir/counter")
+
+    if [ "$exit_code" -eq 0 ] && [ "$calls" -eq 3 ]; then
+        pass "edit_lag_then_success: exits 0 only after the edit's PR-text runs pass (calls=$calls)"
+    else
+        fail "edit_lag_then_success: exits 0 only after the edit's PR-text runs pass" "exit=$exit_code calls=$calls output=$output"
+    fi
+}
+
+test_update_without_pr_text_run_waits_out_grace() {
+    # A comment or label bumps updatedAt but starts no PR-text run: success
+    # is delayed until the grace window passes, never blocked for good.
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    set_epoch_after_edit "$tmpdir" 1
+
+    local output exit_code calls
+    exit_code=0
+    output=$(UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" EPOCH_STEP=20 \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+    calls=$(cat "$tmpdir/counter")
+
+    # Polls read the clock at +21s, +41s (wait), +61s (past the 60s grace).
+    if [ "$exit_code" -eq 0 ] && [ "$calls" -eq 3 ]; then
+        pass "update_without_run: exits 0 once the 60s grace after the update has passed (calls=$calls)"
+    else
+        fail "update_without_run: exits 0 once the 60s grace after the update has passed" "exit=$exit_code calls=$calls output=$output"
+    fi
+}
+
+test_old_update_does_not_wait() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    set_epoch_after_edit "$tmpdir" 300
+
+    local output exit_code calls
+    exit_code=0
+    output=$(UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+    calls=$(cat "$tmpdir/counter")
+
+    if [ "$exit_code" -eq 0 ] && [ "$calls" -eq 1 ]; then
+        pass "old_update: an update 5 minutes ago does not delay success (calls=$calls)"
+    else
+        fail "old_update: an update 5 minutes ago does not delay success" "exit=$exit_code calls=$calls output=$output"
+    fi
+}
+
+test_edit_lag_updated_at_via_rest_fallback() {
+    # GraphQL rate-limited: updatedAt comes from REST `updated_at` (#4507).
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_edit_lag_response "$tmpdir/responses/01.json" before
+    set_epoch_after_edit "$tmpdir" 2
+
+    local output exit_code
+    exit_code=0
+    output=$(PR_VIEW_GRAPHQL_RATE_LIMIT=1 UPDATED_AT_RESPONSE="$EDIT_UPDATED_AT" WAIT_FOR_CI_EPOCH_FILE="$tmpdir/epoch" \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 0 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -ne 0 ] && echo "$output" | grep -q "no PR-text check run has started since"; then
+        pass "edit_lag_rest_fallback: reads updatedAt from REST when GraphQL is rate-limited (exit=$exit_code)"
+    else
+        fail "edit_lag_rest_fallback: reads updatedAt from REST when GraphQL is rate-limited" "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -2023,6 +2217,12 @@ test_pending_closing_refs_blocks_success
 test_pending_validate_pr_blocks_success
 test_pending_closing_refs_then_success_exits_0
 test_pending_closing_refs_then_failure_exits_1
+test_edit_lag_nothing_pending_blocks_success
+test_edit_lag_then_new_run_fails_exits_1
+test_edit_lag_then_new_run_passes_exits_0
+test_update_without_pr_text_run_waits_out_grace
+test_old_update_does_not_wait
+test_edit_lag_updated_at_via_rest_fallback
 
 echo ""
 echo "────────────────────────────────────────────"
