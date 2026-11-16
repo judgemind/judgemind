@@ -415,13 +415,12 @@ class TestSplitImage:
         assert joiner == "\n"
         assert [_size(h)[0] for h in halves] == [1275, 1275]
 
-    def test_touching_lines_taller_than_one_line_are_not_cut_left_right(self) -> None:
+    def test_touching_lines_taller_than_one_line_are_not_cut(self) -> None:
+        """No blank row and no blank column: any cut would go through ink
+        (#5098), so the region is unsplittable."""
         solid = Image.new("L", (600, 120), 0)  # no blank row anywhere
 
-        split = llm_extract._split_image(_png(solid))
-
-        assert split is not None
-        assert split[1] == "\n"
+        assert llm_extract._split_image(_png(solid)) is None
 
     def test_text_line_count(self) -> None:
         assert llm_extract._text_line_count(_page_image(600, 100).point(lambda v: v)) == 3
