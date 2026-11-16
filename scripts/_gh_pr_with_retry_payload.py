@@ -53,6 +53,8 @@ Env contract
         (typically ``worktree-agent-<id>`` or the ralph branch).
     GH_PR_BASE (str, required for ``create``): the PR's base branch
         (typically ``main``).
+    GH_PR_DRAFT (str, optional, ``create`` only): ``"1"`` adds
+        ``"draft": true`` to the payload (#5122).
 
 Output
 ------
@@ -124,12 +126,18 @@ def _build_create_payload() -> dict:
 
     body = _read_body_file(body_file)
 
-    return {
+    payload: dict = {
         "title": title,
         "body": body,
         "head": head,
         "base": base,
     }
+    # --draft passthrough (#5122). POST /pulls takes `draft` directly;
+    # assignees / labels / reviewers need separate calls, which the shell
+    # wrapper makes after the PR exists.
+    if os.environ.get("GH_PR_DRAFT", "") == "1":
+        payload["draft"] = True
+    return payload
 
 
 def _build_edit_payload() -> dict:

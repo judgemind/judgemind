@@ -9,6 +9,10 @@
 #   X.* — `edit`:   success + GraphQL-rate-limit + REST-fail + auth-passthrough.
 #   M.* — `merge`:  success + GraphQL-rate-limit + REST-fail + auth-passthrough,
 #                   plus --delete-branch coverage (success + already-deleted).
+#   A.* — `create` passthrough of --assignee/--label/--reviewer/--draft,
+#         direct and on the REST fallback (#5122).
+#   S.* — `merge` after a 5xx that merged anyway: head-ref delete, no
+#         merge retry (#4231, #5122).
 #
 # All tests run against a PATH-mocked ``gh`` binary — no network. Uses
 # the same temp-cleanup helper pattern as test_gh_comment_with_retry.sh.
@@ -174,6 +178,15 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
             echo "error: authentication required" >&2
             exit 4
             ;;
+        server_502)
+            echo "HTTP 502: Bad Gateway (https://api.github.com/graphql)" >&2
+            exit 1
+            ;;
+        server_504_html)
+            printf '%s\n' "<!DOCTYPE html>" "<title>Unicorn! &middot; GitHub</title>" \
+                "<p>This page is taking too long to load.</p>" >&2
+            exit 1
+            ;;
         *)
             echo "mock gh: unknown MOCK_PR_MERGE_MODE=$mode" >&2
             exit 99
@@ -213,6 +226,25 @@ if [[ "${1:-}" == "api" && "${2:-}" == "-X" && "${3:-}" == "POST" \
             exit 99
             ;;
     esac
+fi
+
+# ── gh api -X POST assignees / labels / requested_reviewers (#5122) ───────
+# Follow-up calls after a REST-fallback create. MOCK_REST_EXTRAS_MODE:
+# "success" (default) or "fail".
+if [[ "${1:-}" == "api" && "${2:-}" == "-X" && "${3:-}" == "POST" \
+        && "${4:-}" =~ ^/repos/.*/(issues/[0-9]+/(assignees|labels)|pulls/[0-9]+/requested_reviewers)$ ]]; then
+    if [[ "${MOCK_REST_EXTRAS_MODE:-success}" == "fail" ]]; then
+        echo "HTTP 422: Validation Failed" >&2
+        exit 1
+    fi
+    echo '{}'
+    exit 0
+fi
+
+# ── gh api /user --jq .login (resolve @me on the REST path) ───────────────
+if [[ "${1:-}" == "api" && "${2:-}" == "/user" ]]; then
+    echo "${MOCK_USER_LOGIN:-mock-login}"
+    exit 0
 fi
 
 # ── gh api -X PATCH /repos/.../pulls/<N> (REST fallback for edit) ─────────
@@ -299,11 +331,17 @@ fi
 # Builds a minimal PR object from MOCK_MERGEABLE_STATE / MOCK_HEAD_SHA /
 # MOCK_HEAD_REF and runs the wrapper's own --jq expression over it.
 if [[ "${1:-}" == "api" && "${2:-}" =~ ^/repos/.*/pulls/[0-9]+$ ]]; then
+    if [[ "${MOCK_PR_READ_MODE:-success}" == "fail" ]]; then
+        echo "HTTP 502: Bad Gateway" >&2
+        exit 1
+    fi
     pr_json=$(jq -cn \
         --arg st "${MOCK_MERGEABLE_STATE:-clean}" \
         --arg sha "${MOCK_HEAD_SHA:-0123456789abcdef0123456789abcdef01234567}" \
         --arg ref "${MOCK_HEAD_REF:-feature-branch}" \
-        '{mergeable_state: $st, head: {sha: $sha, ref: $ref}}')
+        --argjson merged "${MOCK_MERGED:-false}" \
+        --arg state "${MOCK_PR_STATE:-open}" \
+        '{mergeable_state: $st, merged: $merged, state: $state, head: {sha: $sha, ref: $ref}}')
     jq_expr=""
     for ((i=1; i<=$#; i++)); do
         if [[ "${!i}" == "--jq" ]]; then
@@ -1029,6 +1067,271 @@ for blocked_state in blocked behind dirty unknown draft; do
             "exit=$exit_code put_calls=$put_calls err: $err_output"
     fi
 done
+
+# ── Test A — create passthrough flags (#5122) ─────────────────────────────
+
+BODY_FILE_A=$(mktemp)
+register_temp_file "$BODY_FILE_A"
+echo "A body" > "$BODY_FILE_A"
+
+# A.1 — --assignee / --label / --reviewer / --draft reach `gh pr create`
+# in one call, with no follow-up API writes.
+INVOCATIONS_A1="$MOCK_BIN_DIR/invocations_a1.txt"
+: > "$INVOCATIONS_A1"
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_A1" \
+    MOCK_PR_CREATE_MODE=success \
+    "$WRAPPER" create --title "A.1" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a1 \
+        --assignee drewthaler --label type/dx --reviewer octocat --draft \
+        2>/dev/null
+) || exit_code=$?
+create_calls=$(awk '/^pr create / {n++} END {print n+0}' "$INVOCATIONS_A1")
+api_calls=$(awk '/^api / {n++} END {print n+0}' "$INVOCATIONS_A1")
+if [[ "$exit_code" -eq 0 ]] && [[ "$create_calls" == "1" ]] && [[ "$api_calls" == "0" ]] \
+        && grep -qE -- "^pr create .* --head feature-a1 --assignee drewthaler --label type/dx --reviewer octocat --draft$" "$INVOCATIONS_A1" \
+        && [[ "$stdout_output" == *"/pull/777"* ]]; then
+    pass "A.1: create passes --assignee/--label/--reviewer/--draft to one gh pr create call"
+else
+    fail "A.1: create passes --assignee/--label/--reviewer/--draft to one gh pr create call" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_A1")"
+fi
+
+# A.2 — repeated and comma-separated values each become their own flag.
+INVOCATIONS_A2="$MOCK_BIN_DIR/invocations_a2.txt"
+: > "$INVOCATIONS_A2"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_A2" \
+    "$WRAPPER" create --title "A.2" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a2 \
+        --assignee alice,bob --assignee carol --label p1 \
+        > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] \
+        && grep -qE -- "--assignee alice --assignee bob --assignee carol --label p1$" "$INVOCATIONS_A2"; then
+    pass "A.2: repeated and comma-separated --assignee values each pass through"
+else
+    fail "A.2: repeated and comma-separated --assignee values each pass through" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_A2")"
+fi
+
+# A.3 — no extras: the gh pr create argv is unchanged from before #5122.
+INVOCATIONS_A3="$MOCK_BIN_DIR/invocations_a3.txt"
+: > "$INVOCATIONS_A3"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_A3" \
+    "$WRAPPER" create --title "A.3" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a3 > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] && grep -qE -- "--base main --head feature-a3$" "$INVOCATIONS_A3"; then
+    pass "A.3: create without extras sends no extra flags"
+else
+    fail "A.3: create without extras sends no extra flags" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_A3")"
+fi
+
+# A.4 — --assignee is create-only.
+exit_code=0
+err_output=$("$WRAPPER" merge 100 --squash --assignee x 2>&1 >/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 2 ]] && [[ "$err_output" == *"only supported by 'create'"* ]]; then
+    pass "A.4: --assignee on merge exits 2"
+else
+    fail "A.4: --assignee on merge exits 2" "exit=$exit_code err: $err_output"
+fi
+
+# A.5 — --assignee without a value exits 2.
+exit_code=0
+"$WRAPPER" create --title T --body-file "$BODY_FILE_A" --base main --head f --assignee \
+    > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 2 ]]; then
+    pass "A.5: --assignee without a value exits 2"
+else
+    fail "A.5: --assignee without a value exits 2" "expected 2, got $exit_code"
+fi
+
+# A.6 — REST fallback applies assignees (with @me resolved), labels and
+# reviewers after the PR exists, and sends draft in the payload.
+INVOCATIONS_A6="$MOCK_BIN_DIR/invocations_a6.txt"
+: > "$INVOCATIONS_A6"
+PAYLOAD_DUMP_A6=$(mktemp)
+register_temp_file "$PAYLOAD_DUMP_A6"
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_A6" \
+    MOCK_PR_CREATE_MODE=graphql_rate_limit \
+    MOCK_REST_CREATE_MODE=success \
+    MOCK_PAYLOAD_DUMP="$PAYLOAD_DUMP_A6" \
+    MOCK_USER_LOGIN=resolved-me \
+    "$WRAPPER" create --title "A.6" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a6 \
+        --assignee @me --assignee drewthaler --label type/dx --reviewer octocat --draft \
+        2>/dev/null
+) || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] \
+        && grep -qE "^api -X POST /repos/judgemind/judgemind/issues/9001/assignees -f assignees\[\]=resolved-me -f assignees\[\]=drewthaler$" "$INVOCATIONS_A6" \
+        && grep -qE "^api -X POST /repos/judgemind/judgemind/issues/9001/labels -f labels\[\]=type/dx$" "$INVOCATIONS_A6" \
+        && grep -qE "^api -X POST /repos/judgemind/judgemind/pulls/9001/requested_reviewers -f reviewers\[\]=octocat$" "$INVOCATIONS_A6" \
+        && [[ "$stdout_output" == *"assignees applied"* ]] \
+        && [[ "$stdout_output" == *"labels applied"* ]] \
+        && [[ "$stdout_output" == *"reviewers requested"* ]] \
+        && jq -e '.draft == true' "$PAYLOAD_DUMP_A6" > /dev/null; then
+    pass "A.6: REST fallback applies assignees/labels/reviewers and draft"
+else
+    fail "A.6: REST fallback applies assignees/labels/reviewers and draft" \
+        "exit=$exit_code stdout=$stdout_output invocations: $(cat "$INVOCATIONS_A6") payload: $(cat "$PAYLOAD_DUMP_A6")"
+fi
+
+# A.7 — REST fallback: a failed assign warns but exits 0 (the PR exists;
+# a retry would open a duplicate).
+exit_code=0
+err_output=$(
+    MOCK_PR_CREATE_MODE=graphql_rate_limit \
+    MOCK_REST_CREATE_MODE=success \
+    MOCK_REST_EXTRAS_MODE=fail \
+    "$WRAPPER" create --title "A.7" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a7 --assignee drewthaler 2>&1 >/dev/null
+) || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] && [[ "$err_output" == *"WARNING: PR #9001 created but assigning failed"* ]]; then
+    pass "A.7: REST fallback assign failure warns and exits 0"
+else
+    fail "A.7: REST fallback assign failure warns and exits 0" "exit=$exit_code err: $err_output"
+fi
+
+# A.8 — REST fallback without extras makes no follow-up calls and no draft.
+INVOCATIONS_A8="$MOCK_BIN_DIR/invocations_a8.txt"
+: > "$INVOCATIONS_A8"
+PAYLOAD_DUMP_A8=$(mktemp)
+register_temp_file "$PAYLOAD_DUMP_A8"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_A8" \
+    MOCK_PR_CREATE_MODE=graphql_rate_limit \
+    MOCK_REST_CREATE_MODE=success \
+    MOCK_PAYLOAD_DUMP="$PAYLOAD_DUMP_A8" \
+    "$WRAPPER" create --title "A.8" --body-file "$BODY_FILE_A" \
+        --base main --head feature-a8 > /dev/null 2>&1 || exit_code=$?
+api_calls=$(awk '/^api / {n++} END {print n+0}' "$INVOCATIONS_A8")
+if [[ "$exit_code" -eq 0 ]] && [[ "$api_calls" == "1" ]] \
+        && jq -e 'has("draft") | not' "$PAYLOAD_DUMP_A8" > /dev/null; then
+    pass "A.8: REST fallback without extras makes only the POST /pulls call"
+else
+    fail "A.8: REST fallback without extras makes only the POST /pulls call" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_A8")"
+fi
+
+# ── Test S — merge after a 5xx (#4231, #5122) ─────────────────────────────
+
+# S.1 — 502, but the PR merged: delete the head ref, exit 0, never retry
+# the merge and never call the REST merge endpoint.
+INVOCATIONS_S1="$MOCK_BIN_DIR/invocations_s1.txt"
+: > "$INVOCATIONS_S1"
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_S1" \
+    MOCK_PR_MERGE_MODE=server_502 \
+    MOCK_MERGED=true \
+    MOCK_PR_STATE=closed \
+    MOCK_HEAD_REF=worktree-agent-s1 \
+    "$WRAPPER" merge 400 --squash --delete-branch 2>/dev/null
+) || exit_code=$?
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_S1")
+put_calls=$(awk '/^api -X PUT / {n++} END {print n+0}' "$INVOCATIONS_S1")
+if [[ "$exit_code" -eq 0 ]] && [[ "$merge_calls" == "1" ]] && [[ "$put_calls" == "0" ]] \
+        && grep -qE "^api /repos/judgemind/judgemind/pulls/400 --jq " "$INVOCATIONS_S1" \
+        && grep -qE "^api -X DELETE /repos/judgemind/judgemind/git/refs/heads/worktree-agent-s1$" "$INVOCATIONS_S1" \
+        && [[ "$stdout_output" == *"confirmed after server error"* ]] \
+        && [[ "$stdout_output" == *"branch 'worktree-agent-s1' deleted"* ]]; then
+    pass "S.1: 502 + merged deletes the head branch and exits 0 (no merge retry, no PUT)"
+else
+    fail "S.1: 502 + merged deletes the head branch and exits 0 (no merge retry, no PUT)" \
+        "exit=$exit_code stdout=$stdout_output invocations: $(cat "$INVOCATIONS_S1")"
+fi
+
+# S.2 — 502 and the PR is NOT merged: pass the failure through, no DELETE.
+INVOCATIONS_S2="$MOCK_BIN_DIR/invocations_s2.txt"
+: > "$INVOCATIONS_S2"
+exit_code=0
+err_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_S2" \
+    MOCK_PR_MERGE_MODE=server_502 \
+    MOCK_MERGED=false \
+    MOCK_PR_STATE=open \
+    "$WRAPPER" merge 401 --squash --delete-branch 2>&1 >/dev/null
+) || exit_code=$?
+write_calls=$(awk '/^api -X / {n++} END {print n+0}' "$INVOCATIONS_S2")
+merge_calls=$(awk '/^pr merge / {n++} END {print n+0}' "$INVOCATIONS_S2")
+if [[ "$exit_code" -eq 1 ]] && [[ "$write_calls" == "0" ]] && [[ "$merge_calls" == "1" ]] \
+        && [[ "$err_output" == *"HTTP 502"* ]] && [[ "$err_output" == *"is not merged"* ]]; then
+    pass "S.2: 502 + not merged passes the failure through with no writes"
+else
+    fail "S.2: 502 + not merged passes the failure through with no writes" \
+        "exit=$exit_code err=$err_output invocations: $(cat "$INVOCATIONS_S2")"
+fi
+
+# S.3 — 502 + merged, but the branch is already gone: still exits 0.
+exit_code=0
+stdout_output=$(
+    MOCK_PR_MERGE_MODE=server_502 \
+    MOCK_MERGED=true \
+    MOCK_REST_DELETE_MODE=already_gone \
+    MOCK_HEAD_REF=gone-branch \
+    "$WRAPPER" merge 402 --squash --delete-branch 2>/dev/null
+) || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] && [[ "$stdout_output" == *"branch 'gone-branch' was already deleted"* ]]; then
+    pass "S.3: 502 + merged + branch already gone exits 0"
+else
+    fail "S.3: 502 + merged + branch already gone exits 0" "exit=$exit_code stdout=$stdout_output"
+fi
+
+# S.4 — 504 HTML page + merged, no --delete-branch: exit 0, no DELETE.
+INVOCATIONS_S4="$MOCK_BIN_DIR/invocations_s4.txt"
+: > "$INVOCATIONS_S4"
+exit_code=0
+stdout_output=$(
+    MOCK_INVOCATIONS="$INVOCATIONS_S4" \
+    MOCK_PR_MERGE_MODE=server_504_html \
+    MOCK_MERGED=true \
+    "$WRAPPER" merge 403 --squash 2>/dev/null
+) || exit_code=$?
+delete_calls=$(awk '/^api -X DELETE / {n++} END {print n+0}' "$INVOCATIONS_S4")
+if [[ "$exit_code" -eq 0 ]] && [[ "$delete_calls" == "0" ]] \
+        && [[ "$stdout_output" == *"PR #403 is merged"* ]]; then
+    pass "S.4: Unicorn HTML 5xx + merged without --delete-branch exits 0, no DELETE"
+else
+    fail "S.4: Unicorn HTML 5xx + merged without --delete-branch exits 0, no DELETE" \
+        "exit=$exit_code stdout=$stdout_output invocations: $(cat "$INVOCATIONS_S4")"
+fi
+
+# S.5 — 502 and the PR read also fails: pass the original failure through.
+INVOCATIONS_S5="$MOCK_BIN_DIR/invocations_s5.txt"
+: > "$INVOCATIONS_S5"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_S5" \
+    MOCK_PR_MERGE_MODE=server_502 \
+    MOCK_PR_READ_MODE=fail \
+    "$WRAPPER" merge 404 --squash --delete-branch > /dev/null 2>&1 || exit_code=$?
+write_calls=$(awk '/^api -X / {n++} END {print n+0}' "$INVOCATIONS_S5")
+if [[ "$exit_code" -eq 1 ]] && [[ "$write_calls" == "0" ]]; then
+    pass "S.5: 502 + unreadable PR passes the failure through with no writes"
+else
+    fail "S.5: 502 + unreadable PR passes the failure through with no writes" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_S5")"
+fi
+
+# S.6 — a non-5xx failure (branch protection) is not treated as a 5xx:
+# no PR read, no writes.
+INVOCATIONS_S6="$MOCK_BIN_DIR/invocations_s6.txt"
+: > "$INVOCATIONS_S6"
+exit_code=0
+MOCK_INVOCATIONS="$INVOCATIONS_S6" \
+    MOCK_PR_MERGE_MODE=auth \
+    MOCK_MERGED=true \
+    "$WRAPPER" merge 405 --squash --delete-branch > /dev/null 2>&1 || exit_code=$?
+api_calls=$(awk '/^api / {n++} END {print n+0}' "$INVOCATIONS_S6")
+if [[ "$exit_code" -eq 4 ]] && [[ "$api_calls" == "0" ]]; then
+    pass "S.6: non-5xx merge failure skips the merged-anyway check"
+else
+    fail "S.6: non-5xx merge failure skips the merged-anyway check" \
+        "exit=$exit_code invocations: $(cat "$INVOCATIONS_S6")"
+fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
