@@ -858,7 +858,9 @@ test_superseded_older_image_fails_clearly() {
     else
         fail "superseded by older image: says why, with both digests" "output=$output"
     fi
-    if [[ "$took" -lt 10 ]]; then
+    # Exit 3 (not 124) already shows it did not wait out the timeout; this
+    # bound only has to tell a ~2s run from the 30s budget (#5083).
+    if [[ "$took" -lt 20 ]]; then
         pass "superseded by older image: fails promptly (${took}s, budget 30s)"
     else
         fail "superseded by older image: fails promptly" "took ${took}s"

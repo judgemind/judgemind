@@ -712,28 +712,38 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
-# Scenario 20 (#4708): guards run in parallel. Four guards that each
-# sleep 2s must finish in well under the 8s a serial loop would take.
+# Scenario 20 (#4708): guards run in parallel. Four guards meet at a
+# barrier: each marks itself started, then passes only once all four are
+# running at the same time (a serial runner leaves the first one waiting
+# alone until its 20s cap, and it fails). This checks concurrency itself,
+# not wall seconds, so a slow runner cannot fail it (#5083).
 # ───────────────────────────────────────────────────────────────────────
 echo "[scenario 20] guards run in parallel (#4708)"
 synth_scripts="$(seed_synthetic_scripts s20)"
+mkdir -p "$synth_scripts/s20-barrier"
 for g in a b c d; do
-    printf '#!/usr/bin/env bash\nsleep 2\nexit 0\n' > "$synth_scripts/check-sleep-$g.sh"
+    cat > "$synth_scripts/check-sleep-$g.sh" << GUARD
+#!/usr/bin/env bash
+: > "$synth_scripts/s20-barrier/$g"
+for _ in \$(seq 1 200); do
+    n=\$(find "$synth_scripts/s20-barrier" -type f | wc -l)
+    [ "\$n" -ge 4 ] && exit 0
+    sleep 0.1
+done
+echo "only \$n of 4 guards were running at once" >&2
+exit 1
+GUARD
     chmod +x "$synth_scripts/check-sleep-$g.sh"
 done
-t0=$(date +%s)
 out_buf="$(CI_GUARDS_JOBS=4 "$synth_scripts/run-ci-guards.sh" 2>&1)" && rc_buf=0 || rc_buf=$?
-elapsed=$(( $(date +%s) - t0 ))
 if [ "$rc_buf" -ne 0 ]; then
-    report_fail "expected exit 0 with four passing guards, got $rc_buf" "$out_buf"
-elif [ "$elapsed" -ge 6 ]; then
-    report_fail "expected parallel run well under 8s serial time, took ${elapsed}s (#4708)" "$out_buf"
+    report_fail "expected four guards to run at once and pass, got exit $rc_buf (#4708)" "$out_buf"
 elif ! echo "$out_buf" | grep -q "all 4 guard(s) passed"; then
     report_fail "expected 'all 4 guard(s) passed'" "$out_buf"
 elif ! echo "$out_buf" | grep -qE "4 guard\(s\) took [0-9]+s wall at 4 parallel; slowest: check-sleep-"; then
     report_fail "expected timing line naming the slowest guards (#4708)" "$out_buf"
 else
-    report_pass "four 2s guards finished in ${elapsed}s at CI_GUARDS_JOBS=4 (#4708)"
+    report_pass "four guards ran at once at CI_GUARDS_JOBS=4 (#4708)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

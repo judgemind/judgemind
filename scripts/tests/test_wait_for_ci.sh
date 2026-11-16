@@ -634,13 +634,10 @@ test_canonical_gate_fastpath_with_stale_pending() {
     tmpdir=$(make_temp_dir)
     write_stale_pending_with_success_response "$tmpdir/responses/01.json"
 
-    local output exit_code start_ts end_ts elapsed
+    local output exit_code calls
     exit_code=0
-    start_ts=$(date +%s)
     output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
         run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 30 2>&1) || exit_code=$?
-    end_ts=$(date +%s)
-    elapsed=$((end_ts - start_ts))
 
     if [ "$exit_code" -eq 0 ]; then
         pass "canonical_gate_fastpath: exits 0 even with pending=2 from superseded run"
@@ -648,10 +645,12 @@ test_canonical_gate_fastpath_with_stale_pending() {
         fail "canonical_gate_fastpath: exits 0 even with pending=2 from superseded run" "exit=$exit_code output=$output"
     fi
 
-    if [ "$elapsed" -lt 10 ]; then
-        pass "canonical_gate_fastpath: exits in <10s (actual: ${elapsed}s)"
+    # Counted in polls, not wall seconds, so a slow runner cannot fail it (#5083).
+    calls=$(cat "$tmpdir/counter")
+    if [ "$calls" -eq 1 ]; then
+        pass "canonical_gate_fastpath: exits on the first poll (calls=$calls)"
     else
-        fail "canonical_gate_fastpath: exits in <10s" "elapsed=${elapsed}s — fast-path must not wait for pending to drain"
+        fail "canonical_gate_fastpath: exits on the first poll" "calls=$calls — fast-path must not wait for pending to drain"
     fi
 
     if echo "$output" | grep -q "canonical merge gate green"; then
@@ -1187,17 +1186,14 @@ test_rebase_required_exits_3_on_first_poll() {
     tmpdir=$(make_temp_dir)
     write_all_success_response "$tmpdir/responses/01.json"
 
-    local output exit_code start_ts end_ts elapsed
+    local output exit_code calls
     exit_code=0
-    start_ts=$(date +%s)
     # ci-passed=success, failures=0, mergeStateStatus=DIRTY. mergeable would be
     # CONFLICTING in production; the mock returns whatever MERGEABLE_RESPONSE is
     # set to. We pass UNKNOWN to prove the exit-3 path doesn't depend on the
     # mergeable enum (DIRTY is the load-bearing signal).
     output=$(MERGEABLE_RESPONSE=CONFLICTING MERGE_STATE_RESPONSE=DIRTY \
         run_script "$tmpdir" 42 --poll-interval 5 --timeout-secs 60 2>&1) || exit_code=$?
-    end_ts=$(date +%s)
-    elapsed=$((end_ts - start_ts))
 
     if [ "$exit_code" -eq 3 ]; then
         pass "rebase_required: exits 3 on green-but-DIRTY"
@@ -1205,11 +1201,13 @@ test_rebase_required_exits_3_on_first_poll() {
         fail "rebase_required: exits 3 on green-but-DIRTY" "exit=$exit_code output=$output"
     fi
 
-    # AC#1: must exit within one polling cycle (well before --poll-interval).
-    if [ "$elapsed" -lt 5 ]; then
-        pass "rebase_required: exits in <5s (actual: ${elapsed}s) — one polling cycle"
+    # AC#1: must exit within one polling cycle. Counted in polls, not wall
+    # seconds, so a slow runner cannot fail it (#5083).
+    calls=$(cat "$tmpdir/counter")
+    if [ "$calls" -eq 1 ]; then
+        pass "rebase_required: exits on the first poll (calls=$calls)"
     else
-        fail "rebase_required: exits in <5s" "elapsed=${elapsed}s — must not wait for second poll"
+        fail "rebase_required: exits on the first poll" "calls=$calls — must not wait for second poll"
     fi
 
     # AC#2: stdout/stderr names the action with the exact rebase command.
@@ -1376,13 +1374,10 @@ test_cancelled_non_required_does_not_block_merge_gate() {
     tmpdir=$(make_temp_dir)
     write_cancelled_with_success_response "$tmpdir/responses/01.json"
 
-    local output exit_code start_ts end_ts elapsed
+    local output exit_code calls
     exit_code=0
-    start_ts=$(date +%s)
     output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
         run_script "$tmpdir" 4406 --poll-interval 1 --timeout-secs 30 2>&1) || exit_code=$?
-    end_ts=$(date +%s)
-    elapsed=$((end_ts - start_ts))
 
     if [ "$exit_code" -eq 0 ]; then
         pass "cancelled_non_required: exits 0 even when one check is CANCELLED"
@@ -1390,10 +1385,12 @@ test_cancelled_non_required_does_not_block_merge_gate() {
         fail "cancelled_non_required: exits 0 even when one check is CANCELLED" "exit=$exit_code output=$output"
     fi
 
-    if [ "$elapsed" -lt 10 ]; then
-        pass "cancelled_non_required: exits in <10s (actual: ${elapsed}s)"
+    # Counted in polls, not wall seconds, so a slow runner cannot fail it (#5083).
+    calls=$(cat "$tmpdir/counter")
+    if [ "$calls" -eq 1 ]; then
+        pass "cancelled_non_required: exits on the first poll (calls=$calls)"
     else
-        fail "cancelled_non_required: exits in <10s" "elapsed=${elapsed}s — fast-path must not stall on cancelled checks"
+        fail "cancelled_non_required: exits on the first poll" "calls=$calls — fast-path must not stall on cancelled checks"
     fi
 
     if echo "$output" | grep -q "canonical merge gate green"; then

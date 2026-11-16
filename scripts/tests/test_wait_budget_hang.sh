@@ -7,6 +7,13 @@
 # budget plus 10s, and name the killed call on stderr. Also unit-tests the
 # shared scripts/_wait_budget_lib.sh (timeout rc, passthrough, slow-call log).
 #
+# The library units do not measure real elapsed time against tight margins
+# (#5083): the budget and slow-call arithmetic run on a fake clock
+# (WAIT_BUDGET_CLOCK_FILE, advanced by a stub command), and the watchdog
+# tick is a stub (ECS_EXEC_SLEEP_BIN) so a hang or a lingering watchdog
+# shows up as tens of seconds, not one. The helper cases below are
+# end-to-end and keep real ticks: ~7s of work against a 15s limit.
+#
 # ecs-run-task.sh and run-scraper.sh are covered by their own suites
 # (test_ecs_run_task.sh / test_run_scraper.sh, MOCK_DESCRIBE_HANG=1), which
 # already have the full launch mocks those helpers need.
@@ -115,6 +122,36 @@ collect() {
 
 # ── Library probe ───────────────────────────────────────────────────────────
 
+# Fake clock (#5083): the budget reads "now" from a per-case file, and the
+# `advance` stub moves it forward, so a "slow" call takes exactly the
+# seconds the test says. Clocks start at 100000, well above the real
+# $SECONDS, so the watchdog's real-clock --wall-stop never fires on them.
+ADVANCE="$TMP_ROOT/advance"
+cat > "$ADVANCE" << 'STUB'
+#!/usr/bin/env bash
+# advance <secs> — move the fake clock forward by <secs>.
+read -r now < "$WAIT_BUDGET_CLOCK_FILE"
+echo $((now + $1)) > "$WAIT_BUDGET_CLOCK_FILE"
+STUB
+chmod +x "$ADVANCE"
+
+# new_clock <name> — a fresh fake clock file at 100000; prints its path.
+new_clock() {
+    echo 100000 > "$TMP_ROOT/clock_$1"
+    echo "$TMP_ROOT/clock_$1"
+}
+
+# Watchdog tick stubs. A fast tick lets a hung call reach its 5-tick cap in
+# ~2.5s instead of 5s; a slow tick makes a watchdog that lingers after its
+# call returns cost 30s instead of under one second, so "returns at once"
+# can be asserted with a wide margin. `exec` so the watchdog's pkill hits
+# the sleep itself.
+FAST_TICK="$TMP_ROOT/fast_tick"
+printf '#!/usr/bin/env bash\nexec /bin/sleep 0.5\n' > "$FAST_TICK"
+SLOW_TICK="$TMP_ROOT/slow_tick"
+printf '#!/usr/bin/env bash\nexec /bin/sleep 30\n' > "$SLOW_TICK"
+chmod +x "$FAST_TICK" "$SLOW_TICK"
+
 LIB_PROBE="$TMP_ROOT/lib_probe.sh"
 cat > "$LIB_PROBE" << PROBE
 #!/usr/bin/env bash
@@ -134,23 +171,39 @@ case "\$1" in
         echo "rc=\$rc out=\$out"
         ;;
     slow)
+        # Budget 3s: the per-call cap is min(60, 3) floored at 5 = 5s.
         WAIT_SLOW_CALL_SECS=1
-        wait_budget_call "probe slow" /bin/sleep 2
+        wait_budget_call "probe slow" "$ADVANCE" 2
+        ;;
+    asleep)
+        # 12s on the clock with a 5s cap and no kill: the host slept.
+        WAIT_SLOW_CALL_SECS=1
+        wait_budget_call "probe asleep" "$ADVANCE" 12
+        ;;
+    fast)
+        WAIT_SLOW_CALL_SECS=1
+        wait_budget_call "probe fast" "$ADVANCE" 0
+        echo "fast-done"
         ;;
     exhausted)
+        # Budget 8s: one call's worth is min(5, 8/4) = 2s.
         wait_budget_exhausted && echo "exhausted-at-start" || echo "not-exhausted-at-start"
-        /bin/sleep "\${PROBE_SLEEP:-2}"
-        wait_budget_exhausted && echo "exhausted-late" || echo "not-exhausted-late"
+        "$ADVANCE" 6
+        wait_budget_exhausted && echo "exhausted-at-6" || echo "not-exhausted-at-6"
+        "$ADVANCE" 1
+        wait_budget_exhausted && echo "exhausted-at-7" || echo "not-exhausted-at-7"
         ;;
 esac
 PROBE
 chmod +x "$LIB_PROBE"
 
-launch lib_hang "$LIB_PROBE" hang
-launch lib_ok "$LIB_PROBE" ok
-launch lib_slow "$LIB_PROBE" slow
-# Budget 8s: one call's worth is min(5, 8/4) = 2s, so after 7s it is spent.
-launch lib_exhausted env PROBE_BUDGET=8 PROBE_SLEEP=7 "$LIB_PROBE" exhausted
+launch lib_hang env ECS_EXEC_SLEEP_BIN="$FAST_TICK" "$LIB_PROBE" hang
+launch lib_ok env ECS_EXEC_SLEEP_BIN="$SLOW_TICK" "$LIB_PROBE" ok
+launch lib_slow env WAIT_BUDGET_CLOCK_FILE="$(new_clock slow)" "$LIB_PROBE" slow
+launch lib_asleep env WAIT_BUDGET_CLOCK_FILE="$(new_clock asleep)" "$LIB_PROBE" asleep
+launch lib_fast env WAIT_BUDGET_CLOCK_FILE="$(new_clock fast)" "$LIB_PROBE" fast
+launch lib_exhausted env WAIT_BUDGET_CLOCK_FILE="$(new_clock exhausted)" PROBE_BUDGET=8 \
+    "$LIB_PROBE" exhausted
 
 # ── Helper cases ────────────────────────────────────────────────────────────
 
@@ -237,6 +290,8 @@ wait
 # ── Library assertions ──────────────────────────────────────────────────────
 
 collect lib_hang
+# Fast ticks: the 5-tick cap fires after ~2.5s. A grandchild holding the
+# capture pipe would block for its full 3600s.
 if grep -q "rc=124 out=partial" <<< "$RUN_OUT" && [[ $RUN_TOOK -le 10 ]]; then
     pass "lib: a hung call returns 124 with its partial output, in time (${RUN_TOOK}s)"
 else
@@ -254,22 +309,38 @@ if grep -q "rc=7 out=hello" <<< "$RUN_OUT"; then
 else
     fail "lib: a normal call passes its output and exit status through" "out=$RUN_OUT"
 fi
-if [[ $RUN_TOOK -le 1 ]]; then
-    pass "lib: a fast call returns at once (no watchdog linger, ${RUN_TOOK}s)"
+# Slow ticks: a watchdog left running after the call would hold the
+# capture for its 30s tick.
+if [[ $RUN_TOOK -le 10 ]]; then
+    pass "lib: a fast call returns at once (no watchdog linger through a 30s tick, ${RUN_TOOK}s)"
 else
-    fail "lib: a fast call returns at once (no watchdog linger)" "took ${RUN_TOOK}s"
+    fail "lib: a fast call returns at once (no watchdog linger through a 30s tick)" "took ${RUN_TOOK}s"
 fi
 
 collect lib_slow
-if grep -q "slow call: probe slow took 2s" <<< "$RUN_OUT"; then
+if grep -q "slow call: probe slow took 2s (per-call limit 5s)" <<< "$RUN_OUT"; then
     pass "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration"
 else
     fail "lib: a call slower than WAIT_SLOW_CALL_SECS is logged with its duration" "out=$RUN_OUT"
 fi
 
+collect lib_asleep
+if grep -q "slow call: probe asleep took 12s wall, longer than its 5s per-call limit without being killed" <<< "$RUN_OUT"; then
+    pass "lib: a call past its cap without a kill is logged as a host sleep"
+else
+    fail "lib: a call past its cap without a kill is logged as a host sleep" "out=$RUN_OUT"
+fi
+
+collect lib_fast
+if grep -q "fast-done" <<< "$RUN_OUT" && ! grep -q "slow call" <<< "$RUN_OUT"; then
+    pass "lib: a call under WAIT_SLOW_CALL_SECS is not logged"
+else
+    fail "lib: a call under WAIT_SLOW_CALL_SECS is not logged" "out=$RUN_OUT"
+fi
+
 collect lib_exhausted
-if grep -q "not-exhausted-at-start" <<< "$RUN_OUT" && grep -q "exhausted-late" <<< "$RUN_OUT" \
-    && ! grep -q "not-exhausted-late" <<< "$RUN_OUT"; then
+if grep -q "not-exhausted-at-start" <<< "$RUN_OUT" && grep -q "not-exhausted-at-6" <<< "$RUN_OUT" \
+    && grep -q "^exhausted-at-7" <<< "$RUN_OUT"; then
     pass "lib: exhausted once less than one call's worth of budget is left"
 else
     fail "lib: exhausted once less than one call's worth of budget is left" "out=$RUN_OUT"
