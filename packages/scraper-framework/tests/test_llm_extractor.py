@@ -33,6 +33,7 @@ from framework.llm_schema import (
     ExtractionOutcome,
     FieldConfidence,
 )
+from ingestion import llm_retry
 
 # ---------------------------------------------------------------------------
 # Fixtures: mock Anthropic client and responses
@@ -270,21 +271,35 @@ class TestRetryBehavior:
         assert mock_client.messages.create.call_count == 2
         assert no_sleep.call_count == 1
 
+    @pytest.mark.parametrize(
+        ("status", "expected_attempts"),
+        [
+            (500, 2),
+            # A congestion status gets at least CONGESTION_MIN_RETRIES (#5096).
+            (529, llm_retry.CONGESTION_MIN_RETRIES + 1),
+        ],
+    )
     def test_exhausts_retries_returns_empty(
-        self, extractor: LlmExtractor, mock_client: MagicMock, no_sleep: MagicMock
+        self,
+        extractor: LlmExtractor,
+        mock_client: MagicMock,
+        no_sleep: MagicMock,
+        status: int,
+        expected_attempts: int,
     ) -> None:
-        """``max_retries`` counts attempts: 2 means one retry, then give up."""
-        mock_client.messages.create.side_effect = status_error(529)
+        """``max_retries`` counts attempts: 2 means one retry, then give up
+        (raised for 429 / 503 / 529 by ``llm_retry``)."""
+        mock_client.messages.create.side_effect = status_error(status)
         extractor._max_retries = 2
 
         with structlog.testing.capture_logs() as logs:
             rulings = extractor.extract("Some text")
 
         assert rulings == []
-        # A text this short is not split for a second try, so: 2 attempts.
-        assert mock_client.messages.create.call_count == 2
+        # A text this short is not split for a second try.
+        assert mock_client.messages.create.call_count == expected_attempts
         failures = [e for e in logs if e["event"] == "llm_extractor.api_error"]
-        assert failures[0]["status_code"] == 529
+        assert failures[0]["status_code"] == status
         assert failures[0]["retryable"] is True
 
     @pytest.mark.parametrize("status", [400, 401, 403, 404])

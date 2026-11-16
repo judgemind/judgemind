@@ -464,11 +464,13 @@ def _call_anthropic(
             ``ANTHROPIC_API_KEY`` env var.
         max_retries: Number of retries on transient errors (429, 5xx, 529,
             timeouts, dropped connections; see ``ingestion.llm_retry``),
-            with exponential backoff and jitter.
+            with exponential backoff and jitter.  429 / 503 / 529 get at
+            least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
         timeout: Per-attempt timeout in seconds.  If ``None``, the SDK
             default applies.
         deadline: ``time.monotonic()`` value no attempt or retry may run
-            past.  If ``None``, only *max_retries* bounds the retries.
+            past.  If ``None``, the retry count and
+            ``llm_retry.MAX_TOTAL_WAIT`` bound the retries.
 
     Returns:
         An ``LLMResponse``, or ``None`` when no client can be built or the
@@ -522,11 +524,13 @@ def _call_google(
             ``GOOGLE_API_KEY`` env var.
         max_retries: Number of retries on transient errors (429, 5xx,
             timeouts, dropped connections; see ``ingestion.llm_retry``),
-            with exponential backoff and jitter.
+            with exponential backoff and jitter.  429 / 503 get at least
+            ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
         timeout: Per-attempt timeout in seconds.  If ``None``, no timeout
             is applied.
         deadline: ``time.monotonic()`` value no attempt or retry may run
-            past.  If ``None``, only *max_retries* bounds the retries.
+            past.  If ``None``, the retry count and
+            ``llm_retry.MAX_TOTAL_WAIT`` bound the retries.
 
     Returns:
         An ``LLMResponse``, or ``None`` when the API key is missing or the
@@ -652,7 +656,8 @@ def call_llm(
         client: Optional pre-created provider client for connection reuse.
         max_retries: Number of retries on transient errors, for every
             provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
-            504, 529, timeouts and dropped connections).
+            504, 529, timeouts and dropped connections).  429 / 503 / 529
+            get at least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
         timeout: Per-attempt timeout in seconds.  If ``None``, no timeout
             is applied.  When every attempt fails, returns ``None`` so the
             caller can fall back to the next extraction tier (e.g. regex).
@@ -727,7 +732,8 @@ def call_llm_with_images(
         client: Optional pre-created provider client.
         max_retries: Number of retries on transient errors, for every
             provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
-            504, 529, timeouts and dropped connections).
+            504, 529, timeouts and dropped connections).  429 / 503 / 529
+            get at least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
         timeout: Per-attempt timeout in seconds.
         deadline: ``time.monotonic()`` value no attempt or retry may run
             past (the OCR run budget, #4986), for every provider.

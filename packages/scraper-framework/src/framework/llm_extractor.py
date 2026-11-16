@@ -3297,7 +3297,8 @@ class LlmExtractor:
         max_retries: Attempts per API call; transient failures (429, 5xx,
             529, timeouts, dropped connections) get up to
             ``max_retries - 1`` retries with the ``ingestion.llm_retry``
-            backoff.
+            backoff (429 / 503 / 529 get at least
+            ``llm_retry.CONGESTION_MIN_RETRIES`` when any retry is allowed).
         max_output_tokens: Maximum tokens in the model response.
         max_chars_per_chunk: Per-chunk character limit for large documents.
 
@@ -3886,7 +3887,9 @@ class LlmExtractor:
 
         Transient errors (429 / 5xx / 529 / timeouts / dropped connections)
         are retried by ``ingestion.llm_retry`` (#5066), up to
-        ``max_retries - 1`` retries; the client's own SDK retry is off.
+        ``max_retries - 1`` retries (429 / 503 / 529 get at least
+        ``llm_retry.CONGESTION_MIN_RETRIES``); the client's own SDK retry
+        is off.
         """
         effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
         user_message = self._build_user_message(text, metadata)
@@ -4315,7 +4318,8 @@ class LlmExtractor:
         """Call the multimodal LLM for one page.
 
         Transient provider errors are retried inside ``call_llm_with_images``
-        (``ingestion.llm_retry``, #5056), up to ``max_retries - 1`` retries:
+        (``ingestion.llm_retry``, #5056), up to ``max_retries - 1`` retries
+        (429 / 503 / 529 get at least ``llm_retry.CONGESTION_MIN_RETRIES``):
         the same number of attempts as before, but only for errors worth
         retrying (a 400 is not re-sent) and without a second retry loop
         here multiplying the first.  Returns the provider response (text plus
