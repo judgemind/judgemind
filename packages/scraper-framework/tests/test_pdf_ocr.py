@@ -820,18 +820,37 @@ class TestCallGoogleWithImagesErrors:
         mock_sleep.assert_not_called()
 
     def test_generic_api_error_returns_none(self) -> None:
-        """Generic API error returns None."""
+        """A dropped connection, retried and still failing, returns None."""
+        import httpx
+
         from ingestion.llm_providers import _call_google_with_images
 
         client = MagicMock()
-        client.models.generate_content.side_effect = RuntimeError("API failed")
+        client.models.generate_content.side_effect = httpx.ConnectError("API failed")
 
-        result = _call_google_with_images(
-            system_prompt="sys",
-            text_message="user",
-            images=[(b"png", "image/png")],
-            model="test-model",
-            client=client,
-        )
+        with patch("ingestion.llm_retry.time.sleep"):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+            )
 
         assert result is None
+
+    def test_programming_error_propagates(self) -> None:
+        """A bug (e.g. a bad keyword) raises instead of reading as no answer (#5125)."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = TypeError("bad kwarg")
+
+        with pytest.raises(TypeError):
+            _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+            )

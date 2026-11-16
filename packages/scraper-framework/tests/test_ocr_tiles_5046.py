@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pymupdf
+import pytest
 from PIL import Image, ImageDraw
 
 from ingestion import llm_extract, llm_providers
@@ -274,12 +275,16 @@ class TestOcrRecitationFallback:
         assert calls.call_count == 1
         assert failures == {}
 
-    def test_call_error_is_a_failed_page(self) -> None:
-        calls = MagicMock(side_effect=RuntimeError("boom"))
-        with patch.object(llm_extract, "call_llm_with_images", calls):
-            text = llm_extract._ocr_single_page(_page_png(), "image/png", page_index=0, timeout=5)
+    def test_call_bug_propagates(self) -> None:
+        """Provider failures come back as ``None``; anything raised is a bug
+        in our code and must not be logged away as a failed page (#5125)."""
+        calls = MagicMock(side_effect=TypeError("unexpected keyword argument"))
+        with (
+            patch.object(llm_extract, "call_llm_with_images", calls),
+            pytest.raises(TypeError),
+        ):
+            llm_extract._ocr_single_page(_page_png(), "image/png", page_index=0, timeout=5)
 
-        assert text is None
         assert calls.call_count == 1
 
     def test_undecodable_image_is_read_as_words_once(self) -> None:

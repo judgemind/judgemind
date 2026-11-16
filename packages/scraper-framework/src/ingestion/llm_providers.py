@@ -22,7 +22,13 @@ import structlog
 from anthropic import Anthropic as _AnthropicClient
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
-from .llm_retry import KIND_TIMEOUT, call_with_retries, classify_error
+from .llm_retry import (
+    KIND_CLIENT_ERROR,
+    KIND_TIMEOUT,
+    PROVIDER_ERRORS,
+    call_with_retries,
+    classify_error,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -245,6 +251,33 @@ def _anthropic_finish_reason(response: object) -> str | None:
     return _ANTHROPIC_FINISH_REASONS.get(stop_reason, stop_reason.upper())
 
 
+def _anthropic_text(response: object) -> str:
+    """The first text block of an Anthropic ``Message``, stripped.
+
+    A response may hold non-text blocks (``thinking``, ``tool_use``) or no
+    blocks at all (a refusal); that is ``""``, never an exception: the
+    ``finish_reason`` tells the caller the answer is incomplete (#5125).
+    """
+    for block in getattr(response, "content", None) or []:
+        block_type = getattr(block, "type", None)
+        if isinstance(block_type, str) and block_type != "text":
+            continue
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            return text.strip()
+    return ""
+
+
+def _anthropic_response(response: object) -> LLMResponse:
+    """Build an ``LLMResponse`` from an Anthropic ``Message``."""
+    return LLMResponse(
+        text=_anthropic_text(response),
+        input_tokens=response.usage.input_tokens,  # type: ignore[attr-defined]
+        output_tokens=response.usage.output_tokens,  # type: ignore[attr-defined]
+        finish_reason=_anthropic_finish_reason(response),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider adapters
 # ---------------------------------------------------------------------------
@@ -361,18 +394,52 @@ def anthropic_messages_create(
     )
 
 
-def _log_final_failure(event_prefix: str, exc: Exception, timeout: float | None) -> None:
-    """Log ``<event_prefix>timeout`` or ``<event_prefix>api_error``."""
+def _log_final_failure(event_prefix: str, exc: BaseException, timeout: float | None) -> None:
+    """Log why a provider call got no answer.
+
+    A 4xx client error (bad request, auth, model not found) is a config
+    error, not an outage: ``<event_prefix>client_error`` at error level.
+    Otherwise ``<event_prefix>timeout`` or ``<event_prefix>api_error`` (an
+    exhausted outage) at warning level.
+    """
     decision = classify_error(exc)
+    fields = {
+        "timeout": timeout,
+        "status": decision.status,
+        "kind": decision.kind,
+        "retryable": decision.retryable,
+        "error": str(exc),
+    }
+    if decision.kind == KIND_CLIENT_ERROR:
+        logger.error(f"{event_prefix}client_error", **fields)
+        return
     event = "timeout" if decision.kind == KIND_TIMEOUT else "api_error"
-    logger.warning(
-        f"{event_prefix}{event}",
-        timeout=timeout,
-        status=decision.status,
-        kind=decision.kind,
-        retryable=decision.retryable,
-        error=str(exc),
-    )
+    logger.warning(f"{event_prefix}{event}", **fields)
+
+
+def _default_anthropic_client() -> object | None:
+    """``new_anthropic_client()``, or ``None`` (logged) when it is unusable.
+
+    No credentials means no answer, like the Google path's
+    ``google_missing_api_key``.  anthropic 1.x builds a client without any
+    credentials and only fails the request, with a ``TypeError`` that would
+    now propagate, so the credentials are checked here first; a config
+    error the constructor reports (``anthropic.AnthropicError``, not an
+    ``APIError``) is handled the same way.  Any other exception is a bug
+    and propagates.
+    """
+    try:
+        client = new_anthropic_client()
+    except anthropic.AnthropicError as exc:
+        logger.error("llm_providers.anthropic_client_unavailable", error=str(exc))
+        return None
+    if not any(getattr(client, name, None) for name in ("api_key", "auth_token", "credentials")):
+        logger.error(
+            "llm_providers.anthropic_client_unavailable",
+            error="no Anthropic credentials (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or a profile)",
+        )
+        return None
+    return client
 
 
 def _call_anthropic(
@@ -404,12 +471,16 @@ def _call_anthropic(
             past.  If ``None``, only *max_retries* bounds the retries.
 
     Returns:
-        An ``LLMResponse`` or ``None`` on unrecoverable failure.
+        An ``LLMResponse``, or ``None`` when no client can be built or the
+        provider / network fails after retries (``llm_retry.PROVIDER_ERRORS``).
+        Programming errors (``TypeError``, ``AttributeError``, ...) propagate.
     """
     event_prefix = "llm_providers.anthropic_"
-    try:
+    if client is None:
+        client = _default_anthropic_client()
         if client is None:
-            client = new_anthropic_client()
+            return None
+    try:
         response = anthropic_messages_create(
             client,
             {
@@ -423,15 +494,10 @@ def _call_anthropic(
             deadline=deadline,
             event_prefix=event_prefix,
         )
-        return LLMResponse(
-            text=response.content[0].text.strip(),  # type: ignore[attr-defined]
-            input_tokens=response.usage.input_tokens,  # type: ignore[attr-defined]
-            output_tokens=response.usage.output_tokens,  # type: ignore[attr-defined]
-            finish_reason=_anthropic_finish_reason(response),
-        )
-    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+    except PROVIDER_ERRORS as exc:  # the provider / network failed: no answer
         _log_final_failure(event_prefix, exc, timeout)
         return None
+    return _anthropic_response(response)
 
 
 def _call_google(
@@ -463,7 +529,9 @@ def _call_google(
             past.  If ``None``, only *max_retries* bounds the retries.
 
     Returns:
-        An ``LLMResponse`` or ``None`` on unrecoverable failure.
+        An ``LLMResponse``, or ``None`` when the API key is missing or the
+        provider / network fails after retries (``llm_retry.PROVIDER_ERRORS``).
+        Programming errors (``TypeError``, ``AttributeError``, ...) propagate.
     """
     from google import genai
 
@@ -521,8 +589,9 @@ def _google_generate(
     retried by ``llm_retry.call_with_retries``, within *deadline*; each
     attempt's HTTP timeout is *timeout* shortened to the time left.  The
     SDK's own retry stays off (no ``retry_options``), so nothing retries
-    twice.  On final failure, logs ``<event_prefix>timeout`` or
-    ``<event_prefix>api_error`` and returns ``None``.
+    twice.  When the provider / network fails after retries
+    (``llm_retry.PROVIDER_ERRORS``), logs it (:func:`_log_final_failure`)
+    and returns ``None``; programming errors propagate (#5125).
     """
     from google.genai import types
 
@@ -545,7 +614,7 @@ def _google_generate(
             deadline=deadline,
             event_prefix=event_prefix,
         )
-    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+    except PROVIDER_ERRORS as exc:  # the provider / network failed: no answer
         _log_final_failure(event_prefix, exc, timeout)
         return None
 
@@ -592,7 +661,10 @@ def call_llm(
 
     Returns:
         An ``LLMResponse`` with the text and token counts, or ``None``
-        on any unrecoverable failure.
+        when the provider or network fails after retries, credentials are
+        missing, or the provider is unknown.  Programming errors (a
+        ``TypeError`` from a rejected keyword, ...) propagate: they are
+        bugs, not "no answer" (#5125).
     """
     resolved_provider = resolve_provider(provider)
     resolved_model = resolve_model(resolved_provider, model)
@@ -669,7 +741,8 @@ def call_llm_with_images(
             which does not think unless asked to.
 
     Returns:
-        An ``LLMResponse`` or ``None`` on failure.
+        An ``LLMResponse``, or ``None`` as for :func:`call_llm`;
+        programming errors propagate.
     """
     resolved_provider = resolve_provider(provider)
     resolved_model = resolve_model(resolved_provider, model)
@@ -739,9 +812,11 @@ def _call_anthropic_with_images(
     content.append({"type": "text", "text": text_message})
 
     event_prefix = "llm_providers.anthropic_vision_"
-    try:
+    if client is None:
+        client = _default_anthropic_client()
         if client is None:
-            client = new_anthropic_client()
+            return None
+    try:
         response = anthropic_messages_create(
             client,
             {
@@ -755,22 +830,10 @@ def _call_anthropic_with_images(
             deadline=deadline,
             event_prefix=event_prefix,
         )
-    except Exception as exc:  # noqa: BLE001 — every SDK failure means "no answer"
+    except PROVIDER_ERRORS as exc:  # the provider / network failed: no answer
         _log_final_failure(event_prefix, exc, timeout)
         return None
-    # Vision responses may contain non-text blocks; find the first
-    # text block rather than assuming content[0] is text.
-    text_content = ""
-    for block in response.content:  # type: ignore[attr-defined]
-        if hasattr(block, "type") and block.type == "text":
-            text_content = block.text
-            break
-    return LLMResponse(
-        text=text_content.strip(),
-        input_tokens=response.usage.input_tokens,  # type: ignore[attr-defined]
-        output_tokens=response.usage.output_tokens,  # type: ignore[attr-defined]
-        finish_reason=_anthropic_finish_reason(response),
-    )
+    return _anthropic_response(response)
 
 
 def _call_google_with_images(

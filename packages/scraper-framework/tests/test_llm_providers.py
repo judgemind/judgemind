@@ -222,16 +222,17 @@ class TestCallGoogle:
         assert result.output_tokens == 50
 
     def test_api_error_returns_none(self) -> None:
-        """API error returns None."""
+        """A provider API error returns None."""
         client = MagicMock()
-        client.models.generate_content.side_effect = RuntimeError("API failed")
+        client.models.generate_content.side_effect = _genai_error(500, "INTERNAL")
 
-        result = _call_google(
-            system_prompt="sys",
-            user_message="user",
-            model="test-model",
-            client=client,
-        )
+        with patch("ingestion.llm_retry.time.sleep"):
+            result = _call_google(
+                system_prompt="sys",
+                user_message="user",
+                model="test-model",
+                client=client,
+            )
 
         assert result is None
 
@@ -1056,16 +1057,33 @@ class TestGenaiErrorsRetry:
         assert [e["event"] for e in logs] == ["llm_providers.google_vision_unavailable"]
 
     def test_genai_errors_final_failure_logs_status(self, no_sleep: MagicMock) -> None:
+        """A 400 is a config error, not an outage: ``client_error`` at error level."""
         client = MagicMock()
         client.models.generate_content.side_effect = _genai_error(400, "INVALID_ARGUMENT")
 
         with structlog.testing.capture_logs() as logs:
-            _call_google("sys", "user", "test-model", client=client)
+            result = _call_google("sys", "user", "test-model", client=client)
 
+        assert result is None
         (entry,) = logs
-        assert entry["event"] == "llm_providers.google_api_error"
+        assert entry["event"] == "llm_providers.google_client_error"
+        assert entry["log_level"] == "error"
         assert entry["status"] == 400
         assert entry["retryable"] is False
+
+    def test_genai_errors_exhausted_outage_logs_api_error_warning(
+        self, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = _genai_error(503, "UNAVAILABLE")
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_google("sys", "user", "test-model", client=client, max_retries=1)
+
+        assert result is None
+        assert logs[-1]["event"] == "llm_providers.google_api_error"
+        assert logs[-1]["log_level"] == "warning"
+        assert logs[-1]["status"] == 503
 
     def test_genai_errors_final_timeout_logs_timeout_event(self, no_sleep: MagicMock) -> None:
         client = MagicMock()
@@ -1602,3 +1620,273 @@ class TestAnthropicRealTransport:
             )
 
         assert seen == [400]
+
+
+# ---------------------------------------------------------------------------
+# Programming errors propagate; only provider errors mean "no answer" (#5125)
+# ---------------------------------------------------------------------------
+#
+# Before #5125 every helper caught ``Exception``: a ``TypeError`` from a bad
+# keyword (anthropic 1.17 rejecting ``temperature``, #4960) became a quiet
+# ``anthropic_api_error`` warning and a ``None`` result, which looked like an
+# outage rather than a bug for 631 calls.
+
+_IMAGES = [(b"img", "image/png")]
+
+
+class TestProgrammingErrorsPropagate:
+    """A bug in our call (or the SDK's signature) raises; it is not retried."""
+
+    @pytest.mark.parametrize("exc_type", [TypeError, AttributeError, KeyError])
+    def test_call_anthropic_programming_error_propagates(
+        self, exc_type: type[Exception], no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = exc_type("x")
+
+        with pytest.raises(exc_type):
+            _call_anthropic("sys", "user", "test-model", client=client, max_retries=3)
+
+        assert client.messages.create.call_count == 1
+        no_sleep.assert_not_called()
+
+    def test_call_anthropic_with_images_type_error_propagates(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = TypeError("x")
+
+        with pytest.raises(TypeError):
+            _call_anthropic_with_images(
+                "sys", "user", _IMAGES, "test-model", client=client, max_retries=3
+            )
+
+        assert client.messages.create.call_count == 1
+
+    def test_call_llm_anthropic_type_error_propagates(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = TypeError(
+            "Messages.create() got an unexpected keyword argument 'temperature'"
+        )
+
+        with pytest.raises(TypeError, match="temperature"):
+            call_llm("sys", "user", provider="anthropic", model="test-model", client=client)
+
+        assert client.messages.create.call_count == 1
+
+    @pytest.mark.parametrize("exc_type", [TypeError, AttributeError])
+    def test_call_google_programming_error_propagates(
+        self, exc_type: type[Exception], no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = exc_type("x")
+
+        with pytest.raises(exc_type):
+            _call_google("sys", "user", "test-model", client=client, max_retries=3)
+
+        assert client.models.generate_content.call_count == 1
+        no_sleep.assert_not_called()
+
+    @pytest.mark.parametrize("exc_type", [TypeError, AttributeError])
+    def test_call_google_with_images_programming_error_propagates(
+        self, exc_type: type[Exception], no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = exc_type("x")
+
+        with pytest.raises(exc_type):
+            _call_google_with_images(
+                "sys", "user", _IMAGES, "test-model", client=client, max_retries=3
+            )
+
+        assert client.models.generate_content.call_count == 1
+
+    def test_call_llm_with_images_google_type_error_propagates(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = TypeError("x")
+
+        with pytest.raises(TypeError):
+            call_llm_with_images(
+                "sys", "user", _IMAGES, provider="google", model="test-model", client=client
+            )
+
+
+class TestProviderErrorsStillReturnNone:
+    """Transient and API errors still mean "no answer" after retries."""
+
+    def test_anthropic_api_connection_errors_exhausted_return_none(
+        self, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = connection_error()
+
+        assert _call_anthropic("sys", "user", "m", client=client, max_retries=1) is None
+        assert client.messages.create.call_count == 2
+
+    def test_anthropic_vision_exhausted_returns_none(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(529)
+
+        result = _call_anthropic_with_images("sys", "u", _IMAGES, "m", client=client, max_retries=1)
+
+        assert result is None
+        assert client.messages.create.call_count == 2
+
+    def test_google_vision_transport_errors_exhausted_return_none(
+        self, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = httpx.ConnectError("refused")
+
+        result = _call_google_with_images("sys", "u", _IMAGES, "m", client=client, max_retries=1)
+
+        assert result is None
+        assert client.models.generate_content.call_count == 2
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_anthropic_client_error_logs_client_error_at_error_level(
+        self, status: int, no_sleep: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(status)
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_anthropic("sys", "user", "m", client=client)
+
+        assert result is None
+        (entry,) = logs
+        assert entry["event"] == "llm_providers.anthropic_client_error"
+        assert entry["log_level"] == "error"
+        assert entry["status"] == status
+
+    def test_anthropic_vision_client_error_event(self, no_sleep: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.create.side_effect = status_error(401)
+
+        with structlog.testing.capture_logs() as logs:
+            _call_anthropic_with_images("sys", "u", _IMAGES, "m", client=client)
+
+        assert [e["event"] for e in logs] == ["llm_providers.anthropic_vision_client_error"]
+
+    def test_anthropic_past_deadline_still_returns_none(self, no_sleep: MagicMock) -> None:
+        """``call_with_retries`` raises ``TimeoutError`` when no attempt fits."""
+        client = MagicMock()
+
+        with structlog.testing.capture_logs() as logs:
+            result = _call_anthropic(
+                "sys", "user", "m", client=client, deadline=time.monotonic() - 1
+            )
+
+        assert result is None
+        assert logs[-1]["event"] == "llm_providers.anthropic_timeout"
+
+
+class TestAnthropicClientConstruction:
+    """No client and no usable credentials: ``None``, logged at error level."""
+
+    @staticmethod
+    def _no_credentials(monkeypatch: pytest.MonkeyPatch, config_dir: object) -> None:
+        for name in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_PROFILE",
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_IDENTITY_TOKEN",
+            "ANTHROPIC_IDENTITY_TOKEN_FILE",
+            "ANTHROPIC_CONFIG_DIR",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        # An empty home: no ~/.config/anthropic profile on the test machine.
+        monkeypatch.setenv("HOME", str(config_dir))
+
+    @pytest.mark.parametrize("fn", ["text", "vision"])
+    def test_missing_api_key_returns_none(
+        self, fn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        """anthropic 1.x builds a client without credentials and only fails
+        the request (with a ``TypeError``); we check first and say why."""
+        self._no_credentials(monkeypatch, tmp_path)
+
+        with structlog.testing.capture_logs() as logs:
+            if fn == "text":
+                result = _call_anthropic("sys", "user", "m", client=None)
+            else:
+                result = _call_anthropic_with_images("sys", "u", _IMAGES, "m", client=None)
+
+        assert result is None
+        (entry,) = logs
+        assert entry["event"] == "llm_providers.anthropic_client_unavailable"
+        assert entry["log_level"] == "error"
+        assert "no Anthropic credentials" in entry["error"]
+
+    def test_sdk_config_error_returns_none(self) -> None:
+        """``AnthropicError`` from the constructor (e.g. a bad profile) is no answer."""
+        with (
+            patch("anthropic.Anthropic", side_effect=anthropic.AnthropicError("bad profile")),
+            structlog.testing.capture_logs() as logs,
+        ):
+            result = _call_anthropic("sys", "user", "m", client=None)
+
+        assert result is None
+        assert [e["event"] for e in logs] == ["llm_providers.anthropic_client_unavailable"]
+
+    def test_client_construction_bug_propagates(self) -> None:
+        with (
+            patch("anthropic.Anthropic", side_effect=TypeError("bad kwarg")),
+            pytest.raises(TypeError),
+        ):
+            _call_anthropic("sys", "user", "m", client=None)
+
+
+class TestAnthropicResponseParsing:
+    """Parsing a response never turns into a crash (#5125)."""
+
+    def test_empty_content_returns_empty_text(self) -> None:
+        """A refusal can come back with no content blocks at all."""
+        response = MagicMock()
+        response.content = []
+        response.usage.input_tokens = 7
+        response.usage.output_tokens = 0
+        response.stop_reason = "refusal"
+        client = MagicMock()
+        client.messages.create.return_value = response
+
+        result = _call_anthropic("sys", "user", "m", client=client)
+
+        assert result is not None
+        assert result.text == ""
+        assert result.finish_reason == "SAFETY"
+        assert result.incomplete is True
+        assert result.input_tokens == 7
+
+    def test_first_text_block_is_used(self) -> None:
+        thinking = MagicMock()
+        thinking.type = "thinking"
+        text = MagicMock()
+        text.type = "text"
+        text.text = "  answer  "
+        response = MagicMock()
+        response.content = [thinking, text]
+        response.usage.input_tokens = 1
+        response.usage.output_tokens = 1
+        response.stop_reason = "end_turn"
+        client = MagicMock()
+        client.messages.create.return_value = response
+
+        result = _call_anthropic("sys", "user", "m", client=client)
+
+        assert result is not None
+        assert result.text == "answer"
+
+    def test_vision_empty_content_returns_empty_text(self) -> None:
+        response = MagicMock()
+        response.content = []
+        response.usage.input_tokens = 3
+        response.usage.output_tokens = 0
+        response.stop_reason = "refusal"
+        client = MagicMock()
+        client.messages.create.return_value = response
+
+        result = _call_anthropic_with_images("sys", "u", _IMAGES, "m", client=client)
+
+        assert result is not None
+        assert result.text == ""
+        assert result.incomplete is True

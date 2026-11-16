@@ -412,8 +412,8 @@ class LlmEnrichmentExhaustedError(Exception):
     """Raised when all retry attempts for LLM enrichment have been exhausted.
 
     This is raised by ``enrich_ruling_with_retry`` when ``enrich_ruling``
-    returns ``None`` (API-level failure) or raises an exception on every
-    attempt.  It is deliberately NOT raised when ``enrich_ruling`` returns an
+    returns ``None`` (API-level failure) on every attempt.  It is
+    deliberately NOT raised when ``enrich_ruling`` returns an
     ``LlmEnrichmentResult`` with all-``None`` fields — that represents a
     successful LLM call that extracted nothing (e.g. text too short), not a
     transient infrastructure failure.
@@ -430,8 +430,11 @@ def enrich_ruling_with_retry(
 ) -> LlmEnrichmentResult | None:
     """Call ``enrich_ruling`` with exponential-backoff retries.
 
-    Retries when ``enrich_ruling`` returns ``None`` (LLM API failure) or
-    raises an exception.  Does NOT retry when it returns an
+    Retries when ``enrich_ruling`` returns ``None`` (the provider or network
+    failed after the provider-level retries).  An exception is not retried:
+    ``call_llm`` returns ``None`` for every provider failure, so anything
+    raised is a bug in our code or config and propagates at once (#5125).
+    Does NOT retry when it returns an
     ``LlmEnrichmentResult`` with all-``None`` fields (the LLM responded but
     could not extract structured data — that is a content, not infrastructure,
     failure).
@@ -460,28 +463,18 @@ def enrich_ruling_with_retry(
     Raises
     ------
     LlmEnrichmentExhaustedError
-        When every attempt returns ``None`` or raises an exception.
+        When every attempt returns ``None``.
+    Exception
+        Whatever ``enrich_ruling`` raises (a programming or config error),
+        unchanged and on the first attempt.
     """
-    last_exc: Exception | None = None
     for attempt in range(max_attempts):
-        try:
-            result = enrich_ruling(
-                ruling_text,
-                provider=provider,
-                model=model,
-                client=client,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            logger.warning(
-                "llm_enrichment.retry_on_exception",
-                attempt=attempt + 1,
-                max_attempts=max_attempts,
-                error=str(exc),
-            )
-            if attempt < max_attempts - 1:
-                time.sleep(2**attempt)
-            continue
+        result = enrich_ruling(
+            ruling_text,
+            provider=provider,
+            model=model,
+            client=client,
+        )
 
         if result is None:
             # Transient API failure — retry.
@@ -507,8 +500,7 @@ def enrich_ruling_with_retry(
 
     # All attempts exhausted.
     raise LlmEnrichmentExhaustedError(
-        f"LLM enrichment failed after {max_attempts} attempts"
-        + (f": {last_exc}" if last_exc is not None else " (API returned None)")
+        f"LLM enrichment failed after {max_attempts} attempts (API returned None)"
     )
 
 
