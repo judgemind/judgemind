@@ -6,6 +6,8 @@
 # The compute schedule is enabled. The EventBridge Scheduler triggers a
 # twice-daily scraper run at 6:15 AM and 6:15 PM PT.
 
+data "aws_caller_identity" "current" {}
+
 # Look up secrets so we can pass their ARNs to the compute module
 # without hardcoding the random Secrets Manager suffix.
 data "aws_secretsmanager_secret" "residential_proxy" {
@@ -46,6 +48,16 @@ module "document_archive" {
   bucket_name        = "judgemind-document-archive-production"
   environment        = "production"
   enable_object_lock = false
+
+  # The bucket policy denies raw deletes to every principal but the
+  # (absent by default) judgemind-raw-break-glass-production role, and
+  # lifecycle changes to every principal but the Terraform apply identity
+  # (#5013, #5099). Production applies are run by hand from the operator
+  # laptop as the account's only IAM user, the same identity dev uses.
+  # Production is capture-only, so these raws are the only copy.
+  lifecycle_admin_principal_arns = [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:user/admin",
+  ]
 }
 
 module "iam_scraper" {

@@ -21,6 +21,10 @@ set -euo pipefail
 #   5. No IAM policy anywhere under infra/terraform/ grants an S3 wildcard
 #      action (`s3:*`, `s3:Delete*`, ...), and only the storage module (in
 #      its Deny) names s3:DeleteObjectVersion.
+#   6. Every environment that instantiates the storage module sets a
+#      non-empty lifecycle_admin_principal_arns (#5099). Left at its default
+#      ([]), the module omits DenyLifecycleChangeExceptTerraform, so any
+#      principal could add a lifecycle rule that expires raws.
 #
 # Static analysis of the HCL: no AWS credentials needed.
 
@@ -168,6 +172,60 @@ if [ -z "$version_delete_hits" ]; then
 else
     echo "  s3:DeleteObjectVersion in:$version_delete_hits" >&2
     check "no IAM policy outside the storage module names s3:DeleteObjectVersion" 1
+fi
+
+# ── Check 6: every storage-module instance sets a lifecycle admin ──────────
+#
+# Walk each top-level `module "<name>" {` block under environments/. A block
+# whose source is the storage module must set lifecycle_admin_principal_arns
+# to a non-empty list; otherwise the lifecycle-change Deny is not emitted.
+storage_instances=0
+missing_lifecycle_admin=""
+while IFS= read -r tf; do
+    result=$(code_only "$tf" | awk -v file="$tf" '
+        /^module "[^"]*" *\{/ {
+            inmod=1; name=$2; gsub(/"/, "", name)
+            storage=0; set=0; empty=0; pending=0
+        }
+        inmod && /source *= *"[^"]*modules\/storage"/ {storage=1}
+        inmod && pending {
+            pending=0
+            if ($0 ~ /^[[:space:]]*\][[:space:]]*$/) empty=1
+        }
+        inmod && /lifecycle_admin_principal_arns *=/ {
+            set=1
+            if ($0 ~ /= *\[ *\]/) empty=1
+            if ($0 ~ /= *\[[[:space:]]*$/) pending=1
+        }
+        inmod && /^}/ {
+            inmod=0
+            if (storage) {
+                print "instance"
+                if (!set || empty) print "missing " file ": module." name
+            }
+        }
+    ')
+    storage_instances=$((storage_instances + $(grep -c '^instance$' <<< "$result" || true)))
+    missing=$(grep '^missing ' <<< "$result" | sed 's/^missing //' || true)
+    if [ -n "$missing" ]; then
+        missing_lifecycle_admin="$missing_lifecycle_admin $missing"
+    fi
+done < <(find "$TERRAFORM_DIR/environments" -name '*.tf' -not -path '*/.terraform/*' | sort)
+
+if [ "$storage_instances" -gt 0 ]; then
+    check "found ${storage_instances} storage-module instance(s) under environments/" 0
+else
+    check "found storage-module instance(s) under environments/" 1
+fi
+if [ -z "$missing_lifecycle_admin" ]; then
+    check "every storage-module instance sets a non-empty lifecycle_admin_principal_arns" 0
+else
+    echo "  lifecycle_admin_principal_arns unset or empty in:$missing_lifecycle_admin" >&2
+    echo "  Fix: pass the Terraform apply identity, as environments/dev/main.tf does:" >&2
+    echo "    lifecycle_admin_principal_arns = [" >&2
+    echo "      \"arn:aws:iam::\${data.aws_caller_identity.current.account_id}:user/admin\"," >&2
+    echo "    ]" >&2
+    check "every storage-module instance sets a non-empty lifecycle_admin_principal_arns" 1
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
