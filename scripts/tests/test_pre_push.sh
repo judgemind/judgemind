@@ -2307,6 +2307,24 @@ else
     report_pass "docs-only push: no scripts/tests run (#5045)"
 fi
 
+echo "[scenario 53b] a .claude/skills-only or scripts/*.sh-only push runs scripts/tests, as CI does (#5088)"
+st_trigger_fail=""
+for st_path in .claude/skills/demo/SKILL.md scripts/demo-tool.sh; do
+    init_workspace
+    commit_scripts_change "feature-st-trigger-$(basename "$st_path" | tr '.' '-')" "$st_path"
+    seed_st_stubs 0 0
+    run_hook "refs/heads/feature-st-trigger-$(basename "$st_path" | tr '.' '-') $feat_sha refs/heads/feature-st-trigger-$(basename "$st_path" | tr '.' '-') $ZERO_SHA"
+    if ! grep -q "^args=scripts/tests/ " "$TMPDIR/st-pytest.txt" 2>/dev/null; then
+        st_trigger_fail="$st_path"
+        break
+    fi
+done
+if [ -n "$st_trigger_fail" ]; then
+    report_fail "expected a push touching only $st_trigger_fail to run scripts/tests (CI's scripts filter covers it, #5088)" "$hook_out"
+else
+    report_pass "pre-push scripts/tests trigger matches CI's scripts filter (#5088)"
+fi
+
 echo "[scenario 54] PREPUSH_SCRIPTS_TESTS=0 skips it with a WARNING; WORKERS=0 runs serially (#5045)"
 init_workspace
 commit_scripts_change feature-st-knobs scripts/thing.py

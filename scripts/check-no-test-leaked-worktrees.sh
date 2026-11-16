@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/
+# (#5088: inspects what the scripts test run just before it left behind; check-guard-path-filters.sh checks its CI job runs when scripts change.)
 # check-no-test-leaked-worktrees.sh — Fail when synthetic agent worktrees
 # leak into <repo_root>/.claude/worktrees/ during a test run (issue #4307).
 #

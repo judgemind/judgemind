@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: infra/terraform/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-nonascii-tf-descriptions.sh -- Fail if any Terraform `description`
 # argument in `infra/terraform/**/*.tf` contains a non-ASCII byte.
 #

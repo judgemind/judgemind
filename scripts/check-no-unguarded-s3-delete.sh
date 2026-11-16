@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/*/src/ infra/ .github/ scripts/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-unguarded-s3-delete.sh — S3 deletes must not bypass the raw guard (#4991, #5013).
 #
 # Raw S3 objects are the source of truth: a tentative ruling disappears from

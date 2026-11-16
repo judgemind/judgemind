@@ -709,7 +709,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Shard python: both pytest suites + all 11 inline shell guards.
+          # Shard python: the pytest suites (guards live in repo-guards, #5088).
           # pytest-xdist (-n auto) parallelises the 73-file dispatcher suite
           # (~292s sequential → ~150-200s). Estimated wall-clock ~200s.
           - shard: python
@@ -803,237 +803,6 @@ jobs:
       - name: Test dispatcher v3 task-runner skeleton
         if: matrix.shard == 'python'
         run: pytest scripts/dispatcher_v3/tests/ -v --tb=short -n auto
-      - name: Check AWS CLI boolean flag usage
-        if: matrix.shard == 'python'
-        run: scripts/check-aws-bool-flags.sh
-      - name: Check AWS CLI flag portability
-        if: matrix.shard == 'python'
-        run: scripts/check-aws-flag-portability.sh
-      - name: Check for forbidden ECS services-stable waiter usage
-        if: matrix.shard == 'python'
-        run: scripts/check-no-ecs-wait-services-stable.sh
-      - name: Check workflows use the extracted ECS post-deploy healthcheck
-        if: matrix.shard == 'python'
-        run: scripts/check-no-inline-ecs-healthcheck.sh
-      - name: Check docs describe the actual rebuild_db.py CLI
-        if: matrix.shard == 'python'
-        run: scripts/check-no-rebuild-db-skip-reset.sh
-      # Issue #4991: no raw may be deleted unless a live byte-identical copy
-      # exists; only framework.raw_delete_guard may delete from the archive.
-      - name: Check S3 deletes go through the raw-archive guard
-        if: matrix.shard == 'python'
-        run: scripts/check-no-unguarded-s3-delete.sh
-      # Issue #4995: a page / chunk cap that stops reading silently drops
-      # every ruling past it (#4986 OCR at page 10, #4995 multimodal at 50).
-      # Every cap must carry a marker saying how hitting it is flagged.
-      - name: Check page and chunk caps are flagged
-        if: matrix.shard == 'python'
-        run: scripts/check-no-unflagged-page-cap.sh
-      # Issue #4417: forbid spelling out the CI rollup-classifier
-      # vocabulary (frozenset({"FAILURE","TIMED_OUT",...}) or jq
-      # `$x == "FAILURE" or $x == "TIMED_OUT"`) outside the canonical
-      # phase_transitions.py + ci_classifier_cli.py.  Pre-#4417 the rule
-      # was duplicated across four sites and the same bug class —
-      # CANCELLED handling — bit twice (#4407, #4414).
-      - name: Check CI rollup-classifier vocabulary is centralized
-        if: matrix.shard == 'python'
-        run: scripts/check-no-ci-classifier-duplication.sh
-      # Issue #4429: forbid the absolute-package import shape
-      # (`from scripts.dispatcher import ...` /
-      # `import scripts.dispatcher`) inside scripts/dispatcher/tests/.
-      # Hit by #4417 / PR #4425 — pytest collection without an explicit
-      # rootdir resolves the absolute path locally but raises
-      # ModuleNotFoundError("scripts") when CI runs pytest from the
-      # repo root. The peer-test sibling-import pattern
-      # (parents[2] sys.path push + `from dispatcher import X`) works
-      # in both contexts.
-      - name: Check dispatcher tests use sibling-import pattern
-        if: matrix.shard == 'python'
-        run: scripts/check-dispatcher-test-imports.sh
-      # Issue #4267: detect the silent-miscompile pattern where a
-      # piped python3 invocation also has a heredoc — bash gives the
-      # heredoc precedence as stdin, so json.load(sys.stdin) parses
-      # the Python source as JSON and raises "Expecting value: line 1
-      # column 1" at runtime.  Surfaced by #4252 (scripts/ecs-wait-task.sh).
-      - name: Check shell scripts pipe data into python3 without heredoc shadowing
-        if: matrix.shard == 'python'
-        run: scripts/check-no-heredoc-pipe-shadow.sh
-      # Issue #4400: top-level scripts/*.py must use configure_structlog
-      # rather than the stdlib basicConfig anti-pattern.  The format-string
-      # logger silently drops every extra= field passed to logger calls
-      # (extras disappear in CloudWatch Logs Insights), which surfaced as
-      # the post-deploy verification incident in #4368.  #4373 migrated 13
-      # files; #4399 closed out the residual.  This guard prevents a new
-      # top-level script from regressing to the old shape.  Files needing
-      # genuine basicConfig opt out via the # basic-config-allow: marker
-      # (e.g. scripts/telemetry_upload.py).
-      - name: Check top-level scripts use configure_structlog for logger setup
-        if: matrix.shard == 'python'
-        run: scripts/check-no-logging-basicconfig.sh
-      # Issue #4119: every aws_cloudwatch_metric_alarm in
-      # infra/terraform/modules/ must have a row in docs/agent/infrastructure-reference.md
-      # (§"CloudWatch Alarms"). Drift accumulates silently otherwise — the
-      # docs table is the only place an operator can find "what alarms
-      # exist and what do they fire on" without reading every Terraform module.
-      - name: Verify every CloudWatch alarm has a docs row
-        if: matrix.shard == 'python'
-        run: scripts/check-cloudwatch-alarm-docs.sh
-      - name: Check tests use POSIX sed instead of GNU head negative count
-        if: matrix.shard == 'python'
-        run: scripts/check-no-gnu-head.sh
-      # Issue #5058: a test that runs git writes in a scratch repo must
-      # unset git's repository env vars (the conftest git-env-scrub block,
-      # or scripts/tests/_git-env-scrub.sh for shell tests), or a caller
-      # with GIT_DIR exported (a hook, rebase --exec, bisect run) makes it
-      # write to that repository instead (#5045).
-      - name: Check git-writing tests scrub inherited repository env vars
-        if: matrix.shard == 'python'
-        run: scripts/check-test-git-env-scrub.sh
-      # Issue #5071: every test root must cut tests off from real GitHub (the
-      # conftest gh-isolate block, or scripts/tests/_gh-isolate.sh for shell
-      # tests). A test that reaches the real gh with a developer's login acts
-      # on real GitHub; in #5071 one closed an open issue.
-      - name: Check tests cannot reach real GitHub
-        if: matrix.shard == 'python'
-        run: scripts/check-test-gh-isolate.sh
-      - name: Check test files do not redefine the same stub binary
-        if: matrix.shard == 'python'
-        run: scripts/check-no-duplicate-stubs.sh
-      # Issue #3670: detect markers in appended-list files (e.g.
-      # test_agent_runner_entrypoint.sh) that would be silently dropped
-      # by git merge-tree when rebasing onto origin/main — i.e. a merge
-      # that produces no conflict markers but loses a test block.
-      # fetch-depth: 0 (set on this job's checkout) ensures origin/main
-      # is reachable. The check exits 0 gracefully on shallow clones.
-      - name: Check rebase does not silently drop appended-list markers
-        if: matrix.shard == 'python'
-        run: scripts/check-rebase-no-silent-drop.sh
-      # Cross-checks every non-stdlib import under scripts/dispatcher/ against
-      # the pip install step in Dockerfile.dispatcher. Motivated by the #2773
-      # boto3 scope miss (#2776): PR #2771 added `import boto3` but did not
-      # add boto3 to Dockerfile.dispatcher, and no test caught it because the
-      # daemon tests mock the client by method assignment.
-      - name: Verify dispatcher image installs every Python import used by the daemon
-        if: matrix.shard == 'python'
-        run: scripts/check-dispatcher-image-deps.sh
-      # Issue #4294 (retro from #4288): every operator-only script
-      # invoked at runtime via the scraper image's in-container scripts
-      # path must have a corresponding COPY directive in
-      # packages/scraper-framework/Dockerfile. Without this check, a new
-      # caller that references a script under that path but forgets to
-      # update the Dockerfile's COPY block fails silently — direct
-      # python invocation breaks at runtime, while the alternative
-      # scripts/ecs-run-task.sh path keeps working because it uploads
-      # scripts via S3 every run. #4288 was the fixing PR; this check
-      # is the recurrence preventer. NOTE: the literal in-container path
-      # prefix is intentionally not spelled here because the guard's
-      # own pattern would self-match on this comment (CLAUDE.md
-      # §Hygiene-check CI steps / #2542).
-      - name: Verify scraper image ships every script referenced from the in-container scripts path
-        if: matrix.shard == 'python'
-        run: scripts/check-scraper-image-shipped.sh
-      # Issues #3062 (audit) + #3072 (this check): every
-      # ``self._mark_agent_terminal`` call site in
-      # ``scripts/dispatcher/daemon.py`` must carry a nearby
-      # ``ROUTING (#N)`` comment documenting whether the site routes
-      # through ``_handle_agent_failure`` or is intentionally unrouted.
-      # This would have caught the #3054 ralph_not_ship bug at author
-      # time.
-      - name: Verify every daemon terminal site has a ROUTING comment
-        if: matrix.shard == 'python'
-        run: scripts/check-terminal-routing-comments.sh
-      # Issue #3089: every ``subprocess.run([... "git" | "gh" ...])``
-      # call site in ``scripts/dispatcher/daemon.py`` must either route
-      # through the shared ``_subprocess_with_retry`` helper or carry a
-      # nearby ``# cold-path (#3089)`` annotation. Prevents the
-      # #3053/#3085 class of single-transient-failure bug from creeping
-      # back in.
-      - name: Verify every daemon git/gh subprocess site has retry or cold-path annotation
-        if: matrix.shard == 'python'
-        run: scripts/check-git-gh-retries.sh
-      # Issue #3776: every *_TIMEOUT_SECONDS constant referenced inside a
-      # phase-loop function (one that dispatches on a ``phase`` argument)
-      # must use a per-phase access form (BY_PHASE table, token embedding
-      # the phase name, or *_for_phase() helper), or carry a
-      # ``# global-by-design (#NNNN)`` annotation on its declaration.
-      # Prevents accidental uniform-across-all-phases caps when per-phase
-      # tuning is the intent.
-      - name: Verify phase-loop functions use per-phase timeout lookups
-        if: matrix.shard == 'python'
-        run: scripts/check-per-phase-timeouts.sh
-      # Issue #3213: every ``subprocess.run(...)`` call site in
-      # ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must have
-      # a ``timeout=`` kwarg or a ``**kwargs`` splat. An unbounded blocking
-      # subprocess.run was the prime hypothesis for the #3205 silent-daemon
-      # wedge class. This check prevents regression.
-      - name: Verify every subprocess.run call in scripts has timeout= or **kwargs
-        if: matrix.shard == 'python'
-        run: scripts/check-subprocess-timeouts.sh
-      # Issue #3356: every IO call site under scripts/dispatcher/
-      # (boto3.client, psycopg.connect, subprocess.run/Popen/check_*,
-      # requests.*, urllib.request.urlopen, socket.create_connection,
-      # http.client.HTTP{S,}Connection) must carry a bounded timeout.
-      # The 2026-04-25 cascade was caused by a single unbounded
-      # boto3.client("ecs", ...); PR #3353 fixed that one site. This
-      # AST-based check enforces the structural invariant going forward.
-      - name: Check no unbounded timeouts in dispatcher
-        if: matrix.shard == 'python'
-        run: scripts/check-no-unbounded-timeouts.py
-      # Issue #4381: every scripts/*.py file that derives a data-file
-      # path from ``Path(__file__).resolve().parent.parent`` and passes
-      # it to ``open()``/``read_text()``/``read_bytes()``/
-      # ``importlib.util.spec_from_file_location`` must have an
-      # at-import existence assertion or an in-scope existence probe.
-      # Catches the #4374 bug class — under
-      # scripts/ecs-run-task.sh the script lands at
-      # /tmp/_oneshot_script and parent.parent collapses to /, silently
-      # producing a wrong path. PR #4378 fixed that one site with a
-      # candidate-path fallback list; this AST-based check enforces the
-      # structural invariant going forward.
-      - name: Check no /tmp/_oneshot_script path-collapse bugs
-        if: matrix.shard == 'python'
-        run: scripts/check-no-tmp-oneshot-file-path-derivation.py
-      # Issue #3158: every ``UPDATE dispatcher.agents`` /
-      # ``SELECT ... FROM dispatcher.agents`` line in
-      # ``scripts/dispatcher/daemon.py`` must either mention
-      # ``execution_mode`` / ``agent_task_arn`` within +/- 60 lines,
-      # OR carry an ``exec-mode-agnostic (#N): <reason>`` annotation
-      # nearby. Prevents the #3091-draft / #3128-era / #3152 class of
-      # silent-ECS-agent-loss bug from creeping back in.
-      - name: Verify every dispatcher.agents SQL site is execution_mode-aware
-        if: matrix.shard == 'python'
-        run: scripts/check-dispatcher-execution-mode-aware.sh
-      # Issue #2829: every ``subprocess.run([... "git" ...])`` call site in
-      # ``scripts/dispatcher/daemon.py`` whose first positional arg resolves
-      # to a list literal beginning with ``"git"`` AND containing
-      # ``self._repo_root()`` is a bug — in Fargate mode, ``_repo_root()``
-      # returns ``/app`` (no ``.git`` directory). The correct anchor is
-      # ``_git_parent_root()``.
-      - name: Verify no git subprocess in daemon.py anchors at self._repo_root()
-        if: matrix.shard == 'python'
-        run: bash scripts/check-no-git-repo-root-anchor.sh
-      # Issue #3082: operator laptops run macOS's stock bash 3.2.
-      # Shell scripts under scripts/**/*.sh must stick to the bash 3.2
-      # subset — no mapfile, readarray, associative arrays, nameref,
-      # case-conversion parameter expansions, ;;& case fall-through,
-      # or |& pipe shorthand. Retro of #3081's near-miss: the first
-      # draft of check-terminal-routing-comments.sh used mapfile and
-      # silently exited 127 on the operator's laptop. See
-      # docs/agent/code-standards.md §macOS bash 3.2 compatibility.
-      - name: Verify scripts stay within the bash 3.2 feature subset
-        if: matrix.shard == 'python'
-        run: scripts/check-bash-compat.sh
-      # Issue #4143: bash 5.x footgun where 'declare -a <name>'
-      # (without an inline =()) is later expanded as ${#<name>[@]}
-      # under set -u — works on macOS bash 3.2 but trips
-      # 'unbound variable' on Linux CI bash 5.x. Surfaced in #4119 /
-      # PR #4140 (the cloudwatch-alarm-docs check). Sibling guard to
-      # check-bash-compat.sh — that one covers bash-4+ syntax that
-      # doesn't exist on 3.2; this one covers a construct that exists
-      # on both but has different observable behavior under set -u.
-      - name: Verify scripts initialise indexed arrays before reading under nounset
-        if: matrix.shard == 'python'
-        run: scripts/check-bash-set-u-empty-array.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no
@@ -1107,6 +876,238 @@ jobs:
         run: pip install pytest -e packages/judgemind-config
       - name: Run dispatcher integration tests
         run: pytest scripts/dispatcher/tests/test_daemon_integration.py -v --tb=short -m integration
+
+  # ---------------------------------------------------------------
+  # Repo-wide guards (#5088). Every scripts/check-* guard that scans
+  # source outside scripts/ (packages/*/src, infra/, .github/, docs/)
+  # runs here, on every PR, with no path filter. They used to be steps
+  # in scripts-tests, whose `scripts` filter leaves out packages/*/src,
+  # infra/ and most workflow files, so a PR touching only those paths
+  # skipped the guards written to catch it (the S3-delete and page-cap
+  # guards, #4992 / #4995). The guards are stdlib-only and take seconds;
+  # no venv. fetch-depth: 0 for check-rebase-no-silent-drop.sh.
+  #
+  # The last step, check-guard-path-filters.sh, is the meta-guard: it
+  # fails when a guard is wired only into path-filtered jobs whose
+  # filter does not cover the paths the guard declares it scans.
+  # ---------------------------------------------------------------
+  repo-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Check AWS CLI boolean flag usage
+        run: scripts/check-aws-bool-flags.sh
+      - name: Check AWS CLI flag portability
+        run: scripts/check-aws-flag-portability.sh
+      - name: Check for forbidden ECS services-stable waiter usage
+        run: scripts/check-no-ecs-wait-services-stable.sh
+      - name: Check workflows use the extracted ECS post-deploy healthcheck
+        run: scripts/check-no-inline-ecs-healthcheck.sh
+      - name: Check docs describe the actual rebuild_db.py CLI
+        run: scripts/check-no-rebuild-db-skip-reset.sh
+      # Issue #4991: no raw may be deleted unless a live byte-identical copy
+      # exists; only framework.raw_delete_guard may delete from the archive.
+      - name: Check S3 deletes go through the raw-archive guard
+        run: scripts/check-no-unguarded-s3-delete.sh
+      # Issue #4995: a page / chunk cap that stops reading silently drops
+      # every ruling past it (#4986 OCR at page 10, #4995 multimodal at 50).
+      # Every cap must carry a marker saying how hitting it is flagged.
+      - name: Check page and chunk caps are flagged
+        run: scripts/check-no-unflagged-page-cap.sh
+      # Issue #4417: forbid spelling out the CI rollup-classifier
+      # vocabulary (frozenset({"FAILURE","TIMED_OUT",...}) or jq
+      # `$x == "FAILURE" or $x == "TIMED_OUT"`) outside the canonical
+      # phase_transitions.py + ci_classifier_cli.py.  Pre-#4417 the rule
+      # was duplicated across four sites and the same bug class —
+      # CANCELLED handling — bit twice (#4407, #4414).
+      - name: Check CI rollup-classifier vocabulary is centralized
+        run: scripts/check-no-ci-classifier-duplication.sh
+      # Issue #4429: forbid the absolute-package import shape
+      # (`from scripts.dispatcher import ...` /
+      # `import scripts.dispatcher`) inside scripts/dispatcher/tests/.
+      # Hit by #4417 / PR #4425 — pytest collection without an explicit
+      # rootdir resolves the absolute path locally but raises
+      # ModuleNotFoundError("scripts") when CI runs pytest from the
+      # repo root. The peer-test sibling-import pattern
+      # (parents[2] sys.path push + `from dispatcher import X`) works
+      # in both contexts.
+      - name: Check dispatcher tests use sibling-import pattern
+        run: scripts/check-dispatcher-test-imports.sh
+      # Issue #4267: detect the silent-miscompile pattern where a
+      # piped python3 invocation also has a heredoc — bash gives the
+      # heredoc precedence as stdin, so json.load(sys.stdin) parses
+      # the Python source as JSON and raises "Expecting value: line 1
+      # column 1" at runtime.  Surfaced by #4252 (scripts/ecs-wait-task.sh).
+      - name: Check shell scripts pipe data into python3 without heredoc shadowing
+        run: scripts/check-no-heredoc-pipe-shadow.sh
+      # Issue #4400: top-level scripts/*.py must use configure_structlog
+      # rather than the stdlib basicConfig anti-pattern.  The format-string
+      # logger silently drops every extra= field passed to logger calls
+      # (extras disappear in CloudWatch Logs Insights), which surfaced as
+      # the post-deploy verification incident in #4368.  #4373 migrated 13
+      # files; #4399 closed out the residual.  This guard prevents a new
+      # top-level script from regressing to the old shape.  Files needing
+      # genuine basicConfig opt out via the # basic-config-allow: marker
+      # (e.g. scripts/telemetry_upload.py).
+      - name: Check top-level scripts use configure_structlog for logger setup
+        run: scripts/check-no-logging-basicconfig.sh
+      # Issue #4119: every aws_cloudwatch_metric_alarm in
+      # infra/terraform/modules/ must have a row in docs/agent/infrastructure-reference.md
+      # (§"CloudWatch Alarms"). Drift accumulates silently otherwise — the
+      # docs table is the only place an operator can find "what alarms
+      # exist and what do they fire on" without reading every Terraform module.
+      - name: Verify every CloudWatch alarm has a docs row
+        run: scripts/check-cloudwatch-alarm-docs.sh
+      - name: Check tests use POSIX sed instead of GNU head negative count
+        run: scripts/check-no-gnu-head.sh
+      # Issue #5058: a test that runs git writes in a scratch repo must
+      # unset git's repository env vars (the conftest git-env-scrub block,
+      # or scripts/tests/_git-env-scrub.sh for shell tests), or a caller
+      # with GIT_DIR exported (a hook, rebase --exec, bisect run) makes it
+      # write to that repository instead (#5045).
+      - name: Check git-writing tests scrub inherited repository env vars
+        run: scripts/check-test-git-env-scrub.sh
+      # Issue #5071: every test root must cut tests off from real GitHub (the
+      # conftest gh-isolate block, or scripts/tests/_gh-isolate.sh for shell
+      # tests). A test that reaches the real gh with a developer's login acts
+      # on real GitHub; in #5071 one closed an open issue.
+      - name: Check tests cannot reach real GitHub
+        run: scripts/check-test-gh-isolate.sh
+      - name: Check test files do not redefine the same stub binary
+        run: scripts/check-no-duplicate-stubs.sh
+      # Issue #3670: detect markers in appended-list files (e.g.
+      # test_agent_runner_entrypoint.sh) that would be silently dropped
+      # by git merge-tree when rebasing onto origin/main — i.e. a merge
+      # that produces no conflict markers but loses a test block.
+      # fetch-depth: 0 (set on this job's checkout) ensures origin/main
+      # is reachable. The check exits 0 gracefully on shallow clones.
+      - name: Check rebase does not silently drop appended-list markers
+        run: scripts/check-rebase-no-silent-drop.sh
+      # Cross-checks every non-stdlib import under scripts/dispatcher/ against
+      # the pip install step in Dockerfile.dispatcher. Motivated by the #2773
+      # boto3 scope miss (#2776): PR #2771 added `import boto3` but did not
+      # add boto3 to Dockerfile.dispatcher, and no test caught it because the
+      # daemon tests mock the client by method assignment.
+      - name: Verify dispatcher image installs every Python import used by the daemon
+        run: scripts/check-dispatcher-image-deps.sh
+      # Issue #4294 (retro from #4288): every operator-only script
+      # invoked at runtime via the scraper image's in-container scripts
+      # path must have a corresponding COPY directive in
+      # packages/scraper-framework/Dockerfile. Without this check, a new
+      # caller that references a script under that path but forgets to
+      # update the Dockerfile's COPY block fails silently — direct
+      # python invocation breaks at runtime, while the alternative
+      # scripts/ecs-run-task.sh path keeps working because it uploads
+      # scripts via S3 every run. #4288 was the fixing PR; this check
+      # is the recurrence preventer. NOTE: the literal in-container path
+      # prefix is intentionally not spelled here because the guard's
+      # own pattern would self-match on this comment (CLAUDE.md
+      # §Hygiene-check CI steps / #2542).
+      - name: Verify scraper image ships every script referenced from the in-container scripts path
+        run: scripts/check-scraper-image-shipped.sh
+      # Issues #3062 (audit) + #3072 (this check): every
+      # ``self._mark_agent_terminal`` call site in
+      # ``scripts/dispatcher/daemon.py`` must carry a nearby
+      # ``ROUTING (#N)`` comment documenting whether the site routes
+      # through ``_handle_agent_failure`` or is intentionally unrouted.
+      # This would have caught the #3054 ralph_not_ship bug at author
+      # time.
+      - name: Verify every daemon terminal site has a ROUTING comment
+        run: scripts/check-terminal-routing-comments.sh
+      # Issue #3089: every ``subprocess.run([... "git" | "gh" ...])``
+      # call site in ``scripts/dispatcher/daemon.py`` must either route
+      # through the shared ``_subprocess_with_retry`` helper or carry a
+      # nearby ``# cold-path (#3089)`` annotation. Prevents the
+      # #3053/#3085 class of single-transient-failure bug from creeping
+      # back in.
+      - name: Verify every daemon git/gh subprocess site has retry or cold-path annotation
+        run: scripts/check-git-gh-retries.sh
+      # Issue #3776: every *_TIMEOUT_SECONDS constant referenced inside a
+      # phase-loop function (one that dispatches on a ``phase`` argument)
+      # must use a per-phase access form (BY_PHASE table, token embedding
+      # the phase name, or *_for_phase() helper), or carry a
+      # ``# global-by-design (#NNNN)`` annotation on its declaration.
+      # Prevents accidental uniform-across-all-phases caps when per-phase
+      # tuning is the intent.
+      - name: Verify phase-loop functions use per-phase timeout lookups
+        run: scripts/check-per-phase-timeouts.sh
+      # Issue #3213: every ``subprocess.run(...)`` call site in
+      # ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must have
+      # a ``timeout=`` kwarg or a ``**kwargs`` splat. An unbounded blocking
+      # subprocess.run was the prime hypothesis for the #3205 silent-daemon
+      # wedge class. This check prevents regression.
+      - name: Verify every subprocess.run call in scripts has timeout= or **kwargs
+        run: scripts/check-subprocess-timeouts.sh
+      # Issue #3356: every IO call site under scripts/dispatcher/
+      # (boto3.client, psycopg.connect, subprocess.run/Popen/check_*,
+      # requests.*, urllib.request.urlopen, socket.create_connection,
+      # http.client.HTTP{S,}Connection) must carry a bounded timeout.
+      # The 2026-04-25 cascade was caused by a single unbounded
+      # boto3.client("ecs", ...); PR #3353 fixed that one site. This
+      # AST-based check enforces the structural invariant going forward.
+      - name: Check no unbounded timeouts in dispatcher
+        run: scripts/check-no-unbounded-timeouts.py
+      # Issue #4381: every scripts/*.py file that derives a data-file
+      # path from ``Path(__file__).resolve().parent.parent`` and passes
+      # it to ``open()``/``read_text()``/``read_bytes()``/
+      # ``importlib.util.spec_from_file_location`` must have an
+      # at-import existence assertion or an in-scope existence probe.
+      # Catches the #4374 bug class — under
+      # scripts/ecs-run-task.sh the script lands at
+      # /tmp/_oneshot_script and parent.parent collapses to /, silently
+      # producing a wrong path. PR #4378 fixed that one site with a
+      # candidate-path fallback list; this AST-based check enforces the
+      # structural invariant going forward.
+      - name: Check no /tmp/_oneshot_script path-collapse bugs
+        run: scripts/check-no-tmp-oneshot-file-path-derivation.py
+      # Issue #3158: every ``UPDATE dispatcher.agents`` /
+      # ``SELECT ... FROM dispatcher.agents`` line in
+      # ``scripts/dispatcher/daemon.py`` must either mention
+      # ``execution_mode`` / ``agent_task_arn`` within +/- 60 lines,
+      # OR carry an ``exec-mode-agnostic (#N): <reason>`` annotation
+      # nearby. Prevents the #3091-draft / #3128-era / #3152 class of
+      # silent-ECS-agent-loss bug from creeping back in.
+      - name: Verify every dispatcher.agents SQL site is execution_mode-aware
+        run: scripts/check-dispatcher-execution-mode-aware.sh
+      # Issue #2829: every ``subprocess.run([... "git" ...])`` call site in
+      # ``scripts/dispatcher/daemon.py`` whose first positional arg resolves
+      # to a list literal beginning with ``"git"`` AND containing
+      # ``self._repo_root()`` is a bug — in Fargate mode, ``_repo_root()``
+      # returns ``/app`` (no ``.git`` directory). The correct anchor is
+      # ``_git_parent_root()``.
+      - name: Verify no git subprocess in daemon.py anchors at self._repo_root()
+        run: bash scripts/check-no-git-repo-root-anchor.sh
+      # Issue #3082: operator laptops run macOS's stock bash 3.2.
+      # Shell scripts under scripts/**/*.sh must stick to the bash 3.2
+      # subset — no mapfile, readarray, associative arrays, nameref,
+      # case-conversion parameter expansions, ;;& case fall-through,
+      # or |& pipe shorthand. Retro of #3081's near-miss: the first
+      # draft of check-terminal-routing-comments.sh used mapfile and
+      # silently exited 127 on the operator's laptop. See
+      # docs/agent/code-standards.md §macOS bash 3.2 compatibility.
+      - name: Verify scripts stay within the bash 3.2 feature subset
+        run: scripts/check-bash-compat.sh
+      # Issue #4143: bash 5.x footgun where 'declare -a <name>'
+      # (without an inline =()) is later expanded as ${#<name>[@]}
+      # under set -u — works on macOS bash 3.2 but trips
+      # 'unbound variable' on Linux CI bash 5.x. Surfaced in #4119 /
+      # PR #4140 (the cloudwatch-alarm-docs check). Sibling guard to
+      # check-bash-compat.sh — that one covers bash-4+ syntax that
+      # doesn't exist on 3.2; this one covers a construct that exists
+      # on both but has different observable behavior under set -u.
+      - name: Verify scripts initialise indexed arrays before reading under nounset
+        run: scripts/check-bash-set-u-empty-array.sh
+
+      # Issue #5088: a guard wired only into path-filtered jobs must
+      # declare `# scans:` paths that the filter covers; otherwise it
+      # belongs in this unfiltered job.
+      - name: Check every guard runs on the PRs that touch what it scans
+        run: scripts/check-guard-path-filters.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
@@ -1925,8 +1926,6 @@ jobs:
   # #2541/#2542).
   # ---------------------------------------------------------------
   duplicate-parent-regex-check:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1947,8 +1946,6 @@ jobs:
   # and #2541/#2542).
   # ---------------------------------------------------------------
   duplicate-blocked-by-regex-check:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -2108,8 +2105,6 @@ jobs:
   # Removed exports guard: detect broken imports from removed/renamed exports (#2001)
   # ---------------------------------------------------------------
   removed-exports-check:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.scraper == 'true' || needs.detect-changes.outputs.nlp == 'true' || needs.detect-changes.outputs.api == 'true' || needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -2542,6 +2537,7 @@ jobs:
       - no-check-prefix-on-ecs-oneshots-check
       - dispatcher-breaker-recovery-alert-check
       - dependency-upper-bounds-check
+      - repo-guards
     if: always()
     runs-on: ubuntu-latest
     steps:

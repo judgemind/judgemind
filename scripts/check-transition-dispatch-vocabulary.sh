@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/dispatcher/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-transition-dispatch-vocabulary.sh — Assert the action vocabulary
 # in scripts/dispatcher/phase_transitions.py matches the dispatch coverage
 # in scripts/dispatcher/agent-runner-entrypoint.sh's

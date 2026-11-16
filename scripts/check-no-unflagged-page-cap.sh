@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/*/src/ scripts/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-unflagged-page-cap.sh — every page / chunk cap must be flagged (#4995).
 #
 # A hard-coded page limit that stops reading silently drops every ruling

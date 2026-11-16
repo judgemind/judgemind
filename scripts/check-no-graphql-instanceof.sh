@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: packages/api/src/graphql/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-graphql-instanceof.sh — Forbid `instanceof GraphQL*Type`
 # discriminator checks in the api graphql walker source.
 #

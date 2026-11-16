@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/dispatcher/daemon.py packages/api/src/graphql/dispatcher/ packages/web/src/app/(main)/admin/dispatcher/
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-dispatcher-terminals-consistent.sh — Verify that the canonical
 # set of dispatcher terminal-status strings defined in
 # ``_mark_agent_terminal`` (``scripts/dispatcher/daemon.py``) matches

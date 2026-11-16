@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# scans: scripts/*.py
+# (#5088: paths this guard reads; check-guard-path-filters.sh checks its CI job runs when they change.)
 # check-no-basicconfig-with-extra.sh — Forbid ``logging.basicConfig`` +
 # ``extra=`` co-occurrence in scripts/*.py without ``configure_structlog``.
 #
