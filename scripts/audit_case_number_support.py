@@ -271,6 +271,9 @@ def production_gate() -> Gate:
 # Per-key process pool with a hard deadline
 # ---------------------------------------------------------------------------
 
+# Seconds to wait for a worker to exit once its pipe has closed.
+REAP_TIMEOUT = 5.0
+
 
 def _child(
     conn: multiprocessing.connection.Connection, fn: Callable[..., Any], args: tuple
@@ -316,18 +319,28 @@ def run_with_deadline(
             name, proc, deadline = running[conn]
             if conn in ready:
                 del running[conn]
+                eof = False
                 try:
                     status, payload = conn.recv()
                 except EOFError:
-                    status, payload = (
-                        "raised",
-                        f"worker exited with code {proc.exitcode}",
-                    )
+                    eof = True
+                    status, payload = "raised", None
                 conn.close()
-                proc.join(timeout=5)
-                if proc.is_alive():
+                # Reap the worker before reading its exit code.  EOF on the
+                # pipe only means the child's end is closed, which happens
+                # early in its exit, before it can be reaped: an exitcode
+                # read now can still be None (#5126).
+                proc.join(timeout=REAP_TIMEOUT)
+                hung = proc.is_alive()
+                if hung:
                     proc.kill()
                     proc.join()
+                if eof:
+                    payload = (
+                        "worker closed its pipe without a result and did not exit"
+                        if hung
+                        else f"worker exited with code {proc.exitcode}"
+                    )
                 yield (
                     (name, "ok", payload)
                     if status == "ok"

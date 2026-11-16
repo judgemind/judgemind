@@ -182,6 +182,57 @@ def test_run_with_deadline_reports_raise_and_crash() -> None:
     assert results == [("die", "error", "worker exited with code 3")]
 
 
+def _close_result_pipe() -> None:
+    # The job runs inside ``audit._child``, whose ``conn`` is the worker's end
+    # of the result pipe.  Close only that fd: the process sentinel must stay
+    # open, as it does until a real worker exits.
+    os.close(sys._getframe(2).f_locals["conn"].fileno())
+
+
+def _close_pipe_then_die(_x):
+    # The parent sees EOF once the child's end of the pipe is closed, which
+    # happens before the child can be reaped.  Close it early and exit late,
+    # so the parent's EOF always arrives while the child is still alive.
+    _close_result_pipe()
+    time.sleep(0.5)
+    os._exit(3)
+
+
+def test_run_with_deadline_reaps_a_crashed_worker_before_reading_its_code() -> None:
+    """#5126: EOF on the pipe does not mean the process has exited yet."""
+    results = list(
+        audit.run_with_deadline(
+            [("die", (1,))], _close_pipe_then_die, workers=1, timeout=10
+        )
+    )
+    assert results == [("die", "error", "worker exited with code 3")]
+
+
+def _close_pipe_then_hang(_x):
+    _close_result_pipe()
+    time.sleep(60)
+
+
+def test_run_with_deadline_kills_a_worker_that_closes_its_pipe_and_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit, "REAP_TIMEOUT", 0.2)
+    start = time.monotonic()
+    results = list(
+        audit.run_with_deadline(
+            [("stuck", (1,))], _close_pipe_then_hang, workers=1, timeout=10
+        )
+    )
+    assert results == [
+        (
+            "stuck",
+            "error",
+            "worker closed its pipe without a result and did not exit",
+        )
+    ]
+    assert time.monotonic() - start < 5
+
+
 # ---------------------------------------------------------------------------
 # County audit end to end (stubbed S3 + DB)
 # ---------------------------------------------------------------------------
