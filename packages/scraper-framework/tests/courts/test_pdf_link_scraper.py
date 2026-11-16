@@ -374,7 +374,15 @@ def test_oc_run_continues_when_pdf_fails() -> None:
     scraper = OCTentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details is not None
+    assert any(".pdf" in (s["url"] or "") for s in health.failure_details["failed_fetches"])
+    assert health.failure_details["failed_fetches"][0]["http_status"] == 404
+    assert health.failure_details["failed_fetches"][0]["permanent"] is True
     assert health.records_captured == 32  # 33 - 1 failed
 
 
@@ -440,7 +448,8 @@ def test_oc_run_fails_when_every_pdf_url_returns_html() -> None:
 
 @respx.mock
 def test_oc_run_skips_non_pdf_bodies_but_keeps_real_pdfs() -> None:
-    """One non-PDF body among real PDFs is dropped; the rest are captured (#4748)."""
+    """One non-PDF body among real PDFs is dropped and counted as blocked
+    (#4748, #5019); the rest are captured."""
     html = _load_html("oc_civil_page.html")
     pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
     respx.get(OC_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
@@ -460,7 +469,12 @@ def test_oc_run_skips_non_pdf_bodies_but_keeps_real_pdfs() -> None:
     config.request_delay_seconds = 0
     health = OCTentativeRulingsScraper(config=config).run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details["fetch_blocked"] == 1
     assert health.records_captured == 32
 
 

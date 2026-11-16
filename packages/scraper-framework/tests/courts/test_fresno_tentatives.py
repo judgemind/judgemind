@@ -518,7 +518,15 @@ def test_fresno_run_continues_when_pdf_fails() -> None:
     scraper = FresnoTentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details is not None
+    assert any(".pdf" in (s["url"] or "") for s in health.failure_details["failed_fetches"])
+    assert health.failure_details["failed_fetches"][0]["http_status"] == 404
+    assert health.failure_details["failed_fetches"][0]["permanent"] is True
     # 19 PDFs succeeded (1 failed), each split into multiple rulings
     assert health.records_captured > 0
 

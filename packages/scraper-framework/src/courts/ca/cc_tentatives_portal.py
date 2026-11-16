@@ -952,13 +952,13 @@ class CCTentativesPortalScraper(BaseScraper):
                     judge_name=judge_name_dropdown,
                 )
                 try:
-                    listing_response = client.get(
+                    listing_response = tally.http_get(
+                        client,
                         LISTING_URL,
                         params={"field_judge_target_id": judge_id},
                     )
-                    listing_response.raise_for_status()
                 except Exception as exc:
-                    tally.failed(exc)
+                    tally.failed(exc, url=f"{LISTING_URL}?field_judge_target_id={judge_id}")
                     self._log.error(
                         "cc_portal.listing_fetch_failed",
                         judge_id=judge_id,
@@ -1012,7 +1012,8 @@ class CCTentativesPortalScraper(BaseScraper):
                     time.sleep(self.config.request_delay_seconds)
 
                     try:
-                        doc = self._fetch_single_ruling(
+                        doc = tally.retry(
+                            self._fetch_single_ruling,
                             client=client,
                             row=row,
                             judge_id=judge_id,
@@ -1021,7 +1022,7 @@ class CCTentativesPortalScraper(BaseScraper):
                         docs.append(doc)
                         tally.ok()
                     except _UnexpectedDetailPageError as blocked_exc:
-                        tally.blocked(str(blocked_exc))
+                        tally.blocked(str(blocked_exc), url=detail_url)
                         self._log.error(
                             "cc_portal.unexpected_detail_page",
                             slug=slug,
@@ -1029,7 +1030,7 @@ class CCTentativesPortalScraper(BaseScraper):
                             body_prefix=blocked_exc.body_prefix,
                         )
                     except Exception as exc:
-                        tally.failed(exc)
+                        tally.failed(exc, url=detail_url)
                         self._log.error(
                             "cc_portal.row_fetch_failed",
                             slug=slug,

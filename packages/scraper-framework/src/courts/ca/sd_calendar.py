@@ -553,10 +553,9 @@ class SDCalendarScraper(BaseScraper):
 
             for url, division_name in urls:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=url)
                 try:
-                    response = client.get(url)
-                    response.raise_for_status()
+                    response = tally.http_get(client, url)
                     html = response.text
 
                     hearings = parse_calendar_page(html)

@@ -823,7 +823,7 @@ class SDTentativeRulingsScraper(BaseScraper):
                     if i > 0:
                         await asyncio.sleep(self.config.request_delay_seconds)
 
-                    tally.attempt()
+                    tally.attempt(url=f"SD portal case lookup {case_number}")
                     try:
                         doc = await self._fetch_case_ruling(page, case_number)
                     except _LookupBlocked as blocked_exc:

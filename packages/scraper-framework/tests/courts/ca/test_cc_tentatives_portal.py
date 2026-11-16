@@ -1101,8 +1101,10 @@ def test_run_fails_when_every_detail_fetch_fails() -> None:
 
 
 @respx.mock
-def test_run_succeeds_when_one_listing_is_empty_and_another_fails() -> None:
-    """A genuinely empty listing is a successful fetch: no failure (#4693)."""
+def test_one_failed_listing_beside_an_empty_one_is_counted() -> None:
+    """A genuinely empty listing is a successful fetch, so this is not an
+    all-failed outage (#4693); the 500 listing is retried once, then counted
+    against the run with its URL (#5019)."""
     respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
         return_value=httpx.Response(500)
     )
@@ -1113,7 +1115,18 @@ def test_run_succeeds_when_one_listing_is_empty_and_another_fails() -> None:
 
     health = CCTentativesPortalScraper(config=_run_config()).run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert "all " not in health.error_message
+    assert health.failure_details["fetch_retries"] == 1
+    assert health.failure_details is not None
+    assert any(
+        "field_judge_target_id=238" in (s["url"] or "")
+        for s in health.failure_details["failed_fetches"]
+    )
     assert health.records_captured == 0
 
 
@@ -1481,8 +1494,9 @@ def test_run_fails_when_listing_has_dropdown_but_no_rows_and_no_empty_marker(
 @respx.mock
 def test_changed_listing_for_one_judge_does_not_hide_the_other_judges_rulings() -> None:
     """One judge's listing with a changed table is counted blocked, while an
-    empty listing for another judge still counts as a quiet day: the run
-    stays green, and the blocked listing is logged (#4789)."""
+    empty listing for another judge still counts as a quiet day: the run is
+    not an all-failed outage, the blocked listing is logged (#4789) and
+    counted against the run (#5019)."""
     respx.get(LISTING_URL, params={"field_judge_target_id": "238"}).mock(
         return_value=httpx.Response(200, text=_live_listing_with_changed_table())
     )
@@ -1494,7 +1508,11 @@ def test_changed_listing_for_one_judge_does_not_hide_the_other_judges_rulings() 
     with structlog.testing.capture_logs() as logs:
         health = CCTentativesPortalScraper(config=_run_config()).run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
     events = [e["event"] for e in logs]
     # The shared listing guard logs both outcomes (#4912).
     assert "listing.empty_unrecognized" in events

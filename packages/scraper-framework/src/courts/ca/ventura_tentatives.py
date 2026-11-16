@@ -261,6 +261,13 @@ def parse_results_table(html: str) -> list[SearchResult]:
 # ---------------------------------------------------------------------------
 
 
+def _result_document_url(result: SearchResult) -> str:
+    """URL of a search result's ruling document, or the search page."""
+    if result.doc_id:
+        return f"{BASE_URL}/CaseInquiry/ViewFile/{result.doc_id}"
+    return SEARCH_URL
+
+
 def _ventura_llm_enabled() -> bool:
     """Return True when LLM-based extraction is enabled for Ventura rulings."""
     return os.environ.get("ENABLE_VENTURA_LLM_EXTRACTION", "").lower() in (
@@ -488,7 +495,7 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                     date_docs = self._search_date(client, token, date_str, search_date, tally)
                     docs.extend(date_docs)
                 except Exception as exc:
-                    tally.failed(exc)
+                    tally.failed(exc, url=f"{SEARCH_URL} [date {date_str}]")
                     self._log.error(
                         "Failed to search date",
                         date=date_str,
@@ -520,8 +527,7 @@ class VenturaTentativeRulingsScraper(BaseScraper):
             "__RequestVerificationToken": token,
             "SearchFromDate": date_str,
         }
-        response = client.post(SEARCH_URL, data=form_data)
-        response.raise_for_status()
+        response = tally.http_post(client, SEARCH_URL, data=form_data)
 
         results = parse_results_table(response.text)
         self._log.info("Found results", date=date_str, count=len(results))
@@ -542,11 +548,11 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         for result in results:
             time.sleep(self.config.request_delay_seconds)
             try:
-                doc = self._fetch_result_document(client, result, search_date)
+                doc = tally.retry(self._fetch_result_document, client, result, search_date)
                 docs.append(doc)
                 tally.ok()
             except Exception as exc:
-                tally.failed(exc)
+                tally.failed(exc, url=_result_document_url(result))
                 self._log.error(
                     "Failed to fetch document",
                     case_number=result.case_number,
@@ -565,7 +571,7 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         """Download a ruling document and create a CapturedDocument."""
         # Build document URL
         if result.doc_id:
-            doc_url = f"{BASE_URL}/CaseInquiry/ViewFile/{result.doc_id}"
+            doc_url = _result_document_url(result)
             response = client.get(doc_url)
             response.raise_for_status()
             raw_content = response.content

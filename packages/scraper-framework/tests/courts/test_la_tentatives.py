@@ -543,7 +543,9 @@ def test_run_handles_get_failure() -> None:
 
 
 @respx.mock
-def test_run_continues_when_single_post_fails() -> None:
+def test_run_retries_a_transient_post_failure() -> None:
+    """A 500 on one POST is retried in the run; the retry succeeds, so the
+    run is clean and nothing is counted as failed (#5019)."""
     main_html = _load("la_main_page.html")
     ruling_html = _load("la_ruling_response.html")
 
@@ -567,7 +569,12 @@ def test_run_continues_when_single_post_fails() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 192  # (97 - 1 failed) x 2 cases per fixture
+    assert health.records_captured == 194  # 97 x 2 cases per fixture
+    assert health.records_failed == 0
+    assert health.failure_details is not None
+    assert health.failure_details["fetch_retries"] == 1
+    assert health.failure_details["fetch_recovered"] == 1
+    assert health.failure_details["fetch_failed"] == 0
 
 
 def test_default_config() -> None:
@@ -652,7 +659,8 @@ def test_run_fails_when_every_post_raises() -> None:
 
 @respx.mock
 def test_full_run_stale_viewstate_mixed_with_real() -> None:
-    """Full run: stale-ViewState responses are skipped; valid rulings still count."""
+    """Full run: stale-ViewState responses are skipped and counted (#5019);
+    valid rulings still count."""
     main_html = _load("la_main_page.html")
     stale_html = _load("la_ruling_smc49.html")
     ruling_html = _load("la_ruling_response.html")
@@ -676,7 +684,11 @@ def test_full_run_stale_viewstate_mixed_with_real() -> None:
     scraper = LATentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 2
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
     assert health.records_captured == 190  # (97 - 2 stale skips) x 2 cases per fixture
 
 
@@ -3696,8 +3708,8 @@ def test_appellate_full_run_stamps_metadata_through_parse() -> None:
 
 @respx.mock
 def test_appellate_full_run_handles_stale_viewstate() -> None:
-    """Stale-ViewState POST responses are skipped without failing the run
-    as long as another hearing date was fetched."""
+    """A stale-ViewState POST response is skipped and the other hearing date
+    is still captured; the skipped date is counted against the run (#5019)."""
     main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
     # Reuse real LA stale-ViewState error fixture — same portal, same marker.
     stale_html = _load("la_ruling_smc49.html")
@@ -3716,7 +3728,11 @@ def test_appellate_full_run_handles_stale_viewstate() -> None:
     scraper = LAAppellateTentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
     assert health.records_captured == 1
 
 

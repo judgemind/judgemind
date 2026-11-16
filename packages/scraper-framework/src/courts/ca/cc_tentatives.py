@@ -618,10 +618,9 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
             for href, link_text, department, judge_name in recent_links:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=href)
                 try:
-                    pdf_response = client.get(href)
-                    pdf_response.raise_for_status()
+                    pdf_response = tally.http_get(client, href)
 
                     pdf_content = pdf_response.content
 

@@ -786,7 +786,6 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         ) as client:
             for ruling_id in RULING_IDS:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
 
                 dept_info = RULING_ID_MAP[ruling_id]
                 department = dept_info["department"]
@@ -794,9 +793,11 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                 # REST API URL: .../GetRulings/{CaseNum}/{DatePick}/{SeshID}/{RulingID}
                 # Empty case number searches by date only.
                 api_url = f"{CIVIL_REST_BASE}//{date_encoded}/{session_id}/{ruling_id}"
+                # The session id stays out of scraper_runs (#5019).
+                tally.attempt(url=api_url.replace(session_id, "<session>"))
 
                 try:
-                    response = client.get(api_url)
+                    response = tally.retry(client.get, api_url)
 
                     # Check for session expiry or redirect
                     if response.status_code in (301, 302, 303, 307):

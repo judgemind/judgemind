@@ -903,7 +903,15 @@ def test_sc_run_handles_dept_page_failure() -> None:
     scraper = SCTentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details is not None
+    assert any("department-1" in (s["url"] or "") for s in health.failure_details["failed_fetches"])
+    assert health.failure_details["failed_fetches"][0]["http_status"] == 404
+    assert health.failure_details["failed_fetches"][0]["permanent"] is True
     # 9 departments succeeded (1 failed) x 2 PDFs = 18
     assert health.records_captured == 18
 
@@ -936,7 +944,15 @@ def test_sc_run_handles_pdf_failure() -> None:
     scraper = SCTentativeRulingsScraper(config=config)
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details is not None
+    assert any(".pdf" in (s["url"] or "") for s in health.failure_details["failed_fetches"])
+    assert health.failure_details["failed_fetches"][0]["http_status"] == 404
+    assert health.failure_details["failed_fetches"][0]["permanent"] is True
     # 20 PDFs total - 1 failed = 19
     assert health.records_captured == 19
 

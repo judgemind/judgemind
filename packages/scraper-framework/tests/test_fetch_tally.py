@@ -136,6 +136,7 @@ class TestFetchTally:
             "blocked": 0,
             "failed": 1,
             "skipped": 0,
+            "retries": 0,
             "last_error": "RuntimeError: boom",
         }
 
@@ -280,9 +281,12 @@ class _AbortingScraper(BaseScraper):
                     content_hash="",
                 )
             )
-        tally.attempt()
-        tally.failed(TimeoutError("timed out"))
-        tally.abort("breaker tripped", remaining=self.skipped)
+        if self.skipped:
+            # A failed item counts against the run on its own (#5019), so
+            # the breaker case is only staged when items are skipped.
+            tally.attempt()
+            tally.failed(TimeoutError("timed out"))
+            tally.abort("breaker tripped", remaining=self.skipped)
         tally.raise_if_all_failed(docs)
         self._mark_partial_failure(tally.partial_failure_message())
         return docs

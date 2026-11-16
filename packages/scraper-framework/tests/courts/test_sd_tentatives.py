@@ -1818,7 +1818,8 @@ class TestMidRunAbortFailsLoudly:
         assert "net::ERR_TIMED_OUT" in message
 
     def test_streak_on_last_case_is_not_an_abort(self) -> None:
-        """Hitting the streak on the final case skips nothing: keep success."""
+        """Hitting the streak on the final case skips nothing, so it is not an
+        abort; the five failed lookups still count against the run (#5019)."""
         portal = "<html><body>Portal</body></html>"
         empty_search = "<html><body><div>No results</div></body></html>"
         page = _make_mock_page([portal, empty_search])
@@ -1830,8 +1831,11 @@ class TestMidRunAbortFailsLoudly:
         with patch("playwright.async_api.async_playwright", return_value=mock_pw_ctx):
             health = scraper.run()
 
-        assert health.success is True
-        assert health.error_message is None
+        assert health.success is False
+        assert health.records_failed == 5
+        assert health.error_message is not None
+        assert "aborted" not in health.error_message
+        assert "5 of 6 per-item fetches not captured" in health.error_message
 
 
 def _cf_timeouts() -> Any:

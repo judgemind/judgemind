@@ -241,12 +241,14 @@ class ScraperHealthEvent(EventEnvelope):
     scraper_id: str
     success: bool
     records_captured: int
-    #: Documents fetched but not fully captured: failed before archive, failed
-    #: to archive, or archived but not emitted (#5009).  Any non-zero value
+    #: Items not captured: documents that failed before archive, failed to
+    #: archive, or were archived but not emitted (#5009), plus per-item
+    #: fetches that raised or were blocked (#5019).  Any non-zero value
     #: makes ``success`` False.
     records_failed: int = 0
-    #: Per-stage counts and sample failures (``CaptureFailures.details``),
-    #: written to ``scraper_runs.error_details``.  None when nothing failed.
+    #: Per-stage counts and sample failures (``CaptureFailures.details`` and
+    #: ``FetchFailures.details``), written to ``scraper_runs.error_details``.
+    #: None when nothing failed and no per-item retry was needed.
     failure_details: dict[str, Any] | None = None
     response_time_seconds: float
     error_message: str | None = None

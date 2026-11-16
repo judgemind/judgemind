@@ -70,18 +70,87 @@ Semantics:
 
 The semantics match the hand-rolled SD ROA counters from #4673 and #4687,
 which were the first user.
+
+Non-aborting per-item failures count against the run (#5019):
+
+- Every tally created while ``BaseScraper.run()`` is fetching registers
+  itself with the run (see :func:`collect_fetch_tallies`); no scraper has to
+  opt in.  After the fetch, ``run()`` adds each tally's ``failed`` and
+  ``blocked`` items to ``records_failed``, puts the counts and up to 50
+  per-item samples (URL, error, HTTP status, transient / permanent) in
+  ``scraper_runs.error_details``, and records ``success=False``.  One PDF
+  that 404s or times out is a capture loss, so the run is not a clean
+  success even when the other items were captured.
+- Pass the item's URL to ``attempt(url=...)`` (flat loops) or to
+  ``failed(..., url=...)`` / ``blocked(..., url=...)`` (nested loops), so the
+  sample names it.  Without one, an httpx error's request URL is used.  Pass
+  a redacted URL when the real one carries a session id or token.
+- Route the item's network call through :meth:`FetchTally.retry` (any
+  callable) or :meth:`FetchTally.http_get` (an httpx GET that must return
+  2xx).  A transient error (see :func:`is_transient_fetch_error`) is retried
+  once in the run after a short delay; an item that then succeeds is counted
+  in ``n_recovered``, not as a failure.  Permanent errors (404, 410, other
+  4xx, parse errors) are not retried and are recorded with their reason.
+  After three items have failed even after their retry, the tally stops
+  retrying: the site is down and the whole-run policy takes over.  Loops
+  with their own anti-bot handling (the SD portal's circuit breaker) do not
+  retry per item.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sized
+import time
+from collections.abc import Callable, Iterator, Sized
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
+import structlog
 
 from .base import AllFetchesFailed
 
+logger = structlog.get_logger(__name__)
+
 _MAX_ERROR_LEN = 300
+
+#: Per-item samples kept on each tally (and in ``scraper_runs.error_details``).
+#: The counts are always exact; only the list of examples is capped.
+MAX_FETCH_FAILURE_SAMPLES = 50
+
+#: In-run retry of one item's transient fetch error (#5019): two attempts in
+#: all, a short pause between them.
+ITEM_RETRY_ATTEMPTS = 2
+ITEM_RETRY_DELAY_SECONDS = 2.0
+#: Items that may fail even after their retry before the tally stops
+#: retrying.  Past that the site is down; retrying every remaining item
+#: would only stretch an outage run.
+MAX_EXHAUSTED_ITEM_RETRIES = 3
+
+#: HTTP statuses that mean the item is gone, not that the server is busy.
+_PERMANENT_HTTP_STATUS = frozenset({404, 410})
+
+# The tallies of the fetch now running, set by BaseScraper (#5019).
+_run_tallies: ContextVar[list[FetchTally] | None] = ContextVar("fetch_tally_run", default=None)
+
+
+@contextmanager
+def collect_fetch_tallies() -> Iterator[list[FetchTally]]:
+    """Collect every :class:`FetchTally` created inside the block (#5019).
+
+    ``BaseScraper._fetch_with_retry`` wraps each ``fetch_documents`` call in
+    this, so a scraper's per-item failures reach ``scraper_runs`` without the
+    scraper passing its tally anywhere.  A context variable carries the list,
+    so it also reaches the coroutine an async scraper runs with
+    ``asyncio.run``.
+    """
+    tallies: list[FetchTally] = []
+    token = _run_tallies.set(tallies)
+    try:
+        yield tallies
+    finally:
+        _run_tallies.reset(token)
+
 
 # 5xx answers that mean "the server is struggling right now".  429 is left
 # out on purpose: retrying a rate limit seconds later makes it worse.
@@ -145,6 +214,28 @@ def _describe(error: BaseException | str) -> str:
     return text[:_MAX_ERROR_LEN]
 
 
+def _error_url(error: BaseException | str) -> str | None:
+    """The request URL an httpx error carries, or None."""
+    if not isinstance(error, httpx.HTTPError):
+        return None
+    try:
+        return str(error.request.url)
+    except RuntimeError:  # an httpx error built without a request
+        return None
+
+
+def _http_status(error: BaseException | str) -> int | None:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code
+    return None
+
+
+def _request_ok(client: httpx.Client, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    response = getattr(client, method)(url, **kwargs)
+    response.raise_for_status()
+    return response
+
+
 class FetchTally:
     """Count per-item fetch outcomes and fail the run when none succeeded."""
 
@@ -162,36 +253,70 @@ class FetchTally:
         # Set by abort(): why the loop stopped and how many items it skipped.
         self.abort_reason: str | None = None
         self.n_skipped = 0
+        # In-run per-item retries (#5019): retry attempts made, and items
+        # that succeeded on a retry.
+        self.n_retries = 0
+        self.n_recovered = 0
+        self._n_exhausted_retries = 0
+        # One dict per failed / blocked item, capped (#5019).
+        self.samples: list[dict[str, Any]] = []
         self._open = False
+        self._open_url: str | None = None
+        tallies = _run_tallies.get()
+        if tallies is not None:
+            tallies.append(self)
 
     # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
 
-    def attempt(self) -> None:
-        """Start a new item attempt. Unmarked attempts count as succeeded."""
+    def attempt(self, url: str | None = None) -> None:
+        """Start a new item attempt. Unmarked attempts count as succeeded.
+
+        *url* names the item in a failure sample if the attempt later fails
+        or is blocked (#5019).
+        """
         self.n_attempted += 1
         self._open = True
+        self._open_url = url
 
-    def _close_or_count(self) -> None:
+    def _close_or_count(self) -> str | None:
+        """Close the open attempt (or count a new one); return its URL."""
+        url = self._open_url
+        self._open_url = None
         if self._open:
             self._open = False
         else:
             self.n_attempted += 1
+        return url
 
     def ok(self) -> None:
         """Record an explicit success."""
         self._close_or_count()
 
-    def failed(self, error: BaseException | str) -> None:
-        """Mark the current attempt as failed with *error*."""
-        self._close_or_count()
+    def failed(self, error: BaseException | str, *, url: str | None = None) -> None:
+        """Mark the current attempt as failed with *error*.
+
+        *url* overrides the URL given to :meth:`attempt`; with neither, an
+        httpx error's request URL is recorded.
+        """
+        open_url = self._close_or_count()
         self.n_failed += 1
-        if isinstance(error, BaseException) and is_transient_fetch_error(error):
+        transient = isinstance(error, BaseException) and is_transient_fetch_error(error)
+        if transient:
             self.n_transient_failed += 1
         self.last_error = _describe(error)
+        status = _http_status(error)
+        self._sample(
+            "failed",
+            url=url or open_url or _error_url(error),
+            error=self.last_error,
+            transient=transient,
+            http_status=status,
+            permanent=status in _PERMANENT_HTTP_STATUS,
+        )
 
-    def blocked(self, reason: str, *, transient: bool = False) -> None:
+    def blocked(self, reason: str, *, transient: bool = False, url: str | None = None) -> None:
         """Mark the current attempt as blocked (anti-bot page, expired session).
 
         Pass ``transient=True`` only for a block a fresh run clears by
@@ -200,11 +325,76 @@ class FetchTally:
         access-denied pages, and responses of the wrong shape, stay
         deterministic: a retry seconds later gets the same page (#4713).
         """
-        self._close_or_count()
+        open_url = self._close_or_count()
         self.n_blocked += 1
         if transient:
             self.n_transient_blocked += 1
         self.last_block_reason = _describe(reason)
+        self._sample(
+            "blocked",
+            url=url or open_url,
+            error=self.last_block_reason,
+            transient=transient,
+            http_status=None,
+            permanent=False,
+        )
+
+    def _sample(self, outcome: str, **fields: Any) -> None:
+        if len(self.samples) < MAX_FETCH_FAILURE_SAMPLES:
+            self.samples.append({"what": self.what, "outcome": outcome, **fields})
+
+    # ------------------------------------------------------------------
+    # In-run per-item retry (#5019)
+    # ------------------------------------------------------------------
+
+    def retry[T](self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        """Call ``fn(*args, **kwargs)``, retrying a transient error once.
+
+        Only errors :func:`is_transient_fetch_error` accepts are retried
+        (timeouts, connection resets, 5xx); a 404, another 4xx or a parse
+        error raises at once.  The final error propagates, so the caller's
+        ``except`` still records it with :meth:`failed`.  Wrap only the
+        network call, never the parse of its result, and only calls that
+        are safe to repeat (GETs, form POSTs that only read).
+        """
+        attempt = 1
+        while True:
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as exc:
+                if attempt >= ITEM_RETRY_ATTEMPTS or not is_transient_fetch_error(exc):
+                    if attempt > 1:
+                        self._n_exhausted_retries += 1
+                    raise
+                if self._n_exhausted_retries >= MAX_EXHAUSTED_ITEM_RETRIES:
+                    raise
+                self.n_retries += 1
+                logger.warning(
+                    "fetch.item_retrying",
+                    what=self.what,
+                    url=self._open_url or _error_url(exc),
+                    attempt=attempt,
+                    wait_seconds=ITEM_RETRY_DELAY_SECONDS,
+                    error=_describe(exc),
+                )
+                time.sleep(ITEM_RETRY_DELAY_SECONDS)
+                attempt += 1
+                continue
+            if attempt > 1:
+                self.n_recovered += 1
+            return result
+
+    def http_get(self, client: httpx.Client, url: str, **kwargs: Any) -> httpx.Response:
+        """GET *url* with :meth:`retry`; raise for a non-2xx status."""
+        return self.retry(_request_ok, client, "get", url, **kwargs)
+
+    def http_post(self, client: httpx.Client, url: str, **kwargs: Any) -> httpx.Response:
+        """POST *url* with :meth:`retry`; raise for a non-2xx status.
+
+        Only for POSTs that read (a search form), never ones that change
+        state on the court's side.
+        """
+        return self.retry(_request_ok, client, "post", url, **kwargs)
 
     def abort(self, reason: str, *, remaining: int) -> None:
         """Record that the loop stopped early with *remaining* items unattempted."""
@@ -259,6 +449,7 @@ class FetchTally:
             "blocked": self.n_blocked,
             "failed": self.n_failed,
             "skipped": self.n_skipped,
+            "retries": self.n_retries,
             "last_error": self.last_error or self.last_block_reason,
         }
 

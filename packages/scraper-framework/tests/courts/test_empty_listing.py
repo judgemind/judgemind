@@ -190,9 +190,10 @@ def test_ventura_empty_listing_fails_run() -> None:
 
 
 @respx.mock
-def test_ventura_empty_listing_on_one_date_keeps_other_dates_green() -> None:
+def test_ventura_empty_listing_on_one_date_is_counted_not_all_failed() -> None:
     """Per-date listings go on the tally: one live empty date plus one
-    unrecognized page is not an all-failed run."""
+    unrecognized page is not an all-failed run, but the unrecognized page
+    is counted against it (#5019)."""
     unrecognized = _mutate(
         _load("ventura_no_results_live_4748.html"), 'class="noresults"', 'class="empty"'
     )
@@ -211,7 +212,12 @@ def test_ventura_empty_listing_on_one_date_keeps_other_dates_green() -> None:
         search_dates=[datetime(2026, 9, 25), datetime(2026, 9, 27)],
     ).run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert "all " not in health.error_message
 
 
 @pytest.mark.parametrize(
