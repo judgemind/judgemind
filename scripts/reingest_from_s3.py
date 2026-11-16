@@ -2166,7 +2166,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Let a key whose every split child is rejected (validation, the "
             "all-NULL guard) lose its rulings.  Without it the worker keeps "
             "them, records the key all_children_rejected and the run counts "
-            "it failed (#5057).  For a rule tightening meant to remove rows."
+            "it failed (#5057).  For a rule tightening meant to remove rows.  "
+            "Likewise an extraction's verdict of no rulings (no_ruling_text, "
+            "zero_rulings_no_text), recorded empty_extraction (#5094)."
         ),
     )
     return parser

@@ -117,6 +117,13 @@ def test_recorded_skip_or_validation_failure_still_explains_an_orphaned_key(
 ) -> None:
     ex = _orphaned(explained)
     ex.skips[KEY] = "no_ruling_text"
+    # An extraction skip recorded before #5094 is re-judged (stale_skip)...
+    assert rec.classify(_raw(KEY), ex, now=NOW, grace=GRACE) == (
+        "incomplete",
+        "stale_skip",
+    )
+    # ...one recorded under the current rules explains the key.
+    ex.skip_details[KEY] = {"rule_version": 2, "held_rulings": 0}
     assert rec.classify(_raw(KEY), ex, now=NOW, grace=GRACE) == (
         "skipped",
         "no_ruling_text",

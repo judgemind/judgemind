@@ -93,7 +93,10 @@ properties that must hold for any sequence of re-splits:
   extraction did not return (a pre-split capture keeps its earlier
   captures' rulings on other slots).
 - ``explained``: a complete step that leaves its key with no document rows
-  records why (#5015).
+  records why (#5015).  An extraction's skip verdict (``no_ruling_text``,
+  ``zero_rulings_no_text``) carries the current
+  ``validation.skip_versions`` rule version, so the reconciler can re-judge
+  it, and never replaced rulings the key held (#5094).
 - ``marker``: a step that ends incomplete leaves a durable
   ``telemetry.ingest_incomplete`` record for its key, and a later complete
   step clears it (#5008).  A live capture of a new key that takes the
@@ -117,7 +120,12 @@ properties that must hold for any sequence of re-splits:
   refusal is legitimate only after a complete extraction, on a key that
   held a ruling, and when a fresh ingest of the same bytes (the oracle,
   on a key with no history) writes no ruling either.  ``converge`` then
-  allows the key to keep its history's rows.
+  allows the key to keep its history's rows.  The same holds for an
+  extraction's skip verdict (``no_ruling_text``: every row textless;
+  ``zero_rulings_no_text``: no rulings and no text) on a key that holds
+  rulings (#5094): refused, ``marker`` expects ``empty_extraction``, a
+  ``reingest`` / ``db`` step raises ``EmptyExtractionRefusedError``, and the
+  fresh-key oracle records the verdict as a skip.
 
 A shared-court scenario also runs ``search_fields`` (a court rename made by
 one key's write re-indexes the other keys' rulings) and ``judge_converge``
@@ -295,6 +303,12 @@ _EXTRACTION_FAILED_EVENT = "llm_split.extraction_failed"
 #: ``ingestion.worker.EMPTY_SPLIT_SET_REFUSED_EVENT`` (#5057).
 _EMPTY_REFUSED_EVENT = "split_set.empty_replacement_refused"
 _MARKER_ALL_CHILDREN_REJECTED = "all_children_rejected"
+#: ``ingestion.ingest_incomplete.INCOMPLETE_EMPTY_EXTRACTION`` (#5094): an
+#: extraction's skip verdict refused over the key's rulings.
+_MARKER_EMPTY_EXTRACTION = "empty_extraction"
+_EMPTY_EXTRACTION_REFUSED_EVENT = f"{_EMPTY_REFUSED_EVENT}:{_MARKER_EMPTY_EXTRACTION}"
+#: ``validation.skip_versions.EXTRACTION_SKIP_REASONS`` (#5094).
+_EXTRACTION_SKIPS = ("no_ruling_text", "zero_rulings_no_text")
 
 
 class InvariantError(AssertionError):
@@ -1291,6 +1305,10 @@ class _TelemetryHandler(logging.Handler):
         event = getattr(record, "telemetry_event", None)
         if isinstance(event, str):
             self.counter[event] += 1
+            # A refusal names the incomplete reason it records (#5094).
+            reason = getattr(record, "incomplete_reason", None)
+            if isinstance(reason, str):
+                self.counter[f"{event}:{reason}"] += 1
 
 
 def _spelled(spelling: str | None) -> str:
@@ -1477,6 +1495,9 @@ class KeyHarness:
         self._refusal_checked: set[str] = set()
         #: Whether the last step's empty split set was refused (#5057).
         self.last_refused = False
+        #: Whether the current step's refusal was of an extraction's skip
+        #: verdict (``empty_extraction``, #5094).
+        self._empty_refusal = False
         #: Fresh keys :meth:`_check_refusal_rejects_fresh` has used.
         self._refusal_oracles = 0
         self._patches: list[Any] = []
@@ -1725,6 +1746,7 @@ class KeyHarness:
         reported_failed = False
         logged_before = self.events[_EXTRACTION_FAILED_EVENT]
         refused_before = self.events[_EMPTY_REFUSED_EVENT]
+        empty_refused_before = self.events[_EMPTY_EXTRACTION_REFUSED_EVENT]
         try:
             with _real_enrichment(), self._exhausted_enrichment(outcome == "exhausted"):
                 if step.kind == "db":
@@ -1743,10 +1765,12 @@ class KeyHarness:
             # A split-set replacement whose every child was rejected keeps
             # the key's rulings and reports the key failed (#5057); whether
             # the refusal was right is checked below (``refused``).
-            refused_raise = (
-                type(exc).__name__ == "AllChildrenRejectedError"
-                and self.events[_EMPTY_REFUSED_EVENT] > refused_before
-            )
+            # An extraction's skip verdict refused over the key's rulings
+            # raises its subclass (#5094).
+            empty_refusal = self.events[_EMPTY_EXTRACTION_REFUSED_EVENT] > empty_refused_before
+            refused_raise = type(exc).__name__ == (
+                "EmptyExtractionRefusedError" if empty_refusal else "AllChildrenRejectedError"
+            ) and (self.events[_EMPTY_REFUSED_EVENT] > refused_before)
             if not (expect_failed and type(exc).__name__ == expected_error) and not refused_raise:
                 self._fail("error", f"step raised {type(exc).__name__}: {exc}")
             reported_failed = True
@@ -1766,8 +1790,12 @@ class KeyHarness:
         # (#5057): nothing was written, so the step is checked as one that
         # wrote nothing (``untouched``, ``marker``), not as a complete one.
         refused = self.events[_EMPTY_REFUSED_EVENT] > refused_before
+        # The refusal was of an extraction's skip verdict (#5094).
+        self._empty_refusal = self.events[_EMPTY_EXTRACTION_REFUSED_EVENT] > empty_refused_before
         if refused:
             self.events["harness.refused"] += 1
+            if self._empty_refusal:
+                self.events["harness.refused.empty_extraction"] += 1
             self._guard(
                 "refused",
                 self._check_refused,
@@ -1863,7 +1891,7 @@ class KeyHarness:
         self._guard("judge_converge", self._check_votes)
         if refused:
             # Last: it runs a step of its own on a fresh key.
-            self._guard("refused", self._check_refusal_rejects_fresh, step)
+            self._guard("refused", self._check_refusal_rejects_fresh, step, self._empty_refusal)
         self.last_refused = refused
 
     @contextmanager
@@ -2197,6 +2225,42 @@ class KeyHarness:
                 "(no ingest_skips, validation_results or non_ruling_pdf_dropped row)",
             )
         self.events[f"harness.explained.{found[0]}"] += 1
+        skip = self._skip_record(key)
+        if skip is not None and found[0] == f"ingest_skips:{skip[0]}":
+            self._check_extraction_skip(skip[0], skip[1])
+
+    def _skip_record(self, key: Key) -> tuple[str, dict[str, Any]] | None:
+        """The key's ``telemetry.ingest_skips`` row: ``(reason, detail)``."""
+        with self.checker.cursor() as cur:
+            cur.execute(
+                "SELECT reason, detail FROM telemetry.ingest_skips WHERE s3_key = %s",
+                (key.s3_key,),
+            )
+            row = cur.fetchone()
+        return None if row is None else (row[0], row[1] or {})
+
+    def _check_extraction_skip(self, reason: str, detail: dict[str, Any]) -> None:
+        """An extraction's skip verdict is re-judgeable and hid no ruling
+        (#5094): it carries the current rule version, and it never replaced
+        rulings the key held unless the run allowed the removal."""
+        from validation.skip_versions import EXTRACTION_SKIP_RULE_VERSION, stale_skip_reason
+
+        if reason not in _EXTRACTION_SKIPS:
+            return
+        if detail.get("rule_version") != EXTRACTION_SKIP_RULE_VERSION:
+            self._fail(
+                "explained",
+                f"the {reason} skip carries rule version {detail.get('rule_version')!r}, "
+                f"not {EXTRACTION_SKIP_RULE_VERSION}: the reconciler cannot re-judge it",
+            )
+        stale = stale_skip_reason(reason, detail)
+        if stale is not None:
+            self._fail(
+                "explained",
+                f"the {reason} skip replaced {detail.get('held_rulings')} ruling(s) the "
+                f"key held (stale: {stale}); the worker must refuse it (#5094)",
+            )
+        self.events[f"harness.explained.extraction_skip.{reason}"] += 1
 
     def _incomplete_marker(self, key: Key) -> tuple[str, int, datetime] | None:
         """The key's ``telemetry.ingest_incomplete`` record (#5008):
@@ -2244,6 +2308,12 @@ class KeyHarness:
             expect(
                 (_MARKER_EXHAUSTED_CHILD,),
                 f"a whole-document {step.kind} step whose enrichment was exhausted",
+            )
+            return
+        if outcome == "rejected" and self._empty_refusal:
+            expect(
+                (_MARKER_EMPTY_EXTRACTION,),
+                f"a {step.kind} step whose extraction's skip verdict was refused (#5094)",
             )
             return
         if outcome == "rejected":
@@ -2305,11 +2375,24 @@ class KeyHarness:
                 f"a refused {step.kind} step raised no AllChildrenRejectedError, so the "
                 "reingest does not count the key failed",
             )
+        if self._empty_refusal and any(r.ruling_text for r in extracted_rulings(step)):
+            # An ``empty_extraction`` refusal (#5094) is of a verdict that
+            # the document holds no rulings: every row textless, or none.
+            self._fail(
+                "refused",
+                "the worker refused an extraction's skip verdict on a step whose "
+                "extraction returned a ruling with text",
+            )
 
-    def _check_refusal_rejects_fresh(self, step: Step) -> None:
+    def _check_refusal_rejects_fresh(self, step: Step, empty_refusal: bool = False) -> None:
         """The refusal's oracle (#5057): the same bytes ingested on a fresh
         key (no history) write no ruling either.  Otherwise the refused
-        step did not reject every child on its merits."""
+        step did not reject every child on its merits.
+
+        For an extraction's skip verdict (*empty_refusal*, #5094) the fresh
+        key records the verdict as a skip, as before the fix, stamped with
+        the current rule version and no held rulings, so the reconciler
+        counts it as explained (and re-judges it once the rules change)."""
         self._refusal_oracles += 1
         owner = self._key.content_hash[:16] if self._key is not None else ""
         fresh = make_key(f"{self.run_token}-{self.seed}-{owner}-refusal-{self._refusal_oracles}")
@@ -2324,6 +2407,15 @@ class KeyHarness:
                 f"the worker refused an empty split set, but a fresh ingest of the same "
                 f"bytes writes {len(written)} ruling(s)",
             )
+        if empty_refusal:
+            skip = self._skip_record(fresh)
+            if skip is None or skip[0] not in _EXTRACTION_SKIPS:
+                self._fail(
+                    "refused",
+                    "the worker refused an extraction's skip verdict, but a fresh ingest "
+                    f"of the same bytes recorded no such skip (found {skip and skip[0]!r})",
+                )
+            self.events[f"harness.refused.fresh_skip.{skip[0]}"] += 1
 
     @contextmanager
     def _exhausted_enrichment(self, on: bool) -> Iterator[None]:

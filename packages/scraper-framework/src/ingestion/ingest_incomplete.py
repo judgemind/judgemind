@@ -23,6 +23,15 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   write and left the key's rows as they were (#5057).  The detail lists
   the rejections.  A reingest / rebuild run with ``--allow-ruling-removal``
   removes the rows instead.
+- ``empty_extraction``: an extraction's verdict that the document holds no
+  rulings (``no_ruling_text``: every multimodal row came back textless;
+  ``zero_rulings_no_text``: no rulings in a PDF with no text layer) on a
+  key that holds rulings (#5094).  Such a verdict is often a degraded
+  extraction (an LLM answering with empty cells, OCR that read nothing),
+  so the worker refused to replace the rulings with it and left the key's
+  rows as they were.  The detail carries the verdict.  A reingest /
+  rebuild run with ``--allow-ruling-removal`` removes the rows and records
+  the skip instead.
 - ``evidence_unavailable``: a scraper pre-split child's archived page,
   the only evidence for its LLM case number, could not be read, so the
   worker wrote nothing for it rather than trust the number unchecked
@@ -41,6 +50,13 @@ Some ingestion outcomes leave a key with incomplete rows, or none:
   key's ruling exists nowhere.  The key is re-ingested; once one of its
   rows holds a ruling again, or its dedup ruling exists, the reconciler
   deletes the record.
+- ``stale_skip``: written by the raw-key reconciler, not the worker
+  (#5094).  The key's only explanation is an extraction skip verdict
+  (``no_ruling_text`` / ``zero_rulings_no_text``) recorded under an older
+  rule version, or one that replaced rulings the key held
+  (``validation.skip_versions.stale_skip_reason``), so the key is
+  re-ingested with ``--bust-llm-cache``.  A reingest that writes the key,
+  or records the verdict again under the current rules, resolves it.
 
 A record whose raw object is gone from the archive can never heal: the
 reconciler moves it to ``telemetry.ingest_skips`` with reason
@@ -78,10 +94,13 @@ INCOMPLETE_DEAD_LETTER = "dead_letter"
 INCOMPLETE_REINGEST_FAILED = "reingest_failed"
 INCOMPLETE_ALL_CHILDREN_REJECTED = "all_children_rejected"
 INCOMPLETE_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+INCOMPLETE_EMPTY_EXTRACTION = "empty_extraction"
 #: Recorded by ``scripts/reconcile_raw_keys.py`` (#5027), never the worker.
 INCOMPLETE_STALE_VALIDATION = "stale_validation"
 #: Recorded by ``scripts/reconcile_raw_keys.py`` (#5093), never the worker.
 INCOMPLETE_ORPHANED_SUPERSEDED = "orphaned_superseded"
+#: Recorded by ``scripts/reconcile_raw_keys.py`` (#5094), never the worker.
+INCOMPLETE_STALE_SKIP = "stale_skip"
 
 INCOMPLETE_REASONS = frozenset(
     {
@@ -93,7 +112,9 @@ INCOMPLETE_REASONS = frozenset(
         INCOMPLETE_REINGEST_FAILED,
         INCOMPLETE_ALL_CHILDREN_REJECTED,
         INCOMPLETE_EVIDENCE_UNAVAILABLE,
+        INCOMPLETE_EMPTY_EXTRACTION,
         INCOMPLETE_STALE_VALIDATION,
+        INCOMPLETE_STALE_SKIP,
     }
 )
 

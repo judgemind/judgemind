@@ -2065,7 +2065,9 @@ def main() -> None:
             "them, records the key all_children_rejected in "
             "telemetry.ingest_incomplete and counts it in "
             "rows_kept_all_rejected (#5057).  For a rule tightening meant to "
-            "remove rows.  --reset removes every row of the scope anyway."
+            "remove rows.  Likewise an extraction's verdict of no rulings "
+            "(no_ruling_text, zero_rulings_no_text), recorded empty_extraction "
+            "(#5094).  --reset removes every row of the scope anyway."
         ),
     )
     args = parser.parse_args()
