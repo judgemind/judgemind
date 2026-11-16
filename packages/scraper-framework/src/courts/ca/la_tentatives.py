@@ -1251,9 +1251,9 @@ class LATentativeRulingsScraper(BaseScraper):
 
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=f"{CIVIL_URL} [{opt.value}]")
                 try:
-                    ruling_html = _post_for_ruling(client, tokens, opt)
+                    ruling_html = tally.retry(_post_for_ruling, client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
                         tally.blocked("stale ViewState error page", transient=True)
                         self._log.warning(
@@ -1476,9 +1476,9 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
 
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=f"{APPELLATE_URL} [{opt.value}]")
                 try:
-                    ruling_html = _post_for_ruling_appellate(client, tokens, opt)
+                    ruling_html = tally.retry(_post_for_ruling_appellate, client, tokens, opt)
                     if _is_stale_viewstate_response(ruling_html):
                         tally.blocked("stale ViewState error page", transient=True)
                         self._log.warning(

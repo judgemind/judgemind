@@ -430,7 +430,16 @@ def test_ventura_run_continues_when_doc_fails() -> None:
     )
     health = scraper.run()
 
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert health.failure_details is not None
+    assert any(
+        "/CaseInquiry/ViewFile/" in (s["url"] or "")
+        for s in health.failure_details["failed_fetches"]
+    )
     # 5 out of 6 documents succeeded (1 returned 404)
     assert health.records_captured == 5
 
@@ -665,15 +674,16 @@ def test_ventura_search_date_error() -> None:
 
 
 @respx.mock
-def test_ventura_search_date_error_with_other_date_empty_succeeds() -> None:
-    """One date's POST errors, another returns no results: the court was
-    reachable and genuinely empty, so the run succeeds (#4693)."""
+def test_ventura_search_date_error_with_other_date_empty_is_counted() -> None:
+    """One date's POST errors, another returns no results: not an all-failed
+    outage (#4693), but the failed date is a capture loss, so the run fails
+    with the date recorded (#5019)."""
     search_html = _load_html("ventura_search_page.html")
     no_results_html = _load_html("ventura_no_results_live_4748.html")
 
     respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
     respx.post(SEARCH_URL).mock(
-        side_effect=[httpx.Response(500), httpx.Response(200, text=no_results_html)]
+        side_effect=[httpx.Response(403), httpx.Response(200, text=no_results_html)]
     )
 
     config = ventura_default_config()
@@ -684,7 +694,16 @@ def test_ventura_search_date_error_with_other_date_empty_succeeds() -> None:
         search_dates=[datetime(2026, 3, 11), datetime(2026, 3, 12)],
     )
     health = scraper.run()
-    assert health.success is True
+    # One lost item is a capture loss, not a clean success (#5019).
+    assert health.success is False
+    assert health.records_failed == 1
+    assert health.error_message is not None
+    assert "per-item fetches not captured" in health.error_message
+    assert "all " not in health.error_message
+    assert health.failure_details is not None
+    assert any(
+        "date 3/11/2026" in (s["url"] or "") for s in health.failure_details["failed_fetches"]
+    )
     assert health.records_captured == 0
 
 

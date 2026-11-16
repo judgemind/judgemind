@@ -178,6 +178,68 @@ class CaptureFailures:
         }
 
 
+class FetchFailures:
+    """Per-item fetch failures across a run's :class:`FetchTally` objects (#5019).
+
+    A per-item fetch that raised or was blocked, and did not abort the loop,
+    used to leave no trace in ``telemetry.scraper_runs``: a run where one of
+    20 department PDFs timed out recorded ``success=True records_failed=0``.
+    Every tally created during the fetch registers with the run, and this
+    summary turns their counts into ``records_failed``, ``error_details``
+    and a failed run.
+    """
+
+    def __init__(self, tallies: list[FetchTally]) -> None:
+        self.attempted = sum(t.n_attempted for t in tallies)
+        self.failed = sum(t.n_failed for t in tallies)
+        self.blocked = sum(t.n_blocked for t in tallies)
+        self.skipped = sum(t.n_skipped for t in tallies)
+        self.retries = sum(t.n_retries for t in tallies)
+        self.recovered = sum(t.n_recovered for t in tallies)
+        self.samples = [s for t in tallies for s in t.samples][:_MAX_FAILURE_SAMPLES]
+        self.last_error = next(
+            (t.last_error or t.last_block_reason for t in reversed(tallies) if t.samples),
+            None,
+        )
+
+    @property
+    def total(self) -> int:
+        """Items attempted but not captured: raised or blocked."""
+        return self.failed + self.blocked
+
+    def message(self) -> str | None:
+        """One-line run error, or None when every attempted item was fetched."""
+        if not self.total:
+            return None
+        permanent = sum(1 for s in self.samples if s.get("permanent"))
+        text = (
+            f"{self.total} of {self.attempted} per-item fetches not captured "
+            f"({self.failed} raised errors, {self.blocked} blocked"
+        )
+        if permanent:
+            text += f", {permanent} gone (HTTP 404/410)"
+        return f"{text}); last error: {self.last_error}"
+
+    def details(self) -> dict[str, object] | None:
+        """Structured counts for ``scraper_runs.error_details``, or None.
+
+        Present when an item failed or a retry was needed, so a run that
+        only recovered on retries still leaves a trail.
+        """
+        if not self.total and not self.retries:
+            return None
+        return {
+            "fetch_attempted": self.attempted,
+            "fetch_failed": self.failed,
+            "fetch_blocked": self.blocked,
+            "fetch_skipped": self.skipped,
+            "fetch_retries": self.retries,
+            "fetch_recovered": self.recovered,
+            "failed_fetches": self.samples,
+            "failed_fetches_truncated": self.total > len(self.samples),
+        }
+
+
 class BaseScraper(abc.ABC):
     """Abstract base class for all Judgemind court scrapers.
 
@@ -211,7 +273,12 @@ class BaseScraper(abc.ABC):
         A loop that catches and logs each item's exception must count the
         outcomes with :class:`framework.fetch_tally.FetchTally` and call
         ``tally.raise_if_all_failed(docs)`` before returning, so that a run
-        where every item failed is recorded as a failure (#4693).
+        where every item failed is recorded as a failure (#4693).  Every
+        tally created during the fetch registers with the run, so a single
+        failed or blocked item also fails the run and lands in
+        ``records_failed`` / ``error_details`` (#5019).  Pass the item URL to
+        ``tally.attempt(url=...)`` and route the network call through
+        ``tally.retry`` / ``tally.http_get`` for the in-run transient retry.
 
     Deferred PDF transcription:
         A scraper whose ``parse_document`` intentionally leaves ``ruling_text``
@@ -292,6 +359,9 @@ class BaseScraper(abc.ABC):
         # Set by fetch_documents via _mark_partial_failure when the fetch
         # returned docs but skipped items (#4734). Reset at the start of run().
         self._partial_failure: str | None = None
+        # FetchTally objects created by the latest fetch_documents attempt
+        # (#5019). Reset at the start of run() and of each fetch attempt.
+        self._fetch_tallies: list[FetchTally] = []
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -331,6 +401,7 @@ class BaseScraper(abc.ABC):
         records_captured = 0
         error_message: str | None = None
         self._partial_failure = None
+        self._fetch_tallies = []
         failures = CaptureFailures()
         n_docs = 0
 
@@ -359,12 +430,19 @@ class BaseScraper(abc.ABC):
                             error=str(cause),
                         )
 
-                # A fetch that skipped items (#4734) and a document that was
-                # fetched but not archived or not emitted (#5009) both make
+                # A fetch that skipped items (#4734), a per-item fetch that
+                # raised or was blocked (#5019), and a document that was
+                # fetched but not archived or not emitted (#5009) all make
                 # the run a failure.  Documents that were captured stay
-                # archived and emitted.
+                # archived and emitted.  An abort message already carries the
+                # tally's counts and last errors, so the per-item summary is
+                # left out of the error text then (it still counts).
+                fetch_failures = FetchFailures(self._fetch_tallies)
+                fetch_message = None if self._partial_failure else fetch_failures.message()
                 problems = [
-                    m for m in (self._partial_failure, failures.message(n_docs)) if m is not None
+                    m
+                    for m in (self._partial_failure, fetch_message, failures.message(n_docs))
+                    if m is not None
                 ]
                 if problems:
                     success = False
@@ -372,8 +450,9 @@ class BaseScraper(abc.ABC):
                     self._log.error(
                         "Run partially failed",
                         records=records_captured,
-                        records_failed=failures.total,
+                        records_failed=failures.total + fetch_failures.total,
                         **{f"records_failed_{k}": v for k, v in failures.counts.items()},
+                        records_failed_fetch=fetch_failures.total,
                         error=error_message,
                     )
                 else:
@@ -400,13 +479,20 @@ class BaseScraper(abc.ABC):
                     self._inline_css_client = None
 
         elapsed = time.monotonic() - start
+        # Recomputed here so an all-failed fetch (which raised) also records
+        # its per-item counts and samples (#5019).
+        fetch_failures = FetchFailures(self._fetch_tallies)
+        failure_details = {
+            **(failures.details(n_docs) or {}),
+            **(fetch_failures.details() or {}),
+        }
         health = ScraperHealthEvent(
             producer_id=self.config.scraper_id,
             scraper_id=self.config.scraper_id,
             success=success,
             records_captured=records_captured,
-            records_failed=failures.total,
-            failure_details=failures.details(n_docs),
+            records_failed=failures.total + fetch_failures.total,
+            failure_details=failure_details or None,
             response_time_seconds=elapsed,
             error_message=error_message,
             run_timestamp=run_timestamp,
@@ -432,7 +518,12 @@ class BaseScraper(abc.ABC):
         - Any other exception (listing page, session acquisition) is one
           cheap request, retried with exponential backoff as before.
         - The total number of attempts never exceeds ``config.max_retries``.
+
+        Each attempt collects the :class:`FetchTally` objects it creates in
+        ``self._fetch_tallies`` (#5019); only the last attempt's count.
         """
+        from .fetch_tally import collect_fetch_tallies
+
         max_attempts = max(self.config.max_retries, 1)
         delay = _RETRY_BASE_DELAY_SECONDS
         all_failed_retried = False
@@ -442,7 +533,9 @@ class BaseScraper(abc.ABC):
             self._partial_failure = None
             attempt_start = time.monotonic()
             try:
-                return self.fetch_documents()
+                with collect_fetch_tallies() as tallies:
+                    self._fetch_tallies = tallies
+                    return self.fetch_documents()
             except EmptyListing as exc:
                 self._log.warning("empty_listing.no_retry", attempt=attempt, error=str(exc))
                 raise
@@ -604,7 +697,7 @@ class BaseScraper(abc.ABC):
             body_prefix=body[:200],
         )
         if tally is not None:
-            tally.blocked(message)
+            tally.blocked(message, url=url)
             return False
         raise EmptyListing(message)
 

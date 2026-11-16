@@ -1992,7 +1992,7 @@ class SCTentativeRulingsScraper(BaseScraper):
                     dept_docs = self._fetch_department(client, dept_info, tally)
                     docs.extend(dept_docs)
                 except Exception as exc:
-                    tally.failed(exc)
+                    tally.failed(exc, url=dept_info.page_url)
                     self._log.error(
                         "Failed to fetch department",
                         department=dept_info.department,
@@ -2028,8 +2028,7 @@ class SCTentativeRulingsScraper(BaseScraper):
             department=dept_info.department,
             url=dept_info.page_url,
         )
-        response = client.get(dept_info.page_url)
-        response.raise_for_status()
+        response = tally.http_get(client, dept_info.page_url)
 
         pdf_links = extract_pdf_links_from_dept_page(response.text)
         self._log.debug(
@@ -2046,7 +2045,10 @@ class SCTentativeRulingsScraper(BaseScraper):
                 # A department page with no PDF links still carries its
                 # "Department N Tentative Rulings" title. A 200 without it
                 # is a block page or a layout change (#4748).
-                tally.blocked("department page is not a department tentative-rulings page")
+                tally.blocked(
+                    "department page is not a department tentative-rulings page",
+                    url=dept_info.page_url,
+                )
                 self._log.error(
                     "sc.unexpected_dept_page",
                     department=dept_info.department,
@@ -2056,9 +2058,9 @@ class SCTentativeRulingsScraper(BaseScraper):
         for href, link_text in pdf_links:
             time.sleep(self.config.request_delay_seconds)
             try:
-                doc = self._fetch_one_pdf(client, href, link_text, dept_info)
+                doc = tally.retry(self._fetch_one_pdf, client, href, link_text, dept_info)
                 if not looks_like_pdf(doc.raw_content):
-                    tally.blocked(NOT_A_PDF_REASON)
+                    tally.blocked(NOT_A_PDF_REASON, url=href)
                     self._log.error(
                         "sc.not_a_pdf",
                         department=dept_info.department,
@@ -2075,7 +2077,7 @@ class SCTentativeRulingsScraper(BaseScraper):
                     url=href,
                 )
             except Exception as exc:
-                tally.failed(exc)
+                tally.failed(exc, url=href)
                 self._log.error(
                     "Failed to fetch PDF",
                     department=dept_info.department,

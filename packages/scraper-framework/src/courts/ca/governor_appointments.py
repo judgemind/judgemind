@@ -403,9 +403,9 @@ class GovernorAppointmentsScraper(BaseScraper):
             # Phase 2: Fetch each press release
             for pr_info in press_release_urls:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=pr_info["url"])
                 try:
-                    doc = self._fetch_press_release(client, pr_info)
+                    doc = tally.retry(self._fetch_press_release, client, pr_info)
                     docs.append(doc)
                     self._log.debug(
                         "Fetched press release",

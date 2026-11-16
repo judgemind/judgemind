@@ -255,9 +255,9 @@ class PdfLinkScraper(BaseScraper):
 
             for href, link_text in ruling_links:
                 time.sleep(self.config.request_delay_seconds)
-                tally.attempt()
+                tally.attempt(url=href)
                 try:
-                    doc = self._fetch_one_pdf(client, href, link_text)
+                    doc = tally.retry(self._fetch_one_pdf, client, href, link_text)
 
                     if not looks_like_pdf(doc.raw_content):
                         tally.blocked(NOT_A_PDF_REASON)
