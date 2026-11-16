@@ -221,6 +221,157 @@ create_test_file "same_line.sh" 'aws s3 rm "s3://assets/oneshot-scripts/x.py"  #
 assert_passes "a marker on the same line passes"
 reset_tmpdir
 
+# ── #5089: spellings the #5013 patterns missed ─────────────────────────────
+
+create_test_file "region.sh" 'aws --region us-west-2 s3 rm "s3://bucket/ca/x/raw/a.pdf"'
+assert_fails "a global option between aws and s3 (aws --region R s3 rm) is detected"
+reset_tmpdir
+
+create_test_file "profile.sh" 'aws --profile dev --no-cli-pager s3 mv s3://b/ca/a s3://b/old/a'
+assert_fails "several global options before s3 mv are detected"
+reset_tmpdir
+
+create_test_file "region_ok.sh" 'aws --region us-west-2 s3 cp s3://b/ca/a ./a'
+assert_passes "aws --region R s3 cp (no delete) passes"
+reset_tmpdir
+
+create_test_file "continued.sh" 'aws s3 \
+    rm "s3://bucket/ca/x/raw/a.pdf" \
+    --quiet'
+assert_fails "an aws s3 rm split over continuation lines is detected"
+reset_tmpdir
+
+create_test_file "continued2.sh" 'aws --region us-west-2 \
+  s3 sync ./local "s3://bucket/ca/" \
+  --delete'
+assert_fails "an aws s3 sync --delete split over continuation lines is detected"
+reset_tmpdir
+
+create_test_file "continued_marked.sh" '# s3-delete-not-raw: staged oneshot script
+aws s3 \
+    rm "s3://assets/oneshot-scripts/x.py"'
+assert_passes "a marked continued aws s3 rm passes"
+reset_tmpdir
+
+create_test_file "continued_ok.sh" 'aws s3 \
+    cp "s3://bucket/ca/a" ./a'
+assert_passes "a continued aws s3 cp (no delete) passes"
+reset_tmpdir
+
+create_test_file "obj_var.py" 'obj = bucket.Object(k)
+obj.delete()'
+assert_fails "obj = bucket.Object(k); obj.delete() with no resource(\"s3\") is detected"
+reset_tmpdir
+
+create_test_file "svc_name.py" 's3 = boto3.resource(service_name="s3")
+obj = s3.Bucket(b)
+obj.delete()'
+assert_fails "boto3.resource(service_name=\"s3\") marks the file as an S3 resource file"
+reset_tmpdir
+
+create_test_file "svc_name2.py" 's3 = boto3.resource(service_name = "s3")
+x = s3.Bucket(b)
+x.delete()'
+assert_fails "resource(service_name = \"s3\") with spaces is detected"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/other/lifecycle.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "archive_extra" {
+  bucket = var.document_archive_bucket_id
+
+  rule {
+    id     = "expire-all"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = 30
+    }
+  }
+}'
+assert_fails "a lifecycle expiration on the archive in another .tf file is detected"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/storage/lc.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
+  bucket = aws_s3_bucket.document_archive.id
+
+  dynamic "rule" {
+    for_each = var.expiry_rules
+    content {
+      id     = rule.value.id
+      status = "Enabled"
+      filter {
+        prefix = rule.value.prefix
+      }
+      expiration {
+        days = rule.value.days
+      }
+    }
+  }
+}'
+assert_fails "a dynamic \"rule\" block that expires archive objects is detected"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/storage/deep.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
+    bucket = aws_s3_bucket.document_archive.id
+    rule {
+        id = "four-space-indent"
+        filter {
+            prefix = "ca/"
+        }
+        noncurrent_version_expiration {
+            noncurrent_days = 30
+        }
+    }
+}'
+assert_fails "a noncurrent-version expiration at four-space indent on a raw prefix is detected"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/storage/marked.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
+  bucket = aws_s3_bucket.document_archive.id
+  # s3-delete-not-raw: a marker does not excuse a lifecycle expiration
+  rule {
+    id = "expire-all"
+    filter {}
+    expiration {
+      days = 30
+    }
+  }
+}'
+assert_fails "a marker does not excuse an archive lifecycle expiration"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/storage/ok.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
+  bucket = aws_s3_bucket.document_archive.id
+  rule {
+    id = "tiered"
+    filter {}
+    transition {
+      days          = 90
+      storage_class = "STANDARD_IA"
+    }
+  }
+  dynamic "rule" {
+    for_each = ["tmp/", "spotcheck/"]
+    content {
+      id = "ttl"
+      filter { prefix = "tmp/" }
+      expiration { days = 30 }
+    }
+  }
+}'
+assert_passes "archive lifecycle transitions and throwaway-prefix expirations pass"
+reset_tmpdir
+
+create_test_file "infra/terraform/modules/sessions/main.tf" 'resource "aws_s3_bucket_lifecycle_configuration" "sessions" {
+  bucket = aws_s3_bucket.sessions.id
+  rule {
+    id = "ttl"
+    filter {}
+    expiration { days = 7 }
+  }
+}'
+assert_passes "a lifecycle expiration on a non-archive bucket passes"
+reset_tmpdir
+
 # The real repository must be clean.
 TESTS=$((TESTS + 1))
 if "$CHECK_SCRIPT" > /dev/null 2>&1; then

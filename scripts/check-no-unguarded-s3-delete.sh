@@ -20,9 +20,13 @@
 #   - boto3 client:   delete_object( / delete_objects(
 #   - boto3 resource: s3.Object(...).delete(), bucket.objects.filter(...).delete(),
 #                     object_versions...delete(), and any .delete( call in a
-#                     file that builds a resource("s3")
+#                     file that builds a resource("s3") /
+#                     resource(service_name="s3") or calls .Object( /
+#                     .ObjectVersion(
 #   - AWS CLI:        aws s3 rm / mv / rb, aws s3 sync ... --delete,
-#                     aws s3api delete-object[s]
+#                     aws s3api delete-object[s]; global options may come
+#                     first (aws --region us-west-2 s3 rm), and a command
+#                     continued with trailing backslashes is joined first
 #   - JS SDK:         DeleteObject[s]Command
 #   - lifecycle:      put_bucket_lifecycle* / put-bucket-lifecycle* /
 #                     PutBucketLifecycle* (an expiration rule deletes too)
@@ -33,8 +37,16 @@
 #     # s3-delete-not-raw: <what is deleted, e.g. llm-cache/ delete markers>
 #
 # The marker covers only the call(s) right below it, not the whole file
-# (#5013).  The archive's bucket policy denies raw deletes regardless; this
-# check keeps new code from relying on that backstop.
+# (#5013).
+#
+# It also fails on a Terraform aws_s3_bucket_lifecycle_configuration, in any
+# *.tf file, whose bucket is the archive and which has a rule (any indent,
+# `dynamic "rule"` included) that expires objects outside spotcheck/, tmp/
+# and migrations/ (scripts/_tf_archive_lifecycle_expiry.awk, #5089).  No
+# marker excuses that.
+#
+# The archive's bucket policy denies raw deletes regardless; this check
+# keeps new code from relying on that backstop.
 #
 # Usage:
 #   scripts/check-no-unguarded-s3-delete.sh          # scan scripts/ packages/ .github/ infra/
@@ -60,7 +72,9 @@ else
     SCAN_DIRS=("$REPO_ROOT/scripts" "$REPO_ROOT/packages" "$REPO_ROOT/.github" "$REPO_ROOT/infra")
 fi
 
-S3CLI='aws[[:space:]]+s3[[:space:]]+'
+# Global options may sit between aws and s3: aws --region us-west-2 s3 rm
+# (#5089).  An option's value is a word that does not start with "-".
+S3CLI='aws([[:space:]]+--[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+s3[[:space:]]+'
 PATTERN="delete_objects?\("
 PATTERN+="|${S3CLI}(rm|mv|rb)([[:space:]]|$)"
 PATTERN+="|${S3CLI}sync[[:space:]].*--delete"
@@ -69,10 +83,17 @@ PATTERN+='|DeleteObjects?Command'
 PATTERN+='|\.(Object|ObjectVersion)\(.*\)\.delete\('
 PATTERN+='|\.(objects|object_versions)\.([a-z_]+\(.*\)\.)?delete\('
 PATTERN+='|put_bucket_lifecycle|put-bucket-lifecycle|PutBucketLifecycle'
-# A file that builds a boto3 S3 resource: any .delete( in it may be an
-# object delete held in a variable (obj = bucket.Object(k); obj.delete()).
-RESOURCE_PATTERN="resource\([[:space:]]*['\"]s3['\"]"
+# A file that builds a boto3 S3 resource (resource("s3") or
+# resource(service_name="s3")) or uses its Object / ObjectVersion classes:
+# any .delete( in it may be an object delete held in a variable
+# (obj = bucket.Object(k); obj.delete()), #5089.
+RESOURCE_PATTERN="resource\([[:space:]]*(service_name[[:space:]]*=[[:space:]]*)?['\"]s3['\"]"
+RESOURCE_PATTERN+='|\.(Object|ObjectVersion)\('
 RESOURCE_DELETE='\.delete\('
+# Terraform lifecycle expirations on the archive may only target these
+# throwaway prefixes (the same list as the storage module's policy check).
+LIFECYCLE_ALLOWED_PREFIXES="spotcheck/ tmp/ migrations/"
+LIFECYCLE_AWK="$SCRIPT_DIR/_tf_archive_lifecycle_expiry.awk"
 MARKER='s3-delete-not-raw:[[:space:]]*[^[:space:]]'
 MARKER_LOOKBACK=3
 GUARD_MODULE="packages/scraper-framework/src/framework/raw_delete_guard.py"
@@ -105,49 +126,119 @@ if [[ -n "$resource_files" ]]; then
     done <<< "$resource_files"
 fi
 
-# True when a marker sits on line $2 of file $1 or on one of the lines above.
+# True when a marker sits on line $2 of file $1, on one of the lines above,
+# or (for a command continued over several lines) on any line up to $3.
 has_marker() {
-    local file="$1" lineno="$2"
+    local file="$1" lineno="$2" end="${3:-$2}"
     local start=$((lineno - MARKER_LOOKBACK))
     [[ $start -lt 1 ]] && start=1
-    sed -n "${start},${lineno}p" "$file" | grep -qE "$MARKER"
+    sed -n "${start},${end}p" "$file" | grep -qE "$MARKER"
 }
+
+# A command split with trailing backslashes (aws s3 \ / rm ...) matches no
+# single line (#5089).  Join each continued command and print
+# file:first:last:joined for those spanning more than one line.
+JOIN_AWK='
+FNR == 1 { open = 0 }
+{
+    line = $0
+    cont = (line ~ /\\[ \t]*$/)
+    if (cont) sub(/\\[ \t]*$/, " ", line)
+    if (!open) { first = FNR; buf = line; open = 1 } else { buf = buf line }
+    if (!cont) {
+        if (FNR > first) print FILENAME ":" first ":" FNR ":" buf
+        open = 0
+    }
+}'
+continued=""
+continued_files=$(grep -rlIE '\\[[:space:]]*$' "${existing_dirs[@]}" "${exclude_args[@]}" 2>/dev/null || true)
+if [[ -n "$continued_files" ]]; then
+    while IFS= read -r f; do
+        joined=$(awk "$JOIN_AWK" "$f" | grep -E "^[^:]*:[0-9]+:[0-9]+:.*($PATTERN)" || true)
+        [[ -n "$joined" ]] && continued+="$joined"$'\n'
+    done <<< "$continued_files"
+fi
+
+# Terraform lifecycle rules that expire archive objects outside the
+# throwaway prefixes (#5089).  Every *.tf file, any indent, dynamic "rule"
+# blocks included.  No marker excuses these: a raw-bearing prefix must not
+# expire at all.
+lifecycle_hits=""
+lifecycle_files=$(grep -rlE 'aws_s3_bucket_lifecycle_configuration' "${existing_dirs[@]}" \
+    --include='*.tf' "${exclude_args[@]}" 2>/dev/null || true)
+if [[ -n "$lifecycle_files" ]]; then
+    while IFS= read -r f; do
+        hits=$(awk -v allowed="$LIFECYCLE_ALLOWED_PREFIXES" -f "$LIFECYCLE_AWK" "$f")
+        [[ -n "$hits" ]] && lifecycle_hits+="$hits"$'\n'
+    done <<< "$lifecycle_files"
+fi
 
 violations=0
 reported=""
 seen=""
+# Report $1 (file:line:content) unless it is exempt.  $2 = last line of a
+# continued command (marker search range); $3 = "no-marker" when a marker
+# does not excuse the hit.
+check_hit() {
+    local line="$1" end="${2:-}" mode="${3:-}" file_path rest lineno content
+    file_path="${line%%:*}"
+    rest="${line#*:}"
+    lineno="${rest%%:*}"
+    content="${rest#*:}"
+
+    case "$file_path" in
+        *"$GUARD_MODULE" | *scripts/check-no-unguarded-s3-delete.sh) return 0 ;;
+    esac
+    # A line hit by more than one scan is reported once.
+    case "$seen" in
+        *"|$file_path:$lineno|"*) return 0 ;;
+    esac
+    seen+="|$file_path:$lineno|"
+    # Comment lines may name the calls as context.
+    if [[ "$content" =~ ^[[:space:]]*(#|//|\*) ]]; then
+        return 0
+    fi
+    if [[ "$mode" != "no-marker" ]] && has_marker "$file_path" "$lineno" "${end:-$lineno}"; then
+        return 0
+    fi
+
+    if [[ $violations -eq 0 ]]; then
+        echo "ERROR: S3 delete outside framework.raw_delete_guard, with no marker:"
+        echo ""
+    fi
+    echo "    $line"
+    violations=$((violations + 1))
+    reported="$file_path"
+}
+
 if [[ -n "$matches" ]]; then
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        file_path="${line%%:*}"
-        rest="${line#*:}"
-        lineno="${rest%%:*}"
-        content="${rest#*:}"
-
-        case "$file_path" in
-            *"$GUARD_MODULE" | *scripts/check-no-unguarded-s3-delete.sh) continue ;;
-        esac
-        # A line hit by both scans is reported once.
-        case "$seen" in
-            *"|$file_path:$lineno|"*) continue ;;
-        esac
-        seen+="|$file_path:$lineno|"
-        # Comment lines may name the calls as context.
-        if [[ "$content" =~ ^[[:space:]]*(#|//|\*) ]]; then
-            continue
-        fi
-        if has_marker "$file_path" "$lineno"; then
-            continue
-        fi
-
-        if [[ $violations -eq 0 ]]; then
-            echo "ERROR: S3 delete outside framework.raw_delete_guard, with no marker:"
-            echo ""
-        fi
-        echo "    $line"
-        violations=$((violations + 1))
-        reported="$file_path"
+        check_hit "$line"
     done <<< "$matches"
+fi
+if [[ -n "$continued" ]]; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # file:first:last:joined
+        c_file="${line%%:*}"
+        c_rest="${line#*:}"
+        c_first="${c_rest%%:*}"
+        c_rest="${c_rest#*:}"
+        c_last="${c_rest%%:*}"
+        c_joined="${c_rest#*:}"
+        # A delete already on one physical line was reported above.
+        if sed -n "${c_first},${c_last}p" "$c_file" | grep -qE "$PATTERN"; then
+            continue
+        fi
+        check_hit "$c_file:$c_first:$c_joined" "$c_last"
+    done <<< "$continued"
+fi
+if [[ -n "$lifecycle_hits" ]]; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        check_hit "$line" "" no-marker
+    done <<< "$lifecycle_hits"
 fi
 
 if [[ $violations -gt 0 ]]; then
@@ -172,6 +263,20 @@ if [[ $violations -gt 0 ]]; then
     echo "  (it covers that call only, up to $MARKER_LOOKBACK lines below):"
     echo ""
     echo "    # s3-delete-not-raw: <what is deleted and why it is not a raw>"
+    echo ""
+    echo "  A Terraform lifecycle rule on the archive that expires objects takes"
+    echo "  no marker: filter it on a throwaway prefix ($LIFECYCLE_ALLOWED_PREFIXES):"
+    echo ""
+    echo "    rule {"
+    echo "      id     = \"tmp-ttl\""
+    echo "      status = \"Enabled\""
+    echo "      filter {"
+    echo "        prefix = \"tmp/\""
+    echo "      }"
+    echo "      expiration {"
+    echo "        days = 30"
+    echo "      }"
+    echo "    }"
     exit 1
 fi
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-test-git-env-scrub.sh — Fail when a test that writes to git can
+# check-test-git-env-scrub.sh — Fail when a test that runs git can
 # inherit git's repository env vars (issue #5058).
 #
 # `git push` (pre-push hook), `git rebase --exec`, `git bisect run` and `!`
@@ -16,23 +16,30 @@
 #     at the top of the file.
 #
 # What it checks
-#   1. Every test_*.py under a tests/ directory that runs a git write has a
+#   1. Every test_*.py under a tests/ directory that runs git has a
 #      conftest.py with the git-env-scrub block in one of its parent
 #      directories (up to the repo root).
 #   2. Every conftest.py copy of the block is identical to the canonical one.
-#   3. Every test_*.sh under a tests/ directory that runs a git write sources
+#   3. Every test_*.sh under a tests/ directory that runs git sources
 #      _git-env-scrub.sh at top level.
 #
-# A "git write" is detected textually (git + init/commit/config/update-ref),
-# so a file that only mocks those calls is flagged too; scrubbing there is
-# harmless.
+# Any git invocation counts, not only a list of write verbs (#5089): clone,
+# checkout -b, add, push, worktree add, reset ... all write, and even a read
+# with GIT_DIR exported reads the wrong repository. It is detected
+# textually, on non-comment lines:
+#   * Python: a "git" string ("git" list element, shutil.which("git")), a
+#     _git( helper call, a string that starts with "git <arg>" (an f-string
+#     or a shell=True command), or "git" after && ; | inside a string.
+#   * shell: git in command position (line start, after ; & | ( { ` ! $( ,
+#     then / do / else / exec / command / time / env, or VAR=x prefixes).
+# A file that only mocks git is flagged too; scrubbing there is harmless.
 #
 # Usage:
 #   scripts/check-test-git-env-scrub.sh             # scan the repo
 #   scripts/check-test-git-env-scrub.sh <repo_root> # scan another tree (tests)
 #
 # Exit codes:
-#   0 — every git-writing test is covered and every copy matches.
+#   0 — every git-running test is covered and every copy matches.
 #   1 — one or more violations (listed with a Fix: block).
 
 # venv: none
@@ -56,10 +63,15 @@ END_MARK='# --- END git-env-scrub (#5058) ---'
 CANON="scripts/tests/conftest.py"
 HELPER="scripts/tests/_git-env-scrub.sh"
 
-PY_VERB_RE="[\"'](init|commit|config|update-ref)[\"']"
-PY_GIT_RE="[\"']git[\"']|_git\\("
-SH_WRITE_RE='(^|[^[:alnum:]_-])git([[:space:]][^|;#]*)?[[:space:]](init|commit|config|update-ref)([^[:alnum:]_-]|$)'
+PY_GIT_RE="[\"']git[\"']|_git\\(|[\"']git[[:space:]]+[-a-z]|(&&|;|\\|)[[:space:]]*git[[:space:]]+[-a-z]"
+SH_GIT_RE='(^|[;&|({`!]|\$\(|(then|do|else|exec|command|time|env)[[:space:]])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+(-|[a-z])'
 SH_SOURCE_RE='^(\.|source)[[:space:]].*_git-env-scrub\.sh'
+COMMENT_RE='^[[:space:]]*#'
+
+# True when file $1 matches ERE $2 on a line that is not a comment.
+code_matches() {
+    grep -vE "$COMMENT_RE" "$1" | grep -qE "$2"
+}
 
 # Print the block (markers included) from a file.
 extract_block() {
@@ -129,16 +141,16 @@ py_missing=()
 py_drift=()
 sh_missing=()
 
-# 1. Python tests that write to git need the conftest block in scope.
+# 1. Python tests that run git need the conftest block in scope.
 while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     f="${f#./}"
-    grep -qE "$PY_GIT_RE" "$f" || continue
+    code_matches "$f" "$PY_GIT_RE" || continue
     if ! has_scrub_conftest "$f"; then
-        report "$f writes to git but no conftest.py above it has the git-env-scrub block"
+        report "$f runs git but no conftest.py above it has the git-env-scrub block"
         py_missing+=("$(tests_root_of "$f")/conftest.py")
     fi
-done < <(grep -rlE "$PY_VERB_RE" . --include='test_*.py' "${exclude_args[@]}" 2>/dev/null | in_tests_dir | sort)
+done < <(grep -rlE "$PY_GIT_RE" . --include='test_*.py' "${exclude_args[@]}" 2>/dev/null | in_tests_dir | sort)
 
 # 2. Every copy of the block matches the canonical one.
 if [[ ! -f "$CANON" ]] || ! grep -qxF "$BEGIN_MARK" "$CANON"; then
@@ -156,18 +168,19 @@ else
     done < <(grep -rlxF "$BEGIN_MARK" . --include='conftest.py' "${exclude_args[@]}" 2>/dev/null | sort)
 fi
 
-# 3. Shell tests that write to git source the helper at top level.
+# 3. Shell tests that run git source the helper at top level.
 while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     f="${f#./}"
+    code_matches "$f" "$SH_GIT_RE" || continue
     if ! grep -qE "$SH_SOURCE_RE" "$f"; then
-        report "$f writes to git but does not source _git-env-scrub.sh"
+        report "$f runs git but does not source _git-env-scrub.sh"
         sh_missing+=("$f")
     fi
-done < <(grep -rlE "$SH_WRITE_RE" . --include='test_*.sh' "${exclude_args[@]}" 2>/dev/null | in_tests_dir | sort)
+done < <(grep -rlE "$SH_GIT_RE" . --include='test_*.sh' "${exclude_args[@]}" 2>/dev/null | in_tests_dir | sort)
 
 if [[ "$failures" -eq 0 ]]; then
-    echo "OK: every git-writing test scrubs git's repository env vars (#5058)"
+    echo "OK: every git-running test scrubs git's repository env vars (#5058)"
     exit 0
 fi
 

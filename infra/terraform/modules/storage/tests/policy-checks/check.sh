@@ -15,9 +15,11 @@ set -euo pipefail
 #   3. The only exception is an exact ARN match (ArnNotEquals on
 #      aws:PrincipalArn): no ArnNotLike / StringNotLike wildcard that could
 #      widen the exception to a family of roles.
-#   4. No lifecycle rule expires objects outside the throwaway prefixes
-#      (spotcheck/, tmp/, migrations/). A lifecycle expiration deletes
-#      without a DeleteObject call, so the bucket policy cannot stop it.
+#   4. No lifecycle rule on the archive, in any *.tf file under
+#      infra/terraform/ (any indent, `dynamic "rule"` included, #5089),
+#      expires objects outside the throwaway prefixes (spotcheck/, tmp/,
+#      migrations/). A lifecycle expiration deletes without a DeleteObject
+#      call, so the bucket policy cannot stop it.
 #   5. No IAM policy anywhere under infra/terraform/ grants an S3 wildcard
 #      action (`s3:*`, `s3:Delete*`, ...), and only the storage module (in
 #      its Deny) names s3:DeleteObjectVersion.
@@ -118,24 +120,26 @@ fi
 
 # ── Check 4: lifecycle expirations only on throwaway prefixes ──────────────
 #
-# Walk each `rule {` block of the lifecycle configuration. A rule that
+# Walk each `rule {` / `dynamic "rule" {` block (any indent) of every
+# lifecycle configuration on the archive, in every *.tf file under
+# infra/terraform/ (#5089), not only this module's main.tf. A rule that
 # expires anything (expiration, noncurrent_version_expiration) must filter
 # on one of the allowed prefixes; `filter {}` covers the whole bucket,
-# raws included.
+# raws included. The walker is shared with
+# scripts/check-no-unguarded-s3-delete.sh.
 allowed_expiry_prefixes="spotcheck/ tmp/ migrations/"
-bad_rules=$(awk -v allowed="$allowed_expiry_prefixes" '
-    BEGIN { n = split(allowed, list, " "); for (i = 1; i <= n; i++) ok[list[i]] = 1 }
-    /resource "aws_s3_bucket_lifecycle_configuration"/ {inlc=1}
-    inlc && /^}$/ {inlc=0}
-    inlc && /^  rule \{/ {inrule=1; id=""; prefix=""; expires=0}
-    inrule && /id *=/ {gsub(/.*= *"|".*/, ""); id=$0}
-    inrule && /prefix *=/ {gsub(/.*= *"|".*/, ""); prefix=$0}
-    inrule && /(^|[^_])expiration *\{|noncurrent_version_expiration *\{/ {expires=1}
-    inrule && /^  }$/ {
-        inrule=0
-        if (expires && !(prefix in ok)) print id " (prefix=\"" prefix "\")"
-    }
-' <<< "$main_code")
+lifecycle_awk="$(cd "$MODULE_DIR/../../../.." && pwd)/scripts/_tf_archive_lifecycle_expiry.awk"
+if [ ! -f "$lifecycle_awk" ]; then
+    echo "FAIL: $lifecycle_awk not found" >&2
+    exit 2
+fi
+bad_rules=""
+while IFS= read -r tf; do
+    hits=$(awk -v allowed="$allowed_expiry_prefixes" -f "$lifecycle_awk" "$tf")
+    if [ -n "$hits" ]; then
+        bad_rules="$bad_rules $hits"
+    fi
+done < <(find "$TERRAFORM_DIR" -name '*.tf' -not -path '*/.terraform/*' | sort)
 if [ -z "$bad_rules" ]; then
     check "no lifecycle rule expires objects outside spotcheck/, tmp/, migrations/" 0
 else
