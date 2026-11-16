@@ -298,7 +298,7 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
       REQUIRE_PG_TESTS: "1"
-      JUDGEMIND_TEST_REDIS_URL: redis://localhost:6390/0
+      JUDGEMIND_TEST_REDIS_URL: redis://localhost:6379/0
       REQUIRE_REDIS_TESTS: "1"
     steps:
       - uses: actions/checkout@v6
