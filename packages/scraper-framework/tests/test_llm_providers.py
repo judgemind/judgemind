@@ -73,7 +73,9 @@ class TestCallAnthropic:
 
         call_kwargs = client.messages.create.call_args.kwargs
         assert call_kwargs["model"] == DEFAULT_HAIKU_MODEL
-        assert call_kwargs["temperature"] == 0
+        # SDK 1.x rejects the ``temperature`` kwarg; it rides in extra_body (#4960).
+        assert "temperature" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"temperature": 0}
         assert call_kwargs["max_tokens"] == 4096
 
     def test_rate_limit_retries_once(self) -> None:

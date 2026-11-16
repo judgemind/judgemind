@@ -3910,7 +3910,6 @@ class LlmExtractor:
                 {
                     "model": self._model,
                     "max_tokens": self._max_output_tokens,
-                    "temperature": 0,
                     "system": effective_prompt,
                     "messages": [{"role": "user", "content": user_message}],
                 },

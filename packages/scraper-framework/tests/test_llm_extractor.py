@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import anthropic
 import pytest
 import structlog
+from anthropic.resources.messages import Messages
 from helpers.anthropic_errors import connection_error, status_error, timeout_error
 
 from framework.llm_extractor import (
@@ -152,9 +153,13 @@ MULTI_RULING_JSON = json.dumps(
 
 @pytest.fixture
 def mock_client() -> MagicMock:
-    """Return a mock Anthropic client."""
+    """Return a mock Anthropic client.
+
+    ``messages`` is autospecced against the real SDK resource, so a
+    keyword the installed SDK rejects fails here too (#4960).
+    """
     client = MagicMock(spec=anthropic.Anthropic)
-    client.messages = MagicMock()
+    client.messages = create_autospec(Messages, instance=True)
     return client
 
 

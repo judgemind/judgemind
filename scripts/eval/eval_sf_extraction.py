@@ -437,7 +437,7 @@ def call_anthropic(
     response = client.messages.create(
         model=model_id,
         max_tokens=65536,
-        temperature=0,
+        extra_body={"temperature": 0},  # SDK 1.x dropped the kwarg (#4960)
         system=SF_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": text}],
     )
