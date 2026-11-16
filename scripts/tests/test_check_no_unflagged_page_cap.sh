@@ -97,6 +97,57 @@ for op in '>' '<=' '=='; do
     reset_tmpdir
 done
 
+# ── #5089: cap names in other spellings and word orders ───────────────────
+for cap in 'max_pdf_pages = 50' 'MAX_PAGE_COUNT = 40' 'OCR_PAGE_BUDGET = 10' \
+    'max_ocr_pages: int = 25' 'PAGE_LIMIT = 30' 'MaxPages = 20' \
+    'MAX_PAGES = int(os.environ.get("JM_MAX_PAGES", "50"))'; do
+    create_test_file "spelling.py" "$cap"
+    assert_fails "the cap [$cap] is detected"
+    reset_tmpdir
+done
+
+create_test_file "budget_cmp.py" 'if n >= ocr_page_budget:'
+assert_fails "a comparison against a page budget is detected"
+reset_tmpdir
+
+create_test_file "loop_break.py" 'for i, page in enumerate(pdf.pages):
+    if i >= 50:
+        break
+    texts.append(page.extract_text())'
+assert_fails "a literal-count break inside a loop over pages is detected"
+reset_tmpdir
+
+create_test_file "loop_break_inline.py" 'for i, page in enumerate(doc):
+    if i >= 50: break'
+assert_fails "a one-line literal-count break inside a loop over pages is detected"
+reset_tmpdir
+
+create_test_file "loop_break_flagged.py" 'for i, page in enumerate(pdf.pages):
+    # page-cap: a runaway bound far above real calendars.
+    if i >= 5000:
+        break'
+assert_passes "a marked literal-count break passes"
+reset_tmpdir
+
+create_test_file "loop_break_other.py" 'for row in rows:
+    if retries >= 3:
+        break
+for i, page in enumerate(pdf.pages):
+    text = page.extract_text()
+if found > 1:
+    break'
+assert_passes "a literal-count break outside a loop over pages passes"
+reset_tmpdir
+
+create_test_file "not_caps.py" '_SCANNED_PAGE_MAX_TEXT_CHARS = 200
+_MAX_PAGE_OUTPUT_TOKENS = 65536
+self._max_page_parse_retries = 1
+page_count: int = 0
+while i < page_count:
+    i += 1'
+assert_passes "per-page thresholds, retry counts and page counters are not caps"
+reset_tmpdir
+
 create_test_file "flagged.py" '# page-cap: past it the result is PdfText.incomplete (#4986).
 _OCR_MAX_PAGES = 100'
 assert_passes "a cap with a page-cap marker on the line above passes"

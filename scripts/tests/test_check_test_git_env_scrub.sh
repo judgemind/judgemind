@@ -79,7 +79,7 @@ root="$(new_root py_missing)"
 write_py_git_test "$root/other/tests/deep/test_b.py"
 run_check "$root"
 assert_eq "uncovered python test: exit 1" "$rc" "1"
-assert_contains "uncovered python test: names the file" "$err" "other/tests/deep/test_b.py writes to git"
+assert_contains "uncovered python test: names the file" "$err" "other/tests/deep/test_b.py runs git"
 assert_contains "uncovered python test: Fix block" "$err" "Fix:"
 assert_contains "uncovered python test: Fix names the conftest to edit" "$err" "    other/tests/conftest.py"
 assert_contains "uncovered python test: Fix names the imports" "$err" "'import subprocess' and 'import pytest'"
@@ -106,11 +106,65 @@ write_sh_git_test "$root/scripts/tests/test_s.sh" ""
 write_sh_git_test "$root/scripts/dispatcher/tests/test_d.sh" ""
 run_check "$root"
 assert_eq "unsourced shell tests: exit 1" "$rc" "1"
-assert_contains "unsourced shell test: names the file" "$err" "scripts/tests/test_s.sh writes to git but does not source _git-env-scrub.sh"
+assert_contains "unsourced shell test: names the file" "$err" "scripts/tests/test_s.sh runs git but does not source _git-env-scrub.sh"
 assert_contains "unsourced shell test: Fix gives the line for scripts/tests" "$err" \
     '. "$(dirname "${BASH_SOURCE[0]}")/_git-env-scrub.sh"  # unset inherited GIT_DIR etc. (#5058)'
 assert_contains "unsourced shell test: Fix gives the line for a nested dir" "$err" \
     '. "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/tests/_git-env-scrub.sh"'
+
+# ─── 6b. Any git invocation counts, not only four verbs (#5089) ───────────
+# Each shape below gets its own fake root so a miss is attributable.
+i=0
+for line in \
+    'git clone -q "$src" "$dst"' \
+    'git -C "$repo" checkout -b feature' \
+    'git -C "$repo" add file.txt' \
+    'git push origin HEAD' \
+    'git -C "$repo" worktree add "$wt"' \
+    'git reset --hard HEAD~1' \
+    'sha="$(git -C "$repo" rev-parse HEAD)"' \
+    '(cd "$repo" && git tag v1)' \
+    'GIT_AUTHOR_NAME=x git commit -q -m m'; do
+    i=$((i + 1))
+    root="$(new_root sh_verb_$i)"
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n%s\n' "$line" > "$root/scripts/tests/test_v.sh"
+    run_check "$root"
+    assert_eq "shell test running [$line] is flagged" "$rc" "1"
+done
+
+i=0
+for line in \
+    'subprocess.run(["git", "clone", src, dst], check=True, timeout=30)' \
+    'subprocess.run(["git", "-C", repo, "checkout", "-b", "f"], check=True, timeout=30)' \
+    'subprocess.run(["git", "push", "origin", "HEAD"], check=True, timeout=30)' \
+    'subprocess.run(f"git -C {repo} worktree add {wt}", shell=True, check=True, timeout=30)' \
+    'subprocess.run("git reset --hard HEAD~1", shell=True, check=True, timeout=30)' \
+    'subprocess.run(f"cd {repo} && git add .", shell=True, check=True, timeout=30)' \
+    '_git(repo, "add", "x")'; do
+    i=$((i + 1))
+    root="$(new_root py_verb_$i)"
+    mkdir -p "$root/other/tests"
+    printf 'import subprocess\n\n\ndef test_x(repo, src, dst, wt):\n    %s\n' "$line" > "$root/other/tests/test_v.py"
+    run_check "$root"
+    assert_eq "python test running [$line] is flagged" "$rc" "1"
+done
+
+# Mentions of git that are not invocations do not count.
+root="$(new_root not_invocations)"
+cat > "$root/scripts/tests/test_mentions.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# This test never runs git push; it only reads output.
+if echo "$output" | grep -q "git fetch origin main"; then echo ok; fi
+EOF
+mkdir -p "$root/other/tests"
+cat > "$root/other/tests/test_mentions.py" <<'EOF'
+# git clone is mentioned in this comment only.
+def test_x():
+    assert "a github url" != "b"
+EOF
+run_check "$root"
+assert_eq "comments and quoted mentions of git: exit 0" "$rc" "0" --err-file "$TMPDIR_TEST/err"
 
 # ─── 7. The Fix line for a nested dir actually resolves ───────────────────
 nested_dir="$SCRIPT_DIR/dispatcher/tests"

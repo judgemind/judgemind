@@ -21,8 +21,8 @@ Use this naming convention for any sourced library file under
 
 ### Tests that write to git
 
-A shell test that runs `git init` / `commit` / `config` / `update-ref`
-must source `_git-env-scrub.sh` right after `set -euo pipefail`, so a
+A shell test that runs git (any subcommand: `init`, `commit`, `clone`,
+`checkout`, `push`, `worktree add`, `rev-parse` ..., #5089) must source `_git-env-scrub.sh` right after `set -euo pipefail`, so a
 `GIT_DIR` exported by a git hook (or `git rebase --exec`, `git bisect
 run`) cannot redirect its writes into the real repository (#5045,
 #5058). pytest tests get the same protection from the `git-env-scrub`

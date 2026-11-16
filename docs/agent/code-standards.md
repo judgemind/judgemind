@@ -230,7 +230,7 @@ A git hook, `git rebase --exec`, `git bisect run` or a `!` alias runs its comman
 
 - **pytest:** every Python test root's `conftest.py` (`scripts/tests`, `scripts/dispatcher/tests`, `scripts/dispatcher_v3/tests`, `packages/{scraper-framework,nlp-pipeline,judgemind-config}/tests`) has the `git-env-scrub` block. It is a session fixture that removes every variable `git rev-parse --local-env-vars` lists, and points `GIT_CONFIG_GLOBAL` at a throwaway file, so a test cannot write `~/.gitconfig` either. The canonical copy is `scripts/tests/conftest.py`; the other copies must be identical.
 - **shell tests:** source `scripts/tests/_git-env-scrub.sh` right after `set -euo pipefail`.
-- **guard:** `scripts/check-test-git-env-scrub.sh` (CI and the pre-push guard umbrella) fails when a git-writing test has neither, or when a copy of the block drifts. Its `Fix:` block prints the line or file to add.
+- **guard:** `scripts/check-test-git-env-scrub.sh` (CI and the pre-push guard umbrella) fails when a test that runs git has neither, or when a copy of the block drifts. Any git subcommand counts, not only `init` / `commit` / `config` / `update-ref`: `clone`, `checkout -b`, `add`, `push`, `worktree add` and `reset` write too, and a read with `GIT_DIR` exported reads the wrong repository (#5089). It detects git in a Python list, an f-string or a `shell=True` command string, and in shell command position; comment lines do not count. Its `Fix:` block prints the line or file to add.
 
 ### Tests never reach real GitHub (gh isolation)
 
