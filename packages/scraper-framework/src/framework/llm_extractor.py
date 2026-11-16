@@ -560,6 +560,26 @@ PDF_PER_PAGE_PROMPT = (
     "}"
 )
 
+#: The provider and model of the worker's multimodal PDF extractor
+#: (``IngestionWorker._get_multimodal_extractor``).  The raw-key reconciler
+#: compares the extractor identity recorded on an extraction skip verdict
+#: with :func:`current_pdf_cache_namespace` (#5134).
+MULTIMODAL_PDF_PROVIDER = "google"
+MULTIMODAL_PDF_MODEL = "gemini-2.5-flash-lite"
+
+
+def pdf_cache_namespace(provider: str, model: str) -> str:
+    """The PDF split identity of an extractor of *provider* and *model*:
+    its LLM cache namespace, ``{provider}-{model}/prompt-{hash}`` (#5094)."""
+    return f"{provider}-{model}/prompt-{_prompt_hash(PDF_PER_PAGE_PROMPT)[:16]}"
+
+
+def current_pdf_cache_namespace() -> str:
+    """The identity the worker's multimodal extractor records today on an
+    extraction skip verdict (#5134)."""
+    return pdf_cache_namespace(MULTIMODAL_PDF_PROVIDER, MULTIMODAL_PDF_MODEL)
+
+
 # Pattern to detect case numbers across all California county formats:
 #   OC:          2024-01393434, 25D006297
 #   Riverside:   CVRI2401570, CVPS2305159, CVSW2303829
@@ -3594,7 +3614,7 @@ class LlmExtractor:
         exactly when ``extract_from_pdf`` stops reading earlier cache
         entries.  The worker records it on an extraction's skip verdict
         (``no_ruling_text``, ``zero_rulings_no_text``)."""
-        return f"{self._provider}-{self._model}/prompt-{_prompt_hash(PDF_PER_PAGE_PROMPT)[:16]}"
+        return pdf_cache_namespace(self._provider, self._model)
 
     def extract_from_pdf(
         self,

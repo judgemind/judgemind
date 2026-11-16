@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import reconcile_raw_keys as rec
+from validation.skip_versions import EXTRACTION_SKIP_RULE_VERSION
 
 BUCKET = "test-archive"
 LA = "ca/los_angeles/superior_court/raw/"
@@ -177,7 +178,9 @@ def test_skip_record_beats_validation_fail() -> None:
         skips={key: "zero_rulings_no_text"},
         validation_fail={key},
         # Recorded under the current rules (#5094): the verdict stands.
-        skip_details={key: {"rule_version": 2, "held_rulings": 0}},
+        skip_details={
+            key: {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "held_rulings": 0}
+        },
     )
     assert rec.classify(_raw(key), ex, now=NOW, grace=timedelta(0)) == (
         "skipped",

@@ -54,7 +54,13 @@ from courts.ca.la_dept_judges import (
 )
 from framework.enrichment import EnrichmentEngine
 from framework.events import trim_consumed_entries
-from framework.llm_extractor import LlmExtractor, PageCapExceededError, PartialExtractionError
+from framework.llm_extractor import (
+    MULTIMODAL_PDF_MODEL,
+    MULTIMODAL_PDF_PROVIDER,
+    LlmExtractor,
+    PageCapExceededError,
+    PartialExtractionError,
+)
 from framework.models import ContentFormat
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
@@ -2019,6 +2025,31 @@ def _empty_split_skip_reason(batch: _SplitBatch) -> str | None:
     return None
 
 
+def _is_textless_multimodal_row(extraction_method: str | None, ruling_text: str | None) -> bool:
+    """Whether a split row is a textless multimodal row (#4714): skipped,
+    and counted toward the ``no_ruling_text`` verdict (#5015).
+
+    Pinned by ``tests/test_skip_versions_fingerprint.py`` (#5134): a change
+    here can turn that verdict into rulings, so it needs an
+    ``EXTRACTION_SKIP_RULE_VERSION`` bump."""
+    return extraction_method == "multimodal" and not (ruling_text or "").strip()
+
+
+def _is_zero_rulings_no_text(
+    extraction_method: str | None, extracted_rulings: object, ruling_text: str | None
+) -> bool:
+    """Whether a split that found no rulings is the ``zero_rulings_no_text``
+    verdict (#4714): a complete multimodal extraction of a PDF with no text
+    (no text layer, no OCR fallback) to fall back on.
+
+    Pinned by ``tests/test_skip_versions_fingerprint.py`` (#5134)."""
+    return (
+        extraction_method == "multimodal"
+        and extracted_rulings is not None
+        and not (ruling_text or "").strip()
+    )
+
+
 def _writes_nothing(batch: _SplitBatch) -> bool:
     """Whether a worker split writes and keeps no child, and nothing says
     the document holds no rulings (#5057).
@@ -2724,8 +2755,8 @@ class IngestionWorker:
                 # cache-bust intent into every multimodal extraction call
                 # (#4049).
                 self._multimodal_extractor = LlmExtractor(
-                    provider="google",
-                    model="gemini-2.5-flash-lite",
+                    provider=MULTIMODAL_PDF_PROVIDER,
+                    model=MULTIMODAL_PDF_MODEL,
                     bust_cache=self._bust_llm_cache,
                 )
                 logger.info(
@@ -2748,8 +2779,8 @@ class IngestionWorker:
                 # cache-bust intent into every multimodal extraction call
                 # (#4049).
                 extractor = LlmExtractor(
-                    provider="google",
-                    model="gemini-2.5-flash-lite",
+                    provider=MULTIMODAL_PDF_PROVIDER,
+                    model=MULTIMODAL_PDF_MODEL,
                     max_output_tokens=max_output_tokens,
                     bust_cache=self._bust_llm_cache,
                 )
@@ -7219,11 +7250,7 @@ class IngestionWorker:
             # ``data_quality.ruling_empty_text_dropped`` event on every run.
             # The ``zero_ruling_extraction`` warning above is the signal for
             # this document.
-            if (
-                extraction_method == "multimodal"
-                and extracted_rulings is not None
-                and not (ruling_text or "").strip()
-            ):
+            if _is_zero_rulings_no_text(extraction_method, extracted_rulings, ruling_text):
                 logger.info(
                     "llm_split.zero_rulings_no_text_skipped",
                     extra={
@@ -7546,7 +7573,7 @@ class IngestionWorker:
             # rows on every run.  Skip them here with their own event, so
             # that telemetry still means "a ruling lost its text".  Split
             # IDs are unchanged because indices come from the full list.
-            if extraction_method == "multimodal" and not (cr.ruling_text or "").strip():
+            if _is_textless_multimodal_row(extraction_method, cr.ruling_text):
                 entry_number = extracted_rulings[cr.split_index].entry_number
                 logger.info(
                     "llm_split.textless_row_skipped",
