@@ -1800,6 +1800,77 @@ JSON
     fi
 }
 
+# ── Cancelled newest run does not hide an older failure (#5097) ────────────
+#
+# A failed check's re-run is cancelled (e.g. by a concurrency group with no
+# later run). Cancelled checks do not block (#4407), so judging the check by
+# its cancelled newest run would let the script exit 0 over a failure.
+
+# Old failure + newer cancelled run of the same check → failure (exit 1).
+test_cancelled_rerun_does_not_hide_failure_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" failure completed cancelled
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ]; then
+        pass "cancelled_rerun: old failure + newer cancelled run of the same check exits 1"
+    else
+        fail "cancelled_rerun: old failure + newer cancelled run of the same check exits 1" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -q "closing-refs: conclusion=failure.*43761406324"; then
+        pass "cancelled_rerun: reports the older failing run"
+    else
+        fail "cancelled_rerun: reports the older failing run" "output=$output"
+    fi
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        fail "cancelled_rerun: must not report success" "output=$output"
+    else
+        pass "cancelled_rerun: does not report success"
+    fi
+}
+
+# Old success + newer cancelled run of the same check → the success stands
+# (exit 0); the cancel alone is still non-blocking.
+test_cancelled_rerun_after_success_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" success completed cancelled
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        pass "cancelled_rerun_after_success: old success + newer cancelled run exits 0"
+    else
+        fail "cancelled_rerun_after_success: old success + newer cancelled run exits 0" "exit=$exit_code output=$output"
+    fi
+}
+
+# Every run of the check was cancelled → still cancelled, still non-blocking.
+test_all_runs_cancelled_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_superseded_closing_refs_response "$tmpdir/responses/01.json" cancelled completed cancelled
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=UNSTABLE \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ] && echo "$output" | grep -q "cancelled=1"; then
+        pass "all_runs_cancelled: a check whose runs were all cancelled stays non-blocking (exit 0)"
+    else
+        fail "all_runs_cancelled: a check whose runs were all cancelled stays non-blocking (exit 0)" "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Pending PR-text checks block success (#5090) ───────────────────────────
 #
 # `closing-refs` passed, then `gh pr edit` added a stray closing ref and
@@ -1945,6 +2016,9 @@ test_two_checks_one_failed_exits_1
 test_superseded_failure_rerun_in_progress_waits
 test_superseded_failure_rerun_then_success_exits_0
 test_same_name_different_app_not_collapsed
+test_cancelled_rerun_does_not_hide_failure_exits_1
+test_cancelled_rerun_after_success_exits_0
+test_all_runs_cancelled_exits_0
 test_pending_closing_refs_blocks_success
 test_pending_validate_pr_blocks_success
 test_pending_closing_refs_then_success_exits_0

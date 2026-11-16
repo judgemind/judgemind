@@ -978,6 +978,79 @@ test_superseded_follow_times_out_124() {
     fi
 }
 
+# Test 20b (#5097): deployment-id mode. Call 1 follows a same-image
+# superseding deployment and times out (124). ECS then drops the original
+# deployment. The resume must name the FOLLOWED deployment, and resuming on
+# it exits 0 — not 3 ("superseded before this call saw it").
+test_deployment_id_resume_after_follow_does_not_exit_3() {
+    local tmpdir followed_file
+    tmpdir=$(make_temp_dir)
+    followed_file="$tmpdir/followed-id"
+    setup_incident_taskdefs "$tmpdir" "$OUR_DIGEST"
+    # Poll 1: terraform's :809 is PRIMARY, ours (:808) is still listed but
+    # DRAINING. A 0s budget ends the call after this one poll.
+    write_services "$tmpdir/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1), $(dep_json ecs-svc/808 "$OUR_TD" DRAINING IN_PROGRESS 1 0)]"
+
+    local output exit_code=0
+    output=$(ROLLOUT_FOLLOWED_ID_FILE="$followed_file" ROLLOUT_TIMEOUT_SECS=0 \
+        run_script_by_deployment_id "$tmpdir" ecs-svc/808 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 124 ]] && grep -q "Waiting on it instead" <<< "$output"; then
+        pass "deployment-id follow: first call follows the same-image deployment and exits 124"
+    else
+        fail "deployment-id follow: first call follows the same-image deployment and exits 124" "exit=$exit_code output=$output"
+    fi
+    local followed=""
+    read -r followed < "$followed_file" || true
+    if [[ "$followed" == "ecs-svc/809" ]]; then
+        pass "deployment-id follow: writes the followed deployment ID to ROLLOUT_FOLLOWED_ID_FILE"
+    else
+        fail "deployment-id follow: writes the followed deployment ID to ROLLOUT_FOLLOWED_ID_FILE" "file=$followed"
+    fi
+    if grep -q "Re-run with NEW_DEPLOYMENT_ID=ecs-svc/809" <<< "$output" \
+        && ! grep -q "Re-run with the same env vars" <<< "$output"; then
+        pass "deployment-id follow: resume hint names the followed deployment, not the original"
+    else
+        fail "deployment-id follow: resume hint names the followed deployment, not the original" "output=$output"
+    fi
+
+    # Resume: the original :808 deployment is gone from deployments[].
+    local tmpdir2
+    tmpdir2=$(make_temp_dir)
+    setup_incident_taskdefs "$tmpdir2" "$OUR_DIGEST"
+    write_services "$tmpdir2/responses/01.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY IN_PROGRESS 0 1)]"
+    write_services "$tmpdir2/responses/02.json" \
+        "[$(dep_json ecs-svc/809 "$TF_TD" PRIMARY COMPLETED 1 1)]"
+
+    exit_code=0
+    output=$(ROLLOUT_TIMEOUT_SECS=60 run_script_by_deployment_id "$tmpdir2" "$followed" 2>&1) || exit_code=$?
+    if [[ "$exit_code" -eq 0 ]] && ! grep -q "SUPERSEDED" <<< "$output"; then
+        pass "deployment-id resume on the followed deployment (original gone): exits 0, not 3"
+    else
+        fail "deployment-id resume on the followed deployment (original gone): exits 0, not 3" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 20c: nothing followed → ROLLOUT_FOLLOWED_ID_FILE stays empty.
+test_followed_id_file_untouched_without_follow() {
+    local tmpdir followed_file
+    tmpdir=$(make_temp_dir)
+    followed_file="$tmpdir/followed-id"
+    : > "$followed_file"
+    write_response "$tmpdir/responses/01.json" COMPLETED 1 1 0 arn:test:shared ecs-svc/new-redeploy
+
+    local exit_code=0
+    ROLLOUT_FOLLOWED_ID_FILE="$followed_file" run_script_by_deployment_id "$tmpdir" ecs-svc/new-redeploy \
+        > /dev/null 2>&1 || exit_code=$?
+    if [[ "$exit_code" -eq 0 && ! -s "$followed_file" ]]; then
+        pass "no supersession: ROLLOUT_FOLLOWED_ID_FILE left empty"
+    else
+        fail "no supersession: ROLLOUT_FOLLOWED_ID_FILE left empty" "exit=$exit_code file=$(cat "$followed_file")"
+    fi
+}
+
 # Test 21: the ECR lookup fails outright (expired credentials) → exit 125,
 # state unknown — not a superseded verdict and not a timeout.
 test_superseded_image_lookup_failure_125() {
@@ -1066,6 +1139,8 @@ test_superseded_newer_revision_detected_on_first_poll
 test_demoted_deployment_is_not_success
 test_superseded_after_grace_polls
 test_superseded_follow_times_out_124
+test_deployment_id_resume_after_follow_does_not_exit_3
+test_followed_id_file_untouched_without_follow
 test_superseded_image_lookup_failure_125
 test_superseded_deleted_tag_is_mismatch
 test_normal_rollout_makes_no_image_lookups

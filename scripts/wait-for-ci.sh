@@ -47,7 +47,10 @@
 # still listed. The poll loop therefore keeps only the newest run (highest
 # check-run id) per (check name, app) before it counts failures (#5078): a
 # failure replaced by a newer run of the same check does not block, and a
-# newer run still in progress makes the script wait for its verdict.
+# newer run still in progress makes the script wait for its verdict. A
+# newest run that was cancelled is not a verdict: the check falls back to
+# its newest completed, non-cancelled run, so a cancelled re-run cannot hide
+# an earlier failure (#5097).
 #
 # ── Usage ────────────────────────────────────────────────────────────────────
 #
@@ -559,12 +562,23 @@ while true; do
     # required check. A failure that a newer run of the same check replaced
     # (success, or still in progress) no longer counts as failed.
     #
+    # A cancelled run is not a verdict (#5097): cancelled checks do not block
+    # (#4407), so a newest run that is `cancelled` would hide an older
+    # `failure` of the same check, e.g. a re-run killed by a concurrency
+    # group with no later run. When the newest run is cancelled, the check is
+    # judged by its newest completed run that is not cancelled; only when
+    # every run was cancelled does it stay cancelled.
+    #
     # CHECK_RUNS_ALL_JSON keeps every run: the `ci-passed` rule below (#4965)
     # still requires that NO `ci-passed` run on the SHA is in progress.
     CHECK_RUNS_ALL_JSON="$CHECK_RUNS_JSON"
     CHECK_RUNS_JSON=$(printf '%s' "$CHECK_RUNS_ALL_JSON" | jq '
         group_by([(.name // ""), ((.app.id // .app.slug // "") | tostring)])
-        | map(sort_by([(.id // 0), (.started_at // "")]) | last)')
+        | map(sort_by([(.id // 0), (.started_at // "")])
+            | if (last | .status == "completed" and .conclusion == "cancelled")
+              then ((map(select(.status == "completed" and .conclusion != "cancelled")) | last) // last)
+              else last
+              end)')
     # Checks whose newest run is still going and whose replaced run failed:
     # the verdict is not known yet, so success must wait for them. Without
     # this, a re-run of a failed non-required check (which no longer counts

@@ -29,7 +29,9 @@
 #   124   the wait ran out while the deployment is still rolling out.  NOT a
 #         failure.  Do NOT re-run the plain command (that would force yet
 #         another deployment).  Re-run with `--deployment-id <id>`, as
-#         printed, to keep waiting on the same deployment.
+#         printed, to keep waiting on the same deployment.  When a newer
+#         deployment with the same image replaced ours, the printed id is
+#         that newer deployment's (#5097).
 #   125   describe-services failed, so the rollout state is unknown.
 #         Refresh credentials, then re-run with `--deployment-id <id>`.
 #
@@ -161,23 +163,41 @@ if [[ $_rollout_secs -lt 0 ]]; then
 fi
 export ROLLOUT_TIMEOUT_SECS="$_rollout_secs"
 
+# wait-for-rollout.sh writes the ID of a superseding deployment it follows
+# (same image, #5073) here.  The resume command must name that deployment:
+# ECS soon drops the replaced one, and a re-run on its ID could no longer
+# compare images and would exit 3 for a rollout that is succeeding (#5097).
+FOLLOWED_ID_FILE=$(mktemp)
+# shellcheck disable=SC2329  # invoked via the EXIT trap
+_rm_followed_id_file() { rm -f "$FOLLOWED_ID_FILE"; }
+trap _rm_followed_id_file EXIT
+export ROLLOUT_FOLLOWED_ID_FILE="$FOLLOWED_ID_FILE"
+
 ROLLOUT_RC=0
 "$REPO_ROOT/scripts/wait-for-rollout.sh" || ROLLOUT_RC=$?
 if [[ $ROLLOUT_RC -eq 124 || $ROLLOUT_RC -eq 125 ]]; then
+    RESUME_ID="$NEW_DEPLOYMENT_ID"
+    FOLLOWED_ID=""
+    read -r FOLLOWED_ID < "$FOLLOWED_ID_FILE" || true
+    if [[ -n "$FOLLOWED_ID" ]]; then
+        RESUME_ID="$FOLLOWED_ID"
+        echo "Deployment $NEW_DEPLOYMENT_ID was superseded by deployment $FOLLOWED_ID, which carries the same image; waiting on $FOLLOWED_ID." >&2
+    fi
     if [[ $ROLLOUT_RC -eq 124 ]]; then
-        echo "Deployment $NEW_DEPLOYMENT_ID is still rolling out. This is NOT a failure." >&2
+        echo "Deployment $RESUME_ID is still rolling out. This is NOT a failure." >&2
     else
-        echo "Rollout state of deployment $NEW_DEPLOYMENT_ID is unknown (describe-services failed); refresh AWS credentials first." >&2
+        echo "Rollout state of deployment $RESUME_ID is unknown (describe-services failed); refresh AWS credentials first." >&2
     fi
     echo "Do NOT re-run the plain command: that would force another deployment." >&2
     echo "To keep waiting on this deployment:" >&2
-    echo "  scripts/ecs-redeploy.sh $SERVICE $CLUSTER --deployment-id $NEW_DEPLOYMENT_ID" >&2
+    echo "  scripts/ecs-redeploy.sh $SERVICE $CLUSTER --deployment-id $RESUME_ID" >&2
     exit "$ROLLOUT_RC"
 fi
 if [[ $ROLLOUT_RC -eq 3 ]]; then
-    # Another deployment replaced ours and does not carry the same image
+    # Another deployment replaced ours, and either it does not carry the same
+    # image or ours was gone before its image could be read
     # (wait-for-rollout.sh printed the reason, #5073).
-    echo "ERROR: Deployment $NEW_DEPLOYMENT_ID was superseded by a deployment with a different image." >&2
+    echo "ERROR: Deployment $NEW_DEPLOYMENT_ID was superseded by a deployment that is not known to carry its image (reason above)." >&2
     exit 3
 fi
 if [[ $ROLLOUT_RC -ne 0 ]]; then
