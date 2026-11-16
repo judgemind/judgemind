@@ -36,6 +36,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog
 
 from ingestion import llm_extract as _llm_extract
 
@@ -234,6 +235,48 @@ def _gh_isolate_check(request: pytest.FixtureRequest, _gh_isolate: object) -> ob
 
 
 # --- END gh-isolate (#5071) ---
+
+# ---------------------------------------------------------------------------
+# structlog: no cached loggers in the test process (#5113)
+# ---------------------------------------------------------------------------
+#
+# ``configure_structlog()`` sets ``cache_logger_on_first_use=True``, and many
+# modules the tests import call it at import time (``ingestion/__main__.py``,
+# ``scripts/rebuild_db.py``, ``scripts/reingest_from_s3.py``, ...). With
+# caching on, the first call through a module-level
+# ``structlog.get_logger(__name__)`` proxy freezes the processor list that was
+# current then. Any later ``structlog.configure(processors=...)`` installs a
+# new list, and ``structlog.testing.capture_logs()`` only patches the current
+# one, so that test captures nothing from the cached logger. Which logger got
+# cached, and when, depends on test order: #5113 failed
+# ``test_exhausts_retries_returns_empty`` in file order and
+# ``test_llm_providers`` tests under random order / xdist.
+#
+# ``pytest_configure`` runs before collection, so it covers import-time
+# configure calls too. ``structlog.configure`` is wrapped so every call
+# (``configure_structlog``, scripts, tests) gets caching forced off. An
+# uncached proxy reads the global config on every call. Production keeps
+# caching; ``test_configure_structlog`` checks that ``configure_structlog``
+# still asks for it.
+_STRUCTLOG_REAL_CONFIGURE = structlog.configure
+
+
+def _structlog_configure_uncached(*args: object, **kwargs: object) -> None:
+    """``structlog.configure`` with ``cache_logger_on_first_use`` forced off."""
+    kwargs["cache_logger_on_first_use"] = False
+    _STRUCTLOG_REAL_CONFIGURE(*args, **kwargs)  # type: ignore[arg-type]
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Turn structlog logger caching off for the whole session (#5113)."""
+    structlog.configure = _structlog_configure_uncached  # type: ignore[assignment]
+    _STRUCTLOG_REAL_CONFIGURE(cache_logger_on_first_use=False)
+
+    def _restore() -> None:
+        structlog.configure = _STRUCTLOG_REAL_CONFIGURE
+
+    config.add_cleanup(_restore)
+
 
 # ---------------------------------------------------------------------------
 # Disk-based cross-worker PDF text cache

@@ -49,6 +49,7 @@ dev = [
     "pytest-testmon>=2.1",
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.3", # per-test timeout fails a stuck test instead of hanging pre-push (#4812)
+    "pytest-randomly>=3.15", # random test order every run, so state leaks between tests surface at once (#5113)
     "ruff>=0.3",
     "respx>=0.21",       # httpx mocking
     "moto[s3]>=5.0",     # AWS mocking
