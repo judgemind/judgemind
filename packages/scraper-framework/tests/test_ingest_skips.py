@@ -240,3 +240,153 @@ def test_pdf_cache_namespace_names_provider_model_and_prompt() -> None:
     assert extractor.pdf_cache_namespace == (
         f"google-gemini-2.5-flash-lite/prompt-{_prompt_hash(PDF_PER_PAGE_PROMPT)[:16]}"
     )
+
+
+OLD_EXTRACTOR = "google-old-model/prompt-x"
+NEW_EXTRACTOR = "google-gemini-2.5-flash-lite/prompt-new"
+
+
+@pytest.mark.parametrize(
+    ("detail", "current", "expected"),
+    [
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "extractor": OLD_EXTRACTOR},
+            NEW_EXTRACTOR,
+            "extractor",
+            id="other-extractor",
+        ),
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "extractor": NEW_EXTRACTOR},
+            NEW_EXTRACTOR,
+            None,
+            id="same-extractor",
+        ),
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION},
+            NEW_EXTRACTOR,
+            None,
+            id="row-without-extractor",
+        ),
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "extractor": OLD_EXTRACTOR},
+            None,
+            None,
+            id="no-current-extractor",
+        ),
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "extractor": OLD_EXTRACTOR},
+            "",
+            None,
+            id="empty-current-extractor",
+        ),
+        pytest.param(
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "extractor": ""},
+            NEW_EXTRACTOR,
+            None,
+            id="empty-row-extractor",
+        ),
+        pytest.param(
+            {"rule_version": 2, "extractor": NEW_EXTRACTOR},
+            NEW_EXTRACTOR,
+            "rule_version",
+            id="version-2-row",
+        ),
+    ],
+)
+def test_stale_skip_reason_compares_the_recorded_extractor(
+    detail: dict[str, object], current: str | None, expected: str | None
+) -> None:
+    """#5134: a model or per-page-prompt change re-judges a skip without a
+    version bump, because the recorded extractor identity differs."""
+    assert stale_skip_reason("no_ruling_text", detail, current) == expected
+
+
+def test_skip_rule_version_is_bumped_for_the_ocr_tile_fix() -> None:
+    """#5134: #5115 (#5098) changed the OCR tile split; version 2 skips are stale."""
+    assert EXTRACTION_SKIP_RULE_VERSION >= 3
+    assert stale_skip_reason("zero_rulings_no_text", {"rule_version": 2}) == "rule_version"
+
+
+def test_current_pdf_cache_namespace_matches_the_worker_multimodal_extractor() -> None:
+    """The reconciler's current extractor equals what the worker records."""
+    from framework.llm_extractor import (
+        MULTIMODAL_PDF_MODEL,
+        MULTIMODAL_PDF_PROVIDER,
+        LlmExtractor,
+        current_pdf_cache_namespace,
+        pdf_cache_namespace,
+    )
+
+    extractor = LlmExtractor.__new__(LlmExtractor)
+    extractor._provider = MULTIMODAL_PDF_PROVIDER
+    extractor._model = MULTIMODAL_PDF_MODEL
+    assert (MULTIMODAL_PDF_PROVIDER, MULTIMODAL_PDF_MODEL) == ("google", "gemini-2.5-flash-lite")
+    assert current_pdf_cache_namespace() == extractor.pdf_cache_namespace
+    assert pdf_cache_namespace("p", "m").startswith("p-m/prompt-")
+
+
+def test_worker_builds_the_multimodal_extractor_from_the_shared_constants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both multimodal call sites build the extractor the reconciler names."""
+    import ingestion.worker as worker_mod
+    from framework.llm_extractor import (
+        MULTIMODAL_PDF_MODEL,
+        MULTIMODAL_PDF_PROVIDER,
+        pdf_cache_namespace,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeExtractor:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+            self.pdf_cache_namespace = pdf_cache_namespace(
+                str(kwargs["provider"]), str(kwargs["model"])
+            )
+
+    monkeypatch.setattr(worker_mod, "LlmExtractor", _FakeExtractor)
+    worker = worker_mod.IngestionWorker.__new__(worker_mod.IngestionWorker)
+    worker._multimodal_extractor = None
+    worker._multimodal_extractors = {}
+    worker._extractor_init_errors = {}
+    worker._bust_llm_cache = False
+    worker._get_multimodal_extractor(max_output_tokens=32768)
+    worker._get_multimodal_extractor()
+    assert [(c["provider"], c["model"]) for c in calls] == [
+        (MULTIMODAL_PDF_PROVIDER, MULTIMODAL_PDF_MODEL)
+    ] * 2
+
+
+@pytest.mark.parametrize(
+    ("method", "text", "expected"),
+    [
+        ("multimodal", "", True),
+        ("multimodal", "  \n", True),
+        ("multimodal", None, True),
+        ("multimodal", "GRANTED.", False),
+        ("text", "", False),
+    ],
+)
+def test_textless_multimodal_row(method: str, text: str | None, expected: bool) -> None:
+    from ingestion.worker import _is_textless_multimodal_row
+
+    assert _is_textless_multimodal_row(method, text) is expected
+
+
+@pytest.mark.parametrize(
+    ("method", "rulings", "text", "expected"),
+    [
+        ("multimodal", [], "", True),
+        ("multimodal", [], None, True),
+        ("multimodal", None, "", False),
+        ("multimodal", [], "page text", False),
+        ("text", [], "", False),
+    ],
+)
+def test_zero_rulings_no_text_decision(
+    method: str, rulings: list[object] | None, text: str | None, expected: bool
+) -> None:
+    from ingestion.worker import _is_zero_rulings_no_text
+
+    assert _is_zero_rulings_no_text(method, rulings, text) is expected

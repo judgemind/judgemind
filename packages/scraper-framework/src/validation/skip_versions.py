@@ -22,8 +22,10 @@ the same verdict as a source that really holds no rulings.  So:
   (:data:`EXTRACTION_SKIP_RULE_VERSION`) and the extractor identity (the
   LLM cache namespace: provider, model, prompt hash);
 - the raw-key reconciler re-ingests a key whose skip is stale
-  (:func:`stale_skip_reason`), with ``--bust-llm-cache``, through the #5008
-  incomplete path and its attempt cap (reason ``stale_skip``).
+  (:func:`stale_skip_reason`: an older rule version, or a different
+  extractor than the current one, #5134), with ``--bust-llm-cache``,
+  through the #5008 incomplete path and its attempt cap (reason
+  ``stale_skip``).
 
 Standard library only: the reconciler imports this module without pulling
 in the worker.
@@ -47,15 +49,27 @@ EXTRACTION_SKIP_REASONS = frozenset({SKIP_NO_RULING_TEXT, SKIP_ZERO_RULINGS_NO_T
 #: re-judged by the reconciler.
 #:
 #: BUMP IT WHENEVER A CHANGE CAN TURN ONE OF THESE VERDICTS INTO RULINGS: an
-#: extraction prompt or parser fix for empty cells, an OCR fix, a change to
-#: which rows count as textless.  A model or prompt change needs no bump
-#: when the skip carries the extractor identity: its LLM cache namespace
-#: changes with it, and a reingest misses the old entry.
+#: OCR fix, a parser fix for empty cells or fused rows, a change to which
+#: rows count as textless, a change to the worker branch that records the
+#: verdict.  The fingerprint test
+#: (``packages/scraper-framework/tests/test_skip_versions_fingerprint.py``)
+#: pins the code behind the verdicts and fails until such a change either
+#: bumps this version or repins with a reason the verdicts cannot change.
+#:
+#: A change of the multimodal model or of the per-page prompt
+#: (``PDF_PER_PAGE_PROMPT``) needs no bump: it changes the extractor
+#: identity (the LLM cache namespace), and the reconciler re-judges a skip
+#: whose recorded extractor differs from the current one
+#: (:data:`STALE_EXTRACTOR`).  A row with no recorded extractor is judged by
+#: version only.
 #:
 #: 1: recorded before #5094, when the verdict could replace a key's rulings
 #:    and OCR could silently read nothing (#5010, #5046).
 #: 2: #5094.
-EXTRACTION_SKIP_RULE_VERSION = 2
+#: 3: #5098 (#5115): the OCR tile split no longer reports a tile cut through
+#:    a line of text as a blank region, so an empty OCR fallback behind
+#:    ``zero_rulings_no_text`` may have been a false verdict.
+EXTRACTION_SKIP_RULE_VERSION = 3
 
 #: Detail key of the rule version on a skip row.
 RULE_VERSION_KEY = "rule_version"
@@ -69,6 +83,7 @@ ALLOWED_REMOVAL_KEY = "allowed_removal"
 #: Why a skip is stale (:func:`stale_skip_reason`).
 STALE_RULE_VERSION = "rule_version"
 STALE_REMOVED_RULINGS = "removed_rulings"
+STALE_EXTRACTOR = "extractor"
 
 
 def _as_int(value: Any) -> int | None:
@@ -78,7 +93,11 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def stale_skip_reason(reason: str | None, detail: Mapping[str, Any] | None) -> str | None:
+def stale_skip_reason(
+    reason: str | None,
+    detail: Mapping[str, Any] | None,
+    current_extractor: str | None = None,
+) -> str | None:
     """Why a recorded skip must be re-judged, or ``None`` when it stands.
 
     Only an extraction verdict (:data:`EXTRACTION_SKIP_REASONS`) is ever
@@ -86,6 +105,10 @@ def stale_skip_reason(reason: str | None, detail: Mapping[str, Any] | None) -> s
 
     - ``rule_version``: recorded under an older rule version than
       :data:`EXTRACTION_SKIP_RULE_VERSION` (no version: 1);
+    - ``extractor``: recorded by another extractor (model or per-page
+      prompt) than *current_extractor*, the current
+      ``LlmExtractor.pdf_cache_namespace`` (#5134).  A row with no recorded
+      extractor, or a call with no current one, is judged by version only;
     - ``removed_rulings``: the skip replaced rulings the key held, without
       ``--allow-ruling-removal``.  The worker refuses that write now, so
       such a row predates the fix or a bug let it through.
@@ -96,6 +119,15 @@ def stale_skip_reason(reason: str | None, detail: Mapping[str, Any] | None) -> s
     version = _as_int(detail.get(RULE_VERSION_KEY)) or 1
     if version < EXTRACTION_SKIP_RULE_VERSION:
         return STALE_RULE_VERSION
+    recorded = detail.get(EXTRACTOR_KEY)
+    if (
+        isinstance(current_extractor, str)
+        and current_extractor
+        and isinstance(recorded, str)
+        and recorded
+        and recorded != current_extractor
+    ):
+        return STALE_EXTRACTOR
     held = _as_int(detail.get(HELD_RULINGS_KEY)) or 0
     if held > 0 and detail.get(ALLOWED_REMOVAL_KEY) is not True:
         return STALE_REMOVED_RULINGS

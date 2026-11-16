@@ -11,6 +11,7 @@ its attempt cap) with ``--bust-llm-cache``.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pathlib
@@ -302,3 +303,113 @@ def test_unreadable_skip_details_read_as_version_one(capsys: Any) -> None:
     assert ex.skips == {"k1": "no_ruling_text"}
     assert ex.skip_details == {}
     assert "ingest_skips detail unreadable" in capsys.readouterr().out
+
+
+# -- the recorded extractor identity (#5134) ---------------------------------
+
+OLD_EXTRACTOR = "google-old-model/prompt-x"
+NEW_EXTRACTOR = "google-gemini-2.5-flash-lite/prompt-new"
+
+
+def test_skip_by_an_older_extractor_is_reopened(explained: rec.Explained) -> None:
+    """A model or per-page-prompt change needs no rule-version bump: the
+    recorded extractor differs from the current one."""
+    ex = _skip(explained, detail={**CURRENT, "extractor": OLD_EXTRACTOR})
+    ex.current_extractor = NEW_EXTRACTOR
+    assert rec.classify(_raw(KEY), ex, now=NOW, grace=GRACE) == (
+        "incomplete",
+        "stale_skip",
+    )
+    assert rec.key_stale_skip(_raw(KEY), ex) == "extractor"
+
+
+@pytest.mark.parametrize("current", [NEW_EXTRACTOR, None])
+def test_skip_by_the_current_extractor_or_unknown_current_stays_skipped(
+    explained: rec.Explained, current: str | None
+) -> None:
+    recorded = NEW_EXTRACTOR if current else OLD_EXTRACTOR
+    ex = _skip(explained, detail={**CURRENT, "extractor": recorded})
+    ex.current_extractor = current
+    assert rec.classify(_raw(KEY), ex, now=NOW, grace=GRACE) == (
+        "skipped",
+        "no_ruling_text",
+    )
+
+
+def test_deferred_backlog_stale_skip_is_not_recorded(
+    s3: FakeS3, explained: rec.Explained
+) -> None:
+    """Like an orphaned superseded key (#5093): a deferred key is never
+    re-ingested, so no ``stale_skip`` row is written for it."""
+    _skip(explained)
+    lines: list[str] = []
+    backlog = rec.DeferredBacklog("sd", 1, ("ca/san_diego",))
+    inserted: dict[bool, list[Any]] = {}
+    for deferred in (True, False):
+        db = FakeDb({"RETURNING run_id": [("run-d",)]})
+        rec.run(
+            _args("--record"),
+            s3,
+            copy.deepcopy(explained),
+            out=lines.append,
+            now=NOW,
+            conn=db,
+            deferrals=(backlog,) if deferred else (),
+        )
+        inserted[deferred] = [
+            i
+            for i in db.sql("INSERT INTO telemetry.ingest_incomplete")
+            if i[1][:2] == (KEY, "stale_skip")
+        ]
+    assert inserted[True] == []
+    assert len(inserted[False]) == 1
+
+
+def test_fetch_explained_sets_the_current_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rec, "current_pdf_extractor", lambda: NEW_EXTRACTOR)
+    db = FakeDb(
+        {
+            "SELECT s3_key, detail FROM telemetry.ingest_skips": [
+                ("k1", {"rule_version": 3, "extractor": OLD_EXTRACTOR}),
+            ],
+            "SELECT s3_key, reason FROM telemetry.ingest_skips": [
+                ("k1", "no_ruling_text"),
+            ],
+        }
+    )
+    ex = rec.fetch_explained(db)
+    assert ex.current_extractor == NEW_EXTRACTOR
+
+
+def test_current_pdf_extractor_reads_the_framework_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = types.ModuleType("framework.llm_extractor")
+    fake.current_pdf_cache_namespace = lambda: NEW_EXTRACTOR  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "framework.llm_extractor", fake)
+    assert rec.current_pdf_extractor() == NEW_EXTRACTOR
+
+
+def test_current_pdf_extractor_without_the_framework_judges_by_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """The scripts test env has no structlog/anthropic: no current extractor,
+    and the skips are judged by rule version only."""
+    monkeypatch.setitem(sys.modules, "framework.llm_extractor", None)
+    assert rec.current_pdf_extractor() is None
+    assert "skips judged by rule version only" in capsys.readouterr().out
+
+
+def test_current_pdf_extractor_survives_a_broken_namespace(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    def _boom() -> str:
+        raise RuntimeError("boom")
+
+    fake = types.ModuleType("framework.llm_extractor")
+    fake.current_pdf_cache_namespace = _boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "framework.llm_extractor", fake)
+    assert rec.current_pdf_extractor() is None
+    assert "skips judged by rule version only" in capsys.readouterr().out

@@ -42,6 +42,11 @@ from typing import Any
 #: failed it, so the relaxed rule judges it again.  Without the bump the key
 #: stays hidden for good.  A tightening (a new fail, a stricter threshold)
 #: needs no bump.  A new rule starts at 1.
+#:
+#: The fingerprint test
+#: (``packages/scraper-framework/tests/test_rule_versions_fingerprint.py``)
+#: pins each rule's version with a hash of its check and fails when the
+#: code moves without a bump or a repin with a reason (#5134).
 RULE_VERSIONS: dict[str, int] = {
     "no_html_in_ruling_text": 1,
     # 2: a structured-source date out of the 180-day window flags (#4793).

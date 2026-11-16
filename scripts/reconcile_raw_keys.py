@@ -81,12 +81,16 @@ only: no object is read) and sorts each one into a category:
                      Likewise a key whose only explanation is a stale
                      extraction skip verdict (``no_ruling_text`` /
                      ``zero_rulings_no_text`` recorded under an older
-                     ``validation.skip_versions`` rule version, or over
-                     rulings the key held, #5094): reason ``stale_skip``,
-                     re-ingested with ``--bust-llm-cache`` so the LLM cache
-                     does not replay the verdict, and resolved once the
-                     key is represented or the verdict is recorded again
-                     under the current rules.
+                     ``validation.skip_versions`` rule version, by another
+                     extractor than the current multimodal one (its
+                     recorded LLM cache namespace: model, per-page prompt,
+                     #5134), or over rulings the key held, #5094): reason
+                     ``stale_skip``, re-ingested with ``--bust-llm-cache``
+                     so the LLM cache does not replay the verdict, and
+                     resolved once the key is represented or the verdict
+                     is recorded again under the current rules.  With
+                     ``--record`` the row is written (deferred backlogs
+                     excepted).
 - ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
                      (default 3): reported, not retried.  Keys that just
                      reached the cap set ``issue_needed`` once (``stuck_at``
@@ -431,6 +435,11 @@ class Explained:
     #: s3_key -> detail of an extraction skip verdict's ``telemetry.ingest_skips``
     #: row (rule version, extractor, rulings held; #5094).
     skip_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: The current multimodal extractor identity
+    #: (``framework.llm_extractor.current_pdf_cache_namespace``), compared
+    #: with the one recorded on an extraction skip (#5134).  ``None``: skips
+    #: are judged by rule version only.
+    current_extractor: str | None = None
 
 
 @dataclass
@@ -640,13 +649,16 @@ def key_stale_skip(raw: RawKey, explained: Explained) -> str | None:
 
     Only an extraction verdict (``no_ruling_text``, ``zero_rulings_no_text``)
     is ever stale: recorded under an older rule version
-    (``validation.skip_versions``), or over rulings the key held without
-    ``--allow-ruling-removal``.  A deterministic verdict (a placeholder
-    notice, the governor route, nothing readable) stands."""
+    (``validation.skip_versions``), by another extractor than
+    ``explained.current_extractor`` (#5134), or over rulings the key held
+    without ``--allow-ruling-removal``.  A deterministic verdict (a
+    placeholder notice, the governor route, nothing readable) stands."""
     reason = explained.skips.get(raw.key)
     if reason not in EXTRACTION_SKIP_REASONS:
         return None
-    return stale_skip_reason(reason, explained.skip_details.get(raw.key))
+    return stale_skip_reason(
+        reason, explained.skip_details.get(raw.key), explained.current_extractor
+    )
 
 
 def _stale_skip_record_resolved(raw: RawKey, explained: Explained) -> bool:
@@ -959,6 +971,23 @@ def clear_stale_skips(conn: Any, keys: Sequence[str]) -> None:
     clear_stale_validation(conn, keys, STALE_SKIP)
 
 
+def current_pdf_extractor() -> str | None:
+    """The current multimodal extractor identity (#5134), or ``None`` when
+    the framework cannot be imported here (a minimal env without its
+    dependencies): skips are then judged by rule version only.  Imported
+    lazily so this script loads without the LLM stack."""
+    try:
+        from framework.llm_extractor import current_pdf_cache_namespace
+
+        return current_pdf_cache_namespace()
+    except Exception as exc:  # noqa: BLE001 — ImportError or a broken import
+        print(
+            f"WARNING current extractor unknown ({type(exc).__name__}: {exc}); "
+            "skips judged by rule version only"
+        )
+        return None
+
+
 def _fetch_skip_details(conn: Any, explained: Explained) -> None:
     """The detail of every extraction skip verdict's row (#5094): its rule
     version, extractor and the rulings the key held.  Best-effort: without
@@ -1190,6 +1219,7 @@ def fetch_explained(conn: Any) -> Explained:
     else:
         if any(r in EXTRACTION_SKIP_REASONS for r in explained.skips.values()):
             _fetch_skip_details(conn, explained)
+            explained.current_extractor = current_pdf_extractor()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1646,10 +1676,13 @@ def apply_stale_skips(
     conn: Any,
     out: Callable[[str], None],
     sample: int,
+    backlogs: Sequence[DeferredBacklog] = (),
 ) -> tuple[list[tuple[RawKey, str]], list[str]]:
     """Fold this run's stale extraction skips into the incomplete keys
     (#5094): new ones are recorded (with ``--record``) so their reingest
-    counts attempts against the cap; resolved records go."""
+    counts attempts against the cap, except deferred backlog keys, which are
+    never re-ingested (as for orphaned superseded keys, #5093); resolved
+    records go."""
     new = [item for rep in reports.values() for item in rep.new_stale_skips]
     resolved = [raw.key for rep in reports.values() for raw in rep.resolved_stale_skips]
     for raw, _why in new:
@@ -1657,7 +1690,10 @@ def apply_stale_skips(
     for key in resolved:
         explained.incomplete.pop(key, None)
     if conn is not None:
-        record_stale_skips(conn, new)
+        record_stale_skips(
+            conn,
+            [item for item in new if not any(b.matches(item[0]) for b in backlogs)],
+        )
         clear_stale_skips(conn, resolved)
     for raw, why in new[:sample]:
         out(
@@ -1927,7 +1963,7 @@ def run(
     for raw in new_orphaned[: args.sample]:
         out(f"ORPHANED_SUPERSEDED {raw.scope} day={raw.day} key={raw.key}")
     new_stale_skips, resolved_stale_skips = apply_stale_skips(
-        reports, explained, conn, out, args.sample
+        reports, explained, conn, out, args.sample, backlogs
     )
 
     # Incomplete records whose raw object is gone can never heal (#5093):

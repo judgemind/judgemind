@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import reconcile_raw_keys as rec
 from validation.deferred_backlogs import DeferredBacklog
+from validation.skip_versions import EXTRACTION_SKIP_RULE_VERSION
 
 from tests.test_reconcile_raw_keys import (  # noqa: F401 — fixtures
     FED,
@@ -123,7 +124,10 @@ def test_recorded_skip_or_validation_failure_still_explains_an_orphaned_key(
         "stale_skip",
     )
     # ...one recorded under the current rules explains the key.
-    ex.skip_details[KEY] = {"rule_version": 2, "held_rulings": 0}
+    ex.skip_details[KEY] = {
+        "rule_version": EXTRACTION_SKIP_RULE_VERSION,
+        "held_rulings": 0,
+    }
     assert rec.classify(_raw(KEY), ex, now=NOW, grace=GRACE) == (
         "skipped",
         "no_ruling_text",
