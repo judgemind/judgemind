@@ -1799,6 +1799,110 @@ JSON
     fi
 }
 
+# ── Pending PR-text checks block success (#5090) ───────────────────────────
+#
+# `closing-refs` passed, then `gh pr edit` added a stray closing ref and
+# started a new `closing-refs` run. While that run is pending the script
+# must not report success, even with ci-passed green and mergeable CLEAN.
+
+# Args: <file> <check-name> <status> <conclusion-json>
+write_pr_text_check_response() {
+    local file="$1"
+    local name="$2"
+    local status="$3"
+    local conclusion="$4"
+    cat > "$file" << JSON
+{
+  "check_runs": [
+    {"id": 500, "name": "$name",     "app": {"id": 15368}, "status": "$status", "conclusion": $conclusion, "details_url": "https://github.com/judgemind/judgemind/actions/runs/3002/job/500"},
+    {"id": 400, "name": "$name",     "app": {"id": 15368}, "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/3001/job/400"},
+    {"id": 100, "name": "ci-passed", "app": {"id": 15368}, "status": "completed", "conclusion": "success", "details_url": "https://github.com/judgemind/judgemind/actions/runs/1001/job/100"}
+  ]
+}
+JSON
+}
+
+test_pending_closing_refs_blocks_success() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_pr_text_check_response "$tmpdir/responses/01.json" closing-refs in_progress null
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        pass "pending_closing_refs: a pending closing-refs run keeps the exit code non-zero (exit=$exit_code)"
+    else
+        fail "pending_closing_refs: a pending closing-refs run keeps the exit code non-zero" "exit=$exit_code output=$output"
+    fi
+    if echo "$output" | grep -qE "canonical merge gate green|all checks complete"; then
+        fail "pending_closing_refs: must not report success" "output=$output"
+    else
+        pass "pending_closing_refs: does not report success"
+    fi
+    if echo "$output" | grep -q "PR-text check(s) still running: closing-refs"; then
+        pass "pending_closing_refs: names the check it is waiting for"
+    else
+        fail "pending_closing_refs: names the check it is waiting for" "output=$output"
+    fi
+}
+
+test_pending_validate_pr_blocks_success() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_pr_text_check_response "$tmpdir/responses/01.json" validate-pr queued null
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 1 --timeout-secs 2 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 124 ]; then
+        pass "pending_validate_pr: a queued validate-pr run keeps waiting (exit 124)"
+    else
+        fail "pending_validate_pr: a queued validate-pr run keeps waiting (exit 124)" "exit=$exit_code output=$output"
+    fi
+}
+
+test_pending_closing_refs_then_success_exits_0() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_pr_text_check_response "$tmpdir/responses/01.json" closing-refs in_progress null
+    write_pr_text_check_response "$tmpdir/responses/02.json" closing-refs completed '"success"'
+
+    local output exit_code calls
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 2>&1) || exit_code=$?
+    calls=$(cat "$tmpdir/counter")
+
+    if [ "$exit_code" -eq 0 ] && [ "$calls" -ge 2 ]; then
+        pass "closing_refs_then_success: exits 0 once the new closing-refs run passes (calls=$calls)"
+    else
+        fail "closing_refs_then_success: exits 0 once the new closing-refs run passes" "exit=$exit_code calls=$calls output=$output"
+    fi
+}
+
+test_pending_closing_refs_then_failure_exits_1() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_pr_text_check_response "$tmpdir/responses/01.json" closing-refs in_progress null
+    write_pr_text_check_response "$tmpdir/responses/02.json" closing-refs completed '"failure"'
+
+    local output exit_code
+    exit_code=0
+    output=$(MERGEABLE_RESPONSE=MERGEABLE MERGE_STATE_RESPONSE=CLEAN \
+        run_script "$tmpdir" 42 --poll-interval 0 --timeout-secs 30 --no-auto-rerun 2>&1) || exit_code=$?
+
+    if [ "$exit_code" -eq 1 ] && echo "$output" | grep -q "closing-refs: conclusion=failure"; then
+        pass "closing_refs_then_failure: exits 1 when the new closing-refs run fails"
+    else
+        fail "closing_refs_then_failure: exits 1 when the new closing-refs run fails" "exit=$exit_code output=$output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_happy_path
@@ -1840,6 +1944,10 @@ test_two_checks_one_failed_exits_1
 test_superseded_failure_rerun_in_progress_waits
 test_superseded_failure_rerun_then_success_exits_0
 test_same_name_different_app_not_collapsed
+test_pending_closing_refs_blocks_success
+test_pending_validate_pr_blocks_success
+test_pending_closing_refs_then_success_exits_0
+test_pending_closing_refs_then_failure_exits_1
 
 echo ""
 echo "────────────────────────────────────────────"

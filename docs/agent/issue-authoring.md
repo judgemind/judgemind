@@ -431,13 +431,13 @@ Rules for PR bodies and commit messages:
 - **Describe other issues without the pattern.** Drop the `#`, or put a word between the verb and the number: write "the run auto-closed issue 4673", "the fix for issue 4673 landed in PR 5070", or "see #4673", not the verb followed directly by `#4673`.
 - **Issue bodies and comments are safe.** Closing words there do nothing; the rule is for PR descriptions and commit messages.
 
-`scripts/check-pr-closing-refs.py` enforces this. The `closing-refs` job in `.github/workflows/pr-title-check.yml` runs it on every PR (and on every body edit): it reads the PR's `closingIssuesReferences`, the body and the commit messages, and fails, with a `Fix:` block, when any of them would close an issue that is not in the branch name, the PR title, or an explicit `Closes #N` line. Check a draft before opening the PR:
+`scripts/check-pr-closing-refs.py` enforces this. The `closing-refs` job in `.github/workflows/pr-title-check.yml` runs it on every PR (and on every body edit): it reads the PR's `closingIssuesReferences`, the body and the commit messages, and fails, with a `Fix:` block, when any of them would close an issue that is not in the branch name, the PR title, or an explicit `Closes #N` line. An explicit line starts with `close`/`closes`, `fix`/`fixes` or `resolve`/`resolves` (any case, optional colon) and holds nothing but closing statements. A list or quote prefix (`- Fixed #N`, `> closes #N`) or the past tense (`Fixed #N`) reads as incident history, so the check reports it (#5090). Check a draft before opening the PR:
 
 ```
 scripts/check-pr-closing-refs.py --title "<title>" --body-file tmp/pr_body.txt --git-range origin/main..HEAD
 ```
 
-If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh run on the same head commit. No manual rerun is needed: `scripts/wait-for-ci.sh` judges each check by its newest run, so the replaced failure stops counting once the fresh run passes, and the script waits while that run is still going (#5078).
+If the check fails on an open PR and you fix the body with `gh pr edit`, the edit starts a fresh run on the same head commit. No manual rerun is needed: `scripts/wait-for-ci.sh` judges each check by its newest run, so the replaced failure stops counting once the fresh run passes, and the script waits while that run is still going (#5078). It also waits while any `closing-refs` or `validate-pr` run is still going, so a body edit cannot slip a stray closing word into a merge before the check has judged it (#5090).
 
 ## Investigation Tasks
 

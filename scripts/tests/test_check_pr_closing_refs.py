@@ -95,8 +95,10 @@ def test_hex_worktree_branch_contributes_no_numbers() -> None:
         "Closes #7",
         "Closes #7, closes #8",
         "Fixes #7 and fixes #8.",
-        "- Resolves: #7",
+        "Resolves: #7",
         "  closes #7  ",
+        "CLOSES #7",
+        "fix: #7",
     ],
 )
 def test_explicit_closing_lines(line: str) -> None:
@@ -105,6 +107,50 @@ def test_explicit_closing_lines(line: str) -> None:
 
 def test_prose_line_is_not_explicit() -> None:
     assert mod.explicit_closing_numbers("My local run closed #4673 by mistake") == set()
+
+
+# #5090: a list or quote prefix, or the past tense, reads as incident history.
+@pytest.mark.parametrize(
+    "line",
+    [
+        "- Fixed #7",
+        "- Resolves: #7",
+        "* Closes #7",
+        "+ fixes #7",
+        "> closes #7",
+        "  - closes #7",
+        "1. Fixes #7",
+        "**Closes #7**",
+        "Fixed #7",
+        "Closed #7.",
+        "Closes #8, fixed #7",
+        "and closes #7",
+    ],
+)
+def test_bulleted_quoted_or_past_tense_lines_are_not_explicit(line: str) -> None:
+    assert 7 not in mod.explicit_closing_numbers(line)
+
+
+def test_bulleted_fixed_line_in_body_is_unexpected() -> None:
+    body = (
+        "## Summary\n\nIncident history:\n\n- Fixed #4242\n"
+        "- the retry loop\n\nCloses #5090\n"
+    )
+    verdict = mod.evaluate(branch="worktree-agent-x", title="fix(ci): x", body=body)
+    assert [(h.number, h.source) for h in verdict.unexpected] == [(4242, "PR body")]
+    assert verdict.allowed == {5090}
+
+
+def test_bulleted_fixed_line_fails_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = tmp_path / "body.md"
+    body.write_text("- Fixed #4242\n\nCloses #5090\n")
+    rc = mod.main(["--title", "fix(ci): x", "--body-file", str(body), "--branch", "wt"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "#4242 via PR body: - Fixed #4242" in err
+    assert "no '-', '*' or '>' prefix" in err
 
 
 # ── evaluate: the #5072 incident and its fix ─────────────────────────────
