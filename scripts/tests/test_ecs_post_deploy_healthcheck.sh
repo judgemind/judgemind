@@ -15,6 +15,16 @@
 #   - log-check warning (critical errors in recent logs) stays non-fatal
 #   - log-check failure (empty stream / CloudWatch unavailable) stays non-fatal
 #   - missing required env vars exits non-zero
+#   - #5102 polling: a transient 0/1 during a task replacement, then 1/1 with
+#     the PRIMARY deployment COMPLETED, passes; a task of the PRIMARY
+#     deployment that crashed fails with its stoppedReason and exit code;
+#     an old task stopped by the deployment is not a crash; rolloutState
+#     FAILED fails; a service that never settles exits 124 (budget
+#     exhausted); describe-services failing exits 125.
+#
+# The service-check wait runs on a fake clock (#5083): the mock aws moves
+# WAIT_BUDGET_CLOCK_FILE forward on each describe-services call and the poll
+# interval is 0, so the 480s budget is exercised without wall-clock time.
 #
 # Usage:
 #   scripts/tests/test_ecs_post_deploy_healthcheck.sh
@@ -25,6 +35,7 @@
 
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_gh-isolate.sh"  # no real GitHub from tests (#5071)
+. "$(dirname "${BASH_SOURCE[0]}")/_git-env-scrub.sh"  # no writes to the real repo (#5058)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_UNDER_TEST="$REPO_ROOT/scripts/ecs-post-deploy-healthcheck.sh"
@@ -101,13 +112,35 @@ echo "$*" >> "$CALL_LOG"
 
 case "$*" in
     "ecs describe-services"*)
-        file="$RESPONSES_DIR/describe-services.json"
+        # Fake clock (#5083): each poll moves time forward.
+        if [[ -n "${WAIT_BUDGET_CLOCK_FILE:-}" ]]; then
+            read -r now < "$WAIT_BUDGET_CLOCK_FILE"
+            echo $((now + ${MOCK_CLOCK_STEP:-10})) > "$WAIT_BUDGET_CLOCK_FILE"
+        fi
+        # Sequence: describe-services.<n>.json answers the n-th call when
+        # present; describe-services.json answers every other call.
+        n=$(( $(cat "$RESPONSES_DIR/.ds-count" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$RESPONSES_DIR/.ds-count"
+        file="$RESPONSES_DIR/describe-services.$n.json"
+        if [[ ! -f "$file" ]]; then
+            file="$RESPONSES_DIR/describe-services.json"
+        fi
+        ;;
+    "ecs list-tasks"*"--desired-status STOPPED"*)
+        file="$RESPONSES_DIR/list-tasks-stopped.json"
+        if [[ ! -f "$file" ]]; then
+            echo "[]"
+            exit 0
+        fi
         ;;
     "ecs list-tasks"*)
         file="$RESPONSES_DIR/list-tasks.json"
         ;;
-    "ecs describe-tasks"*)
+    "ecs describe-tasks"*"--query tasks[0]"*)
         file="$RESPONSES_DIR/describe-tasks.json"
+        ;;
+    "ecs describe-tasks"*)
+        file="$RESPONSES_DIR/describe-tasks-stopped.json"
         ;;
     "logs describe-log-streams"*)
         file="$RESPONSES_DIR/describe-log-streams.txt"
@@ -135,19 +168,69 @@ MOCK
 }
 
 # Write a describe-services response with the given counts.
-# Usage: write_describe_services <tmpdir> <running> <desired>
+# Usage: write_describe_services <tmpdir> <running> <desired> [rollout] [n]
+#   rollout — omitted: no deployments listed (the pre-#5102 fixture shape).
+#             COMPLETED / FAILED: one PRIMARY deployment in that state.
+#             IN_PROGRESS: a PRIMARY deployment rolling out plus the ACTIVE
+#             deployment it replaces.
+#   n       — write describe-services.<n>.json (answers only the n-th call)
+#             instead of describe-services.json (answers every other call).
 write_describe_services() {
     local tmpdir="$1"
     local running="$2"
     local desired="$3"
-    cat > "$tmpdir/describe-services.json" << JSON
+    local rollout="${4:-}"
+    local n="${5:-}"
+    local file="$tmpdir/describe-services.json"
+    if [[ -n "$n" ]]; then
+        file="$tmpdir/describe-services.$n.json"
+    fi
+    local deployments=""
+    case "$rollout" in
+        "") ;;
+        IN_PROGRESS)
+            deployments=',"deployments":[{"id":"ecs-svc/new","status":"PRIMARY","taskDefinition":"arn:aws:ecs:us-west-2:123:task-definition/test-svc:2","rolloutState":"IN_PROGRESS","rolloutStateReason":"ECS deployment ecs-svc/new in progress.","runningCount":'"$running"',"desiredCount":'"$desired"'},{"id":"ecs-svc/old","status":"ACTIVE","taskDefinition":"arn:aws:ecs:us-west-2:123:task-definition/test-svc:1","rolloutState":"COMPLETED","runningCount":0,"desiredCount":0}]'
+            ;;
+        *)
+            deployments=',"deployments":[{"id":"ecs-svc/new","status":"PRIMARY","taskDefinition":"arn:aws:ecs:us-west-2:123:task-definition/test-svc:2","rolloutState":"'"$rollout"'","rolloutStateReason":"ECS deployment ecs-svc/new '"$rollout"'.","runningCount":'"$running"',"desiredCount":'"$desired"'}]'
+            ;;
+    esac
+    cat > "$file" << JSON
 {
   "serviceName": "test-svc",
   "desiredCount": $desired,
   "runningCount": $running,
-  "pendingCount": 0
+  "pendingCount": 0$deployments
 }
 JSON
+}
+
+# Write the stopped-task fixtures: list-tasks --desired-status STOPPED and
+# the describe-tasks answer for those ARNs.
+# Usage: write_stopped_tasks <tmpdir> <kind>...
+#   replaced — an old-deployment task the deployment stopped (exit 137 after
+#              stopTimeout: still a normal replacement, not a crash)
+#   crashed  — a PRIMARY-deployment task whose essential container exited 1
+write_stopped_tasks() {
+    local tmpdir="$1"
+    shift
+    local arns="" tasks="" sep=""
+    local kind
+    for kind in "$@"; do
+        case "$kind" in
+            replaced)
+                arns="${arns}${sep}\"arn:aws:ecs:us-west-2:123:task/test-cluster/oldtask\""
+                tasks="${tasks}${sep}"'{"taskArn":"arn:aws:ecs:us-west-2:123:task/test-cluster/oldtask","lastStatus":"STOPPED","startedBy":"ecs-svc/old","taskDefinitionArn":"arn:aws:ecs:us-west-2:123:task-definition/test-svc:1","stoppedReason":"Scaling activity initiated by (deployment ecs-svc/new)","stopCode":"ServiceSchedulerInitiated","containers":[{"name":"ingestion-worker","lastStatus":"STOPPED","exitCode":137}]}'
+                ;;
+            crashed)
+                arns="${arns}${sep}\"arn:aws:ecs:us-west-2:123:task/test-cluster/newtask\""
+                tasks="${tasks}${sep}"'{"taskArn":"arn:aws:ecs:us-west-2:123:task/test-cluster/newtask","lastStatus":"STOPPED","startedBy":"ecs-svc/new","taskDefinitionArn":"arn:aws:ecs:us-west-2:123:task-definition/test-svc:2","stoppedReason":"Essential container in task exited","stopCode":"EssentialContainerExited","containers":[{"name":"ingestion-worker","lastStatus":"STOPPED","exitCode":1,"reason":"ModuleNotFoundError"}]}'
+                ;;
+        esac
+        sep=","
+    done
+    echo "[$arns]" > "$tmpdir/list-tasks-stopped.json"
+    echo "[$tasks]" > "$tmpdir/describe-tasks-stopped.json"
 }
 
 # Write a list-tasks response with N task ARNs.
@@ -214,10 +297,16 @@ run_script() {
     local tmpdir="$1"
     local mock_aws
     mock_aws=$(setup_mock_aws "$tmpdir")
+    # Fake clock well above the real $SECONDS (see _wait_budget_lib.sh).
+    echo 100000 > "$tmpdir/clock"
 
     AWS_CLI="$mock_aws" \
     RESPONSES_DIR="$tmpdir" \
     CALL_LOG="$tmpdir/calls.log" \
+    WAIT_BUDGET_CLOCK_FILE="$tmpdir/clock" \
+    WAIT_BUDGET_NO_CAFFEINATE=1 \
+    HEALTHCHECK_POLL_INTERVAL=0 \
+    MOCK_CLOCK_STEP="${MOCK_CLOCK_STEP:-10}" \
     ECS_CLUSTER="test-cluster" \
     INGESTION_SERVICE="test-svc" \
     LOG_GROUP="/ecs/test-svc" \
@@ -295,26 +384,142 @@ test_running_equals_desired_success() {
     fi
 }
 
-# Test 3: running<desired failure (service-check rejects).
+# Test 3: running<desired that never settles exhausts the 480s budget and
+# exits 124 (still rolling out), after polling rather than reading once.
 test_running_below_desired_failure() {
     local tmpdir
     tmpdir=$(make_temp_dir)
-    write_describe_services "$tmpdir" 0 1
+    write_describe_services "$tmpdir" 0 1 IN_PROGRESS
+
+    local output exit_code
+    exit_code=0
+    output=$(MOCK_CLOCK_STEP=100 run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        pass "running<desired that never settles exits 124 (budget exhausted)"
+    else
+        fail "running<desired that never settles exits 124 (budget exhausted)" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "Timed out after 480s" \
+        && echo "$output" | grep -q "does not match desired"; then
+        pass "budget exhaustion names the 480s budget and the count mismatch"
+    else
+        fail "budget exhaustion names the 480s budget and the count mismatch" "output=$output"
+    fi
+
+    local polls
+    polls=$(grep -c "^ecs describe-services" "$tmpdir/calls.log" || true)
+    if [[ "$polls" -ge 4 && "$polls" -le 6 ]]; then
+        pass "budget exhaustion polled ${polls} times on the fake clock (100s per poll, 480s budget)"
+    else
+        fail "budget exhaustion polls 4-6 times on the fake clock" "polls=$polls output=$output"
+    fi
+}
+
+# Test 3b (#5102): the PR #5100 case. The replacement briefly shows 0/1
+# while the PRIMARY deployment is IN_PROGRESS, then 1/1 COMPLETED → pass.
+test_transient_zero_during_replacement_passes() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_describe_services "$tmpdir" 0 1 IN_PROGRESS 1
+    write_describe_services "$tmpdir" 0 1 IN_PROGRESS 2
+    # Counts match but the rollout is not finished yet: keep waiting.
+    write_describe_services "$tmpdir" 1 1 IN_PROGRESS 3
+    write_describe_services "$tmpdir" 1 1 COMPLETED
+    # The old task the deployment stopped is listed, as on the real service.
+    write_stopped_tasks "$tmpdir" replaced
+    write_list_tasks "$tmpdir" 1
+    write_describe_tasks "$tmpdir" 0
+    write_describe_log_streams "$tmpdir" "test-stream"
+    write_get_log_events "$tmpdir" 0
+
+    local output exit_code
+    exit_code=0
+    output=$(run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "transient 0/1 during replacement then 1/1 COMPLETED exits 0"
+    else
+        fail "transient 0/1 during replacement then 1/1 COMPLETED exits 0" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "poll 1: running=0 desired=1 .*rolloutState=IN_PROGRESS" \
+        && echo "$output" | grep -q "poll 4: running=1 desired=1 .*rolloutState=COMPLETED" \
+        && echo "$output" | grep -q "Service is steady after 40s (poll 4)"; then
+        pass "transient replacement logs each poll and becomes steady on poll 4"
+    else
+        fail "transient replacement logs each poll and becomes steady on poll 4" "output=$output"
+    fi
+
+    if echo "$output" | grep -q "CRASHED"; then
+        fail "a task stopped by the deployment is not reported as a crash" "output=$output"
+    else
+        pass "a task stopped by the deployment is not reported as a crash"
+    fi
+
+    if echo "$output" | grep -q "No crash-loop detected"; then
+        pass "transient replacement still runs the crash-loop check after settling"
+    else
+        fail "transient replacement still runs the crash-loop check after settling" "output=$output"
+    fi
+}
+
+# Test 3c (#5102): a task of the PRIMARY deployment crashed → fail at once
+# with the reason, even though the old task was also stopped normally.
+test_crashed_task_fails_with_reason() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_describe_services "$tmpdir" 0 1 IN_PROGRESS
+    write_stopped_tasks "$tmpdir" replaced crashed
 
     local output exit_code
     exit_code=0
     output=$(run_script "$tmpdir" 2>&1) || exit_code=$?
 
     if [[ "$exit_code" -eq 1 ]]; then
-        pass "running<desired exits 1"
+        pass "crashed PRIMARY-deployment task exits 1"
     else
-        fail "running<desired exits 1" "exit=$exit_code output=$output"
+        fail "crashed PRIMARY-deployment task exits 1" "exit=$exit_code output=$output"
     fi
 
-    if echo "$output" | grep -q "does not match desired"; then
-        pass "running<desired emits mismatch error"
+    if echo "$output" | grep -q "ERROR: CRASHED: 1 task(s) of deployment ecs-svc/new" \
+        && echo "$output" | grep -q 'task/test-cluster/newtask: stoppedReason="Essential container in task exited"' \
+        && echo "$output" | grep -q 'container ingestion-worker exitCode=1 reason="ModuleNotFoundError"'; then
+        pass "crash report names the task, stoppedReason and exit code"
     else
-        fail "running<desired emits mismatch error" "output=$output"
+        fail "crash report names the task, stoppedReason and exit code" "output=$output"
+    fi
+
+    if echo "$output" | grep -q "oldtask"; then
+        fail "crash report leaves out the task the deployment replaced" "output=$output"
+    else
+        pass "crash report leaves out the task the deployment replaced"
+    fi
+
+    local polls
+    polls=$(grep -c "^ecs describe-services" "$tmpdir/calls.log" || true)
+    if [[ "$polls" -eq 1 ]]; then
+        pass "crash fails on the first poll instead of waiting out the budget"
+    else
+        fail "crash fails on the first poll instead of waiting out the budget" "polls=$polls"
+    fi
+}
+
+# Test 3d (#5102): ECS reports the PRIMARY deployment FAILED → exit 1.
+test_rollout_failed_fails() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    write_describe_services "$tmpdir" 0 1 FAILED
+
+    local output exit_code
+    exit_code=0
+    output=$(run_script "$tmpdir" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 1 ]] && echo "$output" | grep -q "rolloutState=FAILED for PRIMARY deployment ecs-svc/new"; then
+        pass "rolloutState FAILED exits 1 with the deployment named"
+    else
+        fail "rolloutState FAILED exits 1 with the deployment named" "exit=$exit_code output=$output"
     fi
 }
 
@@ -466,7 +671,8 @@ test_missing_required_env() {
     fi
 }
 
-# Test 10: describe-services failure (aws CLI errors) exits 1.
+# Test 10: describe-services failure (aws CLI errors) exits 125: the
+# service state is unknown (same convention as wait-for-rollout.sh).
 test_describe_services_failure() {
     local tmpdir
     tmpdir=$(make_temp_dir)
@@ -477,10 +683,10 @@ test_describe_services_failure() {
     exit_code=0
     output=$(run_script "$tmpdir" 2>&1) || exit_code=$?
 
-    if [[ "$exit_code" -eq 1 ]]; then
-        pass "describe-services failure exits 1"
+    if [[ "$exit_code" -eq 125 ]]; then
+        pass "describe-services failure exits 125 (state unknown)"
     else
-        fail "describe-services failure exits 1" "exit=$exit_code output=$output"
+        fail "describe-services failure exits 125 (state unknown)" "exit=$exit_code output=$output"
     fi
 
     if echo "$output" | grep -q "describe-services failed"; then
@@ -495,6 +701,9 @@ test_describe_services_failure() {
 test_scale_to_zero_success
 test_running_equals_desired_success
 test_running_below_desired_failure
+test_transient_zero_during_replacement_passes
+test_crashed_task_fails_with_reason
+test_rollout_failed_fails
 test_crash_loop_detected
 test_no_running_tasks_failure
 test_log_check_warning_only

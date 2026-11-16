@@ -288,15 +288,14 @@ jobs:
       - name: Checkout (for post-deploy-healthcheck script)
         uses: actions/checkout@v6
 
-      - name: Wait for new tasks to start
-        run: |
-          echo "Waiting 60 seconds for new ingestion worker task to fully start..."
-          sleep 60
-
       # Post-deploy health check — delegates to the extracted, unit-tested
       # script at scripts/ecs-post-deploy-healthcheck.sh. The extraction
       # keeps the scale-to-zero rule (running==desired==0 treated as
       # healthy) codified in one place so drift like #2605 cannot recur.
+      # The script polls (480s budget) until runningCount == desiredCount
+      # and the PRIMARY deployment is COMPLETED, so a task replacement in
+      # flight no longer reads as a failure; it replaced a fixed `sleep 60`
+      # plus a single read of the running count (#5102).
       - name: Post-deploy ingestion worker health check
         id: healthcheck
         env:
