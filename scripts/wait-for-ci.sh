@@ -742,7 +742,9 @@ EOF
     # a `gh pr edit` re-runs them on the same head SHA. A merge while one is
     # still running could ship a body that closes an unrelated issue (the
     # check never gets to fail). So a pending newest run of one of them
-    # blocks success, exactly like a pending `ci-passed`.
+    # blocks success, exactly like a pending `ci-passed`. Limit: a run GitHub
+    # has not created yet (the first seconds after the edit) is invisible
+    # here; only a required status check closes that window.
     PR_TEXT_PENDING_NAMES=$(printf '%s' "$CHECK_RUNS_JSON" | jq -r --arg names "$PR_TEXT_CHECKS" '
         ($names | split(" ") | map(select(length > 0))) as $gate
         | [.[] | select(.status != "completed" and ((.name // "") as $n | any($gate[]; . == $n))) | .name]
