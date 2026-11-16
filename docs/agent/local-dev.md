@@ -75,6 +75,23 @@ CI (#4950).
   tests import (listed in the WARNING) instead of failing on lines it
   cannot measure. CI still runs the Postgres tests and checks diff
   coverage on every file.
+
+**Real-Redis Python tests (scraper-framework's `real_redis_client`
+fixture, e.g. `TestRealRedis` in `tests/ingestion/test_message_lease_5091.py`).**
+These read `JUDGEMIND_TEST_REDIS_URL` and skip without it. The pre-push
+hook runs `scripts/ensure-test-redis.sh`, which PINGs the docker-compose
+Redis on `localhost:6379` and passes `redis://localhost:6379/15` to that
+package's pytest (database 15 keeps test keys out of database 0) (#5106).
+
+- **An exported `JUDGEMIND_TEST_REDIS_URL` wins:** the hook uses it as is.
+- **No Redis running** (or `PREPUSH_REDIS=0 git push`): the hook prints a
+  WARNING with a `Fix:` block (`docker compose up -d redis`) and the Redis
+  tests skip. The push is not blocked.
+- **CI** runs a `redis:7.0` service (matching dev ElastiCache 7.1, with
+  its `volatile-lru` eviction policy) and sets `REQUIRE_REDIS_TESTS=1`, so
+  a missing or unreachable Redis fails the tests there instead of
+  skipping them. New real-Redis tests should take the `real_redis_client`
+  fixture so they fall under the same gate.
 - **A migration that does not apply** fails the push, as it would fail
   CI's `Apply migrations to the test database` step.
 

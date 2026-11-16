@@ -495,3 +495,34 @@ def _mock_enrichment_engine() -> Generator[None, None, None]:
 
     with patch("ingestion.worker.EnrichmentEngine", return_value=mock_engine):
         yield
+
+
+# ---------------------------------------------------------------------------
+# Real-Redis tests (#5106)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def real_redis_client() -> Generator[object, None, None]:
+    """A real Redis client (bytes replies) from JUDGEMIND_TEST_REDIS_URL.
+
+    Skips without the URL, or FAILS under REQUIRE_REDIS_TESTS=1 (CI); see
+    tests/real_redis.py.  Tests share the server, so each must use unique
+    key names and delete what it creates.
+    """
+    from real_redis import (
+        REDIS_URL_ENV,
+        REQUIRE_REDIS_ENV,
+        connect_and_ping,
+        connect_real_redis,
+    )
+
+    client = connect_real_redis(
+        os.environ.get(REDIS_URL_ENV),
+        os.environ.get(REQUIRE_REDIS_ENV) == "1",
+        connect_and_ping,
+    )
+    try:
+        yield client
+    finally:
+        client.close()  # type: ignore[attr-defined]

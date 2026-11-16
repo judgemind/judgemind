@@ -56,6 +56,10 @@
 #                         out the files they import, with a WARNING (#4950).
 #   TEST_DATABASE_URL     when exported, used as is for the real-Postgres
 #                         tests instead of the per-checkout database.
+#   PREPUSH_REDIS=0       do not use a local Redis; the real-Redis tests
+#                         skip, with a WARNING (#5106).
+#   JUDGEMIND_TEST_REDIS_URL  when exported, used as is for the real-Redis
+#                         tests instead of the docker-compose Redis.
 #   PREPUSH_SCRIPTS_TESTS=0  do not run scripts/tests in CI's minimal
 #                         environment (WARNING; CI still runs it) (#5045).
 #   PREPUSH_SCRIPTS_TESTS_WORKERS  xdist workers for that run (default
@@ -76,6 +80,15 @@
 # with a Fix: block, and diff coverage leaves out the source files those
 # tests import (.githooks/lib/pg_only_sources.py) instead of failing on
 # lines it cannot measure. CI runs the Postgres tests and gates every file.
+#
+# Real-Redis tests (#5106)
+# ────────────────────────
+# A Python package whose tests read JUDGEMIND_TEST_REDIS_URL
+# (scraper-framework: the real_redis_client fixture, TestRealRedis) gets
+# the local docker-compose Redis from scripts/ensure-test-redis.sh. The
+# hook passes it to that package's pytest only. Without a reachable Redis
+# the tests skip and the hook prints a WARNING with a Fix: block; CI runs
+# a Redis service with REQUIRE_REDIS_TESTS=1, where they cannot skip.
 
 set -uo pipefail
 
@@ -478,6 +491,55 @@ ensure_prepush_pg() {
 }
 
 # -------------------------------------------------------------------
+# Real-Redis tests (#5106; see the header comment).
+#
+# pkg_has_redis_tests <pkg_dir>
+#   True when a .py file under <pkg_dir>/tests reads JUDGEMIND_TEST_REDIS_URL.
+#
+# ensure_prepush_redis
+#   Runs once per push, in the foreground, before the package jobs start.
+#   Sets PREPUSH_REDIS_STATE to ready (and PREPUSH_REDIS_URL) or
+#   unavailable (the tests skip, with a WARNING). Never fails the push:
+#   CI runs these tests against its own Redis service.
+# -------------------------------------------------------------------
+PREPUSH_REDIS_STATE=""
+PREPUSH_REDIS_URL=""
+
+pkg_has_redis_tests() {
+    [ -d "$1/tests" ] && grep -rqs --include='*.py' JUDGEMIND_TEST_REDIS_URL "$1/tests"
+}
+
+ensure_prepush_redis() {
+    [ -z "$PREPUSH_REDIS_STATE" ] || return 0
+    if [ -n "${JUDGEMIND_TEST_REDIS_URL:-}" ]; then
+        PREPUSH_REDIS_STATE=ready
+        PREPUSH_REDIS_URL="$JUDGEMIND_TEST_REDIS_URL"
+        echo "pre-push: Redis tests use JUDGEMIND_TEST_REDIS_URL from the environment" >&2
+        return 0
+    fi
+    if [ "${PREPUSH_REDIS:-1}" = "0" ]; then
+        PREPUSH_REDIS_STATE=unavailable
+        echo "pre-push: WARNING: PREPUSH_REDIS=0, so no Redis for the real-Redis tests (#5106)" >&2
+        return 0
+    fi
+    local helper="scripts/ensure-test-redis.sh"
+    if [ ! -x "$helper" ]; then
+        PREPUSH_REDIS_STATE=unavailable
+        echo "pre-push: WARNING: $helper not found; no Redis for the real-Redis tests (#5106)" >&2
+        return 0
+    fi
+    local log="$PREPUSH_LOG_DIR/prepush-_-ensure-test-redis.log" out rc=0
+    out="$("$helper" 2>"$log")" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        PREPUSH_REDIS_STATE=ready
+        PREPUSH_REDIS_URL="$(printf '%s\n' "$out" | tail -n 1)"
+    else
+        PREPUSH_REDIS_STATE=unavailable
+    fi
+    sed 's/^/  /' "$log" >&2
+}
+
+# -------------------------------------------------------------------
 # python_pkg_checks <pkg> <has_code: true|false>
 #
 # ruff check + ruff format for one Python package, then (code changes
@@ -573,6 +635,23 @@ python_pkg_checks() {
         fi
     fi
 
+    # Real-Redis tests (#5106). redis_assign hands this package's pytest
+    # the Redis ensure_prepush_redis found. Without one they skip, loudly.
+    local redis_assign=""
+    if pkg_has_redis_tests "$pkg_dir"; then
+        if [ "$PREPUSH_REDIS_STATE" = "ready" ]; then
+            redis_assign="JUDGEMIND_TEST_REDIS_URL=$PREPUSH_REDIS_URL"
+        else
+            echo "" >&2
+            echo "  WARNING: no local Redis, so $pkg's real-Redis tests (tests that" >&2
+            echo "  read JUDGEMIND_TEST_REDIS_URL) are SKIPPED (#5106). CI runs them" >&2
+            echo "  against a Redis service and fails if they cannot run." >&2
+            echo "  Fix: start the local Redis and push again; the hook then uses it" >&2
+            echo "  by itself:" >&2
+            echo "    docker compose up -d redis" >&2
+        fi
+    fi
+
     if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
         echo "pre-push: running tests for Python package '$pkg'..." >&2
         # pytest-testmon must not run alongside pytest-cov: both drive
@@ -624,9 +703,10 @@ python_pkg_checks() {
         # limit, and a stall should end with stacks, not a killed push.
         local max_secs="${PREPUSH_PYTEST_MAX_SECS:-600}" pytest_rc=0
         local pytest_log="$PREPUSH_LOG_DIR/prepush-${pkg//\//_}-pytest.log"
-        # $pg_assign is unquoted on purpose: empty, it expands to nothing.
+        # $pg_assign / $redis_assign are unquoted on purpose: empty, they
+        # expand to nothing.
         run_check "$pkg" "pytest" run_capped "$max_secs" \
-            env ${PREPUSH_GIT_ENV_UNSET[@]+"${PREPUSH_GIT_ENV_UNSET[@]}"} $pg_assign \
+            env ${PREPUSH_GIT_ENV_UNSET[@]+"${PREPUSH_GIT_ENV_UNSET[@]}"} $pg_assign $redis_assign \
             bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $xdist_flag $timeout_flag tests/ -x -q --tb=line" \
             || pytest_rc=$?
         if [ "$pytest_rc" -eq "$PREPUSH_TIMEOUT_RC" ]; then
@@ -1145,8 +1225,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # alongside the CI guard umbrella, they run concurrently. See
     # python_pkg_checks / ts_pkg_checks above.
     # ---------------------------------------------------------------
-    # Prepare the Postgres test database first, in the foreground, so
-    # the package jobs started below inherit it (#4950).
+    # Prepare the Postgres test database (#4950) and find the local
+    # Redis (#5106) first, in the foreground, so the package jobs
+    # started below inherit them.
     for pkg in $python_pkgs_with_code; do
         if [[ "$pkg" == infra/* ]]; then
             pg_pkg_dir="$pkg"
@@ -1155,6 +1236,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
         if pkg_has_pg_tests "$pg_pkg_dir"; then
             ensure_prepush_pg
+        fi
+        if pkg_has_redis_tests "$pg_pkg_dir"; then
+            ensure_prepush_redis
         fi
     done
 
