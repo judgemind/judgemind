@@ -78,6 +78,15 @@ only: no object is read) and sorts each one into a category:
                      explains the key.  With ``--record`` this script
                      writes the row (deferred backlogs excepted) and
                      deletes it once the key is covered again.
+                     Likewise a key whose only explanation is a stale
+                     extraction skip verdict (``no_ruling_text`` /
+                     ``zero_rulings_no_text`` recorded under an older
+                     ``validation.skip_versions`` rule version, or over
+                     rulings the key held, #5094): reason ``stale_skip``,
+                     re-ingested with ``--bust-llm-cache`` so the LLM cache
+                     does not replay the verdict, and resolved once the
+                     key is represented or the verdict is recorded again
+                     under the current rules.
 - ``incomplete_stuck``  an incomplete key at ``--max-incomplete-attempts``
                      (default 3): reported, not retried.  Keys that just
                      reached the cap set ``issue_needed`` once (``stuck_at``
@@ -247,6 +256,7 @@ from validation.rule_versions import (
     fail_row_from_db,
     stale_rules,
 )
+from validation.skip_versions import EXTRACTION_SKIP_REASONS, stale_skip_reason
 
 BUCKET = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
 
@@ -321,6 +331,15 @@ RAW_MISSING = "raw_missing"
 #: ``HEAD`` error codes that mean the object does not exist.
 _MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
+#: ``ingestion.ingest_incomplete.INCOMPLETE_STALE_SKIP``: the incomplete
+#: reason this script records for a key whose only explanation is an
+#: extraction skip verdict that must be re-judged (#5094).
+STALE_SKIP = "stale_skip"
+
+#: Incomplete reasons whose keys re-ingest with ``--bust-llm-cache``
+#: (#5094): the LLM cache would replay the verdict being re-judged.
+BUST_CACHE_REASONS = frozenset({STALE_SKIP})
+
 #: Incomplete reasons whose keys re-ingest one key per subprocess, after the
 #: batched launches (#5054).  A ``dead_letter`` key killed the live worker
 #: ``MAX_MESSAGE_CRASHES`` times (#5010, #5055), so it is the likeliest to kill a
@@ -356,6 +375,7 @@ REINGEST_CLI_FLAGS = (
     "--write-failed-manifest",
     "--write-crashed-manifest",
     "--no-fail-on-errors",
+    "--bust-llm-cache",
 )
 
 
@@ -408,6 +428,9 @@ class Explained:
     #: Keys in ``documents`` whose rows are all superseded, hold no ruling,
     #: and whose dedup ruling is gone (#5093): not represented.
     orphaned_superseded: set[str] = field(default_factory=set)
+    #: s3_key -> detail of an extraction skip verdict's ``telemetry.ingest_skips``
+    #: row (rule version, extractor, rulings held; #5094).
+    skip_details: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -433,6 +456,11 @@ class ScopeReport:
     #: key is covered again, #5093).
     new_orphaned: list[RawKey] = field(default_factory=list)
     resolved_orphaned: list[RawKey] = field(default_factory=list)
+    #: Keys found with a stale extraction skip this run, with no incomplete
+    #: record yet, and why it is stale (#5094).
+    new_stale_skips: list[tuple[RawKey, str]] = field(default_factory=list)
+    #: Keys whose ``stale_skip`` record is resolved (#5094).
+    resolved_stale_skips: list[RawKey] = field(default_factory=list)
 
     def unrepresented_by_day(self) -> dict[str, int]:
         return dict(sorted(Counter(k.day for k in self.unrepresented).items()))
@@ -607,6 +635,37 @@ def _reconciler_record_resolved(raw: RawKey, explained: Explained) -> bool:
     return False
 
 
+def key_stale_skip(raw: RawKey, explained: Explained) -> str | None:
+    """Why *raw*'s skip record must be re-judged, or ``None`` (#5094).
+
+    Only an extraction verdict (``no_ruling_text``, ``zero_rulings_no_text``)
+    is ever stale: recorded under an older rule version
+    (``validation.skip_versions``), or over rulings the key held without
+    ``--allow-ruling-removal``.  A deterministic verdict (a placeholder
+    notice, the governor route, nothing readable) stands."""
+    reason = explained.skips.get(raw.key)
+    if reason not in EXTRACTION_SKIP_REASONS:
+        return None
+    return stale_skip_reason(reason, explained.skip_details.get(raw.key))
+
+
+def _stale_skip_record_resolved(raw: RawKey, explained: Explained) -> bool:
+    """A ``stale_skip`` record whose re-judgement is done (#5094): the key
+    is represented, or its skip verdict was recorded again under the
+    current rules (or replaced by a deterministic one)."""
+    record = explained.incomplete.get(raw.key)
+    if record is None or record[0] != STALE_SKIP:
+        return False
+    return is_represented(raw.key, explained) or key_stale_skip(raw, explained) is None
+
+
+def _incomplete_record_resolved(raw: RawKey, explained: Explained) -> bool:
+    """A record this script wrote whose cause is gone (#5027, #5093, #5094)."""
+    return _reconciler_record_resolved(raw, explained) or _stale_skip_record_resolved(
+        raw, explained
+    )
+
+
 def classify(
     raw: RawKey,
     explained: Explained,
@@ -634,10 +693,17 @@ def classify(
     (:attr:`Explained.orphaned_superseded`, #5093) is not represented: it
     is ``incomplete`` with reason ``orphaned_superseded`` unless a skip
     record or validation failure explains it.
+
+    A key whose only explanation is a stale extraction skip verdict
+    (:func:`key_stale_skip`) is ``incomplete`` too, with reason
+    ``stale_skip`` (#5094): it is re-ingested, with ``--bust-llm-cache``,
+    for the current extraction to judge it.  Its record is resolved once
+    the key is represented or the verdict is recorded again under the
+    current rules.
     """
     key = raw.key
     incomplete = explained.incomplete.get(key)
-    if incomplete is not None and not _reconciler_record_resolved(raw, explained):
+    if incomplete is not None and not _incomplete_record_resolved(raw, explained):
         reason, attempts = incomplete
         if attempts >= max_incomplete_attempts:
             return "incomplete_stuck", reason
@@ -646,6 +712,8 @@ def classify(
         return "represented", None
     reason = explained.skips.get(key)
     if reason:
+        if key_stale_skip(raw, explained):
+            return "incomplete", STALE_SKIP
         return "skipped", reason
     validation_reason = None
     if key in explained.validation_fail:
@@ -677,6 +745,23 @@ def is_sc_placeholder_pdf(body: bytes) -> bool:
     from ingestion.llm_extract import extract_text_layer
 
     return is_placeholder_notice(extract_text_layer(body))
+
+
+def _track_stale_skip(
+    rep: ScopeReport,
+    raw: RawKey,
+    category: str,
+    reason: str | None,
+    explained: Explained,
+) -> None:
+    """Note a key newly found with a stale extraction skip, or whose
+    ``stale_skip`` record is resolved (#5094)."""
+    record = explained.incomplete.get(raw.key)
+    if record is not None and record[0] == STALE_SKIP:
+        if category not in ("incomplete", "incomplete_stuck"):
+            rep.resolved_stale_skips.append(raw)
+    elif record is None and reason == STALE_SKIP:
+        rep.new_stale_skips.append((raw, key_stale_skip(raw, explained) or ""))
 
 
 def reconcile(
@@ -718,6 +803,7 @@ def reconcile(
             rep.new_stale.append((raw, key_stale_rules(raw, explained)))
         elif record is None and reason == ORPHANED_SUPERSEDED:
             rep.new_orphaned.append(raw)
+        _track_stale_skip(rep, raw, category, reason, explained)
         rep.counts[category] += 1
         if category in ("incomplete", "incomplete_stuck"):
             rep.incomplete_by_reason[reason or "unknown"] += 1
@@ -845,11 +931,66 @@ def record_stale_validation(
     conn.commit()
 
 
+def record_stale_skips(conn: Any, stale: Sequence[tuple[RawKey, str]]) -> None:
+    """Record keys whose extraction skip verdict must be re-judged in
+    ``telemetry.ingest_incomplete`` (reason ``stale_skip``, #5094), so their
+    reingest goes through the #5008 attempt count and cap.  A record the
+    worker already wrote for the key is left alone."""
+    if not stale:
+        return
+    with conn.cursor() as cur:
+        for raw, why in stale:
+            cur.execute(
+                "INSERT INTO telemetry.ingest_incomplete "
+                "(s3_key, reason, document_id, detail) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (s3_key) DO NOTHING",
+                (
+                    raw.key,
+                    STALE_SKIP,
+                    raw_key_document_id(raw.key),
+                    json.dumps({"stale": why, "scope": raw.scope}),
+                ),
+            )
+    conn.commit()
+
+
+def clear_stale_skips(conn: Any, keys: Sequence[str]) -> None:
+    """Delete the resolved ``stale_skip`` records (#5094)."""
+    clear_stale_validation(conn, keys, STALE_SKIP)
+
+
+def _fetch_skip_details(conn: Any, explained: Explained) -> None:
+    """The detail of every extraction skip verdict's row (#5094): its rule
+    version, extractor and the rulings the key held.  Best-effort: without
+    it every such skip reads as version 1, so it is re-judged once."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT s3_key, detail FROM telemetry.ingest_skips "
+                "WHERE reason = ANY(%s)",
+                (sorted(EXTRACTION_SKIP_REASONS),),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001 — table not migrated yet
+        conn.rollback()
+        print(f"WARNING ingest_skips detail unreadable ({exc}); no skip versions used")
+        return
+    for s3_key, detail in rows:
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                continue
+        if s3_key and isinstance(detail, dict):
+            explained.skip_details[s3_key] = detail
+
+
 def clear_stale_validation(
     conn: Any, keys: Sequence[str], reason: str = STALE_VALIDATION
 ) -> None:
     """Delete the resolved records of *reason* (``stale_validation``,
-    #5027; ``orphaned_superseded``, #5093) for *keys*."""
+    #5027; ``orphaned_superseded``, #5093; ``stale_skip``, #5094) for
+    *keys*."""
     if not keys:
         return
     with conn.cursor() as cur:
@@ -1046,6 +1187,9 @@ def fetch_explained(conn: Any) -> Explained:
         print(
             f"WARNING telemetry.ingest_skips unreadable ({exc}); no skip records used"
         )
+    else:
+        if any(r in EXTRACTION_SKIP_REASONS for r in explained.skips.values()):
+            _fetch_skip_details(conn, explained)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1481,6 +1625,48 @@ def split_isolated(
     return batched, isolated
 
 
+def split_bust_cache(
+    batch: Sequence[RawKey], explained: Explained
+) -> tuple[list[RawKey], list[RawKey]]:
+    """The batched incomplete keys split into keys that re-ingest as usual
+    and keys that re-ingest with ``--bust-llm-cache``
+    (:data:`BUST_CACHE_REASONS`, #5094): a stale extraction skip would
+    otherwise replay from the LLM cache."""
+    kept: list[RawKey] = []
+    busted: list[RawKey] = []
+    for raw in batch:
+        reason = explained.incomplete.get(raw.key, ("", 0))[0]
+        (busted if reason in BUST_CACHE_REASONS else kept).append(raw)
+    return kept, busted
+
+
+def apply_stale_skips(
+    reports: dict[str, ScopeReport],
+    explained: Explained,
+    conn: Any,
+    out: Callable[[str], None],
+    sample: int,
+) -> tuple[list[tuple[RawKey, str]], list[str]]:
+    """Fold this run's stale extraction skips into the incomplete keys
+    (#5094): new ones are recorded (with ``--record``) so their reingest
+    counts attempts against the cap; resolved records go."""
+    new = [item for rep in reports.values() for item in rep.new_stale_skips]
+    resolved = [raw.key for rep in reports.values() for raw in rep.resolved_stale_skips]
+    for raw, _why in new:
+        explained.incomplete[raw.key] = (STALE_SKIP, 0)
+    for key in resolved:
+        explained.incomplete.pop(key, None)
+    if conn is not None:
+        record_stale_skips(conn, new)
+        clear_stale_skips(conn, resolved)
+    for raw, why in new[:sample]:
+        out(
+            f"STALE_SKIP {raw.scope} skip={explained.skips.get(raw.key)} "
+            f"stale={why} key={raw.key}"
+        )
+    return new, resolved
+
+
 def read_keys(s3: Any, uri: str) -> set[str]:
     """The keys listed one per line at *uri* (``s3://`` or local); empty when
     it was never written (the reingest writes a manifest only when it has
@@ -1543,10 +1729,17 @@ class Reingester:
     _seq: int = 0
 
     def launch(
-        self, prefix: str, keys: list[str], *, primary: bool = False
+        self,
+        prefix: str,
+        keys: list[str],
+        *,
+        primary: bool = False,
+        bust: bool = False,
     ) -> tuple[Any, set[str]]:
         """Re-ingest *keys* under *prefix* once; return the exit code and
-        the keys a crash implicated (every key on a non-zero exit)."""
+        the keys a crash implicated (every key on a non-zero exit).  With
+        *bust*, the reingest skips LLM cache reads (``--bust-llm-cache``,
+        #5094)."""
         state = _slug(keys[0].split("/", 1)[0])
         if primary:
             name = state
@@ -1574,6 +1767,8 @@ class Reingester:
             crashed_uri,
             "--no-fail-on-errors",
         ]
+        if bust:
+            cmd.append("--bust-llm-cache")
         simulated = sorted(self.simulate_crash.intersection(keys))
         if simulated:
             cmd = [sys.executable, *SIMULATED_CRASH_ARGS]
@@ -1604,15 +1799,24 @@ class Reingester:
             "key_list": uri,
             "exit": code,
         }
+        if bust:
+            entry["bust_llm_cache"] = True
         if code == 0 and crashed:
             entry["crashed"] = len(crashed)
         self.ran.append(entry)
         return code, crashed
 
-    def heal(self, prefix: str, keys: list[str], *, primary: bool = False) -> None:
+    def heal(
+        self,
+        prefix: str,
+        keys: list[str],
+        *,
+        primary: bool = False,
+        bust: bool = False,
+    ) -> None:
         """:meth:`launch`, then bisect the keys a crash implicated until each
         crashing key is alone."""
-        code, crashed = self.launch(prefix, keys, primary=primary)
+        code, crashed = self.launch(prefix, keys, primary=primary, bust=bust)
         if not crashed:
             return
         if len(keys) == 1:
@@ -1621,11 +1825,11 @@ class Reingester:
             return
         implicated = [k for k in keys if k in crashed]
         if len(implicated) == 1:
-            self.heal(implicated[0], implicated)
+            self.heal(implicated[0], implicated, bust=bust)
             return
         mid = len(implicated) // 2
         for half in (implicated[:mid], implicated[mid:]):
-            self.heal(os.path.commonprefix(half), half)
+            self.heal(os.path.commonprefix(half), half, bust=bust)
 
 
 # ---------------------------------------------------------------------------
@@ -1722,6 +1926,9 @@ def run(
         out(f"STALE_VALIDATION {raw.scope} rules={','.join(rules)} key={raw.key}")
     for raw in new_orphaned[: args.sample]:
         out(f"ORPHANED_SUPERSEDED {raw.scope} day={raw.day} key={raw.key}")
+    new_stale_skips, resolved_stale_skips = apply_stale_skips(
+        reports, explained, conn, out, args.sample
+    )
 
     # Incomplete records whose raw object is gone can never heal (#5093):
     # reported, and closed out with --record.
@@ -1856,6 +2063,9 @@ def run(
         "orphan_incomplete_by_reason": dict(sorted(orphan_by_reason.items())),
         "orphan_incomplete_sample": orphan_incomplete[:10],
         "orphan_incomplete_closed": len(orphan_incomplete) if conn is not None else 0,
+        # Extraction skip verdicts re-judged (#5094).
+        "stale_skip_new": len(new_stale_skips),
+        "stale_skip_resolved": len(resolved_stale_skips),
     }
 
     script = None
@@ -1899,6 +2109,7 @@ def run(
         # out so the rest of the run still heals.  Past the cap a key is
         # reported as stuck (#5008).
         batched, isolated = split_isolated(batch, explained)
+        batched, busted = split_bust_cache(batched, explained)
         reingester = Reingester(
             args,
             s3,
@@ -1927,6 +2138,8 @@ def run(
                 reingester.heal(prefix, group, primary=True)
             for raw in isolated:
                 reingester.heal(raw.key, [raw.key])
+            for prefix, group in reingest_groups({}, busted).items():
+                reingester.heal(prefix, group, bust=True)
         except Exception as exc:  # noqa: BLE001 — recorded, then reported as failed
             if not incomplete_only:
                 action = "reingest_failed"
@@ -1934,6 +2147,7 @@ def run(
             detail["reingest_error"] = f"{type(exc).__name__}: {exc}"
         detail["reingest"] = reingester.ran
         detail["reingest_isolated"] = len(isolated)
+        detail["reingest_bust_cache"] = len(busted)
         detail["reingest_crashed"] = len(reingester.crashed)
         detail["reingest_crashed_sample"] = reingester.crashed[:10]
         if args.simulate_crash_key:

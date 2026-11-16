@@ -651,26 +651,141 @@ def test_reingest_all_rejected_whole_document_without_verdict_keeps_rulings() ->
 
 
 @_needs_pg
-@pytest.mark.parametrize(
-    "doc",
-    [
-        pytest.param("", id="no-rulings-no-text-skip"),
-        pytest.param("Page 1 of 1", id="no-rulings-verdict-whole-rejected"),
-    ],
-)
-def test_complete_empty_source_still_empties_the_key(doc: str) -> None:
+def test_complete_empty_source_still_empties_the_key() -> None:
     """A legitimate empty source still replaces the key's rulings with none
-    (#4725, #4940 unchanged by #5057): a document with no rulings and no
-    text (a recorded skip), or a complete extraction that found no rulings
-    whose whole document validation then rejects."""
+    (#4940 unchanged by #5057): a complete extraction that found no
+    rulings, whose whole document validation then rejects.  (A document
+    with no rulings and no text is an extraction's skip verdict, refused
+    over held rulings since #5094: see below.)"""
     events, before, after, marker = _run_after_rulings(
-        f"empty-source-{doc[:4] or 'none'}",
-        lambda specs: harness.Step("reingest", (), specs, ("whole",), doc=doc, whole=True),
+        "empty-source-page",
+        lambda specs: harness.Step(
+            "reingest", (), specs, ("whole",), doc="Page 1 of 1", whole=True
+        ),
     )
     assert len(before) == 3
     assert after == []
     assert marker is None, marker
     assert events["harness.refused"] == 0, dict(events)
+
+
+# ---------------------------------------------------------------------------
+# An extraction's skip verdict keeps the key's rulings (#5094)
+# ---------------------------------------------------------------------------
+
+
+def _empty_verdict(verdict: str, kind: str) -> Callable[[tuple[harness.Spec, ...]], harness.Step]:
+    """A step whose extraction's verdict is that the document holds no
+    rulings: ``no_ruling_text`` (every multimodal row textless, as an LLM
+    answering with empty cells returns) or ``zero_rulings_no_text`` (no
+    rulings in a PDF with no text layer, as after OCR that read nothing)."""
+    if verdict == "no_ruling_text":
+        return lambda specs: harness.Step(
+            kind, tuple(harness.Row("textless", i) for i in range(3)), specs, ("textless",)
+        )
+    return lambda specs: harness.Step(kind, (), specs, ("whole",), doc="", whole=True)
+
+
+def _skip_row(key_tag: str) -> tuple[str, dict[str, Any]] | None:
+    """The ``telemetry.ingest_skips`` row of ``harness.make_key(key_tag)``."""
+    with psycopg.connect(_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail FROM telemetry.ingest_skips WHERE s3_key = %s",
+            (harness.make_key(key_tag).s3_key,),
+        )
+        row = cur.fetchone()
+    return None if row is None else (row[0], row[1])
+
+
+@_needs_pg
+@pytest.mark.parametrize("verdict", ["no_ruling_text", "zero_rulings_no_text"])
+@pytest.mark.parametrize("kind", ["reingest", "db", "live"])
+def test_empty_extraction_verdict_keeps_rulings(verdict: str, kind: str) -> None:
+    """A key with three rulings, then an extraction whose verdict is that
+    the document holds none: the three rulings are kept and the key is
+    recorded ``empty_extraction`` (#5094), so the reconciler retries it
+    under its attempt cap.  A reingest raises
+    ``EmptyExtractionRefusedError`` (an ``AllChildrenRejectedError``), so
+    the run counts the key failed.  Before the fix the verdict replaced the
+    rulings and recorded a skip the reconciler counted as explained."""
+    events, before, after, marker = _run_after_rulings(
+        f"empty-{verdict}-{kind}", _empty_verdict(verdict, kind)
+    )
+    assert len(before) == 3
+    assert after == before
+    assert marker is not None and marker[0] == "empty_extraction", marker
+    assert events["harness.refused.empty_extraction"] == 1, dict(events)
+    raised = events["harness.raised.EmptyExtractionRefusedError"]
+    assert raised == (0 if kind == "live" else 1), dict(events)
+    # The harness's fresh-key oracle: the same verdict on a key with no
+    # rulings is still recorded as a skip, as before the fix.
+    assert events[f"harness.refused.fresh_skip.{verdict}"] == 1, dict(events)
+    assert events[f"harness.explained.extraction_skip.{verdict}"] >= 1, dict(events)
+
+
+@_needs_pg
+def test_generated_seeds_reach_the_empty_extraction_refusal() -> None:
+    """A generated seed reaches the #5094 refusal (a whole document with no
+    rulings and no text on a key that holds rulings), so the sweep keeps
+    checking it (``refused`` with its fresh-key skip oracle, ``marker``
+    expecting ``empty_extraction``)."""
+    events = harness.run_seed(_DSN, 5, _RUN, name="empty-refusal-reach")
+    assert events["harness.refused.empty_extraction"] > 0, dict(events)
+    assert events["harness.refused.fresh_skip.zero_rulings_no_text"] > 0, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize("verdict", ["no_ruling_text", "zero_rulings_no_text"])
+def test_empty_extraction_verdict_on_a_fresh_key_is_a_versioned_skip(verdict: str) -> None:
+    """A key with no rulings: the verdict is recorded as a skip, as before
+    #5094, stamped with the rule version (and the rulings held: none), so
+    the reconciler can re-judge it once the rules change."""
+    from validation.skip_versions import EXTRACTION_SKIP_RULE_VERSION
+
+    tag = f"{_RUN}-fresh-{verdict}"
+    h = harness.KeyHarness(_DSN, _RUN, -1)
+    try:
+        key = harness.make_key(f"{tag}-main")
+        h.run_step(key, _empty_verdict(verdict, "reingest")(_good_specs(tag)), "verdict")
+        assert harness.read_key(h.checker, key.s3_key) == []
+        assert h._incomplete_marker(key) is None
+        events = Counter(h.events)
+    finally:
+        h.close()
+    skip = _skip_row(f"{tag}-main")
+    assert skip is not None
+    reason, detail = skip
+    assert reason == verdict
+    assert detail["rule_version"] == EXTRACTION_SKIP_RULE_VERSION
+    assert detail["held_rulings"] == 0
+    assert events["harness.refused"] == 0, dict(events)
+
+
+@_needs_pg
+@pytest.mark.parametrize("verdict", ["no_ruling_text", "zero_rulings_no_text"])
+def test_allow_ruling_removal_lets_an_empty_extraction_verdict_remove_rulings(
+    verdict: str,
+) -> None:
+    """``--allow-ruling-removal`` is the only way such a verdict removes a
+    key's rulings (#5094): the rows go, and the skip records the removal
+    (``allowed_removal``), so the reconciler does not reopen it."""
+    from validation.skip_versions import stale_skip_reason
+
+    events, before, after, marker = _run_after_rulings(
+        f"empty-allow-{verdict}", _empty_verdict(verdict, "reingest"), allow_removal=True
+    )
+    assert len(before) == 3
+    assert after == []
+    assert marker is None, marker
+    assert events["split_set.empty_replacement_allowed"] == 1, dict(events)
+    assert events["harness.refused"] == 0, dict(events)
+    skip = _skip_row(f"{_RUN}-empty-allow-{verdict}-main")
+    assert skip is not None
+    reason, detail = skip
+    assert reason == verdict
+    assert detail["held_rulings"] == 3
+    assert detail["allowed_removal"] is True
+    assert stale_skip_reason(reason, detail) is None
 
 
 @_needs_pg

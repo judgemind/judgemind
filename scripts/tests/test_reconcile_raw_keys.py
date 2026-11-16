@@ -173,7 +173,12 @@ def test_classify_order_and_reasons(explained: rec.Explained) -> None:
 
 def test_skip_record_beats_validation_fail() -> None:
     key = f"{SD}{_h('9')}.pdf"
-    ex = rec.Explained(skips={key: "zero_rulings_no_text"}, validation_fail={key})
+    ex = rec.Explained(
+        skips={key: "zero_rulings_no_text"},
+        validation_fail={key},
+        # Recorded under the current rules (#5094): the verdict stands.
+        skip_details={key: {"rule_version": 2, "held_rulings": 0}},
+    )
     assert rec.classify(_raw(key), ex, now=NOW, grace=timedelta(0)) == (
         "skipped",
         "zero_rulings_no_text",
@@ -743,6 +748,9 @@ def test_reingest_cli_flags_cover_every_launch_flag(
     """REINGEST_CLI_FLAGS is the contract check_reingest_cli enforces, so it
     must list every flag a launch actually passes (#5060)."""
     calls: list[list[str]] = []
+    # An extraction skip recorded before #5094 re-ingests with
+    # --bust-llm-cache, so that flag is exercised too.
+    explained.skips[f"{SD}{_h('6')}.pdf"] = "no_ruling_text"
     rec.run(
         _args("--record", "--reingest", "--reingest-script", _stub_script(tmp_path)),
         s3,

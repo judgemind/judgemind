@@ -24,25 +24,49 @@ import json
 import logging
 from typing import Any
 
+from validation.skip_versions import (
+    EXTRACTION_SKIP_REASONS,
+    EXTRACTION_SKIP_RULE_VERSION,
+    RULE_VERSION_KEY,
+    SKIP_NO_RULING_TEXT,
+    SKIP_ZERO_RULINGS_NO_TEXT,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "EXTRACTION_SKIP_REASONS",
+    "SKIP_GOVERNOR_BIO_ROUTE",
+    "SKIP_NO_EXTRACTABLE_TEXT",
+    "SKIP_NO_RULING_TEXT",
+    "SKIP_RAW_MISSING",
+    "SKIP_REASONS",
+    "SKIP_SANTA_CLARA_PLACEHOLDER",
+    "SKIP_ZERO_RULINGS_NO_TEXT",
+    "record_ingest_skip",
+]
 
 #: ca-governor-appointments press releases, routed away from ruling
 #: extraction (#3688, #5016).
 SKIP_GOVERNOR_BIO_ROUTE = "governor_bio_route"
 #: Santa Clara "tentative rulings are not available" notice (#4725).
 SKIP_SANTA_CLARA_PLACEHOLDER = "santa_clara_placeholder"
-#: A multimodal PDF with no rulings and no text layer to fall back on (#4714).
-SKIP_ZERO_RULINGS_NO_TEXT = "zero_rulings_no_text"
 #: A PDF nothing could read; a retry cannot succeed (#4983, #4987).
 SKIP_NO_EXTRACTABLE_TEXT = "no_extractable_text"
-#: Every row the multimodal split found had no ruling text (calendar rows
-#: with an empty tentative cell, fused tail rows; #4714).
-SKIP_NO_RULING_TEXT = "no_ruling_text"
 #: Written by ``scripts/reconcile_raw_keys.py``, never the worker (#5093): a
 #: ``telemetry.ingest_incomplete`` key whose raw object is gone from the
 #: archive, closed out so it is reported once and never retried.  The
 #: detail keeps the incomplete reason, detail and attempts.
 SKIP_RAW_MISSING = "raw_missing"
+# Imported above from ``validation.skip_versions`` (#5094):
+# ``SKIP_ZERO_RULINGS_NO_TEXT``, a multimodal PDF with no rulings and no text
+# layer to fall back on (#4714), and ``SKIP_NO_RULING_TEXT``, every row the
+# multimodal split found had no ruling text (calendar rows with an empty
+# tentative cell, fused tail rows; #4714).  Both are extraction verdicts
+# (``EXTRACTION_SKIP_REASONS``): an extraction can be wrong, so their rows
+# carry the rule version that produced them and the raw-key reconciler
+# re-judges a stale one.  The worker never lets them replace a key's
+# rulings (``empty_extraction`` in ``telemetry.ingest_incomplete``).
 
 SKIP_REASONS = frozenset(
     {
@@ -85,6 +109,10 @@ def record_ingest_skip(
     Runs inside the caller's transaction under a savepoint and never raises.
     Nothing is written for an event without an ``s3_key`` (there is no raw
     key to explain), nor for a reason outside :data:`SKIP_REASONS`.
+
+    An extraction verdict (``EXTRACTION_SKIP_REASONS``) is stamped with the
+    current ``EXTRACTION_SKIP_RULE_VERSION`` (#5094), so the raw-key
+    reconciler can re-judge it once the rules change.
     """
     if not s3_key:
         return False
@@ -94,6 +122,9 @@ def record_ingest_skip(
             extra={"s3_key": s3_key, "skip_reason": reason},
         )
         return False
+    detail = dict(detail or {})
+    if reason in EXTRACTION_SKIP_REASONS:
+        detail.setdefault(RULE_VERSION_KEY, EXTRACTION_SKIP_RULE_VERSION)
     try:
         with conn.cursor() as cur:
             cur.execute("SAVEPOINT ingest_skip")
@@ -106,7 +137,7 @@ def record_ingest_skip(
                         county,
                         scraper_id,
                         document_id,
-                        json.dumps(detail or {}, default=str),
+                        json.dumps(detail, default=str),
                     ),
                 )
                 cur.execute("RELEASE SAVEPOINT ingest_skip")

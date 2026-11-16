@@ -8,12 +8,20 @@ from unittest.mock import MagicMock
 import pytest
 
 from ingestion.ingest_skips import (
+    EXTRACTION_SKIP_REASONS,
     SKIP_NO_RULING_TEXT,
     SKIP_REASONS,
     SKIP_SANTA_CLARA_PLACEHOLDER,
     record_ingest_skip,
 )
-from ingestion.worker import _empty_split_skip_reason, _SplitBatch
+from ingestion.worker import (
+    _empty_split_skip_reason,
+    _extraction_skip_verdict,
+    _pdf_extractor_identity,
+    _SplitBatch,
+    _writes_nothing,
+)
+from validation.skip_versions import EXTRACTION_SKIP_RULE_VERSION, stale_skip_reason
 
 
 def _conn() -> tuple[MagicMock, MagicMock]:
@@ -112,7 +120,123 @@ def test_skip_reasons_match_the_migration_comment() -> None:
         pytest.param(
             _SplitBatch("p", textless_rows=1, pre_split=MagicMock()), None, id="pre-split"
         ),
+        # Rows with text were found and rejected: not "all textless" (#5094).
+        pytest.param(
+            _SplitBatch("p", textless_rows=1, rejections=[{"reason": "validation"}]),
+            None,
+            id="textless-and-rejected",
+        ),
     ],
 )
 def test_skip_reason_for_empty_split(batch: _SplitBatch, expected: str | None) -> None:
     assert _empty_split_skip_reason(batch) == expected
+
+
+@pytest.mark.parametrize("reason", sorted(EXTRACTION_SKIP_REASONS))
+def test_extraction_skip_is_stamped_with_the_rule_version(reason: str) -> None:
+    """#5094: an extraction verdict carries the rule version that produced
+    it, so the raw-key reconciler can re-judge it."""
+    conn, cur = _conn()
+    assert record_ingest_skip(conn, s3_key="k", reason=reason, detail={"held_rulings": 0})
+    params = cur.execute.call_args_list[1].args[1]
+    assert json.loads(params[5]) == {
+        "held_rulings": 0,
+        "rule_version": EXTRACTION_SKIP_RULE_VERSION,
+    }
+
+
+def test_deterministic_skip_carries_no_rule_version() -> None:
+    conn, cur = _conn()
+    assert record_ingest_skip(conn, s3_key="k", reason=SKIP_SANTA_CLARA_PLACEHOLDER)
+    assert json.loads(cur.execute.call_args_list[1].args[1][5]) == {}
+
+
+@pytest.mark.parametrize(
+    ("batch", "writes_nothing", "verdict"),
+    [
+        pytest.param(_SplitBatch("p", textless_rows=2), True, "no_ruling_text", id="textless"),
+        pytest.param(
+            _SplitBatch("p", no_rulings_reason="zero_rulings_no_text"),
+            True,
+            "zero_rulings_no_text",
+            id="zero-rulings-no-text",
+        ),
+        pytest.param(
+            _SplitBatch("p", no_rulings_reason="santa_clara_placeholder"),
+            False,
+            None,
+            id="deterministic-placeholder",
+        ),
+        pytest.param(
+            _SplitBatch("p", whole_document=True, no_rulings_verdict=True),
+            False,
+            None,
+            id="no-rulings-verdict",
+        ),
+        pytest.param(_SplitBatch("p"), True, None, id="all-rejected"),
+    ],
+)
+def test_extraction_verdicts_write_nothing(
+    batch: _SplitBatch, writes_nothing: bool, verdict: str | None
+) -> None:
+    """#5094: an extraction's skip verdict is refused over held rulings like
+    a split whose every child was rejected; a deterministic one is not."""
+    assert _writes_nothing(batch) is writes_nothing
+    assert _extraction_skip_verdict(batch) == verdict
+
+
+def test_pdf_extractor_identity_reads_the_cache_namespace() -> None:
+    extractor = MagicMock()
+    extractor.pdf_cache_namespace = "google-gemini/prompt-abc"
+    assert _pdf_extractor_identity(extractor) == "google-gemini/prompt-abc"
+    # A test double without the property (a MagicMock attribute) has none.
+    assert _pdf_extractor_identity(MagicMock()) is None
+    assert _pdf_extractor_identity(None) is None
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail", "expected"),
+    [
+        pytest.param("no_ruling_text", None, "rule_version", id="no-detail"),
+        pytest.param("no_ruling_text", {}, "rule_version", id="pre-5094-row"),
+        pytest.param("zero_rulings_no_text", {"rule_version": 1}, "rule_version", id="v1"),
+        pytest.param("no_ruling_text", {"rule_version": "x"}, "rule_version", id="garbled"),
+        pytest.param(
+            "no_ruling_text",
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "held_rulings": 0},
+            None,
+            id="current-fresh-key",
+        ),
+        pytest.param(
+            "no_ruling_text",
+            {"rule_version": EXTRACTION_SKIP_RULE_VERSION, "held_rulings": 2},
+            "removed_rulings",
+            id="removed-rulings",
+        ),
+        pytest.param(
+            "no_ruling_text",
+            {
+                "rule_version": EXTRACTION_SKIP_RULE_VERSION,
+                "held_rulings": 2,
+                "allowed_removal": True,
+            },
+            None,
+            id="allowed-removal",
+        ),
+        pytest.param("santa_clara_placeholder", {}, None, id="deterministic"),
+        pytest.param(None, {}, None, id="no-skip"),
+    ],
+)
+def test_stale_skip_reason(reason: str | None, detail: object, expected: str | None) -> None:
+    assert stale_skip_reason(reason, detail) == expected  # type: ignore[arg-type]
+
+
+def test_pdf_cache_namespace_names_provider_model_and_prompt() -> None:
+    from framework.llm_extractor import PDF_PER_PAGE_PROMPT, LlmExtractor, _prompt_hash
+
+    extractor = LlmExtractor.__new__(LlmExtractor)
+    extractor._provider = "google"
+    extractor._model = "gemini-2.5-flash-lite"
+    assert extractor.pdf_cache_namespace == (
+        f"google-gemini-2.5-flash-lite/prompt-{_prompt_hash(PDF_PER_PAGE_PROMPT)[:16]}"
+    )

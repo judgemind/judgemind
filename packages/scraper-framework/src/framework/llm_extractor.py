@@ -3585,6 +3585,17 @@ class LlmExtractor:
 
         return rulings
 
+    @property
+    def pdf_cache_namespace(self) -> str:
+        """The identity of this extractor's PDF split: its LLM cache
+        namespace, ``{provider}-{model}/prompt-{hash}`` (#5094).
+
+        It changes with the model and with any edit to the per-page prompt,
+        exactly when ``extract_from_pdf`` stops reading earlier cache
+        entries.  The worker records it on an extraction's skip verdict
+        (``no_ruling_text``, ``zero_rulings_no_text``)."""
+        return f"{self._provider}-{self._model}/prompt-{_prompt_hash(PDF_PER_PAGE_PROMPT)[:16]}"
+
     def extract_from_pdf(
         self,
         pdf_bytes: bytes,

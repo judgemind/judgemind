@@ -138,6 +138,7 @@ from .extract import (
 from .ingest_incomplete import (
     INCOMPLETE_ALL_CHILDREN_REJECTED,
     INCOMPLETE_DEAD_LETTER,
+    INCOMPLETE_EMPTY_EXTRACTION,
     INCOMPLETE_EVIDENCE_UNAVAILABLE,
     INCOMPLETE_EXHAUSTED_CHILD,
     INCOMPLETE_PARTIAL_SPLIT,
@@ -147,6 +148,7 @@ from .ingest_incomplete import (
     record_ingest_incomplete,
 )
 from .ingest_skips import (
+    EXTRACTION_SKIP_REASONS,
     SKIP_GOVERNOR_BIO_ROUTE,
     SKIP_NO_EXTRACTABLE_TEXT,
     SKIP_NO_RULING_TEXT,
@@ -375,6 +377,25 @@ class AllChildrenRejectedError(SplitExtractionFailedError):
     reports it in its ``rows_kept_all_rejected`` count.  A rule tightening
     that should remove the rows is an operator action:
     ``--allow-ruling-removal``.
+    """
+
+
+class EmptyExtractionRefusedError(AllChildrenRejectedError):
+    """A split-set replacement (reingest / rebuild) whose extraction's
+    verdict is that the document holds no rulings, on a key that holds
+    rulings (#5094).
+
+    The verdicts are ``no_ruling_text`` (every multimodal row came back
+    textless) and ``zero_rulings_no_text`` (no rulings in a PDF with no
+    text layer).  Either is often a degraded extraction (an LLM answering
+    with empty cells, a truncated response, OCR that read nothing), not an
+    empty source.  The write is refused as for
+    :class:`AllChildrenRejectedError`: the key's rows are left as they are
+    and the key is recorded ``empty_extraction`` in
+    ``telemetry.ingest_incomplete``, so the raw-key reconciler retries it
+    under its attempt cap.  ``--allow-ruling-removal`` removes the rows and
+    records the skip instead.  A subclass, so a reingest counts the key in
+    ``rows_kept_all_rejected`` like any refused empty split set.
     """
 
 
@@ -1937,6 +1958,28 @@ class _SplitBatch:
     #: on (``ExtractionMethod.NONE``, e.g. CourtListener): its rejection is
     #: no verdict on the key's rulings.
     no_rulings_verdict: bool = False
+    #: The multimodal extractor's identity (its LLM cache namespace:
+    #: provider, model, prompt hash) when it ran, recorded on an extraction
+    #: skip verdict so the verdict can be re-judged (#5094).
+    extractor: str | None = None
+
+
+def _extraction_skip_verdict(batch: _SplitBatch) -> str | None:
+    """The batch's skip verdict when an extraction produced it (#5094):
+    ``no_ruling_text`` or ``zero_rulings_no_text``, else ``None``.
+
+    Unlike a deterministic detector (a Santa Clara placeholder notice), an
+    extraction can be wrong, so such a verdict never replaces rulings the
+    key holds (``_refuse_empty_split_set``)."""
+    reason = _empty_split_skip_reason(batch)
+    return reason if reason in EXTRACTION_SKIP_REASONS else None
+
+
+def _pdf_extractor_identity(extractor: Any) -> str | None:
+    """*extractor*'s PDF cache namespace (``LlmExtractor.pdf_cache_namespace``),
+    or ``None`` when it has none (a test double)."""
+    identity = getattr(extractor, "pdf_cache_namespace", None)
+    return identity if isinstance(identity, str) else None
 
 
 def _incomplete_split_reason(batch: _SplitBatch) -> str | None:
@@ -1966,7 +2009,11 @@ def _empty_split_skip_reason(batch: _SplitBatch) -> str | None:
         return None
     if batch.no_rulings_reason:
         return batch.no_rulings_reason
-    if batch.textless_rows:
+    if batch.textless_rows and not batch.rejections:
+        # Every row was textless (#5015).  When rows with text were found
+        # too and rejected, the rows are not "all textless": the key is
+        # empty because of the rejections (#5094), whose own durable rows
+        # explain it and whose refusal is ``all_children_rejected``.
         return SKIP_NO_RULING_TEXT
     return None
 
@@ -1982,18 +2029,26 @@ def _writes_nothing(batch: _SplitBatch) -> bool:
     verdict on the document, so ``_write_split_batch`` refuses to remove
     them (``_refuse_empty_split_set``).
 
-    Two legitimate empty sources still empty the key: a recorded skip
-    verdict (``_empty_split_skip_reason``: a placeholder notice, a PDF with
-    no rulings and no text, rows with no ruling text), and a complete
-    extraction that found no rulings (``no_rulings_verdict``), whose whole
-    document validation then rejected (#4940).
+    Two legitimate empty sources still empty the key: a deterministic skip
+    verdict (``_empty_split_skip_reason``: a Santa Clara placeholder
+    notice), and a complete extraction that found no rulings
+    (``no_rulings_verdict``), whose whole document validation then
+    rejected (#4940).
+
+    An extraction's skip verdict (``_extraction_skip_verdict``: rows with
+    no ruling text, a PDF with no rulings and no text layer) counts as
+    writing nothing (#5094): an LLM answering with empty cells or OCR that
+    read nothing gives the same verdict as an empty source, so it must not
+    replace the key's rulings either.  On a key with no rulings it is still
+    recorded as a skip.
     """
+    skip = _empty_split_skip_reason(batch)
     return (
         batch.pre_split is None
         and not batch.children
         and not batch.keep_ids
         and not batch.no_rulings_verdict
-        and _empty_split_skip_reason(batch) is None
+        and (skip is None or skip in EXTRACTION_SKIP_REASONS)
     )
 
 
@@ -5710,7 +5765,23 @@ class IngestionWorker:
                 # notice, a PDF with no rulings and no text, rows with no
                 # ruling text): record why in the same transaction as the
                 # empty split set, so the raw-key reconciler does not count
-                # the key as lost (#5015).
+                # the key as lost (#5015).  An extraction verdict reaches
+                # here over held rulings only with --allow-ruling-removal
+                # (#5094); the detail says so, and names the extractor, so
+                # the reconciler can re-judge the verdict.
+                skip_detail: dict[str, Any] = {
+                    "removed_rows": len(removed),
+                    "textless_rows": batch.textless_rows,
+                }
+                if held is not None:
+                    # Read for a split that writes nothing (#5057).
+                    skip_detail["held_rulings"] = held
+                if held:
+                    skip_detail["allowed_removal"] = (
+                        event_data.get(ALLOW_RULING_REMOVAL_KEY) is True
+                    )
+                if batch.extractor:
+                    skip_detail["extractor"] = batch.extractor
                 record_ingest_skip(
                     conn,
                     s3_key=s3_key,
@@ -5718,7 +5789,7 @@ class IngestionWorker:
                     county=event_data.get("county"),
                     scraper_id=event_data.get("scraper_id"),
                     document_id=parent_document_id,
-                    detail={"removed_rows": len(removed), "textless_rows": batch.textless_rows},
+                    detail=skip_detail,
                 )
             if s3_key and batch.pre_split is None:
                 # The key's incomplete record follows this write, in its
@@ -6252,10 +6323,21 @@ class IngestionWorker:
         run with ``--allow-ruling-removal``: a rule tightening meant to
         remove rows) is not refused: the removal is logged as a warning and
         the write goes ahead.
+
+        An extraction's skip verdict (``_extraction_skip_verdict``:
+        ``no_ruling_text``, ``zero_rulings_no_text``) is refused the same
+        way (#5094): it is often a degraded extraction (an LLM answering
+        with empty cells, OCR that read nothing), not an empty source.  The
+        key is recorded ``empty_extraction``, with the verdict, and a
+        split-set replacement raises ``EmptyExtractionRefusedError``.
         """
         s3_key = event_data.get("s3_key")
         replace_set = event_data.get(REPLACE_SPLIT_SET_KEY) is True
         reasons = Counter(r.get("reason", "unknown") for r in batch.rejections)
+        verdict = _extraction_skip_verdict(batch)
+        incomplete_reason = (
+            INCOMPLETE_EMPTY_EXTRACTION if verdict else INCOMPLETE_ALL_CHILDREN_REJECTED
+        )
         log_extra = {
             "document_id": parent_document_id,
             "s3_key": s3_key,
@@ -6266,32 +6348,49 @@ class IngestionWorker:
             "rejection_reasons": dict(reasons),
             "whole_document": batch.whole_document,
             "replace_set": replace_set,
+            "incomplete_reason": incomplete_reason,
+            "verdict": verdict,
+            "textless_rows": batch.textless_rows,
         }
+        what = f"the extraction's verdict is {verdict}" if verdict else "every child was rejected"
         if event_data.get(ALLOW_RULING_REMOVAL_KEY) is True:
             logger.warning(
-                "Removing a key's rulings: every child was rejected and "
-                "--allow-ruling-removal is set",
+                f"Removing a key's rulings: {what} and --allow-ruling-removal is set",
                 extra={"telemetry_event": EMPTY_SPLIT_SET_ALLOWED_EVENT, **log_extra},
             )
             return False
         logger.warning(
-            "Refused to replace a key's rulings with an empty split set: every "
-            "child was rejected; the rows are kept",
+            f"Refused to replace a key's rulings with an empty split set: {what}; "
+            "the rows are kept",
             extra={"telemetry_event": EMPTY_SPLIT_SET_REFUSED_EVENT, **log_extra},
         )
+        detail: dict[str, Any] = {
+            "held_rulings": held,
+            "rejected": len(batch.rejections),
+            "rejection_reasons": dict(reasons),
+            "rejections": batch.rejections[:_MAX_REJECTIONS_IN_DETAIL],
+            "whole_document": batch.whole_document,
+            "replace_set": replace_set,
+        }
+        if verdict:
+            detail.update(
+                {
+                    "verdict": verdict,
+                    "textless_rows": batch.textless_rows,
+                    "extractor": batch.extractor,
+                }
+            )
         self._record_incomplete_and_commit(
             {**event_data, "document_id": parent_document_id},
-            INCOMPLETE_ALL_CHILDREN_REJECTED,
-            {
-                "held_rulings": held,
-                "rejected": len(batch.rejections),
-                "rejection_reasons": dict(reasons),
-                "rejections": batch.rejections[:_MAX_REJECTIONS_IN_DETAIL],
-                "whole_document": batch.whole_document,
-                "replace_set": replace_set,
-            },
+            incomplete_reason,
+            detail,
         )
         if replace_set:
+            if verdict:
+                raise EmptyExtractionRefusedError(
+                    f"{s3_key or parent_document_id}: the extraction's verdict is "
+                    f"{verdict} ({batch.textless_rows} textless row(s)); kept {held} ruling(s)"
+                )
             noted = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "no reason noted"
             raise AllChildrenRejectedError(
                 f"{s3_key or parent_document_id}: every child was rejected ({noted}); "
@@ -6720,6 +6819,7 @@ class IngestionWorker:
                         strict=True,
                     )
                     extraction_method = "multimodal"
+                    batch.extractor = _pdf_extractor_identity(multimodal_extractor)
                     if extracted_rulings:
                         logger.info(
                             "Multimodal extraction succeeded",
