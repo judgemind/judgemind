@@ -35,23 +35,37 @@
 # The shape mirrors `scripts/gh-comment-with-retry.sh` (#4478, #4503,
 # #4484): try the gh subcommand first, on the explicit GraphQL-quota
 # marker fall back to REST, otherwise pass the original failure through.
-# This file does NOT implement the 504-after-success recovery path; PR
-# create/edit/merge each have different idempotency stories than the
-# comment endpoint, and the only failure mode #4527 calls out is
-# GraphQL-quota exhaustion. The 504-on-merge recovery is documented in
-# `.claude/skills/task/SKILL.md` §A.7 ("Fallback — `gh pr merge` returns
-# 5xx / 504 Gateway Timeout (#4231)") and stays operator-driven. A
+# Merge after a 5xx (#4231, #5122): GitHub's `gh pr merge` sometimes
+# returns 502/504 after it has already accepted the squash, so
+# `--delete-branch` never runs. On a 5xx the wrapper never retries the
+# merge. It reads the PR over REST (`GET /pulls/<N>`); when `merged` is
+# true it deletes the head ref (if --delete-branch was given; an
+# already-gone ref counts as deleted) and exits 0. When the PR is not
+# merged, or the read fails, the original failure passes through. This
+# path only reads and deletes a ref; it never merges.
+#
+# create/edit have no 5xx recovery: they are not idempotent the same way
+# (a blind retry of create can open a duplicate PR). A
 # `base branch policy prohibits the merge` refusal is passed through
 # untouched: it means branch protection is not satisfied, so the caller
 # waits (scripts/wait-for-ci.sh) instead of bypassing it (#4965).
 #
-# Tracking: issue #4527.
+# create passes --assignee / --label / --reviewer (each repeatable or
+# comma-separated) and --draft through to `gh pr create`, so a PR opens
+# assigned in one call (#5122). POST /pulls cannot carry assignees,
+# labels or reviewers, so on the REST fallback the wrapper applies them
+# with follow-up calls once the PR exists (`@me` is resolved via
+# GET /user). A failure there warns but still exits 0, because the PR was
+# created and a retry would open a duplicate.
+#
+# Tracking: issues #4527, #5122.
 #
 # Usage
 # -----
 #   scripts/gh-pr-with-retry.sh create \
 #       --title "..." --body-file <path> --base main --head <branch> \
-#       [--repo <owner/name>]
+#       [--assignee <login>]... [--label <name>]... [--reviewer <login>]... \
+#       [--draft] [--repo <owner/name>]
 #
 #   scripts/gh-pr-with-retry.sh edit <PR-N> \
 #       [--title "..."] [--body-file <path>] [--repo <owner/name>]
@@ -115,7 +129,8 @@ with GraphQL-quota REST fallback.
 Usage:
   scripts/gh-pr-with-retry.sh create \
       --title "..." --body-file <path> --base <branch> --head <branch> \
-      [--repo <owner/name>]
+      [--assignee <login>]... [--label <name>]... [--reviewer <login>]... \
+      [--draft] [--repo <owner/name>]
 
   scripts/gh-pr-with-retry.sh edit <PR-N> \
       [--title "..."] [--body-file <path>] [--repo <owner/name>]
@@ -127,10 +142,14 @@ Usage:
 
 Subcommands:
   create   Open a new PR. Required: --title, --body-file, --base, --head.
+           Optional: --assignee, --label, --reviewer (repeatable or
+           comma-separated) and --draft, passed through to gh pr create.
   edit     Update an existing PR's title and/or body. At least one of
            --title or --body-file is required.
   merge    Squash-merge a PR. --squash is required (only mode supported);
            pass --delete-branch to delete the head ref after merging.
+           On a 5xx from gh pr merge, reads the PR: if it merged anyway,
+           deletes the head ref (with --delete-branch) and exits 0.
 
 Common flags:
   --repo <owner/name>   Repository (default: judgemind/judgemind).
@@ -179,6 +198,12 @@ HEAD=""
 REPO="judgemind/judgemind"
 SQUASH=0
 DELETE_BRANCH=0
+# create-only passthrough flags (#5122). Repeatable; each value is passed
+# to `gh pr create` as its own --assignee / --label / --reviewer flag.
+ASSIGNEES=()
+LABELS=()
+REVIEWERS=()
+DRAFT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -225,6 +250,36 @@ while [[ $# -gt 0 ]]; do
             fi
             REPO="$2"
             shift 2
+            ;;
+        --assignee|--label|--reviewer)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: $1 requires a value." >&2
+                exit 2
+            fi
+            if [[ "$SUBCOMMAND" != "create" ]]; then
+                echo "ERROR: $1 is only supported by 'create'." >&2
+                exit 2
+            fi
+            # gh accepts comma-separated lists; split them so the REST
+            # fallback can send each login / label on its own.
+            IFS=',' read -r -a _vals <<< "$2"
+            for _v in "${_vals[@]}"; do
+                [[ -z "$_v" ]] && continue
+                case "$1" in
+                    --assignee) ASSIGNEES+=("$_v") ;;
+                    --label) LABELS+=("$_v") ;;
+                    --reviewer) REVIEWERS+=("$_v") ;;
+                esac
+            done
+            shift 2
+            ;;
+        --draft)
+            if [[ "$SUBCOMMAND" != "create" ]]; then
+                echo "ERROR: $1 is only supported by 'create'." >&2
+                exit 2
+            fi
+            DRAFT=1
+            shift
             ;;
         --squash)
             SQUASH=1
@@ -346,13 +401,96 @@ passthrough_failure() {
 # create
 # ---------------------------------------------------------------------------
 
+# After a REST-fallback create, apply the --assignee / --label / --reviewer
+# flags that POST /pulls cannot carry (#5122). The PR already exists, so a
+# failure here only warns: exiting non-zero would invite a retry that opens
+# a duplicate PR. Prints one status fragment per applied group on stdout.
+apply_create_extras() {
+    local pr_url="$1"
+    local pr_number="${pr_url##*/}"
+    local extras=""
+    if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+        if [[ ${#ASSIGNEES[@]} -gt 0 || ${#LABELS[@]} -gt 0 || ${#REVIEWERS[@]} -gt 0 ]]; then
+            echo "WARNING: could not read the PR number from '$pr_url'; assignees/labels/reviewers NOT applied." >&2
+        fi
+        return 0
+    fi
+
+    if [[ ${#ASSIGNEES[@]} -gt 0 ]]; then
+        local -a a_args=()
+        local login
+        for login in "${ASSIGNEES[@]}"; do
+            if [[ "$login" == "@me" ]]; then
+                # REST does not resolve @me; look up the token's login.
+                login=$(gh api /user --jq '.login' 2>/dev/null) || login=""
+                if [[ -z "$login" ]]; then
+                    echo "WARNING: could not resolve @me to a login; skipping that assignee." >&2
+                    continue
+                fi
+            fi
+            a_args+=("-f" "assignees[]=$login")
+        done
+        if [[ ${#a_args[@]} -gt 0 ]]; then
+            if gh api -X POST "/repos/$REPO/issues/$pr_number/assignees" "${a_args[@]}" > /dev/null 2>> "$REST_STDERR_FILE"; then
+                extras+="; assignees applied"
+            else
+                echo "WARNING: PR #$pr_number created but assigning failed; run: gh pr edit $pr_number --repo $REPO --add-assignee ${ASSIGNEES[*]}" >&2
+            fi
+        fi
+    fi
+
+    if [[ ${#LABELS[@]} -gt 0 ]]; then
+        local -a l_args=()
+        local label
+        for label in "${LABELS[@]}"; do
+            l_args+=("-f" "labels[]=$label")
+        done
+        if gh api -X POST "/repos/$REPO/issues/$pr_number/labels" "${l_args[@]}" > /dev/null 2>> "$REST_STDERR_FILE"; then
+            extras+="; labels applied"
+        else
+            echo "WARNING: PR #$pr_number created but labelling failed; run: gh pr edit $pr_number --repo $REPO --add-label <label>" >&2
+        fi
+    fi
+
+    if [[ ${#REVIEWERS[@]} -gt 0 ]]; then
+        local -a r_args=()
+        local reviewer
+        for reviewer in "${REVIEWERS[@]}"; do
+            r_args+=("-f" "reviewers[]=$reviewer")
+        done
+        if gh api -X POST "/repos/$REPO/pulls/$pr_number/requested_reviewers" "${r_args[@]}" > /dev/null 2>> "$REST_STDERR_FILE"; then
+            extras+="; reviewers requested"
+        else
+            echo "WARNING: PR #$pr_number created but requesting reviewers failed; run: gh pr edit $pr_number --repo $REPO --add-reviewer <login>" >&2
+        fi
+    fi
+
+    printf '%s' "$extras"
+}
+
 run_create() {
+    local -a gh_args=("pr" "create" "--repo" "$REPO"
+        "--title" "$TITLE"
+        "--body-file" "$BODY_FILE"
+        "--base" "$BASE"
+        "--head" "$HEAD")
+    local v
+    # ${arr[@]+...} keeps `set -u` happy on bash 3.2 when the array is empty.
+    for v in ${ASSIGNEES[@]+"${ASSIGNEES[@]}"}; do
+        gh_args+=("--assignee" "$v")
+    done
+    for v in ${LABELS[@]+"${LABELS[@]}"}; do
+        gh_args+=("--label" "$v")
+    done
+    for v in ${REVIEWERS[@]+"${REVIEWERS[@]}"}; do
+        gh_args+=("--reviewer" "$v")
+    done
+    if [[ "$DRAFT" -eq 1 ]]; then
+        gh_args+=("--draft")
+    fi
+
     set +e
-    gh pr create --repo "$REPO" \
-        --title "$TITLE" \
-        --body-file "$BODY_FILE" \
-        --base "$BASE" \
-        --head "$HEAD" \
+    gh "${gh_args[@]}" \
         > "$STDOUT_FILE" 2> "$STDERR_FILE"
     local gh_exit=$?
     set -e
@@ -383,6 +521,7 @@ run_create() {
             GH_PR_BODY_FILE="$BODY_FILE" \
             GH_PR_HEAD="$HEAD" \
             GH_PR_BASE="$BASE" \
+            GH_PR_DRAFT="$DRAFT" \
             GH_PR_PAYLOAD_FILE="$payload_file" \
             python3 "$script_dir/_gh_pr_with_retry_payload.py" create; then
         echo "ERROR: failed to build REST payload for 'pr create'." >&2
@@ -400,7 +539,9 @@ run_create() {
     if [[ "$rest_exit" -eq 0 ]]; then
         local rest_url
         rest_url=$(cat "$REST_STDOUT_FILE")
-        echo "create succeeded (REST fallback): $rest_url"
+        local extras
+        extras=$(apply_create_extras "$rest_url")
+        echo "create succeeded (REST fallback): $rest_url$extras"
         exit 0
     fi
 
@@ -489,6 +630,70 @@ run_edit() {
 # merge
 # ---------------------------------------------------------------------------
 
+is_server_error() {
+    # A 5xx from `gh pr merge` (#4231, #5122). GitHub often returns 502/504
+    # (sometimes as a multi-KB "Unicorn!" HTML page) after it has already
+    # accepted the squash, so `--delete-branch` never runs.
+    grep -qE "HTTP 5[0-9]{2}|(^|[^0-9])50[0-4]([^0-9]|$)|Bad Gateway|Gateway Time-?out|Service Unavailable|Internal Server Error|Unicorn!" "$STDERR_FILE"
+}
+
+# Delete the head ref after a merge whose `--delete-branch` did not run.
+# A ref that is already gone counts as deleted. Prints a status fragment.
+delete_head_ref() {
+    local head_ref="$1"
+    if [[ -z "$head_ref" ]]; then
+        echo "WARNING: could not resolve the head ref to delete." >&2
+        printf '%s' "; head branch NOT deleted (unknown ref)"
+        return 0
+    fi
+    set +e
+    gh api -X DELETE "/repos/$REPO/git/refs/heads/$head_ref" \
+        > "$DELETE_STDOUT_FILE" 2> "$DELETE_STDERR_FILE"
+    local delete_exit=$?
+    set -e
+    if [[ "$delete_exit" -eq 0 ]]; then
+        printf '%s' "; branch '$head_ref' deleted"
+    elif grep -qE "Reference does not exist|HTTP 422" "$DELETE_STDERR_FILE"; then
+        printf '%s' "; branch '$head_ref' was already deleted"
+    else
+        echo "WARNING: branch DELETE failed (gh exit $delete_exit):" >&2
+        head -c 5120 "$DELETE_STDERR_FILE" >&2
+        echo "" >&2
+        echo "  manual cleanup: gh api /repos/$REPO/git/refs/heads/$head_ref -X DELETE" >&2
+        printf '%s' "; branch '$head_ref' NOT deleted"
+    fi
+}
+
+# `gh pr merge` returned a 5xx. Never retry the merge call: read the PR over
+# REST (the GraphQL side is what just failed) and decide (#4231, #5122).
+#   merged       → the squash landed. Delete the head ref if --delete-branch
+#                  was asked for, report success, exit 0.
+#   not merged   → pass the original failure through (the caller diagnoses
+#                  and retries the wrapper once, per SKILL.md §A.7).
+#   read failed  → pass the original failure through.
+recover_merge_after_server_error() {
+    local gh_exit="$1"
+    echo "gh-pr-with-retry: 'pr merge' returned a server error; checking whether the merge landed anyway..." >&2
+
+    local state_line merged head_ref pr_state
+    state_line=$(gh api "/repos/$REPO/pulls/$PR_NUMBER" \
+        --jq '[((.merged // false) | tostring), (.head.ref // ""), (.state // "")] | join("\u001f")' \
+        2>/dev/null) || state_line=""
+    IFS=$'\x1f' read -r merged head_ref pr_state <<< "$state_line" || true
+
+    if [[ "${merged:-}" != "true" ]]; then
+        echo "gh-pr-with-retry: PR #$PR_NUMBER is not merged (state='${pr_state:-unknown}'); passing the original failure through." >&2
+        passthrough_failure "$gh_exit"
+    fi
+
+    local summary="merge succeeded (confirmed after server error): PR #$PR_NUMBER is merged"
+    if [[ "$DELETE_BRANCH" -eq 1 ]]; then
+        summary+=$(delete_head_ref "${head_ref:-}")
+    fi
+    echo "$summary"
+    exit 0
+}
+
 run_merge() {
     # Build the gh pr merge args. SQUASH is the only supported mode.
     local -a gh_args=("pr" "merge" "$PR_NUMBER" "--repo" "$REPO" "--squash")
@@ -508,6 +713,9 @@ run_merge() {
     fi
 
     if ! is_graphql_rate_limit; then
+        if is_server_error; then
+            recover_merge_after_server_error "$gh_exit"
+        fi
         passthrough_failure "$gh_exit"
     fi
 
@@ -566,51 +774,16 @@ run_merge() {
     # Merge succeeded. If --delete-branch was set, delete the head ref
     # explicitly — the REST PUT /merge endpoint does not delete the
     # branch (unlike `gh pr merge --delete-branch` which is a one-shot).
-    local rest_summary
-    rest_summary=$(cat "$REST_STDOUT_FILE")
-
-    if [[ "$DELETE_BRANCH" -ne 1 ]]; then
-        echo "merge succeeded (REST fallback): $rest_summary"
-        exit 0
-    fi
-
     # The head ref came from the pre-merge REST read above (GraphQL
     # `gh pr view` is unavailable — that is why we're in the fallback).
-    if [[ -z "${head_ref:-}" ]]; then
-        echo "WARNING: merge succeeded but could not resolve head ref to delete (--delete-branch)." >&2
-        echo "merge succeeded (REST fallback): $rest_summary" >&2
-        echo "  manual cleanup: gh api /repos/$REPO/git/refs/heads/<branch> -X DELETE" >&2
-        # The merge succeeded; the branch deletion is best-effort. Exit
-        # 0 — the operator can clean up the branch manually.
-        echo "merge succeeded (REST fallback): $rest_summary"
-        exit 0
+    # Branch deletion is best-effort: the merge, the caller's primary
+    # intent, succeeded, so this exits 0 either way.
+    local rest_summary
+    rest_summary="merge succeeded (REST fallback): $(cat "$REST_STDOUT_FILE")"
+    if [[ "$DELETE_BRANCH" -eq 1 ]]; then
+        rest_summary+=$(delete_head_ref "${head_ref:-}")
     fi
-
-    set +e
-    gh api -X DELETE "/repos/$REPO/git/refs/heads/$head_ref" \
-        > "$DELETE_STDOUT_FILE" 2> "$DELETE_STDERR_FILE"
-    local delete_exit=$?
-    set -e
-
-    if [[ "$delete_exit" -eq 0 ]]; then
-        echo "merge succeeded (REST fallback): $rest_summary; branch '$head_ref' deleted"
-        exit 0
-    fi
-
-    # If the branch is already gone (DELETE returns 422 / "Reference does not exist"),
-    # treat as success — same semantics as the SKILL.md A.7 recipe.
-    if grep -qE "Reference does not exist|HTTP 422" "$DELETE_STDERR_FILE"; then
-        echo "merge succeeded (REST fallback): $rest_summary; branch '$head_ref' was already deleted"
-        exit 0
-    fi
-
-    echo "WARNING: merge succeeded but branch DELETE failed (gh exit $delete_exit)." >&2
-    head -c 5120 "$DELETE_STDERR_FILE" >&2
-    echo "" >&2
-    echo "merge succeeded (REST fallback): $rest_summary; branch '$head_ref' NOT deleted"
-    # Merge is the user's primary intent and it succeeded — exit 0 even
-    # though the cleanup didn't. The warning above gives the operator
-    # the manual recovery path.
+    echo "$rest_summary"
     exit 0
 }
 

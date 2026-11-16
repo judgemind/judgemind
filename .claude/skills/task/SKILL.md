@@ -820,13 +820,14 @@ The **Post-deploy verification** section must include at least one concrete veri
 - [ ] N/A — no deployed component (docs/CI/tooling only)
 ```
 
-Create the PR via the `gh-pr-with-retry.sh` wrapper (#4527). The wrapper invokes `gh pr create` first and falls back to `gh api -X POST /repos/.../pulls` on the explicit `GraphQL: API rate limit already exceeded` stderr marker — same shape as `gh-comment-with-retry.sh` (#4503). Auth, validation, and other 5xx failures pass through unchanged. Pass the worktree branch explicitly to `--head` (the wrapper does not infer it from `git rev-parse`):
+Create the PR via the `gh-pr-with-retry.sh` wrapper (#4527). The wrapper invokes `gh pr create` first and falls back to `gh api -X POST /repos/.../pulls` on the explicit `GraphQL: API rate limit already exceeded` stderr marker — same shape as `gh-comment-with-retry.sh` (#4503). Auth, validation, and other 5xx failures pass through unchanged. Pass the worktree branch explicitly to `--head` (the wrapper does not infer it from `git rev-parse`). Pass `--assignee <login>` so the PR opens assigned in the same call, with no follow-up `gh pr edit` (#5122). Use the login the operator or dispatcher named; `drewthaler` while the agent account is unavailable. `--label`, `--reviewer` (each repeatable or comma-separated) and `--draft` pass through the same way, and on the REST fallback the wrapper applies them once the PR exists:
 ```
 {worktree}/scripts/gh-pr-with-retry.sh create \
     --title "..." \
     --body-file {worktree}/tmp/pr_body.txt \
     --base main \
-    --head <branch>
+    --head <branch> \
+    --assignee <login>
 ```
 
 #### A.4 — Verify no merge conflicts
@@ -936,7 +937,9 @@ Once the gate is green, merge via the `gh-pr-with-retry.sh` wrapper (#4527). It 
 
 GitHub's `gh pr merge` periodically returns transient `5xx` / `504 Gateway Timeout` responses (sometimes wrapped in a multi-KB HTML error page that floods the agent transcript) **after the underlying REST endpoint has already accepted the squash on the GitHub side.** The 504 looks like a merge failure but is not — the merge already happened. Naively retrying `gh pr merge` here is wrong because the second call will fail with `Pull request is already closed` or similar, and the loud HTML response makes the failure mode look worse than it is. A concrete observed instance: PR #4230 (issue #4227, 2026-05-06) — two retries of `gh pr merge --squash --delete-branch` both returned 5xx; the PR had actually merged on the first call (`merged_at: 2026-05-06T15:54:59Z`), but `--delete-branch` did not run, leaving the head ref alive.
 
-**Recipe — on 5xx / 504 / HTML response from `gh pr merge`, do NOT retry the merge call. Re-fetch PR state and treat closed-with-merged_at as success.**
+**The wrapper handles the merged-anyway case itself (#5122).** When `gh pr merge` fails with a 5xx (an `HTTP 5xx` line, `Bad Gateway`, `Gateway Timeout`, or the "Unicorn!" HTML page), `gh-pr-with-retry.sh merge` does not retry the merge. It reads the PR with `GET /repos/.../pulls/<N>`. If `merged` is true it deletes the head ref (when `--delete-branch` was given; an already-gone ref counts as deleted), prints `merge succeeded (confirmed after server error): ...`, and exits 0. Continue to A.8. If the PR is not merged, or the read fails, the wrapper passes the original 5xx through with a non-zero exit, and you follow the recipe below. A wrapper exit of 0 needs no manual branch cleanup.
+
+**Recipe — on a non-zero 5xx / 504 / HTML response from the wrapper, do NOT retry the merge call. Re-fetch PR state and treat closed-with-merged_at as success.**
 
 ```
 mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
