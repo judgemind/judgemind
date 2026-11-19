@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import pkgutil
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -12,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
-from framework.court_directory import CourtDirectory
+from framework.court_directory import SEALED_METHODS, CourtDirectory
 from framework.hashing import sha256_hex
 
 # ---------------------------------------------------------------------------
@@ -701,3 +703,110 @@ class TestUnchangedRosterSeedsMissingJudgesPg:
                 )
             conn.commit()
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Sealed base-class methods (#5163)
+# ---------------------------------------------------------------------------
+
+
+def _court_directory_subclasses() -> list[type[CourtDirectory]]:
+    """Import every module under ``courts`` and return its CourtDirectory subclasses.
+
+    Walks the package rather than a registry (``framework.runner`` and
+    ``scripts/fetch_rosters.py`` list different courts), so a new court is
+    covered as soon as its module exists.  An import that raises the
+    ``__init_subclass__`` TypeError fails the calling test with its message.
+    """
+    import courts
+
+    for info in pkgutil.walk_packages(courts.__path__, prefix="courts."):
+        importlib.import_module(info.name)
+
+    found: set[type[CourtDirectory]] = set()
+    pending = list(CourtDirectory.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        if cls.__module__.startswith("courts."):
+            found.add(cls)
+    return sorted(found, key=lambda c: (c.__module__, c.__qualname__))
+
+
+def test_save_snapshot_not_overridden_by_any_court_directory() -> None:
+    """No court directory defines its own save_snapshot or seeding helpers.
+
+    SB and SF copies of save_snapshot skipped the derived.judges seed and the
+    roster-cache clear (#5161).  Per-court storage needs belong in a hook on
+    the base method, not a copy of it.
+    """
+    subclasses = _court_directory_subclasses()
+    names = {cls.__name__ for cls in subclasses}
+    # Guard against a vacuous walk: these courts must be discovered.
+    assert {"SanBernardinoCourtDirectory", "SFCourtDirectory", "LACourtDirectory"} <= names
+    assert len(subclasses) >= 11
+
+    offenders = [
+        f"{cls.__module__}.{cls.__qualname__}.{method}"
+        for cls in subclasses
+        for method in sorted(SEALED_METHODS.intersection(vars(cls)))
+    ]
+    assert offenders == [], (
+        "CourtDirectory subclasses must not override sealed base methods; "
+        f"extend CourtDirectory.save_snapshot instead: {offenders}"
+    )
+
+
+@pytest.mark.parametrize("method", sorted(SEALED_METHODS))
+def test_save_snapshot_not_overridden_rejected_at_class_creation(method: str) -> None:
+    """Defining a sealed method on a subclass raises TypeError naming the base hook."""
+
+    def _override(self: Any, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        return None
+
+    with pytest.raises(TypeError) as excinfo:
+        type(
+            "_OverridingDirectory",
+            (CourtDirectory,),
+            {"fetch_current": lambda self: (b"", {}), method: _override},
+        )
+    message = str(excinfo.value)
+    assert method in message
+    assert "CourtDirectory.save_snapshot" in message
+    assert "fetch_current()" in message
+
+
+def test_save_snapshot_not_overridden_allows_non_sealed_overrides() -> None:
+    """fetch_current and fetch_and_snapshot overrides stay legal."""
+
+    class _Allowed(CourtDirectory):
+        def fetch_current(self) -> tuple[bytes, dict[str, str]]:  # pragma: no cover
+            return b"", {}
+
+        def fetch_and_snapshot(self, court_id: str | None = None) -> dict[str, str]:
+            return super().fetch_and_snapshot(court_id or "ca_test")  # pragma: no cover
+
+    assert "fetch_and_snapshot" in vars(_Allowed)
+
+
+def test_every_court_fetch_and_snapshot_keeps_base_contract() -> None:
+    """Each court's fetch_and_snapshot delegates to the base contract.
+
+    Courts override fetch_and_snapshot only to default ``court_id``.  The base
+    method skips saving an empty mapping (#4880) and otherwise calls
+    save_snapshot once; an override that bypassed super() would lose both.
+    """
+    for cls in _court_directory_subclasses():
+        for mapping, expected_calls in (({}, 0), ({"1": "Alice Smith"}, 1)):
+            directory = cls.__new__(cls)
+            directory.fetch_current = MagicMock(return_value=(b"<html/>", mapping))  # type: ignore[method-assign]
+            directory.save_snapshot = MagicMock(return_value=True)  # type: ignore[method-assign]
+
+            result = directory.fetch_and_snapshot("ca_contract_test")
+
+            assert result == mapping, cls.__name__
+            assert directory.save_snapshot.call_count == expected_calls, cls.__name__
+            if expected_calls:
+                directory.save_snapshot.assert_called_once_with(
+                    b"<html/>", mapping, "ca_contract_test"
+                )

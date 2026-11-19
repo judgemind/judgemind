@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+# Base-class methods whose side effects every court depends on: S3 archival,
+# content-hash dedup, the snapshot insert, the roster-cache clear and the
+# derived.judges seed.  A subclass copy of any of them silently drifts as the
+# base gains steps: SB and SF copies of save_snapshot skipped the judge seed
+# for months (#5161).  ``CourtDirectory.__init_subclass__`` rejects overrides
+# (#5163).
+SEALED_METHODS: frozenset[str] = frozenset({"save_snapshot", "_seed_judges", "_is_duplicate"})
+
 
 class CourtDirectory(abc.ABC):
     """Abstract base class for court department-to-judge directory snapshots.
@@ -48,7 +56,29 @@ class CourtDirectory(abc.ABC):
         The S3 bucket name for archival.
     db_conn : psycopg.Connection
         A psycopg3 connection for reading/writing snapshots.
+
+    Subclasses must not override ``save_snapshot``, ``_seed_judges`` or
+    ``_is_duplicate`` (see ``SEALED_METHODS``); defining one raises
+    ``TypeError`` at class creation.  Court-specific fetching and parsing
+    belongs in ``fetch_current()``.
     """
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        overridden = sorted(SEALED_METHODS.intersection(vars(cls)))
+        if overridden:
+            names = ", ".join(overridden)
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} overrides {names}. "
+                "CourtDirectory.save_snapshot and its helpers own S3 archival, "
+                "dedup, the snapshot insert, the roster-cache clear and the "
+                "derived.judges seed, and a subclass copy drifts out of date "
+                "(#5161). Put court-specific fetching and parsing in "
+                "fetch_current(). If a court needs different storage, add a "
+                "hook to CourtDirectory.save_snapshot in "
+                "framework/court_directory.py so every court keeps the full "
+                "contract (#5163)."
+            )
 
     def __init__(
         self,
