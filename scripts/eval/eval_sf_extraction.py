@@ -339,7 +339,11 @@ def _call_with_retry(
             if attempt < max_retries - 1:
                 wait = 2**attempt
                 print(
-                    "TIMEOUT (" + str(timeout_s) + "s), retry " + str(attempt + 1) + "...",
+                    "TIMEOUT ("
+                    + str(timeout_s)
+                    + "s), retry "
+                    + str(attempt + 1)
+                    + "...",
                     end=" ",
                     flush=True,
                 )
@@ -653,10 +657,14 @@ def score_fixture(result: FixtureResult) -> dict:
         "empty_rulings": empty_count,
         "short_rulings": short_count,
         "ruling_lengths": ruling_lengths,
-        "avg_ruling_length": (total_text_len / len(result.rulings) if result.rulings else 0),
+        "avg_ruling_length": (
+            total_text_len / len(result.rulings) if result.rulings else 0
+        ),
         "fields_present": fields_present,
         "fields_total": fields_total,
-        "field_completeness_pct": (fields_present / fields_total * 100 if fields_total > 0 else 0),
+        "field_completeness_pct": (
+            fields_present / fields_total * 100 if fields_total > 0 else 0
+        ),
         "case_numbers_correct": cn_correct,
         "case_numbers_total": cn_total,
         "case_titles_correct": ct_correct,
@@ -715,7 +723,9 @@ def analyze_model(
     # Cost calculations
     avg_in = summary.total_input_tokens / len(valid) if valid else 0
     avg_out = summary.total_output_tokens / len(valid) if valid else 0
-    summary.cost_per_fixture = (avg_in * pricing["input"] + avg_out * pricing["output"]) / 1_000_000
+    summary.cost_per_fixture = (
+        avg_in * pricing["input"] + avg_out * pricing["output"]
+    ) / 1_000_000
     # Estimate: ~6 PDFs/day (3 departments x 2 scrapes)
     summary.estimated_monthly_cost = summary.cost_per_fixture * 6 * 30
 
@@ -735,7 +745,11 @@ def print_model_report(summary: ModelSummary) -> None:
     )
     print("Avg latency per fixture: " + f"{summary.avg_latency_ms:,.0f}" + "ms")
 
-    scorable = summary.case_count_correct + summary.case_count_off_by_one + summary.case_count_wrong
+    scorable = (
+        summary.case_count_correct
+        + summary.case_count_off_by_one
+        + summary.case_count_wrong
+    )
     if scorable == 0:
         print("\nNo scorable fixtures.")
         return
@@ -745,9 +759,15 @@ def print_model_report(summary: ModelSummary) -> None:
     print("  Off by 1:     " + str(summary.case_count_off_by_one) + "/" + str(scorable))
     print("  Wrong (>1):   " + str(summary.case_count_wrong) + "/" + str(scorable))
     exact_pct = summary.case_count_correct / scorable * 100
-    lenient_pct = (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+    lenient_pct = (
+        (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+    )
     print("  Exact accuracy:   " + f"{exact_pct:.1f}" + "%")
-    print("  Lenient accuracy: " + f"{lenient_pct:.1f}" + "% (off-by-1 counted as correct)")
+    print(
+        "  Lenient accuracy: "
+        + f"{lenient_pct:.1f}"
+        + "% (off-by-1 counted as correct)"
+    )
 
     print("\n## Case Number Accuracy")
     if summary.case_numbers_total > 0:
@@ -795,7 +815,9 @@ def print_model_report(summary: ModelSummary) -> None:
     print("  Empty rulings:           " + str(summary.empty_rulings))
     if summary.total_rulings > 0:
         non_empty_pct = (
-            (summary.total_rulings - summary.empty_rulings) / summary.total_rulings * 100
+            (summary.total_rulings - summary.empty_rulings)
+            / summary.total_rulings
+            * 100
         )
         print("  Non-empty rate:          " + f"{non_empty_pct:.1f}" + "%")
 
@@ -841,8 +863,14 @@ def print_model_report(summary: ModelSummary) -> None:
             tag = " ~1"
         else:
             tag = " ERR"
-        cn_str = str(detail["case_numbers_correct"]) + "/" + str(detail["case_numbers_total"])
-        ct_str = str(detail["case_titles_correct"]) + "/" + str(detail["case_titles_total"])
+        cn_str = (
+            str(detail["case_numbers_correct"])
+            + "/"
+            + str(detail["case_numbers_total"])
+        )
+        ct_str = (
+            str(detail["case_titles_correct"]) + "/" + str(detail["case_titles_total"])
+        )
         fc_str = f"{detail['field_completeness_pct']:.0f}%"
         print(
             "  "
@@ -900,7 +928,11 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Case number accuracy':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = s.case_numbers_correct / s.case_numbers_total * 100 if s.case_numbers_total > 0 else 0
+        pct = (
+            s.case_numbers_correct / s.case_numbers_total * 100
+            if s.case_numbers_total > 0
+            else 0
+        )
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -988,15 +1020,27 @@ def main() -> int:
     google_models = [m for m in args.models if MODELS[m]["provider"] == "google"]
 
     if anthropic_models and not anthropic_key:
-        print("ERROR: ANTHROPIC_API_KEY not set (needed for: " + ", ".join(anthropic_models) + ")")
+        print(
+            "ERROR: ANTHROPIC_API_KEY not set (needed for: "
+            + ", ".join(anthropic_models)
+            + ")"
+        )
         return 1
     if google_models and not google_key:
-        print("ERROR: GOOGLE_API_KEY not set (needed for: " + ", ".join(google_models) + ")")
+        print(
+            "ERROR: GOOGLE_API_KEY not set (needed for: "
+            + ", ".join(google_models)
+            + ")"
+        )
         return 1
 
     # Load fixtures
     fixtures = get_sf_fixtures()
-    print("Found " + str(len(fixtures)) + " San Francisco Family Law PDF fixtures with ground truth\n")
+    print(
+        "Found "
+        + str(len(fixtures))
+        + " San Francisco Family Law PDF fixtures with ground truth\n"
+    )
     for fp, exp in fixtures:
         desc = exp.get("_description", "")
         cc = exp.get("case_count", "?")
@@ -1011,7 +1055,15 @@ def main() -> int:
         fixture_texts[fp.name] = text
         line_count = len(text.split("\n"))
         char_count = len(text)
-        print("  " + fp.name + ": " + str(char_count) + " chars, " + str(line_count) + " lines")
+        print(
+            "  "
+            + fp.name
+            + ": "
+            + str(char_count)
+            + " chars, "
+            + str(line_count)
+            + " lines"
+        )
     print()
 
     # Regex baseline comparison
@@ -1102,7 +1154,11 @@ def main() -> int:
                 match_str = (
                     "EXACT"
                     if len(rulings) == expected_case_count
-                    else ("~1" if abs(len(rulings) - expected_case_count) == 1 else "WRONG")
+                    else (
+                        "~1"
+                        if abs(len(rulings) - expected_case_count) == 1
+                        else "WRONG"
+                    )
                 )
 
                 print(
@@ -1173,7 +1229,10 @@ def main() -> int:
                         llm_cns.add(cn)
 
                 if regex_cns - llm_cns:
-                    print("    REGRESSION: regex found but LLM missed: " + str(regex_cns - llm_cns))
+                    print(
+                        "    REGRESSION: regex found but LLM missed: "
+                        + str(regex_cns - llm_cns)
+                    )
 
             except Exception as e:
                 print("ERROR: " + str(e))
@@ -1215,7 +1274,9 @@ def main() -> int:
                     summary.case_count_correct / scorable * 100 if scorable > 0 else 0
                 ),
                 "case_count_lenient_pct": (
-                    (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+                    (summary.case_count_correct + summary.case_count_off_by_one)
+                    / scorable
+                    * 100
                     if scorable > 0
                     else 0
                 ),
@@ -1246,7 +1307,9 @@ def main() -> int:
     all_pass = True
     for summary in all_summaries.values():
         scorable = (
-            summary.case_count_correct + summary.case_count_off_by_one + summary.case_count_wrong
+            summary.case_count_correct
+            + summary.case_count_off_by_one
+            + summary.case_count_wrong
         )
         if scorable > 0:
             if summary.case_count_correct < scorable:

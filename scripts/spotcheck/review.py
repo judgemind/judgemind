@@ -22,6 +22,7 @@ Checks by entity type:
 
 Outputs findings.json in the spotcheck directory.
 """
+
 from __future__ import annotations
 
 import abc

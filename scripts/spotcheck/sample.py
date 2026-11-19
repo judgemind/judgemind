@@ -16,6 +16,7 @@ Usage (originals — S3 only, can run locally):
 
 Output: manifest JSON to stdout (or to --output path).
 """
+
 from __future__ import annotations
 
 import argparse

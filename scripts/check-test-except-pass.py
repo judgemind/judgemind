@@ -138,7 +138,11 @@ def find_violations(filepath: Path) -> list[tuple[int, str]]:
                 continue
             if _line_has_noqa(source_lines, handler.lineno):
                 continue
-            snippet_line = source_lines[handler.lineno - 1].strip() if handler.lineno - 1 < len(source_lines) else ""
+            snippet_line = (
+                source_lines[handler.lineno - 1].strip()
+                if handler.lineno - 1 < len(source_lines)
+                else ""
+            )
             violations.append((handler.lineno, snippet_line))
 
     return violations

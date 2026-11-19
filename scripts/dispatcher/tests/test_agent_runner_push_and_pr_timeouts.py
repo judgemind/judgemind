@@ -367,11 +367,13 @@ class TestTimeoutWrappersPresent:
                 # ``timeout "$_phase_timeout"`` (#3766), or the #4125
                 # macOS-portable resolver-driven form
                 # ``$_timeout_cmd ${_timeout_cmd:+"$_phase_timeout"}``.
-                assert re.search(
-                    r'timeout\s+"\$\w*TIMEOUT_SECONDS"', line
-                ) or re.search(r'timeout\s+"\$_phase_timeout"', line) or re.search(
-                    r'\$_timeout_cmd\s+\$\{_timeout_cmd:\+"\$_phase_timeout"\}',
-                    line,
+                assert (
+                    re.search(r'timeout\s+"\$\w*TIMEOUT_SECONDS"', line)
+                    or re.search(r'timeout\s+"\$_phase_timeout"', line)
+                    or re.search(
+                        r'\$_timeout_cmd\s+\$\{_timeout_cmd:\+"\$_phase_timeout"\}',
+                        line,
+                    )
                 ), (
                     f"L{lineno}: ``claude -p`` in run_claude_phase is not wrapped by "
                     f'``timeout "$<VAR>_TIMEOUT_SECONDS"``, ``timeout "$_phase_timeout"``, '

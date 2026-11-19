@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Local S3 cache — bulk sync and CLI utilities."""
+
 # venv: scraper-framework
 # permanent: true
 #
@@ -74,7 +75,13 @@ class LocalS3Cache:
         Skips objects that already exist locally (content-addressed = correct).
         """
         paginator = self._s3.get_paginator("list_objects_v2")
-        stats = {"total": 0, "cached": 0, "downloaded": 0, "bytes": 0, "downloaded_bytes": 0}
+        stats = {
+            "total": 0,
+            "cached": 0,
+            "downloaded": 0,
+            "bytes": 0,
+            "downloaded_bytes": 0,
+        }
 
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
@@ -157,11 +164,15 @@ def cmd_stats(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local S3 cache for judgemind documents")
+    parser = argparse.ArgumentParser(
+        description="Local S3 cache for judgemind documents"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_sync = sub.add_parser("sync", help="Bulk sync S3 objects to local cache")
-    p_sync.add_argument("--prefix", default="ca/", help="S3 prefix to sync (default: ca/)")
+    p_sync.add_argument(
+        "--prefix", default="ca/", help="S3 prefix to sync (default: ca/)"
+    )
     p_sync.set_defaults(func=cmd_sync)
 
     p_get = sub.add_parser("get", help="Fetch a single S3 key (lazy cache)")

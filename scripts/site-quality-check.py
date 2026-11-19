@@ -56,7 +56,9 @@ class QualityReport:
 def http_get(url: str, timeout: int = 30) -> tuple[int, str]:
     """Fetch a URL and return (status_code, body). Returns (0, error) on failure."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JudgemindQualityCheck/1.0"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "JudgemindQualityCheck/1.0"}
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
@@ -106,9 +108,7 @@ def resolve_path(data: Any, path: str) -> Any:
     return current
 
 
-def check_pages(
-    base_url: str, pages: list[dict[str, Any]]
-) -> list[CheckResult]:
+def check_pages(base_url: str, pages: list[dict[str, Any]]) -> list[CheckResult]:
     """Check that each page returns 200 and contains expected content markers."""
     results = []
     for page in pages:
@@ -120,29 +120,35 @@ def check_pages(
         status, body = http_get(url)
 
         if status != 200:
-            results.append(CheckResult(
-                name=name,
-                category="page",
-                passed=False,
-                details=f"HTTP {status} for {path}",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="page",
+                    passed=False,
+                    details=f"HTTP {status} for {path}",
+                )
+            )
             continue
 
         missing = [m for m in markers if m.lower() not in body.lower()]
         if missing:
-            results.append(CheckResult(
-                name=name,
-                category="page",
-                passed=False,
-                details=f"Missing content markers on {path}: {', '.join(missing)}",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="page",
+                    passed=False,
+                    details=f"Missing content markers on {path}: {', '.join(missing)}",
+                )
+            )
         else:
-            results.append(CheckResult(
-                name=name,
-                category="page",
-                passed=True,
-                details=f"{path} OK ({len(markers)} markers found)",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="page",
+                    passed=True,
+                    details=f"{path} OK ({len(markers)} markers found)",
+                )
+            )
 
     return results
 
@@ -160,22 +166,30 @@ def check_graphql_queries(
         resp = graphql_query(api_url, query)
 
         if "error" in resp and not isinstance(resp.get("data"), dict):
-            results.append(CheckResult(
-                name=name,
-                category="graphql",
-                passed=False,
-                details=f"Query failed: {resp['error']}",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="graphql",
+                    passed=False,
+                    details=f"Query failed: {resp['error']}",
+                )
+            )
             continue
 
         if "errors" in resp:
-            error_msg = resp["errors"][0].get("message", "Unknown error") if resp["errors"] else "Unknown"
-            results.append(CheckResult(
-                name=name,
-                category="graphql",
-                passed=False,
-                details=f"GraphQL error: {error_msg}",
-            ))
+            error_msg = (
+                resp["errors"][0].get("message", "Unknown error")
+                if resp["errors"]
+                else "Unknown"
+            )
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="graphql",
+                    passed=False,
+                    details=f"GraphQL error: {error_msg}",
+                )
+            )
             continue
 
         value = resolve_path(resp, expected_path)
@@ -183,50 +197,72 @@ def check_graphql_queries(
         # Check expected_value (exact match)
         if "expected_value" in q:
             if value == q["expected_value"]:
-                results.append(CheckResult(
-                    name=name, category="graphql", passed=True,
-                    details=f"Value matches: {value}",
-                ))
+                results.append(
+                    CheckResult(
+                        name=name,
+                        category="graphql",
+                        passed=True,
+                        details=f"Value matches: {value}",
+                    )
+                )
             else:
-                results.append(CheckResult(
-                    name=name, category="graphql", passed=False,
-                    details=f"Expected '{q['expected_value']}' at {expected_path}, got '{value}'",
-                ))
+                results.append(
+                    CheckResult(
+                        name=name,
+                        category="graphql",
+                        passed=False,
+                        details=f"Expected '{q['expected_value']}' at {expected_path}, got '{value}'",
+                    )
+                )
             continue
 
         # Check min_items (list length)
         if "min_items" in q:
             if isinstance(value, list) and len(value) >= q["min_items"]:
-                results.append(CheckResult(
-                    name=name, category="graphql", passed=True,
-                    details=f"{len(value)} items returned (min {q['min_items']})",
-                ))
+                results.append(
+                    CheckResult(
+                        name=name,
+                        category="graphql",
+                        passed=True,
+                        details=f"{len(value)} items returned (min {q['min_items']})",
+                    )
+                )
             else:
                 count = len(value) if isinstance(value, list) else 0
-                results.append(CheckResult(
-                    name=name, category="graphql", passed=False,
-                    details=f"Expected >= {q['min_items']} items at {expected_path}, got {count}",
-                ))
+                results.append(
+                    CheckResult(
+                        name=name,
+                        category="graphql",
+                        passed=False,
+                        details=f"Expected >= {q['min_items']} items at {expected_path}, got {count}",
+                    )
+                )
             continue
 
         # Default: just check it's not None/empty
         if value:
-            results.append(CheckResult(
-                name=name, category="graphql", passed=True,
-                details=f"Value present at {expected_path}",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="graphql",
+                    passed=True,
+                    details=f"Value present at {expected_path}",
+                )
+            )
         else:
-            results.append(CheckResult(
-                name=name, category="graphql", passed=False,
-                details=f"Empty or missing value at {expected_path}",
-            ))
+            results.append(
+                CheckResult(
+                    name=name,
+                    category="graphql",
+                    passed=False,
+                    details=f"Empty or missing value at {expected_path}",
+                )
+            )
 
     return results
 
 
-def check_functional(
-    api_url: str, functional: dict[str, Any]
-) -> list[CheckResult]:
+def check_functional(api_url: str, functional: dict[str, Any]) -> list[CheckResult]:
     """Run functional checks: search, judge profile, ruling detail."""
     results = []
 
@@ -236,19 +272,23 @@ def check_functional(
         resp = graphql_query(api_url, search["query"])
         value = resolve_path(resp, search["expected_path"])
         if isinstance(value, (int, float)) and value >= search.get("min_value", 1):
-            results.append(CheckResult(
-                name="Search functionality",
-                category="functional",
-                passed=True,
-                details=f"Search returned {value} hits",
-            ))
+            results.append(
+                CheckResult(
+                    name="Search functionality",
+                    category="functional",
+                    passed=True,
+                    details=f"Search returned {value} hits",
+                )
+            )
         else:
-            results.append(CheckResult(
-                name="Search functionality",
-                category="functional",
-                passed=False,
-                details=f"Search returned {value} hits (expected >= {search.get('min_value', 1)})",
-            ))
+            results.append(
+                CheckResult(
+                    name="Search functionality",
+                    category="functional",
+                    passed=False,
+                    details=f"Search returned {value} hits (expected >= {search.get('min_value', 1)})",
+                )
+            )
 
     # Detail page checks (judge_profile, ruling_detail)
     for check_name, check_config in functional.items():
@@ -262,12 +302,14 @@ def check_functional(
         sample_id = resolve_path(sample_resp, check_config["sample_id_path"])
 
         if not sample_id:
-            results.append(CheckResult(
-                name=display_name,
-                category="functional",
-                passed=False,
-                details=f"Could not fetch sample ID from {check_config['sample_id_path']}",
-            ))
+            results.append(
+                CheckResult(
+                    name=display_name,
+                    category="functional",
+                    passed=False,
+                    details=f"Could not fetch sample ID from {check_config['sample_id_path']}",
+                )
+            )
             continue
 
         # Build and run the detail query
@@ -279,13 +321,19 @@ def check_functional(
         detail_resp = graphql_query(api_url, detail_query)
 
         if "errors" in detail_resp:
-            error_msg = detail_resp["errors"][0].get("message", "Unknown") if detail_resp["errors"] else "Unknown"
-            results.append(CheckResult(
-                name=display_name,
-                category="functional",
-                passed=False,
-                details=f"Detail query error: {error_msg}",
-            ))
+            error_msg = (
+                detail_resp["errors"][0].get("message", "Unknown")
+                if detail_resp["errors"]
+                else "Unknown"
+            )
+            results.append(
+                CheckResult(
+                    name=display_name,
+                    category="functional",
+                    passed=False,
+                    details=f"Detail query error: {error_msg}",
+                )
+            )
             continue
 
         # Check all expected fields are present
@@ -296,20 +344,24 @@ def check_functional(
                 missing_fields.append(field_path)
 
         if missing_fields:
-            results.append(CheckResult(
-                name=display_name,
-                category="functional",
-                passed=False,
-                details=f"Missing fields for ID {sample_id}: {', '.join(missing_fields)}",
-            ))
+            results.append(
+                CheckResult(
+                    name=display_name,
+                    category="functional",
+                    passed=False,
+                    details=f"Missing fields for ID {sample_id}: {', '.join(missing_fields)}",
+                )
+            )
         else:
             field_count = len(check_config.get("expected_fields", []))
-            results.append(CheckResult(
-                name=display_name,
-                category="functional",
-                passed=True,
-                details=f"ID {sample_id}: all {field_count} expected fields present",
-            ))
+            results.append(
+                CheckResult(
+                    name=display_name,
+                    category="functional",
+                    passed=True,
+                    details=f"ID {sample_id}: all {field_count} expected fields present",
+                )
+            )
 
     return results
 

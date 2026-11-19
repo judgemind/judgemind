@@ -224,7 +224,9 @@ def _update_canonical_name(
 ) -> None:
     """Update a judge's canonical_name."""
     if dry_run:
-        logger.info("  [DRY RUN] Would update judge %s canonical_name to %r", judge_id, new_name)
+        logger.info(
+            "  [DRY RUN] Would update judge %s canonical_name to %r", judge_id, new_name
+        )
         return
 
     with conn.cursor() as cur:

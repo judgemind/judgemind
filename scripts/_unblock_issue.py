@@ -150,7 +150,9 @@ def main() -> None:
         print("No closed blockers to prune — nothing to do.")
         sys.exit(0)
 
-    print(f"  Pruning {len(closed_blockers)} closed blocker(s): {', '.join('#' + b for b in closed_blockers)}")
+    print(
+        f"  Pruning {len(closed_blockers)} closed blocker(s): {', '.join('#' + b for b in closed_blockers)}"
+    )
 
     updated_body = strip_closed_blocker_lines(body, set(closed_blockers))
 

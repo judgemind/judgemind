@@ -254,6 +254,7 @@ def _extract_entry_number(ruling_text: str | None) -> int | None:
 # Title matching
 # ---------------------------------------------------------------------------
 
+
 def _normalize_title(title: str | None) -> str:
     """Normalize a title for comparison."""
     if not title:
@@ -397,6 +398,7 @@ def _create_google_client() -> object:
 # Update / merge helpers
 # ---------------------------------------------------------------------------
 
+
 def _apply_case_number(
     conn: psycopg.Connection,
     case_id: str,
@@ -422,7 +424,10 @@ def _apply_case_number(
 
         logger.info(
             "  MERGE: %s -> %s [%s] ('%s')",
-            old_case_number, new_case_number, match_method, case_title,
+            old_case_number,
+            new_case_number,
+            match_method,
+            case_title,
         )
 
         if not dry_run:
@@ -436,7 +441,10 @@ def _apply_case_number(
 
     logger.info(
         "  UPDATE: %s -> %s [%s] ('%s')",
-        old_case_number, new_case_number, match_method, case_title,
+        old_case_number,
+        new_case_number,
+        match_method,
+        case_title,
     )
 
     if not dry_run:
@@ -449,6 +457,7 @@ def _apply_case_number(
 # ---------------------------------------------------------------------------
 # Phase 1: Enhanced regex extraction
 # ---------------------------------------------------------------------------
+
 
 def phase1_regex(
     conn: psycopg.Connection,
@@ -479,7 +488,9 @@ def phase1_regex(
 
     logger.info(
         "Phase 1 complete: %d updated, %d merged, %d skipped",
-        stats["updated"], stats["merged"], stats["skipped"],
+        stats["updated"],
+        stats["merged"],
+        stats["skipped"],
     )
     return stats
 
@@ -487,6 +498,7 @@ def phase1_regex(
 # ---------------------------------------------------------------------------
 # Phase 2: Exact title matching against known OC cases
 # ---------------------------------------------------------------------------
+
 
 def phase2_title_match(
     conn: psycopg.Connection,
@@ -570,7 +582,9 @@ def phase2_title_match(
 
     logger.info(
         "Phase 2 complete: %d updated, %d merged, %d skipped",
-        stats["updated"], stats["merged"], stats["skipped"],
+        stats["updated"],
+        stats["merged"],
+        stats["skipped"],
     )
     return stats
 
@@ -578,6 +592,7 @@ def phase2_title_match(
 # ---------------------------------------------------------------------------
 # Phase 3: LLM index page extraction
 # ---------------------------------------------------------------------------
+
 
 def phase3_llm_index(
     conn: psycopg.Connection,
@@ -593,7 +608,8 @@ def phase3_llm_index(
 
     # Filter to unresolved cases with S3 keys
     remaining = [
-        uc for uc in unknown_cases
+        uc
+        for uc in unknown_cases
         if uc.get("_resolved") is not True and uc.get("s3_key")
     ]
 
@@ -610,16 +626,22 @@ def phase3_llm_index(
     for i, (s3_key, cases_in_pdf) in enumerate(sorted(by_s3_key.items())):
         logger.info(
             "  Processing PDF %d/%d: %s (%d cases)",
-            i + 1, len(by_s3_key), s3_key.rsplit("/", 1)[-1], len(cases_in_pdf),
+            i + 1,
+            len(by_s3_key),
+            s3_key.rsplit("/", 1)[-1],
+            len(cases_in_pdf),
         )
 
         try:
             response = s3_client.get_object(  # type: ignore[union-attr]
-                Bucket=s3_buckets[s3_key], Key=s3_key,
+                Bucket=s3_buckets[s3_key],
+                Key=s3_key,
             )
             raw_content = response["Body"].read()  # type: ignore[index]
         except Exception:
-            logger.error("Failed to fetch s3://%s/%s", s3_buckets[s3_key], s3_key, exc_info=True)
+            logger.error(
+                "Failed to fetch s3://%s/%s", s3_buckets[s3_key], s3_key, exc_info=True
+            )
             stats["errors"] += len(cases_in_pdf)
             continue
 
@@ -630,7 +652,9 @@ def phase3_llm_index(
             stats["errors"] += len(cases_in_pdf)
             continue
 
-        logger.info("    Index mapping: %d entries with case numbers", len(index_mapping))
+        logger.info(
+            "    Index mapping: %d entries with case numbers", len(index_mapping)
+        )
 
         if not index_mapping:
             stats["skipped"] += len(cases_in_pdf)
@@ -650,7 +674,9 @@ def phase3_llm_index(
             if new_case_number is None and uc.get("case_title"):
                 best_score = 0.5
                 for _en, entry_info in index_mapping.items():
-                    score = _title_similarity(uc["case_title"], entry_info.get("case_title"))
+                    score = _title_similarity(
+                        uc["case_title"], entry_info.get("case_title")
+                    )
                     if score > best_score:
                         best_score = score
                         new_case_number = entry_info["case_number"]
@@ -659,7 +685,9 @@ def phase3_llm_index(
             if not new_case_number or not _is_valid_oc_case_number(new_case_number):
                 logger.info(
                     "    SKIP: No match for '%s' (entry=%s, %s)",
-                    uc.get("case_title"), entry_num, uc["case_number"],
+                    uc.get("case_title"),
+                    entry_num,
+                    uc["case_number"],
                 )
                 stats["skipped"] += 1
                 continue
@@ -679,7 +707,10 @@ def phase3_llm_index(
 
     logger.info(
         "Phase 3 complete: %d updated, %d merged, %d skipped, %d errors",
-        stats["updated"], stats["merged"], stats["skipped"], stats["errors"],
+        stats["updated"],
+        stats["merged"],
+        stats["skipped"],
+        stats["errors"],
     )
     return stats
 
@@ -687,6 +718,7 @@ def phase3_llm_index(
 # ---------------------------------------------------------------------------
 # Phase 4: Delete orphans
 # ---------------------------------------------------------------------------
+
 
 def phase4_delete_orphans(
     conn: psycopg.Connection,
@@ -724,6 +756,7 @@ def phase4_delete_orphans(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -767,22 +800,34 @@ def main() -> None:
         unknown_cases = []
         seen_case_ids: set[str] = set()
         for row in rows:
-            case_id, case_number, case_title, document_id, s3_key, s3_bucket, hearing_date, ruling_text, department = row
+            (
+                case_id,
+                case_number,
+                case_title,
+                document_id,
+                s3_key,
+                s3_bucket,
+                hearing_date,
+                ruling_text,
+                department,
+            ) = row
             cid = str(case_id)
             if cid in seen_case_ids:
                 continue
             seen_case_ids.add(cid)
-            unknown_cases.append({
-                "case_id": case_id,
-                "case_number": case_number,
-                "case_title": case_title,
-                "document_id": document_id,
-                "s3_key": s3_key,
-                "s3_bucket": s3_bucket,
-                "hearing_date": hearing_date,
-                "ruling_text": ruling_text,
-                "department": department,
-            })
+            unknown_cases.append(
+                {
+                    "case_id": case_id,
+                    "case_number": case_number,
+                    "case_title": case_title,
+                    "document_id": document_id,
+                    "s3_key": s3_key,
+                    "s3_bucket": s3_bucket,
+                    "hearing_date": hearing_date,
+                    "ruling_text": ruling_text,
+                    "department": department,
+                }
+            )
 
         logger.info("Unique UNKNOWN cases: %d", len(unknown_cases))
 
@@ -818,7 +863,10 @@ def main() -> None:
         # Phase 3: LLM index extraction (optional)
         if not args.skip_llm and google_client and s3_client:
             p3 = phase3_llm_index(
-                conn, unknown_cases, s3_client, google_client,
+                conn,
+                unknown_cases,
+                s3_client,
+                google_client,
                 dry_run=args.dry_run,
             )
             for k in ("updated", "merged", "skipped", "errors"):
@@ -838,8 +886,11 @@ def main() -> None:
 
     logger.info(
         "Complete: %d updated, %d merged, %d deleted, %d skipped, %d errors",
-        totals["updated"], totals["merged"], totals["deleted"],
-        totals["skipped"], totals["errors"],
+        totals["updated"],
+        totals["merged"],
+        totals["deleted"],
+        totals["skipped"],
+        totals["errors"],
     )
 
     # Final check: count remaining UNKNOWN

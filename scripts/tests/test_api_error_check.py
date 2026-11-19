@@ -297,8 +297,13 @@ class TestGetMetricSum:
         }
 
         result = api_error_check.get_metric_sum(
-            client, "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count",
-            [], datetime.now(UTC), datetime.now(UTC), 300,
+            client,
+            "AWS/ApplicationELB",
+            "HTTPCode_Target_5XX_Count",
+            [],
+            datetime.now(UTC),
+            datetime.now(UTC),
+            300,
         )
         assert result == 8.0
 
@@ -310,8 +315,13 @@ class TestGetMetricSum:
         client.get_metric_statistics.return_value = {"Datapoints": []}
 
         result = api_error_check.get_metric_sum(
-            client, "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count",
-            [], datetime.now(UTC), datetime.now(UTC), 300,
+            client,
+            "AWS/ApplicationELB",
+            "HTTPCode_Target_5XX_Count",
+            [],
+            datetime.now(UTC),
+            datetime.now(UTC),
+            300,
         )
         assert result == 0.0
 
@@ -332,8 +342,13 @@ class TestGetMetricP99:
         }
 
         result = api_error_check.get_metric_p99(
-            client, "AWS/ApplicationELB", "TargetResponseTime",
-            [], datetime.now(UTC), datetime.now(UTC), 300,
+            client,
+            "AWS/ApplicationELB",
+            "TargetResponseTime",
+            [],
+            datetime.now(UTC),
+            datetime.now(UTC),
+            300,
         )
         assert result == 2.3
 
@@ -345,7 +360,12 @@ class TestGetMetricP99:
         client.get_metric_statistics.return_value = {"Datapoints": []}
 
         result = api_error_check.get_metric_p99(
-            client, "AWS/ApplicationELB", "TargetResponseTime",
-            [], datetime.now(UTC), datetime.now(UTC), 300,
+            client,
+            "AWS/ApplicationELB",
+            "TargetResponseTime",
+            [],
+            datetime.now(UTC),
+            datetime.now(UTC),
+            300,
         )
         assert result is None

@@ -18,6 +18,7 @@ Exit codes:
 
 Ref: https://github.com/judgemind/judgemind/issues/1300
 """
+
 # permanent: true
 from __future__ import annotations
 
@@ -100,8 +101,10 @@ def main() -> int:
         line_list = ", ".join(str(ln) for ln in lines)
         print(f"  {rel}: '{name}' defined at lines {line_list}")
 
-    print(f"\n{len(all_duplicates)} duplicate(s) found. "
-          "Remove or rename the duplicate definitions.")
+    print(
+        f"\n{len(all_duplicates)} duplicate(s) found. "
+        "Remove or rename the duplicate definitions."
+    )
     return 1
 
 

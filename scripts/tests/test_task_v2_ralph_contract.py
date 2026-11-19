@@ -49,9 +49,7 @@ class TestTaskV2RalphShortCircuitRemoved:
     """The #2767 short-circuit must be removed by #2845."""
 
     def test_skill_file_exists(self) -> None:
-        assert TASK_V2_RALPH_SKILL.exists(), (
-            "/task-v2-ralph/SKILL.md must exist"
-        )
+        assert TASK_V2_RALPH_SKILL.exists(), "/task-v2-ralph/SKILL.md must exist"
 
     def test_no_step_0_change_type_routing_heading(self) -> None:
         """Step 0 is no longer 'Change-type routing' — it's the Task-tool
@@ -185,8 +183,7 @@ class TestRalphNonTestableBranch:
             "top-level section (required by #2845 for caller visibility)."
         )
         assert "## Testable" in content, (
-            "/ralph must reference the `## Testable` task.md line as the "
-            "branch signal."
+            "/ralph must reference the `## Testable` task.md line as the branch signal."
         )
 
     def test_non_testable_change_types_enumerated(self) -> None:
@@ -251,7 +248,9 @@ class TestRalphNonTestableBranch:
             "The reviewer prompt must explicitly say: do not flag 'no "
             "tests added' as REVISE on non-testable changes."
         )
-        assert 'Do not REVISE for "no tests added" on non-testable changes' in content, (
+        assert (
+            'Do not REVISE for "no tests added" on non-testable changes' in content
+        ), (
             "The Guardrails section must reinforce: 'no tests added' is "
             "not a REVISE reason on the non-testable branch."
         )
@@ -333,10 +332,15 @@ class TestSyntheticDocsChangeType:
             "Step 1 must seed a `## Testable` line in task.md."
         )
         # The testable enumeration must list all six testable types.
-        for ct in ("api", "scraper", "ingestion", "web", "backfill_script", "agent_skill"):
-            assert ct in content, (
-                f"Step 1 must list `{ct}` as a testable change type."
-            )
+        for ct in (
+            "api",
+            "scraper",
+            "ingestion",
+            "web",
+            "backfill_script",
+            "agent_skill",
+        ):
+            assert ct in content, f"Step 1 must list `{ct}` as a testable change type."
 
 
 class TestSyntheticDxToolingChangeType:
@@ -363,17 +367,16 @@ class TestSyntheticDxToolingChangeType:
         # same completion contract as the testable worker. The output
         # is a real diff, which the outer /task-v2-ralph captures via
         # `git diff --name-only HEAD`.
-        assert 'write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`' in content, (
-            "Non-testable worker must write COMPLETE on success."
-        )
+        assert (
+            'write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`' in content
+        ), "Non-testable worker must write COMPLETE on success."
         # Pre-PR checks list must include per-file-type gates so the
         # worker touches real files and verifies them.
         assert "ruff check" in content, (
             "Non-testable worker must run ruff on touched .py files."
         )
         assert "check-markdown-links.sh" in content, (
-            "Non-testable worker must run markdown-link check on "
-            "touched .md files."
+            "Non-testable worker must run markdown-link check on touched .md files."
         )
 
 

@@ -175,39 +175,45 @@ class TestStripCaseNumberPrefix:
 
     def test_civ_prefix(self) -> None:
         """Strips CIV (civil) prefix (#2192)."""
-        assert strip_case_number_prefix(
-            "Civ208568 City Of Barstow v. City Of Adelanto"
-        ) == "City Of Barstow v. City Of Adelanto"
+        assert (
+            strip_case_number_prefix("Civ208568 City Of Barstow v. City Of Adelanto")
+            == "City Of Barstow v. City Of Adelanto"
+        )
 
     def test_civ_prefix_uppercase(self) -> None:
         """Strips CIV prefix in uppercase (#2192)."""
-        assert strip_case_number_prefix(
-            "CIV208568 City Of Barstow v. City Of Adelanto"
-        ) == "City Of Barstow v. City Of Adelanto"
+        assert (
+            strip_case_number_prefix("CIV208568 City Of Barstow v. City Of Adelanto")
+            == "City Of Barstow v. City Of Adelanto"
+        )
 
     def test_mvc_prefix(self) -> None:
         """Strips MVC (motor vehicle collision) prefix (#2192)."""
-        assert strip_case_number_prefix(
-            "Mvc1904273 Cavalry Spv I LLC v. Ingram"
-        ) == "Cavalry Spv I LLC v. Ingram"
+        assert (
+            strip_case_number_prefix("Mvc1904273 Cavalry Spv I LLC v. Ingram")
+            == "Cavalry Spv I LLC v. Ingram"
+        )
 
     def test_tec_prefix(self) -> None:
         """Strips TEC (Temecula) prefix (#2192)."""
-        assert strip_case_number_prefix(
-            "Tec1102057 Villages v. Martinez"
-        ) == "Villages v. Martinez"
+        assert (
+            strip_case_number_prefix("Tec1102057 Villages v. Martinez")
+            == "Villages v. Martinez"
+        )
 
     def test_udps_prefix(self) -> None:
         """Strips UDPS (unlawful detainer Palm Springs) prefix (#2192)."""
-        assert strip_case_number_prefix(
-            "Udps2500726 Parkview Mobile Estates v. Caivano"
-        ) == "Parkview Mobile Estates v. Caivano"
+        assert (
+            strip_case_number_prefix("Udps2500726 Parkview Mobile Estates v. Caivano")
+            == "Parkview Mobile Estates v. Caivano"
+        )
 
     def test_udps_party_name(self) -> None:
         """Strips UDPS prefix from a party name (#2192)."""
-        assert strip_case_number_prefix(
-            "Udps2500726 Parkview Mobile Estates"
-        ) == "Parkview Mobile Estates"
+        assert (
+            strip_case_number_prefix("Udps2500726 Parkview Mobile Estates")
+            == "Parkview Mobile Estates"
+        )
 
 
 # ---------------------------------------------------------------------------

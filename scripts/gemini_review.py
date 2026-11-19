@@ -241,7 +241,10 @@ def run_review(state_dir: Path, *, mode: str = "standard") -> int:
         0 on success, 1 on error, 2 on graceful skip.
     """
     if mode not in ("standard", "adversarial"):
-        print(f"ERROR: Invalid review mode: {mode!r}. Use 'standard' or 'adversarial'.", file=sys.stderr)
+        print(
+            f"ERROR: Invalid review mode: {mode!r}. Use 'standard' or 'adversarial'.",
+            file=sys.stderr,
+        )
         return 1
 
     api_key = os.environ.get("GOOGLE_API_KEY", "")

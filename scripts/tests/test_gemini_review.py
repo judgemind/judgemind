@@ -43,7 +43,10 @@ class TestModelLogName:
         assert _model_log_name("standard", "gemini-2.5-pro") == "gemini-2.5-pro"
 
     def test_adversarial_mode(self) -> None:
-        assert _model_log_name("adversarial", "gemini-2.5-pro") == "gemini-2.5-pro-adversarial"
+        assert (
+            _model_log_name("adversarial", "gemini-2.5-pro")
+            == "gemini-2.5-pro-adversarial"
+        )
 
 
 class TestBuildPrompts:
@@ -128,17 +131,31 @@ class TestRunReviewNoApiKey:
         with patch.dict("os.environ", {"GOOGLE_API_KEY": ""}, clear=False):
             result = run_review(state_dir, mode="standard")
         assert result == 2
-        assert (state_dir / "gemini-review-result.txt").read_text(encoding="utf-8").strip() == "SKIPPED"
-        assert "standard" in (state_dir / "gemini-feedback.md").read_text(encoding="utf-8").lower()
+        assert (state_dir / "gemini-review-result.txt").read_text(
+            encoding="utf-8"
+        ).strip() == "SKIPPED"
+        assert (
+            "standard"
+            in (state_dir / "gemini-feedback.md").read_text(encoding="utf-8").lower()
+        )
 
     def test_adversarial_skip_writes_adversarial_files(self, state_dir: Path) -> None:
         with patch.dict("os.environ", {"GOOGLE_API_KEY": ""}, clear=False):
             result = run_review(state_dir, mode="adversarial")
         assert result == 2
-        assert (state_dir / "adversarial-result.txt").read_text(encoding="utf-8").strip() == "SKIPPED"
-        assert "adversarial" in (state_dir / "adversarial-feedback.md").read_text(encoding="utf-8").lower()
+        assert (state_dir / "adversarial-result.txt").read_text(
+            encoding="utf-8"
+        ).strip() == "SKIPPED"
+        assert (
+            "adversarial"
+            in (state_dir / "adversarial-feedback.md")
+            .read_text(encoding="utf-8")
+            .lower()
+        )
 
-    def test_adversarial_skip_logs_with_adversarial_model_name(self, state_dir: Path) -> None:
+    def test_adversarial_skip_logs_with_adversarial_model_name(
+        self, state_dir: Path
+    ) -> None:
         with patch.dict("os.environ", {"GOOGLE_API_KEY": ""}, clear=False):
             run_review(state_dir, mode="adversarial")
         log_path = state_dir / "review-log.jsonl"
@@ -156,14 +173,18 @@ class TestRunReviewNoApiKey:
 class TestRunReviewApiError:
     """Tests for run_review when the API call fails."""
 
-    def test_adversarial_api_error_writes_adversarial_files(self, state_dir: Path) -> None:
+    def test_adversarial_api_error_writes_adversarial_files(
+        self, state_dir: Path
+    ) -> None:
         mock_genai = MagicMock()
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = RuntimeError("API down")
         mock_genai.Client.return_value = mock_client
 
         with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"google": MagicMock(), "google.genai": mock_genai}):
+            with patch.dict(
+                "sys.modules", {"google": MagicMock(), "google.genai": mock_genai}
+            ):
                 # We need to patch the import inside the function
                 with patch("gemini_review.run_review.__module__", "gemini_review"):
                     # Directly test the error path by mocking genai at import time

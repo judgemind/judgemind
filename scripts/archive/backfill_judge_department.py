@@ -9,6 +9,7 @@ Usage:
     scripts/run-py.sh scripts/backfill_judge_department.py [--dry-run]
     scripts/ecs-run-task.sh scripts/backfill_judge_department.py [-- --dry-run]
 """
+
 # venv: scraper-framework
 # one-off: true
 from __future__ import annotations
@@ -21,8 +22,12 @@ import psycopg
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill judges.department from rulings")
-    parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
+    parser = argparse.ArgumentParser(
+        description="Backfill judges.department from rulings"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview changes without writing"
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL")

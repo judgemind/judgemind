@@ -353,16 +353,17 @@ def _call_with_retry(
             if attempt < max_retries - 1:
                 wait = 2**attempt
                 print(
-                    "TIMEOUT (" + str(timeout_s) + "s), retry "
-                    + str(attempt + 1) + "...",
+                    "TIMEOUT ("
+                    + str(timeout_s)
+                    + "s), retry "
+                    + str(attempt + 1)
+                    + "...",
                     end=" ",
                     flush=True,
                 )
                 time.sleep(wait)
             else:
-                raise TimeoutError(
-                    "Timed out after " + str(max_retries) + " retries"
-                )
+                raise TimeoutError("Timed out after " + str(max_retries) + " retries")
         except Exception as e:
             err_str = str(e)
             if "503" in err_str and attempt < max_retries - 1:
@@ -577,9 +578,7 @@ def score_fixture(result: FixtureResult) -> dict:
     cn_total = len(expected_numbers)
 
     # Outcome accuracy
-    expected_outcomes = {
-        c["case_number"]: c.get("outcome") for c in expected_cases
-    }
+    expected_outcomes = {c["case_number"]: c.get("outcome") for c in expected_cases}
     outcomes_correct = 0
     outcomes_total = 0
     for ruling in result.rulings:
@@ -661,16 +660,14 @@ def analyze_model(
             summary.errors.append(r.fixture_name + ": " + r.error)
 
     latencies = [r.latency_ms for r in valid]
-    summary.avg_latency_ms = (
-        sum(latencies) / len(latencies) if latencies else 0.0
-    )
+    summary.avg_latency_ms = sum(latencies) / len(latencies) if latencies else 0.0
 
     # Cost calculations
     avg_in = summary.total_input_tokens / len(valid) if valid else 0
     avg_out = summary.total_output_tokens / len(valid) if valid else 0
     summary.cost_per_fixture = (
-        (avg_in * pricing["input"] + avg_out * pricing["output"]) / 1_000_000
-    )
+        avg_in * pricing["input"] + avg_out * pricing["output"]
+    ) / 1_000_000
     # Estimate: ~8 PDFs/day (4 departments x 2 scrapes)
     summary.estimated_monthly_cost = summary.cost_per_fixture * 8 * 30
 
@@ -688,11 +685,7 @@ def print_model_report(summary: ModelSummary) -> None:
         + f"{summary.total_output_tokens:,}"
         + " output"
     )
-    print(
-        "Avg latency per fixture: "
-        + f"{summary.avg_latency_ms:,.0f}"
-        + "ms"
-    )
+    print("Avg latency per fixture: " + f"{summary.avg_latency_ms:,.0f}" + "ms")
 
     scorable = (
         summary.case_count_correct
@@ -704,29 +697,12 @@ def print_model_report(summary: ModelSummary) -> None:
         return
 
     print("\n## Case Count Accuracy")
-    print(
-        "  Exact match:  "
-        + str(summary.case_count_correct)
-        + "/"
-        + str(scorable)
-    )
-    print(
-        "  Off by 1:     "
-        + str(summary.case_count_off_by_one)
-        + "/"
-        + str(scorable)
-    )
-    print(
-        "  Wrong (>1):   "
-        + str(summary.case_count_wrong)
-        + "/"
-        + str(scorable)
-    )
+    print("  Exact match:  " + str(summary.case_count_correct) + "/" + str(scorable))
+    print("  Off by 1:     " + str(summary.case_count_off_by_one) + "/" + str(scorable))
+    print("  Wrong (>1):   " + str(summary.case_count_wrong) + "/" + str(scorable))
     exact_pct = summary.case_count_correct / scorable * 100
     lenient_pct = (
-        (summary.case_count_correct + summary.case_count_off_by_one)
-        / scorable
-        * 100
+        (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
     )
     print("  Exact accuracy:   " + f"{exact_pct:.1f}" + "%")
     print(
@@ -737,9 +713,7 @@ def print_model_report(summary: ModelSummary) -> None:
 
     print("\n## Case Number Accuracy")
     if summary.case_numbers_total > 0:
-        cn_pct = (
-            summary.case_numbers_correct / summary.case_numbers_total * 100
-        )
+        cn_pct = summary.case_numbers_correct / summary.case_numbers_total * 100
         print(
             "  Correct: "
             + str(summary.case_numbers_correct)
@@ -834,11 +808,7 @@ def print_model_report(summary: ModelSummary) -> None:
             + "/"
             + str(detail["case_numbers_total"])
         )
-        oc_str = (
-            str(detail["outcomes_correct"])
-            + "/"
-            + str(detail["outcomes_total"])
-        )
+        oc_str = str(detail["outcomes_correct"]) + "/" + str(detail["outcomes_total"])
         fc_str = f"{detail['field_completeness_pct']:.0f}%"
         print(
             "  "
@@ -874,10 +844,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         header += f"  {name:>20}"
     print(header)
-    print(
-        "-" * 35
-        + "".join("  " + "-" * 20 for _ in model_names)
-    )
+    print("-" * 35 + "".join("  " + "-" * 20 for _ in model_names))
 
     # Fixtures
     row = f"{'Fixtures processed':<35}"
@@ -890,12 +857,8 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Case count exact match':<35}"
     for name in model_names:
         s = summaries[name]
-        scorable = (
-            s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
-        )
-        pct = (
-            (s.case_count_correct / scorable * 100) if scorable > 0 else 0
-        )
+        scorable = s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
+        pct = (s.case_count_correct / scorable * 100) if scorable > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -915,11 +878,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Outcome accuracy':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = (
-            s.outcomes_correct / s.outcomes_total * 100
-            if s.outcomes_total > 0
-            else 0
-        )
+        pct = s.outcomes_correct / s.outcomes_total * 100 if s.outcomes_total > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -927,11 +886,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Field completeness':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = (
-            s.fields_complete / s.fields_total * 100
-            if s.fields_total > 0
-            else 0
-        )
+        pct = s.fields_complete / s.fields_total * 100 if s.fields_total > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -940,11 +895,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         s = summaries[name]
         if s.total_rulings > 0:
-            pct = (
-                (s.total_rulings - s.empty_rulings)
-                / s.total_rulings
-                * 100
-            )
+            pct = (s.total_rulings - s.empty_rulings) / s.total_rulings * 100
         else:
             pct = 0
         row += f"  {pct:>19.1f}%"
@@ -999,12 +950,8 @@ def main() -> int:
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     google_key = os.environ.get("GOOGLE_API_KEY")
 
-    anthropic_models = [
-        m for m in args.models if MODELS[m]["provider"] == "anthropic"
-    ]
-    google_models = [
-        m for m in args.models if MODELS[m]["provider"] == "google"
-    ]
+    anthropic_models = [m for m in args.models if MODELS[m]["provider"] == "anthropic"]
+    google_models = [m for m in args.models if MODELS[m]["provider"] == "google"]
 
     if anthropic_models and not anthropic_key:
         print(
@@ -1024,17 +971,11 @@ def main() -> int:
 
     # Load fixtures
     fixtures = get_fresno_fixtures()
-    print(
-        "Found "
-        + str(len(fixtures))
-        + " Fresno PDF fixtures with ground truth\n"
-    )
+    print("Found " + str(len(fixtures)) + " Fresno PDF fixtures with ground truth\n")
     for fp, exp in fixtures:
         desc = exp.get("_description", "")
         cc = exp.get("case_count", "?")
-        print(
-            "  " + fp.name + ": " + str(cc) + " cases -- " + desc[:70]
-        )
+        print("  " + fp.name + ": " + str(cc) + " cases -- " + desc[:70])
     print()
 
     # Extract text from all PDFs
@@ -1089,13 +1030,7 @@ def main() -> int:
         call_fn = call_gemini if provider == "google" else call_anthropic
 
         print("\n" + "=" * 70)
-        print(
-            "MODEL: "
-            + model_name
-            + " ("
-            + model_id
-            + ") -- text extraction"
-        )
+        print("MODEL: " + model_name + " (" + model_id + ") -- text extraction")
         print("=" * 70 + "\n")
 
         results: list[FixtureResult] = []
@@ -1137,12 +1072,8 @@ def main() -> int:
                 fixture_result.extracted_judge_initials = extracted.get(
                     "judge_initials"
                 )
-                fixture_result.extracted_hearing_date = extracted.get(
-                    "hearing_date"
-                )
-                fixture_result.extracted_department = extracted.get(
-                    "department"
-                )
+                fixture_result.extracted_hearing_date = extracted.get("hearing_date")
+                fixture_result.extracted_department = extracted.get("department")
                 fixture_result.input_tokens = inp_tok
                 fixture_result.output_tokens = out_tok
                 fixture_result.latency_ms = lat
@@ -1179,9 +1110,7 @@ def main() -> int:
                     mt = ruling.get("motion_type", "?")
                     rt_len = len(ruling.get("ruling_text") or "")
                     parties = ruling.get("extracted_parties", [])
-                    party_count = (
-                        len(parties) if isinstance(parties, list) else 0
-                    )
+                    party_count = len(parties) if isinstance(parties, list) else 0
                     hd = ruling.get("hearing_date", "?")
                     print(
                         "    #"
@@ -1272,15 +1201,10 @@ def main() -> int:
                 "case_count_off_by_one": summary.case_count_off_by_one,
                 "case_count_wrong": summary.case_count_wrong,
                 "case_count_exact_pct": (
-                    summary.case_count_correct / scorable * 100
-                    if scorable > 0
-                    else 0
+                    summary.case_count_correct / scorable * 100 if scorable > 0 else 0
                 ),
                 "case_count_lenient_pct": (
-                    (
-                        summary.case_count_correct
-                        + summary.case_count_off_by_one
-                    )
+                    (summary.case_count_correct + summary.case_count_off_by_one)
                     / scorable
                     * 100
                     if scorable > 0
@@ -1324,9 +1248,7 @@ def main() -> int:
     if all_pass:
         print("\nAll models achieved 100% exact case count accuracy!")
     else:
-        print(
-            "\nSome models did NOT achieve 100% exact case count accuracy."
-        )
+        print("\nSome models did NOT achieve 100% exact case count accuracy.")
 
     return 0
 

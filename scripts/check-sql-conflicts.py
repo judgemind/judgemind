@@ -125,7 +125,7 @@ def _extract_unique_constraints_from_sql(
         # Strip known schema prefixes. Preserve "staging." for separation.
         for prefix in ("public.", "derived.", "telemetry."):
             if table.startswith(prefix):
-                table = table[len(prefix):]
+                table = table[len(prefix) :]
                 break
         lst = constraints.setdefault(table, [])
         if cols not in lst:
@@ -427,7 +427,7 @@ def _validate_conflict(
     normalized = table
     for prefix in ("public.", "derived.", "telemetry."):
         if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
+            normalized = normalized[len(prefix) :]
             break
     constraints = UNIQUE_CONSTRAINTS.get(normalized)
     if constraints is None:

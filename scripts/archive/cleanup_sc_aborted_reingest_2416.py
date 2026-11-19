@@ -11,6 +11,7 @@ This script restores the pre-reingest state:
 2. Deletes those split-child documents.
 3. Re-activates parent documents superseded on 2026-04-16.
 """
+
 # venv: scraper-framework
 # one-off: true
 from __future__ import annotations
@@ -27,7 +28,9 @@ CUTOFF = datetime(2026, 4, 16, 23, 0, 0, tzinfo=timezone.utc)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Report what would be changed")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Report what would be changed"
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -62,10 +65,18 @@ def main() -> int:
                 (CUTOFF,),
             )
             row = cur.fetchone()
-            (active_sc_docs, superseded_all, new_active_recent, total_rulings, null_outcomes) = row
-            print(f"Baseline: active_sc_docs={active_sc_docs} superseded_all={superseded_all}"
-                  f" new_active_recent={new_active_recent} total_rulings={total_rulings}"
-                  f" null_outcomes={null_outcomes}")
+            (
+                active_sc_docs,
+                superseded_all,
+                new_active_recent,
+                total_rulings,
+                null_outcomes,
+            ) = row
+            print(
+                f"Baseline: active_sc_docs={active_sc_docs} superseded_all={superseded_all}"
+                f" new_active_recent={new_active_recent} total_rulings={total_rulings}"
+                f" null_outcomes={null_outcomes}"
+            )
 
             if args.dry_run:
                 print("DRY RUN — no changes will be made")
@@ -84,8 +95,10 @@ def main() -> int:
                     (CUTOFF,),
                 )
                 to_delete_rulings = cur.fetchone()[0]
-                print(f"DRY RUN — would delete {to_delete_rulings} rulings from {new_active_recent} "
-                      f"new docs and re-activate {superseded_all} superseded docs")
+                print(
+                    f"DRY RUN — would delete {to_delete_rulings} rulings from {new_active_recent} "
+                    f"new docs and re-activate {superseded_all} superseded docs"
+                )
                 return 0
 
             # Step 1: Delete rulings for the newly-created split children
@@ -103,7 +116,9 @@ def main() -> int:
                 (CUTOFF,),
             )
             deleted_rulings = cur.rowcount
-            print(f"Deleted {deleted_rulings} rulings from newly-created split children")
+            print(
+                f"Deleted {deleted_rulings} rulings from newly-created split children"
+            )
 
             # Step 2: Delete the newly-created split child documents
             cur.execute(
@@ -161,11 +176,15 @@ def main() -> int:
                      WHERE ct.county = 'Santa Clara' AND r.outcome IS NULL) AS null_outcomes
                 """
             )
-            (active_sc_docs2, superseded2, total_rulings2, null_outcomes2) = cur.fetchone()
+            (active_sc_docs2, superseded2, total_rulings2, null_outcomes2) = (
+                cur.fetchone()
+            )
             null_pct = 100.0 * null_outcomes2 / max(total_rulings2, 1)
-            print(f"After: active_sc_docs={active_sc_docs2} superseded={superseded2}"
-                  f" total_rulings={total_rulings2} null_outcomes={null_outcomes2}"
-                  f" null_pct={null_pct:.1f}%")
+            print(
+                f"After: active_sc_docs={active_sc_docs2} superseded={superseded2}"
+                f" total_rulings={total_rulings2} null_outcomes={null_outcomes2}"
+                f" null_pct={null_pct:.1f}%"
+            )
 
     return 0
 

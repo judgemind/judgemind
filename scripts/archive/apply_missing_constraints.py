@@ -11,6 +11,7 @@ This script:
 
 Safe to run multiple times — skips constraints that already exist.
 """
+
 # venv: scraper-framework
 from __future__ import annotations
 
@@ -36,8 +37,7 @@ def constraint_exists(
 ) -> bool:
     """Check if a named constraint exists on a table."""
     cur.execute(
-        "SELECT 1 FROM pg_constraint "
-        "WHERE conrelid = %s::regclass AND conname = %s",
+        "SELECT 1 FROM pg_constraint WHERE conrelid = %s::regclass AND conname = %s",
         (table, constraint_name),
     )
     return cur.fetchone() is not None
@@ -71,7 +71,9 @@ def dedup_and_add_constraint(
     print(f"  Found {dup_count} duplicate rows in {table}")
 
     if dry_run:
-        print(f"  DRY RUN: Would delete {dup_count} duplicates and add {constraint_name}")
+        print(
+            f"  DRY RUN: Would delete {dup_count} duplicates and add {constraint_name}"
+        )
         return
 
     if dup_count > 0:
@@ -86,8 +88,7 @@ def dedup_and_add_constraint(
         print(f"  Deleted {dup_count} duplicate rows")
 
     cur.execute(
-        f"ALTER TABLE {table} "
-        f"ADD CONSTRAINT {constraint_name} UNIQUE ({cols_str})"
+        f"ALTER TABLE {table} ADD CONSTRAINT {constraint_name} UNIQUE ({cols_str})"
     )
     print(f"  Added constraint {constraint_name}")
 

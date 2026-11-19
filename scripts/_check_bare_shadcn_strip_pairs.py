@@ -96,6 +96,7 @@ MODIFIER_PREFIXED_RE = re.compile(
 # unconditionally.
 MUTED_FOREGROUND_RE = re.compile(r"\btext-muted-foreground\b")
 
+
 # Surface tokens (NOT followed by `-foreground`). The trailing
 # negative lookahead allows opacity modifiers like `bg-primary/80` to
 # count as a surface pair (the `80` opacity suffix doesn't change

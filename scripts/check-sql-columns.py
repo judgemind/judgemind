@@ -124,9 +124,7 @@ def _extract_table_columns_from_sql(
     # Column definition regex: starts with column_name followed by a type.
     # We match any identifier as the type (including custom enum types like
     # ruling_outcome, document_format, etc.) and filter via _sql_keywords.
-    _col_def_re = re.compile(
-        r"^\s*([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)"
-    )
+    _col_def_re = re.compile(r"^\s*([a-z_][a-z0-9_]*)\s+([a-z_][a-z0-9_]*)")
 
     current_table: str | None = None
     paren_depth = 0
@@ -145,7 +143,7 @@ def _extract_table_columns_from_sql(
             raw_name = m.group(1)
             for prefix in ("public.", "derived.", "telemetry."):
                 if raw_name.startswith(prefix):
-                    raw_name = raw_name[len(prefix):]
+                    raw_name = raw_name[len(prefix) :]
                     break
             current_table = raw_name
             columns.setdefault(current_table, set())
@@ -164,10 +162,7 @@ def _extract_table_columns_from_sql(
                 # Both the column name and type must not be SQL keywords.
                 # This handles standard types (uuid, text) and custom enum
                 # types (ruling_outcome, document_format, etc.).
-                if (
-                    col_name not in _sql_keywords
-                    and type_name not in _sql_keywords
-                ):
+                if col_name not in _sql_keywords and type_name not in _sql_keywords:
                     columns[current_table].add(col_name)
 
         # Detect leaving the CREATE TABLE block
@@ -215,11 +210,7 @@ def build_table_columns(
             merged.setdefault(table, set()).update(col_set)
 
     if schema_path.is_file():
-        _merge(
-            _extract_table_columns_from_sql(
-                schema_path.read_text(encoding="utf-8")
-            )
-        )
+        _merge(_extract_table_columns_from_sql(schema_path.read_text(encoding="utf-8")))
 
     if migrations_dir.is_dir():
         for migration_file in sorted(migrations_dir.glob("*.sql")):
@@ -272,9 +263,7 @@ def _extract_string_tokens(
             if tok_type == tokenize.STRING:
                 # Check for suppression comment on start line, end line,
                 # preceding line, or line after end
-                if _has_ignore_comment(lines, srow) or _has_ignore_comment(
-                    lines, erow
-                ):
+                if _has_ignore_comment(lines, srow) or _has_ignore_comment(lines, erow):
                     continue
 
                 raw = tok_string
@@ -417,15 +406,66 @@ _QUALIFIED_COL_RE = re.compile(
 # SQL keywords that should not be resolved as alias keywords
 _ALIAS_KEYWORD_EXCLUDES = frozenset(
     {
-        "on", "where", "set", "and", "or", "not", "as", "in", "is",
-        "left", "right", "inner", "outer", "cross", "full", "join",
-        "lateral", "true", "false", "null", "limit", "offset", "order",
-        "group", "having", "union", "except", "intersect", "values",
-        "returning", "using", "natural", "between", "like", "ilike",
-        "exists", "case", "when", "then", "else", "end", "do", "nothing",
-        "update", "cascade", "restrict", "default", "select", "from",
-        "into", "insert", "delete", "create", "alter", "drop",
-        "index", "table", "if", "with", "recursive",
+        "on",
+        "where",
+        "set",
+        "and",
+        "or",
+        "not",
+        "as",
+        "in",
+        "is",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "cross",
+        "full",
+        "join",
+        "lateral",
+        "true",
+        "false",
+        "null",
+        "limit",
+        "offset",
+        "order",
+        "group",
+        "having",
+        "union",
+        "except",
+        "intersect",
+        "values",
+        "returning",
+        "using",
+        "natural",
+        "between",
+        "like",
+        "ilike",
+        "exists",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "do",
+        "nothing",
+        "update",
+        "cascade",
+        "restrict",
+        "default",
+        "select",
+        "from",
+        "into",
+        "insert",
+        "delete",
+        "create",
+        "alter",
+        "drop",
+        "index",
+        "table",
+        "if",
+        "with",
+        "recursive",
     }
 )
 
@@ -433,22 +473,79 @@ _ALIAS_KEYWORD_EXCLUDES = frozenset(
 # functions, or special qualifiers
 _QUALIFIER_EXCLUDES = frozenset(
     {
-        "excluded", "new", "old",
-        "pg_catalog", "information_schema", "public",
+        "excluded",
+        "new",
+        "old",
+        "pg_catalog",
+        "information_schema",
+        "public",
         "staging",  # handled as schema prefix
         # PostgreSQL functions (common ones that could appear as qualifier.arg)
-        "gen_random_uuid", "now", "coalesce", "lower", "upper", "trim",
-        "length", "count", "sum", "avg", "min", "max", "row_number",
-        "rank", "dense_rank", "lag", "lead", "first_value", "last_value",
-        "array_agg", "string_agg", "jsonb_build_object", "jsonb_agg",
-        "json_agg", "extract", "date_trunc", "to_char", "to_date",
-        "to_timestamp", "regexp_replace", "regexp_match", "regexp_matches",
-        "substring", "position", "replace", "concat", "format",
-        "split_part", "btrim", "ltrim", "rtrim", "chr", "ascii",
-        "encode", "decode", "md5", "sha256", "gen_random_bytes",
-        "greatest", "least", "abs", "ceil", "floor", "round", "trunc",
-        "random", "generate_series", "unnest", "exists", "any", "all",
-        "some", "every", "bool_and", "bool_or",
+        "gen_random_uuid",
+        "now",
+        "coalesce",
+        "lower",
+        "upper",
+        "trim",
+        "length",
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "row_number",
+        "rank",
+        "dense_rank",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "array_agg",
+        "string_agg",
+        "jsonb_build_object",
+        "jsonb_agg",
+        "json_agg",
+        "extract",
+        "date_trunc",
+        "to_char",
+        "to_date",
+        "to_timestamp",
+        "regexp_replace",
+        "regexp_match",
+        "regexp_matches",
+        "substring",
+        "position",
+        "replace",
+        "concat",
+        "format",
+        "split_part",
+        "btrim",
+        "ltrim",
+        "rtrim",
+        "chr",
+        "ascii",
+        "encode",
+        "decode",
+        "md5",
+        "sha256",
+        "gen_random_bytes",
+        "greatest",
+        "least",
+        "abs",
+        "ceil",
+        "floor",
+        "round",
+        "trunc",
+        "random",
+        "generate_series",
+        "unnest",
+        "exists",
+        "any",
+        "all",
+        "some",
+        "every",
+        "bool_and",
+        "bool_or",
     }
 )
 
@@ -529,9 +626,27 @@ def _extract_column_references(
             continue
 
         # Skip file-extension-like patterns: something.pdf, something.html, etc
-        if column in ("pdf", "html", "txt", "csv", "json", "xml", "docx", "py",
-                       "sql", "sh", "md", "yml", "yaml", "toml", "cfg", "ini",
-                       "log", "tmp", "bak"):
+        if column in (
+            "pdf",
+            "html",
+            "txt",
+            "csv",
+            "json",
+            "xml",
+            "docx",
+            "py",
+            "sql",
+            "sh",
+            "md",
+            "yml",
+            "yaml",
+            "toml",
+            "cfg",
+            "ini",
+            "log",
+            "tmp",
+            "bak",
+        ):
             continue
 
         results.append((qualifier, column))
@@ -698,7 +813,7 @@ def _single_base_table(sql: str) -> str | None:
         if select_from is None:
             return None
         # Reject multi-table SELECTs.
-        if _MULTI_TABLE_SIGNALS_RE.search(cleaned[select_from.end():]):
+        if _MULTI_TABLE_SIGNALS_RE.search(cleaned[select_from.end() :]):
             return None
         table = select_from.group(1)
     elif kind == "update":
@@ -736,7 +851,7 @@ def _single_base_table(sql: str) -> str | None:
     table = table.lower()
     for prefix in ("public.", "derived.", "telemetry."):
         if table.startswith(prefix):
-            table = table[len(prefix):]
+            table = table[len(prefix) :]
             break
     return table
 
@@ -747,43 +862,200 @@ def _single_base_table(sql: str) -> str | None:
 _UNQUALIFIED_SKIP = frozenset(
     {
         # Keywords
-        "select", "from", "where", "and", "or", "not", "in", "is", "as",
-        "on", "set", "values", "into", "insert", "update", "delete",
-        "create", "alter", "drop", "table", "if", "exists", "null",
-        "true", "false", "default", "primary", "key", "unique",
-        "constraint", "foreign", "references", "check", "with", "recursive",
-        "limit", "offset", "order", "by", "group", "having", "union",
-        "except", "intersect", "returning", "using", "natural", "between",
-        "like", "ilike", "case", "when", "then", "else", "end", "do",
-        "nothing", "cascade", "restrict", "asc", "desc", "nulls", "first",
-        "last", "lateral", "join", "left", "right", "inner", "outer",
-        "cross", "full", "any", "all", "some", "distinct", "filter",
-        "over", "partition", "window", "rows", "range", "groups",
-        "current", "row", "unbounded", "preceding", "following",
-        "for", "of", "share", "no", "key", "skip", "locked",
+        "select",
+        "from",
+        "where",
+        "and",
+        "or",
+        "not",
+        "in",
+        "is",
+        "as",
+        "on",
+        "set",
+        "values",
+        "into",
+        "insert",
+        "update",
+        "delete",
+        "create",
+        "alter",
+        "drop",
+        "table",
+        "if",
+        "exists",
+        "null",
+        "true",
+        "false",
+        "default",
+        "primary",
+        "key",
+        "unique",
+        "constraint",
+        "foreign",
+        "references",
+        "check",
+        "with",
+        "recursive",
+        "limit",
+        "offset",
+        "order",
+        "by",
+        "group",
+        "having",
+        "union",
+        "except",
+        "intersect",
+        "returning",
+        "using",
+        "natural",
+        "between",
+        "like",
+        "ilike",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "do",
+        "nothing",
+        "cascade",
+        "restrict",
+        "asc",
+        "desc",
+        "nulls",
+        "first",
+        "last",
+        "lateral",
+        "join",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "cross",
+        "full",
+        "any",
+        "all",
+        "some",
+        "distinct",
+        "filter",
+        "over",
+        "partition",
+        "window",
+        "rows",
+        "range",
+        "groups",
+        "current",
+        "row",
+        "unbounded",
+        "preceding",
+        "following",
+        "for",
+        "of",
+        "share",
+        "no",
+        "key",
+        "skip",
+        "locked",
         # Casts / types (not exhaustive, but common ones)
-        "uuid", "text", "integer", "int", "bigint", "smallint", "boolean",
-        "bool", "numeric", "decimal", "real", "double", "precision",
-        "date", "time", "timestamp", "timestamptz", "interval", "jsonb",
-        "json", "bytea", "char", "varchar",
+        "uuid",
+        "text",
+        "integer",
+        "int",
+        "bigint",
+        "smallint",
+        "boolean",
+        "bool",
+        "numeric",
+        "decimal",
+        "real",
+        "double",
+        "precision",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "jsonb",
+        "json",
+        "bytea",
+        "char",
+        "varchar",
         # Common functions
-        "count", "sum", "avg", "min", "max", "now", "coalesce", "lower",
-        "upper", "trim", "length", "row_number", "rank", "dense_rank",
-        "lag", "lead", "first_value", "last_value", "array_agg",
-        "string_agg", "jsonb_build_object", "jsonb_agg", "json_agg",
-        "extract", "date_trunc", "to_char", "to_date", "to_timestamp",
-        "regexp_replace", "regexp_match", "regexp_matches", "substring",
-        "position", "replace", "concat", "format", "split_part", "btrim",
-        "ltrim", "rtrim", "chr", "ascii", "encode", "decode", "md5",
-        "sha256", "gen_random_uuid", "gen_random_bytes", "greatest",
-        "least", "abs", "ceil", "floor", "round", "trunc", "random",
-        "generate_series", "unnest", "bool_and", "bool_or", "every",
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "now",
+        "coalesce",
+        "lower",
+        "upper",
+        "trim",
+        "length",
+        "row_number",
+        "rank",
+        "dense_rank",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "array_agg",
+        "string_agg",
+        "jsonb_build_object",
+        "jsonb_agg",
+        "json_agg",
+        "extract",
+        "date_trunc",
+        "to_char",
+        "to_date",
+        "to_timestamp",
+        "regexp_replace",
+        "regexp_match",
+        "regexp_matches",
+        "substring",
+        "position",
+        "replace",
+        "concat",
+        "format",
+        "split_part",
+        "btrim",
+        "ltrim",
+        "rtrim",
+        "chr",
+        "ascii",
+        "encode",
+        "decode",
+        "md5",
+        "sha256",
+        "gen_random_uuid",
+        "gen_random_bytes",
+        "greatest",
+        "least",
+        "abs",
+        "ceil",
+        "floor",
+        "round",
+        "trunc",
+        "random",
+        "generate_series",
+        "unnest",
+        "bool_and",
+        "bool_or",
+        "every",
         "exists",
         # Boolean / SQL literals
-        "current_timestamp", "current_date", "current_time", "localtime",
-        "localtimestamp", "current_user", "session_user",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtime",
+        "localtimestamp",
+        "current_user",
+        "session_user",
         # Special
-        "excluded", "new", "old",
+        "excluded",
+        "new",
+        "old",
     }
 )
 
@@ -828,7 +1100,9 @@ def _select_list_text(sql: str) -> str:
             if (
                 sql[i : i + 4].lower() == "from"
                 and (i == 0 or not sql[i - 1].isalnum() and sql[i - 1] != "_")
-                and (i + 4 == len(sql) or not sql[i + 4].isalnum() and sql[i + 4] != "_")
+                and (
+                    i + 4 == len(sql) or not sql[i + 4].isalnum() and sql[i + 4] != "_"
+                )
             ):
                 return sql[start:i]
         i += 1
@@ -1122,9 +1396,7 @@ def scan_file(
                     # SQL string.
                     cleaned = _strip_string_literals(string_val)
                     m = re.search(rf"\b{re.escape(ident)}\b", cleaned, re.IGNORECASE)
-                    line_offset = (
-                        cleaned[: m.start()].count("\n") if m else 0
-                    )
+                    line_offset = cleaned[: m.start()].count("\n") if m else 0
                     errors.append(
                         f"  {filepath.name}:{start_line + line_offset}: "
                         f"column '{ident}' does not exist on table "
@@ -1175,8 +1447,7 @@ def main() -> int:
         return 1
 
     print(
-        f"All clean -- scanned {len(files)} files, "
-        f"no invalid column references found."
+        f"All clean -- scanned {len(files)} files, no invalid column references found."
     )
     return 0
 

@@ -137,9 +137,7 @@ def main() -> None:
             for label, scroll_y in [("mid", 600), ("deep", 1200), ("bottom", 2400)]:
                 page.evaluate(f"window.scrollTo(0, {scroll_y})")
                 page.wait_for_timeout(300)
-                page.screenshot(
-                    path=str(output_dir / f"case-{short_id}-{label}.png")
-                )
+                page.screenshot(path=str(output_dir / f"case-{short_id}-{label}.png"))
 
             print(f"  Saved 4 screenshots for {short_id}")
 
