@@ -63,7 +63,7 @@ def _make_extractor_with_stub(
     extractor._provider = "anthropic"
     extractor._model = "stub"
     extractor._client = None
-    extractor._max_retries = 0
+    extractor._max_attempts = 0
     extractor._max_output_tokens = 4096
     extractor._max_chars_per_chunk = 80_000
     extractor._cache = None

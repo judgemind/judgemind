@@ -366,9 +366,10 @@ def anthropic_messages_create(
 ) -> object:
     """``client.messages.create(**request)`` under the shared retry policy.
 
-    Transient errors (429 / 5xx / 529 / timeouts / dropped connections)
-    are retried by ``llm_retry.call_with_retries``, within *deadline*;
-    each attempt's HTTP timeout is *timeout* shortened to the time left
+    *max_retries* counts retries after the first attempt (N allows N+1
+    attempts).  Transient errors (429 / 5xx / 529 / timeouts / dropped
+    connections) are retried by ``llm_retry.call_with_retries``, within
+    *deadline*; each attempt's HTTP timeout is *timeout* shortened to the time left
     (no ``timeout`` keyword is sent when neither is set).  The SDK's own
     retry is off (:func:`without_sdk_retries`).  ``temperature=0`` is
     added through ``extra_body`` for models that accept it
@@ -462,7 +463,8 @@ def _call_anthropic(
         client: Optional pre-created ``anthropic.Anthropic`` client for
             connection reuse.  If ``None``, creates one from the
             ``ANTHROPIC_API_KEY`` env var.
-        max_retries: Number of retries on transient errors (429, 5xx, 529,
+        max_retries: Counts retries after the first attempt (N allows N+1
+            attempts) on transient errors (429, 5xx, 529,
             timeouts, dropped connections; see ``ingestion.llm_retry``),
             with exponential backoff and jitter.  429 / 503 / 529 get at
             least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
@@ -522,7 +524,8 @@ def _call_google(
         client: Optional pre-created ``google.genai.Client`` instance for
             connection reuse.  If ``None``, creates one from the
             ``GOOGLE_API_KEY`` env var.
-        max_retries: Number of retries on transient errors (429, 5xx,
+        max_retries: Counts retries after the first attempt (N allows N+1
+            attempts) on transient errors (429, 5xx,
             timeouts, dropped connections; see ``ingestion.llm_retry``),
             with exponential backoff and jitter.  429 / 503 get at least
             ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
@@ -589,8 +592,9 @@ def _google_generate(
 ) -> LLMResponse | None:
     """One ``generate_content`` call with the shared retry policy (#5056).
 
-    Transient errors (429 / 5xx / timeouts / dropped connections) are
-    retried by ``llm_retry.call_with_retries``, within *deadline*; each
+    *max_retries* counts retries after the first attempt (N allows N+1
+    attempts).  Transient errors (429 / 5xx / timeouts / dropped
+    connections) are retried by ``llm_retry.call_with_retries``, within *deadline*; each
     attempt's HTTP timeout is *timeout* shortened to the time left.  The
     SDK's own retry stays off (no ``retry_options``), so nothing retries
     twice.  When the provider / network fails after retries
@@ -654,7 +658,8 @@ def call_llm(
         model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
-        max_retries: Number of retries on transient errors, for every
+        max_retries: Counts retries after the first attempt (N allows N+1
+            attempts) on transient errors, for every
             provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
             504, 529, timeouts and dropped connections).  429 / 503 / 529
             get at least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.
@@ -730,7 +735,8 @@ def call_llm_with_images(
         provider: Provider name — ``"google"`` or ``"anthropic"``.
         model: Model ID.
         client: Optional pre-created provider client.
-        max_retries: Number of retries on transient errors, for every
+        max_retries: Counts retries after the first attempt (N allows N+1
+            attempts) on transient errors, for every
             provider: ``ingestion.llm_retry`` decides (429, 500, 502, 503,
             504, 529, timeouts and dropped connections).  429 / 503 / 529
             get at least ``llm_retry.CONGESTION_MIN_RETRIES`` when it is > 0.

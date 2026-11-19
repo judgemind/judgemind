@@ -2236,7 +2236,7 @@ class TestLlmExtractorBustCachePlumbing:
         extractor._provider = "google"
         extractor._model = "test"
         extractor._client = MagicMock()
-        extractor._max_retries = 1
+        extractor._max_attempts = 1
         extractor._max_output_tokens = 4096
         extractor._max_chars_per_chunk = 1_000_000
 
@@ -2272,7 +2272,7 @@ class TestLlmExtractorBustCachePlumbing:
         extractor._provider = "google"
         extractor._model = "test"
         extractor._client = MagicMock()
-        extractor._max_retries = 1
+        extractor._max_attempts = 1
         extractor._max_output_tokens = 4096
         extractor._max_chars_per_chunk = 1_000_000
 
@@ -2304,7 +2304,7 @@ class TestLlmExtractorExtractFromPdfBustCache:
         extractor._provider = "google"
         extractor._model = "test"
         extractor._client = MagicMock()
-        extractor._max_retries = 1
+        extractor._max_attempts = 1
         extractor._max_output_tokens = 4096
         extractor._max_chars_per_chunk = 1_000_000
 
@@ -2335,7 +2335,7 @@ class TestLlmExtractorExtractFromPdfBustCache:
         extractor._provider = "google"
         extractor._model = "test"
         extractor._client = MagicMock()
-        extractor._max_retries = 1
+        extractor._max_attempts = 1
         extractor._max_output_tokens = 4096
         extractor._max_chars_per_chunk = 1_000_000
 

@@ -287,10 +287,10 @@ class TestRetryBehavior:
         status: int,
         expected_attempts: int,
     ) -> None:
-        """``max_retries`` counts attempts: 2 means one retry, then give up
+        """``max_attempts`` counts attempts: 2 means one retry, then give up
         (raised for 429 / 503 / 529 by ``llm_retry``)."""
         mock_client.messages.create.side_effect = status_error(status)
-        extractor._max_retries = 2
+        extractor._max_attempts = 2
 
         with structlog.testing.capture_logs() as logs:
             rulings = extractor.extract("Some text")

@@ -123,7 +123,7 @@ def _extractor_with_cache(cache: object) -> LlmExtractor:
     extractor._provider = "google"
     extractor._model = "stub"
     extractor._client = None
-    extractor._max_retries = 0
+    extractor._max_attempts = 0
     extractor._max_output_tokens = 32768
     extractor._max_chars_per_chunk = 80_000
     extractor._cache = cache

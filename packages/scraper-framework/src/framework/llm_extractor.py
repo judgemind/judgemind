@@ -140,9 +140,10 @@ class TokenUsage:
 # Retry configuration
 # ---------------------------------------------------------------------------
 
-# Attempts per API call (first try plus retries).  Which errors are retried
-# and how long to wait is ``ingestion.llm_retry``'s policy (#5056, #5066).
-_DEFAULT_MAX_RETRIES = 3
+# Counts attempts per API call (first try plus retries), not retries.  Which
+# errors are retried and how long to wait is ``ingestion.llm_retry``'s policy
+# (#5056, #5066).
+_DEFAULT_MAX_ATTEMPTS = 3
 
 # ---------------------------------------------------------------------------
 # Chunking constants
@@ -3314,11 +3315,15 @@ class LlmExtractor:
         api_key: Provider API key.  For Anthropic, if ``None`` the
             ``ANTHROPIC_API_KEY`` env var is used.  For Google, the
             ``GOOGLE_API_KEY`` env var is used.
-        max_retries: Attempts per API call; transient failures (429, 5xx,
-            529, timeouts, dropped connections) get up to
-            ``max_retries - 1`` retries with the ``ingestion.llm_retry``
-            backoff (429 / 503 / 529 get at least
+        max_attempts: Counts attempts (first try included), not retries.
+            Transient failures (429, 5xx, 529, timeouts, dropped
+            connections) get up to ``max_attempts - 1`` retries with the
+            ``ingestion.llm_retry`` backoff (429 / 503 / 529 get at least
             ``llm_retry.CONGESTION_MIN_RETRIES`` when any retry is allowed).
+            Applies to the Anthropic text path and the multimodal per-page
+            path; the Google text-chunk path uses ``call_llm``'s own
+            default (2 retries, 3 attempts).  A value below 1 still makes
+            one attempt; it does not disable the call.
         max_output_tokens: Maximum tokens in the model response.
         max_chars_per_chunk: Per-chunk character limit for large documents.
 
@@ -3344,14 +3349,14 @@ class LlmExtractor:
         provider: str = "anthropic",
         model: str | None = None,
         api_key: str | None = None,
-        max_retries: int = _DEFAULT_MAX_RETRIES,
+        max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         max_output_tokens: int = 4096,
         max_chars_per_chunk: int = _DEFAULT_MAX_CHARS,
         bust_cache: bool = False,
     ) -> None:
         self._provider = provider
         self._model = model or self._PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_HAIKU_MODEL)
-        self._max_retries = max_retries
+        self._max_attempts = max_attempts
         # Extra calls per PDF page when the response is not valid JSON (#4716).
         self._max_page_parse_retries = 1
         self._max_output_tokens = max_output_tokens
@@ -3907,7 +3912,7 @@ class LlmExtractor:
 
         Transient errors (429 / 5xx / 529 / timeouts / dropped connections)
         are retried by ``ingestion.llm_retry`` (#5066), up to
-        ``max_retries - 1`` retries (429 / 503 / 529 get at least
+        ``max_attempts - 1`` retries (429 / 503 / 529 get at least
         ``llm_retry.CONGESTION_MIN_RETRIES``); the client's own SDK retry
         is off.
         """
@@ -3936,7 +3941,7 @@ class LlmExtractor:
                     "system": effective_prompt,
                     "messages": [{"role": "user", "content": user_message}],
                 },
-                max_retries=max(0, self._max_retries - 1),
+                max_retries=max(0, self._max_attempts - 1),
                 timeout=None,
                 deadline=None,
                 event_prefix="llm_extractor.anthropic_",
@@ -4003,7 +4008,8 @@ class LlmExtractor:
 
         if response is None:
             # Self-diagnosing API-failure payload (#4253).  ``call_llm``
-            # already represents 3 exhausted internal Google retries, so
+            # already represents 3 exhausted Google attempts (its default of
+            # 2 retries, independent of ``max_attempts``), so
             # a single failure deserves the full diagnostic blob (SHA-256
             # + preview) rather than waiting for an N-failure threshold —
             # which the typical 2-chunk doc never reached.
@@ -4338,7 +4344,7 @@ class LlmExtractor:
         """Call the multimodal LLM for one page.
 
         Transient provider errors are retried inside ``call_llm_with_images``
-        (``ingestion.llm_retry``, #5056), up to ``max_retries - 1`` retries
+        (``ingestion.llm_retry``, #5056), up to ``max_attempts - 1`` retries
         (429 / 503 / 529 get at least ``llm_retry.CONGESTION_MIN_RETRIES``):
         the same number of attempts as before, but only for errors worth
         retrying (a 400 is not re-sent) and without a second retry loop
@@ -4356,7 +4362,7 @@ class LlmExtractor:
             provider=self._provider,
             model=self._model,
             client=self._client,
-            max_retries=max(0, self._max_retries - 1),
+            max_retries=max(0, self._max_attempts - 1),
             max_tokens=max_tokens or self._max_output_tokens,
             timeout=20.0,
             json_mode=json_mode,

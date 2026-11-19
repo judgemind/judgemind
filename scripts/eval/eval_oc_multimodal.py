@@ -225,14 +225,14 @@ def render_pdf_to_images(
     return images
 
 
-MAX_RETRIES = 3
+MAX_ATTEMPTS = 3
 CALL_TIMEOUT_S = 20  # timeout per API call
 
 
 def _call_with_retry(
     fn,
     *args,
-    max_retries: int = MAX_RETRIES,
+    max_attempts: int = MAX_ATTEMPTS,
     timeout_s: float = CALL_TIMEOUT_S,
 ) -> tuple[dict, int, int, float]:
     """Retry wrapper for LLM API calls.
@@ -241,14 +241,14 @@ def _call_with_retry(
     """
     import concurrent.futures
 
-    for attempt in range(max_retries):
+    for attempt in range(max_attempts):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(fn, *args)
                 result = future.result(timeout=timeout_s)
                 return result
         except concurrent.futures.TimeoutError:
-            if attempt < max_retries - 1:
+            if attempt < max_attempts - 1:
                 wait = 2**attempt
                 print(
                     f"TIMEOUT ({timeout_s}s), retry {attempt + 1}...",
@@ -257,10 +257,10 @@ def _call_with_retry(
                 )
                 time.sleep(wait)
             else:
-                raise TimeoutError(f"Timed out after {max_retries} retries")
+                raise TimeoutError(f"Timed out after {max_attempts} attempts")
         except Exception as e:
             err_str = str(e)
-            if "503" in err_str and attempt < max_retries - 1:
+            if "503" in err_str and attempt < max_attempts - 1:
                 wait = 2**attempt
                 print(f"503, retry {attempt + 1}...", end=" ", flush=True)
                 time.sleep(wait)
