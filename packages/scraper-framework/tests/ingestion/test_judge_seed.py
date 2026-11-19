@@ -31,6 +31,9 @@ Coverage matrix:
   - Mapping JSON parse failure: skipped without raising.
   - Real Postgres: a roster name a judge already holds (as an alias, or
     as its canonical name in another case) is not seeded again (#4926).
+  - Real Postgres: a near-duplicate of a judge's name (middle initial,
+    case, whitespace, suffix order) is not seeded, seeded names are
+    stored normalized, and distinct similar names are still seeded (#4931).
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -506,3 +510,244 @@ class TestSeedSkipsRosterNameHeldByAJudgePg:
                 )
             conn.commit()
             conn.close()
+
+
+class TestSeedLocksTheCourt:
+    """The seed takes a per-court advisory lock before it reads the court's
+    judges, so two concurrent seeds cannot both pass the near-duplicate
+    check and insert two spellings of one judge (#4931)."""
+
+    def test_advisory_lock_precedes_judge_read(self) -> None:
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchall.return_value = [("ca_los_angeles", {"1": "Alice Smith"})]
+        mock_cur.fetchone.return_value = ("la-uuid",)
+        mock_cur.rowcount = 1
+
+        seed_judges_from_directory_snapshots(mock_conn)
+
+        sqls = [c.args[0] for c in mock_cur.execute.call_args_list]
+        lock = next(i for i, s in enumerate(sqls) if "pg_advisory_xact_lock" in s)
+        read = next(i for i, s in enumerate(sqls) if "SELECT canonical_name FROM judges" in s)
+        assert lock < read
+        assert mock_cur.execute.call_args_list[lock].args[1] == ("la-uuid",)
+
+
+class TestFindNearDuplicateJudgeName:
+    """``find_near_duplicate_judge_name``: resolve_judge Step 3's comparison,
+    without matching conflicting middle initials (#4931)."""
+
+    @pytest.mark.parametrize(
+        ("name", "judges", "expected"),
+        [
+            ("Eunice W. Lee", ["Eunice Lee"], "Eunice Lee"),
+            ("Jeffrey El-Hajj", ["Jeffrey B. El-Hajj"], "Jeffrey B. El-Hajj"),
+            ("Beth McGowan", ["Beth Mcgowan"], "Beth Mcgowan"),
+            ("Edward Moreton Jr.", ["Edward B. Moreton Jr."], "Edward B. Moreton Jr."),
+            ("Mary B. Jones", ["Mary A. Jones"], None),
+            ("Jane Smith", ["John Smith"], None),
+            ("Edward B. Moreton Sr.", ["Edward B. Moreton Jr."], None),
+            ("Edward B. Moreton", ["Edward B. Moreton Jr."], None),
+            ("Eunice Lee", [], None),
+        ],
+    )
+    def test_matches(self, name: str, judges: list[str], expected: str | None) -> None:
+        from ingestion.db import find_near_duplicate_judge_name
+
+        assert find_near_duplicate_judge_name(name, judges) == expected
+
+
+def _pg_court_with_judges(cur: Any, code: str, roster: dict[str, str], judges: list[str]) -> str:
+    """Create a court, its roster snapshot, and *judges*; return the court id."""
+    cur.execute(
+        "INSERT INTO courts (state, county, court_name, court_code) "
+        "VALUES ('CA', 'Seed4931', 'Superior Court', %s) RETURNING id",
+        (code,),
+    )
+    court_id = str(cur.fetchone()[0])
+    cur.execute(
+        "INSERT INTO court_directory_snapshots "
+        "(court_id, captured_at, s3_key, mapping, content_hash) "
+        "VALUES (%s, NOW(), %s, %s::jsonb, %s)",
+        (code.replace("-", "_"), f"test/{code}.json", json.dumps(roster), code),
+    )
+    for name in judges:
+        cur.execute(
+            "INSERT INTO judges (canonical_name, court_id) VALUES (%s, %s::uuid)",
+            (name, court_id),
+        )
+    return court_id
+
+
+def _pg_cleanup(conn: Any, code: str) -> None:
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM courts WHERE court_code = %s", (code,))
+        for (cleanup_court,) in cur.fetchall():
+            cur.execute("DELETE FROM judges WHERE court_id = %s", (cleanup_court,))
+            cur.execute("DELETE FROM courts WHERE id = %s", (cleanup_court,))
+        cur.execute(
+            "DELETE FROM court_directory_snapshots WHERE court_id = %s",
+            (code.replace("-", "_"),),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _pg_judge_names(conn: Any, court_id: str) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT canonical_name FROM judges WHERE court_id = %s::uuid ORDER BY canonical_name",
+            (court_id,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def _pg_seed(roster: dict[str, str], judges: list[str]) -> tuple[dict[str, int], list[str]]:
+    """Seed *roster* into a new court holding *judges*; return the seed stats
+    and the court's judge names afterwards."""
+    import psycopg
+
+    code = f"ca-seed4931-{uuid.uuid4().hex[:12]}"
+    conn = psycopg.connect(_DSN, autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            court_id = _pg_court_with_judges(cur, code, roster, judges)
+        conn.commit()
+        stats = seed_judges_from_directory_snapshots(conn, only_court_id=code.replace("-", "_"))
+        conn.commit()
+        return stats, _pg_judge_names(conn, court_id)
+    finally:
+        _pg_cleanup(conn, code)
+
+
+@pytest.mark.skipif(not _DSN, reason="TEST_DATABASE_URL not set")
+class TestSeedSkipsNearDuplicateNamesPg:
+    """Real Postgres: the seed resolves a roster name the way ``resolve_judge``
+    does, so it does not insert an empty judge next to a judge whose name is
+    the same name with a middle initial added or missing, another case, other
+    whitespace, or the suffix in another place (#4931).
+
+    On dev, Santa Clara held 'Eunice Lee' (310 rulings) next to a seeded
+    'Eunice W. Lee' (0), and Los Angeles held 'Edward B. Moreton Jr.' (309)
+    next to a raw seeded 'Jr, Edward B. Moreton' (0).
+    """
+
+    def test_near_duplicate_roster_names_are_not_seeded(self) -> None:
+        existing = ["Eunice Lee", "Edward B. Moreton Jr.", "Beth Mcgowan", "Jeffrey B. El-Hajj"]
+        stats, names = _pg_seed(
+            {
+                "1": "Eunice W. Lee",
+                "2": "Jr, Edward B. Moreton",
+                "3": "Beth McGowan",
+                "4": "Jeffrey El-Hajj",
+            },
+            existing,
+        )
+        assert stats["inserted"] == 0
+        assert stats["skipped_existing"] == 4
+        assert names == sorted(existing)
+
+    def test_seeded_names_are_stored_normalized(self) -> None:
+        stats, names = _pg_seed({"1": "Susan  J. De Witt", "2": "III, Robert Q. Example"}, [])
+        assert stats["inserted"] == 2
+        assert names == ["Robert Q. Example III", "Susan J. De Witt"]
+
+    def test_roster_name_with_extra_whitespace_matches_existing_judge(self) -> None:
+        stats, names = _pg_seed({"1": "Susan  J. De Witt"}, ["Susan J. De Witt"])
+        assert stats["inserted"] == 0
+        assert names == ["Susan J. De Witt"]
+
+    def test_distinct_judges_with_similar_names_are_still_seeded(self) -> None:
+        """A different first name, a Sr. next to a Jr., or a conflicting middle
+        initial is another judge: the seed inserts it."""
+        existing = ["John Smith", "Edward B. Moreton Jr.", "Mary A. Jones"]
+        stats, names = _pg_seed(
+            {"1": "Jane Smith", "2": "Edward B. Moreton Sr.", "3": "Mary B. Jones"},
+            existing,
+        )
+        assert stats["inserted"] == 3
+        assert names == sorted([*existing, "Jane Smith", "Edward B. Moreton Sr.", "Mary B. Jones"])
+
+    def test_near_duplicate_of_a_roster_name_held_as_alias_is_not_seeded(self) -> None:
+        """A judge renamed away from 'Mark D. Flanagan' keeps it as an alias.
+        The roster also prints 'Mark Flanagan': that is the same judge, so the
+        seed inserts neither spelling."""
+        import psycopg
+
+        code = f"ca-seed4931-{uuid.uuid4().hex[:12]}"
+        conn = psycopg.connect(_DSN, autocommit=False)
+        try:
+            with conn.cursor() as cur:
+                court_id = _pg_court_with_judges(
+                    cur,
+                    code,
+                    {"1": "Mark D. Flanagan", "2": "Mark Flanagan"},
+                    ["M. Dennis Flanagan"],
+                )
+                cur.execute(
+                    "INSERT INTO judge_aliases (judge_id, raw_name, source, confidence) "
+                    "SELECT id, 'Mark D. Flanagan', 'roster_match', 1.0 FROM judges "
+                    "WHERE court_id = %s::uuid",
+                    (court_id,),
+                )
+            conn.commit()
+            stats = seed_judges_from_directory_snapshots(conn, only_court_id=code.replace("-", "_"))
+            conn.commit()
+            assert stats["inserted"] == 0
+            assert _pg_judge_names(conn, court_id) == ["M. Dennis Flanagan"]
+        finally:
+            _pg_cleanup(conn, code)
+
+    def test_court_lock_is_held_during_the_check_on_autocommit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scheduled roster refresh seeds on an autocommit connection.
+        The per-court lock must still be held while the seed checks names,
+        not released right after the SELECT that took it."""
+        import psycopg
+
+        import ingestion.db as db
+
+        code = f"ca-seed4931-{uuid.uuid4().hex[:12]}"
+        setup = psycopg.connect(_DSN, autocommit=False)
+        with setup.cursor() as cur:
+            court_id = _pg_court_with_judges(cur, code, {"1": "Pat Q. Lockjudge"}, [])
+        setup.commit()
+        setup.close()
+
+        probe = psycopg.connect(_DSN, autocommit=True)
+        seen: list[bool] = []
+        real = db.find_near_duplicate_judge_name
+
+        def checking(name: str, judge_names: list[str]) -> str | None:
+            with probe.cursor() as pcur:
+                pcur.execute(
+                    "SELECT pg_try_advisory_lock(hashtext('judge_seed:' || %s))",
+                    (court_id,),
+                )
+                got = pcur.fetchone()[0]
+                if got:
+                    pcur.execute(
+                        "SELECT pg_advisory_unlock(hashtext('judge_seed:' || %s))",
+                        (court_id,),
+                    )
+            seen.append(got)
+            return real(name, judge_names)
+
+        monkeypatch.setattr(db, "find_near_duplicate_judge_name", checking)
+        conn = psycopg.connect(_DSN, autocommit=True)
+        try:
+            stats = seed_judges_from_directory_snapshots(conn, only_court_id=code.replace("-", "_"))
+            assert stats["inserted"] == 1
+            assert seen == [False]
+        finally:
+            probe.close()
+            conn.close()
+            _pg_cleanup(psycopg.connect(_DSN, autocommit=False), code)
+
+    def test_near_duplicate_names_within_one_roster_seed_one_judge(self) -> None:
+        """Two departments that print the same judge with and without a
+        middle initial produce one judge, not two."""
+        stats, names = _pg_seed({"1": "Mark Flanagan", "2": "Mark D. Flanagan"}, [])
+        assert stats["inserted"] == 1
+        assert len(names) == 1

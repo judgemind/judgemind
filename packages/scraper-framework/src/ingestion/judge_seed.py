@@ -36,6 +36,13 @@ Behaviour
   canonical name (any case) or as an alias (#4926).  A judge renamed
   away from the roster spelling keeps that spelling as an alias; seeding
   it again would create an empty duplicate judge.
+- Resolves each roster name the way ``resolve_judge`` resolves an
+  incoming name (#4931): normalizes it with ``normalize_judge_name``,
+  skips it when a judge in the court holds the same name up to middle
+  initials (``find_near_duplicate_judge_name``, the comparison of
+  ``resolve_judge`` Step 3), and stores the normalized form.  Before,
+  'Eunice W. Lee' was seeded next to 'Eunice Lee', and the raw string
+  'Jr, Edward B. Moreton' next to 'Edward B. Moreton Jr.'.
 - Skips entries that fail :func:`_looks_like_valid_judge_name` (e.g.
   empty strings, single-word values, garbage).  These should never
   appear in a directory mapping but we defend in depth.
@@ -190,6 +197,7 @@ def seed_judges_from_directory_snapshots(
     from ingestion.db import (
         ROSTER_JUDGE_PREDICATE,
         _looks_like_valid_judge_name,
+        find_near_duplicate_judge_name,
         normalize_judge_name,
     )
 
@@ -216,60 +224,110 @@ def seed_judges_from_directory_snapshots(
             )
             continue
 
-        # Canonical names in the mapping values.  Use a set so that
-        # multiple departments assigned to the same judge produce one
-        # candidate, not N.
-        unique_names = {name for name in mapping.values() if name}
+        # One transaction per court (a savepoint when the caller already has
+        # one open), so the advisory lock below is held across the read of
+        # the court's judges and every insert, also on an autocommit
+        # connection such as the scheduled roster refresh's.
+        with conn.transaction():
+            # Canonical names in the mapping values.  Use a set so that
+            # multiple departments assigned to the same judge produce one
+            # candidate, not N.  Sorted so that, of two near-duplicate roster
+            # spellings, the same one is seeded on every run.
+            unique_names = sorted({name for name in mapping.values() if name})
 
-        for name in unique_names:
-            stats["candidates"] += 1
-            if not _looks_like_valid_judge_name(name):
-                stats["skipped_invalid"] += 1
-                logger.debug(
-                    "seed_judges_from_directory_snapshots: skipping invalid name %r for court %r",
-                    name,
-                    snapshot_court_id,
-                )
-                continue
-
-            # The roster name as resolve_judge's Step 3b normalizes it.
-            normalized = normalize_judge_name(name) or name
+            # The court's judge names, for the near-duplicate check.  Names
+            # inserted below are appended so that two departments printing
+            # the same judge with and without a middle initial seed one judge.
             with conn.cursor() as cur:
-                # Skip the name when a judge in this court already holds
-                # it, as its canonical name (any case) or as an alias.
-                # Arbitration can rename a judge away from the roster
-                # spelling and keep that spelling as an alias; seeding the
-                # roster spelling again created an empty duplicate judge
-                # that then took every document printing the roster
-                # spelling (#4926, Orange 'H. Shaina Colover').  Same
-                # predicate as resolve_judge Step 3b.
-                #
-                # ON CONFLICT DO NOTHING relies on migration #10's
-                # UNIQUE (canonical_name, court_id) constraint.  We
-                # check rowcount instead of using RETURNING because
-                # ON CONFLICT DO NOTHING with RETURNING returns no row
-                # on conflict — rowcount is the simpler path.
+                # Serialize seeds of one court until the transaction ends, so a
+                # concurrent seed cannot insert a near-duplicate between this
+                # read and the inserts below (two roster refreshes at once).
+                # Inside a caller's transaction the lock lasts until the
+                # caller commits.
                 cur.execute(
-                    f"""
-                    INSERT INTO judges (canonical_name, court_id)
-                    SELECT %s, %s::uuid
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM judges j
-                        WHERE j.court_id = %s::uuid
-                          AND ({ROSTER_JUDGE_PREDICATE} OR {ROSTER_JUDGE_PREDICATE})
-                    )
-                    ON CONFLICT (canonical_name, court_id) DO NOTHING
-                    """,
-                    (name, court_uuid, court_uuid, name, name, normalized, normalized),
+                    "SELECT pg_advisory_xact_lock(hashtext('judge_seed:' || %s))",
+                    (court_uuid,),
                 )
-                if cur.rowcount > 0:
-                    stats["inserted"] += 1
-                    logger.info(
-                        "seed_judges_from_directory_snapshots: inserted judge %r for court %r",
+                cur.execute(
+                    "SELECT canonical_name FROM judges WHERE court_id = %s::uuid",
+                    (court_uuid,),
+                )
+                court_judge_names = [str(row[0]) for row in cur.fetchall()]
+
+            for name in unique_names:
+                stats["candidates"] += 1
+                # The roster name as resolve_judge normalizes an incoming name
+                # (whitespace collapsed, "Jr, First Last" reordered, title case).
+                # Seeding the raw string stored names resolve_judge never
+                # produces, such as 'Jr, Edward B. Moreton' (#4931).
+                normalized = normalize_judge_name(name)
+                if normalized is None or not _looks_like_valid_judge_name(normalized):
+                    stats["skipped_invalid"] += 1
+                    logger.debug(
+                        "seed_judges_from_directory_snapshots: skipping invalid name %r "
+                        "for court %r",
                         name,
                         snapshot_court_id,
                     )
-                else:
+                    continue
+
+                # resolve_judge Step 3: a judge whose name differs only by middle
+                # initials already is this judge.  Seeding the roster spelling
+                # next to it created an empty judge that then took every document
+                # printing that spelling through Step 2 (#4931).
+                near_duplicate = find_near_duplicate_judge_name(normalized, court_judge_names)
+                if near_duplicate is not None:
                     stats["skipped_existing"] += 1
+                    logger.debug(
+                        "seed_judges_from_directory_snapshots: roster name %r for court %r "
+                        "is held by judge %r",
+                        name,
+                        snapshot_court_id,
+                        near_duplicate,
+                    )
+                    continue
+
+                with conn.cursor() as cur:
+                    # Skip the name when a judge in this court already holds
+                    # it, as its canonical name (any case) or as an alias.
+                    # Arbitration can rename a judge away from the roster
+                    # spelling and keep that spelling as an alias; seeding the
+                    # roster spelling again created an empty duplicate judge
+                    # that then took every document printing the roster
+                    # spelling (#4926, Orange 'H. Shaina Colover').  Same
+                    # predicate as resolve_judge Step 3b.
+                    #
+                    # ON CONFLICT DO NOTHING relies on migration #10's
+                    # UNIQUE (canonical_name, court_id) constraint.  We
+                    # check rowcount instead of using RETURNING because
+                    # ON CONFLICT DO NOTHING with RETURNING returns no row
+                    # on conflict — rowcount is the simpler path.
+                    cur.execute(
+                        f"""
+                        INSERT INTO judges (canonical_name, court_id)
+                        SELECT %s, %s::uuid
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM judges j
+                            WHERE j.court_id = %s::uuid
+                              AND ({ROSTER_JUDGE_PREDICATE} OR {ROSTER_JUDGE_PREDICATE})
+                        )
+                        ON CONFLICT (canonical_name, court_id) DO NOTHING
+                        """,
+                        (normalized, court_uuid, court_uuid, name, name, normalized, normalized),
+                    )
+                    # Inserted, or skipped because a judge already holds the name
+                    # (as its canonical name or an alias): either way a judge in
+                    # the court holds it now, so a later near-duplicate roster
+                    # spelling must not be seeded.
+                    court_judge_names.append(normalized)
+                    if cur.rowcount > 0:
+                        stats["inserted"] += 1
+                        logger.info(
+                            "seed_judges_from_directory_snapshots: inserted judge %r for court %r",
+                            normalized,
+                            snapshot_court_id,
+                        )
+                    else:
+                        stats["skipped_existing"] += 1
 
     return stats
