@@ -263,6 +263,9 @@ def call_with_retries[T](
 ) -> T:
     """``fn(attempt_timeout)``, retried on transient errors.
 
+    *max_retries* counts retries after the first attempt (N allows N+1
+    attempts), not attempts.
+
     *fn* gets the HTTP timeout for this attempt: *timeout*, shortened to
     the time left before *deadline* (``None`` when neither is set).  At most
     *max_retries* retries follow the first attempt, except that a 429, 503

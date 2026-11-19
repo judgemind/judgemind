@@ -189,7 +189,7 @@ def build_validation_input(tc: TestCase) -> str:
 # LLM call helpers
 # ---------------------------------------------------------------------------
 
-MAX_RETRIES = 3
+MAX_ATTEMPTS = 3
 
 
 def call_gemini(
@@ -303,15 +303,15 @@ def call_anthropic(
 def call_with_retry(
     call_fn: object,
     *args: object,
-    max_retries: int = MAX_RETRIES,
+    max_attempts: int = MAX_ATTEMPTS,
 ) -> tuple[dict, int, int, float]:
     """Retry wrapper for LLM API calls."""
-    for attempt in range(max_retries):
+    for attempt in range(max_attempts):
         try:
             return call_fn(*args)
         except Exception as e:
             err_str = str(e)
-            if ("503" in err_str or "429" in err_str) and attempt < max_retries - 1:
+            if ("503" in err_str or "429" in err_str) and attempt < max_attempts - 1:
                 wait = 2**attempt
                 print(
                     "retrying (" + str(attempt + 1) + ")...",

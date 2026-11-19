@@ -2874,7 +2874,7 @@ class TestExtractFromPdf:
         """If the LLM API call fails on all pages, returns empty list."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 1
+        ext._max_attempts = 1
 
         with (
             patch(
@@ -3177,10 +3177,10 @@ class TestExtractSinglePageRetry:
 
     def test_page_retries_delegated_to_provider(self, sample_pdf_bytes: bytes) -> None:
         """The provider owns the retries (#5056): one call per page, asked
-        for ``max_retries - 1`` retries, so nothing retries twice."""
+        for ``max_attempts - 1`` retries, so nothing retries twice."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 3
+        ext._max_attempts = 3
 
         mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
@@ -3204,7 +3204,7 @@ class TestExtractSinglePageRetry:
         was not retryable, e.g. a 400): the page is not re-sent (#5056)."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 3
+        ext._max_attempts = 3
 
         with (
             patch(
@@ -3225,7 +3225,7 @@ class TestExtractSinglePageRetry:
         """When all retries return None, returns empty list."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 2
+        ext._max_attempts = 2
 
         with (
             patch(
@@ -3266,7 +3266,7 @@ class TestExtractSinglePageRetry:
         """If one page fails, other pages' results are still used."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 1
+        ext._max_attempts = 1
 
         page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
@@ -3301,7 +3301,7 @@ class TestExtractSinglePageRetry:
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 1
+        ext._max_attempts = 1
 
         # Wire up a cache mock.
         mock_cache = MagicMock()
@@ -3341,7 +3341,7 @@ class TestExtractSinglePageRetry:
 
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
-        ext._max_retries = 1
+        ext._max_attempts = 1
 
         mock_cache = MagicMock()
         mock_cache.get.return_value = None

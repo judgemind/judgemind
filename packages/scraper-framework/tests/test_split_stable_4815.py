@@ -104,7 +104,7 @@ class _FakeS3:
 def _extractor(cache: _LlmCache | None) -> LlmExtractor:
     with patch.object(anthropic, "Anthropic"):
         ext = LlmExtractor(api_key="test-key")
-    ext._max_retries = 1
+    ext._max_attempts = 1
     ext._cache = cache
     return ext
 

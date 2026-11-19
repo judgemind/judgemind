@@ -330,27 +330,27 @@ def _sanitize_json(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-MAX_RETRIES = 3
+MAX_ATTEMPTS = 3
 CALL_TIMEOUT_S = 120
 
 
 def _call_with_retry(
     fn: object,
     *args: object,
-    max_retries: int = MAX_RETRIES,
+    max_attempts: int = MAX_ATTEMPTS,
     timeout_s: float = CALL_TIMEOUT_S,
 ) -> tuple[dict, int, int, float]:
     """Retry wrapper for LLM API calls."""
     import concurrent.futures
 
-    for attempt in range(max_retries):
+    for attempt in range(max_attempts):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(fn, *args)
                 result = future.result(timeout=timeout_s)
                 return result
         except concurrent.futures.TimeoutError:
-            if attempt < max_retries - 1:
+            if attempt < max_attempts - 1:
                 wait = 2**attempt
                 print(
                     "TIMEOUT ("
@@ -363,10 +363,10 @@ def _call_with_retry(
                 )
                 time.sleep(wait)
             else:
-                raise TimeoutError("Timed out after " + str(max_retries) + " retries")
+                raise TimeoutError("Timed out after " + str(max_attempts) + " attempts")
         except Exception as e:
             err_str = str(e)
-            if "503" in err_str and attempt < max_retries - 1:
+            if "503" in err_str and attempt < max_attempts - 1:
                 wait = 2**attempt
                 print(
                     "503, retry " + str(attempt + 1) + "...",
