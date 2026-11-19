@@ -216,7 +216,7 @@ def _event(**extra: Any) -> dict[str, Any]:
 def test_retry_marker_dead_letter_after_retries() -> None:
     """Dead-lettering is only an xack: the key is recorded first (#5008)."""
     worker, redis, conn, cur = _worker()
-    worker._max_retries = 2
+    worker._max_attempts = 2
     order: list[str] = []
     conn.rollback.side_effect = lambda: order.append("rollback")
     conn.commit.side_effect = lambda: order.append("commit")
@@ -244,7 +244,7 @@ def test_retry_marker_dead_letter_on_schema_constraint_error() -> None:
 
 def test_retry_marker_dead_letter_without_s3_key_or_malformed_records_nothing() -> None:
     worker, redis, _conn_, cur = _worker()
-    worker._max_retries = 1
+    worker._max_attempts = 1
     with patch.object(worker, "process_event", side_effect=ValueError("bad")):
         worker._process_message(b"1-0", {b"data": json.dumps(_event(s3_key=None)).encode()})
         worker._process_message(b"2-0", {b"data": b"{not json"})
@@ -254,7 +254,7 @@ def test_retry_marker_dead_letter_without_s3_key_or_malformed_records_nothing() 
 
 def test_retry_marker_dead_letter_record_failure_still_acks() -> None:
     worker, redis, conn, _cur = _worker()
-    worker._max_retries = 1
+    worker._max_attempts = 1
     conn.cursor.side_effect = RuntimeError("connection closed")
     with patch.object(worker, "process_event", side_effect=ValueError("bad")):
         worker._process_message(b"1-0", {b"data": json.dumps(_event()).encode()})

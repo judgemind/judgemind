@@ -605,7 +605,7 @@ def _forbidden() -> httpx.HTTPStatusError:
 
 class TestAllFailedRetryPolicy:
     def test_all_failed_transient_fast_attempt_retries_once(self, fake_clock: _FakeClock) -> None:
-        config = _retry_config(max_retries=3)
+        config = _retry_config(max_attempts=3)
         scraper = _ScriptedFetchScraper(config, [_timeout()], fake_clock)
 
         health = scraper.run()
@@ -676,8 +676,8 @@ class TestAllFailedRetryPolicy:
         over_budget.run()
         assert over_budget.calls == 1
 
-    def test_all_failed_retry_respects_max_retries_one(self, fake_clock: _FakeClock) -> None:
-        scraper = _ScriptedFetchScraper(_retry_config(max_retries=1), [_timeout()], fake_clock)
+    def test_all_failed_retry_respects_max_attempts_one(self, fake_clock: _FakeClock) -> None:
+        scraper = _ScriptedFetchScraper(_retry_config(max_attempts=1), [_timeout()], fake_clock)
 
         scraper.run()
 
@@ -693,9 +693,9 @@ class TestAllFailedRetryPolicy:
 
     def test_non_all_failed_exception_keeps_full_retry(self, fake_clock: _FakeClock) -> None:
         # A listing-page or session failure is one request: cheap to retry
-        # with the normal exponential backoff, up to max_retries.
+        # with the normal exponential backoff, up to max_attempts.
         scraper = _ScriptedFetchScraper(
-            _retry_config(max_retries=3), [RuntimeError("listing")], fake_clock
+            _retry_config(max_attempts=3), [RuntimeError("listing")], fake_clock
         )
 
         health = scraper.run()
@@ -706,7 +706,7 @@ class TestAllFailedRetryPolicy:
 
     def test_all_failed_after_other_failure_still_capped(self, fake_clock: _FakeClock) -> None:
         scraper = _ScriptedFetchScraper(
-            _retry_config(max_retries=3),
+            _retry_config(max_attempts=3),
             [RuntimeError("listing"), _timeout(), _timeout()],
             fake_clock,
         )
@@ -714,7 +714,7 @@ class TestAllFailedRetryPolicy:
         scraper.run()
 
         # listing failure -> retry; all-failed transient -> one retry; the
-        # third attempt is the last allowed by max_retries.
+        # third attempt is the last allowed by max_attempts.
         assert scraper.calls == 3
 
     def test_all_failed_retry_logs_decision(self, fake_clock: _FakeClock) -> None:

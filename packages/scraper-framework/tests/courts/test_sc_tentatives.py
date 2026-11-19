@@ -868,7 +868,7 @@ def test_sc_run_handles_landing_failure() -> None:
     respx.get(LANDING_URL).mock(return_value=httpx.Response(503))
 
     config = sc_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = SCTentativeRulingsScraper(config=config)
     health = scraper.run()
@@ -967,7 +967,7 @@ def test_sc_run_fails_when_every_dept_page_fails() -> None:
 
     config = sc_default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = SCTentativeRulingsScraper(config=config).run()
 
     assert health.success is False
@@ -993,7 +993,7 @@ def test_sc_run_fails_when_every_pdf_fails() -> None:
 
     config = sc_default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = SCTentativeRulingsScraper(config=config).run()
 
     assert health.success is False
@@ -1020,7 +1020,7 @@ def test_sc_run_succeeds_when_dept_pages_have_no_pdfs() -> None:
 
     config = sc_default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = SCTentativeRulingsScraper(config=config).run()
 
     assert health.success is True

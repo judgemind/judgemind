@@ -18,7 +18,8 @@ Environment variables:
                        multimodal and county extractors are Google)
     ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic"
     JUDGEMIND_EXTRACTION — "required" (default) or "optional" (#4953)
-    MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
+    MAX_ATTEMPTS      — Per-message processing attempts before dead-lettering
+                       (default: 3; MAX_RETRIES is a deprecated alias)
     HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
@@ -2132,7 +2133,7 @@ DEFAULT_BLOCK_MS = 5000
 # latency on the server's empty reply; a server silent past block + margin is a
 # genuine hang and still raises.
 REDIS_SOCKET_TIMEOUT_MARGIN_S = 10.0
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_ATTEMPTS = 3
 # Number of consecutive empty poll cycles between heartbeat log messages.
 # At the default block timeout of 5 seconds, 60 cycles ≈ 5 minutes.
 DEFAULT_HEARTBEAT_INTERVAL = 60
@@ -2453,8 +2454,9 @@ class IngestionWorker:
       insert fails every time).
 
     **Message-level errors** (bad data, validation failures, transient issues):
-      Retried up to max_retries times. After exhaustion, the message is
-      acknowledged (dead-letter pattern) and logged as CRITICAL for alerting.
+      Processed up to max_attempts times (first try included). After
+      exhaustion, the message is acknowledged (dead-letter pattern) and
+      logged as CRITICAL for alerting.
     """
 
     def __init__(
@@ -2464,7 +2466,7 @@ class IngestionWorker:
         opensearch_client: OpenSearch,
         s3_client: Any,
         archive_bucket: str,
-        max_retries: int = DEFAULT_MAX_RETRIES,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         llm_client: object | None = None,
         llm_provider: str | None = None,
         llm_model: str | None = None,
@@ -2481,7 +2483,7 @@ class IngestionWorker:
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         self._pg_dsn = pg_dsn
-        self._max_retries = max_retries
+        self._max_attempts = max_attempts
         self._conn: psycopg.Connection | None = None
         self._s3_client = s3_client
         self._archive_bucket = archive_bucket
@@ -8227,7 +8229,7 @@ class IngestionWorker:
         """Run ``process_event`` with retries, then ack or dead-letter."""
         attempt = 0
         last_exc: Exception | None = None
-        while attempt < self._max_retries:
+        while attempt < self._max_attempts:
             try:
                 self.process_event(event_data)
                 self._ack(msg_id)
@@ -8274,16 +8276,16 @@ class IngestionWorker:
                 logger.warning(
                     "Message-level error processing event (attempt %d/%d): %s",
                     attempt,
-                    self._max_retries,
+                    self._max_attempts,
                     exc,
                 )
 
         # Exhausted retries on a message-level error — dead-letter and alert.
         # This message has genuinely bad data that won't succeed on retry.
         logger.critical(
-            "Dead-lettering message %s after %d retries. Last error: %s",
+            "Dead-lettering message %s after %d attempts. Last error: %s",
             msg_id,
-            self._max_retries,
+            self._max_attempts,
             last_exc,
         )
         self._record_dead_letter(event_data, last_exc, attempts=attempt)

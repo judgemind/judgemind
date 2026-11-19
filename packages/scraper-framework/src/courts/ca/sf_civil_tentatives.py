@@ -129,8 +129,8 @@ TURNSTILE_TIMEOUT = 60.0
 # Turnstile poll interval (seconds) — how often to check for page navigation.
 TURNSTILE_POLL_INTERVAL = 2.0
 
-# Maximum session acquisition retries.
-SESSION_MAX_RETRIES = 3
+# Number of session acquisition attempts (first try included).
+SESSION_MAX_ATTEMPTS = 3
 
 # Regex to extract seshID from the page JavaScript.
 # Matches: var seshID="<hex_string>";
@@ -955,11 +955,11 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
             use_solver=use_solver,
         )
 
-        for attempt in range(1, SESSION_MAX_RETRIES + 1):
+        for attempt in range(1, SESSION_MAX_ATTEMPTS + 1):
             self._log.info(
                 "Session acquisition attempt",
                 attempt=attempt,
-                max_retries=SESSION_MAX_RETRIES,
+                max_attempts=SESSION_MAX_ATTEMPTS,
             )
 
             try:
@@ -973,12 +973,12 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     error=str(exc),
                 )
 
-            if attempt < SESSION_MAX_RETRIES:
+            if attempt < SESSION_MAX_ATTEMPTS:
                 await asyncio.sleep(3.0)
 
         self._log.error(
-            "Failed to acquire session after all retries",
-            max_retries=SESSION_MAX_RETRIES,
+            "Failed to acquire session after all attempts",
+            max_attempts=SESSION_MAX_ATTEMPTS,
         )
         # The all-retries failure surfaced only as opaque Chromium timeouts.
         # When a proxy is configured, run a stdlib probe through the SAME proxy
@@ -1456,6 +1456,6 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         ],
         request_delay_seconds=1.0,
         request_timeout_seconds=30.0,
-        max_retries=3,
+        max_attempts=3,
         s3_bucket=s3_bucket,
     )

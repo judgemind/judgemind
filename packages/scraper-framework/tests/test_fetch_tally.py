@@ -235,7 +235,7 @@ def _config() -> ScraperConfig:
         county="X",
         court="Superior Court",
         target_urls=["https://example.test"],
-        max_retries=1,
+        max_attempts=1,
     )
 
 

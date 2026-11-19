@@ -500,7 +500,7 @@ def test_cc_run_fails_when_every_pdf_fetch_fails() -> None:
     """Every PDF GET raised: the run is a failure, not success/0 (#4693)."""
     config = cc_default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     scraper = CCTentativeRulingsScraper(config)
 
     index_html = (

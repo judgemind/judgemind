@@ -517,14 +517,14 @@ class BaseScraper(abc.ABC):
           change is not.  The next scheduled run is the retry for those.
         - Any other exception (listing page, session acquisition) is one
           cheap request, retried with exponential backoff as before.
-        - The total number of attempts never exceeds ``config.max_retries``.
+        - The total number of attempts never exceeds ``config.max_attempts``.
 
         Each attempt collects the :class:`FetchTally` objects it creates in
         ``self._fetch_tallies`` (#5019); only the last attempt's count.
         """
         from .fetch_tally import collect_fetch_tallies
 
-        max_attempts = max(self.config.max_retries, 1)
+        max_attempts = max(self.config.max_attempts, 1)
         delay = _RETRY_BASE_DELAY_SECONDS
         all_failed_retried = False
         attempt = 0
@@ -595,7 +595,7 @@ class BaseScraper(abc.ABC):
         if already_retried:
             return "the one whole-run retry for an all-failed fetch was already used"
         if attempt >= max_attempts:
-            return f"max_retries={self.config.max_retries} reached"
+            return f"max_attempts={self.config.max_attempts} reached"
         budget = self.config.all_failed_retry_budget_seconds
         if budget <= 0:
             return "all_failed_retry_budget_seconds is 0 (retry off)"

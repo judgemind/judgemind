@@ -342,7 +342,7 @@ def test_oc_run_handles_get_failure() -> None:
     respx.get(OC_INDEX_URL).mock(return_value=httpx.Response(503))
 
     config = oc_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = OCTentativeRulingsScraper(config=config)
     health = scraper.run()
@@ -401,7 +401,7 @@ def test_oc_run_fails_when_every_pdf_fetch_fails() -> None:
 
     config = oc_default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = OCTentativeRulingsScraper(config=config).run()
 
     assert health.success is False

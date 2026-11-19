@@ -7,7 +7,7 @@ from datetime import UTC, datetime, time
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -127,7 +127,9 @@ class ScraperConfig(BaseModel):
     # Rate limiting / courtesy
     request_delay_seconds: float = 1.0
     request_timeout_seconds: float = 30.0
-    max_retries: int = 3
+    # Total fetch attempts per run, the first try included -- not retries
+    # after the first (#5158).
+    max_attempts: int = 3
     # Whole-run retry for an all-items-failed fetch (#4713).  BaseScraper.run()
     # retries it once, after this delay, only when every failure looked
     # transient and the failed attempt took at most the budget.  A longer
@@ -143,6 +145,21 @@ class ScraperConfig(BaseModel):
     # S3 archival
     s3_bucket: str = ""
     s3_prefix: str = ""  # overrides default path convention if set
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_max_retries(cls, data: Any) -> Any:
+        """Refuse the pre-#5158 ``max_retries`` key instead of dropping it.
+
+        Pydantic ignores unknown keys by default, so an old ``max_retries=1``
+        would silently run with the default attempt count.
+        """
+        if isinstance(data, dict) and "max_retries" in data:
+            raise ValueError(
+                "ScraperConfig.max_retries was renamed to max_attempts (#5158): "
+                "it counts total attempts, the first try included"
+            )
+        return data
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ def _config(**overrides: object) -> ScraperConfig:
         "county": "X",
         "court": "Superior Court",
         "target_urls": [BASE],
-        "max_retries": 1,
+        "max_attempts": 1,
         "request_delay_seconds": 0,
     }
     values.update(overrides)
@@ -193,7 +193,7 @@ class TestFetchFailureCountedInRun:
             def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
                 return doc
 
-        scraper = _FlakyOnce(_config(max_retries=2, all_failed_retry_delay_seconds=0))
+        scraper = _FlakyOnce(_config(max_attempts=2, all_failed_retry_delay_seconds=0))
         health = scraper.run()
 
         assert _FlakyOnce.calls == 2

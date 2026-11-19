@@ -561,7 +561,7 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         ],
         request_delay_seconds=2.0,
         request_timeout_seconds=30.0,
-        max_retries=3,
+        max_attempts=3,
         s3_bucket=s3_bucket,
     )
 

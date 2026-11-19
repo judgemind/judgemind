@@ -96,7 +96,7 @@ def _capture(hearing: datetime) -> tuple[dict[str, Any], bytes]:
     archiver.archive.side_effect = _archive
     archiver.bucket = "test-bucket"
     config = portal_default_config().model_copy(
-        update={"request_delay_seconds": 0.0, "max_retries": 1}
+        update={"request_delay_seconds": 0.0, "max_attempts": 1}
     )
     scraper = CCTentativesPortalScraper(
         config=config, archiver=archiver, event_bus=EventBus(redis_client)
@@ -474,7 +474,7 @@ def _capture_pdf_plus_inline() -> dict[str, Any]:
     archiver.archive.return_value = _S3_KEY
     archiver.bucket = "test-bucket"
     config = portal_default_config().model_copy(
-        update={"request_delay_seconds": 0.0, "max_retries": 1}
+        update={"request_delay_seconds": 0.0, "max_attempts": 1}
     )
     CCTentativesPortalScraper(
         config=config, archiver=archiver, event_bus=EventBus(redis_client)

@@ -933,9 +933,9 @@ def test_process_message_acks_on_success(mock_psycopg: MagicMock) -> None:
 
 @patch("ingestion.worker.psycopg")
 def test_process_message_retries_then_dead_letters(mock_psycopg: MagicMock) -> None:
-    """Failed events are retried max_retries times, then dead-lettered (XACK)."""
+    """Failed events are retried max_attempts times, then dead-lettered (XACK)."""
     worker, _ = _make_worker()
-    worker._max_retries = 2
+    worker._max_attempts = 2
     worker.process_event = MagicMock(side_effect=RuntimeError("db down"))
 
     msg_id = b"9999-0"
@@ -1096,7 +1096,7 @@ def test_process_message_infra_error_raises_instead_of_dead_letter(
 ) -> None:
     """Infrastructure errors should NOT dead-letter. They raise InfrastructureError."""
     worker, _ = _make_worker()
-    worker._max_retries = 3
+    worker._max_attempts = 3
     worker.process_event = MagicMock(
         side_effect=psycopg.OperationalError("connection refused"),
     )
@@ -1117,7 +1117,7 @@ def test_process_message_dead_letters_only_message_errors(
 ) -> None:
     """Message-level errors (e.g. ValueError) should still dead-letter after retries."""
     worker, _ = _make_worker()
-    worker._max_retries = 2
+    worker._max_attempts = 2
     worker.process_event = MagicMock(side_effect=ValueError("bad field"))
 
     msg_id = b"msg-err-0"
@@ -1132,9 +1132,9 @@ def test_process_message_dead_letters_only_message_errors(
 def test_process_message_infra_error_on_first_attempt_raises_immediately(
     mock_psycopg: MagicMock,
 ) -> None:
-    """Infra errors should raise on first attempt, not retry max_retries times."""
+    """Infra errors should raise on first attempt, not retry max_attempts times."""
     worker, _ = _make_worker()
-    worker._max_retries = 5
+    worker._max_attempts = 5
     worker.process_event = MagicMock(
         side_effect=psycopg.errors.UndefinedTable("relation 'courts' does not exist"),
     )
@@ -1161,7 +1161,7 @@ def test_process_message_schema_error_dead_letters_immediately(
 ) -> None:
     """Schema constraint errors should dead-letter immediately without retry."""
     worker, _ = _make_worker()
-    worker._max_retries = 5
+    worker._max_attempts = 5
     worker.process_event = MagicMock(
         side_effect=psycopg.errors.StringDataRightTruncation(
             "value too long for type character(2)"
@@ -1184,7 +1184,7 @@ def test_process_message_schema_error_does_not_raise(
 ) -> None:
     """Schema constraint errors should NOT raise InfrastructureError (worker stays up)."""
     worker, _ = _make_worker()
-    worker._max_retries = 3
+    worker._max_attempts = 3
     worker.process_event = MagicMock(
         side_effect=psycopg.errors.NumericValueOutOfRange("numeric value out of range"),
     )
@@ -1205,7 +1205,7 @@ def test_process_message_schema_error_not_null_violation(
 ) -> None:
     """NotNullViolation dead-letters immediately without retry."""
     worker, _ = _make_worker()
-    worker._max_retries = 3
+    worker._max_attempts = 3
     worker.process_event = MagicMock(
         side_effect=psycopg.errors.NotNullViolation("null value in column 'state_code'"),
     )
@@ -1224,7 +1224,7 @@ def test_process_message_schema_error_check_violation(
 ) -> None:
     """CheckViolation dead-letters immediately without retry."""
     worker, _ = _make_worker()
-    worker._max_retries = 3
+    worker._max_attempts = 3
     worker.process_event = MagicMock(
         side_effect=psycopg.errors.CheckViolation("check constraint failed"),
     )
