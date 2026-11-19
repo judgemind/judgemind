@@ -81,8 +81,9 @@ fi
 # Install these first so a judgemind-config install failure does not leave
 # a venv that looks partially ready.
 
-echo "Installing PyPI dependencies: pytest pytest-xdist ruff boto3"
-"$PIP" install --quiet pytest pytest-xdist ruff boto3
+# ruff comes from requirements-ruff.txt, the repo's one ruff pin (#5153).
+echo "Installing PyPI dependencies: pytest pytest-xdist boto3, ruff (pinned)"
+"$PIP" install --quiet pytest pytest-xdist boto3 -r "$REPO_ROOT/requirements-ruff.txt"
 
 # ── Install local sibling dependency ─────────────────────────────────────
 # judgemind-config is an unpublished local package. Install it last (editable)

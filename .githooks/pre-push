@@ -540,6 +540,47 @@ ensure_prepush_redis() {
 }
 
 # -------------------------------------------------------------------
+# The ruff pin (#5153). requirements-ruff.txt holds the one ruff version
+# CI installs. Another ruff version can lint and format differently, so
+# its verdict says nothing about CI's: the checks below only run a ruff
+# whose `--version` is the pin. A checkout with no pin file (an old
+# branch) skips the version check.
+#
+# pick_pinned_ruff <candidate>...
+#   Sets picked_ruff to the first candidate (a path or a command on PATH)
+#   that exists and matches the pin, and seen_ruff to the first that
+#   exists at all ("<path> (ruff X.Y.Z)"), for the error message. Both
+#   stay empty when no candidate exists.
+# -------------------------------------------------------------------
+RUFF_PIN=""
+if [ -f requirements-ruff.txt ]; then
+    RUFF_PIN=$(sed -n 's/^ruff==\([0-9][0-9.]*\)[[:space:]]*$/\1/p' requirements-ruff.txt | head -n 1)
+fi
+
+pick_pinned_ruff() {
+    picked_ruff=""
+    seen_ruff=""
+    local cand version
+    for cand in "$@"; do
+        case "$cand" in
+            */*) [ -x "$cand" ] || continue ;;
+            *) command -v "$cand" &>/dev/null || continue ;;
+        esac
+        if [ -z "$RUFF_PIN" ]; then
+            picked_ruff="$cand"
+            return 0
+        fi
+        version=$("$cand" --version 2>/dev/null | awk '{print $2}')
+        [ -n "$seen_ruff" ] || seen_ruff="$cand (ruff ${version:-unknown version})"
+        if [ "$version" = "$RUFF_PIN" ]; then
+            picked_ruff="$cand"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# -------------------------------------------------------------------
 # python_pkg_checks <pkg> <has_code: true|false>
 #
 # ruff check + ruff format for one Python package, then (code changes
@@ -560,15 +601,26 @@ python_pkg_checks() {
     fi
     echo "pre-push: checking Python package '$pkg'..." >&2
 
-    # Prefer the package's own venv ruff, fall back to global
+    # Prefer the package's own venv ruff, fall back to global; either must
+    # be the pinned version (#5153).
     local ruff_cmd=""
-    if [ -x "$pkg_dir/.venv/bin/ruff" ]; then
-        ruff_cmd="$pkg_dir/.venv/bin/ruff"
-    elif command -v ruff &>/dev/null; then
-        ruff_cmd="ruff"
+    pick_pinned_ruff "$pkg_dir/.venv/bin/ruff" ruff
+    if [ -n "$picked_ruff" ]; then
+        ruff_cmd="$picked_ruff"
+    elif [ -n "$seen_ruff" ]; then
+        echo "" >&2
+        echo "  FAILED: ruff for $pkg is not the pinned ruff==$RUFF_PIN (requirements-ruff.txt, #5153): $seen_ruff" >&2
+        echo "  Lint and format did not run: another ruff version can disagree with CI." >&2
+        echo "  Fix:" >&2
+        if [[ "$pkg" == infra/* ]]; then
+            echo "    ${pkg_dir}/.venv/bin/pip install -r requirements-ruff.txt" >&2
+        else
+            echo "    scripts/install-package-venv.sh $pkg" >&2
+        fi
+        failures=$((failures + 1))
     else
         echo "  WARNING: ruff not found for $pkg — skipping lint/format checks" >&2
-        echo "  Install with: pip install ruff" >&2
+        echo "  Install with: pip install -r requirements-ruff.txt" >&2
     fi
 
     if [ -n "$ruff_cmd" ]; then
@@ -1347,25 +1399,26 @@ done
 # outside every package's ruff scope, so format drift there built up with
 # nothing noticing. CI's scripts-tests job checks the whole tree with
 # `ruff format --check scripts/`; here only the pushed files are checked.
-# Deleted files are skipped. ruff comes from PATH, else any package venv.
+# Deleted files are skipped. ruff is the first pinned one (#5153) of: the
+# scripts/tests venv (built from requirements that include the pin), PATH,
+# any package venv.
 # -------------------------------------------------------------------
 changed_scripts_py_fmt=$(echo "$changed_files" | grep -E '^scripts/.+\.py$' || true)
 changed_scripts_py_fmt=$(for f in $changed_scripts_py_fmt; do [ -f "$f" ] && echo "$f"; done)
 if [ -n "$changed_scripts_py_fmt" ]; then
-    scripts_ruff=""
-    if command -v ruff &>/dev/null; then
-        scripts_ruff="ruff"
-    else
-        for r in packages/*/.venv/bin/ruff; do
-            if [ -x "$r" ]; then
-                scripts_ruff="$r"
-                break
-            fi
-        done
-    fi
-    if [ -z "$scripts_ruff" ]; then
+    # shellcheck disable=SC2046 # one word per venv path
+    pick_pinned_ruff "${SCRIPTS_TESTS_VENV:-tmp/scripts-tests-venv}/bin/ruff" ruff $(ls -d packages/*/.venv/bin/ruff 2>/dev/null)
+    scripts_ruff="$picked_ruff"
+    if [ -z "$scripts_ruff" ] && [ -n "$seen_ruff" ]; then
+        echo "" >&2
+        echo "  FAILED: no pinned ruff==$RUFF_PIN (requirements-ruff.txt, #5153) for ruff format on scripts/; found $seen_ruff" >&2
+        echo "  Another ruff version can disagree with CI's 'ruff format --check scripts/'." >&2
+        echo "  Fix (builds the scripts/tests venv, which holds the pinned ruff):" >&2
+        echo "    scripts/ensure-scripts-tests-venv.sh" >&2
+        failures=$((failures + 1))
+    elif [ -z "$scripts_ruff" ]; then
         echo "  WARNING: ruff not found — skipping ruff format on scripts/ (CI still checks it)" >&2
-        echo "  Install with: pip install ruff" >&2
+        echo "  Install with: pip install -r requirements-ruff.txt" >&2
     else
         echo "pre-push: checking ruff format on changed scripts/ Python files..." >&2
         # shellcheck disable=SC2086 # one word per path
@@ -1381,15 +1434,15 @@ fi
 # scripts/tests in CI's minimal environment (#5045) — run whenever a path
 # in CI's `scripts` paths-filter changes (the filter that gates CI's
 # scripts-tests job: scripts/**, .claude/skills/**, the preflight hooks,
-# the dispatcher Dockerfiles, package tests, the ecs-deploy action), or
-# judgemind-config (installed into that environment). A narrower trigger
+# the dispatcher Dockerfiles, package tests, the ecs-deploy action, the
+# ruff pin), or judgemind-config (installed into that environment). A narrower trigger
 # let an edit to only scripts/*.sh or .claude/skills/** pass pre-push and
 # go red in CI (#5088); scripts/tests/test_pre_push_scripts_tests_trigger.py
 # keeps this regex in step with the CI filter. A background job, so it
 # overlaps the CI guard umbrella. See scripts_tests_checks.
 # -------------------------------------------------------------------
 changed_scripts_tests_inputs=$(echo "$changed_files" \
-    | grep -E '^(scripts/.*|\.claude/skills/.*|\.claude/hooks/preflight.*|Dockerfile\.dispatcher.*|packages/[^/]+/tests/.*|\.github/actions/ecs-deploy/.*|packages/judgemind-config/.*)$' || true)
+    | grep -E '^(scripts/.*|\.claude/skills/.*|\.claude/hooks/preflight.*|Dockerfile\.dispatcher.*|packages/[^/]+/tests/.*|\.github/actions/ecs-deploy/.*|packages/judgemind-config/.*|requirements-ruff\.txt)$' || true)
 if [ -n "$changed_scripts_tests_inputs" ]; then
     if [ "${PREPUSH_SCRIPTS_TESTS:-1}" = "0" ]; then
         echo "pre-push: WARNING: PREPUSH_SCRIPTS_TESTS=0, so scripts/tests did not run; CI still runs it (#5045)" >&2
@@ -1409,7 +1462,7 @@ fi
 # script the dispatcher imports (scripts/audit_llm_carry_forward.py).
 # Background jobs alongside scripts/tests; all share its cached venv.
 # -------------------------------------------------------------------
-minimal_env_shared_re='scripts/tests/requirements-ci\.txt|scripts/ensure-scripts-tests-venv\.sh|scripts/tests/conftest\.py|packages/judgemind-config/.*'
+minimal_env_shared_re='scripts/tests/requirements-ci\.txt|requirements-ruff\.txt|scripts/ensure-scripts-tests-venv\.sh|scripts/tests/conftest\.py|packages/judgemind-config/.*'
 changed_dispatcher_tests_inputs=$(echo "$changed_files" \
     | grep -E "^(scripts/dispatcher/.*|scripts/audit_llm_carry_forward\.py|${minimal_env_shared_re})$" || true)
 changed_dispatcher_v3_tests_inputs=$(echo "$changed_files" \

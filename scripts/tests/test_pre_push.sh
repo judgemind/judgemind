@@ -93,6 +93,10 @@
 #  70. a package README change lints but runs no pytest (#5151)
 #  71. a scripts/**/*.py change runs ruff format --check on it (#5151)
 #  72. scripts/ format drift fails the push with a Fix: block (#5151)
+#  73. a package venv ruff that is not the requirements-ruff.txt pin fails (#5153)
+#  74. a package venv ruff at the pin runs lint and format (#5153)
+#  75. scripts/ format check with no pinned ruff fails with a Fix: block (#5153)
+#  76. scripts/ format check uses a ruff at the pin (#5153)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2847,6 +2851,97 @@ elif ! echo "$hook_out" | grep -q "ruff format scripts/foo.py"; then
     report_fail "expected a copy-pasteable 'ruff format scripts/foo.py' Fix line (#5151)" "$hook_out"
 else
     report_pass "scripts/ format drift fails the push with a Fix: block (#5151)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 73-76 (#5153): with a requirements-ruff.txt pin in the
+# checkout, the hook only runs a ruff whose --version is the pin. The pin
+# 9.9.9 never matches a real ruff, so a ruff on the developer's PATH
+# cannot make these pass by accident.
+# ───────────────────────────────────────────────────────────────────────
+
+# write_versioned_ruff <path> <version> <log>: a ruff stub that answers
+# --version with "ruff <version>" and logs every other call's argv.
+write_versioned_ruff() {
+    mkdir -p "$(dirname "$1")"
+    printf '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "ruff %s"; exit 0; fi\necho "$*" >> "%s"\nexit 0\n' \
+        "$2" "$3" > "$1"
+    chmod +x "$1"
+}
+PIN_RUFF_LOG="$TMPDIR/pin-ruff-calls.log"
+
+echo "[scenario 73] a package venv ruff that is not the pin fails with a Fix: block (#5153)"
+init_workspace
+commit_testpkg_on_main_then_branch feature-ruff-stale packages/testpkg/README.md '# testpkg'
+seed_stub_venv 0 0
+write_versioned_ruff "$WORK/packages/testpkg/.venv/bin/ruff" 1.0.0 "$PIN_RUFF_LOG"
+echo "ruff==9.9.9" > "$WORK/requirements-ruff.txt"
+: > "$PIN_RUFF_LOG"
+run_hook "refs/heads/feature-ruff-stale $feat_sha refs/heads/feature-ruff-stale $ZERO_SHA"
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a non-pinned venv ruff to fail the push (#5153)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "is not the pinned ruff==9.9.9"; then
+    report_fail "expected 'is not the pinned ruff==9.9.9' (#5153)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/install-package-venv.sh testpkg"; then
+    report_fail "expected the 'scripts/install-package-venv.sh testpkg' Fix line (#5153)" "$hook_out"
+elif [ -s "$PIN_RUFF_LOG" ]; then
+    report_fail "expected the non-pinned ruff not to run check/format; it ran: $(cat "$PIN_RUFF_LOG")" "$hook_out"
+else
+    report_pass "non-pinned package venv ruff fails with a Fix: block (#5153)"
+fi
+
+echo "[scenario 74] a package venv ruff at the pin runs lint and format (#5153)"
+init_workspace
+commit_testpkg_on_main_then_branch feature-ruff-pinned packages/testpkg/README.md '# testpkg'
+seed_stub_venv 0 0
+write_versioned_ruff "$WORK/packages/testpkg/.venv/bin/ruff" 9.9.9 "$PIN_RUFF_LOG"
+echo "ruff==9.9.9" > "$WORK/requirements-ruff.txt"
+: > "$PIN_RUFF_LOG"
+run_hook "refs/heads/feature-ruff-pinned $feat_sha refs/heads/feature-ruff-pinned $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the pinned venv ruff to pass (#5153)" "$hook_out"
+elif ! grep -q "^check " "$PIN_RUFF_LOG" || ! grep -q "^format --check " "$PIN_RUFF_LOG"; then
+    report_fail "expected the pinned ruff to run check and format; calls: $(cat "$PIN_RUFF_LOG")" "$hook_out"
+else
+    report_pass "pinned package venv ruff runs lint and format (#5153)"
+fi
+
+PIN_FAKE_DIR="$TMPDIR/fake-ruff-pin"
+
+echo "[scenario 75] scripts/ format check with no pinned ruff fails with a Fix: block (#5153)"
+init_workspace
+commit_scripts_change feature-scripts-ruff-stale scripts/foo.py
+write_versioned_ruff "$PIN_FAKE_DIR/ruff" 1.0.0 "$PIN_RUFF_LOG"
+echo "ruff==9.9.9" > "$WORK/requirements-ruff.txt"
+: > "$PIN_RUFF_LOG"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-scripts-ruff-stale $feat_sha refs/heads/feature-scripts-ruff-stale $ZERO_SHA" \
+    | PATH="$PIN_FAKE_DIR:$PATH" PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected a non-pinned ruff to fail the scripts/ format check (#5153)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "no pinned ruff==9.9.9"; then
+    report_fail "expected 'no pinned ruff==9.9.9' (#5153)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/ensure-scripts-tests-venv.sh"; then
+    report_fail "expected the 'scripts/ensure-scripts-tests-venv.sh' Fix line (#5153)" "$hook_out"
+elif [ -s "$PIN_RUFF_LOG" ]; then
+    report_fail "expected the non-pinned ruff not to format; it ran: $(cat "$PIN_RUFF_LOG")" "$hook_out"
+else
+    report_pass "scripts/ format check with no pinned ruff fails with a Fix: block (#5153)"
+fi
+
+echo "[scenario 76] scripts/ format check uses a ruff at the pin (#5153)"
+init_workspace
+commit_scripts_change feature-scripts-ruff-pinned scripts/foo.py
+write_versioned_ruff "$PIN_FAKE_DIR/ruff" 9.9.9 "$PIN_RUFF_LOG"
+echo "ruff==9.9.9" > "$WORK/requirements-ruff.txt"
+: > "$PIN_RUFF_LOG"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-scripts-ruff-pinned $feat_sha refs/heads/feature-scripts-ruff-pinned $ZERO_SHA" \
+    | PATH="$PIN_FAKE_DIR:$PATH" PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected the pinned ruff to pass the scripts/ format check (#5153)" "$hook_out"
+elif ! grep -qx "format --check scripts/foo.py" "$PIN_RUFF_LOG"; then
+    report_fail "expected 'format --check scripts/foo.py' from the pinned ruff; calls: $(cat "$PIN_RUFF_LOG")" "$hook_out"
+else
+    report_pass "scripts/ format check uses a ruff at the pin (#5153)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

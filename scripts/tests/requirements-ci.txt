@@ -23,4 +23,9 @@ boto3
 # diff-cover: scripts/tests/test_diff_cover_range_notation.py runs the
 # real binary against a scratch repo (#4764).
 diff-cover
+# ruff: the repo's one pinned version (#5153). CI's scripts-tests job runs
+# `ruff format --check scripts/` with it, and the pre-push hook uses this
+# venv's ruff for changed scripts/ files. pip reads a nested -r relative
+# to this file, not to the working directory.
+-r ../../requirements-ruff.txt
 -e packages/judgemind-config

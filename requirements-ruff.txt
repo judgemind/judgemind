@@ -1,0 +1,21 @@
+# The one ruff version for the whole repo (#5153).
+#
+# Every ruff install reads or matches this line: the CI jobs
+# (`pip install -r requirements-ruff.txt`, or the scripts/tests
+# requirements that include this file), the pre-push hook, the
+# dispatcher venv installers, and the `ruff==` spec in each
+# packages/*/pyproject.toml [dev] extras. scripts/check-ruff-pin.py
+# fails when any of them disagrees, and the pre-push hook refuses a
+# ruff of any other version.
+#
+# Why: CI used to install ruff unpinned, so a ruff release that changed
+# the format style turned every open PR red at once, and local pre-push
+# results (from each venv's own ruff) disagreed with CI.
+#
+# To upgrade ruff, in one PR:
+#   1. change the version below and every "ruff==" in packages/*/pyproject.toml
+#      (scripts/check-ruff-pin.py lists any you miss);
+#   2. run the new ruff's `ruff format` and `ruff check --fix` over
+#      packages/*/src, packages/*/tests, scripts/ and .claude/hooks/;
+#   3. commit the reformat as its own commit.
+ruff==0.17.5
