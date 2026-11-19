@@ -168,6 +168,10 @@ module "compute" {
   schedule_enabled    = true
   log_retention_days  = 14
   enable_alerts       = true
+
+  # Always-on db-shell service that scripts/dev-db-query.sh execs into,
+  # instead of the live ingestion worker (#5168).
+  enable_db_shell = true
 }
 
 module "search" {

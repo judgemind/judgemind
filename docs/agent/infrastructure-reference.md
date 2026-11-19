@@ -407,7 +407,7 @@ This closes the race window observed in PR #2907 where a new resolver shipped on
 | Tool | Use for | Reliability | Notes |
 |---|---|---|---|
 | `scripts/ecs-run-task.sh` | All data scripts (backfills, migrations, audits) | Reliable | Standalone Fargate task, CloudWatch logs, no session timeout |
-| `scripts/dev-db-query.sh` | Quick SQL queries, including large result sets | Complete result or non-zero exit | Uses ECS Exec; results over 512 bytes travel via S3 (#4781). See [Output-size limits](#output-size-limits-via-ssm--ecs-exec) |
+| `scripts/dev-db-query.sh` | Quick SQL queries, including large result sets | Complete result or non-zero exit | ECS Exec into the `judgemind-db-shell-dev` service, never the ingestion worker (#5168); results over 512 bytes travel via S3 (#4781). See [Where dev-db-query.sh runs](#where-dev-db-querysh-runs) and [Output-size limits](#output-size-limits-via-ssm--ecs-exec) |
 | `scripts/ecs-run.sh` | Interactive debugging only | Unreliable | SSM sessions drop after seconds; never use for scripts |
 | `scripts/ecs-wait-task.sh` | Wait on a `--detach`'d oneshot until STOPPED | Reliable | 60s polling, 480s per call then exit 124 (re-run to keep waiting), propagates container exitCode |
 
@@ -502,6 +502,22 @@ scripts/ecs-run-task.sh scripts/audit_case_number_support.py -- Riverside --keys
 
 Each S3 key is audited in its own forked process with a hard deadline (`--timeout`, default 180s), so one PDF that pdfplumber stalls on is reported as a `TIMEOUT` line instead of hanging the county. A `PROGRESS` line every `--progress-every` keys (default 100) shows the run is moving.
 
+### Where dev-db-query.sh runs
+
+`scripts/dev-db-query.sh` execs into the `judgemind-db-shell-dev` ECS service, container `db-shell` (`infra/terraform/modules/compute/db_shell.tf`, enabled in dev with `enable_db_shell = true`). That service runs the ingestion worker's image with `sleep infinity`: it does no work, holds `DATABASE_URL` and `JUDGEMIND_ARCHIVE_BUCKET`, and uses the worker's task role. Its size is 0.25 vCPU / 0.5 GB on `FARGATE_SPOT`.
+
+Why it exists (#5168): each query starts a `python3` + psycopg process and an SSM session worker inside the target container. When the target was the live ingestion worker, each query used 20-40 MB of the worker's 512 MB, in the worker's own cgroup. One such query triggered the OOM kill in #5147. Queries also failed with `TargetNotConnectedException` whenever the worker restarted. The db-shell service does not restart on worker deploys, so a query works during a worker rollout.
+
+Options considered:
+
+| Option | Latency for `SELECT 1` | Cost | Why not |
+|---|---|---|---|
+| Exec into the ingestion worker (before #5168) | ~7 s | none | Spends the worker's memory; unavailable during worker restarts |
+| One-off `ecs-run-task.sh` task per query | ~95 s (measured) | none idle | Image pull and provisioning on every query |
+| Always-on db-shell service (chosen) | ~7 s | small fixed (0.25 vCPU / 0.5 GB on Spot) | — |
+
+After a Spot interruption, ECS places a new db-shell task within a few minutes. The script polls `list-tasks` (60 s) and then the exec agent (120 s) through that gap. If no task is running, it exits 1 and the `Fix:` block names the `scripts/ecs-run-task.sh` fallback. Production has no db-shell: it runs capture only and has no database (#4971).
+
 ### Output-size limits via SSM / ECS Exec
 
 The SSM / ECS Exec transport cuts a session's output off partway: anywhere from ~1 KB to ~10 KB on dev (946 bytes on one run, 8-10 KB on others), with a `Cannot perform start session: EOF` trailer, and `aws ecs execute-command` still exits 0 (#3195, #4781).
@@ -509,7 +525,7 @@ The SSM / ECS Exec transport cuts a session's output off partway: anywhere from 
 **`scripts/dev-db-query.sh` returns results of any size complete, or exits non-zero (#4781).** It never prints a partial result as if it were whole:
 
 - The runner (`scripts/dev_db_query_runner.py`) never prints a bare payload. Results of up to 512 bytes go inline between `@@JM_DEVDB_BEGIN inline bytes=<n> sha256=<hex>@@` and `@@JM_DEVDB_END@@` lines.
-- Larger results are written to `s3://judgemind-document-archive-dev/tmp/dev-db-query/<id>.json` by the ingestion worker's task role. Only a short pointer line (`@@JM_DEVDB_BEGIN s3 bytes=... sha256=... uri=...@@`) crosses SSM.
+- Larger results are written to `s3://judgemind-document-archive-dev/tmp/dev-db-query/<id>.json` by the db-shell task (it uses the ingestion worker's task role). Only a short pointer line (`@@JM_DEVDB_BEGIN s3 bytes=... sha256=... uri=...@@`) crosses SSM.
 - Locally, `scripts/dev_db_query_result.py` finds the frame and downloads the S3 object with `aws s3 cp`. It checks the byte count and sha256 against the BEGIN line, prints the payload to stdout, and deletes the object. The `tmp/` lifecycle rule expires any object left behind after 30 days.
 - A missing frame (a runner or database error, or a stream that died early), a missing END marker (truncation), a size or digest mismatch, or a failed download exits 1. You get a `Fix:` block on stderr and an empty stdout. Re-run, or fall back to `scripts/ecs-run-task.sh`.
 

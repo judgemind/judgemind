@@ -273,7 +273,7 @@ See **`docs/specs/architecture-spec-v1.md` §3.3** for the full ingestion pipeli
 The dev database is in a private VPC — **not reachable from localhost**. Use:
 
 - `scripts/ecs-run-task.sh` for **all data scripts** (backfills, migrations, audits, one-offs).
-- `scripts/dev-db-query.sh` for **quick SQL queries** (SELECT, EXPLAIN).
+- `scripts/dev-db-query.sh` for **quick SQL queries** (SELECT, EXPLAIN). It execs into the always-on `judgemind-db-shell-dev` service, never the live ingestion worker (#5168).
 - `scripts/ecs-run.sh` for **interactive debugging only** — SSM sessions drop; never use for scripts.
 
 See `docs/agent/infrastructure-reference.md` §ECS Script Execution for full patterns. For Reingest vs Rebuild guidance, see `docs/agent/infrastructure-reference.md` §Reingest vs Rebuild.

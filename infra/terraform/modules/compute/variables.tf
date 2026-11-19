@@ -164,3 +164,9 @@ variable "ingestion_idle_threshold_seconds" {
   type        = number
   default     = 90000
 }
+
+variable "enable_db_shell" {
+  description = "Run the always-on db-shell ECS service (0.25 vCPU / 0.5 GB, FARGATE_SPOT) that scripts/dev-db-query.sh execs into, so queries never run inside the live ingestion worker (#5168). Needs db_connection_secret_arn."
+  type        = bool
+  default     = false
+}
