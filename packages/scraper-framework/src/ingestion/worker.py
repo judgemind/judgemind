@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from collections import Counter
@@ -2135,6 +2136,31 @@ DEFAULT_MAX_RETRIES = 3
 # Number of consecutive empty poll cycles between heartbeat log messages.
 # At the default block timeout of 5 seconds, 60 cycles ≈ 5 minutes.
 DEFAULT_HEARTBEAT_INTERVAL = 60
+
+
+def _current_rss_mb(status_path: str = "/proc/self/status") -> float | None:
+    """This process's resident set size in MB, for the idle heartbeat (#5147).
+
+    ``VmRSS`` from ``/proc/self/status`` on Linux (Fargate).  Elsewhere (macOS
+    dev) the peak ``ru_maxrss`` stands in; None when neither is readable.
+    """
+    try:
+        with open(status_path) as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        pass
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, OSError, ValueError):
+        return None
+    # Bytes on macOS, KiB on Linux.
+    return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)
+
+
 # Consumers idle for longer than this (in milliseconds) with 0 pending messages
 # are considered stale and eligible for cleanup.  1 hour = 3,600,000 ms.
 STALE_CONSUMER_IDLE_MS = 3_600_000
@@ -8125,6 +8151,7 @@ class IngestionWorker:
                         "consumer": self._consumer_name,
                         "idle_seconds": idle_seconds,
                         "empty_polls": self._empty_polls,
+                        "rss_mb": _current_rss_mb(),
                     },
                 )
             return

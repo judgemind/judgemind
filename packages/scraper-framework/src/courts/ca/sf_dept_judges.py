@@ -51,6 +51,7 @@ import structlog
 from bs4 import BeautifulSoup, Tag
 
 from framework.court_directory import CourtDirectory
+from framework.pdf_pages import iter_pdf_pages
 
 from .la_dept_judges import normalize_department
 
@@ -322,7 +323,7 @@ def parse_dept_listing_pdf(pdf_bytes: bytes) -> list[DepartmentJudge]:
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in iter_pdf_pages(pdf):
                 tables = page.extract_tables()
                 if not tables:
                     continue

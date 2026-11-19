@@ -37,6 +37,7 @@ from ingestion.worker import (
     WHOLE_DOCUMENT_KEY,
     InfrastructureError,
     IngestionWorker,
+    _current_rss_mb,
     _parse_date,
     _parse_datetime,
     is_infrastructure_error,
@@ -3843,6 +3844,63 @@ def test_heartbeat_includes_idle_duration(mock_psycopg: MagicMock) -> None:
         idle_seconds = call_args[1]["extra"]["idle_seconds"]
         # Should be approximately 300 seconds (5 minutes), allow some tolerance
         assert idle_seconds >= 299
+
+
+@patch("ingestion.worker._current_rss_mb", return_value=187.5)
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_includes_rss_mb(mock_psycopg: MagicMock, _rss: MagicMock) -> None:
+    """The idle heartbeat reports the worker's resident set size (#5147), so
+    memory growth toward the 512 MB task limit shows in CloudWatch."""
+    worker, _ = _make_worker()
+    worker._redis.xreadgroup.return_value = None
+
+    with patch("ingestion.worker.logger") as mock_logger:
+        for _ in range(DEFAULT_HEARTBEAT_INTERVAL):
+            worker._process_batch(batch_size=10, block_ms=5000)
+
+    assert mock_logger.log.call_args[1]["extra"]["rss_mb"] == 187.5
+
+
+def test_current_rss_mb_reads_vmrss(tmp_path: Any) -> None:
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython\nVmHWM:\t  512000 kB\nVmRSS:\t  204800 kB\n")
+    assert _current_rss_mb(str(status)) == 200.0
+
+
+def test_current_rss_mb_falls_back_to_ru_maxrss(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import resource
+    import sys
+
+    usage = MagicMock(ru_maxrss=300 * 1024 * 1024 if sys.platform == "darwin" else 300 * 1024)
+    monkeypatch.setattr(resource, "getrusage", lambda _who: usage)
+    assert _current_rss_mb(str(tmp_path / "missing")) == 300.0
+
+
+def test_current_rss_mb_no_vmrss_line_falls_back(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import resource
+    import sys
+
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython\n")
+    usage = MagicMock(ru_maxrss=10 * 1024 * 1024 if sys.platform == "darwin" else 10 * 1024)
+    monkeypatch.setattr(resource, "getrusage", lambda _who: usage)
+    assert _current_rss_mb(str(status)) == 10.0
+
+
+def test_current_rss_mb_none_when_unavailable(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import resource
+
+    def boom(_who: int) -> object:
+        raise OSError("no rusage")
+
+    monkeypatch.setattr(resource, "getrusage", boom)
+    assert _current_rss_mb(str(tmp_path / "missing")) is None
 
 
 # ---------------------------------------------------------------------------

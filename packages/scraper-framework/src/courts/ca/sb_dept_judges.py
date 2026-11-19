@@ -39,6 +39,7 @@ import pdfplumber
 import structlog
 
 from framework.court_directory import CourtDirectory
+from framework.pdf_pages import iter_pdf_pages
 
 from .la_dept_judges import normalize_department
 
@@ -298,7 +299,7 @@ def parse_schedule_pdf(pdf_bytes: bytes) -> list[DepartmentJudge]:
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in iter_pdf_pages(pdf):
                 text = page.extract_text()
                 if not text or not _is_calendar_page(text):
                     continue

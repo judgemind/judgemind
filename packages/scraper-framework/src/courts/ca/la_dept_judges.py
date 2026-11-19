@@ -56,6 +56,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework.court_directory import CourtDirectory
+from framework.pdf_pages import iter_pdf_pages
 
 if TYPE_CHECKING:
     import psycopg
@@ -386,7 +387,7 @@ def parse_judicial_directory_pdf(pdf_bytes: bytes) -> list[DirectoryOfficer]:
     courthouse = ""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in iter_pdf_pages(pdf):
                 columns: _Columns | None = None
                 pending: _PendingRow | None = None  # the row a wrapped line belongs to
                 for line in _group_lines(page.extract_words()):

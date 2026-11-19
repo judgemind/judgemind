@@ -58,6 +58,7 @@ from framework import (
     ScraperConfig,
 )
 from framework.fetch_tally import FetchTally
+from framework.pdf_pages import iter_pdf_pages
 
 from .pdf_link_scraper import NOT_A_PDF_REASON, looks_like_pdf
 
@@ -1049,7 +1050,7 @@ def _split_rulings_format_b(text: str, pdf_bytes: bytes) -> list[SplitRuling]:
     seen_header = False
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in iter_pdf_pages(pdf):
                 tables = page.extract_tables() or []
                 for table in tables:
                     if not table:
@@ -1420,7 +1421,7 @@ def _dept12_table_entries(pdf_bytes: bytes, headerless: bool = False) -> dict[st
         in_table = False
         current: SplitRuling | None = None
         title_open = False
-        for page in pdf.pages:
+        for page in iter_pdf_pages(pdf):
             for table in page.extract_tables() or []:
                 rows = [row for row in table if row and len(row) >= 3]
                 if not rows:
