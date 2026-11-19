@@ -57,6 +57,70 @@ EFFECTIVE_CWD="${PREFLIGHT_CWD:-$PWD}"
 #   's/"[^"]*"//g'              — double-quoted runs (no double-quote escaping)
 STRIPPED_COMMAND=$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g")
 
+# long_running_heads — print one line per simple command in
+# $STRIPPED_COMMAND: its command word and the arguments after it (#5155).
+# Check 8 matches long-running commands (pytest, pip install, ...) against
+# the start of these lines, so the words count only as the command, never
+# as an argument (`grep -n pytest f`, `gh issue create --title "x pytest"`).
+#
+# Splitting: on ; | & ( ) { } and newlines, so `a && pytest`, `a | pytest`
+# and `(pytest)` each yield a `pytest ...` line. Quoted runs are already
+# gone from STRIPPED_COMMAND, so an operator inside a quoted argument does
+# not split. Skipped before the command word: VAR=value assignments, the
+# wrappers env / time / nice / command / exec / sudo / xargs (and their
+# -flags), `timeout <duration>`, `uv run` / `poetry run` / `pipenv run`, the
+# shell keywords if / then / else / elif / do / while / until / !.
+# A quoted command word (`"pytest" tests/`) or `bash -c "pytest"` is not
+# seen: its quoted run is stripped. Agents do not write those forms.
+long_running_heads() {
+    local seg n i w
+    local -a words
+    # shellcheck disable=SC2020  # tr maps each operator char to a newline
+    while IFS= read -r seg; do
+        words=()
+        read -r -a words <<< "$seg" || true
+        n=${#words[@]}
+        i=0
+        while [ "$i" -lt "$n" ]; do
+            w="${words[$i]}"
+            case "$w" in
+                [A-Za-z_]*=*|env|time|nice|command|exec|sudo|xargs|if|then|else|elif|do|while|until|'!')
+                    i=$((i + 1))
+                    # Drop the -flags of a wrapper (env -i, time -p).
+                    while [ "$i" -lt "$n" ]; do
+                        case "${words[$i]}" in
+                            -*) i=$((i + 1)) ;;
+                            *) break ;;
+                        esac
+                    done
+                    ;;
+                timeout)
+                    i=$((i + 1))
+                    while [ "$i" -lt "$n" ]; do
+                        case "${words[$i]}" in
+                            -*) i=$((i + 1)) ;;
+                            *) break ;;
+                        esac
+                    done
+                    # the duration
+                    i=$((i + 1))
+                    ;;
+                uv|poetry|pipenv)
+                    if [ "$((i + 1))" -lt "$n" ] && [ "${words[$((i + 1))]}" = "run" ]; then
+                        i=$((i + 2))
+                    else
+                        break
+                    fi
+                    ;;
+                *) break ;;
+            esac
+        done
+        if [ "$i" -lt "$n" ]; then
+            printf '%s\n' "${words[*]:$i}"
+        fi
+    done < <(printf '%s\n' "$STRIPPED_COMMAND" | tr ';|&(){}' '\n\n\n\n\n\n\n')
+}
+
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
@@ -88,7 +152,13 @@ fi
 #    and `;` count as real compound-command operators. See issue #2589.
 if echo "$STRIPPED_COMMAND" | grep -qE '&&|;' ; then
     if echo "$COMMAND" | grep -qE "[\"']" ; then
-        echo "BLOCKED: Command contains quoted strings combined with && or ;. Split into separate tool calls. See CLAUDE.md §Unattended Operation Patterns." >&2
+        CHECK4_HINT=""
+        # sed -i '' is the usual casualty (#5155): the empty backup suffix is
+        # a quoted string, so `sed -i '' ... && git add ...` trips this rule.
+        if echo "$STRIPPED_COMMAND" | grep -qE '(^|[[:space:];&|(])sed[[:space:]]' ; then
+            CHECK4_HINT=" For an in-place sed edit (sed -i ''), run the sed alone in its own Bash call, or use the Edit tool."
+        fi
+        echo "BLOCKED: Command contains quoted strings combined with && or ;. Split into separate tool calls.${CHECK4_HINT} See CLAUDE.md §Unattended Operation Patterns." >&2
         exit 2
     fi
 fi
@@ -126,11 +196,18 @@ fi
 #    .claude/hooks/test_preflight_hook.py — widening risks false positives on
 #    scripts/dev-db-query.sh SQL arguments, which legitimately contain '' for
 #    empty-string comparisons in PostgreSQL.
-if echo "$COMMAND" | grep -qE "''[[:space:]]+-" ; then
+#
+#    Exemption (#5155): the macOS in-place form `sed -i '' -e 's/a/b/' file`
+#    puts an empty backup suffix right before a flag. CHECK6_COMMAND drops an
+#    empty '' / "" that is the argument of sed's -i flag (`sed -i ''`,
+#    `sed -n -i ''`, `sed -Ei ''`) before the test. Empty quotes anywhere else
+#    before a flag (`rm '' -rf`, `sed 's/a/b/' '' -i`) are still blocked.
+CHECK6_COMMAND=$(printf '%s' "$COMMAND" | sed -E "s/((^|[[:space:];&|(])sed([[:space:]]+-[A-Za-z]+)*[[:space:]]+-[A-Za-z]*i)[[:space:]]+(''|\"\")([[:space:]]|$)/\1\5/g")
+if echo "$CHECK6_COMMAND" | grep -qE "''[[:space:]]+-" ; then
     echo "BLOCKED: Command contains empty quotes before a flag ('' -...), which looks like a bypass attempt. If this is a legitimate use, write the command to a script file. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
-if echo "$COMMAND" | grep -qE '""[[:space:]]+-' ; then
+if echo "$CHECK6_COMMAND" | grep -qE '""[[:space:]]+-' ; then
     echo "BLOCKED: Command contains empty quotes before a flag (\"\" -...), which looks like a bypass attempt. If this is a legitimate use, write the command to a script file. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
@@ -180,36 +257,42 @@ if [ "$RUN_IN_BG" != "true" ]; then
         fi
     fi
 
-    # pytest (any invocation)
-    if echo "$COMMAND" | grep -qE '\bpytest\b' ; then
+    # The long-running words below count only in COMMAND position (#5155):
+    # the first word of each simple command, after env assignments and
+    # wrappers like `env` / `time` / `uv run`. A substring match flagged
+    # `grep -n pytest f`, `git grep "pip install"` and
+    # `gh issue create --title "... pytest ..."` as long-running.
+    # LONG_RUNNING_HEADS holds one line per simple command: the command word
+    # and its arguments, with quoted runs removed (STRIPPED_COMMAND).
+    LONG_RUNNING_HEADS=$(long_running_heads)
+    # pytest (any invocation): pytest, .venv/bin/pytest, python -m pytest
+    if printf '%s\n' "$LONG_RUNNING_HEADS" | grep -qE '^([^[:space:]]*/)?(pytest|python[0-9.]*[[:space:]]+-m[[:space:]]+pytest)([[:space:]]|$)' ; then
         NEEDS_TIMEOUT=1
     fi
     # gh run watch
-    if echo "$COMMAND" | grep -qE '\bgh\s+run\s+watch\b' ; then
+    if printf '%s\n' "$LONG_RUNNING_HEADS" | grep -qE '^gh[[:space:]]+run[[:space:]]+watch([[:space:]]|$)' ; then
         NEEDS_TIMEOUT=1
     fi
-    # pip install
-    if echo "$COMMAND" | grep -qE '\bpip\s+install\b' ; then
+    # pip install: pip / pip3 / .venv/bin/pip, python -m pip, uv pip
+    if printf '%s\n' "$LONG_RUNNING_HEADS" | grep -qE '^(([^[:space:]]*/)?(pip[0-9.]*|python[0-9.]*[[:space:]]+-m[[:space:]]+pip)|uv[[:space:]]+pip)[[:space:]]+install([[:space:]]|$)' ; then
         NEEDS_TIMEOUT=1
     fi
-    # npm install (but not npm run or npm test)
-    if echo "$COMMAND" | grep -qE '\bnpm\s+install\b' ; then
-        NEEDS_TIMEOUT=1
-    fi
-    # npm run build
-    if echo "$COMMAND" | grep -qE '\bnpm\s+run\s+build\b' ; then
+    # npm install and npm run build (not npm run lint / npm test), with an
+    # optional --prefix <dir>
+    if printf '%s\n' "$LONG_RUNNING_HEADS" | grep -qE '^npm([[:space:]]+--prefix[[:space:]]+[^[:space:]]+)?[[:space:]]+(install|run[[:space:]]+build)([[:space:]]|$)' ; then
         NEEDS_TIMEOUT=1
     fi
     # ruff check on large paths (src/, tests/, or .)
     #   Match "src/" or "tests/" only as standalone directory args (followed by
     #   space or end-of-line), not as prefixes of deeper paths like "src/foo.py".
-    if echo "$COMMAND" | grep -qE '\bruff\s+check\b' ; then
-        if echo "$COMMAND" | grep -qE '\bsrc/(\s|$)|\btests/(\s|$)|\s\.$' ; then
+    RUFF_CHECK_HEADS=$(printf '%s\n' "$LONG_RUNNING_HEADS" | grep -E '^([^[:space:]]*/)?ruff[[:space:]]+check([[:space:]]|$)')
+    if [ -n "$RUFF_CHECK_HEADS" ]; then
+        if printf '%s\n' "$RUFF_CHECK_HEADS" | grep -qE '\bsrc/([[:space:]]|$)|\btests/([[:space:]]|$)|[[:space:]]\.([[:space:]]|$)' ; then
             NEEDS_TIMEOUT=1
         fi
     fi
     # terraform apply
-    if echo "$COMMAND" | grep -qE '\bterraform\b.*\bapply\b' ; then
+    if printf '%s\n' "$LONG_RUNNING_HEADS" | grep -qE '^([^[:space:]]*/)?terraform[[:space:]].*\bapply\b' ; then
         NEEDS_TIMEOUT=1
     fi
 
