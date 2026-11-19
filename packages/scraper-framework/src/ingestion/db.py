@@ -877,6 +877,41 @@ def _strip_middle_initials(name: str) -> str:
     return " ".join([words[0], *kept, words[-1]])
 
 
+def _middle_initials(name: str) -> set[str]:
+    """The middle initials :func:`_strip_middle_initials` removes, uppercased."""
+    words = name.split()
+    return {
+        w.rstrip(".").upper() for w in words[1:-1] if len(w.rstrip(".")) == 1 and w[0].isupper()
+    }
+
+
+def find_near_duplicate_judge_name(name: str, judge_names: Iterable[str]) -> str | None:
+    """Return the first of *judge_names* that is *name* up to middle initials.
+
+    The comparison is ``resolve_judge`` Step 3's: both names with their
+    middle initials removed (:func:`_strip_middle_initials`), compared
+    case-insensitively, so 'Eunice W. Lee' matches 'Eunice Lee' and
+    'Beth McGowan' matches 'Beth Mcgowan'.  A different first name or
+    surname, or another suffix ('Jr.' and 'Sr.'), does not match.
+
+    Unlike Step 3, two names that both carry middle initials and carry
+    different ones ('Mary A. Jones' and 'Mary B. Jones') do not match:
+    the roster seed (``ingestion.judge_seed``) uses this to decide that a
+    roster name is already held, and a roster that lists both names lists
+    two judges (#4931).
+    """
+    stripped = _strip_middle_initials(name).lower()
+    initials = _middle_initials(name)
+    for judge_name in judge_names:
+        if _strip_middle_initials(judge_name).lower() != stripped:
+            continue
+        other = _middle_initials(judge_name)
+        if initials and other and initials != other:
+            continue
+        return judge_name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Roster-based judge name matching
 # ---------------------------------------------------------------------------
