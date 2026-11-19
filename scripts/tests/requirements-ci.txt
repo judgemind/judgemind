@@ -15,6 +15,10 @@
 # Paths are relative to the repository root: both callers run pip there.
 pytest
 pytest-xdist
+# pytest-randomly: random test order on every run of scripts/tests,
+# scripts/dispatcher/tests and scripts/dispatcher_v3/tests, so a test
+# that reads state an earlier test left behind fails at once (#5120).
+pytest-randomly
 boto3
 # diff-cover: scripts/tests/test_diff_cover_range_notation.py runs the
 # real binary against a scratch repo (#4764).
