@@ -48,13 +48,13 @@ class TestScraperConfigMaxAttempts:
         assert "max_attempts" in ScraperConfig.model_fields
 
     def test_old_max_retries_kwarg_raises(self) -> None:
-        # pydantic's default extra="ignore" would otherwise drop it silently
-        # and the scraper would run with the default attempt count.
-        with pytest.raises(ValidationError, match="max_attempts"):
+        # ScraperConfig forbids unknown keys (#5165), so the old name fails
+        # loudly instead of running with the default attempt count.
+        with pytest.raises(ValidationError, match="max_retries"):
             ScraperConfig(**_config_kwargs(max_retries=1))
 
     def test_old_key_raises_from_model_validate(self) -> None:
-        with pytest.raises(ValidationError, match="max_attempts"):
+        with pytest.raises(ValidationError, match="max_retries"):
             ScraperConfig.model_validate(_config_kwargs(max_retries=1))
 
 
@@ -119,23 +119,10 @@ class TestMaxAttemptsFromEnv:
         assert main_mod.max_attempts_from_env({"MAX_ATTEMPTS": "5"}) == 5
         fake_logger.warning.assert_not_called()
 
-    def test_max_retries_alias_same_value_and_warns(
-        self, main_mod: Any, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        fake_logger = MagicMock()
-        monkeypatch.setattr(main_mod, "logger", fake_logger)
-        # MAX_RETRIES always counted attempts, so the value carries over as-is.
-        assert main_mod.max_attempts_from_env({"MAX_RETRIES": "4"}) == 4
-        fake_logger.warning.assert_called_once()
-        assert fake_logger.warning.call_args.args[0] == "ingestion.max_retries_env_deprecated"
-
-    def test_both_set_max_attempts_wins(
-        self, main_mod: Any, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        fake_logger = MagicMock()
-        monkeypatch.setattr(main_mod, "logger", fake_logger)
-        env = {"MAX_ATTEMPTS": "2", "MAX_RETRIES": "7"}
-        assert main_mod.max_attempts_from_env(env) == 2
+    def test_max_retries_env_is_not_read(self, main_mod: Any) -> None:
+        # The MAX_RETRIES alias was dropped (#5165): no task definition sets it.
+        assert main_mod.max_attempts_from_env({"MAX_RETRIES": "7"}) == 3
+        assert main_mod.max_attempts_from_env({"MAX_ATTEMPTS": "2", "MAX_RETRIES": "7"}) == 2
 
     def test_empty_max_attempts_falls_through(self, main_mod: Any) -> None:
         assert main_mod.max_attempts_from_env({"MAX_ATTEMPTS": ""}) == 3
