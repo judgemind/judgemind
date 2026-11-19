@@ -87,6 +87,12 @@
 #  65. no local Redis: loud WARNING + Fix: block, push not blocked (#5106)
 #  66. an exported JUDGEMIND_TEST_REDIS_URL is used as is, helper not run (#5106)
 #  67. a package without Redis tests does not look for Redis (#5106)
+#  68. a pyproject.toml-only change runs the package's pytest; the test
+#      scope comes from scripts/touched_package_map.py (#5151)
+#  69. requirements*.txt / package-root conftest.py changes run pytest (#5151)
+#  70. a package README change lints but runs no pytest (#5151)
+#  71. a scripts/**/*.py change runs ruff format --check on it (#5151)
+#  72. scripts/ format drift fails the push with a Fix: block (#5151)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -2731,6 +2737,116 @@ elif [ -n "$missing_blocks" ]; then
     report_fail "expected each dispatcher conftest.py to carry the isolation blocks; missing:$missing_blocks"
 else
     report_pass "dispatcher runs under a real push see no GIT_DIR and no gh login; conftests isolate (#5052)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenarios 68-72 (#5151): which paths select a package's tests comes from
+# scripts/touched_package_map.py (shared with /ralph), and changed
+# scripts/**/*.py get `ruff format --check`.
+# ───────────────────────────────────────────────────────────────────────
+
+# commit_testpkg_on_main_then_branch <branch> <path> <content>: testpkg
+# (with its .gitignore) lands on main and is pushed, then <branch> commits
+# only <path> with <content>, so the push diff is that one file.
+commit_testpkg_on_main_then_branch() {
+    seed_testpkg
+    printf '.venv/\npytest-args.txt\ncoverage.xml\n' > "$WORK/packages/testpkg/.gitignore"
+    git -C "$WORK" add packages/testpkg
+    git -C "$WORK" commit --quiet -m "feat: add testpkg"
+    git -C "$WORK" push --quiet origin main
+    git -C "$WORK" checkout --quiet -b "$1"
+    mkdir -p "$WORK/$(dirname "$2")"
+    printf '%s\n' "$3" > "$WORK/$2"
+    git -C "$WORK" add "$2"
+    git -C "$WORK" commit --quiet -m "chore: change $2"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+}
+
+echo "[scenario 68] a pyproject-only change runs the package's pytest (#5151)"
+init_workspace
+commit_testpkg_on_main_then_branch feature-pyproject-only packages/testpkg/pyproject.toml \
+    "$(printf '[project]\nname = "testpkg"\nversion = "0.0.2"')"
+seed_stub_venv 0 0
+rm -f "$WORK/packages/testpkg/pytest-args.txt"
+run_hook "refs/heads/feature-pyproject-only $feat_sha refs/heads/feature-pyproject-only $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected passing stubs to pass the hook (#5151)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "running tests for Python package 'testpkg'"; then
+    report_fail "expected a pyproject-only change to run testpkg's pytest (#5151)" "$hook_out"
+elif [ ! -f "$WORK/packages/testpkg/pytest-args.txt" ]; then
+    report_fail "expected the pytest stub to have run (#5151)" "$hook_out"
+else
+    report_pass "pyproject-only change runs the package's pytest (#5151)"
+fi
+
+echo "[scenario 69] requirements / conftest changes run the package's pytest (#5151)"
+r69_ok=true
+for r69_path in packages/testpkg/requirements-dev.txt packages/testpkg/conftest.py; do
+    init_workspace
+    commit_testpkg_on_main_then_branch feature-r69 "$r69_path" '# changed'
+    seed_stub_venv 0 0
+    rm -f "$WORK/packages/testpkg/pytest-args.txt"
+    run_hook "refs/heads/feature-r69 $feat_sha refs/heads/feature-r69 $ZERO_SHA"
+    if [ "$hook_rc" -ne 0 ] || [ ! -f "$WORK/packages/testpkg/pytest-args.txt" ]; then
+        report_fail "expected a $r69_path-only change to run testpkg's pytest (#5151)" "$hook_out"
+        r69_ok=false
+    fi
+done
+[ "$r69_ok" = true ] && report_pass "requirements*.txt / conftest.py changes run the package's pytest (#5151)"
+
+echo "[scenario 70] a package README change lints but runs no pytest (#5151)"
+init_workspace
+commit_testpkg_on_main_then_branch feature-readme packages/testpkg/README.md '# testpkg'
+seed_stub_venv 0 0
+rm -f "$WORK/packages/testpkg/pytest-args.txt"
+run_hook "refs/heads/feature-readme $feat_sha refs/heads/feature-readme $ZERO_SHA"
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a README-only change to pass (#5151)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "checking Python package 'testpkg'"; then
+    report_fail "expected the README change to still lint testpkg (#5151)" "$hook_out"
+elif [ -f "$WORK/packages/testpkg/pytest-args.txt" ]; then
+    report_fail "expected no pytest run for a README-only change (#5151)" "$hook_out"
+else
+    report_pass "README-only change lints, runs no pytest (#5151)"
+fi
+
+# A fake ruff first on PATH: records its argv to $FAKE_RUFF_LOG and exits
+# $FAKE_RUFF_RC (default 0).
+FAKE_RUFF_DIR="$TMPDIR/fake-ruff"
+FAKE_RUFF_LOG="$TMPDIR/fake-ruff-calls.log"
+mkdir -p "$FAKE_RUFF_DIR"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nif [ "${FAKE_RUFF_RC:-0}" != 0 ]; then echo "Would reformat: $3"; fi\nexit "${FAKE_RUFF_RC:-0}"\n' \
+    "$FAKE_RUFF_LOG" > "$FAKE_RUFF_DIR/ruff"
+chmod +x "$FAKE_RUFF_DIR/ruff"
+
+echo "[scenario 71] a scripts/**/*.py change runs ruff format --check on it (#5151)"
+init_workspace
+commit_scripts_change feature-scripts-fmt scripts/sub/foo.py
+: > "$FAKE_RUFF_LOG"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-scripts-fmt $feat_sha refs/heads/feature-scripts-fmt $ZERO_SHA" \
+    | PATH="$FAKE_RUFF_DIR:$PATH" PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "expected a passing format check to pass the hook (#5151)" "$hook_out"
+elif ! grep -qx "format --check scripts/sub/foo.py" "$FAKE_RUFF_LOG"; then
+    report_fail "expected 'ruff format --check scripts/sub/foo.py'; ruff calls: $(cat "$FAKE_RUFF_LOG")" "$hook_out"
+else
+    report_pass "scripts/**/*.py change runs ruff format --check on it (#5151)"
+fi
+
+echo "[scenario 72] scripts/ format drift fails the push with a Fix: block (#5151)"
+init_workspace
+commit_scripts_change feature-scripts-fmt-fail scripts/foo.py
+: > "$FAKE_RUFF_LOG"
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-scripts-fmt-fail $feat_sha refs/heads/feature-scripts-fmt-fail $ZERO_SHA" \
+    | PATH="$FAKE_RUFF_DIR:$PATH" FAKE_RUFF_RC=1 PREPUSH_SCRIPTS_TESTS=0 "$HOOK" origin "$REMOTE" 2>&1)" && hook_rc=0 || hook_rc=$?
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected scripts/ format drift to fail the push (#5151)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: ruff format scripts"; then
+    report_fail "expected 'FAILED: ruff format scripts' (#5151)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "ruff format scripts/foo.py"; then
+    report_fail "expected a copy-pasteable 'ruff format scripts/foo.py' Fix line (#5151)" "$hook_out"
+else
+    report_pass "scripts/ format drift fails the push with a Fix: block (#5151)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

@@ -803,6 +803,14 @@ jobs:
         run: pip install -r scripts/tests/requirements-ci.txt
       - name: Install Node.js test dependencies
         run: npm install --no-save graphql@^16.8
+      # scripts/ sits outside every package's ruff scope, so format drift
+      # built up unnoticed (#5151). The pre-push hook checks the changed
+      # files; this checks the whole tree.
+      - name: Ruff format check (scripts)
+        if: matrix.shard == 'python'
+        run: |
+          pip install ruff
+          ruff format --check scripts/
       - name: Test
         if: matrix.shard == 'python'
         run: pytest scripts/tests/ -v --tb=short
