@@ -137,10 +137,14 @@ APPELLATE_SELECT_ID = "siteMasterHolder_basicBodyHolder_List1DeptDate"
 APPELLATE_COURTHOUSE = "Stanley Mosk Courthouse"
 APPELLATE_DEPARTMENT = "Appellate Division"
 
-# Appellate option value format: "MM/DD/YYYY" (hearing date only — no
-# courthouse/dept, per LA Court's own HTML comment "appellate division does
-# not include the location and department in the drop down box").
-_APPELLATE_OPTION_VALUE_RE = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})$")
+# Appellate option value format.  The live page (2026-11-19) serves the same
+# "LOCATION ,DEPT,MM/DD/YYYY" shape as civil, e.g. ``LA ,ZAP,11/19/2026``,
+# even though LA Court's HTML comment says the appellate dropdown "does not
+# include the location and department" (that is true of the display text
+# only).  A bare "MM/DD/YYYY" is still accepted.  The date is the last
+# comma-separated field; whitespace around fields varies, so strip it.  The
+# POST must send the full original value, not just the date (#5173).
+_APPELLATE_OPTION_VALUE_RE = re.compile(r"^(?:[^,]*,\s*[^,]*,\s*)?(?P<date>\d{2}/\d{2}/\d{4})\s*$")
 
 # Empty-state marker on the appellate main page.  When no rulings are
 # published the page renders a #siteMasterHolder_basicBodyHolder_NoRuling
@@ -1682,8 +1686,10 @@ def _has_no_rulings_appellate(html: str) -> bool:
 def _parse_appellate_dropdown_options(html: str) -> list[DropdownOption]:
     """Parse the appellate-division dropdown options.
 
-    Appellate options carry only a hearing date (e.g. value
-    ``04/17/2026``).  Static courthouse and department metadata is
+    Appellate option values look like ``LA ,ZAP,11/19/2026`` on the live
+    site (a bare ``04/17/2026`` is also accepted); only the hearing date is
+    used, and the full value is kept for the POST.  Static courthouse and
+    department metadata is
     stamped from :data:`APPELLATE_COURTHOUSE` / :data:`APPELLATE_DEPARTMENT`
     since the Appellate Division is a single physical department.
 
