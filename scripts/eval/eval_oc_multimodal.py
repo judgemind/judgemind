@@ -249,15 +249,19 @@ def _call_with_retry(
                 return result
         except concurrent.futures.TimeoutError:
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"TIMEOUT ({timeout_s}s), retry {attempt + 1}...", end=" ", flush=True)
+                wait = 2**attempt
+                print(
+                    f"TIMEOUT ({timeout_s}s), retry {attempt + 1}...",
+                    end=" ",
+                    flush=True,
+                )
                 time.sleep(wait)
             else:
                 raise TimeoutError(f"Timed out after {max_retries} retries")
         except Exception as e:
             err_str = str(e)
             if "503" in err_str and attempt < max_retries - 1:
-                wait = 2 ** attempt
+                wait = 2**attempt
                 print(f"503, retry {attempt + 1}...", end=" ", flush=True)
                 time.sleep(wait)
             else:
@@ -528,11 +532,15 @@ def join_page_results(page_results: list[PageResult]) -> list[str]:
                 # that the LLM misattributes to columns 1/2.
                 # case_info must look like real case identification:
                 # a case number, standalone case ID, or "vs"/"v."
-                looks_like_case = bool(
-                    _CASE_NUMBER_RE.search(case_info)
-                    or _STANDALONE_CASE_NUM_RE.search(case_info)
-                    or _CASE_NAME_RE.search(case_info)
-                ) if case_info else False
+                looks_like_case = (
+                    bool(
+                        _CASE_NUMBER_RE.search(case_info)
+                        or _STANDALONE_CASE_NUM_RE.search(case_info)
+                        or _CASE_NAME_RE.search(case_info)
+                    )
+                    if case_info
+                    else False
+                )
                 has_valid_entry = (
                     bool(entry_num)
                     and _is_valid_entry_number(entry_num)
@@ -633,9 +641,7 @@ def score_fixture(result: FixtureResult) -> dict:
         "short_rulings": short_count,
         "ruling_lengths": ruling_lengths,
         "avg_ruling_length": (
-            total_text_len / len(result.joined_rulings)
-            if result.joined_rulings
-            else 0
+            total_text_len / len(result.joined_rulings) if result.joined_rulings else 0
         ),
         "continuation_pages": continuation_count,
         "page_count": result.page_count,
@@ -707,8 +713,11 @@ def print_model_report(summary: ModelSummary) -> None:
     print("\n--- " + summary.model + " ---\n")
     print("Fixtures processed: " + str(summary.total_fixtures))
     print(
-        "Total tokens: " + f"{summary.total_input_tokens:,}" + " input + "
-        + f"{summary.total_output_tokens:,}" + " output"
+        "Total tokens: "
+        + f"{summary.total_input_tokens:,}"
+        + " input + "
+        + f"{summary.total_output_tokens:,}"
+        + " output"
     )
     print("Total pages processed: " + str(summary.total_pages))
     print("Avg latency per fixture: " + f"{summary.avg_latency_ms:,.0f}" + "ms")
@@ -724,26 +733,17 @@ def print_model_report(summary: ModelSummary) -> None:
         return
 
     print("\n## Case Count Accuracy")
-    print(
-        "  Exact match:  "
-        + str(summary.case_count_correct) + "/" + str(scorable)
-    )
-    print(
-        "  Off by 1:     "
-        + str(summary.case_count_off_by_one) + "/" + str(scorable)
-    )
-    print(
-        "  Wrong (>1):   "
-        + str(summary.case_count_wrong) + "/" + str(scorable)
-    )
+    print("  Exact match:  " + str(summary.case_count_correct) + "/" + str(scorable))
+    print("  Off by 1:     " + str(summary.case_count_off_by_one) + "/" + str(scorable))
+    print("  Wrong (>1):   " + str(summary.case_count_wrong) + "/" + str(scorable))
     exact_pct = summary.case_count_correct / scorable * 100
     lenient_pct = (
-        (summary.case_count_correct + summary.case_count_off_by_one)
-        / scorable * 100
+        (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
     )
     print("  Exact accuracy:   " + f"{exact_pct:.1f}" + "%")
     print(
-        "  Lenient accuracy: " + f"{lenient_pct:.1f}"
+        "  Lenient accuracy: "
+        + f"{lenient_pct:.1f}"
         + "% (off-by-1 counted as correct)"
     )
 
@@ -753,26 +753,46 @@ def print_model_report(summary: ModelSummary) -> None:
     if summary.total_rulings > 0:
         non_empty_pct = (
             (summary.total_rulings - summary.empty_rulings)
-            / summary.total_rulings * 100
+            / summary.total_rulings
+            * 100
         )
         print("  Non-empty rate:          " + f"{non_empty_pct:.1f}" + "%")
 
     print("\n## Cross-Page Join")
     print(
         "  Pages with continuations: "
-        + str(summary.continuation_pages) + "/" + str(summary.total_pages)
+        + str(summary.continuation_pages)
+        + "/"
+        + str(summary.total_pages)
     )
 
     # Per-fixture detail
     print("\n## Per-Fixture Detail")
     print(
-        "  " + f"{'Fixture':<40}" + f"{'Exp':>5}" + f"{'Got':>5}"
-        + f"{'Match':>7}" + f"{'Empty':>7}" + f"{'Cont':>6}"
+        "  "
+        + f"{'Fixture':<40}"
+        + f"{'Exp':>5}"
+        + f"{'Got':>5}"
+        + f"{'Match':>7}"
+        + f"{'Empty':>7}"
+        + f"{'Cont':>6}"
         + f"{'Pages':>7}"
     )
     print(
-        "  " + "-" * 40 + " " + "-" * 5 + " " + "-" * 5 + " "
-        + "-" * 7 + " " + "-" * 7 + " " + "-" * 6 + " " + "-" * 7
+        "  "
+        + "-" * 40
+        + " "
+        + "-" * 5
+        + " "
+        + "-" * 5
+        + " "
+        + "-" * 7
+        + " "
+        + "-" * 7
+        + " "
+        + "-" * 6
+        + " "
+        + "-" * 7
     )
     for detail in summary.fixture_details:
         fname = detail["fixture_name"]
@@ -788,7 +808,8 @@ def print_model_report(summary: ModelSummary) -> None:
         else:
             tag = " ERR"
         print(
-            "  " + f"{fname:<40}"
+            "  "
+            + f"{fname:<40}"
             + f"{detail['expected_case_count']:>5}"
             + f"{detail['actual_case_count']:>5}"
             + f"{tag:>7}"
@@ -832,9 +853,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Case count exact match':<35}"
     for name in model_names:
         s = summaries[name]
-        scorable = (
-            s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
-        )
+        scorable = s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
         pct = (s.case_count_correct / scorable * 100) if scorable > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
@@ -843,9 +862,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Case count lenient':<35}"
     for name in model_names:
         s = summaries[name]
-        scorable = (
-            s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
-        )
+        scorable = s.case_count_correct + s.case_count_off_by_one + s.case_count_wrong
         lenient = s.case_count_correct + s.case_count_off_by_one
         pct = (lenient / scorable * 100) if scorable > 0 else 0
         row += f"  {pct:>19.1f}%"
@@ -856,9 +873,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         s = summaries[name]
         if s.total_rulings > 0:
-            pct = (
-                (s.total_rulings - s.empty_rulings) / s.total_rulings * 100
-            )
+            pct = (s.total_rulings - s.empty_rulings) / s.total_rulings * 100
         else:
             pct = 0
         row += f"  {pct:>19.1f}%"
@@ -933,38 +948,31 @@ def main() -> int:
     google_key = os.environ.get("GOOGLE_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 
-    google_models = [
-        m for m in args.models if MODELS[m]["provider"] == "google"
-    ]
-    anthropic_models = [
-        m for m in args.models if MODELS[m]["provider"] == "anthropic"
-    ]
+    google_models = [m for m in args.models if MODELS[m]["provider"] == "google"]
+    anthropic_models = [m for m in args.models if MODELS[m]["provider"] == "anthropic"]
 
     if google_models and not google_key:
         print(
             "ERROR: GOOGLE_API_KEY not set (needed for: "
-            + ", ".join(google_models) + ")"
+            + ", ".join(google_models)
+            + ")"
         )
         return 1
     if anthropic_models and not anthropic_key:
         print(
             "ERROR: ANTHROPIC_API_KEY not set (needed for: "
-            + ", ".join(anthropic_models) + ")"
+            + ", ".join(anthropic_models)
+            + ")"
         )
         return 1
 
     # Load fixtures
     fixtures = get_oc_fixtures()
-    print(
-        "Found " + str(len(fixtures))
-        + " OC PDF fixtures with ground truth\n"
-    )
+    print("Found " + str(len(fixtures)) + " OC PDF fixtures with ground truth\n")
     for fp, exp in fixtures:
         desc = exp.get("_description", "")
         cc = exp.get("case_count", "?")
-        print(
-            "  " + fp.name + ": " + str(cc) + " cases -- " + desc[:70]
-        )
+        print("  " + fp.name + ": " + str(cc) + " cases -- " + desc[:70])
     print()
 
     # Pre-render all PDFs to images (shared across models)
@@ -991,10 +999,7 @@ def main() -> int:
             api_key = anthropic_key
 
         print("\n" + "=" * 70)
-        print(
-            "MODEL: " + model_name + " (" + model_id
-            + ") -- per-page transcription"
-        )
+        print("MODEL: " + model_name + " (" + model_id + ") -- per-page transcription")
         print("=" * 70 + "\n")
 
         results: list[FixtureResult] = []
@@ -1006,8 +1011,13 @@ def main() -> int:
             expected_case_count = expected.get("case_count", 0)
 
             print(
-                "  " + fname + " (" + str(page_count) + " pages, "
-                + str(expected_case_count) + " expected cases)"
+                "  "
+                + fname
+                + " ("
+                + str(page_count)
+                + " pages, "
+                + str(expected_case_count)
+                + " expected cases)"
             )
 
             fixture_result = FixtureResult(
@@ -1025,9 +1035,9 @@ def main() -> int:
 
             for page_idx, image in enumerate(images):
                 print(
-                    "    page " + str(page_idx + 1) + "/"
-                    + str(page_count) + "...",
-                    end=" ", flush=True,
+                    "    page " + str(page_idx + 1) + "/" + str(page_count) + "...",
+                    end=" ",
+                    flush=True,
                 )
 
                 try:
@@ -1058,9 +1068,15 @@ def main() -> int:
                     # Summary of what was found on this page
                     n_rulings = len(rulings)
                     print(
-                        str(n_rulings) + " rulings"
-                        + " (" + str(inp_tok) + "+" + str(out_tok)
-                        + " tok, " + f"{lat:.0f}" + "ms)"
+                        str(n_rulings)
+                        + " rulings"
+                        + " ("
+                        + str(inp_tok)
+                        + "+"
+                        + str(out_tok)
+                        + " tok, "
+                        + f"{lat:.0f}"
+                        + "ms)"
                     )
 
                 except Exception as e:
@@ -1076,25 +1092,26 @@ def main() -> int:
             # Join cross-page results
             fixture_result.page_results = page_results
             fixture_result.joined_rulings = join_page_results(page_results)
-            fixture_result.actual_case_count = len(
-                fixture_result.joined_rulings
-            )
+            fixture_result.actual_case_count = len(fixture_result.joined_rulings)
             fixture_result.total_input_tokens = total_inp
             fixture_result.total_output_tokens = total_out
             fixture_result.total_latency_ms = total_lat
 
             # Count heuristic continuations
             cont_count = sum(
-                1 for pr in page_results
-                if pr.rulings and pr.rulings[0].get(
-                    "_heuristic_continued", False
-                )
+                1
+                for pr in page_results
+                if pr.rulings and pr.rulings[0].get("_heuristic_continued", False)
             )
             print(
                 "    -> joined: "
                 + str(fixture_result.actual_case_count)
-                + " cases (expected " + str(expected_case_count) + ")"
-                + ", " + str(cont_count) + " continuations detected"
+                + " cases (expected "
+                + str(expected_case_count)
+                + ")"
+                + ", "
+                + str(cont_count)
+                + " continuations detected"
             )
 
             results.append(fixture_result)
@@ -1131,8 +1148,7 @@ def main() -> int:
                 "case_count_off_by_one": summary.case_count_off_by_one,
                 "case_count_wrong": summary.case_count_wrong,
                 "case_count_exact_pct": (
-                    summary.case_count_correct / scorable * 100
-                    if scorable > 0 else 0
+                    summary.case_count_correct / scorable * 100 if scorable > 0 else 0
                 ),
                 "total_rulings": summary.total_rulings,
                 "empty_rulings": summary.empty_rulings,

@@ -1246,7 +1246,9 @@ def _process_prefix_document(
             # Every child was rejected: the worker kept the key's rulings
             # and recorded ``all_children_rejected`` (#5057).  A failure,
             # counted apart so the run says how many keys it kept.
-            logger.warning("Kept rulings: every child was rejected", s3_key=key, error=str(exc))
+            logger.warning(
+                "Kept rulings: every child was rejected", s3_key=key, error=str(exc)
+            )
             return {
                 "status": "error",
                 "hash_mismatch": hash_mismatch,

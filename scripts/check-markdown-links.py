@@ -248,8 +248,7 @@ def main() -> int:
     parser.add_argument(
         "--repo-root",
         default=None,
-        help="Path to repository root (defaults to two levels above this "
-        "script).",
+        help="Path to repository root (defaults to two levels above this script).",
     )
     args = parser.parse_args()
 

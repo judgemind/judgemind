@@ -165,7 +165,9 @@ def run_live_extraction(
 
             # Serialize rulings to dict
             extraction_dict = {
-                "extracted_judge_name": (rulings[0].extracted_judge_name if rulings else None),
+                "extracted_judge_name": (
+                    rulings[0].extracted_judge_name if rulings else None
+                ),
                 "hearing_date": rulings[0].hearing_date if rulings else None,
                 "department": rulings[0].department if rulings else None,
                 "rulings": [
@@ -348,7 +350,9 @@ def save_scores(summary: object, model_name: str) -> Path:
 
 def main() -> int:
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Run extraction evaluation against test fixtures.")
+    parser = argparse.ArgumentParser(
+        description="Run extraction evaluation against test fixtures."
+    )
     parser.add_argument(
         "--live",
         action="store_true",

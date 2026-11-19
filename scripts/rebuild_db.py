@@ -511,7 +511,9 @@ def build_event(
         "s3_bucket": bucket,
         "scraper_id": f"rebuild-{parsed['state']}-{parsed['county']}",
         "source_url": "",
-        "capture_timestamp": capture_timestamp.isoformat() if capture_timestamp else None,
+        "capture_timestamp": capture_timestamp.isoformat()
+        if capture_timestamp
+        else None,
         # A rebuild re-derives the split set, so reused split-child ids may
         # take the re-derived (real) case link (#4700, #4788).
         # ``ingestion.worker.REPLACE_SPLIT_SET_KEY``.
@@ -2390,7 +2392,9 @@ def main() -> None:
                         skipped += 1
                     else:
                         errors += 1
-                        if isinstance(result, dict) and result.get("rows_kept_all_rejected"):
+                        if isinstance(result, dict) and result.get(
+                            "rows_kept_all_rejected"
+                        ):
                             rows_kept_all_rejected += 1
 
                     if content_format:

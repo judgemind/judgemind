@@ -17,9 +17,10 @@ CLI reports every outcome explicitly:
 * exit ``0`` — one package name per line on stdout.
 * exit ``3`` — no packages to test, with the reason on stderr as a
   ``no-packages:`` line. Either the change set is genuinely empty, or every
-  changed file is outside the package code paths (docs, ``scripts/``,
-  package config such as ``pyproject.toml``), or it maps only to the other
-  language's packages.
+  changed file is outside the package test paths (docs, ``scripts/``,
+  fixtures), or it maps only to the other language's packages. Which
+  paths select a package comes from ``scripts/touched_package_map.py``,
+  shared with the pre-push hook (#5151).
 * exit ``1`` — the change set has a code file (``.py`` / ``.ts`` / ``.tsx``)
   under ``packages/`` that no package mapping covers. Fails loudly with a
   ``Fix:`` block instead of returning empty.
@@ -38,6 +39,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Run as `python3 scripts/ralph_touched_packages.py`, so scripts/ is on
+# sys.path and the shared mapping imports directly.
+from touched_package_map import select_test_packages
+
 EXIT_OK = 0
 EXIT_UNMAPPED = 1
 EXIT_GIT_ERROR = 2
@@ -51,12 +56,15 @@ class GitError(RuntimeError):
 
 
 def derive_touched_packages(changed_files: list[str]) -> list[str]:
-    """Return sorted list of Python packages with code changes.
+    """Return sorted list of Python packages whose full test run is selected.
 
-    Counts ``.py`` files under ``packages/<name>/src/`` or
-    ``packages/<name>/tests/``, plus a package-root ``conftest.py`` (it
-    shapes the package's test run). Doc, config, and fixture changes are
-    excluded.
+    The rules live in ``scripts/touched_package_map.py``, shared with the
+    pre-push hook (#5151): ``.py`` files under ``packages/<name>/src/`` or
+    ``tests/``, plus package-root files that shape the test run
+    (``conftest.py``, ``pyproject.toml``, ``requirements*.txt``,
+    ``setup.cfg``, ``pytest.ini``, ...). Docs and fixtures are excluded.
+    ``infra/<dir>`` packages are left out: ralph's worker runs
+    ``packages/<name>/.venv`` suites only.
 
     Args:
         changed_files: List of repo-relative file paths.
@@ -65,24 +73,18 @@ def derive_touched_packages(changed_files: list[str]) -> list[str]:
         Sorted list of package *names* (the ``<name>`` component, not the
         full path).  E.g. ``['nlp-pipeline', 'scraper-framework']``.
     """
-    packages: set[str] = set()
-    for f in changed_files:
-        parts = f.split("/")
-        if len(parts) < 3 or parts[0] != "packages" or not f.endswith(".py"):
-            continue
-        if (len(parts) >= 4 and parts[2] in ("src", "tests")) or (
-            len(parts) == 3 and parts[2] == "conftest.py"
-        ):
-            packages.add(parts[1])
-    return sorted(packages)
+    python_ids, _ = select_test_packages(changed_files)
+    return [p for p in python_ids if not p.startswith("infra/")]
 
 
 def derive_touched_ts_packages(changed_files: list[str]) -> list[str]:
-    """Return sorted list of TypeScript packages with code changes.
+    """Return sorted list of TypeScript packages whose full test run is selected.
 
-    Counts ``.ts`` / ``.tsx`` files under ``packages/<name>/src/``,
-    ``packages/<name>/app/`` or ``packages/<name>/tests/``, plus
-    package-root config files such as ``vitest.config.ts``.
+    The rules live in ``scripts/touched_package_map.py``, shared with the
+    pre-push hook (#5151): ``.ts`` / ``.tsx`` / ``.js`` / ``.jsx`` files
+    under ``src/``, ``app/``, ``tests/``, ``__tests__/`` or ``lib/``, plus
+    package-root config (``package.json``, ``tsconfig*.json``,
+    ``vitest.config.ts``, ...).
 
     Args:
         changed_files: List of repo-relative file paths.
@@ -91,16 +93,8 @@ def derive_touched_ts_packages(changed_files: list[str]) -> list[str]:
         Sorted list of package *names* (the ``<name>`` component, not the
         full path).  E.g. ``['web']``.
     """
-    packages: set[str] = set()
-    for f in changed_files:
-        parts = f.split("/")
-        if len(parts) < 3 or parts[0] != "packages":
-            continue
-        if not f.endswith((".ts", ".tsx")):
-            continue
-        if (len(parts) >= 4 and parts[2] in ("src", "app", "tests")) or len(parts) == 3:
-            packages.add(parts[1])
-    return sorted(packages)
+    _, ts_ids = select_test_packages(changed_files)
+    return ts_ids
 
 
 def unmapped_code_files(changed_files: list[str]) -> list[str]:
@@ -186,7 +180,7 @@ def _no_packages_reason(changed: list[str], ts_mode: bool) -> str:
     sample = ", ".join(changed[:5]) + (" ..." if len(changed) > 5 else "")
     return (
         f"{len(changed)} changed file(s), none under a package's code paths "
-        f"(docs / scripts / config-only change): {sample}"
+        f"(docs / scripts / fixture-only change): {sample}"
     )
 
 
@@ -219,8 +213,8 @@ def run(worktree: str | Path, ts_mode: bool = False) -> int:
             "  # Run the owning package's full suite by hand, e.g.\n"
             "  packages/<pkg>/.venv/bin/pytest packages/<pkg>/tests/   # Python\n"
             "  npm test --prefix packages/<pkg>                       # TypeScript\n"
-            "  # and teach derive_touched_packages / derive_touched_ts_packages in\n"
-            "  # scripts/ralph_touched_packages.py about the new path.",
+            "  # and teach scripts/touched_package_map.py (shared with the\n"
+            "  # pre-push hook) about the new path.",
             file=sys.stderr,
         )
         return EXIT_UNMAPPED

@@ -195,11 +195,15 @@ class TestParseCIYaml:
             assert job.start_line < job.end_line, f"{name}: {job}"
 
         # scripts-tests must START strictly after detect-changes ends
-        assert by_name["scripts-tests"].start_line > by_name["detect-changes"].start_line
+        assert (
+            by_name["scripts-tests"].start_line > by_name["detect-changes"].start_line
+        )
 
     def test_parses_real_ci_yml(self) -> None:
         """Parse the real repo ci.yml and ensure filters + jobs come out sane."""
-        repo_ci = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        repo_ci = (
+            Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        )
         if not repo_ci.is_file():
             pytest.skip("real ci.yml not present")
         ci = parse_ci_yaml(repo_ci)
@@ -440,9 +444,7 @@ class TestFindSkippedModifiedJobs:
 class TestAcceptanceCriteria:
     """These tests encode the issue's acceptance criteria verification."""
 
-    def test_toy_pr_that_would_skip_scripts_tests_fails(
-        self, tmp_path: Path
-    ) -> None:
+    def test_toy_pr_that_would_skip_scripts_tests_fails(self, tmp_path: Path) -> None:
         """AC1: a PR that modifies scripts-tests without touching scripts/**
         AND without .github/workflows/ci.yml in the filter is flagged."""
         ci_path = tmp_path / "ci.yml"

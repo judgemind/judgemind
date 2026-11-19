@@ -301,9 +301,7 @@ def _call_with_retry(
                 )
                 time.sleep(wait)
             else:
-                raise TimeoutError(
-                    "Timed out after " + str(max_retries) + " retries"
-                )
+                raise TimeoutError("Timed out after " + str(max_retries) + " retries")
         except Exception as e:
             err_str = str(e)
             if "503" in err_str and attempt < max_retries - 1:
@@ -373,9 +371,7 @@ def call_gemini(
 
     if response_text.startswith("```"):
         lines = response_text.split("\n")
-        lines = [
-            line for line in lines if not line.strip().startswith("```")
-        ]
+        lines = [line for line in lines if not line.strip().startswith("```")]
         response_text = "\n".join(lines)
 
     try:
@@ -496,12 +492,10 @@ def score_parties(
     if len(name_overlap) == len(expected_names):
         # Check roles
         expected_roles = {
-            _normalize_name(p["name"]): p.get("role", "")
-            for p in expected
+            _normalize_name(p["name"]): p.get("role", "") for p in expected
         }
         extracted_roles = {
-            _normalize_name(p["name"]): p.get("role", "")
-            for p in extracted
+            _normalize_name(p["name"]): p.get("role", "") for p in extracted
         }
         role_matches = sum(
             1
@@ -520,10 +514,7 @@ def score_parties(
     if name_overlap:
         return (
             "partial",
-            str(len(name_overlap))
-            + "/"
-            + str(len(expected_names))
-            + " names matched",
+            str(len(name_overlap)) + "/" + str(len(expected_names)) + " names matched",
         )
 
     # Try fuzzy: check if expected names are substrings of extracted
@@ -537,10 +528,7 @@ def score_parties(
     if fuzzy_matches > 0:
         return (
             "partial",
-            str(fuzzy_matches)
-            + "/"
-            + str(len(expected_names))
-            + " fuzzy name matches",
+            str(fuzzy_matches) + "/" + str(len(expected_names)) + " fuzzy name matches",
         )
 
     return (
@@ -642,9 +630,7 @@ def analyze_model(
             summary.errors.append(r.fixture_name + ": " + r.error)
 
     latencies = [r.latency_ms for r in valid]
-    summary.avg_latency_ms = (
-        sum(latencies) / len(latencies) if latencies else 0.0
-    )
+    summary.avg_latency_ms = sum(latencies) / len(latencies) if latencies else 0.0
 
     # Cost calculations
     avg_in = summary.total_input_tokens / len(valid) if valid else 0
@@ -669,11 +655,7 @@ def print_model_report(summary: ModelSummary) -> None:
         + f"{summary.total_output_tokens:,}"
         + " output"
     )
-    print(
-        "Avg latency per doc: "
-        + f"{summary.avg_latency_ms:,.0f}"
-        + "ms"
-    )
+    print("Avg latency per doc: " + f"{summary.avg_latency_ms:,.0f}" + "ms")
 
     total = summary.total_fixtures
     if total == 0:
@@ -690,18 +672,8 @@ def print_model_report(summary: ModelSummary) -> None:
         + f"{summary.outcome_correct / total * 100:.0f}"
         + "%)"
     )
-    print(
-        "  Wrong:    "
-        + str(summary.outcome_wrong)
-        + "/"
-        + str(total)
-    )
-    print(
-        "  Null:     "
-        + str(summary.outcome_null)
-        + "/"
-        + str(total)
-    )
+    print("  Wrong:    " + str(summary.outcome_wrong) + "/" + str(total))
+    print("  Null:     " + str(summary.outcome_null) + "/" + str(total))
 
     print("\n## Party Extraction")
     print(
@@ -713,18 +685,8 @@ def print_model_report(summary: ModelSummary) -> None:
         + f"{summary.parties_correct / total * 100:.0f}"
         + "%)"
     )
-    print(
-        "  Partial:  "
-        + str(summary.parties_partial)
-        + "/"
-        + str(total)
-    )
-    print(
-        "  Wrong:    "
-        + str(summary.parties_wrong)
-        + "/"
-        + str(total)
-    )
+    print("  Partial:  " + str(summary.parties_partial) + "/" + str(total))
+    print("  Wrong:    " + str(summary.parties_wrong) + "/" + str(total))
 
     print("\n## Ruling Text Quality")
     print(
@@ -794,10 +756,7 @@ def print_model_report(summary: ModelSummary) -> None:
 
     print("\nCost estimate:")
     print("  Per document: $" + f"{summary.cost_per_doc:.6f}")
-    print(
-        "  Monthly (~12 docs/day): $"
-        + f"{summary.estimated_monthly_cost:.2f}"
-    )
+    print("  Monthly (~12 docs/day): $" + f"{summary.estimated_monthly_cost:.2f}")
 
 
 def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
@@ -812,10 +771,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         header += f"  {name:>20}"
     print(header)
-    print(
-        "-" * 35
-        + "".join("  " + "-" * 20 for _ in model_names)
-    )
+    print("-" * 35 + "".join("  " + "-" * 20 for _ in model_names))
 
     # Fixtures
     row = f"{'Fixtures processed':<35}"
@@ -828,11 +784,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Outcome accuracy':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = (
-            s.outcome_correct / s.total_fixtures * 100
-            if s.total_fixtures > 0
-            else 0
-        )
+        pct = s.outcome_correct / s.total_fixtures * 100 if s.total_fixtures > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -840,11 +792,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Party exact match':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = (
-            s.parties_correct / s.total_fixtures * 100
-            if s.total_fixtures > 0
-            else 0
-        )
+        pct = s.parties_correct / s.total_fixtures * 100 if s.total_fixtures > 0 else 0
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -853,9 +801,7 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         s = summaries[name]
         pct = (
-            (s.parties_correct + s.parties_partial)
-            / s.total_fixtures
-            * 100
+            (s.parties_correct + s.parties_partial) / s.total_fixtures * 100
             if s.total_fixtures > 0
             else 0
         )
@@ -935,12 +881,8 @@ def main() -> int:
     google_key = os.environ.get("GOOGLE_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 
-    google_models = [
-        m for m in args.models if MODELS[m]["provider"] == "google"
-    ]
-    anthropic_models = [
-        m for m in args.models if MODELS[m]["provider"] == "anthropic"
-    ]
+    google_models = [m for m in args.models if MODELS[m]["provider"] == "google"]
+    anthropic_models = [m for m in args.models if MODELS[m]["provider"] == "anthropic"]
 
     if google_models and not google_key:
         print(
@@ -972,10 +914,7 @@ def main() -> int:
 
     if not fixtures:
         print("ERROR: No Ventura fixtures found.")
-        print(
-            "Expected ventura_*.json files in "
-            + str(EXPECTED_DIR)
-        )
+        print("Expected ventura_*.json files in " + str(EXPECTED_DIR))
         return 1
 
     # Extract text from all fixtures
@@ -1016,13 +955,7 @@ def main() -> int:
             api_key = anthropic_key
 
         print("\n" + "=" * 70)
-        print(
-            "MODEL: "
-            + model_name
-            + " ("
-            + model_id
-            + ") -- single-case extraction"
-        )
+        print("MODEL: " + model_name + " (" + model_id + ") -- single-case extraction")
         print("=" * 70 + "\n")
 
         results: list[FixtureResult] = []
@@ -1062,9 +995,7 @@ def main() -> int:
             )
 
             try:
-                user_message = _build_user_message(
-                    text, case_number, motion_type
-                )
+                user_message = _build_user_message(text, case_number, motion_type)
 
                 if provider == "google":
                     call_fn = call_gemini
@@ -1080,12 +1011,8 @@ def main() -> int:
 
                 # Extract fields
                 fixture_result.extracted_outcome = extracted.get("outcome")
-                fixture_result.extracted_parties = extracted.get(
-                    "parties", []
-                )
-                fixture_result.extracted_case_title = extracted.get(
-                    "case_title"
-                )
+                fixture_result.extracted_parties = extracted.get("parties", [])
+                fixture_result.extracted_case_title = extracted.get("case_title")
 
                 ruling_text = extracted.get("ruling_text") or ""
                 fixture_result.ruling_text_length = len(ruling_text)
@@ -1111,11 +1038,7 @@ def main() -> int:
                     0 < len(ruling_text) < len(text) * 0.95
                 )
 
-                outcome_tag = (
-                    "OK"
-                    if fixture_result.outcome_match
-                    else "MISS"
-                )
+                outcome_tag = "OK" if fixture_result.outcome_match else "MISS"
                 party_count = len(fixture_result.extracted_parties)
 
                 print(

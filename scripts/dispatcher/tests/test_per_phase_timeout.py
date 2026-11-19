@@ -148,7 +148,9 @@ class TestPerPhaseTimeoutTablePresent:
         # Find the function body up to the next top-level function
         # definition (a heuristic that matches the file's existing
         # structure).
-        next_func = text.find("\nclaude_phase_timeout_seconds_by_phase()", run_claude_idx)
+        next_func = text.find(
+            "\nclaude_phase_timeout_seconds_by_phase()", run_claude_idx
+        )
         body = (
             text[run_claude_idx:next_func] if next_func > 0 else text[run_claude_idx:]
         )
@@ -263,9 +265,7 @@ class TestTimeoutBlockedEnvelopeBranch:
         # ``read_phase_output`` call between rc==124 and this block, so the
         # bare-condition anchor would point inside the salvage block and the
         # ``between`` slice would no longer contain the BLOCKED printf/return.
-        blocked_match = re.search(
-            r'_timeout_output=\$\(jq -n -c', text
-        )
+        blocked_match = re.search(r"_timeout_output=\$\(jq -n -c", text)
         assert blocked_match is not None, (
             "Could not find BLOCKED envelope construction "
             "``_timeout_output=$(jq -n -c`` in run_claude_phase. "
@@ -305,7 +305,7 @@ class TestTimeoutBlockedEnvelopeBranch:
         # ``elapsed_seconds`` field.
         # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
         text = _helper_text()
-        blocked_match = re.search(r'_timeout_output=\$\(jq -n -c', text)
+        blocked_match = re.search(r"_timeout_output=\$\(jq -n -c", text)
         assert blocked_match is not None, (
             "Could not find BLOCKED envelope construction "
             "``_timeout_output=$(jq -n -c`` — expected in the rc==124 "
@@ -373,7 +373,7 @@ class TestClaudePhaseTimeoutSalvage:
             "claude finished cleanly before the wrapper was killed (#3832)."
         )
         assert 'terminal_reason == "completed"' in text, (
-            "Salvage prelude must check ``.terminal_reason == \"completed\"`` "
+            'Salvage prelude must check ``.terminal_reason == "completed"`` '
             "to confirm the envelope is a completed run, not a mid-iteration "
             "kill (#3832)."
         )
@@ -393,7 +393,7 @@ class TestClaudePhaseTimeoutSalvage:
             "BEFORE the BLOCKED envelope construction (#3832, #3775)."
         )
         assert 'terminal_reason == "completed"' in between, (
-            "``terminal_reason == \"completed\"`` check must appear inside the "
+            '``terminal_reason == "completed"`` check must appear inside the '
             "rc==124 branch BEFORE the BLOCKED envelope construction (#3832, #3775)."
         )
 
@@ -441,7 +441,7 @@ class TestClaudePhaseTimeoutSalvage:
         assert blocked_idx > rc124_idx
         salvage_region = text[rc124_idx:blocked_idx]
         assert 'read_phase_output "$_skill"' in salvage_region, (
-            "Salvage prelude must call ``read_phase_output \"$_skill\"`` so "
+            'Salvage prelude must call ``read_phase_output "$_skill"`` so '
             "dispatcher-output files written by the skill are picked up on "
             "the salvage path, exactly as the clean-exit branch does (#3832, #3775)."
         )
@@ -458,8 +458,10 @@ class TestClaudePhaseTimeoutSalvage:
             "structured BLOCKED verdict even after the salvage prelude is "
             "added (#3832, #3775)."
         )
-        assert 'category="claude_phase_timeout"' in text or \
-               'category: "claude_phase_timeout"' in text, (
-            "BLOCKED envelope must still carry ``category=\"claude_phase_timeout\"`` "
+        assert (
+            'category="claude_phase_timeout"' in text
+            or 'category: "claude_phase_timeout"' in text
+        ), (
+            'BLOCKED envelope must still carry ``category="claude_phase_timeout"`` '
             "so the diagnoser routes genuine timeouts correctly (#3832, #3775)."
         )

@@ -123,10 +123,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=DEFAULT_SOURCE_DIR,
-        help=(
-            "Directory to scan (recursively). "
-            "Default: scripts/dispatcher."
-        ),
+        help=("Directory to scan (recursively). Default: scripts/dispatcher."),
     )
     return parser.parse_args(argv)
 
@@ -134,6 +131,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Shared PASS-condition logic
 # ---------------------------------------------------------------------------
+
 
 def _token_passes_by_name(token: str) -> bool:
     """PASS conditions that depend only on the token name (rules 1 & 2)."""
@@ -206,16 +204,13 @@ def _check_reference(
 # Python file analysis
 # ---------------------------------------------------------------------------
 
+
 def _is_exempt_python(func_name: str) -> bool:
     return func_name.endswith("_for_phase") or func_name.endswith("_by_phase")
 
 
 def _has_phase_param(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    all_args = (
-        func.args.args
-        + func.args.posonlyargs
-        + func.args.kwonlyargs
-    )
+    all_args = func.args.args + func.args.posonlyargs + func.args.kwonlyargs
     return any(a.arg == "phase" for a in all_args)
 
 
@@ -360,9 +355,7 @@ def _check_bash_file(path: Path) -> list[tuple[int, str, str]]:
             continue
         # Body lines are between opening and closing brace (exclusive).
         body_linenos = range(start_lineno + 1, end_lineno)
-        body_lines = [
-            all_lines[ln - 1] for ln in body_linenos if ln <= len(all_lines)
-        ]
+        body_lines = [all_lines[ln - 1] for ln in body_linenos if ln <= len(all_lines)]
         if not _is_phase_loop_bash(body_lines):
             continue
         for ln in body_linenos:
@@ -385,6 +378,7 @@ def _check_bash_file(path: Path) -> list[tuple[int, str, str]]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main(argv: list[str]) -> int:
     args = _parse_args(argv)

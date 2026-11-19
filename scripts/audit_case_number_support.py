@@ -575,9 +575,7 @@ def run_no_text(
 
 def no_text_key_list(reports: Iterable[NoTextReport]) -> str:
     """The reported keys: no-text PDFs, then text PDFs with scanned pages."""
-    return "".join(
-        f"{key}\n" for r in reports for key, *_ in (*r.no_text, *r.mixed)
-    )
+    return "".join(f"{key}\n" for r in reports for key, *_ in (*r.no_text, *r.mixed))
 
 
 def county_keys(

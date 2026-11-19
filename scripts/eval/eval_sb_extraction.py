@@ -454,9 +454,7 @@ def score_fixture(result: FixtureResult) -> dict:
     for ruling in result.rulings:
         cn = ruling.get("extracted_case_number")
         if cn:
-            extracted_by_cn[cn.replace(" ", "")] = ruling.get(
-                "extracted_case_title"
-            )
+            extracted_by_cn[cn.replace(" ", "")] = ruling.get("extracted_case_title")
     for cn, exp_title in expected_by_cn.items():
         if exp_title is not None:
             ct_total += 1
@@ -687,9 +685,7 @@ def print_model_report(summary: ModelSummary) -> None:
             + str(detail["case_numbers_total"])
         )
         ct_str = (
-            str(detail["case_titles_correct"])
-            + "/"
-            + str(detail["case_titles_total"])
+            str(detail["case_titles_correct"]) + "/" + str(detail["case_titles_total"])
         )
         fc_str = f"{detail['field_completeness_pct']:.0f}%"
         print(

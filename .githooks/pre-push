@@ -1153,10 +1153,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     changed_python_pkgs=""
     changed_ts_pkgs=""
     changed_terraform=false
-    # Track packages with code changes (not just docs/config) for test runs
+    # Packages whose full test run (tests + coverage gates) this push
+    # selects, filled in after the loop from the shared mapping.
     python_pkgs_with_code=""
     ts_pkgs_with_code=""
 
+    # Lint scope: any file under a package runs that package's lint.
     while IFS= read -r file; do
         # Python packages: packages/<pkg>/ with a pyproject.toml
         if [[ "$file" =~ ^packages/([^/]+)/ ]]; then
@@ -1164,12 +1166,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             if [ -f "packages/$pkg/pyproject.toml" ]; then
                 if ! in_list "$pkg" "$changed_python_pkgs"; then
                     changed_python_pkgs="$changed_python_pkgs $pkg"
-                fi
-                # Check if this is a code file (src/ or tests/ .py files)
-                if [[ "$file" =~ ^packages/[^/]+/(src|tests)/.+\.py$ ]]; then
-                    if ! in_list "$pkg" "$python_pkgs_with_code"; then
-                        python_pkgs_with_code="$python_pkgs_with_code $pkg"
-                    fi
                 fi
             elif [ -f "packages/$pkg/package.json" ]; then
                 # Skip files that ESLint cannot lint: SQL migrations and the
@@ -1185,12 +1181,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                         changed_ts_pkgs="$changed_ts_pkgs $pkg"
                     fi
                 fi
-                # Check if this is a code file (.ts, .tsx, .js, .jsx in src/ or tests/)
-                if [[ "$file" =~ ^packages/[^/]+/(src|tests|__tests__|lib)/.+\.(ts|tsx|js|jsx)$ ]]; then
-                    if ! in_list "$pkg" "$ts_pkgs_with_code"; then
-                        ts_pkgs_with_code="$ts_pkgs_with_code $pkg"
-                    fi
-                fi
             fi
         fi
 
@@ -1203,12 +1193,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                 if ! in_list "$pkg_id" "$changed_python_pkgs"; then
                     changed_python_pkgs="$changed_python_pkgs $pkg_id"
                 fi
-                # Check if this is a code file (.py in any subdirectory or root)
-                if [[ "$file" =~ \.py$ ]]; then
-                    if ! in_list "$pkg_id" "$python_pkgs_with_code"; then
-                        python_pkgs_with_code="$python_pkgs_with_code $pkg_id"
-                    fi
-                fi
             fi
         fi
 
@@ -1217,6 +1201,45 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             changed_terraform=true
         fi
     done <<< "$changed_files"
+
+    # Test scope (#5151): which paths select a package's full test run
+    # comes from scripts/touched_package_map.py, the mapping /ralph uses
+    # too (scripts/ralph_touched_packages.py), so a path cannot run tests
+    # in one and not the other. Besides src/ and tests/ code it selects
+    # pyproject.toml, requirements*.txt, conftest.py and test-config
+    # changes: a dependency bump is exactly the edit that breaks tests.
+    # The helper maps by path alone; keep only ids that are real packages
+    # of that language here. A helper failure fails the push: running no
+    # tests would look like a pass.
+    if ! select_test_packages_out="$(printf '%s\n' "$changed_files" \
+            | python3 "$PREPUSH_HOOK_DIR/../scripts/touched_package_map.py" 2>&1)"; then
+        echo "  FAILED: could not map changed paths to package test runs (#5151):" >&2
+        echo "$select_test_packages_out" | sed 's/^/    /' >&2
+        echo "  Fix:" >&2
+        echo "    python3 scripts/touched_package_map.py < /dev/null   # must exit 0" >&2
+        failures=$((failures + 1))
+        select_test_packages_out=""
+    fi
+    while IFS="$(printf '\t')" read -r lang pkg_id; do
+        [ -n "$pkg_id" ] || continue
+        case "$lang" in
+            python)
+                if [[ "$pkg_id" == infra/* ]]; then
+                    pkg_dir="$pkg_id"
+                else
+                    pkg_dir="packages/$pkg_id"
+                fi
+                if [ -f "$pkg_dir/pyproject.toml" ] && ! in_list "$pkg_id" "$python_pkgs_with_code"; then
+                    python_pkgs_with_code="$python_pkgs_with_code $pkg_id"
+                fi
+                ;;
+            ts)
+                if [ -f "packages/$pkg_id/package.json" ] && ! in_list "$pkg_id" "$ts_pkgs_with_code"; then
+                    ts_pkgs_with_code="$ts_pkgs_with_code $pkg_id"
+                fi
+                ;;
+        esac
+    done <<< "$select_test_packages_out"
 
     # ---------------------------------------------------------------
     # Per-package checks (#4708): one background job per touched
@@ -1318,6 +1341,41 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
 
 done
+
+# -------------------------------------------------------------------
+# ruff format --check on changed scripts/**/*.py (#5151). scripts/ is
+# outside every package's ruff scope, so format drift there built up with
+# nothing noticing. CI's scripts-tests job checks the whole tree with
+# `ruff format --check scripts/`; here only the pushed files are checked.
+# Deleted files are skipped. ruff comes from PATH, else any package venv.
+# -------------------------------------------------------------------
+changed_scripts_py_fmt=$(echo "$changed_files" | grep -E '^scripts/.+\.py$' || true)
+changed_scripts_py_fmt=$(for f in $changed_scripts_py_fmt; do [ -f "$f" ] && echo "$f"; done)
+if [ -n "$changed_scripts_py_fmt" ]; then
+    scripts_ruff=""
+    if command -v ruff &>/dev/null; then
+        scripts_ruff="ruff"
+    else
+        for r in packages/*/.venv/bin/ruff; do
+            if [ -x "$r" ]; then
+                scripts_ruff="$r"
+                break
+            fi
+        done
+    fi
+    if [ -z "$scripts_ruff" ]; then
+        echo "  WARNING: ruff not found — skipping ruff format on scripts/ (CI still checks it)" >&2
+        echo "  Install with: pip install ruff" >&2
+    else
+        echo "pre-push: checking ruff format on changed scripts/ Python files..." >&2
+        # shellcheck disable=SC2086 # one word per path
+        if ! run_check "_" "ruff format scripts" $scripts_ruff format --check $changed_scripts_py_fmt; then
+            echo "  Fix:" >&2
+            echo "    $scripts_ruff format" $changed_scripts_py_fmt >&2
+            failures=$((failures + 1))
+        fi
+    fi
+fi
 
 # -------------------------------------------------------------------
 # scripts/tests in CI's minimal environment (#5045) — run whenever a path

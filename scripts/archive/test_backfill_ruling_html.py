@@ -212,9 +212,7 @@ def test_process_batch_dry_run(mock_fmt: MagicMock) -> None:
     ts = datetime(2025, 1, 1)
     rows = [("uuid-1", "ruling text 1", ts)]
 
-    formatted, skipped, errors = process_batch(
-        conn, rows, concurrency=1, dry_run=True
-    )
+    formatted, skipped, errors = process_batch(conn, rows, concurrency=1, dry_run=True)
     assert formatted == 1
     assert errors == 0
     conn.rollback.assert_called_once()
@@ -295,7 +293,13 @@ def test_run_backfill_processes_all(
 
     # Sequence: count query, then fetch, then updates, then fetch again
     conn.cursor.return_value.__enter__ = MagicMock(
-        side_effect=[count_cursor, fetch_cursor, update_cursor, update_cursor, fetch_cursor]
+        side_effect=[
+            count_cursor,
+            fetch_cursor,
+            update_cursor,
+            update_cursor,
+            fetch_cursor,
+        ]
     )
     conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -337,9 +341,7 @@ def test_run_backfill_with_limit(
     )
     conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-    stats = run_backfill(
-        "postgresql://test", batch_size=10, concurrency=1, limit=1
-    )
+    stats = run_backfill("postgresql://test", batch_size=10, concurrency=1, limit=1)
 
     assert stats["total_processed"] == 1
 

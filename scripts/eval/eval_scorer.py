@@ -455,7 +455,9 @@ def score_fixture(
         if fld not in expected:
             continue
 
-        ext_val = extraction_result.get(fld) or extraction_result.get(f"extracted_{fld}")
+        ext_val = extraction_result.get(fld) or extraction_result.get(
+            f"extracted_{fld}"
+        )
 
         # If expected is None, skip scoring — we cannot validate
         # correctness without ground truth
@@ -509,14 +511,18 @@ def score_fixture(
     combined_ruling_text = " ".join(all_text_parts) if all_text_parts else ""
 
     if combined_ruling_text and source_text:
-        score.ruling_text_similarity = compute_text_similarity(combined_ruling_text, source_text)
+        score.ruling_text_similarity = compute_text_similarity(
+            combined_ruling_text, source_text
+        )
     else:
         score.ruling_text_similarity = 0.0
 
     # Also check ruling_text_contains as an additional field score
     ruling_text_contains = expected.get("ruling_text_contains", [])
     if ruling_text_contains and combined_ruling_text:
-        all_found, missing = check_ruling_text_contains(combined_ruling_text, ruling_text_contains)
+        all_found, missing = check_ruling_text_contains(
+            combined_ruling_text, ruling_text_contains
+        )
         score.field_scores.append(
             FieldScore(
                 field_name="ruling_text_contains",
@@ -543,10 +549,14 @@ def score_fixture(
             extracted_parties.extend(r.get("extracted_parties", []))
         if extracted_parties:
             ext_names = {
-                p.get("name", "").lower().strip() for p in extracted_parties if p.get("name")
+                p.get("name", "").lower().strip()
+                for p in extracted_parties
+                if p.get("name")
             }
             found = sum(1 for ep in expected_parties if ep.lower().strip() in ext_names)
-            score.party_recall = found / len(expected_parties) if expected_parties else 0.0
+            score.party_recall = (
+                found / len(expected_parties) if expected_parties else 0.0
+            )
         else:
             score.party_recall = 0.0
     # If no expected party data, leave party_recall at default 0.0
@@ -666,7 +676,9 @@ def _check_thresholds(summary: EvalSummary) -> None:
 
     outcome_acc = summary.field_accuracy.get("outcome", 0.0)
     if outcome_acc < THRESHOLDS["outcome"]:
-        failures.append(f"outcome accuracy {outcome_acc:.1%} < {THRESHOLDS['outcome']:.0%}")
+        failures.append(
+            f"outcome accuracy {outcome_acc:.1%} < {THRESHOLDS['outcome']:.0%}"
+        )
 
     if summary.avg_ruling_text_similarity < THRESHOLDS["ruling_text_similarity"]:
         failures.append(
@@ -710,7 +722,10 @@ def compare_models(
 
     # Field accuracy comparison
     all_fields = sorted(
-        set(list(summary_a.field_accuracy.keys()) + list(summary_b.field_accuracy.keys()))
+        set(
+            list(summary_a.field_accuracy.keys())
+            + list(summary_b.field_accuracy.keys())
+        )
     )
     for fld in all_fields:
         acc_a = summary_a.field_accuracy.get(fld, 0.0)

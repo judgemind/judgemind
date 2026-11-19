@@ -59,21 +59,33 @@ class TestDeriveTouchedPackages:
         assert derive_touched_packages(files) == []
 
     def test_non_package_paths_excluded(self) -> None:
-        """Files not under packages/<name>/src/ or tests/ are excluded."""
+        """Files outside a package's test paths are excluded.
+
+        infra/<dir> packages are the hook's concern; ralph runs only
+        packages/<name>/.venv suites.
+        """
         files = [
             "scripts/some_script.py",
             "infra/lambda-handler/handler.py",
-            "packages/scraper-framework/pyproject.toml",
+            "packages/scraper-framework/README.md",
+            "packages/scraper-framework/tests/fixtures/page.html",
         ]
         assert derive_touched_packages(files) == []
 
-    def test_package_config_file_excluded(self) -> None:
-        """Config files at the package root level are excluded."""
-        files = [
-            "packages/scraper-framework/pyproject.toml",
-            "packages/scraper-framework/setup.cfg",
-        ]
-        assert derive_touched_packages(files) == []
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "pyproject.toml",
+            "setup.cfg",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "pytest.ini",
+        ],
+    )
+    def test_package_test_config_selects_package(self, name: str) -> None:
+        """A dependency or test-config change selects the package (#5151)."""
+        files = [f"packages/nlp-pipeline/{name}"]
+        assert derive_touched_packages(files) == ["nlp-pipeline"]
 
     def test_duplicate_files_in_same_package_deduplicated(self) -> None:
         """Multiple changed files in the same package count as one entry."""
@@ -313,12 +325,19 @@ class TestNoPackagesOutcomes:
     def test_changes_outside_any_package(self, repo: Path) -> None:
         _write(repo, "docs/guide.md", "doc\n")
         _write(repo, "scripts/tool.py")
-        _write(repo, "packages/scraper-framework/pyproject.toml", "[x]\n")
+        _write(repo, "packages/scraper-framework/README.md", "doc\n")
         result = _cli(repo)
         assert result.returncode == EXIT_NO_PACKAGES
         assert result.stdout == ""
         assert "no-packages: 3 changed file(s), none under a package" in result.stderr
         assert "docs/guide.md" in result.stderr
+
+    def test_pyproject_only_change_selects_package(self, repo: Path) -> None:
+        """A pyproject-only change is not a no-packages result (#5151)."""
+        _write(repo, "packages/scraper-framework/pyproject.toml", "[x]\n")
+        result = _cli(repo)
+        assert result.returncode == 0
+        assert result.stdout == "scraper-framework\n"
 
     def test_python_mode_with_ts_only_change_points_at_ts(self, repo: Path) -> None:
         _write(repo, "packages/web/src/page.tsx", "export {}\n")

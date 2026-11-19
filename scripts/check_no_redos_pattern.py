@@ -139,7 +139,7 @@ def _pattern_is_redos_shape(pattern: str) -> bool:
     # Strip at most one outer group prefix so ``([^\n]+?)..`` is
     # classified by ``[^\n]+?`` rather than the bare ``(``.
     m = _WRAP_PREFIX_RE.match(pattern)
-    head = pattern[m.end():] if m else pattern
+    head = pattern[m.end() :] if m else pattern
 
     # If the very first construct is a literal anchor, we are safe —
     # bail out early.
@@ -214,7 +214,11 @@ def _is_re_compile_call(node: ast.Call) -> bool:
     """Return True if ``node.func`` resolves to ``re.compile``."""
     func = node.func
     if isinstance(func, ast.Attribute):
-        if func.attr == "compile" and isinstance(func.value, ast.Name) and func.value.id == "re":
+        if (
+            func.attr == "compile"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+        ):
             return True
     return False
 

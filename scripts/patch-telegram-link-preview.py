@@ -25,7 +25,9 @@ from pathlib import Path
 def find_server_ts() -> Path:
     """Locate the cached Telegram plugin server.ts."""
     home = Path.home()
-    cache_dir = home / ".claude" / "plugins" / "cache" / "claude-plugins-official" / "telegram"
+    cache_dir = (
+        home / ".claude" / "plugins" / "cache" / "claude-plugins-official" / "telegram"
+    )
     if not cache_dir.exists():
         print(f"ERROR: Plugin cache directory not found: {cache_dir}", file=sys.stderr)
         sys.exit(1)
@@ -159,17 +161,43 @@ EDIT_HANDLER_NEW = """\
 
 
 PATCHES = [
-    ("reply tool schema: add disable_web_page_preview", REPLY_SCHEMA_OLD, REPLY_SCHEMA_NEW),
-    ("reply handler: extract disable_web_page_preview", REPLY_HANDLER_OLD, REPLY_HANDLER_NEW),
-    ("reply handler: pass link_preview_options to sendMessage", SEND_MESSAGE_OLD, SEND_MESSAGE_NEW),
-    ("edit_message tool schema: add disable_web_page_preview", EDIT_SCHEMA_OLD, EDIT_SCHEMA_NEW),
-    ("edit_message handler: extract and pass disable_web_page_preview", EDIT_HANDLER_OLD, EDIT_HANDLER_NEW),
+    (
+        "reply tool schema: add disable_web_page_preview",
+        REPLY_SCHEMA_OLD,
+        REPLY_SCHEMA_NEW,
+    ),
+    (
+        "reply handler: extract disable_web_page_preview",
+        REPLY_HANDLER_OLD,
+        REPLY_HANDLER_NEW,
+    ),
+    (
+        "reply handler: pass link_preview_options to sendMessage",
+        SEND_MESSAGE_OLD,
+        SEND_MESSAGE_NEW,
+    ),
+    (
+        "edit_message tool schema: add disable_web_page_preview",
+        EDIT_SCHEMA_OLD,
+        EDIT_SCHEMA_NEW,
+    ),
+    (
+        "edit_message handler: extract and pass disable_web_page_preview",
+        EDIT_HANDLER_OLD,
+        EDIT_HANDLER_NEW,
+    ),
 ]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patch Telegram plugin for link preview control")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would change without modifying files")
+    parser = argparse.ArgumentParser(
+        description="Patch Telegram plugin for link preview control"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying files",
+    )
     args = parser.parse_args()
 
     server_ts = find_server_ts()
@@ -184,7 +212,9 @@ def main() -> None:
     for name, old, new in PATCHES:
         if old not in content:
             print(f"ERROR: Could not find patch target for: {name}", file=sys.stderr)
-            print("The plugin version may have changed. Review manually.", file=sys.stderr)
+            print(
+                "The plugin version may have changed. Review manually.", file=sys.stderr
+            )
             sys.exit(1)
         content = content.replace(old, new, 1)
         print(f"  [OK] {name}")

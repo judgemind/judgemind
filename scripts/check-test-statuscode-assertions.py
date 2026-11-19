@@ -86,6 +86,7 @@ _TEST_OPEN_RE = re.compile(
 # ``it()`` / ``test()`` opening call.
 _NOQA_MARKER = "// status-assertion-noqa"
 
+
 # Assertion patterns inside a test body. We accept any line where a
 # ``statusCode`` reference and the expected status number appear together,
 # regardless of which assertion library style is in use.
@@ -407,7 +408,9 @@ def main(argv: list[str]) -> int:
     )
     print("", file=sys.stderr)
     for fp, lineno, status, snippet in violations:
-        print(f"  {fp}:{lineno}: missing assert on statusCode={status}", file=sys.stderr)
+        print(
+            f"  {fp}:{lineno}: missing assert on statusCode={status}", file=sys.stderr
+        )
         print(f"      {snippet}", file=sys.stderr)
     print("", file=sys.stderr)
     print(

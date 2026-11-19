@@ -251,7 +251,7 @@ x = "SELECT r.bad_col FROM rulings r"'''
         assert len(tokens) == 0
 
     def test_ignore_comment_on_same_line(self) -> None:
-        code = '''x = "SELECT r.bad FROM rulings r"  # sql-check:ignore'''
+        code = """x = "SELECT r.bad FROM rulings r"  # sql-check:ignore"""
         tokens = _extract_string_tokens(code)
         assert len(tokens) == 0
 
@@ -433,9 +433,9 @@ QUERY = """
     def test_url_string_not_flagged(self, tmp_path: Path) -> None:
         """URLs should not trigger false positives."""
         f = tmp_path / "urls.py"
-        f.write_text('''
+        f.write_text("""
 URL = "https://www.fresno.courts.ca.gov/tentative-rulings"
-''')
+""")
         errors = scan_file(f, table_columns=TABLE_COLUMNS)
         assert errors == []
 
@@ -544,9 +544,18 @@ class TestTableColumnsCompleteness:
     def test_rulings_has_expected_columns(self) -> None:
         cols = TABLE_COLUMNS["rulings"]
         expected = {
-            "id", "document_id", "case_id", "judge_id", "court_id",
-            "ruling_text", "ruling_text_html", "ruling_text_hash",
-            "outcome", "motion_type", "hearing_date", "is_tentative",
+            "id",
+            "document_id",
+            "case_id",
+            "judge_id",
+            "court_id",
+            "ruling_text",
+            "ruling_text_html",
+            "ruling_text_hash",
+            "outcome",
+            "motion_type",
+            "hearing_date",
+            "is_tentative",
         }
         assert expected.issubset(cols)
 
@@ -665,7 +674,9 @@ class TestExtractUnqualifiedColumnReferences:
         assert "captured_at" in refs
 
     def test_update_set_columns(self) -> None:
-        sql = "UPDATE rulings SET outcome = 'granted', is_tentative = false WHERE id = 1"
+        sql = (
+            "UPDATE rulings SET outcome = 'granted', is_tentative = false WHERE id = 1"
+        )
         refs = _extract_unqualified_column_references(sql)
         assert "outcome" in refs
         assert "is_tentative" in refs
@@ -698,7 +709,9 @@ class TestExtractUnqualifiedColumnReferences:
 
     def test_skips_keywords(self) -> None:
         """SQL keywords should not be treated as columns."""
-        sql = "SELECT id FROM derived.documents WHERE id IS NOT NULL ORDER BY captured_at"
+        sql = (
+            "SELECT id FROM derived.documents WHERE id IS NOT NULL ORDER BY captured_at"
+        )
         refs = _extract_unqualified_column_references(sql)
         for kw in ("is", "not", "null", "order", "by", "where", "select", "from"):
             assert kw not in refs
@@ -821,9 +834,7 @@ QUERY = """
         errors = scan_file(f, table_columns=table_cols)
         assert errors == []
 
-    def test_sql_check_ignore_suppresses_unqualified(
-        self, tmp_path: Path
-    ) -> None:
+    def test_sql_check_ignore_suppresses_unqualified(self, tmp_path: Path) -> None:
         """sql-check:ignore suppresses both qualified and unqualified checks."""
         f = tmp_path / "ignored.py"
         f.write_text('''
@@ -862,7 +873,7 @@ QUERY = """
         f = tmp_path / "regression_ac.py"
         # This is the exact bug the issue describes: WHERE clause uses
         # `capture_timestamp` but the actual column is `captured_at`.
-        f.write_text('''
+        f.write_text("""
 def fetch_capture_count(conn, scraper_id, since):
     with conn.cursor() as cur:
         cur.execute(
@@ -871,7 +882,7 @@ def fetch_capture_count(conn, scraper_id, since):
             (scraper_id, since),
         )
         return cur.fetchone()[0]
-''')
+""")
         # Use the real TABLE_COLUMNS map built from the repo's schema files.
         errors = scan_file(f, table_columns=TABLE_COLUMNS)
         assert len(errors) >= 1
