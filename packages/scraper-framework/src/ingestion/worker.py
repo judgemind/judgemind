@@ -69,7 +69,7 @@ from framework.search.ruling_doc import (
     load_search_events,
     reindex_dependent_rulings,
 )
-from framework.storage import is_transient_archive_error
+from framework.storage import capturing_scraper_id, is_transient_archive_error
 from validation.deterministic import (
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
@@ -2311,12 +2311,11 @@ def is_governor_appointment_event(event_data: dict[str, Any]) -> bool:
     ``reingest_from_s3`` set ``scraper_id`` to ``rebuild-…`` / ``reingest-…``
     and carry the live id only as ``capture_scraper_id`` (from the raw
     object's metadata), and a local-cache rebuild has no metadata at all.
-    The raw key's prefix covers that last case.
+    The raw key's prefix covers that last case.  The scraper id comes from
+    ``framework.storage.capturing_scraper_id``, the resolver every
+    capture-keyed routing decision shares (#5145).
     """
-    if GOVERNOR_APPOINTMENTS_SCRAPER_ID in (
-        event_data.get("scraper_id"),
-        event_data.get("capture_scraper_id"),
-    ):
+    if capturing_scraper_id(event_data) == GOVERNOR_APPOINTMENTS_SCRAPER_ID:
         return True
     return str(event_data.get("s3_key") or "").startswith(GOVERNOR_APPOINTMENTS_KEY_PREFIX)
 
@@ -4153,10 +4152,12 @@ class IngestionWorker:
         # ``system_prompt`` / ``provider`` / ``model`` /
         # ``max_chars_per_chunk`` come from one helper instead of being
         # re-derived from ``CountyExtractionConfig`` inline.  Reingest and
-        # rebuild run through this method too (#4845).
-        from framework.extraction_config import decide_extraction_strategy
+        # rebuild run through this method too (#4845).  The scraper override
+        # is keyed on the capturing scraper, not the rebuild-/reingest-
+        # scraper_id those entry points set (#5145).
+        from framework.extraction_config import extraction_strategy_for_event
 
-        strategy = decide_extraction_strategy(state, county, scraper_id=scraper_id)
+        strategy = extraction_strategy_for_event(event_data)
 
         # ------------------------------------------------------------------
         # PHASE: parse_document_ms (#4116)
@@ -4876,7 +4877,9 @@ class IngestionWorker:
         resolved_ct, resolved_method = resolve_case_type(
             case_type=case_type,
             case_number=case_number,
-            scraper_id=scraper_id,
+            # The capturing scraper's id names the case category; a
+            # rebuild-/reingest- id never does (#5145).
+            scraper_id=capturing_scraper_id(event_data),
             motion_type=motion_type,
             case_title=eff_title,
         )
@@ -6795,11 +6798,9 @@ class IngestionWorker:
             # Nothing any extractor could read: no text, and no page images
             # (a text-first county's PDF with no text layer, or a multimodal
             # county whose raw PDF could not be fetched).
-            from framework.extraction_config import decide_extraction_strategy
+            from framework.extraction_config import extraction_strategy_for_event
 
-            strategy = decide_extraction_strategy(
-                state, county, scraper_id=event_data.get("scraper_id", "")
-            )
+            strategy = extraction_strategy_for_event(event_data)
             if strategy.skip_llm:
                 # The scraper's fields are the document's, as below.
                 batch.whole_document = True
@@ -6815,13 +6816,11 @@ class IngestionWorker:
         # text fallback is refused further down if it is needed.
         ocr_incomplete = _ocr_incomplete_reason(event_data)
         if ocr_incomplete:
-            from framework.extraction_config import decide_extraction_strategy
+            from framework.extraction_config import extraction_strategy_for_event
 
             reads_images = (
                 raw_pdf_bytes is not None
-                and decide_extraction_strategy(
-                    state, county, scraper_id=event_data.get("scraper_id", "")
-                ).use_multimodal
+                and extraction_strategy_for_event(event_data).use_multimodal
             )
             if not reads_images:
                 batch.extraction_failed = ocr_incomplete
@@ -7009,10 +7008,12 @@ class IngestionWorker:
         # with ExtractionMethod.NONE (``strategy.skip_llm``) skip framework
         # extraction entirely (e.g. SD calendar — structured HTML already
         # fully parsed).
-        from framework.extraction_config import decide_extraction_strategy
+        from framework.extraction_config import extraction_strategy_for_event
 
-        event_scraper_id: str = event_data.get("scraper_id", "")
-        strategy = decide_extraction_strategy(state, county, scraper_id=event_scraper_id)
+        # Keyed on the capturing scraper, so a rebuild or reingest of a raw
+        # routes as its live capture did (#5145).
+        event_scraper_id = capturing_scraper_id(event_data)
+        strategy = extraction_strategy_for_event(event_data)
 
         # NONE means the scraper handles everything — no framework extraction.
         if strategy.skip_llm:

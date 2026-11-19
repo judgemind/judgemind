@@ -106,6 +106,30 @@ def capture_provenance_from_s3_object(response: Mapping[str, Any]) -> dict[str, 
     return fields
 
 
+def capturing_scraper_id(event_data: Mapping[str, Any]) -> str:
+    """The scraper id an ingestion event should be routed by (#5016, #5145).
+
+    Every decision keyed on "which scraper captured this raw" (the governor
+    bio route, ``extraction_config`` scraper overrides, the case-type
+    fallback, the ``hearing_date_for_raw`` hook) goes through here, so the
+    answer does not depend on which entry point built the event:
+
+    - a live event carries the live id as ``scraper_id``;
+    - ``rebuild_db`` / prefix-mode ``reingest_from_s3`` events set
+      ``scraper_id`` to ``rebuild-<state>-<county>`` /
+      ``reingest-<state>-<county>`` and carry the live id as
+      ``capture_scraper_id`` (restored from the raw object's metadata by
+      :func:`capture_provenance_from_s3_object`), which wins;
+    - a rebuild from a local S3 cache has no metadata, so the synthetic
+      ``rebuild-…`` id is all there is and is returned as-is.
+
+    Returns ``""`` when the event names no scraper.  Recording fields
+    (``documents.scraper_id``, skip and validation telemetry) keep the
+    event's own ``scraper_id``: they record the entry point, not routing.
+    """
+    return str(event_data.get("capture_scraper_id") or event_data.get("scraper_id") or "")
+
+
 class S3Archiver:
     """Archives raw captured content to S3. Documents are written once and never modified."""
 
