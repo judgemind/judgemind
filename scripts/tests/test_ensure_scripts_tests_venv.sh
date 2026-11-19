@@ -13,6 +13,7 @@
 #   2. second run reuses it: no venv / pip call
 #   3. an edited requirements file rebuilds it
 #   4. an edited packages/judgemind-config/pyproject.toml rebuilds it
+#  4b. an edited requirements-ruff.txt (the ruff pin, #5153) rebuilds it
 #   5. an interrupted build (no fingerprint) rebuilds it
 #   6. pip failure -> exit 1, FAILED + Fix: block, venv removed, and the
 #      next run rebuilds
@@ -147,6 +148,20 @@ if [ "$rc" -ne 0 ] || ! grep -q "^pip " "$STUB_LOG"; then
     report_fail "expected a rebuild after editing judgemind-config/pyproject.toml (rc=$rc)" "$err"
 else
     report_pass "judgemind-config change rebuilds"
+fi
+
+echo "[4b] an edited requirements-ruff.txt (the ruff pin) rebuilds (#5153)"
+printf 'ruff==0.0.1\n' > "$CHECKOUT/requirements-ruff.txt"
+run_helper
+if [ "$rc" -ne 0 ] || ! grep -q "^pip " "$STUB_LOG"; then
+    report_fail "expected a rebuild after editing requirements-ruff.txt (rc=$rc)" "$err"
+else
+    run_helper
+    if [ -n "$(cat "$STUB_LOG")" ]; then
+        report_fail "expected reuse once the new pin is built" "$(cat "$STUB_LOG")"
+    else
+        report_pass "ruff pin change rebuilds"
+    fi
 fi
 
 echo "[5] an interrupted build (no fingerprint) rebuilds"

@@ -16,8 +16,9 @@
 #   path         <checkout>/tmp/scripts-tests-venv (tmp/ is gitignored
 #                and on every repo-walk exclusion list)
 #   fingerprint  <venv>/.scripts-tests-fingerprint: sha256 of the
-#                requirements file, packages/judgemind-config/pyproject.toml
-#                and the interpreter version.
+#                requirements file, packages/judgemind-config/pyproject.toml,
+#                requirements-ruff.txt (the ruff pin, #5153) and the
+#                interpreter version.
 # When the fingerprint matches, the venv is reused as is (well under a
 # second). When it differs, or a build was interrupted (no fingerprint),
 # the venv is deleted and rebuilt (a few seconds with a warm pip cache).
@@ -43,6 +44,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REQUIREMENTS="$REPO_ROOT/scripts/tests/requirements-ci.txt"
 CONFIG_PYPROJECT="$REPO_ROOT/packages/judgemind-config/pyproject.toml"
+# requirements-ci.txt includes this file with -r (the ruff pin, #5153), so
+# a pin bump must rebuild the venv too.
+RUFF_PIN="$REPO_ROOT/requirements-ruff.txt"
 VENV="${SCRIPTS_TESTS_VENV:-$REPO_ROOT/tmp/scripts-tests-venv}"
 FINGERPRINT_FILE="$VENV/.scripts-tests-fingerprint"
 
@@ -107,6 +111,7 @@ want="$(
     {
         cat "$REQUIREMENTS"
         [ -f "$CONFIG_PYPROJECT" ] && cat "$CONFIG_PYPROJECT"
+        [ -f "$RUFF_PIN" ] && cat "$RUFF_PIN"
         echo "python=$py_version"
     } | sha256_of
 )"

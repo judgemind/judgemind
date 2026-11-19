@@ -82,7 +82,8 @@ fi
 # in the venv even though runners.py itself doesn't import it, so future
 # v3 modules can be added without touching this install list.
 
-echo "Installing PyPI dependencies: pytest pytest-xdist ruff boto3"
-"$PIP" install --quiet pytest pytest-xdist ruff boto3
+# ruff comes from requirements-ruff.txt, the repo's one ruff pin (#5153).
+echo "Installing PyPI dependencies: pytest pytest-xdist boto3, ruff (pinned)"
+"$PIP" install --quiet pytest pytest-xdist boto3 -r "$REPO_ROOT/requirements-ruff.txt"
 
 echo "Done. Venv ready at $VENV_DIR"

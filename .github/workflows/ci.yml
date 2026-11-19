@@ -160,6 +160,10 @@ jobs:
               # (#5058); a PR that only adds a git-writing package test
               # must still run it.
               - 'packages/*/tests/**'
+              # The ruff pin (#5153): scripts-tests runs ruff format on
+              # scripts/ with it. A bump also edits packages/*/pyproject.toml
+              # (check-ruff-pin.py enforces it), which runs the package jobs.
+              - 'requirements-ruff.txt'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
@@ -199,6 +203,8 @@ jobs:
               # so regressions in the auto-discovery loop are caught on the
               # PR that introduces them (#2410).
               - '.github/workflows/ci.yml'
+              # The ruff pin the hook-file format check installs (#5153).
+              - 'requirements-ruff.txt'
             githooks:
               - '.githooks/**'
               - 'scripts/tests/test_pre_push.sh'
@@ -215,6 +221,7 @@ jobs:
               # The hook's scripts/tests venv (#5045).
               - 'scripts/ensure-scripts-tests-venv.sh'
               - 'scripts/tests/requirements-ci.txt'
+              - 'requirements-ruff.txt'
               - '.github/workflows/ci.yml'
             dispatcher-terminals:
               - 'scripts/dispatcher/daemon.py'
@@ -805,11 +812,13 @@ jobs:
         run: npm install --no-save graphql@^16.8
       # scripts/ sits outside every package's ruff scope, so format drift
       # built up unnoticed (#5151). The pre-push hook checks the changed
-      # files; this checks the whole tree.
+      # files; this checks the whole tree. ruff is the pinned version
+      # from requirements-ruff.txt, installed above through
+      # scripts/tests/requirements-ci.txt (#5153).
       - name: Ruff format check (scripts)
         if: matrix.shard == 'python'
         run: |
-          pip install ruff
+          ruff --version
           ruff format --check scripts/
       - name: Test
         if: matrix.shard == 'python'
@@ -1141,6 +1150,12 @@ jobs:
       # on both but has different observable behavior under set -u.
       - name: Verify scripts initialise indexed arrays before reading under nounset
         run: scripts/check-bash-set-u-empty-array.sh
+      # Issue #5153: every ruff install (CI jobs, pre-push, dispatcher
+      # venv installers, package [dev] extras) must resolve to the one
+      # version pinned in requirements-ruff.txt, so a ruff release cannot
+      # turn every open PR red and local results match CI.
+      - name: Check every ruff install matches the repo pin
+        run: scripts/check-ruff-pin.py
 
       # Issue #5088: a guard wired only into path-filtered jobs must
       # declare `# scans:` paths that the filter covers; otherwise it
@@ -2207,8 +2222,9 @@ jobs:
           python-version: '3.12'
       # .claude/hooks/*.py sits outside every package's ruff scope, so
       # format drift went unnoticed (#4703). Gate it here.
+      # The repo's one pinned ruff (#5153).
       - name: Install ruff
-        run: pip install ruff
+        run: pip install -r requirements-ruff.txt
       - name: Ruff format check (hook Python files)
         run: ruff format --check .claude/hooks/
       - name: Run hook test suites

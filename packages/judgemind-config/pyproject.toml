@@ -20,7 +20,7 @@ dev = [
     "diff-cover>=9.0",   # pre-push diff-coverage gate (#4719)
     "pytest-testmon>=2.1",
     "pytest-xdist>=3.5",
-    "ruff>=0.3",
+    "ruff==0.17.5",
 ]
 
 [tool.ruff]
