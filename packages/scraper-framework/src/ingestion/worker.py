@@ -19,7 +19,7 @@ Environment variables:
     ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic"
     JUDGEMIND_EXTRACTION — "required" (default) or "optional" (#4953)
     MAX_ATTEMPTS      — Per-message processing attempts before dead-lettering
-                       (default: 3; MAX_RETRIES is a deprecated alias)
+                       (default: 3)
     HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)

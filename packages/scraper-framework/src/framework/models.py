@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, time
 from enum import StrEnum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -112,7 +113,14 @@ class ScheduleWindow(BaseModel):
 
 
 class ScraperConfig(BaseModel):
-    """Configuration for a single scraper instance."""
+    """Configuration for a single scraper instance.
+
+    Unknown keys raise ``ValidationError`` (#5165).  Pydantic's default
+    ``extra="ignore"`` dropped a misspelled or renamed key (such as the
+    pre-#5158 ``max_retries``) and the scraper silently ran with the default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     scraper_id: str
     state: str
@@ -146,20 +154,19 @@ class ScraperConfig(BaseModel):
     s3_bucket: str = ""
     s3_prefix: str = ""  # overrides default path convention if set
 
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_max_retries(cls, data: Any) -> Any:
-        """Refuse the pre-#5158 ``max_retries`` key instead of dropping it.
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Copy the config, validating ``update`` like the constructor (#5165).
 
-        Pydantic ignores unknown keys by default, so an old ``max_retries=1``
-        would silently run with the default attempt count.
+        Pydantic does not validate ``model_copy(update=...)``: an unknown key
+        is set as a stray attribute (the real field keeps its value) and a
+        wrong-typed value is stored as is.  With an update, the merged data
+        goes through ``model_validate``, so both raise ``ValidationError``.
+        ``model_dump`` already copies every value, so ``deep`` has no extra
+        effect on that path.
         """
-        if isinstance(data, dict) and "max_retries" in data:
-            raise ValueError(
-                "ScraperConfig.max_retries was renamed to max_attempts (#5158): "
-                "it counts total attempts, the first try included"
-            )
-        return data
+        if update:
+            return type(self).model_validate({**self.model_dump(), **update})
+        return super().model_copy(deep=deep)
 
 
 # ---------------------------------------------------------------------------

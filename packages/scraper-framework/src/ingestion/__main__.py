@@ -11,8 +11,7 @@ Required environment variables:
 
 Optional:
     MAX_ATTEMPTS           — Per-message processing attempts, the first try
-                             included (default: 3).  MAX_RETRIES is read as a
-                             deprecated alias when MAX_ATTEMPTS is unset (#5158)
+                             included (default: 3) (#5158)
     OPENSEARCH_USERNAME    — OpenSearch basic-auth username (local-dev fallback)
     OPENSEARCH_PASSWORD    — OpenSearch basic-auth password (local-dev fallback)
     JUDGEMIND_EXTRACTION   — ``required`` (default): ANTHROPIC_API_KEY and
@@ -74,23 +73,10 @@ def _require_env(name: str) -> str:
 
 
 def max_attempts_from_env(environ: Mapping[str, str]) -> int:
-    """Per-message processing attempts from ``MAX_ATTEMPTS`` (#5158).
-
-    ``MAX_RETRIES`` is the pre-#5158 name of the same setting: it always
-    counted attempts, so its value carries over unchanged.  It is read only
-    when ``MAX_ATTEMPTS`` is unset, with a warning to rename it.
-    """
+    """Per-message processing attempts from ``MAX_ATTEMPTS`` (#5158)."""
     value = environ.get("MAX_ATTEMPTS", "")
     if value:
         return int(value)
-    legacy = environ.get("MAX_RETRIES", "")
-    if legacy:
-        logger.warning(
-            "ingestion.max_retries_env_deprecated",
-            value=legacy,
-            fix="rename the MAX_RETRIES env var to MAX_ATTEMPTS (same value)",
-        )
-        return int(legacy)
     return DEFAULT_MAX_ATTEMPTS
 
 
