@@ -27,8 +27,10 @@ county).  They are re-exported here for backward compatibility::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 # Re-export per-county prompts so existing import sites keep working.
 from .prompts import (  # noqa: F401
@@ -43,6 +45,7 @@ from .prompts import (  # noqa: F401
     VENTURA_FRAMEWORK_PROMPT,
     VENTURA_SYSTEM_PROMPT,
 )
+from .storage import capturing_scraper_id
 
 
 class ExtractionMethod(StrEnum):
@@ -179,23 +182,32 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
 # (wrong dates from body text, truncated multi-case output, raw HTML stored
 # as ruling_text).  See #2331.
 #
-# Key: scraper_id string.
+# Key: the live scraper id that captured the raw.  Callers resolve it with
+# ``framework.storage.capturing_scraper_id`` (``extraction_strategy_for_event``
+# does this), so a rebuild or reingest event, whose ``scraper_id`` is the
+# synthetic ``rebuild-<state>-<county>`` / ``reingest-<state>-<county>``, is
+# routed by the ``capture_scraper_id`` restored from the raw object's S3
+# metadata, exactly as the live capture was (#5145).
 #
-# ``rebuild-ca-san_diego`` is a synthetic scraper_id emitted by
-# ``scripts/rebuild_db.py`` when seeding the local DB from S3.  The S3
-# payload for San Diego is an entire calendar HTML page (60-100KB, 30+
-# cases), identical to what ``ca-sd-calendar`` captures.  Without an
-# override, the (CA, SAN DIEGO) county default (LLM) fires and the
-# whole HTML is shipped to the model with a prompt assuming a single
-# case, producing 50000-char raw-HTML dumps and swapped identifiers
-# (#2447).  Registering the synthetic scraper_id with NONE forces the
-# worker to route the document through the deterministic SD splitter
-# (``courts.ca.sd_calendar._split_rulings``) instead.
+# The synthetic ``rebuild-ca-san_diego`` / ``reingest-ca-san_diego`` entries
+# are only the fallback for an event with no capture metadata: a rebuild
+# from a local S3 cache, or an S3 object archived before the archiver
+# stamped ``scraper-id``.  Such an event cannot say which SD scraper
+# captured it, so it takes the calendar route (#2447): every San Diego raw
+# in the dev archive is ``ca-sd-calendar`` HTML (1,059 of 1,059 on
+# 2026-11-18), and sending a calendar page to the county LLM produces
+# 50000-char raw-HTML dumps and swapped identifiers.  An SD tentatives raw
+# with metadata resolves to ``ca-sd-tentatives`` and takes the county LLM
+# default.
 _SCRAPER_CONFIGS: dict[str, CountyExtractionConfig] = {
     "ca-sd-calendar": CountyExtractionConfig(
         method=ExtractionMethod.NONE,
     ),
+    # Metadata-less fallbacks only — see above.
     "rebuild-ca-san_diego": CountyExtractionConfig(
+        method=ExtractionMethod.NONE,
+    ),
+    "reingest-ca-san_diego": CountyExtractionConfig(
         method=ExtractionMethod.NONE,
     ),
 }
@@ -269,8 +281,9 @@ def configured_providers() -> frozenset[str]:
 # parity test (#4071) was the preventative; this helper is the structural fix
 # described in #4081 (Option B), and #4845 removed the second path.
 #
-# The worker calls ``decide_extraction_strategy(...)`` once and reads the
-# resulting ``ExtractionStrategy`` fields, so a new ``ExtractionMethod``
+# The worker calls ``extraction_strategy_for_event(event_data)`` (a wrapper
+# over ``decide_extraction_strategy`` keyed on the capturing scraper, #5145)
+# and reads the resulting ``ExtractionStrategy`` fields, so a new ``ExtractionMethod``
 # value or ``CountyExtractionConfig`` field is handled in one place.
 #
 # Default semantics for unconfigured (state, county, scraper_id) tuples
@@ -394,4 +407,20 @@ def decide_extraction_strategy(
         provider=config.provider,
         model=config.model,
         max_chars_per_chunk=config.max_chars_per_chunk,
+    )
+
+
+def extraction_strategy_for_event(event_data: Mapping[str, Any]) -> ExtractionStrategy:
+    """The extraction strategy for an ingestion event (#5145).
+
+    The worker calls this rather than :func:`decide_extraction_strategy`
+    with the event's ``scraper_id``: the scraper override is looked up on
+    :func:`framework.storage.capturing_scraper_id`, so a rebuild or reingest
+    event (``scraper_id`` ``rebuild-…`` / ``reingest-…``) resolves the way
+    the live capture of the same raw did.
+    """
+    return decide_extraction_strategy(
+        str(event_data.get("state") or ""),
+        str(event_data.get("county") or ""),
+        scraper_id=capturing_scraper_id(event_data),
     )

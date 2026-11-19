@@ -150,9 +150,10 @@ def raw_hearing_date(event_data: dict[str, Any], text: str | None) -> str | None
     content_format = str(event_data.get("content_format") or "")
     capture_timestamp = _parse_capture_timestamp(event_data.get("capture_timestamp"))
 
-    cls = by_id.get(str(event_data.get("capture_scraper_id") or "")) or by_id.get(
-        str(event_data.get("scraper_id") or "")
-    )
+    from framework.storage import capturing_scraper_id
+
+    # The resolver every capture-keyed routing decision shares (#5145).
+    cls = by_id.get(capturing_scraper_id(event_data))
     if cls is not None:
         result = _as_date(_call_hook(cls, text, source_url, content_format, capture_timestamp))
         return result.isoformat() if result is not None else None
