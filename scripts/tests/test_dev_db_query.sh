@@ -1007,6 +1007,77 @@ test_run_with_timeout_passthrough() {
     pass "run_with_timeout: passes through rc/stdout, returns 124 on timeout"
 }
 
+# ── Exec target (#5168) ────────────────────────────────────────────────────
+# Queries must run in the db-shell service, never inside the live ingestion
+# worker: each exec'd query spent 20-40 MB of the worker's memory (it caused
+# the OOM kill in #5147) and failed whenever the worker restarted.
+
+test_exec_target_is_db_shell_not_worker() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local mock_bin="$tmpdir/bin"
+    local calls="$tmpdir/aws_calls"
+    local payload="$tmpdir/payload.txt"
+    mkdir -p "$mock_bin"
+    frame_inline '[{"one":1}]' > "$payload"
+
+    cat > "$mock_bin/aws" << MOCK_AWS
+#!/usr/bin/env bash
+echo "\$*" >> "$calls"
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
+    echo "arn:aws:ecs:us-west-2:000000000000:task/judgemind-dev/dbshelltask"
+    exit 0
+fi
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
+    if [[ "\$*" == *"bash -c 'true'"* ]]; then
+        exit 0
+    fi
+    cat "$payload"
+    exit 0
+fi
+echo "Mock aws: unexpected command: \$*" >&2
+exit 1
+MOCK_AWS
+    chmod +x "$mock_bin/aws"
+
+    local stdout rc=0
+    stdout=$(PATH="$mock_bin:$PATH" "$DEV_DB_QUERY" "SELECT 1 AS one" 2>/dev/null) || rc=$?
+    if [[ $rc -ne 0 || "$stdout" != '[{"one":1}]' ]]; then
+        fail "exec target: query round-trip" "rc=$rc stdout=$stdout"
+        return
+    fi
+    if grep -q 'ingestion-worker' "$calls"; then
+        fail "exec target: an aws call names the ingestion worker" "calls: $(cat "$calls")"
+        return
+    fi
+    if ! grep -q 'list-tasks .*--service-name judgemind-db-shell-dev' "$calls"; then
+        fail "exec target: list-tasks does not look up judgemind-db-shell-dev" "calls: $(cat "$calls")"
+        return
+    fi
+    local exec_calls exec_on_db_shell
+    exec_calls=$(grep -c 'execute-command' "$calls" || true)
+    exec_on_db_shell=$(grep 'execute-command' "$calls" | grep -c -- '--container db-shell' || true)
+    if [[ "$exec_calls" -lt 2 || "$exec_calls" -ne "$exec_on_db_shell" ]]; then
+        fail "exec target: every execute-command must target container db-shell" "calls: $(cat "$calls")"
+        return
+    fi
+    pass "exec target: list-tasks + every execute-command go to db-shell, none to the ingestion worker"
+}
+
+test_no_db_shell_task_names_service_and_fallback() {
+    local mock_bin
+    mock_bin=$(setup_mock_aws_no_tasks)
+    local output
+    output=$(run_script "$mock_bin" "SELECT 1" || true)
+    if [[ "$output" == *"no running task found for service judgemind-db-shell-dev"* \
+        && "$output" == *"Fix:"* \
+        && "$output" == *"scripts/ecs-run-task.sh"* ]]; then
+        pass "no db-shell task: error names the service and the one-off fallback"
+    else
+        fail "no db-shell task: error names the service and the one-off fallback" "got: $output"
+    fi
+}
+
 # ── Run all ────────────────────────────────────────────────────────────────
 
 test_no_args_shows_usage
@@ -1041,6 +1112,8 @@ test_exec_agent_probe_deadline_msg
 test_probe_hang_times_out_with_fallback_fix
 test_query_hang_times_out_with_fallback_fix
 test_run_with_timeout_passthrough
+test_exec_target_is_db_shell_not_worker
+test_no_db_shell_task_names_service_and_fallback
 
 echo ""
 echo "────────────────────────────────────────────────"

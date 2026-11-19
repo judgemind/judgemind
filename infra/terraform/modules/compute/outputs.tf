@@ -57,3 +57,8 @@ output "ingestion_worker_container_definitions_ssm_parameter_name" {
   description = "SSM parameter holding terraform-rendered container_definitions JSON for the ingestion-worker task (empty if ingestion is not deployed). Pass to .github/actions/ecs-deploy as `desired-container-definitions-ssm-parameter` to make terraform the source of truth on deploy. See #3770."
   value       = local.deploy_ingestion ? aws_ssm_parameter.ingestion_worker_container_definitions[0].name : ""
 }
+
+output "db_shell_service_name" {
+  description = "Name of the db-shell ECS service that scripts/dev-db-query.sh execs into (empty if not deployed). See #5168."
+  value       = local.deploy_db_shell ? aws_ecs_service.db_shell[0].name : ""
+}

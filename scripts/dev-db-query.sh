@@ -2,14 +2,21 @@
 # dev-db-query.sh — Run a SQL query against the dev RDS database via ECS Exec.
 #
 # The dev RDS instance lives in a private VPC subnet and is not reachable from
-# local machines. This script uses ECS Exec to run psql inside the already-
-# running ingestion worker container, which has DATABASE_URL set and network
-# access to the database.
+# local machines. This script uses ECS Exec to run a small Python query runner
+# inside the always-on `judgemind-db-shell-dev` service, which has
+# DATABASE_URL set and network access to the database
+# (infra/terraform/modules/compute/db_shell.tf).
+#
+# It never execs into the live ingestion worker (#5168): each query starts a
+# python3 + SSM session worker in the target container, which cost the worker
+# 20-40 MB of its 512 MB per query (one triggered the OOM kill in #5147), and
+# queries failed whenever the worker restarted. The db-shell service does no
+# work of its own and does not restart on worker deploys.
 #
 # Prerequisites:
 #   - AWS CLI v2 with the Session Manager plugin installed
 #   - Credentials for the judgemind AWS account (155326049300)
-#   - The ingestion worker ECS service must be running with execute command enabled
+#   - The db-shell ECS service must be running (it has execute command enabled)
 #
 # Usage:
 #   scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"
@@ -44,8 +51,9 @@
 set -euo pipefail
 
 CLUSTER="judgemind-dev"
-SERVICE="judgemind-ingestion-worker-dev"
-CONTAINER="ingestion-worker"
+# The exec target. Never the ingestion worker (#5168): see the header.
+SERVICE="judgemind-db-shell-dev"
+CONTAINER="db-shell"
 REGION="us-west-2"
 
 usage() {
@@ -186,8 +194,11 @@ while true; do
     _now=$(date +%s)
     if [[ "$_now" -ge "$_list_tasks_deadline" ]]; then
         echo "Error: no running task found for service $SERVICE in cluster $CLUSTER" >&2
-        echo "Check that the ingestion worker is running:" >&2
-        echo "  aws ecs describe-services --cluster $CLUSTER --services $SERVICE --region $REGION --query 'services[0].runningCount'" >&2
+        echo "Fix: the db-shell service (infra/terraform/modules/compute/db_shell.tf) runs on" >&2
+        echo "FARGATE_SPOT; after a Spot interruption ECS places a new task within a few minutes." >&2
+        echo "  - check it: aws ecs describe-services --cluster $CLUSTER --services $SERVICE --region $REGION --query 'services[0].{running:runningCount,events:events[0:3]}'" >&2
+        echo "  - retry in a minute or two, or run the query as a one-off task:" >&2
+        echo "      scripts/ecs-run-task.sh tmp/q.py   (a small psycopg script reading DATABASE_URL)" >&2
         exit 1
     fi
 

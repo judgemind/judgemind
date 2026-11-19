@@ -106,8 +106,9 @@ def result_bucket() -> str:
     """Return the bucket for large results, or exit 1 if none is configured.
 
     ``DEV_DB_QUERY_RESULT_BUCKET`` overrides; otherwise the container's
-    ``JUDGEMIND_ARCHIVE_BUCKET`` (set on the ingestion worker task, whose
-    role can write anywhere in the archive bucket) is used.
+    ``JUDGEMIND_ARCHIVE_BUCKET`` (set on the db-shell task, which runs with
+    the ingestion worker's task role and so can write anywhere in the
+    archive bucket; #5168) is used.
     """
     bucket = os.environ.get("DEV_DB_QUERY_RESULT_BUCKET") or os.environ.get(
         "JUDGEMIND_ARCHIVE_BUCKET"

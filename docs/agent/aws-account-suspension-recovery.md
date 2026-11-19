@@ -87,7 +87,7 @@ aws rds restore-db-instance-to-point-in-time \
   --no-deletion-protection --availability-zone us-west-2a --region us-west-2
 ```
 
-**Verify the restore before destroying anything.** The DB is in a private VPC, and `scripts/dev-db-query.sh` targets the production hostname, so query the staging endpoint by rewriting the host in `DATABASE_URL` and running it inside the ingestion worker via ECS Exec. Check all five schemas (`derived`, `dispatcher`, `public`, `staging`, `telemetry`) and row counts — especially `public.*` and `telemetry.*`, which are **not** rebuildable from S3.
+**Verify the restore before destroying anything.** The DB is in a private VPC, and `scripts/dev-db-query.sh` targets the production hostname, so query the staging endpoint by rewriting the host in `DATABASE_URL` and running it inside the `judgemind-db-shell-dev` service via ECS Exec (the service `dev-db-query.sh` uses, #5168), or as a one-off with `scripts/ecs-run-task.sh`. Check all five schemas (`derived`, `dispatcher`, `public`, `staging`, `telemetry`) and row counts — especially `public.*` and `telemetry.*`, which are **not** rebuildable from S3.
 
 Then swap identifiers. The `cbmkwssi8nes` infix is stable per account+region, so renaming restores the original hostname exactly and no application config changes:
 

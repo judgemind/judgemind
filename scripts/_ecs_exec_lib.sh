@@ -144,7 +144,8 @@ ecs_exec_run_with_timeout() {
 # Prints (to stderr) a copy-pasteable Fix: block pointing at the
 # scripts/ecs-run-task.sh one-off fallback. That path launches a fresh Fargate
 # task through `aws ecs run-task` and never touches ECS Exec/SSM, so it still
-# works when the Exec session to the running ingestion-worker task is wedged.
+# works when the Exec session to the target task (the db-shell service for
+# dev-db-query.sh, #5168) is wedged.
 ecs_exec_print_fallback_fix() {
     cat >&2 <<'FIX'
 Fix: ECS Exec to this task is stalled (often right after a rollout). Either
