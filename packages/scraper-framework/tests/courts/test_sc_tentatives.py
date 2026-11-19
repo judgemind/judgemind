@@ -1230,8 +1230,15 @@ class TestSantaClaraCourtDirectory:
 
         # S3 upload happens because HeadObject returns 404 (content-addressed key not yet in S3)
         s3_real.put_object.assert_called_once()
-        # But DB commit should NOT happen (dedup)
-        db.commit.assert_not_called()
+        # But no snapshot row is inserted (dedup).  The judge seed still runs
+        # and commits on this path (#5161), so assert on the INSERT.
+        cursor = db.cursor.return_value.__enter__.return_value
+        snapshot_inserts = [
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert snapshot_inserts == []
         # Mapping should still be returned
         assert len(mapping) >= 8
 

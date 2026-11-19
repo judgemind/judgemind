@@ -97,6 +97,12 @@ class CourtDirectory(abc.ABC):
         Skips the DB insert if the content hash matches the most recent
         snapshot for this court (dedup).
 
+        Seeds ``derived.judges`` from the court's latest snapshot on both
+        paths: after a new insert, and when the roster is unchanged (#5161).
+        The seed is idempotent, so an unchanged refresh catches up a court
+        whose snapshot was never seeded or whose judges were rebuilt.  Only
+        a new insert clears the roster name cache.
+
         Parameters
         ----------
         raw : bytes
@@ -152,10 +158,16 @@ class CourtDirectory(abc.ABC):
 
         # Check if the most recent snapshot has the same content hash
         if self._is_duplicate(court_id, content_hash):
+            # Still seed: the stored snapshot may never have been seeded (SB's
+            # old save_snapshot override skipped it) or derived.judges may have
+            # been rebuilt since.  The seed is idempotent (#5161).  The roster
+            # cache is not cleared: the roster itself did not change.
+            judges_seeded = self._seed_judges(court_id)
             logger.info(
                 "Directory unchanged — skipping DB insert",
                 court_id=court_id,
                 content_hash=content_hash[:12],
+                judges_seeded=judges_seeded,
             )
             return False
 
@@ -179,33 +191,14 @@ class CourtDirectory(abc.ABC):
 
         clear_roster_cache()
 
-        # Seed derived.judges from the just-inserted snapshot so that the
-        # single-word surname expansion helper (#4297) has multi-word
-        # canonical-name candidates to expand against.  Best-effort — a
-        # seed failure must not roll back the snapshot insert that
-        # already committed.  See #4370.
-        from ingestion.judge_seed import seed_judges_from_directory_snapshots
-
-        try:
-            seed_stats = seed_judges_from_directory_snapshots(self._conn, only_court_id=court_id)
-            self._conn.commit()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                "Judge seed from snapshot failed — continuing",
-                court_id=court_id,
-            )
-            try:
-                self._conn.rollback()
-            except Exception:  # pragma: no cover
-                pass
-            seed_stats = {"inserted": 0}
+        judges_seeded = self._seed_judges(court_id)
 
         logger.info(
             "Saved directory snapshot",
             court_id=court_id,
             departments=len(mapping),
             content_hash=content_hash[:12],
-            judges_seeded=seed_stats.get("inserted", 0),
+            judges_seeded=judges_seeded,
         )
         return True
 
@@ -308,8 +301,8 @@ class CourtDirectory(abc.ABC):
         would make an empty roster the court's newest snapshot and wipe judge
         attribution. Lookups keep using the last good snapshot, and
         ``framework.roster_health.fetch_roster`` records the attempt as an
-        ``empty_roster`` failure. The check lives here rather than in
-        ``save_snapshot`` because subclasses (SF, SB) override that.
+        ``empty_roster`` failure. The check lives here, at the fetch step,
+        so ``save_snapshot`` stays a plain archive-and-store primitive.
 
         Parameters
         ----------
@@ -337,6 +330,38 @@ class CourtDirectory(abc.ABC):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _seed_judges(self, court_id: str) -> int:
+        """Seed ``derived.judges`` from the court's latest snapshot.
+
+        Gives the single-word surname expansion helper (#4297) multi-word
+        canonical-name candidates to expand against (#4370).  Idempotent, so
+        it runs on every refresh, changed or not (#5161).  Best-effort: a
+        seed failure is logged and rolled back, never raised, so it cannot
+        lose a snapshot insert that already committed.
+
+        Returns
+        -------
+        int
+            The number of judges inserted (0 when the seed failed).
+        """
+        # Lazy import to avoid circular dependency (framework -> ingestion).
+        from ingestion.judge_seed import seed_judges_from_directory_snapshots
+
+        try:
+            seed_stats = seed_judges_from_directory_snapshots(self._conn, only_court_id=court_id)
+            self._conn.commit()
+        except Exception:
+            logger.exception(
+                "Judge seed from snapshot failed — continuing",
+                court_id=court_id,
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+        return seed_stats.get("inserted", 0)
 
     def _is_duplicate(self, court_id: str, content_hash: str) -> bool:
         """Check if the most recent snapshot for this court has the same content hash."""

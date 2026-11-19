@@ -50,17 +50,29 @@ Behaviour
   to the ``derived.courts.id`` UUID via ``court_code`` (with the
   ``_`` -> ``-`` translation that mirrors
   :func:`resolve_judge_from_department`).
+- Skips, deliberately, a snapshot whose court has no ``derived.courts``
+  row (``skipped_no_court``).  Court rows are created only from captured
+  documents (``rebuild_db.py`` ``discover_courts``/``seed_courts`` and the
+  ingestion worker).  A court whose roster is fetched but whose rulings
+  are not scraped, such as Kern (``ca_kern``, ``kern_dept_judges.py``),
+  has no court row, and creating one from a roster alone would show an
+  empty court with judges and no rulings.  Once the court row exists, the
+  next roster refresh seeds it.
 - Reads the **latest** snapshot per ``court_id``.  Historical snapshots
   are not read here — they would already have produced a seed when they
   were the latest, and re-reading them only re-confirms current state.
 
 Wired into:
 
-- :func:`framework.court_directory.CourtDirectory.save_snapshot` after
-  every new-snapshot insert, so each daily directory refresh seeds new
-  judges for its court.
-- :mod:`scripts.seed_judges_from_directory_snapshots` for the
-  retroactive backfill across all courts.
+- :func:`framework.court_directory.CourtDirectory.save_snapshot` on every
+  roster refresh, whether it inserts a new snapshot or finds the roster
+  unchanged (#5161).  Seeding only after a new insert left a court whose
+  stored snapshot was never seeded (San Bernardino, whose ``save_snapshot``
+  override skipped the seed) or whose judges were rebuilt with no way to
+  catch up while its roster stayed the same.
+- ``scripts/seed_roster_judges_dryrun.py`` for a per-court dry run
+  (rolled back) with a near-duplicate audit, or a one-off ``--commit``
+  catch-up across all courts.
 """
 
 from __future__ import annotations
@@ -191,7 +203,10 @@ def seed_judges_from_directory_snapshots(
         - ``skipped_existing``: candidates that were already present.
         - ``skipped_invalid``: names that failed the validity guard.
         - ``skipped_no_court``: snapshots whose ``court_id`` did not
-          resolve to a row in ``derived.courts``.
+          resolve to a row in ``derived.courts``.  Expected for a court
+          whose roster is fetched but whose rulings are not scraped, such
+          as Kern: court rows come only from captured documents (see the
+          module docstring).
     """
     # Lazy import to avoid circular dependency with ingestion.db.
     from ingestion.db import (
@@ -216,10 +231,15 @@ def seed_judges_from_directory_snapshots(
         stats["courts"] += 1
         court_uuid = _resolve_court_uuid(conn, snapshot_court_id)
         if court_uuid is None:
+            # Deliberate, not an error: court rows come only from captured
+            # documents, so a court whose roster is fetched but whose rulings
+            # are not scraped (Kern) has none.  Seeding judges into a court
+            # created from a roster alone would show an empty court.  The
+            # next roster refresh after the court row appears seeds it (#5161).
             stats["skipped_no_court"] += 1
-            logger.warning(
+            logger.info(
                 "seed_judges_from_directory_snapshots: no derived.courts row "
-                "for snapshot court_id=%r — skipping",
+                "for snapshot court_id=%r (no captured documents yet) — skipping",
                 snapshot_court_id,
             )
             continue
