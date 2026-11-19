@@ -55,6 +55,26 @@ Always pop by explicit ref: run `git stash list` first, confirm `stash@{0}`'s su
 
 ---
 
+## Other hook rules agents hit
+
+### Long-running commands need `timeout: 600000`
+
+The hook blocks a long-running command whose Bash `timeout` is missing or below 300000: `pytest` (including `python -m pytest`), `pip install` (including `pip3`, `python -m pip`, `uv pip`), `npm install`, `npm run build`, `gh run watch`, `ruff check` on `src/`, `tests/` or `.`, and `terraform ... apply`. The resumable wait helpers (`scripts/wait-for-ci.sh` and friends) need at least 540000.
+
+These words count only as the **command word** of a simple command: the first word after `VAR=value` assignments and wrappers such as `env`, `time`, `timeout <n>` and `uv run`, including after `&&`, `|`, `;` or `(`. They do not count inside arguments, so `grep -n pytest f`, `git grep -n "pip install"` and `gh issue create --title "fix pytest flake"` need no timeout (#5155).
+
+### In-place `sed`
+
+`sed -i '' 's/a/b/' file` and the macOS form with flags after the empty suffix (`sed -i '' -e 's/a/b/' file`) are allowed (#5155). The empty-quotes-before-a-flag rule exempts the empty `''` / `""` that is the argument of sed's `-i`.
+
+A `sed -i ''` chained with `&&` or `;` is still blocked by the quoted-strings rule. Run the `sed` alone in its own Bash call, then the next command in another. For anything beyond a one-line mechanical substitution, use the Edit tool.
+
+### `awk`
+
+The preflight hook does not block `awk` in any form. If `awk -f <file>` or `awk --version` is refused inside a worktree with a message like "This agent is isolated in the worktree ... what it runs cannot be shown not to be git", that refusal comes from Claude Code's own worktree-isolation check, not from this hook: `awk` can run shell commands through `system()`, so Claude Code cannot prove the command stays out of git. (Verified 2026-11-18: `awk --version` in a worktree agent got this refusal while the hook allowed it.) Run the same logic as a script file under `{worktree}/tmp/` or `scripts/`, or use `grep` / `sed` for simple extraction. The same check refuses a plain `bash ...` invocation.
+
+---
+
 ## Fargate scope
 
 **Four safety-critical rules remain enforced** in the Fargate dispatcher container (`Dockerfile.dispatcher`):

@@ -38,8 +38,13 @@ def run_test(
     timeout: int | None = None,
     run_in_background: bool = False,
     cwd_override: str | None = None,
+    stderr_contains: str | None = None,
 ) -> None:
-    """Run the hook with a given command and assert the exit code."""
+    """Run the hook with a given command and assert the exit code.
+
+    When ``stderr_contains`` is given, the hook's stderr must also contain
+    that text (used to pin what a block message tells the agent to do).
+    """
     global passed, failed
     tool_input: dict = {"command": command}
     if timeout is not None:
@@ -57,13 +62,16 @@ def run_test(
         text=True,
         env=env,
     )
-    if result.returncode == expect_exit:
+    stderr_ok = stderr_contains is None or stderr_contains in result.stderr
+    if result.returncode == expect_exit and stderr_ok:
         print(f"  PASS: {description}")
         passed += 1
     else:
         print(
             f"  FAIL: {description} (expected exit={expect_exit}, got exit={result.returncode})"
         )
+        if not stderr_ok:
+            print(f"        stderr missing expected text: {stderr_contains!r}")
         if result.stderr:
             print(f"        stderr: {result.stderr.strip()}")
         failed += 1
@@ -148,6 +156,20 @@ run_test(
     "real semicolon-separated with quotes on one side still blocked (#2589 AC2)",
     f"echo hi; echo {SQ}bye{SQ}",
     2,
+)
+
+# Issue #5155: `sed -i '' ... && ...` stays blocked (the rule is real), but
+# the message names the two ways out: run the sed alone, or use Edit.
+run_test(
+    "sed -i '' chained with && still blocked, message names the Edit tool (#5155)",
+    f"sed -i {SQ}{SQ} {SQ}s/a/b/{SQ} f.txt && git add f.txt",
+    2,
+    stderr_contains="use the Edit tool",
+)
+run_test(
+    "sed -i '' alone in its own call allowed (#5155)",
+    f"sed -i {SQ}{SQ} {SQ}s/a/b/{SQ} f.txt",
+    0,
 )
 
 # --- Check 5: cd in compound commands ---
@@ -266,6 +288,45 @@ run_test(
 run_test(
     "obfuscated '' -rf outside SQL still blocked (#2049)",
     f"rm {SQ}{SQ} -rf /tmp/important",
+    2,
+)
+
+# Issue #5155: the macOS in-place form puts an empty backup suffix before a
+# flag (`sed -i '' -e ...`). The empty quotes that are the argument of sed's
+# -i flag are exempt; empty quotes anywhere else before a flag are not.
+run_test(
+    "sed -i '' -e allowed (macOS in-place form, #5155)",
+    f"sed -i {SQ}{SQ} -e {SQ}s/a/b/{SQ} f.txt",
+    0,
+)
+run_test(
+    'sed -i "" -E allowed (double-quoted empty suffix, #5155)',
+    f"sed -i {DQ}{DQ} -E {SQ}s/a+/b/{SQ} f.txt",
+    0,
+)
+run_test(
+    "sed -n -i '' -e allowed (other flags before -i, #5155)",
+    f"sed -n -i {SQ}{SQ} -e {SQ}s/a/b/p{SQ} f.txt",
+    0,
+)
+run_test(
+    "sed -Ei '' -e allowed (combined flag ending in i, #5155)",
+    f"sed -Ei {SQ}{SQ} -e {SQ}s/a+/b/{SQ} f.txt",
+    0,
+)
+run_test(
+    "empty quotes before a flag NOT after sed -i still blocked (#5155)",
+    f"sed {SQ}s/a/b/{SQ} {SQ}{SQ} -i f.txt",
+    2,
+)
+run_test(
+    "rm -i '' -rf still blocked (exemption is sed-only, #5155)",
+    f"rm -i {SQ}{SQ} -rf /important",
+    2,
+)
+run_test(
+    "word ending in sed does not get the exemption (#5155)",
+    f"unsed -i {SQ}{SQ} -rf /important",
     2,
 )
 
@@ -464,6 +525,179 @@ run_test(
     "ruff format allowed without timeout",
     ".venv/bin/ruff format --check src/ tests/",
     0,
+)
+
+# Issue #5155: the long-running words count only in command position, never
+# inside an argument. Each now-allowed case is paired with a still-blocked one.
+run_test(
+    "gh issue create with pytest in quoted title allowed at timeout 60000 (#5155 AC1)",
+    f"gh issue create --title {DQ}x pytest y{DQ} --body-file f",
+    0,
+    timeout=60000,
+)
+run_test(
+    "gh issue create with pytest in quoted title allowed without timeout (#5155)",
+    f"gh issue create --title {DQ}fix: pytest flake{DQ} --body-file f",
+    0,
+)
+run_test(
+    "git grep for pip install allowed without timeout (#5155 AC1)",
+    f"git grep -n {DQ}pip install{DQ}",
+    0,
+)
+run_test(
+    "git grep for pip install.*ruff allowed without timeout (#5155)",
+    f"git grep -n {DQ}pip install.*ruff{DQ}",
+    0,
+)
+run_test(
+    "unquoted grep -n pytest allowed without timeout (#5155)",
+    "grep -n pytest .claude/hooks/test_preflight_hook.py",
+    0,
+)
+run_test(
+    "sed over a file mentioning pip install allowed without timeout (#5155)",
+    f"sed -n {SQ}/pip install/p{SQ} docs/agent/local-dev.md",
+    0,
+)
+run_test(
+    "pytest path as an argument (ls) allowed without timeout (#5155)",
+    "ls packages/api/.venv/bin/pytest",
+    0,
+)
+run_test(
+    "terraform apply word in a grep argument allowed without timeout (#5155)",
+    "grep -rn terraform docs/agent/infrastructure-reference.md --include apply",
+    0,
+)
+run_test(
+    "npm install word in a gh comment body arg allowed without timeout (#5155)",
+    f"gh issue comment 1 --body {DQ}run npm install first{DQ}",
+    0,
+)
+run_test(
+    "pytest tests/ still requires a timeout (#5155 AC1)",
+    "pytest tests/",
+    2,
+)
+run_test(
+    "pytest tests/ with timeout 60000 still blocked (#5155)",
+    "pytest tests/",
+    2,
+    timeout=60000,
+)
+run_test(
+    "pytest after env assignments still blocked (#5155)",
+    "PYTHONPATH=src FOO=1 .venv/bin/pytest -q",
+    2,
+)
+run_test(
+    "pytest after a pipe still blocked (#5155)",
+    "echo x | pytest -q",
+    2,
+)
+run_test(
+    "pytest after && still blocked (#5155)",
+    "ls && .venv/bin/pytest -q",
+    2,
+)
+run_test(
+    "pytest in a subshell still blocked (#5155)",
+    "(pytest -q)",
+    2,
+)
+run_test(
+    "pytest with quoted -k arg still blocked (#5155)",
+    f".venv/bin/pytest tests/ -k {DQ}test_a or test_b{DQ}",
+    2,
+)
+run_test(
+    "python -m pytest still blocked (#5155)",
+    ".venv/bin/python -m pytest tests/",
+    2,
+)
+run_test(
+    "python3.12 -m pytest still blocked (#5155)",
+    "python3.12 -m pytest tests/",
+    2,
+)
+run_test(
+    "env wrapper before pytest still blocked (#5155)",
+    "env -i FOO=1 pytest -q",
+    2,
+)
+run_test(
+    "time wrapper before pytest still blocked (#5155)",
+    "time pytest -q",
+    2,
+)
+run_test(
+    "timeout wrapper before pytest still blocked (#5155)",
+    "timeout 300 pytest -q",
+    2,
+)
+run_test(
+    "uv run pytest still blocked (#5155)",
+    "uv run pytest -q",
+    2,
+)
+run_test(
+    "pip3 install still blocked (#5155)",
+    "pip3 install requests",
+    2,
+)
+run_test(
+    "python -m pip install still blocked (#5155)",
+    "python3 -m pip install -e .",
+    2,
+)
+run_test(
+    "uv pip install still blocked (#5155)",
+    "uv pip install -e .",
+    2,
+)
+run_test(
+    "npm --prefix dir run build still blocked (#5155)",
+    "npm --prefix packages/web run build",
+    2,
+)
+run_test(
+    "ruff check after && still blocked on src/ (#5155)",
+    "ls && .venv/bin/ruff check src/",
+    2,
+)
+run_test(
+    "ruff check . still blocked (#5155)",
+    "ruff check .",
+    2,
+)
+run_test(
+    "terraform -chdir apply still blocked (#5155)",
+    "terraform -chdir=infra/terraform/environments/dev apply",
+    2,
+)
+run_test(
+    "gh run watch after && still blocked (#5155)",
+    "ls && gh run watch 123 --interval 60",
+    2,
+)
+
+# Issue #5155: this hook does not block awk. A refusal of `awk -f` inside a
+# worktree comes from Claude Code's own worktree-isolation check, not from
+# here (see docs/agent/interactive-shell-rules.md). Pin that the hook allows
+# both forms, from a worktree cwd.
+AWK_WT_CWD = "/Users/test/judgemind/judgemind-bootstrap/.claude/worktrees/agent-x"
+run_test(
+    "awk -f <file> allowed from a worktree (#5155)",
+    "awk -f scripts/_tf_archive_lifecycle_expiry.awk infra/terraform/main.tf",
+    0,
+    cwd_override=AWK_WT_CWD,
+)
+run_test(
+    "awk --version allowed from a worktree (#5155)",
+    "awk --version",
+    0,
+    cwd_override=AWK_WT_CWD,
 )
 
 # --- Check 9: run_in_background inside worktree subagents ---
