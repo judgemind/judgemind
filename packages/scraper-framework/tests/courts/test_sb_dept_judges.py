@@ -17,7 +17,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -300,12 +300,15 @@ class TestSanBernardinoCourtDirectory:
         assert len(mapping) >= 30
         assert mapping["R1"] == "James J. Hosking"
 
-    @respx.mock
-    def test_save_snapshot_uses_pdf_content_type(self) -> None:
-        """save_snapshot uploads with application/pdf content type."""
-        pdf_bytes = _load_pdf("sb_schedule_assignments.pdf")
+    @staticmethod
+    def _directory_with_mocks() -> tuple[SanBernardinoCourtDirectory, MagicMock, MagicMock]:
+        """An SB directory whose S3 HeadObject 404s and whose DB has no snapshot."""
+        from botocore.exceptions import ClientError
 
         mock_s3 = MagicMock()
+        mock_s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+        )
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
@@ -317,9 +320,46 @@ class TestSanBernardinoCourtDirectory:
             s3_bucket="test-bucket",
             db_conn=mock_conn,
         )
+        return directory, mock_s3, mock_conn
 
-        directory.save_snapshot(pdf_bytes, {"R1": "Test Judge"}, "ca_san_bernardino")
+    def test_save_snapshot_uses_pdf_content_type(self) -> None:
+        """save_snapshot uploads the PDF under a content-addressed .pdf key
+        with application/pdf content type (base class behaviour, #5161)."""
+        from framework.hashing import sha256_hex
+
+        pdf_bytes = _load_pdf("sb_schedule_assignments.pdf")
+        directory, mock_s3, _ = self._directory_with_mocks()
+
+        with patch(
+            "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+            return_value={"inserted": 0},
+        ):
+            directory.save_snapshot(pdf_bytes, {"R1": "Test Judge"}, "ca_san_bernardino")
 
         put_call = mock_s3.put_object.call_args
         assert put_call.kwargs["ContentType"] == "application/pdf"
-        assert put_call.kwargs["Key"].endswith(".pdf")
+        assert put_call.kwargs["Key"] == (
+            f"directories/ca_san_bernardino/{sha256_hex(pdf_bytes)}.pdf"
+        )
+
+    def test_save_snapshot_seeds_judges_on_new_snapshot(self) -> None:
+        """A new SB snapshot seeds derived.judges for SB (#5161).
+
+        SB used to override save_snapshot with a copy that predated the seed
+        (#4370), so its roster judges were never seeded.
+        """
+        pdf_bytes = _load_pdf("sb_schedule_assignments.pdf")
+        directory, _, mock_conn = self._directory_with_mocks()
+
+        with (
+            patch("ingestion.db.clear_roster_cache") as clear_cache,
+            patch(
+                "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+                return_value={"inserted": 1},
+            ) as mock_seed,
+        ):
+            inserted = directory.save_snapshot(pdf_bytes, {"R1": "Test Judge"}, "ca_san_bernardino")
+
+        assert inserted is True
+        mock_seed.assert_called_once_with(mock_conn, only_court_id="ca_san_bernardino")
+        clear_cache.assert_called_once()

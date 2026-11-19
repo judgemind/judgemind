@@ -544,15 +544,35 @@ class TestSFCourtDirectory:
         clear_cache.assert_called_once()
 
     def test_save_snapshot_uses_pdf_content_type(self) -> None:
-        """PDF snapshots (legacy fallback) upload with application/pdf content type."""
+        """PDF snapshots (legacy fallback) upload under a content-addressed
+        .pdf key with application/pdf content type, and seed derived.judges
+        like any other new snapshot (#5161)."""
+        from botocore.exceptions import ClientError
+
+        from framework.hashing import sha256_hex
+
         pdf_bytes = _load_pdf("sf_dept_listing.pdf")
         mock_s3 = MagicMock()
-        directory = SFCourtDirectory(
-            s3_client=mock_s3, s3_bucket="test-bucket", db_conn=_mock_db_conn()
+        mock_s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
         )
+        db_conn = _mock_db_conn()
+        directory = SFCourtDirectory(s3_client=mock_s3, s3_bucket="test-bucket", db_conn=db_conn)
 
-        directory.save_snapshot(pdf_bytes, {"301": "Test Judge"}, "ca_san_francisco")
+        with (
+            patch("ingestion.db.clear_roster_cache") as clear_cache,
+            patch(
+                "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+                return_value={"inserted": 1},
+            ) as mock_seed,
+        ):
+            inserted = directory.save_snapshot(pdf_bytes, {"301": "Test Judge"}, "ca_san_francisco")
 
+        assert inserted is True
         put_call = mock_s3.put_object.call_args
         assert put_call.kwargs["ContentType"] == "application/pdf"
-        assert put_call.kwargs["Key"].endswith(".pdf")
+        assert put_call.kwargs["Key"] == (
+            f"directories/ca_san_francisco/{sha256_hex(pdf_bytes)}.pdf"
+        )
+        mock_seed.assert_called_once_with(db_conn, only_court_id="ca_san_francisco")
+        clear_cache.assert_called_once()

@@ -691,8 +691,15 @@ class TestLACourtDirectory:
         # S3 upload happens because HeadObject returns 404 (content-addressed key not yet in S3)
         mock_s3.put_object.assert_called_once()
 
-        # But commit should NOT be called (duplicate detected in DB)
-        mock_db.commit.assert_not_called()
+        # But no snapshot row is inserted (duplicate detected in DB).  The
+        # judge seed still runs and commits on this path (#5161), so assert
+        # on the INSERT rather than on commit.
+        snapshot_inserts = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert snapshot_inserts == []
 
     @respx.mock
     def test_fetch_current_http_error_raises(self) -> None:

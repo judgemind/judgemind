@@ -441,10 +441,11 @@ class SanBernardinoCourtDirectory(CourtDirectory):
 
     Implements ``CourtDirectory.fetch_current()`` by downloading the schedule of
     assignments PDF and parsing the CALENDAR OF ASSIGNMENTS summary pages.
-    The base class handles S3 archival, DB storage, and content-hash deduplication.
-
-    Overrides ``save_snapshot()`` to use ``application/pdf`` content type and
-    ``.pdf`` S3 key extension instead of the base class defaults.
+    The base class handles S3 archival (a content-addressed ``.pdf`` key with
+    ``application/pdf`` content type, since the raw is a PDF), DB storage,
+    content-hash deduplication, and the judge seed.  Do not override
+    ``save_snapshot()``: a copy here once skipped the judge seed, so SB's
+    roster judges were never seeded (#5161).
 
     Parameters
     ----------
@@ -482,86 +483,6 @@ class SanBernardinoCourtDirectory(CourtDirectory):
             A tuple of (raw_pdf_bytes, dept_to_judge_mapping).
         """
         return _fetch_and_parse_directory(self._timeout)
-
-    def save_snapshot(
-        self,
-        raw: bytes,
-        mapping: dict[str, str],
-        court_id: str,
-    ) -> bool:
-        """Archive a PDF directory snapshot to S3 and DB.
-
-        Overrides the base class to use ``application/pdf`` content type and
-        ``.pdf`` S3 key extension.
-
-        Parameters
-        ----------
-        raw : bytes
-            The raw PDF content.
-        mapping : dict[str, str]
-            The parsed {department: judge_name} mapping.
-        court_id : str
-            The court identifier.
-
-        Returns
-        -------
-        bool
-            True if a new snapshot was inserted, False if deduplicated.
-        """
-        import json
-        from datetime import UTC, datetime
-
-        from framework.hashing import sha256_hex
-
-        content_hash = sha256_hex(raw)
-        now = datetime.now(UTC)
-        s3_key = f"directories/{court_id}/{now.strftime('%Y%m%dT%H%M%SZ')}.pdf"
-
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=s3_key,
-            Body=raw,
-            ContentType="application/pdf",
-            Metadata={
-                "court-id": court_id,
-                "content-hash": content_hash,
-                "captured-at": now.isoformat(),
-            },
-        )
-        logger.info(
-            "Archived directory PDF to S3",
-            court_id=court_id,
-            s3_key=s3_key,
-            size=len(raw),
-        )
-
-        if self._is_duplicate(court_id, content_hash):
-            logger.info(
-                "Directory unchanged -- skipping DB insert",
-                court_id=court_id,
-                content_hash=content_hash[:12],
-            )
-            return False
-
-        mapping_json = json.dumps(mapping, sort_keys=True)
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO court_directory_snapshots
-                    (court_id, captured_at, s3_key, mapping, content_hash)
-                VALUES (%s, %s, %s, %s::jsonb, %s)
-                """,
-                (court_id, now, s3_key, mapping_json, content_hash),
-            )
-        self._conn.commit()
-
-        logger.info(
-            "Saved directory snapshot",
-            court_id=court_id,
-            departments=len(mapping),
-            content_hash=content_hash[:12],
-        )
-        return True
 
     def fetch_and_snapshot(self, court_id: str | None = None) -> dict[str, str]:
         """Fetch the live directory and save a snapshot.

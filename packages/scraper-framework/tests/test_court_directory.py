@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
@@ -197,10 +199,23 @@ class TestSaveSnapshot:
         cursor = directory._conn.cursor.return_value.__enter__.return_value
         cursor.fetchone.return_value = (content_hash,)  # same hash
 
-        result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+        # The judge seed still runs (and commits) on this path (#5161); it is
+        # patched out so only the snapshot write is under test here.
+        from unittest.mock import patch
+
+        with patch(
+            "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+            return_value={"inserted": 0},
+        ):
+            result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
         assert result is False
-        directory._conn.commit.assert_not_called()
+        snapshot_inserts = [
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO court_directory_snapshots" in c.args[0]
+        ]
+        assert snapshot_inserts == []
 
     def test_inserts_when_different_hash(self, directory: _StubDirectory) -> None:
         """When content_hash differs from latest, insert a new snapshot."""
@@ -356,20 +371,49 @@ class TestSaveSnapshot:
             # court_id.
             mock_seed.assert_called_once_with(directory._conn, only_court_id=COURT_ID)
 
-    def test_skips_seed_when_snapshot_is_duplicate(self, directory: _StubDirectory) -> None:
-        """When the snapshot is a duplicate (no new DB row), the seeder is
-        not called — there's no new mapping to seed from."""
+    def test_seeds_judges_when_snapshot_is_duplicate(self, directory: _StubDirectory) -> None:
+        """An unchanged roster (no new DB row) still seeds judges (#5161).
+
+        The latest snapshot may never have been seeded (San Bernardino's
+        save_snapshot override skipped the seed), or derived.judges may have
+        been rebuilt since.  The seed is idempotent, so running it on every
+        refresh catches those courts up.
+        """
         from unittest.mock import patch
 
         cursor = directory._conn.cursor.return_value.__enter__.return_value
         # _is_duplicate sees the same content_hash -> duplicate.
         cursor.fetchone.return_value = (sha256_hex(RAW_HTML),)
 
-        with patch("ingestion.judge_seed.seed_judges_from_directory_snapshots") as mock_seed:
+        with patch(
+            "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+            return_value={"inserted": 3},
+        ) as mock_seed:
             result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
             assert result is False
-            mock_seed.assert_not_called()
+            mock_seed.assert_called_once_with(directory._conn, only_court_id=COURT_ID)
+        directory._conn.commit.assert_called_once()
+
+    def test_seed_failure_on_duplicate_does_not_break_save_snapshot(
+        self, directory: _StubDirectory
+    ) -> None:
+        """A seed failure on the unchanged-roster path is logged, rolled
+        back, and does not raise."""
+        from unittest.mock import patch
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (sha256_hex(RAW_HTML),)
+
+        with patch(
+            "ingestion.judge_seed.seed_judges_from_directory_snapshots",
+            side_effect=RuntimeError("simulated seed failure"),
+        ):
+            result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        assert result is False
+        directory._conn.rollback.assert_called_once()
+        directory._conn.commit.assert_not_called()
 
     def test_seed_failure_does_not_break_save_snapshot(self, directory: _StubDirectory) -> None:
         """A seed failure must not roll back the snapshot insert that
@@ -566,3 +610,94 @@ class TestGetMappingForDate:
         cursor.execute.assert_called_once()
         sql, params = cursor.execute.call_args.args
         assert params == (COURT_ID, as_of)
+
+
+# ---------------------------------------------------------------------------
+# Real Postgres: an unchanged roster refresh seeds missing judges (#5161)
+# ---------------------------------------------------------------------------
+
+_DSN = os.environ.get("TEST_DATABASE_URL", "")
+
+
+@pytest.mark.skipif(not _DSN, reason="TEST_DATABASE_URL not set")
+class TestUnchangedRosterSeedsMissingJudgesPg:
+    """Real Postgres: ``fetch_and_snapshot`` on a roster whose content hash
+    matches the stored snapshot inserts no snapshot row but still seeds the
+    roster judges missing from ``judges`` (#5161).
+
+    San Bernardino's latest snapshot was stored without a seed, and every
+    later refresh was unchanged, so its 60 roster judges were never seeded.
+    """
+
+    def test_unchanged_roster_seeds_missing_judge(self) -> None:
+        import psycopg
+
+        suffix = uuid.uuid4().hex[:12]
+        court_code = f"ca-seed5161-{suffix}"
+        snapshot_court_id = court_code.replace("-", "_")
+        raw = f"<html>roster {suffix}</html>".encode()
+        mapping = {"1": "Alice M. Rosterseed", "2": "Bob Q. Presentjudge"}
+
+        conn = psycopg.connect(_DSN, autocommit=False)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO courts (state, county, court_name, court_code) "
+                    "VALUES ('CA', 'Seed5161', 'Superior Court', %s) RETURNING id",
+                    (court_code,),
+                )
+                court_uuid = str(cur.fetchone()[0])
+                # The roster as already stored: same content hash, so the
+                # refresh below is a duplicate.  It was never seeded.
+                cur.execute(
+                    "INSERT INTO court_directory_snapshots "
+                    "(court_id, captured_at, s3_key, mapping, content_hash) "
+                    "VALUES (%s, NOW(), %s, %s::jsonb, %s)",
+                    (
+                        snapshot_court_id,
+                        f"directories/{snapshot_court_id}/{sha256_hex(raw)}.html",
+                        json.dumps(mapping),
+                        sha256_hex(raw),
+                    ),
+                )
+                cur.execute(
+                    "INSERT INTO judges (canonical_name, court_id) VALUES (%s, %s::uuid)",
+                    ("Bob Q. Presentjudge", court_uuid),
+                )
+            conn.commit()
+
+            s3 = MagicMock()  # head_object succeeds: raw already archived
+            directory = _StubDirectory(
+                s3_client=s3, s3_bucket="test-bucket", db_conn=conn, raw=raw, mapping=mapping
+            )
+
+            result = directory.fetch_and_snapshot(snapshot_court_id)
+
+            assert result == mapping
+            s3.put_object.assert_not_called()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM court_directory_snapshots WHERE court_id = %s",
+                    (snapshot_court_id,),
+                )
+                assert cur.fetchone()[0] == 1
+                cur.execute(
+                    "SELECT canonical_name FROM judges WHERE court_id = %s::uuid "
+                    "ORDER BY canonical_name",
+                    (court_uuid,),
+                )
+                names = [row[0] for row in cur.fetchall()]
+            assert names == ["Alice M. Rosterseed", "Bob Q. Presentjudge"]
+        finally:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM courts WHERE court_code = %s", (court_code,))
+                for (cleanup_court,) in cur.fetchall():
+                    cur.execute("DELETE FROM judges WHERE court_id = %s", (cleanup_court,))
+                    cur.execute("DELETE FROM courts WHERE id = %s", (cleanup_court,))
+                cur.execute(
+                    "DELETE FROM court_directory_snapshots WHERE court_id = %s",
+                    (snapshot_court_id,),
+                )
+            conn.commit()
+            conn.close()
