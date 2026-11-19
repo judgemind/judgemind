@@ -287,7 +287,7 @@ def test_read_fails_permanently_live_message_is_acked_without_retry(sleeps: Any)
 def test_read_fails_transiently_live_message_is_retried_then_dead_lettered(sleeps: Any) -> None:
     worker = _live_worker(_client_error("ServiceUnavailable"))
     worker._process_event_data(b"1-0", _child())
-    assert worker.process_event.call_count == worker._max_retries
+    assert worker.process_event.call_count == worker._max_attempts
     worker._ack.assert_called_once_with(b"1-0")
     reasons = [c.args[1] for c in worker._record_incomplete_and_commit.call_args_list]
     assert reasons == ["dead_letter"]

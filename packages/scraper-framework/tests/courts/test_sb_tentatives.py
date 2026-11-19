@@ -397,7 +397,7 @@ def test_sb_run_handles_get_failure() -> None:
     respx.get(INDEX_URL).mock(return_value=httpx.Response(503))
 
     config = sb_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = SBTentativeRulingsScraper(config=config)
     health = scraper.run()

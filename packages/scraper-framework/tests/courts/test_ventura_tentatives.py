@@ -370,7 +370,7 @@ def test_ventura_run_handles_get_failure() -> None:
     respx.get(SEARCH_URL).mock(return_value=httpx.Response(503))
 
     config = ventura_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = VenturaTentativeRulingsScraper(
         config=config,
@@ -390,7 +390,7 @@ def test_ventura_run_handles_missing_token() -> None:
     )
 
     config = ventura_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = VenturaTentativeRulingsScraper(
         config=config,
@@ -661,7 +661,7 @@ def test_ventura_search_date_error() -> None:
     respx.post(SEARCH_URL).mock(return_value=httpx.Response(500))
 
     config = ventura_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = VenturaTentativeRulingsScraper(
         config=config,
@@ -687,7 +687,7 @@ def test_ventura_search_date_error_with_other_date_empty_is_counted() -> None:
     )
 
     config = ventura_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = VenturaTentativeRulingsScraper(
         config=config,
@@ -718,7 +718,7 @@ def test_ventura_run_fails_when_every_document_fetch_fails() -> None:
     respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(return_value=httpx.Response(503))
 
     config = ventura_default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = VenturaTentativeRulingsScraper(
         config=config,

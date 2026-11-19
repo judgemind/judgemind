@@ -56,7 +56,7 @@ class TestSDProxyAuthDiagnosisWiring:
 
         diag = MagicMock()
         monkeypatch.setattr(sd_mod, "diagnose_and_log_proxy_auth", diag)
-        monkeypatch.setattr(sd_mod, "CF_MAX_RETRIES", 1)
+        monkeypatch.setattr(sd_mod, "CF_MAX_ATTEMPTS", 1)
 
         page = AsyncMock()
         page.goto = AsyncMock(side_effect=RuntimeError("net::ERR_TIMED_OUT"))
@@ -77,7 +77,7 @@ class TestSDProxyAuthDiagnosisWiring:
 
         diag = MagicMock()
         monkeypatch.setattr(sd_mod, "diagnose_and_log_proxy_auth", diag)
-        monkeypatch.setattr(sd_mod, "CF_MAX_RETRIES", 1)
+        monkeypatch.setattr(sd_mod, "CF_MAX_ATTEMPTS", 1)
 
         page = AsyncMock()
         page.goto = AsyncMock(side_effect=RuntimeError("net::ERR_TIMED_OUT"))
@@ -99,7 +99,7 @@ class TestSFProxyAuthDiagnosisWiring:
 
         diag = MagicMock()
         monkeypatch.setattr(sf_mod, "diagnose_and_log_proxy_auth", diag)
-        monkeypatch.setattr(sf_mod, "SESSION_MAX_RETRIES", 1)
+        monkeypatch.setattr(sf_mod, "SESSION_MAX_ATTEMPTS", 1)
 
         async def _fail_try_acquire(_pw: Any) -> str | None:
             return None
@@ -122,7 +122,7 @@ class TestSFProxyAuthDiagnosisWiring:
 
         diag = MagicMock()
         monkeypatch.setattr(sf_mod, "diagnose_and_log_proxy_auth", diag)
-        monkeypatch.setattr(sf_mod, "SESSION_MAX_RETRIES", 1)
+        monkeypatch.setattr(sf_mod, "SESSION_MAX_ATTEMPTS", 1)
 
         async def _fail_try_acquire(_pw: Any) -> str | None:
             return None

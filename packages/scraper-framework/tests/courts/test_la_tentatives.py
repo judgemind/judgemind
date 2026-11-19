@@ -533,7 +533,7 @@ def test_run_handles_get_failure() -> None:
     respx.get(CIVIL_URL).mock(return_value=httpx.Response(503))
 
     config = default_config()
-    config.max_retries = 1
+    config.max_attempts = 1
     config.request_delay_seconds = 0
     scraper = LATentativeRulingsScraper(config=config)
     health = scraper.run()
@@ -564,7 +564,7 @@ def test_run_retries_a_transient_post_failure() -> None:
 
     config = default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     scraper = LATentativeRulingsScraper(config=config)
     health = scraper.run()
 
@@ -629,7 +629,7 @@ def test_full_run_stale_viewstate_not_counted() -> None:
 
     config = default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     scraper = LATentativeRulingsScraper(config=config)
     health = scraper.run()
 
@@ -648,7 +648,7 @@ def test_run_fails_when_every_post_raises() -> None:
 
     config = default_config()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = LATentativeRulingsScraper(config=config).run()
 
     assert health.success is False
@@ -3748,7 +3748,7 @@ def test_appellate_run_fails_when_every_post_is_stale_viewstate() -> None:
 
     config = default_config_appellate()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = LAAppellateTentativeRulingsScraper(config=config).run()
 
     assert health.success is False
@@ -3810,7 +3810,7 @@ def test_appellate_run_fails_when_every_post_raises() -> None:
 
     config = default_config_appellate()
     config.request_delay_seconds = 0
-    config.max_retries = 1
+    config.max_attempts = 1
     health = LAAppellateTentativeRulingsScraper(config=config).run()
 
     assert health.success is False

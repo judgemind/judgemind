@@ -301,7 +301,7 @@ class TestPipelineEndToEnd:
         """If every Phase 1 calendar fetch fails, the pipeline records a
         failed run with the reason, not success/0 (#4693)."""
         config = _make_config()
-        config.max_retries = 1
+        config.max_attempts = 1
         scraper = SDPipelineScraper(config, day_numbers=[1])
 
         # All calendar pages return 500
@@ -324,7 +324,7 @@ class TestPipelineEndToEnd:
             court="Superior Court",
             target_urls=[CALENDAR_BASE_URL],
             request_delay_seconds=0.0,
-            max_retries=1,
+            max_attempts=1,
         )
         scraper = SDPipelineScraper(config, day_numbers=[1])
 
@@ -372,7 +372,7 @@ class TestPipelineEndToEnd:
             court="Superior Court",
             target_urls=[CALENDAR_BASE_URL],
             request_delay_seconds=0.0,
-            max_retries=1,
+            max_attempts=1,
         )
         archiver = MagicMock()
         archiver.archive.return_value = "ca/san-diego/key.html"

@@ -731,7 +731,7 @@ class TestSFCivilScraperRun:
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        config.max_retries = 1
+        config.max_attempts = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=TEST_SESSION_ID,
@@ -951,7 +951,7 @@ class TestSFCivilScraperRun:
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        config.max_retries = 1
+        config.max_attempts = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=TEST_SESSION_ID,
@@ -1036,7 +1036,7 @@ class TestSFCivilScraperRun:
         config.request_delay_seconds = 0
         # Keep a single attempt so the unit test stays fast; retry behavior
         # is exercised in TestSessionAcquisition.
-        config.max_retries = 1
+        config.max_attempts = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=None,
@@ -1082,8 +1082,8 @@ class TestRunHealthOnSessionFailure:
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
         # Keep retries at 1 so the test stays fast — the base runner's
-        # retry_sync wraps fetch_documents with config.max_retries.
-        config.max_retries = 1
+        # retry_sync wraps fetch_documents with config.max_attempts.
+        config.max_attempts = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=None,
@@ -1121,7 +1121,7 @@ class TestRunHealthOnSessionFailure:
         """
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        config.max_retries = 1
+        config.max_attempts = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=None,
@@ -1179,7 +1179,7 @@ class TestSessionAcquisition:
         scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
         result = asyncio.run(scraper._acquire_session())
         assert result is None
-        assert call_count == 3  # SESSION_MAX_RETRIES
+        assert call_count == 3  # SESSION_MAX_ATTEMPTS
 
     def test_acquire_session_retries_on_exception(self) -> None:
         """_acquire_session should retry on exceptions and return None."""

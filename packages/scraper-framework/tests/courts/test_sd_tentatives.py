@@ -1435,7 +1435,7 @@ class TestLoudAntiBotFailures:
             court="Superior Court",
             target_urls=[PORTAL_BASE_URL],
             request_delay_seconds=0.0,
-            max_retries=1,
+            max_attempts=1,
         )
         scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
 
@@ -1638,7 +1638,7 @@ class TestLookupExceptionsFailLoudly:
             court="Superior Court",
             target_urls=[PORTAL_BASE_URL],
             request_delay_seconds=0.0,
-            max_retries=1,
+            max_attempts=1,
         )
         cases = [f"24CU0000{i:02d}C" for i in range(6)]
         scraper = SDTentativeRulingsScraper(config, case_numbers=cases)
@@ -1760,7 +1760,7 @@ class TestMidRunAbortFailsLoudly:
             court="Superior Court",
             target_urls=[PORTAL_BASE_URL],
             request_delay_seconds=0.0,
-            max_retries=1,
+            max_attempts=1,
         )
 
     def test_abort_after_clean_lookups_fails_run_and_keeps_captures(self) -> None:

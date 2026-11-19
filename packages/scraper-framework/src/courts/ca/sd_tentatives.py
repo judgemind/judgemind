@@ -84,8 +84,8 @@ CF_CHALLENGE_TIMEOUT = 45.0
 # Maximum time (seconds) to wait for page navigation.
 PAGE_LOAD_TIMEOUT = 60000  # Playwright uses milliseconds
 
-# Number of retry attempts for Cloudflare challenge resolution.
-CF_MAX_RETRIES = 3
+# Number of attempts (first try included) for Cloudflare challenge resolution.
+CF_MAX_ATTEMPTS = 3
 
 # Seconds between cf_clearance cookie poll checks during challenge resolution.
 CF_POLL_INTERVAL = 2.0
@@ -908,11 +908,11 @@ class SDTentativeRulingsScraper(BaseScraper):
         """
         context = page.context
 
-        for attempt in range(1, CF_MAX_RETRIES + 1):
+        for attempt in range(1, CF_MAX_ATTEMPTS + 1):
             self._log.info(
                 "Cloudflare solve attempt",
                 attempt=attempt,
-                max_retries=CF_MAX_RETRIES,
+                max_attempts=CF_MAX_ATTEMPTS,
             )
 
             try:
@@ -940,7 +940,7 @@ class SDTentativeRulingsScraper(BaseScraper):
                         stage="portal",
                         proxy=bool(self._proxy_url),
                     )
-                    if attempt < CF_MAX_RETRIES:
+                    if attempt < CF_MAX_ATTEMPTS:
                         await asyncio.sleep(CF_RETRY_PAUSE)
                     continue
 
@@ -1000,12 +1000,12 @@ class SDTentativeRulingsScraper(BaseScraper):
                 )
 
             # Brief pause before retrying to let Cloudflare state settle
-            if attempt < CF_MAX_RETRIES:
+            if attempt < CF_MAX_ATTEMPTS:
                 await asyncio.sleep(CF_RETRY_PAUSE)
 
         self._log.error(
             "Failed to solve Cloudflare challenge after all retries",
-            max_retries=CF_MAX_RETRIES,
+            max_attempts=CF_MAX_ATTEMPTS,
         )
         # The all-retries failure surfaced only as opaque Chromium timeouts.
         # When a proxy is configured, run a stdlib probe through the SAME proxy
@@ -1237,6 +1237,6 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         ],
         request_delay_seconds=DEFAULT_REQUEST_DELAY,
         request_timeout_seconds=30.0,
-        max_retries=2,  # Fewer retries — browser restarts are expensive
+        max_attempts=2,  # Fewer attempts — browser restarts are expensive
         s3_bucket=s3_bucket,
     )

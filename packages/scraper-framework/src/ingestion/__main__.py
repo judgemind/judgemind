@@ -10,7 +10,9 @@ Required environment variables:
     JUDGEMIND_ARCHIVE_BUCKET — S3 bucket for ruling content
 
 Optional:
-    MAX_RETRIES            — Per-message retry limit (default: 3)
+    MAX_ATTEMPTS           — Per-message processing attempts, the first try
+                             included (default: 3).  MAX_RETRIES is read as a
+                             deprecated alias when MAX_ATTEMPTS is unset (#5158)
     OPENSEARCH_USERNAME    — OpenSearch basic-auth username (local-dev fallback)
     OPENSEARCH_PASSWORD    — OpenSearch basic-auth password (local-dev fallback)
     JUDGEMIND_EXTRACTION   — ``required`` (default): ANTHROPIC_API_KEY and
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 
 import redis
 import structlog
@@ -41,6 +44,7 @@ from framework.s3_cache import make_s3_client
 
 from .worker import (
     DEFAULT_BLOCK_MS,
+    DEFAULT_MAX_ATTEMPTS,
     InfrastructureError,
     IngestionWorker,
     redis_socket_timeout_for_block,
@@ -69,13 +73,34 @@ def _require_env(name: str) -> str:
     return val
 
 
+def max_attempts_from_env(environ: Mapping[str, str]) -> int:
+    """Per-message processing attempts from ``MAX_ATTEMPTS`` (#5158).
+
+    ``MAX_RETRIES`` is the pre-#5158 name of the same setting: it always
+    counted attempts, so its value carries over unchanged.  It is read only
+    when ``MAX_ATTEMPTS`` is unset, with a warning to rename it.
+    """
+    value = environ.get("MAX_ATTEMPTS", "")
+    if value:
+        return int(value)
+    legacy = environ.get("MAX_RETRIES", "")
+    if legacy:
+        logger.warning(
+            "ingestion.max_retries_env_deprecated",
+            value=legacy,
+            fix="rename the MAX_RETRIES env var to MAX_ATTEMPTS (same value)",
+        )
+        return int(legacy)
+    return DEFAULT_MAX_ATTEMPTS
+
+
 def main() -> None:
     """Start the ingestion worker. Runs until SIGINT/SIGTERM."""
     pg_dsn = _require_env("DATABASE_URL")
     redis_url = _require_env("REDIS_URL")
     opensearch_url = _require_env("OPENSEARCH_URL")
     archive_bucket = _require_env("JUDGEMIND_ARCHIVE_BUCKET")
-    max_retries = int(os.environ.get("MAX_RETRIES", "3"))
+    max_attempts = max_attempts_from_env(os.environ)
 
     try:
         # socket_timeout must outlast the XREADGROUP BLOCK interval: redis-py 8
@@ -100,7 +125,7 @@ def main() -> None:
             opensearch_client=opensearch_client,
             s3_client=s3_client,
             archive_bucket=archive_bucket,
-            max_retries=max_retries,
+            max_attempts=max_attempts,
         )
 
         # ECS stops tasks with SIGTERM; without a handler PID 1 ignores it

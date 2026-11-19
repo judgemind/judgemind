@@ -690,7 +690,7 @@ def _make_scraper_config() -> ScraperConfig:
         target_urls=[f"{API_BASE_URL}/clusters/"],
         request_delay_seconds=0,
         request_timeout_seconds=10.0,
-        max_retries=1,
+        max_attempts=1,
     )
 
 

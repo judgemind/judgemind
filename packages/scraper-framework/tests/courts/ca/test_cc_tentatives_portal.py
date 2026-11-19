@@ -1050,7 +1050,7 @@ _TWO_JUDGE_FORM = (
 
 def _run_config() -> ScraperConfig:
     config = portal_default_config()
-    return config.model_copy(update={"request_delay_seconds": 0.0, "max_retries": 1})
+    return config.model_copy(update={"request_delay_seconds": 0.0, "max_attempts": 1})
 
 
 @respx.mock

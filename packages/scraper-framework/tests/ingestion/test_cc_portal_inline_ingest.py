@@ -72,7 +72,7 @@ def _capture_event_payload(days_from_now: int = 3) -> dict[str, Any]:
     archiver.archive.return_value = "ca/contra_costa/superior_court/raw/abc.txt"
     archiver.bucket = "test-bucket"
     config = portal_default_config().model_copy(
-        update={"request_delay_seconds": 0.0, "max_retries": 1}
+        update={"request_delay_seconds": 0.0, "max_attempts": 1}
     )
     scraper = CCTentativesPortalScraper(
         config=config, archiver=archiver, event_bus=EventBus(redis_client)
