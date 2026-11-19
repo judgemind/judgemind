@@ -34,6 +34,7 @@ from framework.llm_schema import (
     FieldConfidence,
 )
 from framework.llm_utils import parse_llm_json, rulings_array_shape_error
+from framework.pdf_pages import iter_pdf_pages
 from framework.pdf_render import RENDER_DPI, render_page
 
 from .llm_providers import (
@@ -351,7 +352,7 @@ def _read_pdf_pages(raw_bytes: bytes) -> list[_PdfPage]:
 
     pages: list[_PdfPage] = []
     with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-        for page in pdf.pages:
+        for page in iter_pdf_pages(pdf):
             text = page.extract_text() or ""
             chars = _non_blank(text)
             scanned = chars < _SCANNED_PAGE_MAX_TEXT_CHARS and (

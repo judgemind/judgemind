@@ -2974,6 +2974,9 @@ class _FakePage:
     def extract_tables(self) -> list[list[list[str | None]]]:
         return self._tables
 
+    def close(self) -> None:
+        """pdfplumber ``Page.close``: the parsers close each page (#5147)."""
+
 
 class _FakePdf:
     def __init__(self, pages: list[_FakePage]) -> None:

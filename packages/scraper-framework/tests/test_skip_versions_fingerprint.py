@@ -37,8 +37,9 @@ PINNED_VERSION = 3
 #: Why the last repin without a version bump cannot change a verdict.
 #: Replace it on every such repin.
 UNCHANGED_VERDICT_REASON = (
-    "Baseline pinned with version 3 (#5134): #5098/#5115 OCR tile split, "
-    "and the worker's verdict decisions extracted into helpers unchanged."
+    "#5147: _read_pdf_pages loops through iter_pdf_pages, which closes each "
+    "pdfplumber page after it is read (frees its cached layout).  Every page's "
+    "text and scanned flag are read exactly as before, so no verdict changes."
 )
 
 #: Modules whose functions and constants a covered function pulls in.
@@ -140,7 +141,7 @@ PINNED_FINGERPRINTS: dict[str, str] = {
     "ingestion.llm_extract._ocr_total_timeout": "2af5503b23db66a0",
     "ingestion.llm_extract._page_list": "94e75e89e2cd78ed",
     "ingestion.llm_extract._pdf_bytes": "02657a3d51148646",
-    "ingestion.llm_extract._read_pdf_pages": "b27a1845ebe04a83",
+    "ingestion.llm_extract._read_pdf_pages": "2d6bf76e77b0e29b",
     "ingestion.llm_extract._render_page": "71e2be05594f3802",
     "ingestion.llm_extract._scanned_page_indexes": "5f6b374e078ff591",
     "ingestion.llm_extract._split_image": "2c95add1885ea70d",
