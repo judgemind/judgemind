@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -329,7 +331,14 @@ class TestRunQuery:
         result = json.loads(_unframe(captured.out))
         assert result == {"rowcount": 0}
 
-    def test_readonly_flag_sets_transaction_readonly(self) -> None:
+    def test_readonly_flag_opens_session_read_only(self) -> None:
+        """#5170 — read-only must be in force before the user's query runs.
+
+        A ``SET default_transaction_read_only = on`` on the open connection
+        opens a read-write transaction (psycopg is non-autocommit) and the
+        query then runs inside it. The setting has to travel in the startup
+        packet, so the only statement the cursor executes is the query.
+        """
         query = "SELECT 1"
         query_b64 = base64.b64encode(query.encode()).decode()
 
@@ -344,9 +353,30 @@ class TestRunQuery:
 
                 run_query(query_b64, "1")
 
+        mock_psycopg.connect.assert_called_once_with(
+            "postgresql://test", options="-c default_transaction_read_only=on"
+        )
         mock_cursor = mock_psycopg.connect.return_value.cursor.return_value
-        calls = [str(c) for c in mock_cursor.execute.call_args_list]
-        assert any("SET default_transaction_read_only = on" in c for c in calls)
+        assert [c.args for c in mock_cursor.execute.call_args_list] == [(query,)]
+
+    def test_rw_flag_opens_session_without_read_only_option(self) -> None:
+        query = "SELECT 1"
+        query_b64 = base64.b64encode(query.encode()).decode()
+
+        mock_psycopg = self._make_mock_psycopg(
+            description=[("?column?",)],
+            rows=[(1,)],
+        )
+
+        with patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+                from dev_db_query_runner import run_query
+
+                run_query(query_b64, "0")
+
+        mock_psycopg.connect.assert_called_once_with("postgresql://test")
+        mock_cursor = mock_psycopg.connect.return_value.cursor.return_value
+        assert [c.args for c in mock_cursor.execute.call_args_list] == [(query,)]
 
     def test_missing_database_url_exits(self) -> None:
         query_b64 = base64.b64encode(b"SELECT 1").decode()
@@ -456,3 +486,90 @@ class TestMain:
         payload = "x" * (RESULT_INLINE_MAX_BYTES + 10)
         emit_result(payload, inline_max=10_000_000)
         assert _unframe(capsys.readouterr().out) == payload
+
+
+# ── Real Postgres (#5170) ────────────────────────────────────────────────────
+# These run run_query against a real server when TEST_DATABASE_URL is set, so
+# the read-only guard is proven at the database, not just at the mock.
+
+_DSN = os.environ.get("TEST_DATABASE_URL", "")
+
+
+@pytest.fixture
+def real_psycopg() -> object:
+    if not _DSN:
+        pytest.skip("TEST_DATABASE_URL not set")
+    return pytest.importorskip("psycopg")
+
+
+@pytest.fixture
+def scratch_table(real_psycopg: object) -> object:
+    """A throwaway one-column table, created and dropped outside run_query."""
+    name = f"jm_devdb_ro_probe_{uuid.uuid4().hex[:12]}"
+    with real_psycopg.connect(_DSN, autocommit=True) as conn:  # type: ignore[attr-defined]
+        conn.execute(f"CREATE TABLE {name} (x int)")
+    try:
+        yield name
+    finally:
+        with real_psycopg.connect(_DSN, autocommit=True) as conn:  # type: ignore[attr-defined]
+            conn.execute(f"DROP TABLE IF EXISTS {name}")
+
+
+def _row_count(psycopg_mod: object, table: str) -> int:
+    with psycopg_mod.connect(_DSN) as conn:  # type: ignore[attr-defined]
+        return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+
+def _run_real(query: str, readonly_flag: str) -> None:
+    with patch.dict("os.environ", {"DATABASE_URL": _DSN}):
+        dev_db_query_runner.run_query(
+            base64.b64encode(query.encode()).decode(), readonly_flag
+        )
+
+
+class TestRunQueryRealPostgres:
+    def test_default_mode_transaction_is_read_only(
+        self, real_psycopg: object, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run_real("SELECT current_setting('transaction_read_only') AS tx_ro", "1")
+        assert json.loads(_unframe(capsys.readouterr().out)) == [{"tx_ro": "on"}]
+
+    def test_default_mode_rejects_write(
+        self,
+        real_psycopg: object,
+        scratch_table: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            _run_real(f"INSERT INTO {scratch_table} VALUES (1)", "1")
+        assert exc_info.value.code == 1
+        assert "read-only transaction" in capsys.readouterr().err
+        assert _row_count(real_psycopg, scratch_table) == 0
+
+    def test_default_mode_rejects_write_in_multi_statement_query(
+        self,
+        real_psycopg: object,
+        scratch_table: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A --file query with several statements is read-only throughout."""
+        with pytest.raises(SystemExit):
+            _run_real(f"SELECT 1; INSERT INTO {scratch_table} VALUES (1);", "1")
+        assert "read-only transaction" in capsys.readouterr().err
+        assert _row_count(real_psycopg, scratch_table) == 0
+
+    def test_rw_mode_transaction_is_read_write(
+        self, real_psycopg: object, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run_real("SELECT current_setting('transaction_read_only') AS tx_ro", "0")
+        assert json.loads(_unframe(capsys.readouterr().out)) == [{"tx_ro": "off"}]
+
+    def test_rw_mode_writes(
+        self,
+        real_psycopg: object,
+        scratch_table: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _run_real(f"INSERT INTO {scratch_table} VALUES (1)", "0")
+        assert json.loads(_unframe(capsys.readouterr().out)) == {"rowcount": 1}
+        assert _row_count(real_psycopg, scratch_table) == 1

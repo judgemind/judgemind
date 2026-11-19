@@ -24,8 +24,10 @@
 #   scripts/dev-db-query.sh "SELECT * FROM courts WHERE state = 'CA'"
 #   scripts/dev-db-query.sh --file path/to/query.sql
 #
-# By default, the session is set to read-only mode (SET default_transaction_read_only = on)
-# so that only SELECT/EXPLAIN queries succeed. Use --rw to allow writes:
+# By default, the session is opened read-only (the connection's startup options
+# carry default_transaction_read_only=on, #5170), so every statement, including
+# each statement of a --file query, runs in a read-only transaction and writes
+# fail with "cannot execute ... in a read-only transaction". Use --rw to allow writes:
 #   scripts/dev-db-query.sh --rw "UPDATE rulings SET status = 'active' WHERE id = 1"
 #   scripts/dev-db-query.sh --rw --file path/to/update.sql
 #
@@ -230,10 +232,10 @@ echo "" >&2
 # in SQL (e.g. WHERE status = 'active'). The runner script decodes it.
 query_b64=$(printf '%s' "$query" | base64 | tr -d '\n')
 
-# When READ_ONLY is true (the default), the runner script sets the session to
-# read-only mode before executing the user's query, so PostgreSQL itself
-# rejects any write attempt — defense-in-depth on top of the application-
-# level SQL keyword blocklist.
+# When READ_ONLY is true (the default), the runner script opens the session
+# read-only (startup option, before any statement; #5170), so PostgreSQL itself
+# rejects any write attempt. There is no client-side SQL keyword filter: this
+# database-side setting is the only write guard.
 if [[ "$READ_ONLY" == "true" ]]; then
     readonly_flag="1"
 else

@@ -195,6 +195,28 @@ def format_non_select_result(rowcount: int) -> str:
     return json.dumps({"rowcount": rowcount})
 
 
+# Session option that makes every transaction on the connection read-only
+# from its first statement (#5170). It is sent in the startup packet, so it is
+# in force before psycopg opens the implicit transaction the user's query runs
+# in. A `SET default_transaction_read_only = on` issued on the open connection
+# does not work: psycopg is non-autocommit, so the SET itself opens a
+# read-write transaction, and the default only applies to transactions that
+# start after it.
+READONLY_SESSION_OPTIONS = "-c default_transaction_read_only=on"
+
+
+def connect_kwargs(readonly_flag: str) -> dict[str, str]:
+    """Return the extra ``psycopg.connect`` kwargs for ``readonly_flag``.
+
+    ``"1"`` opens the session read-only (every statement, including each
+    statement of a multi-statement ``--file`` query, runs in a read-only
+    transaction). ``"0"`` (``--rw``) adds nothing.
+    """
+    if readonly_flag == "1":
+        return {"options": READONLY_SESSION_OPTIONS}
+    return {}
+
+
 def run_query(
     query_b64: str,
     readonly_flag: str,
@@ -217,11 +239,8 @@ def run_query(
     query = decode_query(query_b64)
 
     try:
-        with psycopg.connect(database_url) as conn:
+        with psycopg.connect(database_url, **connect_kwargs(readonly_flag)) as conn:
             with conn.cursor() as cursor:
-                if readonly_flag == "1":
-                    cursor.execute("SET default_transaction_read_only = on")
-
                 cursor.execute(query)
 
                 if cursor.description is not None:
