@@ -412,7 +412,8 @@ def test_empty_parse_fetch_and_snapshot_returns_empty_without_saving() -> None:
 @pytest.mark.parametrize(
     ("module_path", "class_name", "raw"),
     [
-        # Both override save_snapshot, so the guard must sit above it.
+        # Both once overrode save_snapshot (removed in #5161; overrides are
+        # now rejected by CourtDirectory.__init_subclass__, #5163).
         ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory", b"%PDF-1.7 changed"),
         ("courts.ca.sf_dept_judges", "SFCourtDirectory", b"%PDF-1.7 changed"),
         ("courts.ca.sf_dept_judges", "SFCourtDirectory", b"<article>changed</article>"),
