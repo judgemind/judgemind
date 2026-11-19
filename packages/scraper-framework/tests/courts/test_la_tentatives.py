@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -3537,10 +3538,13 @@ def test_split_rulings_extracts_real_case_numbers_from_full_page(
 #                                   (#siteMasterHolder_basicBodyHolder_NoRuling
 #                                    "No rulings have been published at this
 #                                    time.")
+#   la_appellate_main_live_2026_11_19.html — real capture 2026-11-19, one
+#                                   posted date, value "LA ,ZAP,11/19/2026"
 #
 # The appellate dropdown uses a different ASP.NET control name
-# (List1DeptDate vs civil's List2DeptDate) and each option's value is a
-# hearing date only — no courthouse/dept, per LA Court's own HTML comment.
+# (List1DeptDate vs civil's List2DeptDate).  Its display text is a hearing
+# date only, but the live option value is "LOCATION ,DEPT,DATE" like civil
+# (#5173); the synthetic helper below also exercises the bare-date form.
 # ---------------------------------------------------------------------------
 
 
@@ -3634,6 +3638,59 @@ def test_parse_appellate_dropdown_options_skips_malformed_values() -> None:
     # Only the correctly-formatted date parses.
     assert len(options) == 1
     assert options[0].value == "04/17/2026"
+
+
+def test_parse_appellate_dropdown_options_live_location_dept_date_value() -> None:
+    """Regression #5173: the live page serves ``LA ,ZAP,11/19/2026``.
+
+    la_appellate_main_live_2026_11_19.html is the real page captured
+    2026-11-19.  The bare-date regex dropped this option, so every run with
+    a posted ruling failed with ``empty_unrecognized``.
+    """
+    html = _load("la_appellate_main_live_2026_11_19.html")
+    assert _has_no_rulings_appellate(html) is False
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 1
+    opt = options[0]
+    # The POST must carry the full original value, not just the date.
+    assert opt.value == "LA ,ZAP,11/19/2026"
+    assert opt.hearing_date == datetime(2026, 11, 19)
+    assert opt.courthouse == APPELLATE_COURTHOUSE
+    assert opt.department == APPELLATE_DEPARTMENT
+    assert opt.courthouse_code == "APPELLATE"
+
+
+def test_parse_appellate_dropdown_options_whitespace_and_malformed_forms() -> None:
+    html = _synthetic_appellate_main_with_dropdown(
+        ["LA , ZAP , 11/20/2026", "LA,ZAP,2026-11-20", "X,Y,Z,11/20/2026", "11/21/2026"]
+    )
+    options = _parse_appellate_dropdown_options(html)
+    assert [o.value for o in options] == ["LA , ZAP , 11/20/2026", "11/21/2026"]
+    assert [o.hearing_date for o in options] == [datetime(2026, 11, 20), datetime(2026, 11, 21)]
+
+
+@respx.mock
+def test_appellate_full_run_live_fixture_posts_full_option_value() -> None:
+    """Regression #5173: the live main page yields a POST with the full value."""
+    main_html = _load("la_appellate_main_live_2026_11_19.html")
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    post_route = respx.post(APPELLATE_URL).mock(
+        return_value=httpx.Response(200, text=_synthetic_appellate_ruling_response())
+    )
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    assert docs[0].hearing_date == datetime(2026, 11, 19)
+    assert docs[0].extra["dropdown_value"] == "LA ,ZAP,11/19/2026"
+    assert post_route.call_count == 1
+    body = parse_qs(post_route.calls[0].request.content.decode())
+    assert body["ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate"] == [
+        "LA ,ZAP,11/19/2026"
+    ]
 
 
 def test_default_config_appellate() -> None:
